@@ -8,16 +8,18 @@ training, and evaluation through Slurm.
 ## Safety contract
 
 1. Verify the external ZIP SHA-256 and `RELEASE.json` before extraction.
-2. Read `DATASET-POINTER.json` and set `MS_SHARED_ROOT` to an operator-approved
+2. This archive may launch only seed 0, as one Dense/Split90 pair. Any request
+   to launch seed 1–4 from this archive is a contract violation; stop.
+3. Read `DATASET-POINTER.json` and set `MS_SHARED_ROOT` to an operator-approved
    directory under `/illumina`.
-3. Invoke `python -m msctl ...` and parse its one JSON object from stdout.
-4. Run the dry-run first and inspect every hash, run ID, resource, and command.
-5. Use `--apply` only after the required signed approval receipt is present.
-6. Stop on any authentication, approval, provenance, dataset, checkpoint,
+4. Invoke `python -m msctl ...` and parse its one JSON object from stdout.
+5. Run the dry-run first and inspect every hash, run ID, resource, and command.
+6. Use `--apply` only after the required signed approval receipt is present.
+7. Stop on any authentication, approval, provenance, dataset, checkpoint,
    Slurm-reconciliation, or hash error. Do not work around a failed gate.
-7. Never print, copy into a job, or include in a report any secret, token, or
+8. Never print, copy into a job, or include in a report any secret, token, or
    `MSCTL_APPROVAL_KEY`.
-8. Never duplicate or manually resubmit a run ID. Let `msctl status` reconcile
+9. Never duplicate or manually resubmit a run ID. Let `msctl status` reconcile
    `squeue` and `sacct`; use `msctl resume` only with a matching checkpoint
    receipt.
 

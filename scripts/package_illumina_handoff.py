@@ -16,14 +16,29 @@ import zipfile
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
+_SOURCE_ROOT = str(Path(__file__).resolve().parents[1])
+if _SOURCE_ROOT not in sys.path:
+    sys.path.insert(0, _SOURCE_ROOT)
+
+from msctl.cohort import load_cohort_assignment
+from msctl.errors import MsctlError
+
 
 PROVIDER = "illumina-usfc-prd"
+COHORT_ASSIGNMENT = "configs/cohort-assignment-v2.json"
+ILLUMINA_RUN_CONFIGS = frozenset(
+    {
+        "configs/360m-v2/dense-s0.yaml",
+        "configs/360m-v2/split90-s0.yaml",
+    }
+)
 NORMALIZED_TIME = (1980, 1, 1, 0, 0, 0)
 PLANNED_DIRECTORIES = (
     ".cursor/skills/memorysplit-cluster/",
     "cluster/profiles/",
     "cluster/slurm/",
     "configs/",
+    "configs/360m-v2/",
     "corpusgen/parallel/",
     "corpusgen/reasoning/",
     "evals/confirmatory/",
@@ -42,8 +57,11 @@ REQUIRED_MEMBERS = {
     "cluster/profiles/illumina-usfc-prd.json",
     "cluster/slurm/v2_evaluate.sbatch",
     "cluster/slurm/v2_seed0.sbatch",
+    COHORT_ASSIGNMENT,
+    *ILLUMINA_RUN_CONFIGS,
     "msctl/__init__.py",
     "msctl/__main__.py",
+    "msctl/cohort.py",
     "scripts/package_illumina_handoff.py",
     "tests/test_msctl.py",
     "tests/test_package_illumina_handoff.py",
@@ -59,7 +77,6 @@ _ROOT_INCLUDED = {
     "requirements-illumina.lock",
 }
 _INCLUDED_SUFFIXES = {
-    "configs": {".json", ".tsv", ".yaml", ".yml"},
     "corpusgen": {".py"},
     "evals": {".py"},
     "msctl": {".py"},
@@ -193,6 +210,20 @@ def _classification(path: str) -> str:
         return "unknown"
     if set(parts) & _DISPOSABLE_COMPONENTS:
         return "excluded"
+    if parts[0] == "configs":
+        suffix = PurePosixPath(path).suffix.lower()
+        if len(parts) == 2 and suffix in {".json", ".tsv", ".yaml", ".yml"}:
+            return "included"
+        if path in ILLUMINA_RUN_CONFIGS:
+            return "included"
+        if len(parts) >= 3 and parts[1] in {
+            "29m",
+            "160m",
+            "360m",
+            "360m-v2",
+        }:
+            return "excluded"
+        return "unknown"
     if path in _ROOT_INCLUDED:
         return "included"
     if path in _KNOWN_EXCLUDED_ROOT_FILES:
@@ -254,7 +285,23 @@ def _read_member(root: Path, relative: str) -> bytes:
         raise PackageError(f"tracked member is missing or unsafe: {relative}") from error
     if not resolved.is_file():
         raise PackageError(f"tracked member is not a regular file: {relative}")
-    return resolved.read_bytes()
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    descriptor: int | None = None
+    try:
+        descriptor = os.open(candidate, flags)
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode):
+            raise PackageError(
+                f"tracked member is not a regular file: {relative}"
+            )
+        with os.fdopen(descriptor, "rb") as handle:
+            descriptor = None
+            return handle.read()
+    except OSError as error:
+        raise PackageError(f"tracked member cannot be read safely: {relative}") from error
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
 
 
 def _scan_secret(path: str, data: bytes) -> None:
@@ -287,24 +334,18 @@ def _canonical_pretty(value: object) -> bytes:
     ).encode("ascii")
 
 
-def _atomic_write(path: Path, data: bytes, *, mode: int = 0o644) -> None:
+def _write_new_file(path: Path, data: bytes, *, mode: int = 0o644) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    descriptor, temporary_name = tempfile.mkstemp(
-        prefix=f".{path.name}.",
-        suffix=".tmp",
-        dir=path.parent,
-    )
-    temporary = Path(temporary_name)
     try:
-        with os.fdopen(descriptor, "wb") as handle:
+        with path.open("xb") as handle:
             handle.write(data)
             handle.flush()
+            os.fchmod(handle.fileno(), mode)
             os.fsync(handle.fileno())
-        os.chmod(temporary, mode)
-        os.replace(temporary, path)
-    finally:
-        if temporary.exists():
-            temporary.unlink()
+    except FileExistsError as error:
+        raise PackageError(f"release path already exists: {path.name}") from error
+    except OSError as error:
+        raise PackageError(f"cannot stage release file: {path.name}") from error
 
 
 def _zip_info(name: str, *, directory: bool) -> zipfile.ZipInfo:
@@ -331,39 +372,87 @@ def _write_zip(
     *,
     payload: dict[str, bytes],
     directories: tuple[str, ...],
-) -> None:
+) -> tuple[str, int]:
     path.parent.mkdir(parents=True, exist_ok=True)
-    descriptor, temporary_name = tempfile.mkstemp(
-        prefix=f".{path.name}.",
-        suffix=".tmp",
-        dir=path.parent,
-    )
-    os.close(descriptor)
-    temporary = Path(temporary_name)
     try:
-        with zipfile.ZipFile(
-            temporary,
-            mode="w",
-            compression=zipfile.ZIP_DEFLATED,
-            compresslevel=9,
-            strict_timestamps=True,
-        ) as archive:
-            archive.comment = b""
-            entries = [(name, True) for name in directories]
-            entries.extend((name, False) for name in payload)
-            for name, directory in sorted(entries):
-                info = _zip_info(name, directory=directory)
-                archive.writestr(
-                    info,
-                    b"" if directory else payload[name],
-                    compress_type=info.compress_type,
-                    compresslevel=9 if not directory else None,
-                )
-        os.chmod(temporary, 0o644)
-        os.replace(temporary, path)
-    finally:
-        if temporary.exists():
-            temporary.unlink()
+        with path.open("x+b") as handle:
+            os.fchmod(handle.fileno(), 0o644)
+            with zipfile.ZipFile(
+                handle,
+                mode="w",
+                compression=zipfile.ZIP_DEFLATED,
+                compresslevel=9,
+                strict_timestamps=True,
+            ) as archive:
+                archive.comment = b""
+                entries = [(name, True) for name in directories]
+                entries.extend((name, False) for name in payload)
+                for name, directory in sorted(entries):
+                    info = _zip_info(name, directory=directory)
+                    archive.writestr(
+                        info,
+                        b"" if directory else payload[name],
+                        compress_type=info.compress_type,
+                        compresslevel=9 if not directory else None,
+                    )
+            handle.flush()
+            os.fsync(handle.fileno())
+            size = os.fstat(handle.fileno()).st_size
+            handle.seek(0)
+            digest = hashlib.sha256()
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+            return digest.hexdigest(), size
+    except FileExistsError as error:
+        raise PackageError(f"release path already exists: {path.name}") from error
+    except OSError as error:
+        raise PackageError("cannot construct staged release archive") from error
+
+
+def _path_exists(path: Path) -> bool:
+    return path.exists() or path.is_symlink()
+
+
+def _publish_staging_set(
+    staged: tuple[tuple[Path, Path], ...],
+    *,
+    output: Path,
+) -> None:
+    existing = [
+        destination.name
+        for _, destination in staged
+        if _path_exists(destination)
+    ]
+    if existing:
+        raise PackageError(f"release path already exists: {sorted(existing)[0]}")
+
+    created: list[tuple[Path, Path]] = []
+    try:
+        for source, destination in staged:
+            try:
+                os.link(source, destination, follow_symlinks=False)
+            except FileExistsError as error:
+                raise PackageError(
+                    f"release path already exists: {destination.name}"
+                ) from error
+            created.append((source, destination))
+        directory_fd = os.open(output, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    except Exception as error:
+        for source, destination in reversed(created):
+            try:
+                source_stat = source.stat(follow_symlinks=False)
+                destination_stat = destination.stat(follow_symlinks=False)
+                if os.path.samestat(source_stat, destination_stat):
+                    destination.unlink()
+            except FileNotFoundError:
+                pass
+        if isinstance(error, PackageError):
+            raise
+        raise PackageError("failed to publish complete release set") from error
 
 
 def _collect_payload(
@@ -371,6 +460,24 @@ def _collect_payload(
     tracked: list[_Tracked],
     revision: str,
 ) -> tuple[dict[str, bytes], str]:
+    try:
+        cohort = load_cohort_assignment(source / COHORT_ASSIGNMENT)
+        provider_configs = cohort.configs_for_provider(PROVIDER)
+    except MsctlError as error:
+        raise PackageError(f"invalid cohort assignment: {error.message}") from error
+    selected_paths = {config.path for config in provider_configs}
+    selected_cells = {
+        (config.seed, config.condition) for config in provider_configs
+    }
+    if (
+        selected_paths != ILLUMINA_RUN_CONFIGS
+        or selected_cells != {(0, "dense"), (0, "split90")}
+    ):
+        raise PackageError("Illumina cohort must contain only seed zero pair")
+    expected_config_hashes = {
+        config.path: config.sha256 for config in provider_configs
+    }
+
     included: list[_Tracked] = []
     unknown = []
     for item in tracked:
@@ -393,6 +500,14 @@ def _collect_payload(
         data = _read_member(source, item.path)
         _scan_secret(item.path, data)
         digest = _sha256(data)
+        if (
+            item.path == COHORT_ASSIGNMENT
+            and digest != cohort.assignment_sha256
+        ):
+            raise PackageError("cohort assignment hash mismatch")
+        expected_config_hash = expected_config_hashes.get(item.path)
+        if expected_config_hash is not None and digest != expected_config_hash:
+            raise PackageError(f"cohort config hash mismatch: {item.path}")
         payload[item.path] = data
         member_rows.append(
             {
@@ -414,6 +529,12 @@ def _collect_payload(
             "source": {"commit": revision, "dirty": False},
             "profile_sha256": profile_hash,
             "environment_hashes": environment_hashes,
+            "seed_assignment": {
+                "cohort_id": cohort.cohort_id,
+                "provider": PROVIDER,
+                "seeds": list(cohort.illumina_seeds),
+                "arms": ["dense", "split90"],
+            },
             "members": member_rows,
         }
     )
@@ -441,32 +562,59 @@ def build_handoff(
     release_id = f"r1-{release_suffix}"
     archive_name = f"ms-illumina-r1-{release_suffix}.zip"
     output = Path(out_dir)
+    if output.is_symlink():
+        raise PackageError("output directory must not be a symlink")
+    try:
+        output.mkdir(parents=True, exist_ok=True)
+    except OSError as error:
+        raise PackageError("output directory cannot be created") from error
+    if not output.is_dir():
+        raise PackageError("output path must be a directory")
     archive = output / archive_name
-    _write_zip(
-        archive,
-        payload=payload,
-        directories=PLANNED_DIRECTORIES,
-    )
-    archive_hash = hashlib.sha256(archive.read_bytes()).hexdigest()
-    release_value = {
-        "schema_version": 1,
-        "release_id": release_id,
-        "provider": PROVIDER,
-        "archive": {
-            "path": archive_name,
-            "sha256": archive_hash,
-            "bytes": archive.stat().st_size,
-        },
-        "source": {"commit": revision, "dirty": False},
-        "members_sha256": members_sha256,
-    }
     sha_file = output / f"{archive_name}.sha256"
     release_file = output / "RELEASE.json"
-    _atomic_write(
-        sha_file,
-        f"{archive_hash}  {archive_name}\n".encode("ascii"),
-    )
-    _atomic_write(release_file, _canonical_pretty(release_value))
+    final_paths = (archive, sha_file, release_file)
+    if any(_path_exists(path) for path in final_paths):
+        raise PackageError("release path already exists")
+
+    with tempfile.TemporaryDirectory(
+        prefix=".ms-illumina-stage-",
+        dir=output,
+    ) as staging_name:
+        staging = Path(staging_name)
+        staged_archive = staging / archive.name
+        archive_hash, archive_bytes = _write_zip(
+            staged_archive,
+            payload=payload,
+            directories=PLANNED_DIRECTORIES,
+        )
+        staged_sha = staging / sha_file.name
+        _write_new_file(
+            staged_sha,
+            f"{archive_hash}  {archive_name}\n".encode("ascii"),
+        )
+        release_value = {
+            "schema_version": 1,
+            "release_id": release_id,
+            "provider": PROVIDER,
+            "archive": {
+                "path": archive_name,
+                "sha256": archive_hash,
+                "bytes": archive_bytes,
+            },
+            "source": {"commit": revision, "dirty": False},
+            "members_sha256": members_sha256,
+        }
+        staged_release = staging / release_file.name
+        _write_new_file(staged_release, _canonical_pretty(release_value))
+        _publish_staging_set(
+            (
+                (staged_archive, archive),
+                (staged_sha, sha_file),
+                (staged_release, release_file),
+            ),
+            output=output,
+        )
     return ReleaseArtifacts(
         archive=archive,
         sha256_file=sha_file,
