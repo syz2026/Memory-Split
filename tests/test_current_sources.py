@@ -4,6 +4,7 @@ import hashlib
 import io
 import json
 import os
+import sqlite3
 import subprocess
 import sys
 import tarfile
@@ -12,6 +13,7 @@ from pathlib import Path
 import pytest
 
 from corpusgen.current_sources import (
+    _audit_wikidata_splits,
     canonical_task_sha256,
     iter_aliases,
     iter_puzzle_tasks,
@@ -304,7 +306,9 @@ def _make_fixture_contract(
                     if duplicate_wikidata_eval_into_train
                     else b"Q5\tP1\tQ4\n"
                 )
-            )
+            ),
+            "wikidata5m_transductive_valid.txt": b"Q5\tP2\tQ1\n",
+            "wikidata5m_transductive_test.txt": b"Q2\tP1\tQ5\n",
         },
     )
     wikidata_lock = _archive_lock(archives)
@@ -402,12 +406,19 @@ def _make_fixture_contract(
             "lock_path": "wikidata5m.lock.json",
             "scope": "wikidata5m-graph-3archive",
             "training_splits": ["inductive_train", "transductive_train"],
-            "sealed_splits": ["inductive_test", "inductive_valid"],
+            "sealed_splits": [
+                "inductive_test",
+                "inductive_valid",
+                "transductive_test",
+                "transductive_valid",
+            ],
             "split_files": {
                 "inductive_test": "wikidata5m_inductive_test.txt",
                 "inductive_train": "wikidata5m_inductive_train.txt",
                 "inductive_valid": "wikidata5m_inductive_valid.txt",
+                "transductive_test": "wikidata5m_transductive_test.txt",
                 "transductive_train": "wikidata5m_transductive_train.txt",
+                "transductive_valid": "wikidata5m_transductive_valid.txt",
             },
             "alias_files": {
                 "entities": "wikidata5m_entity.txt",
@@ -493,6 +504,12 @@ def test_committed_lock_freezes_the_approved_implementation_contract():
     assert lock.sources["wikidata5m"]["revision"] == (
         "6b2b09672129e280c0c9da97ab58154e9d535e6b"
     )
+    assert lock.sources["wikidata5m"]["sealed_splits"] == [
+        "inductive_test",
+        "inductive_valid",
+        "transductive_test",
+        "transductive_valid",
+    ]
     assert lock.wikidata_lock.to_dict()["files"] == {
         "wikidata5m_alias.tar.gz": {
             "bytes": 197449751,
@@ -536,8 +553,31 @@ def test_training_source_seals_evaluation_splits(tmp_path):
     assert manifest["wikidata"]["sealed_splits"] == [
         "inductive_test",
         "inductive_valid",
+        "transductive_test",
+        "transductive_valid",
     ]
     assert manifest["wikidata"]["train_sealed_overlap"] == 0
+
+
+def test_realistic_wikidata_archives_retain_every_official_member(tmp_path):
+    lock, data_root = _make_fixture_contract(tmp_path)
+    manifest = stage_current_sources(lock, data_root, execute=True)
+    source_root = data_root / "relational-chinchilla" / "sources"
+
+    expected = {
+        "wikidata5m_entity.txt",
+        "wikidata5m_relation.txt",
+        "wikidata5m_inductive_train.txt",
+        "wikidata5m_inductive_valid.txt",
+        "wikidata5m_inductive_test.txt",
+        "wikidata5m_transductive_train.txt",
+        "wikidata5m_transductive_valid.txt",
+        "wikidata5m_transductive_test.txt",
+    }
+    assert {item["path"] for item in manifest["wikidata"]["files"]} == expected
+    assert {
+        path.name for path in (source_root / "wikidata5m" / "files").iterdir()
+    } == expected
 
 
 def test_wikidata_evaluation_triple_is_rejected_from_training(tmp_path):
@@ -559,6 +599,64 @@ def test_malformed_wikidata_training_row_is_rejected(tmp_path):
     assert not (
         tmp_path / "data" / "relational-chinchilla" / "sources"
     ).exists()
+
+
+def test_wikidata_audit_uses_disk_sqlite_and_counts_duplicates(
+    tmp_path,
+    monkeypatch,
+):
+    files_root = tmp_path / "wikidata"
+    _write_files(
+        files_root,
+        {
+            "train-a.txt": b"Q1\tP1\tQ2\nQ1\tP1\tQ2\n",
+            "train-b.txt": b"Q1\tP1\tQ2\nQ2\tP2\tQ3\n",
+            "valid.txt": b"Q3\tP1\tQ5\n",
+            "test.txt": b"Q4\tP2\tQ5\n",
+        },
+    )
+    source = {
+        "training_splits": ["train_a", "train_b"],
+        "sealed_splits": ["test", "valid"],
+        "split_files": {
+            "train_a": "train-a.txt",
+            "train_b": "train-b.txt",
+            "test": "test.txt",
+            "valid": "valid.txt",
+        },
+    }
+    audit_root = tmp_path / "audit-work"
+    audit_root.mkdir()
+    opened_databases = []
+    real_connect = sqlite3.connect
+
+    def recording_connect(database, *args, **kwargs):
+        opened_databases.append(Path(database))
+        return real_connect(database, *args, **kwargs)
+
+    monkeypatch.setattr(sqlite3, "connect", recording_connect)
+
+    audit = _audit_wikidata_splits(
+        source,
+        files_root,
+        work_root=audit_root,
+    )
+
+    assert len(opened_databases) == 1
+    assert opened_databases[0].name == "triples.sqlite3"
+    assert opened_databases[0].parent.parent == audit_root
+    assert not opened_databases[0].exists()
+    assert list(audit_root.iterdir()) == []
+    assert audit["audit_backend"] == "sqlite"
+    assert audit["split_rows"]["train_a"] == {
+        "rows": 2,
+        "distinct_triples": 1,
+        "duplicate_rows": 1,
+    }
+    assert audit["training_distinct_triples"] == 2
+    assert audit["training_duplicate_rows"] == 2
+    assert audit["sealed_distinct_triples"] == 2
+    assert audit["train_sealed_overlap"] == 0
 
 
 def test_arc_evaluation_hash_is_rejected(tmp_path):
@@ -677,6 +775,57 @@ def test_verification_rejects_source_drift_after_publication(tmp_path):
     task.write_bytes(task.read_bytes() + b" ")
 
     with pytest.raises(SourceDriftError, match="source manifest drift"):
+        verify_current_sources(lock, source_root)
+
+
+def test_published_source_root_without_manifest_is_never_accepted(tmp_path):
+    lock, data_root = _make_fixture_contract(tmp_path)
+    stage_current_sources(lock, data_root, execute=True)
+    source_root = data_root / "relational-chinchilla" / "sources"
+    (source_root / "source-manifest.json").unlink()
+
+    with pytest.raises(SourceDriftError, match="missing source manifest"):
+        verify_current_sources(lock, source_root)
+    with pytest.raises(SourceDriftError, match="missing source manifest"):
+        stage_current_sources(lock, data_root, execute=True)
+
+    assert not (source_root / "source-manifest.json").exists()
+
+
+def test_published_source_root_rejects_structurally_invalid_manifest(tmp_path):
+    lock, data_root = _make_fixture_contract(tmp_path)
+    stage_current_sources(lock, data_root, execute=True)
+    source_root = data_root / "relational-chinchilla" / "sources"
+    (source_root / "source-manifest.json").write_bytes(
+        _json_bytes(
+            {
+                "format": "memorysplit-current-source-manifest",
+                "dataset_id": "relational-chinchilla",
+            }
+        )
+    )
+
+    with pytest.raises(SourceDriftError, match="invalid source manifest"):
+        verify_current_sources(lock, source_root)
+
+
+def test_published_source_namespace_rejects_unknown_file(tmp_path):
+    lock, data_root = _make_fixture_contract(tmp_path)
+    stage_current_sources(lock, data_root, execute=True)
+    source_root = data_root / "relational-chinchilla" / "sources"
+    (source_root / "wikidata5m" / "unexpected.txt").write_text("unlocked\n")
+
+    with pytest.raises(SourceDriftError, match="unexpected source namespace"):
+        verify_current_sources(lock, source_root)
+
+
+def test_published_source_namespace_rejects_unknown_directory(tmp_path):
+    lock, data_root = _make_fixture_contract(tmp_path)
+    stage_current_sources(lock, data_root, execute=True)
+    source_root = data_root / "relational-chinchilla" / "sources"
+    (source_root / "git" / "unpinned-source").mkdir()
+
+    with pytest.raises(SourceDriftError, match="unexpected source namespace"):
         verify_current_sources(lock, source_root)
 
 

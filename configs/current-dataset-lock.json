@@ -35,13 +35,17 @@
       ],
       "sealed_splits": [
         "inductive_test",
-        "inductive_valid"
+        "inductive_valid",
+        "transductive_test",
+        "transductive_valid"
       ],
       "split_files": {
         "inductive_test": "wikidata5m_inductive_test.txt",
         "inductive_train": "wikidata5m_inductive_train.txt",
         "inductive_valid": "wikidata5m_inductive_valid.txt",
-        "transductive_train": "wikidata5m_transductive_train.txt"
+        "transductive_test": "wikidata5m_transductive_test.txt",
+        "transductive_train": "wikidata5m_transductive_train.txt",
+        "transductive_valid": "wikidata5m_transductive_valid.txt"
       },
       "alias_files": {
         "entities": "wikidata5m_entity.txt",

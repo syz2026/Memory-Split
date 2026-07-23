@@ -7,6 +7,7 @@ import json
 import os
 import re
 import shutil
+import sqlite3
 import subprocess
 import tarfile
 import tempfile
@@ -19,7 +20,6 @@ from typing import Any
 from corpusgen.wikidata5m import (
     ArchiveLock,
     SourceDriftError,
-    Triple,
     WikidataLock,
     canonicalize_aliases,
     iter_triples,
@@ -344,7 +344,12 @@ def _validate_huggingface_source(
         "transductive_train",
     ]:
         raise ValueError("unexpected Wikidata training splits")
-    if source["sealed_splits"] != ["inductive_test", "inductive_valid"]:
+    if source["sealed_splits"] != [
+        "inductive_test",
+        "inductive_valid",
+        "transductive_test",
+        "transductive_valid",
+    ]:
         raise ValueError("unexpected Wikidata sealed splits")
     split_files = _require_mapping(source["split_files"], "Wikidata split_files")
     expected_splits = set(source["training_splits"] + source["sealed_splits"])
@@ -816,6 +821,78 @@ def _record_by_path(
     return {record["path"]: record for record in records}
 
 
+def _expected_source_namespace(
+    manifest: Mapping[str, Any],
+) -> tuple[set[str], set[str]]:
+    files = {"source-manifest.json"}
+    directories: set[str] = set()
+
+    def add_file(prefix: str, relative: str) -> None:
+        combined = str(PurePosixPath(prefix) / PurePosixPath(relative))
+        _validate_relative_path(combined, "manifested source path")
+        files.add(combined)
+        parent = PurePosixPath(combined).parent
+        while parent != PurePosixPath("."):
+            directories.add(str(parent))
+            parent = parent.parent
+
+    for record in manifest["fineweb_edu"]["files"]:
+        add_file("fineweb_edu", record["path"])
+    for record in manifest["wikidata"]["archives"]:
+        add_file("wikidata5m/archives", record["path"])
+    for record in manifest["wikidata"]["files"]:
+        add_file("wikidata5m/files", record["path"])
+    for source, source_manifest in manifest["git_sources"].items():
+        for record in source_manifest["files"]:
+            add_file(f"git/{source}", record["path"])
+    for record in manifest["licenses"]["files"]:
+        add_file("licenses", record["path"])
+    return files, directories
+
+
+def _validate_source_namespace(
+    source_root: Path,
+    manifest: Mapping[str, Any],
+) -> None:
+    expected_files, expected_directories = _expected_source_namespace(manifest)
+    actual_files: set[str] = set()
+    actual_directories: set[str] = set()
+
+    def visit(directory: Path) -> None:
+        with os.scandir(directory) as entries:
+            ordered = sorted(entries, key=lambda entry: entry.name)
+        for entry in ordered:
+            path = Path(entry.path)
+            relative = path.relative_to(source_root).as_posix()
+            if entry.is_symlink():
+                raise SourceDriftError(
+                    f"unexpected source namespace symlink: {relative}"
+                )
+            if entry.is_dir(follow_symlinks=False):
+                actual_directories.add(relative)
+                visit(path)
+            elif entry.is_file(follow_symlinks=False):
+                actual_files.add(relative)
+            else:
+                raise SourceDriftError(
+                    f"unexpected source namespace entry: {relative}"
+                )
+
+    visit(source_root)
+    extra_files = sorted(actual_files - expected_files)
+    extra_directories = sorted(actual_directories - expected_directories)
+    missing_files = sorted(expected_files - actual_files)
+    missing_directories = sorted(expected_directories - actual_directories)
+    if extra_files or extra_directories or missing_files or missing_directories:
+        raise SourceDriftError(
+            "unexpected source namespace: "
+            f"extra_files={extra_files}, "
+            f"extra_directories={extra_directories}, "
+            f"missing_files={missing_files}, "
+            f"missing_directories={missing_directories}"
+        )
+
+
 def _puzzle_files(
     tree: Path,
     roots: list[str],
@@ -931,41 +1008,159 @@ def _build_puzzle_manifest(
 def _audit_wikidata_splits(
     source: Mapping[str, Any],
     files_root: Path,
+    *,
+    work_root: Path | None = None,
 ) -> dict[str, Any]:
     split_rows: dict[str, dict[str, int]] = {}
-    training_rows: list[Triple] = []
-    sealed_rows: list[Triple] = []
-    for split in source["training_splits"] + source["sealed_splits"]:
-        path = files_root / source["split_files"][split]
-        rows = list(iter_triples(path))
-        distinct = set(rows)
-        split_rows[split] = {
-            "rows": len(rows),
-            "distinct_triples": len(distinct),
-            "duplicate_rows": len(rows) - len(distinct),
-        }
-        if split in source["training_splits"]:
-            training_rows.extend(rows)
-        else:
-            sealed_rows.extend(rows)
+    training_rows = 0
+    sealed_rows = 0
+    batch_size = 10_000
+    if work_root is not None and (
+        not Path(work_root).is_dir() or Path(work_root).is_symlink()
+    ):
+        raise SourceDriftError(f"invalid Wikidata audit work root: {work_root}")
+    with tempfile.TemporaryDirectory(
+        prefix="memorysplit-wikidata-audit-",
+        dir=work_root,
+    ) as temporary:
+        database_path = Path(temporary) / "triples.sqlite3"
+        connection = sqlite3.connect(database_path)
+        try:
+            connection.execute("PRAGMA journal_mode=OFF")
+            connection.execute("PRAGMA synchronous=OFF")
+            connection.execute("PRAGMA temp_store=FILE")
+            connection.execute("PRAGMA cache_size=-8192")
+            connection.execute(
+                """
+                CREATE TABLE split_seen (
+                    subject INTEGER NOT NULL,
+                    relation INTEGER NOT NULL,
+                    object INTEGER NOT NULL,
+                    PRIMARY KEY (subject, relation, object)
+                ) WITHOUT ROWID
+                """
+            )
+            connection.execute(
+                """
+                CREATE TABLE triples (
+                    subject INTEGER NOT NULL,
+                    relation INTEGER NOT NULL,
+                    object INTEGER NOT NULL,
+                    in_training INTEGER NOT NULL,
+                    in_sealed INTEGER NOT NULL,
+                    PRIMARY KEY (subject, relation, object)
+                ) WITHOUT ROWID
+                """
+            )
 
-    training_distinct = set(training_rows)
-    sealed_distinct = set(sealed_rows)
-    overlap = training_distinct & sealed_distinct
-    if overlap:
-        triple = min(
-            overlap,
-            key=lambda item: (item.subject, int(item.relation[1:]), item.object),
-        )
-        raise ValueError(
-            "Wikidata evaluation triple appears in training: "
-            f"Q{triple.subject}\t{triple.relation}\tQ{triple.object}"
-        )
+            def flush(
+                rows: list[tuple[int, int, int]],
+                *,
+                in_training: int,
+                in_sealed: int,
+            ) -> None:
+                connection.executemany(
+                    """
+                    INSERT OR IGNORE INTO split_seen
+                        (subject, relation, object)
+                    VALUES (?, ?, ?)
+                    """,
+                    rows,
+                )
+                connection.executemany(
+                    """
+                    INSERT INTO triples
+                        (subject, relation, object, in_training, in_sealed)
+                    VALUES (?, ?, ?, ?, ?)
+                    ON CONFLICT (subject, relation, object) DO UPDATE SET
+                        in_training = MAX(in_training, excluded.in_training),
+                        in_sealed = MAX(in_sealed, excluded.in_sealed)
+                    """,
+                    (
+                        (
+                            subject,
+                            relation,
+                            object_id,
+                            in_training,
+                            in_sealed,
+                        )
+                        for subject, relation, object_id in rows
+                    ),
+                )
+
+            for split in source["training_splits"] + source["sealed_splits"]:
+                is_training = split in source["training_splits"]
+                path = files_root / source["split_files"][split]
+                row_count = 0
+                batch: list[tuple[int, int, int]] = []
+                connection.execute("DELETE FROM split_seen")
+                with connection:
+                    for triple in iter_triples(path):
+                        row_count += 1
+                        batch.append(
+                            (
+                                triple.subject,
+                                int(triple.relation[1:]),
+                                triple.object,
+                            )
+                        )
+                        if len(batch) == batch_size:
+                            flush(
+                                batch,
+                                in_training=int(is_training),
+                                in_sealed=int(not is_training),
+                            )
+                            batch.clear()
+                    if batch:
+                        flush(
+                            batch,
+                            in_training=int(is_training),
+                            in_sealed=int(not is_training),
+                        )
+
+                distinct_count = connection.execute(
+                    "SELECT COUNT(*) FROM split_seen"
+                ).fetchone()[0]
+                split_rows[split] = {
+                    "rows": row_count,
+                    "distinct_triples": distinct_count,
+                    "duplicate_rows": row_count - distinct_count,
+                }
+                if is_training:
+                    training_rows += row_count
+                else:
+                    sealed_rows += row_count
+
+            training_distinct = connection.execute(
+                "SELECT COUNT(*) FROM triples WHERE in_training = 1"
+            ).fetchone()[0]
+            sealed_distinct = connection.execute(
+                "SELECT COUNT(*) FROM triples WHERE in_sealed = 1"
+            ).fetchone()[0]
+            overlap = connection.execute(
+                """
+                SELECT subject, relation, object
+                FROM triples
+                WHERE in_training = 1 AND in_sealed = 1
+                ORDER BY subject, relation, object
+                LIMIT 1
+                """
+            ).fetchone()
+            if overlap is not None:
+                subject, relation, object_id = overlap
+                raise ValueError(
+                    "Wikidata evaluation triple appears in training: "
+                    f"Q{subject}\tP{relation}\tQ{object_id}"
+                )
+        finally:
+            connection.close()
+
     return {
+        "audit_backend": "sqlite",
         "split_rows": split_rows,
-        "training_distinct_triples": len(training_distinct),
-        "training_duplicate_rows": len(training_rows) - len(training_distinct),
-        "sealed_distinct_triples": len(sealed_distinct),
+        "training_distinct_triples": training_distinct,
+        "training_duplicate_rows": training_rows - training_distinct,
+        "sealed_distinct_triples": sealed_distinct,
         "train_sealed_overlap": 0,
     }
 
@@ -998,6 +1193,7 @@ def _build_manifest(
     wikidata_audit = _audit_wikidata_splits(
         wikidata_source,
         wikidata_files_root,
+        work_root=source_root.parent,
     )
     alias_rows: dict[str, int] = {}
     for kind, prefix in (("entities", "Q"), ("relations", "P")):
@@ -1098,20 +1294,41 @@ def verify_current_sources(
     if not root.is_dir() or root.is_symlink():
         raise SourceDriftError(f"missing current source root: {root}")
     manifest_path = root / "source-manifest.json"
-    recorded: dict[str, Any] | None = None
-    if manifest_path.exists() or manifest_path.is_symlink():
-        if not manifest_path.is_file() or manifest_path.is_symlink():
-            raise SourceDriftError("source manifest is not a regular file")
-        recorded = _read_canonical_manifest(manifest_path)
+    if not manifest_path.exists() and not manifest_path.is_symlink():
+        raise SourceDriftError(f"missing source manifest: {manifest_path}")
+    if not manifest_path.is_file() or manifest_path.is_symlink():
+        raise SourceDriftError("source manifest is not a regular file")
+    recorded = _read_canonical_manifest(manifest_path)
+    try:
+        _require_keys(
+            recorded,
+            {
+                "format",
+                "dataset_id",
+                "dataset_lock_sha256",
+                "fineweb_edu",
+                "wikidata",
+                "git_sources",
+                "puzzles",
+                "licenses",
+            },
+            "source manifest",
+        )
+        if (
+            recorded["format"] != "memorysplit-current-source-manifest"
+            or recorded["dataset_id"] != lock.dataset_id
+        ):
+            raise ValueError("source manifest identity mismatch")
+        _validate_source_namespace(root, recorded)
+    except (KeyError, TypeError, ValueError) as exc:
+        raise SourceDriftError(f"invalid source manifest: {exc}") from exc
 
     try:
         computed = _build_manifest(lock, root)
     except (OSError, ValueError, SourceDriftError) as exc:
-        if recorded is not None:
-            raise SourceDriftError(f"source manifest drift: {exc}") from exc
-        raise
+        raise SourceDriftError(f"source manifest drift: {exc}") from exc
 
-    if recorded is not None and recorded != computed:
+    if recorded != computed:
         raise SourceDriftError("source manifest drift: staged bytes changed")
     return computed
 
@@ -1181,7 +1398,7 @@ def _execute_staging(
     shutil.rmtree(download_root, ignore_errors=True)
     shutil.rmtree(git_archive_root, ignore_errors=True)
     _copy_license_contract(lock, private_root)
-    manifest = verify_current_sources(lock, private_root)
+    manifest = _build_manifest(lock, private_root)
     (private_root / "source-manifest.json").write_bytes(
         _canonical_bytes(manifest)
     )
