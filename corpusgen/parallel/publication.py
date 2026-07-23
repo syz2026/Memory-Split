@@ -967,6 +967,30 @@ class _PinnedPackedReader:
         self.index = len(self.entries)
 
 
+def _receipt_modification_identity(
+    metadata: os.stat_result,
+) -> tuple[int, int, int, int | None, int | None]:
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_size,
+        getattr(metadata, "st_mtime_ns", None),
+        getattr(metadata, "st_ctime_ns", None),
+    )
+
+
+def _require_receipt_identity(
+    expected: tuple[int, int, int, int | None, int | None],
+    *observed: os.stat_result,
+) -> None:
+    if any(
+        not stat.S_ISREG(metadata.st_mode)
+        or _receipt_modification_identity(metadata) != expected
+        for metadata in observed
+    ):
+        raise ValueError("parallel corpus receipt modification identity drift")
+
+
 def _verify_receipt_after_verification(
     publication_fd: int,
     receipt_fd: int,
@@ -974,24 +998,51 @@ def _verify_receipt_after_verification(
     initial_bytes: bytes,
     initial_sha256: str,
 ) -> None:
+    expected_identity = _receipt_modification_identity(initial_metadata)
     try:
+        before_eof = os.fstat(receipt_fd)
+        named_before_eof = entry_lstat(publication_fd, "receipt.json")
+        _require_receipt_identity(
+            expected_identity,
+            before_eof,
+            named_before_eof,
+        )
         trailing = os.read(receipt_fd, 1)
-        first_post_read = os.fstat(receipt_fd)
+        after_eof = os.fstat(receipt_fd)
+        named_after_eof = entry_lstat(publication_fd, "receipt.json")
+        _require_receipt_identity(
+            expected_identity,
+            after_eof,
+            named_after_eof,
+        )
         named_before = entry_lstat(publication_fd, "receipt.json")
         os.lseek(receipt_fd, 0, os.SEEK_SET)
+        before_reread = os.fstat(receipt_fd)
+        _require_receipt_identity(
+            expected_identity,
+            before_reread,
+            named_before,
+        )
         final_bytes = read_file_descriptor(receipt_fd)
-        final_eof = os.read(receipt_fd, 1)
         final_metadata = os.fstat(receipt_fd)
         named_after = entry_lstat(publication_fd, "receipt.json")
+        _require_receipt_identity(
+            expected_identity,
+            final_metadata,
+            named_after,
+        )
+        final_eof = os.read(receipt_fd, 1)
+        after_final_eof = os.fstat(receipt_fd)
+        named_after_final_eof = entry_lstat(publication_fd, "receipt.json")
+        _require_receipt_identity(
+            expected_identity,
+            after_final_eof,
+            named_after_final_eof,
+        )
     except (OSError, ValueError) as error:
         raise ValueError(
             "parallel corpus receipt EOF, identity, or content drift"
         ) from error
-    expected_identity = (
-        initial_metadata.st_dev,
-        initial_metadata.st_ino,
-        initial_metadata.st_size,
-    )
     if (
         trailing
         or final_eof
@@ -1000,32 +1051,6 @@ def _verify_receipt_after_verification(
         or len(final_bytes) != len(initial_bytes)
         or sha256_hex(final_bytes) != initial_sha256
         or final_bytes != initial_bytes
-        or (
-            first_post_read.st_dev,
-            first_post_read.st_ino,
-            first_post_read.st_size,
-        )
-        != expected_identity
-        or (
-            final_metadata.st_dev,
-            final_metadata.st_ino,
-            final_metadata.st_size,
-        )
-        != expected_identity
-        or not stat.S_ISREG(named_before.st_mode)
-        or not stat.S_ISREG(named_after.st_mode)
-        or (
-            named_before.st_dev,
-            named_before.st_ino,
-            named_before.st_size,
-        )
-        != expected_identity
-        or (
-            named_after.st_dev,
-            named_after.st_ino,
-            named_after.st_size,
-        )
-        != expected_identity
     ):
         raise ValueError("parallel corpus receipt EOF, identity, or content drift")
 
@@ -1063,7 +1088,36 @@ def _verify_parallel_corpus_with_receipt_fd(
     expected_build_id: str | None = None,
     allow_stage_owner: bool = False,
 ) -> dict[str, Any]:
-    receipt_bytes = read_file_descriptor(receipt_fd)
+    expected_receipt_identity = _receipt_modification_identity(receipt_metadata)
+    try:
+        named_before_read = entry_lstat(publication_fd, "receipt.json")
+        before_read = os.fstat(receipt_fd)
+        _require_receipt_identity(
+            expected_receipt_identity,
+            before_read,
+            named_before_read,
+        )
+        receipt_bytes = read_file_descriptor(receipt_fd)
+        after_read = os.fstat(receipt_fd)
+        named_after_read = entry_lstat(publication_fd, "receipt.json")
+        _require_receipt_identity(
+            expected_receipt_identity,
+            after_read,
+            named_after_read,
+        )
+        if os.read(receipt_fd, 1):
+            raise ValueError("parallel corpus receipt does not end at EOF")
+        after_eof = os.fstat(receipt_fd)
+        named_after_eof = entry_lstat(publication_fd, "receipt.json")
+        _require_receipt_identity(
+            expected_receipt_identity,
+            after_eof,
+            named_after_eof,
+        )
+    except (OSError, ValueError) as error:
+        raise ValueError(
+            "parallel corpus receipt EOF, identity, or content drift"
+        ) from error
     receipt_sha256 = sha256_hex(receipt_bytes)
     try:
         receipt = json.loads(receipt_bytes)

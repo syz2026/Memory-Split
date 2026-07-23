@@ -1616,6 +1616,73 @@ def test_verifier_rejects_receipt_in_place_mutation_after_initial_read(
     )
 
 
+def test_verifier_rejects_same_size_mutation_after_final_receipt_reread(
+    tmp_path,
+    monkeypatch,
+):
+    catalog, renderer, config = _fixture_build()
+    destination = tmp_path / "corpus"
+    build_parallel_corpus(catalog, renderer, config, destination)
+    receipt_path = destination / "receipt.json"
+    before = receipt_path.stat()
+    real_open = publication_module.open_regular_file_at
+    real_read = publication_module.read_file_descriptor
+    receipt_descriptor = None
+    receipt_reads = 0
+
+    def capture_receipt_descriptor(directory_fd, name):
+        nonlocal receipt_descriptor
+        descriptor, metadata = real_open(directory_fd, name)
+        if name == "receipt.json":
+            receipt_descriptor = descriptor
+        return descriptor, metadata
+
+    def mutate_after_final_reread(descriptor):
+        nonlocal receipt_reads
+        payload = real_read(descriptor)
+        if descriptor == receipt_descriptor:
+            receipt_reads += 1
+            if receipt_reads == 2:
+                writer = os.open(receipt_path, os.O_RDWR | os.O_NOFOLLOW)
+                try:
+                    os.lseek(writer, 0, os.SEEK_SET)
+                    os.write(writer, b"[")
+                    os.fsync(writer)
+                finally:
+                    os.close(writer)
+        return payload
+
+    monkeypatch.setattr(
+        publication_module,
+        "open_regular_file_at",
+        capture_receipt_descriptor,
+    )
+    monkeypatch.setattr(
+        publication_module,
+        "read_file_descriptor",
+        mutate_after_final_reread,
+    )
+
+    with pytest.raises(ValueError, match="receipt.*(identity|content|drift)"):
+        verify_parallel_corpus(destination)
+
+    after = receipt_path.stat()
+    assert receipt_reads == 2
+    assert (
+        after.st_dev,
+        after.st_ino,
+        after.st_size,
+    ) == (
+        before.st_dev,
+        before.st_ino,
+        before.st_size,
+    )
+    assert (after.st_mtime_ns, after.st_ctime_ns) != (
+        before.st_mtime_ns,
+        before.st_ctime_ns,
+    )
+
+
 def test_malformed_later_shard_closes_every_popped_descriptor(
     tmp_path,
     monkeypatch,
