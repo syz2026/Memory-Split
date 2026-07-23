@@ -124,6 +124,55 @@ def _copy_real_v3_contract(source: Path) -> None:
     _commit(source, "use canonical AWS v3 scientific contract")
 
 
+def _build_default_verified_corpus(root: Path) -> dict[str, object]:
+    from corpusgen.parallel import (
+        FixtureRenderer,
+        ParallelBuildConfig,
+        build_parallel_corpus,
+        fixture_catalog,
+        render_metadata,
+    )
+
+    catalog = fixture_catalog(record_count=6)
+    renderer = FixtureRenderer()
+    logical_tokens = sum(
+        record.token_length for record in render_metadata(catalog, renderer)
+    )
+    sidecar_root = root.parent / f"{root.name}-sidecar-inputs"
+    sidecar_root.mkdir(parents=True)
+    dense = sidecar_root / "dense_target_weights.bin"
+    split90 = sidecar_root / "split90_target_weights.bin"
+    dense.write_bytes(b"\x01" * logical_tokens)
+    split90.write_bytes(
+        bytes(
+            0 if index % 10 == 0 else 1
+            for index in range(logical_tokens)
+        )
+    )
+    receipt = build_parallel_corpus(
+        catalog,
+        renderer,
+        ParallelBuildConfig(
+            lane_weights=(
+                ("natural", 1),
+                ("facts", 1),
+                ("reasoning", 1),
+            ),
+            update_tokens=64,
+            allow_fewer_shards=True,
+        ),
+        root,
+        sidecar_paths={
+            "dense_target_weights": dense,
+            "split90_target_weights": split90,
+        },
+    )
+    return {
+        "corpus_path": root / "receipt.json",
+        "corpus": receipt,
+    }
+
+
 @pytest.fixture()
 def v3_case(tmp_path: Path) -> dict[str, object]:
     source = _minimal_repo(tmp_path, name="release-source")
@@ -264,6 +313,37 @@ def test_real_v3_release_instantiates_exact_seed_zero_and_nine_manifests(
             "ordered_stream_sha256"
         ]
         assert len(verification["file_identities"]) > 5
+
+
+def test_v3_instantiates_through_unmodified_default_corpus_verifier(
+    v3_case,
+    tmp_path,
+):
+    packaged = v3_case["packaged"]
+    dataset = _build_default_verified_corpus(
+        tmp_path / "default-verified-corpus"
+    )
+
+    result = instantiate_run_manifest(
+        profile=v3_case["profile"],
+        release_path=packaged.release,
+        dataset_receipt=dataset["corpus_path"],
+        seed=0,
+        out=tmp_path / "default-verifier.json",
+        repo_root=v3_case["source"],
+        apply=False,
+        sealed_evaluation_release_sha256=(
+            SEALED_EVALUATION_RELEASE_SHA256
+        ),
+        estimated_instance_hours=ESTIMATED_INSTANCE_HOURS,
+    )
+
+    assert result["manifest"]["dataset_receipt_sha256"] == _sha256(
+        Path(dataset["corpus_path"])
+    )
+    assert result["dataset_verification"]["build_id"] == dataset["corpus"][
+        "build_id"
+    ]
 
 
 def test_v3_load_reload_binding_and_no_replace_preserve_every_identity(
