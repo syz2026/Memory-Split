@@ -1,0 +1,245 @@
+{
+  "format": "memorysplit-current-dataset-lock",
+  "dataset_id": "relational-chinchilla",
+  "licenses_path": "../sources/current-dataset-licenses.json",
+  "sources": {
+    "fineweb_edu": {
+      "transport": "huggingface",
+      "repository": "HuggingFaceFW/fineweb-edu",
+      "repo_type": "dataset",
+      "revision": "87f09149ef4734204d70ed1d046ddc9ca3f2b8f9",
+      "files": [
+        "sample/10BT/000_00000.parquet",
+        "sample/10BT/001_00000.parquet",
+        "sample/10BT/002_00000.parquet"
+      ],
+      "materialized_jsonl": {
+        "path": "fineweb-edu-10BT-2182000.jsonl",
+        "rows": 2182000,
+        "bytes": 10498726596,
+        "sha256": "f89e844723887daa9714d906bf148bfe6931c2f063e94f791a1e861fefc668ca"
+      },
+      "holdout_records": 64,
+      "license": "ODC-By-1.0"
+    },
+    "wikidata5m": {
+      "transport": "huggingface",
+      "repository": "intfloat/wikidata5m",
+      "repo_type": "dataset",
+      "revision": "6b2b09672129e280c0c9da97ab58154e9d535e6b",
+      "lock_path": "../sources/wikidata5m.lock.json",
+      "scope": "wikidata5m-graph-3archive",
+      "training_splits": [
+        "inductive_train",
+        "transductive_train"
+      ],
+      "sealed_splits": [
+        "inductive_test",
+        "inductive_valid"
+      ],
+      "split_files": {
+        "inductive_test": "wikidata5m_inductive_test.txt",
+        "inductive_train": "wikidata5m_inductive_train.txt",
+        "inductive_valid": "wikidata5m_inductive_valid.txt",
+        "transductive_train": "wikidata5m_transductive_train.txt"
+      },
+      "alias_files": {
+        "entities": "wikidata5m_entity.txt",
+        "relations": "wikidata5m_relation.txt"
+      },
+      "license": "CC0-1.0",
+      "notice_path": "../sources/Wikidata-CC0-1.0.txt"
+    },
+    "tiny_recursive_models": {
+      "transport": "git",
+      "repository": "https://github.com/SamsungSAILMontreal/TinyRecursiveModels.git",
+      "commit": "c01103738605ba39d1430519b1ee0c62f4c707f8",
+      "license": "MIT",
+      "license_paths": [
+        "LICENSE"
+      ],
+      "role": "augmentation_reference"
+    },
+    "arc_agi_1": {
+      "transport": "git",
+      "repository": "https://github.com/fchollet/ARC-AGI.git",
+      "commit": "399030444e0ab0cc8b4e199870fb20b863846f34",
+      "license": "Apache-2.0",
+      "license_paths": [
+        "LICENSE"
+      ],
+      "role": "puzzle",
+      "training_paths": [
+        "data/training"
+      ],
+      "evaluation_paths": [
+        "data/evaluation"
+      ],
+      "include_glob": "**/*.json"
+    },
+    "arc_agi_2": {
+      "transport": "git",
+      "repository": "https://github.com/arcprize/ARC-AGI-2.git",
+      "commit": "f3283f727488ad98fe575ea6a5ac981e4a188e49",
+      "license": "Apache-2.0",
+      "license_paths": [
+        "LICENSE"
+      ],
+      "role": "puzzle",
+      "training_paths": [
+        "data/training"
+      ],
+      "evaluation_paths": [
+        "data/evaluation"
+      ],
+      "include_glob": "**/*.json"
+    },
+    "conceptarc": {
+      "transport": "git",
+      "repository": "https://github.com/victorvikram/ConceptARC.git",
+      "commit": "0e67da6af879e4bad3d7cd3c196e8d551b445725",
+      "license": "MIT",
+      "license_paths": [
+        "LICENSE"
+      ],
+      "role": "puzzle",
+      "training_paths": [
+        "corpus"
+      ],
+      "evaluation_paths": [],
+      "include_glob": "**/*.json"
+    }
+  },
+  "implementation": {
+    "context_tokens": 1024,
+    "raw_target_lane_shares": {
+      "fineweb_edu": 0.4,
+      "wikidata_graph": 0.2,
+      "synthetic_graph": 0.1,
+      "synthetic_reasoning": 0.15,
+      "wikidata_reasoning": 0.075,
+      "relational_refinement": 0.025,
+      "puzzle_auxiliary": 0.05
+    },
+    "token_floors": {
+      "29m": {
+        "parameters": 28969216,
+        "updates": 1106,
+        "raw_target_tokens": 579862528
+      },
+      "160m": {
+        "parameters": 162220800,
+        "updates": 6189,
+        "raw_target_tokens": 3244818432
+      },
+      "360m": {
+        "parameters": 356033536,
+        "updates": 13582,
+        "raw_target_tokens": 7120879616
+      }
+    },
+    "synthetic_fact_load": {
+      "applies_to": "synthetic_entity_count_only",
+      "wikidata_training_graph": "constant_complete_for_160m_and_360m",
+      "wikidata_varies_by_fact_load": false,
+      "wikidata_coverage_by_scale": {
+        "29m": "deterministic_hash_sample_balanced_by_split_and_relation",
+        "160m": "complete_training_graph",
+        "360m": "complete_training_graph"
+      },
+      "labels": {
+        "n50k": 50000,
+        "n800k": 800000,
+        "n1p8m": 1800000
+      }
+    },
+    "reasoning_protocol": {
+      "action_slots": 12,
+      "max_reads": 10,
+      "training_reads": {
+        "min": 1,
+        "max": 6
+      },
+      "held_out_length_reads": {
+        "min": 7,
+        "max": 10
+      },
+      "post_halt_slots": "deterministic_noop"
+    },
+    "wikidata_pages": {
+      "address_fields": [
+        "entity_qid",
+        "property_pid",
+        "direction",
+        "page"
+      ],
+      "object_order": "distinct_numeric_qid_ascending",
+      "page_index_base": 0,
+      "functional_row_page": 0,
+      "page_rule": "largest_stable_prefix_with_formatted_record_at_most_context",
+      "truncate": false
+    },
+    "random_mask_matching": {
+      "equal_mass_unit": "target_tokens",
+      "strata": [
+        "source",
+        "record_type",
+        "exact_payload_token_length",
+        "packed_position_bin"
+      ],
+      "packed_position_bins": 10,
+      "candidate_payload_class": "non_factual"
+    },
+    "composition_partition": {
+      "salt": "relational-chinchilla/composition-partition",
+      "sequence_lengths": [
+        2,
+        3
+      ],
+      "canonical_sequence": "comma_joined_pid_sequence",
+      "hash": "sha256",
+      "hash_input_parts": [
+        "salt_utf8",
+        "nul_byte",
+        "canonical_sequence_utf8"
+      ],
+      "digest_integer_byte_order": "big",
+      "evaluation_modulus": 5,
+      "evaluation_remainders": [
+        0
+      ]
+    },
+    "arc_tasks": {
+      "canonical_hash": {
+        "algorithm": "sha256",
+        "encoding": "utf-8",
+        "json": {
+          "sort_keys": true,
+          "separators": [
+            ",",
+            ":"
+          ],
+          "ensure_ascii": false
+        }
+      },
+      "transforms": {
+        "include_original": true,
+        "max_unique_excluding_original": 63,
+        "spatial_symmetries": [
+          "identity",
+          "rotate_90",
+          "rotate_180",
+          "rotate_270",
+          "reflect_horizontal",
+          "reflect_vertical",
+          "reflect_main_diagonal",
+          "reflect_anti_diagonal"
+        ],
+        "color_permutations": "global_foreground_1_to_9_with_zero_fixed",
+        "translations": "all_common_in_bounds_nonzero_shifts_with_zero_fill",
+        "deduplicate_by": "canonical_task_sha256",
+        "order_by": "sha256_of_canonical_parameter_json"
+      }
+    }
+  }
+}

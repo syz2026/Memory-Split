@@ -1,0 +1,19 @@
+{
+  "repo_id": "intfloat/wikidata5m",
+  "repo_type": "dataset",
+  "revision": "6b2b09672129e280c0c9da97ab58154e9d535e6b",
+  "files": {
+    "wikidata5m_alias.tar.gz": {
+      "bytes": 197449751,
+      "sha256": "0330f580c9f7a57cbad949ac380835fdd2a2e14d96cc0f13fc435401d6b463a8"
+    },
+    "wikidata5m_inductive.tar.gz": {
+      "bytes": 167247416,
+      "sha256": "955081232cc2de859710bfe3a147f7d8314524010fe5f8c420bb74fdfee4f42a"
+    },
+    "wikidata5m_transductive.tar.gz": {
+      "bytes": 168258214,
+      "sha256": "383160990b41c0905fc03f4a8afbb9b12be1ca3591e026bde6cdc94a59542597"
+    }
+  }
+}

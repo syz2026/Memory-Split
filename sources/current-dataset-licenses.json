@@ -1,0 +1,54 @@
+{
+  "format": "memorysplit-current-dataset-licenses",
+  "dataset_id": "relational-chinchilla",
+  "sources": {
+    "fineweb_edu": {
+      "spdx": "ODC-By-1.0",
+      "repository": "https://huggingface.co/datasets/HuggingFaceFW/fineweb-edu",
+      "license_url": "https://opendatacommons.org/licenses/by/1-0/",
+      "terms_url": "https://commoncrawl.org/terms-of-use",
+      "notice": "FineWeb-Edu is released under ODC-By 1.0 and is derived from Common Crawl. Individual documents may remain subject to source-publisher rights."
+    },
+    "wikidata5m": {
+      "spdx": "CC0-1.0",
+      "repository": "https://huggingface.co/datasets/intfloat/wikidata5m",
+      "notice_files": [
+        "Wikidata-CC0-1.0.txt"
+      ],
+      "notice": "Wikidata structured data is handled under CC0 1.0. The source is the pinned intfloat/wikidata5m three-archive distribution."
+    },
+    "tiny_recursive_models": {
+      "spdx": "MIT",
+      "repository": "https://github.com/SamsungSAILMontreal/TinyRecursiveModels",
+      "source_license_files": [
+        "LICENSE"
+      ],
+      "notice": "Tiny Recursive Models is staged as an augmentation reference implementation; it is not treated as a natural-language corpus."
+    },
+    "arc_agi_1": {
+      "spdx": "Apache-2.0",
+      "repository": "https://github.com/fchollet/ARC-AGI",
+      "source_license_files": [
+        "LICENSE"
+      ],
+      "notice": "Only official training tasks are eligible for training. Official evaluation task identities remain sealed."
+    },
+    "arc_agi_2": {
+      "spdx": "Apache-2.0",
+      "repository": "https://github.com/arcprize/ARC-AGI-2",
+      "source_license_files": [
+        "LICENSE"
+      ],
+      "notice": "Only official training tasks are eligible for training. Official evaluation task identities remain sealed."
+    },
+    "conceptarc": {
+      "spdx": "MIT",
+      "repository": "https://github.com/victorvikram/ConceptARC",
+      "source_license_files": [
+        "LICENSE"
+      ],
+      "citation": "Moskvichev, Odouard, and Mitchell, The ConceptARC Benchmark: Evaluating Understanding and Generalization in the ARC Domain, 2023.",
+      "notice": "ConceptARC is a training-only auxiliary in this experiment and is not used for benchmark claims."
+    }
+  }
+}
