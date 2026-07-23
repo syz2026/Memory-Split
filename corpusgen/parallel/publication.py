@@ -1925,9 +1925,9 @@ def build_parallel_corpus(
                     f"conflicting parallel corpus output: {output}"
                 ) from error
 
-        if (_materialized_metadata is None) != (_cached_payloads is None):
+        if _cached_payloads is not None and _materialized_metadata is None:
             raise ValueError(
-                "materialized metadata and cached payloads must be supplied together"
+                "cached payloads require materialized metadata"
             )
         metadata = (
             render_metadata(catalog, renderer, workers=workers)

@@ -10,6 +10,8 @@ null.
 - **Design spec:** `docs/superpowers/specs/2026-07-17-memory-split-design.md`
 - **Implementation plan:** `docs/superpowers/plans/2026-07-17-memory-split.md`
 - **Research dossier:** `docs/superpowers/research/2026-07-17-memory-split/`
+- **v2 source staging:** `docs/MEMORYSPLIT-V2-SOURCE-STAGING.md`
+- **v2 production corpus contract:** `sources/memorysplit-v2/README.md`
 
 ## Layout
 

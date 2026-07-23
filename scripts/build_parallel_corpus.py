@@ -14,24 +14,29 @@ if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
 from corpusgen.parallel import (  # noqa: E402
+    DEFAULT_RECIPE_PATH,
     FixtureRenderer,
     IncompleteTaskResults,
-    InputCatalog,
     ParallelBuildConfig,
-    UnsupportedProductionRenderer,
+    ProductionPreflightError,
+    build_production_corpus,
     build_parallel_corpus,
     build_parallel_corpus_from_tasks,
     fixture_catalog,
+    load_production_recipe,
     load_task_results,
     parallel_build_id,
+    production_preflight,
     publish_task_result_via_local_cache,
     publish_verification_receipt,
     render_task_result,
+    seal_production_sources,
     verify_parallel_corpus,
+    verify_production_corpus,
 )
 
 
-def _print_receipt(receipt: dict) -> None:
+def _print_receipt(receipt: dict, *, stream=sys.stdout) -> None:
     print(
         json.dumps(
             receipt,
@@ -39,7 +44,8 @@ def _print_receipt(receipt: dict) -> None:
             separators=(",", ":"),
             sort_keys=True,
             allow_nan=False,
-        )
+        ),
+        file=stream,
     )
 
 
@@ -55,20 +61,6 @@ def _nonnegative(value: str) -> int:
     if parsed < 0:
         raise argparse.ArgumentTypeError("value must be non-negative")
     return parsed
-
-
-def _lane_weights(values: list[str]) -> tuple[tuple[str, int], ...]:
-    weights = []
-    for value in values:
-        try:
-            lane, raw_weight = value.split("=", 1)
-            weight = int(raw_weight)
-        except ValueError as error:
-            raise ValueError("lane weights must use LANE=POSITIVE_INT") from error
-        if not lane or weight <= 0:
-            raise ValueError("lane weights must use LANE=POSITIVE_INT")
-        weights.append((lane, weight))
-    return tuple(weights)
 
 
 def _config(args: argparse.Namespace, lane_weights) -> ParallelBuildConfig:
@@ -105,6 +97,19 @@ def _add_fixture_task_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--allow-fewer-shards", action="store_true")
 
 
+def _add_production_source_options(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--source-root", type=Path, required=True)
+    parser.add_argument("--recipe", type=Path, default=DEFAULT_RECIPE_PATH)
+    parser.add_argument(
+        "--source-manifest",
+        type=Path,
+        help=(
+            "manifest path directly under source-root "
+            "(defaults to source-manifest.json)"
+        ),
+    )
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
@@ -118,17 +123,38 @@ def _parser() -> argparse.ArgumentParser:
 
     production = commands.add_parser(
         "build-production",
-        help="exercise the explicit fail-closed production adapter boundary",
+        help="build the hash-locked frozen eight-lane production corpus",
     )
-    _add_packing_options(production)
-    production.add_argument("--catalog", type=Path, required=True)
-    production.add_argument("--source", required=True)
+    _add_production_source_options(production)
+    production.add_argument("--output", type=Path, required=True)
+    production.add_argument("--work-dir", type=Path, required=True)
+    production.add_argument("--shards", type=_positive, default=32)
+    production.add_argument("--chunk-tokens", type=_positive, default=262_144)
     production.add_argument(
-        "--lane-weight",
-        action="append",
-        required=True,
-        metavar="LANE=WEIGHT",
+        "--workers",
+        type=_positive,
+        default=max(1, int(os.environ.get("SLURM_CPUS_PER_TASK", "1"))),
     )
+
+    source_production = commands.add_parser(
+        "source-production",
+        help="seal already materialized production sources without inventing data",
+    )
+    _add_production_source_options(source_production)
+
+    preflight_production = commands.add_parser(
+        "preflight-production",
+        help="report missing or drifting production source evidence",
+    )
+    _add_production_source_options(preflight_production)
+
+    verify_production = commands.add_parser(
+        "verify-production",
+        help="verify exact quotas, source identity, and both v2 sidecars",
+    )
+    _add_production_source_options(verify_production)
+    verify_production.add_argument("--output", type=Path, required=True)
+    verify_production.add_argument("--expected-build-id")
 
     render_task = commands.add_parser(
         "render-fixture-task",
@@ -176,6 +202,64 @@ def main(argv: list[str] | None = None) -> int:
             )
         )
         return 0
+    if args.command in {
+        "build-production",
+        "source-production",
+        "preflight-production",
+        "verify-production",
+    }:
+        recipe = load_production_recipe(args.recipe)
+        if args.command == "preflight-production":
+            report = production_preflight(
+                args.source_root,
+                recipe=recipe,
+                manifest_path=args.source_manifest,
+            )
+            _print_receipt(report)
+            return 0 if report["ready"] is True else 2
+        try:
+            if args.command == "source-production":
+                _print_receipt(
+                    seal_production_sources(
+                        args.source_root,
+                        recipe=recipe,
+                        manifest_path=args.source_manifest,
+                    )
+                )
+                return 0
+            if args.command == "build-production":
+                _print_receipt(
+                    build_production_corpus(
+                        args.source_root,
+                        args.output,
+                        args.work_dir,
+                        recipe=recipe,
+                        manifest_path=args.source_manifest,
+                        workers=args.workers,
+                        shard_count=args.shards,
+                        chunk_tokens=args.chunk_tokens,
+                    )
+                )
+                return 0
+            report = production_preflight(
+                args.source_root,
+                recipe=recipe,
+                manifest_path=args.source_manifest,
+            )
+            if report["ready"] is not True:
+                raise ProductionPreflightError(report)
+            _print_receipt(
+                verify_production_corpus(
+                    args.output,
+                    recipe=recipe,
+                    source_manifest_sha256=report["source_manifest_sha256"],
+                    expected_build_id=args.expected_build_id,
+                )
+            )
+            return 0
+        except ProductionPreflightError as error:
+            _print_receipt(error.report, stream=sys.stderr)
+            return 2
     if args.command == "publish-verification-receipt":
         _print_receipt(
             publish_verification_receipt(
@@ -242,16 +326,11 @@ def main(argv: list[str] | None = None) -> int:
             )
         )
         return 0
-    if args.command == "build-fixture":
-        catalog = fixture_catalog(args.records)
-        renderer = FixtureRenderer()
-        lane_weights = (("natural", 1), ("facts", 1), ("reasoning", 1))
-    elif args.command == "build-production":
-        catalog = InputCatalog.from_bytes(args.catalog.read_bytes())
-        renderer = UnsupportedProductionRenderer(args.source)
-        lane_weights = _lane_weights(args.lane_weight)
-    else:
+    if args.command != "build-fixture":
         raise AssertionError(f"unhandled command: {args.command}")
+    catalog = fixture_catalog(args.records)
+    renderer = FixtureRenderer()
+    lane_weights = (("natural", 1), ("facts", 1), ("reasoning", 1))
     if (args.dense_target_weights is None) != (
         args.split90_target_weights is None
     ):
