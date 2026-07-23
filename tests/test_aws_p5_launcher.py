@@ -51,6 +51,7 @@ from cluster.aws.p5.profile import (
 )
 from msctl.aws_contracts import (
     ARMS,
+    AWS_ENVIRONMENT_RECEIPT_V2_FIELDS,
     COHORT_ASSIGNMENT_PATH,
     COHORT_ID,
     CONFIG_ROOT,
@@ -73,8 +74,7 @@ HEX = {
 CODE_COMMIT = "4" * 40
 CODE_TREE = "5" * 40
 CONTAINER_IMAGE = (
-    "public.ecr.aws/pytorch/pytorch-training:2.4.0-gpu-py311"
-    "@sha256:"
+    "public.ecr.aws/pytorch/pytorch-training@sha256:"
     + "a" * 64
 )
 BOOT_ID = "01234567-89ab-4cde-8f01-23456789abcd"
@@ -361,13 +361,9 @@ def _launcher_fixture(tmp_path: Path, seed: int = 1) -> dict[str, Path | dict]:
             "runtime_environment_receipt": {
                 "required_at_launch": True,
                 "authentication": "aws_instance_identity_document_pkcs7",
-                "required_fields": [
-                    "schema_version",
-                    "profile_sha256",
-                    "container_image_digest",
-                    "aws_instance_identity_document",
-                    "aws_instance_identity_pkcs7",
-                ],
+                "required_fields": list(
+                    AWS_ENVIRONMENT_RECEIPT_V2_FIELDS
+                ),
             },
         },
         "members": member_rows,

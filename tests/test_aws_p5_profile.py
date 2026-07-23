@@ -264,6 +264,10 @@ def test_runtime_environment_requires_immutable_aws_identity():
         ("MS_CONTAINER_IMAGE", "memorysplit@sha256:" + "a" * 64),
         (
             "MS_CONTAINER_IMAGE",
+            "registry.example/memorysplit:latest@sha256:" + "a" * 64,
+        ),
+        (
+            "MS_CONTAINER_IMAGE",
             "registry.example/memorysplit@sha256:" + "b" * 64,
         ),
         ("MS_RUNTIME_UID", "0"),

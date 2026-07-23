@@ -99,6 +99,7 @@ _ENVIRONMENT_FIELDS = {
     "AWS_REGION",
     "MS_AWS_AMI_ID",
     "MS_CONTAINER_DIGEST",
+    "MS_CONTAINER_IMAGE",
     "MS_RUNTIME_GID",
     "MS_RUNTIME_UID",
     "MS_S3_ROOT",
@@ -113,7 +114,14 @@ _CHECKPOINT_FIELDS = {
 _FORBIDDEN_ENVIRONMENT = {
     "AWS_ACCESS_KEY_ID",
     "AWS_CONFIG_FILE",
+    "AWS_CONTAINER_CREDENTIALS_FULL_URI",
+    "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
+    "AWS_DEFAULT_PROFILE",
+    "AWS_EC2_METADATA_DISABLED",
     "AWS_PROFILE",
+    "AWS_ROLE_ARN",
+    "AWS_ROLE_SESSION_NAME",
+    "AWS_SECURITY_TOKEN",
     "AWS_SECRET_ACCESS_KEY",
     "AWS_SESSION_TOKEN",
     "AWS_SHARED_CREDENTIALS_FILE",
@@ -336,6 +344,23 @@ def _validate_intent(
         or _REGION_RE.fullmatch(str(environment["AWS_REGION"])) is None
     ):
         raise RemoteIntentError("operation environment is not closed and credential-free")
+    image = str(environment["MS_CONTAINER_IMAGE"])
+    digest = str(environment["MS_CONTAINER_DIGEST"])
+    image_name, separator, image_digest = image.partition("@")
+    repository = image_name.rsplit("/", 1)[-1]
+    if (
+        re.fullmatch(r"sha256:[0-9a-f]{64}", digest) is None
+        or separator != "@"
+        or image.count("@") != 1
+        or image_digest != digest
+        or "/" not in image_name
+        or "." not in image_name.partition("/")[0]
+        or ":" in repository
+        or any(character.isspace() for character in image)
+    ):
+        raise RemoteIntentError(
+            "operation container image is not pinned to its digest"
+        )
     s3_root = _s3_uri(environment["MS_S3_ROOT"])
     started_receipt_uri = _s3_uri(intent["started_receipt_uri"], root=s3_root)
     terminal_receipt_uri = _s3_uri(intent["terminal_receipt_uri"], root=s3_root)

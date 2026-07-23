@@ -15,6 +15,7 @@ from pathlib import Path
 
 from .aws_contracts import (
     ARMS as AWS_ARMS,
+    AWS_ENVIRONMENT_RECEIPT_V2_FIELDS,
     COHORT_ASSIGNMENT_PATH as AWS_COHORT_ASSIGNMENT_PATH,
     COHORT_ID as AWS_COHORT_ID,
     DATASET_POINTER_PATH as AWS_DATASET_POINTER_PATH,
@@ -144,13 +145,7 @@ class CheckpointReceipt:
 
 _GIT_OBJECT_RE = re.compile(r"^[0-9a-f]{40}(?:[0-9a-f]{24})?$")
 _GIT_SHA1_RE = re.compile(r"^[0-9a-f]{40}$")
-_RUNTIME_RECEIPT_FIELDS = [
-    "schema_version",
-    "profile_sha256",
-    "container_image_digest",
-    "aws_instance_identity_document",
-    "aws_instance_identity_pkcs7",
-]
+_RUNTIME_RECEIPT_FIELDS = list(AWS_ENVIRONMENT_RECEIPT_V2_FIELDS)
 
 
 def same_typed_value(actual: object, expected: object) -> bool:

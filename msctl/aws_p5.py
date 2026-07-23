@@ -16,6 +16,13 @@ from pathlib import Path
 from typing import Protocol
 from urllib.parse import urlsplit
 
+from cluster.aws.p5.attest_environment import (
+    AttestationError,
+    parse_environment_receipt_bytes,
+    parse_runtime_lock_bytes,
+    read_regular_input,
+)
+
 from .approval import verify_scope_approval
 from .aws_argv import (
     ARGV_DOCUMENT_CONTENT,
@@ -84,6 +91,18 @@ _SELECTED_INSTANCE_FIELDS = _INSTANCE_FIELDS | {
 _SAFE_PATH = "/usr/local/bin:/usr/bin:/bin"
 _MAX_PAID_RUNTIME = timedelta(minutes=1440)
 _AWS_PRIVATE_HOME = "/var/lib/memorysplit/aws-private-home"
+_V3_PROFILE_ID = "aws-p5.48xlarge-v3"
+_LOCAL_AWS_CONFIG = (
+    "AWS_PROFILE",
+    "AWS_CONFIG_FILE",
+    "AWS_SHARED_CREDENTIALS_FILE",
+)
+_STATIC_AWS_CREDENTIALS = {
+    "AWS_ACCESS_KEY_ID",
+    "AWS_SECRET_ACCESS_KEY",
+    "AWS_SESSION_TOKEN",
+    "AWS_SECURITY_TOKEN",
+}
 _AWS_US_EAST_1_DSA_CERTIFICATE = """-----BEGIN CERTIFICATE-----
 MIIC7TCCAq0CCQCWukjZ5V4aZzAJBgcqhkjOOAQDMFwxCzAJBgNVBAYTAlVTMRkw
 FwYDVQQIExBXYXNoaW5ndG9uIFN0YXRlMRAwDgYDVQQHEwdTZWF0dGxlMSAwHgYD
@@ -261,18 +280,26 @@ def _aws_output_list(value: object, *, label: str) -> list[object]:
 
 
 def _validate_profile(profile: object) -> None:
+    profile_id = getattr(profile, "profile_id", None)
+    expected_seeds = (
+        (1, 2, 3, 4)
+        if profile_id == AWS_P5_PROFILE
+        else tuple(range(10))
+        if profile_id == _V3_PROFILE_ID
+        else None
+    )
     if (
         getattr(profile, "provider", None) != AWS_P5_PROFILE
-        or getattr(profile, "profile_id", None) != AWS_P5_PROFILE
+        or expected_seeds is None
         or getattr(profile, "instance_type", None) != INSTANCE_TYPE
         or getattr(profile, "purchase_model", None) != "on_demand"
         or getattr(profile, "allocated_gpus", None) != 8
         or getattr(profile, "train_groups", None) != (4, 4)
-        or getattr(profile, "assigned_seeds", None) != (1, 2, 3, 4)
+        or getattr(profile, "assigned_seeds", None) != expected_seeds
     ):
         raise MsctlError(
             "PROFILE_INVALID",
-            "AWS backend requires the exact P5 4+4 provider profile",
+            "AWS backend requires one exact frozen P5 provider profile",
         )
 
 
@@ -280,6 +307,11 @@ def _validate_runtime(runtime: object) -> None:
     s3_root = getattr(runtime, "s3_root", None)
     container_image = getattr(runtime, "container_image", None)
     container_digest = getattr(runtime, "container_digest", None)
+    image_name = (
+        container_image.partition("@")[0]
+        if isinstance(container_image, str)
+        else ""
+    )
     try:
         parsed = urlsplit(s3_root) if isinstance(s3_root, str) else None
         parsed_port = parsed.port if parsed is not None else None
@@ -314,8 +346,9 @@ def _validate_runtime(runtime: object) -> None:
             container_image.partition("@")[0] + "@" + str(container_digest)
         )
         or container_image.count("@") != 1
-        or "/" not in container_image.partition("@")[0]
-        or "." not in container_image.partition("/")[0]
+        or "/" not in image_name
+        or "." not in image_name.partition("/")[0]
+        or ":" in image_name.rsplit("/", 1)[-1]
         or any(character.isspace() for character in container_image)
     ):
         raise MsctlError(
@@ -395,6 +428,43 @@ class AwsP5Backend:
         self.corpus_verifier = corpus_verifier
         self.identity_verifier = identity_verifier
         self.environ = dict(os.environ if environ is None else environ)
+        inherited_static = sorted(
+            name
+            for name in _STATIC_AWS_CREDENTIALS
+            if self.environ.get(name)
+        )
+        if inherited_static:
+            raise MsctlError(
+                "AWS_RUNTIME_INVALID",
+                "local AWS controller must not inherit static key credentials",
+                details={"variables": inherited_static},
+            )
+        self.local_aws_config: dict[str, str] = {}
+        for name in _LOCAL_AWS_CONFIG:
+            value = self.environ.get(name)
+            if value is None or value == "":
+                continue
+            if not isinstance(value, str) or "\x00" in value:
+                raise MsctlError(
+                    "AWS_RUNTIME_INVALID",
+                    "local AWS controller configuration is invalid",
+                    details={"variable": name},
+                )
+            self.local_aws_config[name] = value
+        configured_home = self.environ.get("HOME")
+        if self.local_aws_config and configured_home:
+            if (
+                not isinstance(configured_home, str)
+                or "\x00" in configured_home
+                or not Path(configured_home).is_absolute()
+            ):
+                raise MsctlError(
+                    "AWS_RUNTIME_INVALID",
+                    "local AWS controller HOME is invalid",
+                )
+            self.controller_home = configured_home
+        else:
+            self.controller_home = "/tmp"
 
     def _aws_argv(
         self,
@@ -406,8 +476,13 @@ class AwsP5Backend:
         return [
             "env",
             "-i",
+            *[
+                f"{name}={self.local_aws_config[name]}"
+                for name in _LOCAL_AWS_CONFIG
+                if name in self.local_aws_config
+            ],
             f"AWS_REGION={self.runtime.region}",
-            "HOME=/tmp",
+            f"HOME={self.controller_home}",
             f"PATH={_SAFE_PATH}",
             "aws",
             "--no-cli-pager",
@@ -937,6 +1012,7 @@ class AwsP5Backend:
                 "AWS_REGION": self.runtime.region,
                 "MS_AWS_AMI_ID": self.runtime.ami_id,
                 "MS_CONTAINER_DIGEST": self.runtime.container_digest,
+                "MS_CONTAINER_IMAGE": self.runtime.container_image,
                 "MS_RUNTIME_GID": str(getattr(self.runtime, "gid", 1000)),
                 "MS_RUNTIME_UID": str(getattr(self.runtime, "uid", 1000)),
                 "MS_S3_ROOT": self.runtime.s3_root,
@@ -2613,139 +2689,372 @@ class AwsP5Backend:
         self,
         *,
         root: Path | str,
-        lock: Path | str,
         apply: bool,
+        runtime_lock: Path | str | None = None,
+        control_bundle: Path | str | None = None,
+        instance_id: str | None = None,
+        receipt: Path | str | None = None,
+        lock: Path | str | None = None,
     ) -> dict[str, object]:
-        raise MsctlError(
-            "STATIC_ENVIRONMENT_FORBIDDEN",
-            "AWS runtime identity must come from the package runtime_attested "
-            "contract and an authenticated instance receipt",
-        )
-        lock_path = Path(lock).resolve(strict=True)
-        before = lock_path.stat(follow_symlinks=False)
-        lock_sha256 = sha256_file(lock_path)
-        after = lock_path.stat(follow_symlinks=False)
+        if getattr(self.profile, "profile_id", None) != _V3_PROFILE_ID:
+            raise MsctlError(
+                "STATIC_ENVIRONMENT_FORBIDDEN",
+                "AWS runtime identity must come from the package "
+                "runtime_attested contract and an authenticated instance receipt",
+            )
         if (
-            not lock_path.is_file()
-            or lock_path.is_symlink()
-            or before.st_nlink != 1
-            or (before.st_dev, before.st_ino, before.st_size)
-            != (after.st_dev, after.st_ino, after.st_size)
+            lock is not None
+            or runtime_lock is None
+            or control_bundle is None
+            or instance_id is None
+            or receipt is None
         ):
             raise MsctlError(
-                "ENVIRONMENT_LOCK_INVALID",
-                "AWS environment lock must be one stable regular file",
+                "CLI_USAGE",
+                "v3 environment attestation requires explicit runtime lock, "
+                "control bundle, instance ID, receipt, and output root",
             )
-        receipt = {
+        if (
+            not isinstance(instance_id, str)
+            or _INSTANCE_ID_RE.fullmatch(instance_id) is None
+        ):
+            raise MsctlError(
+                "ENVIRONMENT_RECEIPT_INVALID",
+                "environment attestation requires one immutable instance ID",
+            )
+        try:
+            lock_bytes = read_regular_input(
+                runtime_lock,
+                label="AWS runtime lock",
+                maximum_bytes=1024 * 1024,
+            )
+            control_bytes = read_regular_input(
+                control_bundle,
+                label="AWS control bundle",
+            )
+            receipt_bytes = read_regular_input(
+                receipt,
+                label="AWS environment receipt",
+                maximum_bytes=1024 * 1024,
+            )
+            lock = parse_runtime_lock_bytes(lock_bytes)
+            environment_receipt = parse_environment_receipt_bytes(
+                receipt_bytes
+            )
+        except (AttestationError, OSError, TypeError, ValueError) as error:
+            raise MsctlError(
+                "ENVIRONMENT_RECEIPT_INVALID",
+                "AWS environment attestation inputs are invalid",
+            ) from error
+
+        lock_sha256 = hashlib.sha256(lock_bytes).hexdigest()
+        control_sha256 = hashlib.sha256(control_bytes).hexdigest()
+        identity = environment_receipt["aws_instance_identity_document"]
+        if (
+            lock["profile_sha256"] != self.profile.sha256
+            or lock["control_bundle_sha256"] != control_sha256
+            or lock["ami_id"] != self.runtime.ami_id
+            or lock["container_image"] != self.runtime.container_image
+            or lock["container_image_digest"] != self.runtime.container_digest
+            or environment_receipt["profile_sha256"] != self.profile.sha256
+            or environment_receipt["runtime_lock_sha256"] != lock_sha256
+            or environment_receipt["control_bundle_sha256"] != control_sha256
+            or environment_receipt["source_commit"] != lock["source_commit"]
+            or environment_receipt["source_tree"] != lock["source_tree"]
+            or environment_receipt["container_image"]
+            != self.runtime.container_image
+            or environment_receipt["container_image_digest"]
+            != self.runtime.container_digest
+            or environment_receipt["account_id"] != identity["accountId"]
+            or environment_receipt["instance_id"] != instance_id
+            or environment_receipt["region"] != self.runtime.region
+            or environment_receipt["ami_id"] != self.runtime.ami_id
+            or environment_receipt["runtime_facts"] != lock["versions"]
+        ):
+            raise MsctlError(
+                "ENVIRONMENT_RECEIPT_INVALID",
+                "AWS environment receipt does not bind the selected runtime",
+            )
+        try:
+            signature_valid = self.identity_verifier(
+                identity,
+                str(environment_receipt["aws_instance_identity_pkcs7"]),
+                self.runtime.region,
+            )
+        except MsctlError:
+            raise
+        except Exception as error:
+            raise MsctlError(
+                "ENVIRONMENT_RECEIPT_INVALID",
+                "AWS instance identity signature verification failed",
+            ) from error
+        if signature_valid is not True:
+            raise MsctlError(
+                "ENVIRONMENT_RECEIPT_INVALID",
+                "AWS instance identity signature is not valid",
+            )
+
+        remote_root = Path(os.path.abspath(os.fspath(root)))
+        receipt_path = Path(os.path.abspath(os.fspath(receipt)))
+        attestation_argv = [
+            "/usr/bin/python3",
+            str(
+                remote_root
+                / "cluster"
+                / "aws"
+                / "p5"
+                / "attest_environment.py"
+            ),
+            "--profile",
+            str(
+                remote_root
+                / "cluster"
+                / "profiles"
+                / "aws-p5.48xlarge-v3.json"
+            ),
+            "--runtime-lock",
+            str(Path(runtime_lock)),
+            "--control-bundle",
+            str(Path(control_bundle)),
+            "--out",
+            str(receipt_path),
+            "--apply",
+        ]
+        ssm_intent = {
             "schema_version": 1,
-            "receipt_type": "memorysplit-aws-environment",
-            "profile_sha256": self.profile.sha256,
-            "runtime_sha256": self._runtime_sha256(),
-            "ami_id": self.runtime.ami_id,
-            "container_image": self.runtime.container_image,
-            "container_digest": self.runtime.container_digest,
-            "lock_name": lock_path.name,
-            "lock_sha256": lock_sha256,
-            "lock_bytes": before.st_size,
+            "operation": "attest-environment",
+            "instance_id": instance_id,
+            "environment": {
+                "AWS_REGION": self.runtime.region,
+                "MS_AWS_AMI_ID": self.runtime.ami_id,
+                "MS_CONTAINER_DIGEST": self.runtime.container_digest,
+                "MS_CONTAINER_IMAGE": self.runtime.container_image,
+            },
+            "steps": [
+                {
+                    "name": "attest-environment",
+                    "argv": attestation_argv,
+                }
+            ],
         }
-        receipt_bytes = canonical_json(receipt) + b"\n"
         receipt_sha256 = hashlib.sha256(receipt_bytes).hexdigest()
-        receipt_root = Path(root).absolute()
-        receipt_path = receipt_root / "environment-receipt.json"
-        objects = [
-            {
-                "path": lock_path,
-                "s3_relative": (
-                    f"environment/locks/{lock_sha256}/{lock_path.name}"
-                ),
-                "sha256": lock_sha256,
-                "bytes": before.st_size,
-                "device": before.st_dev,
-                "inode": before.st_ino,
-            },
-            {
-                "path": receipt_path,
-                "s3_relative": (
-                    f"environment/receipts/{receipt_sha256}.json"
-                ),
-                "sha256": receipt_sha256,
-                "bytes": len(receipt_bytes),
-                "device": None,
-                "inode": None,
-            },
-        ]
-        commands = [
-            self._immutable_s3_object_argv(
-                local_path=item["path"],
-                relative=item["s3_relative"],
-                sha256=item["sha256"],
-                byte_count=item["bytes"],
-                upload=upload,
-            )
-            for item in objects
-            for upload in (True, False)
-        ]
+        receipt_key = (
+            f"environments/{receipt_sha256}/receipt.json"
+        )
         result = {
             "provider": AWS_P5_PROFILE,
-            "receipt": receipt,
-            "receipt_sha256": receipt_sha256,
+            "profile_id": _V3_PROFILE_ID,
+            "environment_receipt_sha256": receipt_sha256,
+            "receipt_key": receipt_key,
+            "receipt_uri": (
+                f"{self.runtime.s3_root.rstrip('/')}/{receipt_key}"
+            ),
             "receipt_path": str(receipt_path),
-            "objects": [
-                {
-                    key: value
-                    for key, value in item.items()
-                    if key != "path"
-                }
-                for item in objects
-            ],
-            "commands": commands,
-            "verified": False,
+            "remote_attestation_argv": attestation_argv,
+            "ssm_intent": ssm_intent,
+            "published": False,
+            "verified": True,
         }
         if not apply:
             return result
-        directory_fd = open_directory(
-            receipt_root,
-            label="AWS environment receipt root",
-            create=True,
+
+        instance_output = _aws_output_object(
+            self._run(
+                self._aws_argv(
+                    "ec2",
+                    "describe-instances",
+                    "--instance-ids",
+                    instance_id,
+                    query=(
+                        "{instance:{account_id:Reservations[0].OwnerId,"
+                        "instance_id:Reservations[0].Instances[0].InstanceId,"
+                        "image_id:Reservations[0].Instances[0].ImageId,"
+                        "instance_type:Reservations[0].Instances[0].InstanceType,"
+                        "state:Reservations[0].Instances[0].State.Name,"
+                        "architecture:Reservations[0].Instances[0].Architecture,"
+                        "private_ip:Reservations[0].Instances[0].PrivateIpAddress}}"
+                    ),
+                ),
+                operation="verify selected environment instance",
+            ),
+            {"instance"},
+            label="selected environment instance output",
         )
-        try:
-            try:
-                existing = receipt_path.read_bytes()
-            except FileNotFoundError:
-                atomic_write_at(
-                    directory_fd,
-                    receipt_path.name,
-                    receipt_bytes,
-                    label="AWS environment receipt",
-                )
-            else:
-                if receipt_path.is_symlink() or existing != receipt_bytes:
-                    raise MsctlError(
-                        "ENVIRONMENT_RECEIPT_CONFLICT",
-                        "existing AWS environment receipt has different content",
-                    )
-        finally:
-            os.close(directory_fd)
-        receipt_stat = receipt_path.stat(follow_symlinks=False)
-        objects[1]["device"] = receipt_stat.st_dev
-        objects[1]["inode"] = receipt_stat.st_ino
-        for index, item in enumerate(objects):
-            put_argv = commands[index * 2]
-            head_argv = commands[index * 2 + 1]
-            try:
-                self._run(put_argv, operation="materialize environment object")
-            except MsctlError:
-                pass
-            self._verify_dataset_object(
-                item,
-                self._run(head_argv, operation="verify environment object"),
+        selected_instance = _aws_output_object(
+            instance_output["instance"],
+            {
+                "account_id",
+                "instance_id",
+                "image_id",
+                "instance_type",
+                "state",
+                "architecture",
+                "private_ip",
+            },
+            label="selected environment instance",
+        )
+        image_output = _aws_output_object(
+            self._run(
+                self._aws_argv(
+                    "ec2",
+                    "describe-images",
+                    "--image-ids",
+                    self.runtime.ami_id,
+                    "--owners",
+                    str(lock["ami_owner_id"]),
+                    query=(
+                        "{image:{image_id:Images[0].ImageId,"
+                        "owner_id:Images[0].OwnerId,"
+                        "state:Images[0].State,"
+                        "architecture:Images[0].Architecture}}"
+                    ),
+                ),
+                operation="verify selected environment AMI",
+            ),
+            {"image"},
+            label="selected environment AMI output",
+        )
+        selected_image = _aws_output_object(
+            image_output["image"],
+            {"image_id", "owner_id", "state", "architecture"},
+            label="selected environment AMI",
+        )
+        if (
+            selected_instance["account_id"]
+            != environment_receipt["account_id"]
+            or selected_instance["instance_id"] != instance_id
+            or selected_instance["image_id"] != self.runtime.ami_id
+            or selected_instance["instance_type"] != INSTANCE_TYPE
+            or selected_instance["state"] != "running"
+            or selected_instance["architecture"] != identity["architecture"]
+            or selected_instance["private_ip"] != identity["privateIp"]
+            or selected_image["image_id"] != self.runtime.ami_id
+            or selected_image["owner_id"] != lock["ami_owner_id"]
+            or selected_image["state"] != "available"
+            or selected_image["architecture"] != identity["architecture"]
+        ):
+            raise MsctlError(
+                "ENVIRONMENT_RECEIPT_INVALID",
+                "selected AWS instance or AMI differs from authenticated receipt",
             )
-        result["verified"] = True
-        result["objects"] = [
-            {key: value for key, value in item.items() if key != "path"}
-            for item in objects
-        ]
-        return result
+
+        checksum = base64.b64encode(
+            bytes.fromhex(receipt_sha256)
+        ).decode("ascii")
+        bucket, key = self._s3_location(receipt_key)
+        put_version: str | None = None
+        with tempfile.TemporaryDirectory(
+            prefix="msctl-environment-receipt-"
+        ) as staging_directory:
+            staged_receipt = (
+                Path(staging_directory) / "environment-receipt.json"
+            )
+            staged_receipt.write_bytes(receipt_bytes)
+            staged_receipt.chmod(0o600)
+            put_argv = self._aws_argv(
+                "s3api",
+                "put-object",
+                "--bucket",
+                bucket,
+                "--key",
+                key,
+                "--body",
+                str(staged_receipt),
+                "--content-length",
+                str(len(receipt_bytes)),
+                "--checksum-algorithm",
+                "SHA256",
+                "--checksum-sha256",
+                checksum,
+                "--metadata",
+                f"environment-receipt-sha256={receipt_sha256}",
+                "--if-none-match",
+                "*",
+                query=(
+                    "{object:{checksum_sha256:ChecksumSHA256,"
+                    "version_id:VersionId}}"
+                ),
+            )
+            try:
+                put_output = _aws_output_object(
+                    self._run(
+                        put_argv,
+                        operation="publish environment receipt",
+                    ),
+                    {"object"},
+                    label="environment receipt publication output",
+                )
+                put_object = _aws_output_object(
+                    put_output["object"],
+                    {"checksum_sha256", "version_id"},
+                    label="environment receipt publication",
+                )
+                if (
+                    put_object["checksum_sha256"] != checksum
+                    or not isinstance(put_object["version_id"], str)
+                    or put_object["version_id"] in {"", "null"}
+                ):
+                    raise MsctlError(
+                        "S3_OBJECT_MISMATCH",
+                        "published environment receipt lacks checksum or version",
+                    )
+                put_version = put_object["version_id"]
+            except MsctlError as error:
+                if error.code != "AWS_COMMAND_FAILED":
+                    raise
+
+        head_output = _aws_output_object(
+            self._run(
+                self._aws_argv(
+                    "s3api",
+                    "head-object",
+                    "--bucket",
+                    bucket,
+                    "--key",
+                    key,
+                    "--checksum-mode",
+                    "ENABLED",
+                    query=(
+                        "{object:{checksum_sha256:ChecksumSHA256,"
+                        "content_length:ContentLength,metadata:Metadata,"
+                        "version_id:VersionId}}"
+                    ),
+                ),
+                operation="verify environment receipt publication",
+            ),
+            {"object"},
+            label="environment receipt head output",
+        )
+        head_object = _aws_output_object(
+            head_output["object"],
+            {
+                "checksum_sha256",
+                "content_length",
+                "metadata",
+                "version_id",
+            },
+            label="environment receipt object",
+        )
+        version_id = head_object["version_id"]
+        if (
+            head_object["checksum_sha256"] != checksum
+            or type(head_object["content_length"]) is not int
+            or head_object["content_length"] != len(receipt_bytes)
+            or head_object["metadata"]
+            != {"environment-receipt-sha256": receipt_sha256}
+            or not isinstance(version_id, str)
+            or version_id in {"", "null"}
+            or (put_version is not None and version_id != put_version)
+        ):
+            raise MsctlError(
+                "S3_OBJECT_MISMATCH",
+                "environment receipt publication does not match local bytes",
+            )
+        return {
+            **result,
+            "published": True,
+            "version_id": version_id,
+        }
 
     def _dataset_object_argv(
         self,
@@ -4092,6 +4401,7 @@ class AwsP5Backend:
                 "AWS_REGION": self.runtime.region,
                 "MS_AWS_AMI_ID": self.runtime.ami_id,
                 "MS_CONTAINER_DIGEST": self.runtime.container_digest,
+                "MS_CONTAINER_IMAGE": self.runtime.container_image,
                 "MS_RUNTIME_GID": str(getattr(self.runtime, "gid", 1000)),
                 "MS_RUNTIME_UID": str(getattr(self.runtime, "uid", 1000)),
                 "MS_S3_ROOT": self.runtime.s3_root,
@@ -4548,8 +4858,33 @@ class AwsP5Backend:
             return False, self.capacity_check()
         if command == "env ensure":
             apply = bool(getattr(args, "apply", False))
-            lock_value = getattr(args, "lock", None)
             root_value = getattr(args, "root", None)
+            if getattr(self.profile, "profile_id", None) == _V3_PROFILE_ID:
+                runtime_lock = getattr(args, "runtime_lock", None)
+                control_bundle = getattr(args, "control_bundle", None)
+                instance_id = getattr(args, "instance_id", None)
+                receipt = getattr(args, "receipt", None)
+                if (
+                    root_value is None
+                    or runtime_lock is None
+                    or control_bundle is None
+                    or instance_id is None
+                    or receipt is None
+                ):
+                    raise MsctlError(
+                        "CLI_USAGE",
+                        "AWS v3 env ensure requires explicit runtime lock, "
+                        "control bundle, instance ID, receipt, and root",
+                    )
+                return not apply, self.env_ensure(
+                    root=root_value,
+                    runtime_lock=runtime_lock,
+                    control_bundle=control_bundle,
+                    instance_id=instance_id,
+                    receipt=receipt,
+                    apply=apply,
+                )
+            lock_value = getattr(args, "lock", None)
             if lock_value is None or root_value is None:
                 raise MsctlError(
                     "CLI_USAGE",
@@ -4733,8 +5068,13 @@ def build_aws_backend(
             "the AWS P5 runtime adapter has no validator",
             details={"adapter": module_name},
         )
+    remote_environment = {
+        name: value
+        for name, value in environment.items()
+        if name not in _LOCAL_AWS_CONFIG
+    }
     try:
-        runtime = validator(profile, environment)
+        runtime = validator(profile, remote_environment)
     except MsctlError:
         raise
     except (TypeError, ValueError) as error:

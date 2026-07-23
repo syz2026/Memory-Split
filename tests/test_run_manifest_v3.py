@@ -510,12 +510,13 @@ def test_v3_cli_requires_and_forwards_instantiation_inputs(
     assert result["published"] is False
 
 
-def test_v3_cli_profile_support_is_limited_to_manifest_instantiation(
+def test_v3_cli_profile_support_is_limited_to_instantiation_and_env_ensure(
     v3_case,
+    tmp_path,
 ):
     from msctl.cli import build_parser, dispatch
 
-    args = build_parser().parse_args(
+    unsupported = build_parser().parse_args(
         [
             "--profile",
             str(Path(v3_case["source"]) / PROFILE_PATH),
@@ -525,9 +526,65 @@ def test_v3_cli_profile_support_is_limited_to_manifest_instantiation(
     )
 
     with pytest.raises(MsctlError) as caught:
-        dispatch(args)
+        dispatch(unsupported)
 
     assert caught.value.code == "PROFILE_INVALID"
+
+    captured = {}
+
+    class Backend:
+        def dispatch(self, command, args):
+            captured["command"] = command
+            captured["args"] = args
+            return True, {"planned": True}
+
+    common = [
+        "--profile",
+        str(Path(v3_case["source"]) / PROFILE_PATH),
+        "env",
+        "ensure",
+        "--root",
+        str(tmp_path / "remote-root"),
+        "--runtime-lock",
+        str(tmp_path / "runtime-lock.json"),
+        "--control-bundle",
+        str(tmp_path / "control-bundle.zip"),
+        "--instance-id",
+        "i-0123456789abcdef0",
+        "--receipt",
+        str(tmp_path / "environment-receipt.json"),
+    ]
+    supplied = build_parser().parse_args(common)
+    dry_run, result = dispatch(
+        supplied,
+        aws_backend_factory=lambda **kwargs: Backend(),
+        environ={},
+    )
+
+    assert dry_run is True
+    assert result == {"planned": True}
+    assert captured["command"] == "env ensure"
+    assert captured["args"].runtime_lock == str(tmp_path / "runtime-lock.json")
+    assert captured["args"].control_bundle == str(tmp_path / "control-bundle.zip")
+    assert captured["args"].instance_id == "i-0123456789abcdef0"
+    assert captured["args"].receipt == str(tmp_path / "environment-receipt.json")
+
+    missing = build_parser().parse_args(common[:6])
+    with pytest.raises(MsctlError) as caught:
+        dispatch(
+            missing,
+            aws_backend_factory=lambda **kwargs: pytest.fail(
+                "backend must not be built without explicit attestation inputs"
+            ),
+            environ={},
+        )
+    assert caught.value.code == "CLI_USAGE"
+    assert set(caught.value.details["missing"]) == {
+        "--control-bundle",
+        "--instance-id",
+        "--receipt",
+        "--runtime-lock",
+    }
 
 
 @pytest.mark.parametrize(

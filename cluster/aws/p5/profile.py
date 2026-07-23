@@ -364,15 +364,11 @@ def _parse_profile(raw: object, *, sha256: str) -> AwsP5Profile:
     )
 
 
-def load_aws_p5_profile(path: Path | str) -> AwsP5Profile:
-    """Load one regular JSON file under a closed P5 profile identity."""
+def parse_aws_p5_profile_bytes(data: bytes) -> AwsP5Profile:
+    """Parse already-pinned profile bytes under the closed P5 identity."""
 
-    profile_path = Path(path)
-    if profile_path.is_symlink():
-        raise ValueError(f"profile must not be a symlink: {profile_path}")
-    if not profile_path.is_file():
-        raise ValueError(f"profile is not a regular file: {profile_path}")
-    data = profile_path.read_bytes()
+    if not isinstance(data, bytes):
+        raise TypeError("profile bytes must be bytes")
     if len(data) > _MAX_PROFILE_BYTES:
         raise ValueError("profile exceeds 64 KiB")
     try:
@@ -387,6 +383,17 @@ def load_aws_p5_profile(path: Path | str) -> AwsP5Profile:
     except (UnicodeDecodeError, json.JSONDecodeError) as error:
         raise ValueError("profile must contain valid UTF-8 JSON") from error
     return _parse_profile(raw, sha256=hashlib.sha256(data).hexdigest())
+
+
+def load_aws_p5_profile(path: Path | str) -> AwsP5Profile:
+    """Load one regular JSON file under a closed P5 profile identity."""
+
+    profile_path = Path(path)
+    if profile_path.is_symlink():
+        raise ValueError(f"profile must not be a symlink: {profile_path}")
+    if not profile_path.is_file():
+        raise ValueError(f"profile is not a regular file: {profile_path}")
+    return parse_aws_p5_profile_bytes(profile_path.read_bytes())
 
 
 def _required_environment(
@@ -477,12 +484,14 @@ def validate_runtime_environment(
         )
     container_image = _required_environment(environment, "MS_CONTAINER_IMAGE")
     image_name, separator, image_digest = container_image.partition("@")
+    repository = image_name.rsplit("/", 1)[-1]
     if (
         separator != "@"
         or image_digest != container_digest
         or container_image.count("@") != 1
         or "/" not in image_name
         or "." not in image_name.partition("/")[0]
+        or ":" in repository
         or any(character.isspace() for character in container_image)
     ):
         raise ValueError(

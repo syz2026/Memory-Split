@@ -249,10 +249,23 @@ def _runtime_environment_contract(profile_sha256: str) -> dict[str, object]:
             "authentication": "aws_instance_identity_document_pkcs7",
             "required_fields": [
                 "schema_version",
+                "receipt_type",
+                "provider",
                 "profile_sha256",
+                "runtime_lock_sha256",
+                "control_bundle_sha256",
+                "source_commit",
+                "source_tree",
+                "container_image",
                 "container_image_digest",
                 "aws_instance_identity_document",
                 "aws_instance_identity_pkcs7",
+                "account_id",
+                "instance_id",
+                "region",
+                "ami_id",
+                "boot_id",
+                "runtime_facts",
             ],
         },
     }
@@ -290,6 +303,13 @@ def _minimal_repo(
         "cluster/profiles/aws-p5.48xlarge-v3.json": _canonical_json(_profile()),
         "cluster/profiles/aws-p5.48xlarge.json": _canonical_json(_v2_profile()),
         "cluster/aws/p5/bootstrap.sh": "#!/bin/sh\nset -eu\n",
+        "cluster/aws/p5/attest_environment.py": (
+            "#!/usr/bin/env python3\nraise SystemExit(0)\n"
+        ),
+        "cluster/aws/p5/profile.py": (
+            "def parse_aws_p5_profile_bytes(data):\n"
+            "    return data\n"
+        ),
         "cluster/aws/p5/launch_seed_pair.py": (
             "#!/usr/bin/env python3\nraise SystemExit(0)\n"
         ),
@@ -516,6 +536,8 @@ def test_archive_contains_only_semantic_seed_pairs_and_hash_bound_metadata(
         assert "cluster/profiles/aws-p5.48xlarge.json" not in names
         assert "configs/preregistration-v3.yaml" in names
         assert "cluster/profiles/aws-p5.48xlarge-v3.json" in names
+        assert "cluster/aws/p5/attest_environment.py" in names
+        assert "cluster/aws/p5/profile.py" in names
         assert "msctl/aws_contracts.py" in names
         assert "tests/fixtures/current_sources/README.md" in names
         assert "tests/fixtures/relational-smoke-route-policy.json" in names

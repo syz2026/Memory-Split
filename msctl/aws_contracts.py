@@ -19,6 +19,50 @@ SEEDS: Final = tuple(range(10))
 ARMS: Final = ("dense", "split90")
 SNAPSHOT_STEPS: Final = (1_358, 3_396, 6_791, 10_187, 13_582)
 PACKAGE_FORMAT_VERSION: Final = 2
+AWS_RUNTIME_VERSION_FIELDS: Final = (
+    "python",
+    "pytorch",
+    "cuda",
+    "cudnn",
+    "nccl",
+    "nvidia_driver",
+    "fabric_manager",
+    "docker",
+    "nvidia_container_runtime",
+    "aws_cli",
+)
+AWS_RUNTIME_LOCK_FIELDS: Final = (
+    "schema_version",
+    "source_commit",
+    "source_tree",
+    "control_bundle_sha256",
+    "profile_sha256",
+    "ami_id",
+    "ami_owner_id",
+    "container_image",
+    "container_image_digest",
+    "versions",
+)
+AWS_ENVIRONMENT_RECEIPT_V2_FIELDS: Final = (
+    "schema_version",
+    "receipt_type",
+    "provider",
+    "profile_sha256",
+    "runtime_lock_sha256",
+    "control_bundle_sha256",
+    "source_commit",
+    "source_tree",
+    "container_image",
+    "container_image_digest",
+    "aws_instance_identity_document",
+    "aws_instance_identity_pkcs7",
+    "account_id",
+    "instance_id",
+    "region",
+    "ami_id",
+    "boot_id",
+    "runtime_facts",
+)
 
 EXPECTED_CONFIG_PATHS: Final = tuple(
     f"{CONFIG_ROOT}/{arm}-s{seed}.yaml"
@@ -72,6 +116,9 @@ def dataset_receipt_key() -> str:
 
 __all__ = [
     "ARMS",
+    "AWS_ENVIRONMENT_RECEIPT_V2_FIELDS",
+    "AWS_RUNTIME_LOCK_FIELDS",
+    "AWS_RUNTIME_VERSION_FIELDS",
     "COHORT_ASSIGNMENT_PATH",
     "COHORT_ID",
     "CONFIG_ROOT",

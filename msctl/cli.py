@@ -100,6 +100,10 @@ def build_parser() -> JsonArgumentParser:
     ensure_env.add_argument("--root")
     ensure_env.add_argument("--lock")
     ensure_env.add_argument("--release")
+    ensure_env.add_argument("--runtime-lock")
+    ensure_env.add_argument("--control-bundle")
+    ensure_env.add_argument("--instance-id")
+    ensure_env.add_argument("--receipt")
     ensure_env.add_argument("--apply", action="store_true")
 
     dataset = _leaf(commands, "dataset", help_text="dataset lifecycle")
@@ -271,7 +275,9 @@ def dispatch(
 ) -> tuple[bool, dict[str, object]]:
     command = _command_name(args)
     default_profile_loader = (
-        _load_cli_profile if command == "runs instantiate" else load_profile
+        _load_cli_profile
+        if command in {"runs instantiate", "env ensure"}
+        else load_profile
     )
     profile = (profile_loader or default_profile_loader)(args.profile)
     environment = dict(os.environ if environ is None else environ)
@@ -308,6 +314,18 @@ def dispatch(
             cohort_loader=cohort_loader,
         )
     if provider == AWS_P5_PROFILE:
+        if (
+            command == "env ensure"
+            and getattr(profile, "profile_id", None) == "aws-p5.48xlarge-v3"
+        ):
+            _require_cli_values(
+                args,
+                "root",
+                "runtime_lock",
+                "control_bundle",
+                "instance_id",
+                "receipt",
+            )
         if command == "submit":
             _require_cli_values(args, "instance_id", "terminate_at")
         if command in {"runs render", "submit", "resume", "evaluate"}:

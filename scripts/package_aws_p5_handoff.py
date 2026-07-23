@@ -28,6 +28,7 @@ if __package__ in {None, ""}:
 
 from msctl.aws_contracts import (
     ARMS,
+    AWS_ENVIRONMENT_RECEIPT_V2_FIELDS,
     COHORT_ASSIGNMENT_PATH as COHORT_PATH,
     COHORT_ID,
     CONFIG_ROOT,
@@ -57,9 +58,11 @@ REQUIRED_MEMBERS = EXPECTED_CONFIGS | {
     PREREGISTRATION_PATH,
     PROFILE_PATH,
     RUNBOOK_PATH,
+    "cluster/aws/p5/attest_environment.py",
     "cluster/aws/p5/bootstrap.sh",
     "cluster/aws/p5/interruption_checkpoint.py",
     "cluster/aws/p5/launch_seed_pair.py",
+    "cluster/aws/p5/profile.py",
     "corpusgen/parallel/__init__.py",
     "evals/confirmatory/__init__.py",
     "msctl/__init__.py",
@@ -1326,13 +1329,7 @@ def _runtime_environment_contract(profile_sha256: str) -> dict[str, object]:
         "runtime_environment_receipt": {
             "required_at_launch": True,
             "authentication": "aws_instance_identity_document_pkcs7",
-            "required_fields": [
-                "schema_version",
-                "profile_sha256",
-                "container_image_digest",
-                "aws_instance_identity_document",
-                "aws_instance_identity_pkcs7",
-            ],
+            "required_fields": list(AWS_ENVIRONMENT_RECEIPT_V2_FIELDS),
         },
     }
 
