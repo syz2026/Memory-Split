@@ -536,6 +536,33 @@ def test_runs_render_is_deterministic_dry_run_with_explicit_environment(tmp_path
     ) not in command
 
 
+def test_relative_release_exports_authenticated_absolute_archive(tmp_path):
+    release = _release(tmp_path)
+    manifest, _ = _runs(tmp_path)
+
+    completed = _run_msctl(
+        *_base_args(tmp_path),
+        "runs",
+        "render",
+        "--release",
+        release.name,
+        "--manifest",
+        str(manifest),
+        cwd=tmp_path,
+    )
+
+    assert completed.returncode == 0
+    command = _single_report(completed)["result"]["commands"][0]
+    export = next(item for item in command if item.startswith("--export="))
+    release_value = json.loads(release.read_text())
+    archive = (release.parent / release_value["archive"]["path"]).resolve()
+    assert f"MS_RELEASE_ARCHIVE={archive}" in export
+    assert (
+        f"MS_RELEASE_ARCHIVE={release_value['archive']['path']}" not in export
+    )
+    assert "--chdir=/" in command
+
+
 @pytest.mark.parametrize(
     "arguments",
     [

@@ -442,7 +442,7 @@ def _verify_release_internals(
 
 
 def load_release(path: Path | str) -> Release:
-    release_path = Path(path)
+    release_path = Path(os.path.abspath(os.fspath(path)))
     value = require_object(load_json(release_path, label="release"), label="release")
     require_exact_keys(
         value,
