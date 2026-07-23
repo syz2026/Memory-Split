@@ -2366,3 +2366,19 @@ def build_fixture_current_dataset(
         fixture_current_sources(),
         out_dir,
     )
+
+
+def build_reasoning_v2_smoke_fixture(out_dir: Path | str) -> dict:
+    """Build the non-scientific intervention-faithfulness smoke artifact."""
+
+    from corpusgen.reasoning.smoke import build_v2_smoke_fixture
+
+    return build_v2_smoke_fixture(out_dir)
+
+
+def verify_reasoning_v2_smoke_fixture(out_dir: Path | str) -> dict:
+    """Verify route dose and semantic closure for a v2 smoke artifact."""
+
+    from corpusgen.reasoning.smoke import verify_v2_smoke_fixture
+
+    return verify_v2_smoke_fixture(out_dir)

@@ -15,8 +15,10 @@ from corpusgen.current_dataset import (
     _token_chunks,
     build_current_dataset,
     build_fixture_current_dataset,
+    build_reasoning_v2_smoke_fixture,
     fixture_current_sources,
     verify_current_dataset,
+    verify_reasoning_v2_smoke_fixture,
 )
 from train.tokenizer import get_tok
 
@@ -289,3 +291,44 @@ def test_29m_wikidata_sample_is_hash_stable_and_balanced(tmp_path):
         assert set(strata.values()) == {1}
 
     assert selections[0] == selections[1]
+
+
+def test_v2_smoke_proves_route_dose_and_zero_supervised_semantic_copies(
+    tmp_path,
+):
+    built = build_reasoning_v2_smoke_fixture(tmp_path)
+    verified = verify_reasoning_v2_smoke_fixture(tmp_path)
+
+    assert verified == built
+    assert built["profile"] == "smoke"
+    assert built["scientific_result"] is False
+    assert built["scientific_readiness"] is False
+    assert built["route_dose"]["Split50"]["external_facts"] == 5
+    assert built["route_dose"]["Split90"]["external_facts"] == 9
+    assert all(
+        dose["external_facts"] == dose["quota_facts"]
+        and dose["information_burden_quota_met"]
+        for dose in built["route_dose"].values()
+    )
+    assert all(
+        closure["passed"]
+        and closure["unmasked_supervised_occurrences"] == 0
+        for closure in built["semantic_closure"].values()
+    )
+    assert built["answer_states"]["surface_value_copies"] == 0
+    assert built["answer_states"]["phases"] == ["candidate", "final"]
+    assert built["proofs"] == {
+        "families": ["graph_composition_mod4", "slot_equality"],
+        "verified": True,
+    }
+
+    token_count = built["tokens"]
+    dense = np.fromfile(tmp_path / "dense.weights.bin", dtype=np.uint8)
+    assert dense.tolist() == [1] * token_count
+    for split in ("Split50", "Split90"):
+        weights = np.fromfile(
+            tmp_path / f"{split.lower()}.weights.bin",
+            dtype=np.uint8,
+        )
+        assert len(weights) == token_count
+        assert int((weights == 0).sum()) > 0
