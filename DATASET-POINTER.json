@@ -1,12 +1,15 @@
 {
   "dataset_id": "memorysplit-v2-20x-reasoning-max-seed0",
   "full_corpus_in_release": false,
+  "identity_scheme": "memorysplit-dataset-binding-v1",
   "materialization": "slurm",
   "provider": "illumina-usfc-prd",
   "relative_path": "memorysplit/datasets/memorysplit-v2-20x-reasoning-max-seed0",
-  "required_receipt": "dataset-receipt.json",
+  "receipt_format": "memorysplit-parallel-corpus-v1",
+  "required_receipt": "receipt.json",
   "schema_version": 1,
   "shared_root_env": "MS_SHARED_ROOT",
   "shared_root_prefix": "/illumina",
-  "source_lock_manifest": "configs/reasoning-dataset-v2.json"
+  "source_lock_manifest": "configs/reasoning-dataset-v2.json",
+  "verification_receipt_format": "memorysplit-dataset-verification-v1"
 }

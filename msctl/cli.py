@@ -10,7 +10,11 @@ from pathlib import Path
 
 from .cleanup import apply_cleanup, make_cleanup_plan
 from .collect import collect_evidence
-from .dataset import ensure_dataset, verify_dataset
+from .dataset import (
+    ensure_dataset,
+    verify_dataset,
+    write_dataset_verification,
+)
 from .environment import ensure_environment
 from .errors import MsctlError
 from .jsonutil import canonical_sha256
@@ -18,6 +22,7 @@ from .operations import (
     cancel_runs,
     check_capacity,
     evaluate_runs,
+    load_bound_inputs,
     render_runs,
     resume_runs,
     status_runs,
@@ -98,23 +103,37 @@ def build_parser() -> JsonArgumentParser:
     )
     verify_dataset.add_argument("--pointer", default="DATASET-POINTER.json")
     verify_dataset.add_argument("--dataset-root", required=True)
+    verify_dataset.add_argument("--release", required=True)
+    verify_dataset.add_argument("--manifest", required=True)
+    verify_dataset.add_argument("--verification-out")
+    verify_dataset.add_argument("--apply", action="store_true")
 
     runs = _leaf(commands, "runs", help_text="run plan lifecycle")
     runs_sub = runs.add_subparsers(dest="action", required=True)
     render = _leaf(runs_sub, "render", help_text="render deterministic Slurm argv")
     render.add_argument("--release", required=True)
     render.add_argument("--manifest", required=True)
+    render.add_argument("--dataset-pointer", required=True)
+    render_dataset = render.add_mutually_exclusive_group(required=True)
+    render_dataset.add_argument("--dataset-root")
+    render_dataset.add_argument("--dataset-verification")
 
     for name in ("submit", "resume", "cancel", "evaluate"):
         leaf = _leaf(commands, name, help_text=f"plan or {name} runs")
         leaf.add_argument("--release", required=True)
         leaf.add_argument("--manifest", required=True)
+        if name in {"submit", "resume", "evaluate"}:
+            leaf.add_argument("--dataset-pointer", required=True)
+            dataset_binding = leaf.add_mutually_exclusive_group(required=True)
+            dataset_binding.add_argument("--dataset-root")
+            dataset_binding.add_argument("--dataset-verification")
         leaf.add_argument("--approval")
         if name == "resume":
             leaf.add_argument("--checkpoint-receipt", required=True)
         leaf.add_argument("--apply", action="store_true")
 
     status = _leaf(commands, "status", help_text="reconcile run status")
+    status.add_argument("--release", required=True)
     status.add_argument("--manifest", required=True)
     status.add_argument("--cached", action="store_true")
 
@@ -188,6 +207,9 @@ def dispatch(args: argparse.Namespace) -> tuple[bool, dict[str, object]]:
             profile=profile,
             release_path=args.release,
             manifest_path=args.manifest,
+            dataset_pointer=args.dataset_pointer,
+            dataset_root=args.dataset_root,
+            dataset_verification=args.dataset_verification,
             repo_root=args.repo_root,
         )
     if command == "submit":
@@ -195,6 +217,9 @@ def dispatch(args: argparse.Namespace) -> tuple[bool, dict[str, object]]:
             profile=profile,
             release_path=args.release,
             manifest_path=args.manifest,
+            dataset_pointer=args.dataset_pointer,
+            dataset_root=args.dataset_root,
+            dataset_verification=args.dataset_verification,
             repo_root=args.repo_root,
             state_root=args.state_root,
             approval_path=args.approval,
@@ -217,13 +242,27 @@ def dispatch(args: argparse.Namespace) -> tuple[bool, dict[str, object]]:
             environ=dict(os.environ),
         )
     if command == "dataset verify":
-        return False, verify_dataset(
+        release, manifest = load_bound_inputs(
+            profile=profile,
+            release_path=args.release,
+            manifest_path=args.manifest,
+            repo_root=args.repo_root,
+        )
+        result = verify_dataset(
             profile=profile,
             pointer_path=args.pointer,
             dataset_root=args.dataset_root,
+            release=release,
+            manifest=manifest,
+            repo_root=args.repo_root,
         )
+        if args.verification_out and args.apply:
+            write_dataset_verification(args.verification_out, result)
+        return bool(args.verification_out and not args.apply), result
     if command == "status":
         return False, status_runs(
+            profile=profile,
+            release_path=args.release,
             manifest_path=args.manifest,
             repo_root=args.repo_root,
             state_root=args.state_root,
@@ -236,6 +275,9 @@ def dispatch(args: argparse.Namespace) -> tuple[bool, dict[str, object]]:
             release_path=args.release,
             manifest_path=args.manifest,
             checkpoint_receipt=args.checkpoint_receipt,
+            dataset_pointer=args.dataset_pointer,
+            dataset_root=args.dataset_root,
+            dataset_verification=args.dataset_verification,
             repo_root=args.repo_root,
             state_root=args.state_root,
             approval_path=args.approval,
@@ -258,6 +300,9 @@ def dispatch(args: argparse.Namespace) -> tuple[bool, dict[str, object]]:
             profile=profile,
             release_path=args.release,
             manifest_path=args.manifest,
+            dataset_pointer=args.dataset_pointer,
+            dataset_root=args.dataset_root,
+            dataset_verification=args.dataset_verification,
             repo_root=args.repo_root,
             state_root=args.state_root,
             approval_path=args.approval,

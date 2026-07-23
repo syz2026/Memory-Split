@@ -8,8 +8,9 @@
 #SBATCH --open-mode=append
 #SBATCH --output=ms-v2-seed0-%j.out
 #
-# Submitted only through `msctl submit --apply`, whose argv uses
-# `sbatch --parsable --export=NONE,<explicit allowlist>`.
+# Submitted only through `msctl submit --apply`, whose argv uses Slurm's
+# supported `--export=NAME,NAME=value` explicit allowlist form. It never mixes
+# variables with ALL or NONE. The payload is narrowed again with `env -i`.
 set -euo pipefail
 umask 077
 
@@ -34,16 +35,23 @@ umask 077
 [[ "$MS_EVAL_GPU" == "6" ]]
 [[ "$MS_RESUME" == "0" || "$MS_RESUME" == "1" ]]
 [[ "$MS_SHARED_ROOT" == /illumina/* ]]
+if [[ "$MS_RESUME" == "1" ]]; then
+  : "${MS_DENSE_RESUME_PATH:?}"
+  : "${MS_DENSE_RESUME_SHA256:?}"
+  : "${MS_SPLIT_RESUME_PATH:?}"
+  : "${MS_SPLIT_RESUME_SHA256:?}"
+fi
 
 MS_ENV_ROOT="${MS_ENV_ROOT:-$MS_SHARED_ROOT/memorysplit/env}"
 MS_DATA_ROOT="${MS_DATA_ROOT:-$MS_SHARED_ROOT/memorysplit/data}"
 MS_OUT_ROOT="${MS_OUT_ROOT:-$MS_SHARED_ROOT/memorysplit/runs}"
+MS_JOB_HOME="$MS_SHARED_ROOT/memorysplit/job-home"
 PYTHON="$MS_ENV_ROOT/bin/python"
 [[ -x "$PYTHON" ]]
 cd "${SLURM_SUBMIT_DIR:?}"
 [[ -f "$MS_DENSE_CONFIG" && ! -L "$MS_DENSE_CONFIG" ]]
 [[ -f "$MS_SPLIT_CONFIG" && ! -L "$MS_SPLIT_CONFIG" ]]
-mkdir -p "$MS_OUT_ROOT"
+mkdir -p "$MS_OUT_ROOT" "$MS_JOB_HOME"
 
 verify_config() {
   env -i "PATH=/usr/bin:/bin" "$PYTHON" - "$1" "$2" <<'PY'
@@ -53,7 +61,11 @@ import sys
 
 path = pathlib.Path(sys.argv[1])
 expected = sys.argv[2]
-actual = hashlib.sha256(path.read_bytes()).hexdigest()
+digest = hashlib.sha256()
+with path.open("rb") as handle:
+    for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+        digest.update(chunk)
+actual = digest.hexdigest()
 if actual != expected:
     raise SystemExit("config SHA-256 mismatch")
 PY
@@ -61,12 +73,54 @@ PY
 verify_config "$MS_DENSE_CONFIG" "$MS_DENSE_CONFIG_SHA256"
 verify_config "$MS_SPLIT_CONFIG" "$MS_SPLIT_CONFIG_SHA256"
 
+TRAIN_ENTRYPOINT="scripts/run_train.py"
+[[ -f "$TRAIN_ENTRYPOINT" && ! -L "$TRAIN_ENTRYPOINT" ]]
+env -i "PATH=/usr/bin:/bin" "$PYTHON" - "$TRAIN_ENTRYPOINT" <<'PY'
+import ast
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+contract = None
+for node in tree.body:
+    if not isinstance(node, ast.Assign):
+        continue
+    if any(
+        isinstance(target, ast.Name) and target.id == "MSCTL_DDP_CONTRACT"
+        for target in node.targets
+    ):
+        contract = ast.literal_eval(node.value)
+if contract != "memorysplit-ddp-v1":
+    raise SystemExit(
+        "training preflight failed: missing memorysplit-ddp-v1 contract"
+    )
+PY
+train_help="$(
+  env -i \
+    "HOME=$MS_JOB_HOME" \
+    "PATH=/usr/bin:/bin" \
+    "PYTHONPATH=$SLURM_SUBMIT_DIR" \
+    "$PYTHON" "$TRAIN_ENTRYPOINT" --help
+)"
+grep -q -- "--resume-path" <<< "$train_help" || {
+  echo "training preflight failed: --resume-path is unavailable" >&2
+  exit 64
+}
+
+if [[ "$MS_RESUME" == "1" ]]; then
+  [[ -f "$MS_DENSE_RESUME_PATH" && ! -L "$MS_DENSE_RESUME_PATH" ]]
+  [[ -f "$MS_SPLIT_RESUME_PATH" && ! -L "$MS_SPLIT_RESUME_PATH" ]]
+  verify_config "$MS_DENSE_RESUME_PATH" "$MS_DENSE_RESUME_SHA256"
+  verify_config "$MS_SPLIT_RESUME_PATH" "$MS_SPLIT_RESUME_SHA256"
+fi
+
 # Explicit environment allowlist: approval keys, tokens, and ambient shell
 # variables never cross into training. GPU 6 stays reserved for independent
 # evaluation/checkpoint verification; training is symmetric GPUs 0,1,2 and
 # GPUs 3,4,5.
 common_env=(
-  "HOME=$HOME"
+  "HOME=$MS_JOB_HOME"
   "PATH=/usr/bin:/bin"
   "PYTHONPATH=$SLURM_SUBMIT_DIR"
   "MS_PROVIDER=$MS_PROVIDER"
@@ -78,16 +132,23 @@ common_env=(
   "MS_OUT_ROOT=$MS_OUT_ROOT"
 )
 
+dense_args=("$TRAIN_ENTRYPOINT" --config "$MS_DENSE_CONFIG")
+split_args=("$TRAIN_ENTRYPOINT" --config "$MS_SPLIT_CONFIG")
+if [[ "$MS_RESUME" == "1" ]]; then
+  dense_args+=(--resume-path "$MS_DENSE_RESUME_PATH")
+  split_args+=(--resume-path "$MS_SPLIT_RESUME_PATH")
+fi
+
 env -i "${common_env[@]}" CUDA_VISIBLE_DEVICES=0,1,2 \
   "$PYTHON" -m torch.distributed.run \
   --standalone --nnodes=1 --nproc_per_node=3 --master_port=29500 \
-  scripts/run_train.py --config "$MS_DENSE_CONFIG" --resume auto &
+  "${dense_args[@]}" &
 dense_pid=$!
 
 env -i "${common_env[@]}" CUDA_VISIBLE_DEVICES=3,4,5 \
   "$PYTHON" -m torch.distributed.run \
   --standalone --nnodes=1 --nproc_per_node=3 --master_port=29510 \
-  scripts/run_train.py --config "$MS_SPLIT_CONFIG" --resume auto &
+  "${split_args[@]}" &
 split_pid=$!
 
 set +e

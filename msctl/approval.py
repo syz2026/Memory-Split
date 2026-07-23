@@ -14,12 +14,14 @@ from .jsonutil import (
     canonical_json,
     load_json,
     require_exact_keys,
+    require_nonnegative_int,
     require_nonnegative_number,
     require_object,
-    require_positive_int,
+    require_schema_version,
     require_sha256,
 )
 from .profile import IlluminaProfile
+from .slurm import resource_request
 
 
 APPROVAL_OPERATIONS = {
@@ -68,8 +70,7 @@ def verify_approval(
         operation=operation,
         release_sha256=release_sha256,
         scope_sha256=run_manifest.sha256,
-        requested_jobs=len(run_manifest.runs),
-        requested_gpu_hours=run_manifest.gpu_hours,
+        resources=resource_request(profile, operation),
         profile=profile,
         environ=environ,
         now=now,
@@ -82,8 +83,7 @@ def verify_scope_approval(
     operation: str,
     release_sha256: str,
     scope_sha256: str,
-    requested_jobs: int,
-    requested_gpu_hours: float,
+    resources: dict[str, object],
     profile: IlluminaProfile,
     environ: dict[str, str] | None = None,
     now: datetime | None = None,
@@ -106,6 +106,7 @@ def verify_scope_approval(
             "operation",
             "release_sha256",
             "run_manifest_sha256",
+            "resources",
             "limits",
             "expires_at",
             "key_id",
@@ -113,11 +114,16 @@ def verify_scope_approval(
         },
         label="approval receipt",
     )
-    if receipt["schema_version"] != 1:
+    try:
+        require_schema_version(
+            receipt["schema_version"],
+            label="approval receipt.schema_version",
+        )
+    except MsctlError as error:
         raise MsctlError(
             "APPROVAL_INVALID",
             "unsupported approval receipt schema",
-        )
+        ) from error
     if (
         not isinstance(receipt["receipt_id"], str)
         or not receipt["receipt_id"]
@@ -194,10 +200,51 @@ def verify_scope_approval(
         limits["gpu_hours"],
         label="approval receipt.limits.gpu_hours",
     )
-    job_limit = require_positive_int(
+    job_limit = require_nonnegative_int(
         limits["jobs"],
         label="approval receipt.limits.jobs",
     )
+    receipt_resources = require_object(
+        receipt["resources"],
+        label="approval receipt.resources",
+    )
+    require_exact_keys(
+        receipt_resources,
+        {
+            "schema_version",
+            "operation",
+            "jobs",
+            "allocated_gpus",
+            "wall_minutes",
+            "gpu_hours",
+            "gres",
+            "script",
+        },
+        label="approval receipt.resources",
+    )
+    try:
+        require_schema_version(
+            receipt_resources["schema_version"],
+            label="approval receipt.resources.schema_version",
+        )
+        requested_jobs = require_nonnegative_int(
+            resources.get("jobs"),
+            label="resource request.jobs",
+        )
+        requested_gpu_hours = require_nonnegative_number(
+            resources.get("gpu_hours"),
+            label="resource request.gpu_hours",
+        )
+    except MsctlError as error:
+        raise MsctlError(
+            "APPROVAL_INVALID",
+            "approval resource request schema is invalid",
+        ) from error
+    if canonical_json(receipt_resources) != canonical_json(resources):
+        raise MsctlError(
+            "APPROVAL_SCOPE_MISMATCH",
+            "approval receipt does not bind the exact resource request",
+        )
     if requested_jobs > job_limit or requested_gpu_hours > gpu_limit:
         raise MsctlError(
             "APPROVAL_LIMIT_EXCEEDED",

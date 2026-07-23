@@ -15,6 +15,16 @@
       3
     ]
   },
+  "environment": {
+    "contract": {
+      "cuda_version": null,
+      "platform": "linux_x86_64",
+      "python_implementation": "CPython",
+      "python_version": null
+    },
+    "lock_path": "requirements-illumina.lock",
+    "status": "operator_input_required"
+  },
   "job_env_allowlist": [
     "MS_PROVIDER",
     "MS_PROFILE_SHA256",
@@ -32,6 +42,10 @@
     "MS_WORLD_SIZE",
     "MS_EVAL_GPU",
     "MS_RESUME",
+    "MS_DENSE_RESUME_PATH",
+    "MS_DENSE_RESUME_SHA256",
+    "MS_SPLIT_RESUME_PATH",
+    "MS_SPLIT_RESUME_SHA256",
     "MS_SHARED_ROOT",
     "MS_ENV_ROOT",
     "MS_DATA_ROOT",

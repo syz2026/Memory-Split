@@ -2,16 +2,20 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
+import os
 from dataclasses import dataclass
 from pathlib import Path
 
 from .errors import MsctlError
+from .fsutil import open_directory, open_regular_at, read_fd
 from .jsonutil import (
     canonical_sha256,
-    load_json,
     require_exact_keys,
     require_object,
     require_positive_int,
+    require_schema_version,
 )
 
 
@@ -35,7 +39,14 @@ class IlluminaProfile:
     seed0_wall_minutes: int
     evaluation_wall_minutes: int
     job_env_allowlist: tuple[str, ...]
+    environment_lock: str
+    python_implementation: str
+    python_version: str | None
+    platform: str
+    cuda_version: str | None
+    environment_status: str
     sha256: str
+    source_sha256: str
 
 
 def _optional_slug(value: object, *, label: str) -> str | None:
@@ -54,7 +65,51 @@ def _optional_slug(value: object, *, label: str) -> str | None:
 
 
 def load_profile(path: Path | str) -> IlluminaProfile:
-    value = require_object(load_json(path, label="profile"), label="profile")
+    candidate = Path(path)
+    directory_fd = open_directory(
+        candidate.parent,
+        label="profile directory",
+    )
+    try:
+        descriptor, parent_fd, _ = open_regular_at(
+            directory_fd,
+            candidate.name,
+            label="profile",
+        )
+        try:
+            before = os.fstat(descriptor)
+            data = read_fd(descriptor)
+            after = os.fstat(descriptor)
+        finally:
+            os.close(descriptor)
+            os.close(parent_fd)
+    finally:
+        os.close(directory_fd)
+    if (
+        before.st_dev,
+        before.st_ino,
+        before.st_size,
+        before.st_mtime_ns,
+        before.st_ctime_ns,
+    ) != (
+        after.st_dev,
+        after.st_ino,
+        after.st_size,
+        after.st_mtime_ns,
+        after.st_ctime_ns,
+    ) or len(data) != after.st_size:
+        raise MsctlError(
+            "PROFILE_INVALID",
+            "profile changed while being read",
+        )
+    try:
+        decoded = json.loads(data.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise MsctlError(
+            "PROFILE_INVALID",
+            "profile must contain valid UTF-8 JSON",
+        ) from error
+    value = require_object(decoded, label="profile")
     require_exact_keys(
         value,
         {
@@ -68,11 +123,20 @@ def load_profile(path: Path | str) -> IlluminaProfile:
             "storage",
             "slurm",
             "job_env_allowlist",
+            "environment",
         },
         label="profile",
     )
-    if value["schema_version"] != 1:
-        raise MsctlError("PROFILE_INVALID", "unsupported profile schema version")
+    try:
+        require_schema_version(
+            value["schema_version"],
+            label="profile.schema_version",
+        )
+    except MsctlError as error:
+        raise MsctlError(
+            "PROFILE_INVALID",
+            "unsupported profile schema version",
+        ) from error
     if (
         value["profile_id"] != SUPPORTED_PROFILE
         or value["provider"] != SUPPORTED_PROFILE
@@ -181,6 +245,66 @@ def load_profile(path: Path | str) -> IlluminaProfile:
         label="profile.slurm.evaluation_wall_minutes",
     )
 
+    environment = require_object(
+        value["environment"],
+        label="profile.environment",
+    )
+    require_exact_keys(
+        environment,
+        {"status", "lock_path", "contract"},
+        label="profile.environment",
+    )
+    contract = require_object(
+        environment["contract"],
+        label="profile.environment.contract",
+    )
+    require_exact_keys(
+        contract,
+        {
+            "python_implementation",
+            "python_version",
+            "platform",
+            "cuda_version",
+        },
+        label="profile.environment.contract",
+    )
+    if (
+        environment["status"] not in {"operator_input_required", "pinned"}
+        or environment["lock_path"] != "requirements-illumina.lock"
+        or contract["python_implementation"] != "CPython"
+        or contract["platform"] != "linux_x86_64"
+        or (
+            contract["python_version"] is not None
+            and (
+                not isinstance(contract["python_version"], str)
+                or not contract["python_version"]
+            )
+        )
+        or (
+            contract["cuda_version"] is not None
+            and (
+                not isinstance(contract["cuda_version"], str)
+                or not contract["cuda_version"]
+            )
+        )
+        or (
+            environment["status"] == "pinned"
+            and (
+                contract["python_version"] is None
+                or contract["cuda_version"] is None
+            )
+        )
+        or (
+            environment["status"] == "operator_input_required"
+            and contract["python_version"] is not None
+            and contract["cuda_version"] is not None
+        )
+    ):
+        raise MsctlError(
+            "PROFILE_INVALID",
+            "environment contract must explicitly identify missing site pins",
+        )
+
     allowlist = value["job_env_allowlist"]
     if (
         not isinstance(allowlist, list)
@@ -217,5 +341,20 @@ def load_profile(path: Path | str) -> IlluminaProfile:
         seed0_wall_minutes=seed0_wall,
         evaluation_wall_minutes=evaluation_wall,
         job_env_allowlist=tuple(allowlist),
+        environment_lock=str(environment["lock_path"]),
+        python_implementation=str(contract["python_implementation"]),
+        python_version=(
+            str(contract["python_version"])
+            if contract["python_version"] is not None
+            else None
+        ),
+        platform=str(contract["platform"]),
+        cuda_version=(
+            str(contract["cuda_version"])
+            if contract["cuda_version"] is not None
+            else None
+        ),
+        environment_status=str(environment["status"]),
         sha256=canonical_sha256(value),
+        source_sha256=hashlib.sha256(data).hexdigest(),
     )

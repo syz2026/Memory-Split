@@ -121,9 +121,37 @@ def require_sha256(value: object, *, label: str) -> str:
     return value
 
 
+def require_schema_version(
+    value: object,
+    *,
+    expected: int = 1,
+    label: str,
+) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise MsctlError(
+            "SCHEMA_INVALID",
+            f"{label} must be the integer {expected}",
+        )
+    if value != expected:
+        raise MsctlError(
+            "SCHEMA_INVALID",
+            f"{label} has an unsupported schema version",
+        )
+    return value
+
+
 def require_positive_int(value: object, *, label: str) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
         raise MsctlError("SCHEMA_INVALID", f"{label} must be a positive integer")
+    return value
+
+
+def require_nonnegative_int(value: object, *, label: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise MsctlError(
+            "SCHEMA_INVALID",
+            f"{label} must be a nonnegative integer",
+        )
     return value
 
 

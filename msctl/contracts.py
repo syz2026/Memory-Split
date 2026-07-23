@@ -2,11 +2,19 @@
 
 from __future__ import annotations
 
+import hashlib
+import io
+import json
+import os
+import re
+import stat
+import zipfile
 from dataclasses import dataclass
 from pathlib import Path
 
 from .cohort import load_cohort_assignment as load_cohort_assignment
 from .errors import MsctlError
+from .fsutil import hash_fd, open_directory, open_regular_at, read_fd
 from .jsonutil import (
     COMMIT_RE,
     RUN_ID_RE,
@@ -16,6 +24,7 @@ from .jsonutil import (
     require_exact_keys,
     require_nonnegative_number,
     require_object,
+    require_schema_version,
     require_sha256,
     resolve_inside,
     sha256_file,
@@ -27,8 +36,12 @@ from .profile import SUPPORTED_PROFILE
 class Release:
     release_id: str
     archive_sha256: str
+    archive_bytes: int
+    archive_path: Path
     source_commit: str
     members_sha256: str
+    members: dict[str, dict[str, object]]
+    metadata: dict[str, object]
     value: dict[str, object]
 
 
@@ -56,8 +69,374 @@ class RunManifest:
         return sum(run.estimated_gpu_hours for run in self.runs)
 
 
+@dataclass(frozen=True)
+class Checkpoint:
+    run_id: str
+    arm: str
+    path: Path
+    sha256: str
+    config_sha256: str
+    step: int
+    world_size: int
+
+
+@dataclass(frozen=True)
+class CheckpointReceipt:
+    sha256: str
+    checkpoints: tuple[Checkpoint, ...]
+    value: dict[str, object]
+
+
+_GIT_OBJECT_RE = re.compile(r"^[0-9a-f]{40}(?:[0-9a-f]{24})?$")
+
+
+def _release_error(
+    code: str,
+    message: str,
+    *,
+    path: Path | None = None,
+) -> MsctlError:
+    details = {"path": str(path)} if path is not None else {}
+    return MsctlError(code, message, details=details)
+
+
+def _read_regular_relative(
+    root: Path,
+    relative: str,
+    *,
+    label: str,
+) -> bytes:
+    root_fd = open_directory(root, label=f"{label} directory")
+    try:
+        descriptor, parent_fd, _ = open_regular_at(
+            root_fd,
+            relative,
+            label=label,
+        )
+        try:
+            before = os.fstat(descriptor)
+            data = read_fd(descriptor)
+            after = os.fstat(descriptor)
+        finally:
+            os.close(descriptor)
+            os.close(parent_fd)
+    finally:
+        os.close(root_fd)
+    identity_before = (
+        before.st_dev,
+        before.st_ino,
+        before.st_size,
+        before.st_mtime_ns,
+        before.st_ctime_ns,
+    )
+    identity_after = (
+        after.st_dev,
+        after.st_ino,
+        after.st_size,
+        after.st_mtime_ns,
+        after.st_ctime_ns,
+    )
+    if identity_before != identity_after or len(data) != after.st_size:
+        raise _release_error(
+            "RELEASE_ARCHIVE_INVALID",
+            f"{label} changed while being read",
+        )
+    return data
+
+
+def _read_archive(
+    release_path: Path,
+    relative: str,
+) -> tuple[Path, bytes]:
+    parent_fd = open_directory(
+        release_path.parent,
+        label="release directory",
+    )
+    try:
+        descriptor, archive_parent_fd, _ = open_regular_at(
+            parent_fd,
+            relative,
+            label="release archive",
+        )
+        try:
+            before = os.fstat(descriptor)
+            data = read_fd(descriptor)
+            after = os.fstat(descriptor)
+            if (
+                before.st_dev,
+                before.st_ino,
+                before.st_size,
+                before.st_mtime_ns,
+                before.st_ctime_ns,
+            ) != (
+                after.st_dev,
+                after.st_ino,
+                after.st_size,
+                after.st_mtime_ns,
+                after.st_ctime_ns,
+            ) or len(data) != after.st_size:
+                raise _release_error(
+                    "RELEASE_ARCHIVE_INVALID",
+                    "release archive changed while being read",
+                )
+        finally:
+            os.close(descriptor)
+            os.close(archive_parent_fd)
+    except MsctlError as error:
+        if error.code == "RELEASE_ARCHIVE_INVALID":
+            raise
+        raise _release_error(
+            "RELEASE_ARCHIVE_INVALID",
+            "release archive must be a non-symlink regular file",
+            path=release_path.parent / relative,
+        ) from error
+    finally:
+        os.close(parent_fd)
+    return release_path.parent / relative, data
+
+
+def _parse_internal_json(data: bytes, *, label: str) -> dict[str, object]:
+    try:
+        value = json.loads(data.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise _release_error(
+            "RELEASE_INTERNAL_INVALID",
+            f"{label} must be valid UTF-8 JSON",
+        ) from error
+    return require_object(value, label=label)
+
+
+def _validate_zip_member(info: zipfile.ZipInfo) -> None:
+    name = info.filename
+    if (
+        not name
+        or "\\" in name
+        or name.startswith("/")
+        or any(part in {"", ".", ".."} for part in name.rstrip("/").split("/"))
+    ):
+        raise _release_error(
+            "RELEASE_INTERNAL_INVALID",
+            "release archive contains an unsafe member path",
+        )
+    mode = info.external_attr >> 16
+    if info.is_dir():
+        if not mode or not stat.S_ISDIR(mode):
+            raise _release_error(
+                "RELEASE_INTERNAL_INVALID",
+                "release archive directory metadata is invalid",
+            )
+    elif not mode or not stat.S_ISREG(mode):
+        raise _release_error(
+            "RELEASE_INTERNAL_INVALID",
+            "release archive contains a non-regular member",
+        )
+
+
+def _verify_release_internals(
+    archive_data: bytes,
+    *,
+    release_value: dict[str, object],
+) -> tuple[dict[str, dict[str, object]], dict[str, object]]:
+    try:
+        archive = zipfile.ZipFile(io.BytesIO(archive_data))
+    except (OSError, zipfile.BadZipFile) as error:
+        raise _release_error(
+            "RELEASE_ARCHIVE_INVALID",
+            "release archive is not a valid ZIP",
+        ) from error
+    with archive:
+        infos = archive.infolist()
+        names = [info.filename for info in infos]
+        if len(names) != len(set(names)):
+            raise _release_error(
+                "RELEASE_INTERNAL_INVALID",
+                "release archive contains duplicate member names",
+            )
+        for info in infos:
+            _validate_zip_member(info)
+        file_names = {
+            info.filename for info in infos if not info.is_dir()
+        }
+        if not {"RELEASE-METADATA.json", "SHA256SUMS"} <= file_names:
+            raise _release_error(
+                "RELEASE_INTERNAL_INVALID",
+                "release archive is missing internal verification metadata",
+            )
+        payload = {name: archive.read(name) for name in file_names}
+
+    sums_bytes = payload["SHA256SUMS"]
+    if hashlib.sha256(sums_bytes).hexdigest() != release_value["members_sha256"]:
+        raise _release_error(
+            "RELEASE_INTERNAL_INVALID",
+            "internal checksum manifest does not match RELEASE.json",
+        )
+    try:
+        sums_text = sums_bytes.decode("ascii")
+    except UnicodeDecodeError as error:
+        raise _release_error(
+            "RELEASE_INTERNAL_INVALID",
+            "SHA256SUMS must be ASCII",
+        ) from error
+    if not sums_text.endswith("\n"):
+        raise _release_error(
+            "RELEASE_INTERNAL_INVALID",
+            "SHA256SUMS must end with one newline",
+        )
+    checksum_rows: dict[str, str] = {}
+    ordered_paths: list[str] = []
+    for line in sums_text.splitlines():
+        if len(line) < 67 or line[64:66] != "  ":
+            raise _release_error(
+                "RELEASE_INTERNAL_INVALID",
+                "SHA256SUMS contains a malformed row",
+            )
+        digest = line[:64]
+        relative = line[66:]
+        require_sha256(digest, label="SHA256SUMS digest")
+        portable_relative(relative, label="SHA256SUMS path")
+        if relative in checksum_rows or relative == "SHA256SUMS":
+            raise _release_error(
+                "RELEASE_INTERNAL_INVALID",
+                "SHA256SUMS contains a duplicate or self-reference",
+            )
+        checksum_rows[relative] = digest
+        ordered_paths.append(relative)
+    expected_paths = file_names - {"SHA256SUMS"}
+    if ordered_paths != sorted(ordered_paths) or set(ordered_paths) != expected_paths:
+        raise _release_error(
+            "RELEASE_INTERNAL_INVALID",
+            "SHA256SUMS is not sorted and hash-complete",
+        )
+    for relative, digest in checksum_rows.items():
+        if hashlib.sha256(payload[relative]).hexdigest() != digest:
+            raise _release_error(
+                "RELEASE_INTERNAL_INVALID",
+                "release member checksum mismatch",
+            )
+
+    metadata = _parse_internal_json(
+        payload["RELEASE-METADATA.json"],
+        label="RELEASE-METADATA.json",
+    )
+    require_exact_keys(
+        metadata,
+        {
+            "schema_version",
+            "provider",
+            "source",
+            "profile_sha256",
+            "environment_hashes",
+            "members",
+        },
+        label="RELEASE-METADATA.json",
+    )
+    try:
+        require_schema_version(
+            metadata["schema_version"],
+            label="RELEASE-METADATA.json.schema_version",
+        )
+    except MsctlError as error:
+        raise _release_error(
+            "RELEASE_INTERNAL_INVALID",
+            "RELEASE-METADATA.json schema is unsupported",
+        ) from error
+    if (
+        metadata["provider"] != release_value["provider"]
+        or metadata["source"] != release_value["source"]
+    ):
+        raise _release_error(
+            "RELEASE_INTERNAL_INVALID",
+            "internal metadata does not bind RELEASE.json",
+        )
+    profile_hash = require_sha256(
+        metadata["profile_sha256"],
+        label="RELEASE-METADATA.json.profile_sha256",
+    )
+    raw_members = metadata["members"]
+    if not isinstance(raw_members, list) or not raw_members:
+        raise _release_error(
+            "RELEASE_INTERNAL_INVALID",
+            "internal metadata members must be non-empty",
+        )
+    members: dict[str, dict[str, object]] = {}
+    ordered_member_paths: list[str] = []
+    for index, raw in enumerate(raw_members):
+        row = require_object(raw, label=f"release member[{index}]")
+        require_exact_keys(
+            row,
+            {"path", "bytes", "sha256", "git_blob"},
+            label=f"release member[{index}]",
+        )
+        relative = portable_relative(
+            row["path"],
+            label=f"release member[{index}].path",
+        )
+        size = row["bytes"]
+        digest = require_sha256(
+            row["sha256"],
+            label=f"release member[{index}].sha256",
+        )
+        if (
+            relative in members
+            or isinstance(size, bool)
+            or not isinstance(size, int)
+            or size < 0
+            or not isinstance(row["git_blob"], str)
+            or _GIT_OBJECT_RE.fullmatch(row["git_blob"]) is None
+        ):
+            raise _release_error(
+                "RELEASE_INTERNAL_INVALID",
+                "internal release member row is invalid",
+            )
+        if (
+            relative not in payload
+            or len(payload[relative]) != size
+            or hashlib.sha256(payload[relative]).hexdigest() != digest
+        ):
+            raise _release_error(
+                "RELEASE_INTERNAL_INVALID",
+                "internal release member row does not match ZIP bytes",
+            )
+        members[relative] = row
+        ordered_member_paths.append(relative)
+    expected_source_members = file_names - {
+        "RELEASE-METADATA.json",
+        "SHA256SUMS",
+    }
+    if (
+        ordered_member_paths != sorted(ordered_member_paths)
+        or set(ordered_member_paths) != expected_source_members
+    ):
+        raise _release_error(
+            "RELEASE_INTERNAL_INVALID",
+            "internal metadata is not sorted and member-complete",
+        )
+    profile_member = members.get("cluster/profiles/illumina-usfc-prd.json")
+    if profile_member is None or profile_member["sha256"] != profile_hash:
+        raise _release_error(
+            "RELEASE_INTERNAL_INVALID",
+            "internal profile hash is not bound to its member",
+        )
+    environment_hashes = require_object(
+        metadata["environment_hashes"],
+        label="RELEASE-METADATA.json.environment_hashes",
+    )
+    for relative, raw_digest in environment_hashes.items():
+        digest = require_sha256(
+            raw_digest,
+            label=f"environment hash {relative}",
+        )
+        if relative not in members or members[relative]["sha256"] != digest:
+            raise _release_error(
+                "RELEASE_INTERNAL_INVALID",
+                "environment hash does not bind a release member",
+            )
+    return members, metadata
+
+
 def load_release(path: Path | str) -> Release:
-    value = require_object(load_json(path, label="release"), label="release")
+    release_path = Path(path)
+    value = require_object(load_json(release_path, label="release"), label="release")
     require_exact_keys(
         value,
         {
@@ -70,7 +449,17 @@ def load_release(path: Path | str) -> Release:
         },
         label="release",
     )
-    if value["schema_version"] != 1 or value["provider"] != SUPPORTED_PROFILE:
+    try:
+        require_schema_version(
+            value["schema_version"],
+            label="release.schema_version",
+        )
+    except MsctlError as error:
+        raise MsctlError(
+            "RELEASE_INVALID",
+            "release is not an Illumina v1 release",
+        ) from error
+    if value["provider"] != SUPPORTED_PROFILE:
         raise MsctlError(
             "RELEASE_INVALID",
             "release is not an Illumina v1 release",
@@ -88,7 +477,10 @@ def load_release(path: Path | str) -> Release:
         {"path", "sha256", "bytes"},
         label="release.archive",
     )
-    portable_relative(archive["path"], label="release.archive.path")
+    archive_relative = portable_relative(
+        archive["path"],
+        label="release.archive.path",
+    )
     if (
         isinstance(archive["bytes"], bool)
         or not isinstance(archive["bytes"], int)
@@ -110,15 +502,57 @@ def load_release(path: Path | str) -> Release:
             "RELEASE_INVALID",
             "release source must bind a clean Git commit",
         )
+    archive_hash = require_sha256(
+        archive["sha256"], label="release.archive.sha256"
+    )
+    members_hash = require_sha256(
+        value["members_sha256"], label="release.members_sha256"
+    )
+    archive_path, archive_data = _read_archive(
+        release_path,
+        archive_relative,
+    )
+    if (
+        len(archive_data) != archive["bytes"]
+        or hashlib.sha256(archive_data).hexdigest() != archive_hash
+    ):
+        raise _release_error(
+            "RELEASE_ARCHIVE_INVALID",
+            "release archive byte count or SHA-256 does not match RELEASE.json",
+            path=archive_path,
+        )
+    try:
+        checksum_data = _read_regular_relative(
+            release_path.parent,
+            f"{archive_relative}.sha256",
+            label="external archive checksum",
+        )
+    except MsctlError as error:
+        raise _release_error(
+            "RELEASE_ARCHIVE_INVALID",
+            "external archive checksum must be a non-symlink regular file",
+            path=release_path.parent / f"{archive_relative}.sha256",
+        ) from error
+    expected_checksum = f"{archive_hash}  {archive_path.name}\n".encode("ascii")
+    if checksum_data != expected_checksum:
+        raise _release_error(
+            "RELEASE_ARCHIVE_INVALID",
+            "external archive checksum does not match RELEASE.json",
+            path=release_path.parent / f"{archive_relative}.sha256",
+        )
+    members, metadata = _verify_release_internals(
+        archive_data,
+        release_value=value,
+    )
     return Release(
         release_id=release_id,
-        archive_sha256=require_sha256(
-            archive["sha256"], label="release.archive.sha256"
-        ),
+        archive_sha256=archive_hash,
+        archive_bytes=int(archive["bytes"]),
+        archive_path=archive_path,
         source_commit=source["commit"],
-        members_sha256=require_sha256(
-            value["members_sha256"], label="release.members_sha256"
-        ),
+        members_sha256=members_hash,
+        members=members,
+        metadata=metadata,
         value=value,
     )
 
@@ -143,7 +577,17 @@ def load_run_manifest(
         },
         label="run manifest",
     )
-    if value["schema_version"] != 1 or value["provider"] != SUPPORTED_PROFILE:
+    try:
+        require_schema_version(
+            value["schema_version"],
+            label="run manifest.schema_version",
+        )
+    except MsctlError as error:
+        raise MsctlError(
+            "RUN_MANIFEST_INVALID",
+            "run manifest provider or schema is unsupported",
+        ) from error
+    if value["provider"] != SUPPORTED_PROFILE:
         raise MsctlError(
             "RUN_MANIFEST_INVALID",
             "run manifest provider or schema is unsupported",
@@ -256,12 +700,62 @@ def bind_release(release: Release, manifest: RunManifest) -> None:
         )
 
 
+def verify_release_member(
+    release: Release,
+    *,
+    member_path: str,
+    local_path: Path | str,
+    label: str,
+) -> str:
+    """Bind one local runtime file to its authenticated release member."""
+
+    member = release.members.get(member_path)
+    if member is None:
+        raise MsctlError(
+            "RELEASE_MEMBER_MISMATCH",
+            f"{label} is absent from the verified release",
+            details={"path": member_path},
+        )
+    candidate = Path(local_path)
+    try:
+        directory_fd = open_directory(
+            candidate.parent,
+            label=f"{label} directory",
+        )
+        try:
+            descriptor, parent_fd, _ = open_regular_at(
+                directory_fd,
+                candidate.name,
+                label=label,
+            )
+            try:
+                size, digest = hash_fd(descriptor)
+            finally:
+                os.close(descriptor)
+                os.close(parent_fd)
+        finally:
+            os.close(directory_fd)
+    except MsctlError as error:
+        raise MsctlError(
+            "RELEASE_MEMBER_MISMATCH",
+            f"{label} is not a safe local release member",
+            details={"path": member_path},
+        ) from error
+    if size != member["bytes"] or digest != member["sha256"]:
+        raise MsctlError(
+            "RELEASE_MEMBER_MISMATCH",
+            f"{label} bytes differ from the verified release",
+            details={"path": member_path},
+        )
+    return digest
+
+
 def verify_checkpoint_receipt(
     path: Path | str,
     *,
     release: Release,
     manifest: RunManifest,
-) -> dict[str, object]:
+) -> CheckpointReceipt:
     receipt_path = Path(path)
     value = require_object(
         load_json(receipt_path, label="checkpoint receipt"),
@@ -279,9 +773,18 @@ def verify_checkpoint_receipt(
         },
         label="checkpoint receipt",
     )
+    try:
+        require_schema_version(
+            value["schema_version"],
+            label="checkpoint receipt.schema_version",
+        )
+    except MsctlError as error:
+        raise MsctlError(
+            "CHECKPOINT_PROVENANCE_MISMATCH",
+            "checkpoint receipt schema is unsupported",
+        ) from error
     if (
-        value["schema_version"] != 1
-        or value["provider"] != manifest.provider
+        value["provider"] != manifest.provider
         or value["release_sha256"] != release.archive_sha256
         or value["run_manifest_sha256"] != manifest.sha256
         or value["dataset_sha256"] != manifest.dataset_sha256
@@ -298,6 +801,7 @@ def verify_checkpoint_receipt(
         )
     by_id = {run.run_id: run for run in manifest.runs}
     seen: set[str] = set()
+    checkpoints: list[Checkpoint] = []
     for index, item in enumerate(raw):
         row = require_object(item, label=f"checkpoint[{index}]")
         require_exact_keys(
@@ -350,9 +854,26 @@ def verify_checkpoint_receipt(
                 "checkpoint bytes do not match their receipt",
                 details={"run_id": run_id},
             )
+        checkpoints.append(
+            Checkpoint(
+                run_id=run_id,
+                arm=by_id[run_id].arm,
+                path=checkpoint,
+                sha256=expected_hash,
+                config_sha256=str(row["config_sha256"]),
+                step=int(row["step"]),
+                world_size=int(row["world_size"]),
+            )
+        )
     if seen != set(by_id):
         raise MsctlError(
             "CHECKPOINT_PROVENANCE_MISMATCH",
             "checkpoint receipt is missing a paired run",
         )
-    return value
+    return CheckpointReceipt(
+        sha256=canonical_sha256(value),
+        checkpoints=tuple(
+            sorted(checkpoints, key=lambda item: item.run_id)
+        ),
+        value=value,
+    )

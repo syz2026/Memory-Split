@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
-import json
 import os
+import platform
+import re
 import shutil
 import subprocess
 import sys
@@ -12,11 +13,21 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from .errors import MsctlError
-from .jsonutil import atomic_write_json, regular_file, sha256_file
+from .jsonutil import (
+    atomic_write_json,
+    load_json,
+    regular_file,
+    require_exact_keys,
+    require_object,
+    require_schema_version,
+    require_sha256,
+    sha256_file,
+)
 from .profile import IlluminaProfile
 
 
 RECEIPT_NAME = "msctl-env-receipt.json"
+LOCK_HEADER = "# memorysplit-illumina-lock-v1"
 
 
 def _run(command: list[str], *, operation: str) -> None:
@@ -49,18 +60,126 @@ def _run(command: list[str], *, operation: str) -> None:
 
 def _read_receipt(path: Path) -> dict[str, object]:
     try:
-        value = json.loads(path.read_text())
-    except (OSError, json.JSONDecodeError) as error:
+        value = require_object(
+            load_json(path, label="environment receipt"),
+            label="environment receipt",
+        )
+        require_exact_keys(
+            value,
+            {
+                "schema_version",
+                "provider",
+                "profile_sha256",
+                "lock_sha256",
+                "python",
+                "platform",
+                "cuda_version",
+                "created_at",
+            },
+            label="environment receipt",
+        )
+        require_schema_version(
+            value["schema_version"],
+            label="environment receipt.schema_version",
+        )
+        require_sha256(
+            value["profile_sha256"],
+            label="environment receipt.profile_sha256",
+        )
+        require_sha256(
+            value["lock_sha256"],
+            label="environment receipt.lock_sha256",
+        )
+        if not all(
+            isinstance(value[field], str) and value[field]
+            for field in (
+                "provider",
+                "python",
+                "platform",
+                "cuda_version",
+                "created_at",
+            )
+        ):
+            raise MsctlError(
+                "SCHEMA_INVALID",
+                "environment receipt strings must be non-empty",
+            )
+    except MsctlError as error:
         raise MsctlError(
             "ENV_RECEIPT_INVALID",
             "environment receipt is invalid",
         ) from error
-    if not isinstance(value, dict):
-        raise MsctlError(
-            "ENV_RECEIPT_INVALID",
-            "environment receipt is invalid",
-        )
     return value
+
+
+def _validate_lock_contract(path: Path, profile: IlluminaProfile) -> None:
+    try:
+        text = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as error:
+        raise MsctlError(
+            "ENV_LOCK_INVALID",
+            "environment lock must be readable UTF-8",
+        ) from error
+    required_headers = {
+        LOCK_HEADER,
+        f"# platform: {profile.platform}",
+        f"# python-implementation: {profile.python_implementation}",
+        f"# python-version: {profile.python_version}",
+        f"# cuda-version: {profile.cuda_version}",
+    }
+    lines = {line.strip() for line in text.splitlines()}
+    requirement_lines = [
+        line.strip()
+        for line in text.splitlines()
+        if line.strip() and not line.lstrip().startswith(("#", "--"))
+    ]
+    if (
+        not required_headers <= lines
+        or not requirement_lines
+        or "--hash=sha256:" not in text
+    ):
+        raise MsctlError(
+            "ENV_LOCK_INVALID",
+            "environment lock does not bind the pinned platform or hashes",
+        )
+
+
+def _detect_cuda_version() -> str:
+    executable = shutil.which("nvcc")
+    if executable is None:
+        raise MsctlError(
+            "ENV_CUDA_UNAVAILABLE",
+            "pinned CUDA toolkit cannot be verified because nvcc is unavailable",
+        )
+    environment = {
+        key: value
+        for key, value in os.environ.items()
+        if key in {"HOME", "LANG", "LC_ALL", "PATH", "TMPDIR", "USER"}
+    }
+    try:
+        completed = subprocess.run(
+            [executable, "--version"],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=30,
+            env=environment,
+        )
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise MsctlError(
+            "ENV_CUDA_UNAVAILABLE",
+            "pinned CUDA toolkit version could not be queried",
+        ) from error
+    match = re.search(
+        r"\brelease\s+([0-9]+\.[0-9]+(?:\.[0-9]+)?)\b",
+        completed.stdout + "\n" + completed.stderr,
+    )
+    if completed.returncode != 0 or match is None:
+        raise MsctlError(
+            "ENV_CUDA_UNAVAILABLE",
+            "nvcc did not report a supported CUDA release",
+        )
+    return match.group(1)
 
 
 def ensure_environment(
@@ -78,17 +197,70 @@ def ensure_environment(
     destination = Path(root)
     if destination.is_symlink() or destination.parent.is_symlink():
         raise MsctlError("UNSAFE_PATH", "environment root must not be a symlink")
-    lock_path = regular_file(lock, label="environment lock")
-    lock_hash = sha256_file(lock_path)
+    lock_candidate = Path(lock)
+    lock_path: Path | None = None
+    lock_hash: str | None = None
+    if lock_candidate.exists() and not lock_candidate.is_symlink():
+        lock_path = regular_file(lock_candidate, label="environment lock")
+        lock_hash = sha256_file(lock_path)
+    missing_inputs = [
+        name
+        for name, value in (
+            ("python_version", profile.python_version),
+            ("cuda_version", profile.cuda_version),
+        )
+        if value is None
+    ]
     plan = {
         "provider": profile.provider,
         "root": str(destination),
-        "lock": str(lock_path),
+        "lock": str(lock_candidate),
         "lock_sha256": lock_hash,
+        "site_contract": {
+            "status": profile.environment_status,
+            "python_implementation": profile.python_implementation,
+            "python_version": profile.python_version,
+            "platform": profile.platform,
+            "cuda_version": profile.cuda_version,
+        },
+        "missing_operator_inputs": missing_inputs,
         "steps": ["venv", "pip-install-require-hashes", "write-receipt"],
     }
     if not apply:
         return {**plan, "created": False}
+    if profile.environment_status != "pinned" or missing_inputs:
+        raise MsctlError(
+            "ENV_CONTRACT_INCOMPLETE",
+            "environment apply requires operator-pinned CPython and CUDA versions",
+            details={"missing_operator_inputs": missing_inputs},
+        )
+    if lock_path is None or lock_hash is None:
+        raise MsctlError(
+            "ENV_LOCK_REQUIRED",
+            "environment apply requires the platform-specific hash lock",
+            details={"lock": str(lock_candidate)},
+        )
+    _validate_lock_contract(lock_path, profile)
+    actual_platform = (
+        f"{platform.system().lower()}_{platform.machine().lower()}"
+    )
+    actual_python = platform.python_version()
+    actual_cuda = _detect_cuda_version()
+    if (
+        platform.python_implementation() != profile.python_implementation
+        or actual_platform != profile.platform
+        or actual_python != profile.python_version
+        or actual_cuda != profile.cuda_version
+    ):
+        raise MsctlError(
+            "ENV_PLATFORM_MISMATCH",
+            "the current interpreter does not match the pinned site contract",
+            details={
+                "actual_platform": actual_platform,
+                "actual_python": actual_python,
+                "actual_cuda": actual_cuda,
+            },
+        )
 
     receipt_path = destination / RECEIPT_NAME
     if destination.exists():
@@ -105,6 +277,9 @@ def ensure_environment(
                 and receipt.get("provider") == profile.provider
                 and receipt.get("profile_sha256") == profile.sha256
                 and receipt.get("lock_sha256") == lock_hash
+                and receipt.get("python") == profile.python_version
+                and receipt.get("platform") == profile.platform
+                and receipt.get("cuda_version") == profile.cuda_version
             ):
                 return {
                     **plan,
@@ -152,7 +327,9 @@ def ensure_environment(
             "provider": profile.provider,
             "profile_sha256": profile.sha256,
             "lock_sha256": lock_hash,
-            "python": sys.version.split()[0],
+            "python": profile.python_version,
+            "platform": profile.platform,
+            "cuda_version": profile.cuda_version,
             "created_at": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
         }
         atomic_write_json(temporary / RECEIPT_NAME, receipt)

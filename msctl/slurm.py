@@ -8,8 +8,9 @@ import shutil
 import subprocess
 from collections.abc import Mapping, Sequence
 
-from .contracts import Release, RunManifest
+from .contracts import CheckpointReceipt, Release, RunManifest
 from .errors import MsctlError
+from .jsonutil import canonical_sha256
 from .profile import IlluminaProfile
 
 
@@ -24,6 +25,17 @@ ACTIVE_STATES = {
     "REQUEUED",
     "RUNNING",
     "SUSPENDED",
+}
+RESUMABLE_TERMINAL_STATES = {
+    "BOOT_FAIL",
+    "CANCELLED",
+    "DEADLINE",
+    "FAILED",
+    "NODE_FAIL",
+    "OUT_OF_MEMORY",
+    "PREEMPTED",
+    "REVOKED",
+    "TIMEOUT",
 }
 _SAFE_CHILD_ENV = {
     "HOME",
@@ -97,14 +109,92 @@ def _resource_args(profile: IlluminaProfile) -> list[str]:
     return result
 
 
+def resource_request(
+    profile: IlluminaProfile,
+    operation: str,
+) -> dict[str, object]:
+    if operation in {"submit", "resume"}:
+        gpus = profile.allocated_gpus
+        wall_minutes = profile.seed0_wall_minutes
+        script: str | None = SEED0_SCRIPT
+        gres: str | None = f"{profile.gres}:{gpus}"
+        jobs = 1
+    elif operation == "evaluate":
+        gpus = profile.evaluation_gpus
+        wall_minutes = profile.evaluation_wall_minutes
+        script = EVALUATE_SCRIPT
+        gres = f"{profile.gres}:{gpus}"
+        jobs = 1
+    elif operation in {"cancel", "cleanup"}:
+        gpus = 0
+        wall_minutes = 0
+        script = None
+        gres = None
+        jobs = 0
+    else:
+        raise MsctlError(
+            "RESOURCE_REQUEST_INVALID",
+            "unsupported operation for resource accounting",
+            details={"operation": operation},
+        )
+    return {
+        "schema_version": 1,
+        "operation": operation,
+        "jobs": jobs,
+        "allocated_gpus": gpus,
+        "wall_minutes": wall_minutes,
+        "gpu_hours": gpus * wall_minutes / 60.0,
+        "gres": gres,
+        "script": script,
+    }
+
+
+def submission_identity(
+    profile: IlluminaProfile,
+    release: Release,
+    manifest: RunManifest,
+    *,
+    operation: str,
+    attempt: int = 1,
+    checkpoint_receipt_sha256: str | None = None,
+) -> tuple[str, str, str]:
+    value = {
+        "schema_version": 1,
+        "provider": profile.provider,
+        "profile_sha256": profile.sha256,
+        "release_sha256": release.archive_sha256,
+        "run_manifest_sha256": manifest.sha256,
+        "operation": operation,
+        "attempt": attempt,
+        "checkpoint_receipt_sha256": checkpoint_receipt_sha256,
+        "resource_request": resource_request(profile, operation),
+    }
+    key = canonical_sha256(value)
+    return key, f"ms-v2-{operation}-{key[:12]}", f"msctl:{key}"
+
+
 def render_seed0_command(
     profile: IlluminaProfile,
     release: Release,
     manifest: RunManifest,
     *,
-    resume: bool = False,
+    checkpoint_receipt: CheckpointReceipt | None = None,
+    attempt: int = 1,
 ) -> list[str]:
+    operation = "resume" if checkpoint_receipt is not None else "submit"
     by_arm = {run.arm: run for run in manifest.runs}
+    key, job_name, comment = submission_identity(
+        profile,
+        release,
+        manifest,
+        operation=operation,
+        attempt=attempt,
+        checkpoint_receipt_sha256=(
+            checkpoint_receipt.sha256
+            if checkpoint_receipt is not None
+            else None
+        ),
+    )
     exports = _forward_exports(
         profile,
         ("MS_SHARED_ROOT", "MS_ENV_ROOT", "MS_DATA_ROOT", "MS_OUT_ROOT"),
@@ -135,16 +225,38 @@ def render_seed0_command(
         ),
         _safe_export("MS_WORLD_SIZE", 3, profile),
         _safe_export("MS_EVAL_GPU", 6, profile),
-        _safe_export("MS_RESUME", int(resume), profile),
+        _safe_export("MS_RESUME", int(checkpoint_receipt is not None), profile),
     ]
+    if checkpoint_receipt is not None:
+        by_checkpoint_arm = {
+            checkpoint.arm: checkpoint
+            for checkpoint in checkpoint_receipt.checkpoints
+        }
+        for prefix, arm in (("DENSE", "dense"), ("SPLIT", "split90")):
+            checkpoint = by_checkpoint_arm[arm]
+            exports.extend(
+                [
+                    _safe_export(
+                        f"MS_{prefix}_RESUME_PATH",
+                        checkpoint.path,
+                        profile,
+                    ),
+                    _safe_export(
+                        f"MS_{prefix}_RESUME_SHA256",
+                        checkpoint.sha256,
+                        profile,
+                    ),
+                ]
+            )
     return [
         "sbatch",
         "--parsable",
         *_resource_args(profile),
         f"--gres={profile.gres}:{profile.allocated_gpus}",
         f"--time={_wall_time(profile.seed0_wall_minutes)}",
-        "--job-name=ms-v2-seed0",
-        f"--export=NONE,{','.join(exports)}",
+        f"--job-name={job_name}",
+        f"--comment={comment}",
+        f"--export={','.join(exports)}",
         SEED0_SCRIPT,
     ]
 
@@ -154,6 +266,12 @@ def render_evaluate_command(
     release: Release,
     manifest: RunManifest,
 ) -> list[str]:
+    _, job_name, comment = submission_identity(
+        profile,
+        release,
+        manifest,
+        operation="evaluate",
+    )
     exports = _forward_exports(
         profile,
         (
@@ -185,8 +303,9 @@ def render_evaluate_command(
         *_resource_args(profile),
         f"--gres={profile.gres}:{profile.evaluation_gpus}",
         f"--time={_wall_time(profile.evaluation_wall_minutes)}",
-        "--job-name=ms-v2-evaluate",
-        f"--export=NONE,{','.join(exports)}",
+        f"--job-name={job_name}",
+        f"--comment={comment}",
+        f"--export={','.join(exports)}",
         EVALUATE_SCRIPT,
     ]
 
@@ -197,7 +316,13 @@ def redact(value: str, *, secrets: Sequence[str] = ()) -> str:
         if secret:
             result = result.replace(secret, "[REDACTED]")
     for pattern in _REDACT_PATTERNS:
-        result = pattern.sub(lambda match: f"{match.group(1)}=[REDACTED]", result)
+        if pattern.groups:
+            result = pattern.sub(
+                lambda match: f"{match.group(1)}=[REDACTED]",
+                result,
+            )
+        else:
+            result = pattern.sub("[REDACTED]", result)
     return result
 
 
@@ -295,6 +420,14 @@ def query_states(
     *,
     environ: Mapping[str, str] | None = None,
 ) -> dict[str, str]:
+    if any(
+        not isinstance(job_id, str) or not job_id.isdigit()
+        for job_id in job_ids
+    ):
+        raise MsctlError(
+            "STATUS_RESPONSE_INVALID",
+            "recorded Slurm job IDs must be decimal integers",
+        )
     unique = sorted(set(job_ids), key=int)
     if not unique:
         return {}
@@ -353,6 +486,67 @@ def query_states(
             details={"job_ids": unique},
         )
     return states
+
+
+def discover_jobs(
+    submission_key: str,
+    job_name: str,
+    *,
+    environ: Mapping[str, str] | None = None,
+) -> dict[str, str]:
+    """Find existing Slurm jobs by the exact deterministic msctl comment."""
+
+    require_tools(
+        ["squeue", "sacct"],
+        operation="submission recovery",
+        environ=environ,
+    )
+    source = os.environ if environ is None else environ
+    user = source.get("USER", "")
+    comment = f"msctl:{submission_key}"
+    queue = run_command(
+        ["squeue", "-h", "-u", user, "-o", "%i|%k|%T"],
+        operation="submission recovery",
+        environ=environ,
+    )
+    jobs: dict[str, str] = {}
+
+    def consume(text: str, *, source_name: str) -> None:
+        for raw_line in text.splitlines():
+            if not raw_line.strip():
+                continue
+            parts = raw_line.strip().split("|")
+            if len(parts) < 3:
+                raise MsctlError(
+                    "RECOVERY_RESPONSE_INVALID",
+                    f"{source_name} returned a malformed recovery row",
+                )
+            job_id, row_comment, state = parts[:3]
+            if row_comment != comment:
+                continue
+            if not job_id.isdigit() or not state:
+                raise MsctlError(
+                    "RECOVERY_RESPONSE_INVALID",
+                    f"{source_name} returned an invalid matching row",
+                )
+            jobs[job_id] = state.split()[0].upper()
+
+    consume(queue.stdout, source_name="squeue")
+    accounting = run_command(
+        [
+            "sacct",
+            "-n",
+            "-P",
+            "-X",
+            "--name",
+            job_name,
+            "--format=JobIDRaw,Comment,State",
+        ],
+        operation="submission recovery",
+        environ=environ,
+    )
+    consume(accounting.stdout, source_name="sacct")
+    return jobs
 
 
 def capacity_check(

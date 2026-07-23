@@ -196,10 +196,12 @@ def test_double_build_is_byte_identical_with_internal_and_external_hashes(
     first = package_module.build_handoff(
         source_root=source,
         out_dir=tmp_path / "out-a",
+        apply=True,
     )
     second = package_module.build_handoff(
         source_root=source,
         out_dir=tmp_path / "out-b",
+        apply=True,
     )
 
     assert first.archive.name == second.archive.name
@@ -491,6 +493,7 @@ def test_zip_has_closed_members_normalized_metadata_and_all_planned_directories(
     artifacts = package_module.build_handoff(
         source_root=source,
         out_dir=tmp_path / "out",
+        apply=True,
     )
 
     with zipfile.ZipFile(artifacts.archive) as archive:
@@ -606,6 +609,7 @@ def test_packager_cli_emits_one_json_object(tmp_path, package_module):
             str(source),
             "--out-dir",
             str(tmp_path / "out"),
+            "--apply",
         ],
         capture_output=True,
         text=True,
@@ -619,3 +623,195 @@ def test_packager_cli_emits_one_json_object(tmp_path, package_module):
     report = json.loads(lines[0])
     assert report["ok"] is True
     assert report["sha256"] == _sha256(Path(report["archive"]))
+
+
+def test_packager_reads_immutable_git_objects_after_snapshot(
+    tmp_path,
+    package_module,
+    monkeypatch,
+):
+    source = _minimal_repo(tmp_path)
+    committed = (source / "AGENT-START.md").read_bytes()
+    original_run_git = package_module._run_git
+    raced = False
+
+    def racing_git(root, *arguments):
+        nonlocal raced
+        output = original_run_git(root, *arguments)
+        if not raced and arguments and arguments[0] in {"ls-files", "ls-tree"}:
+            (source / "AGENT-START.md").write_bytes(b"raced worktree bytes\n")
+            raced = True
+        return output
+
+    monkeypatch.setattr(package_module, "_run_git", racing_git)
+    artifacts = package_module.build_handoff(
+        source_root=source,
+        out_dir=tmp_path / "out",
+        apply=True,
+    )
+
+    assert raced is True
+    with zipfile.ZipFile(artifacts.archive) as archive:
+        assert archive.read("AGENT-START.md") == committed
+
+
+@pytest.mark.parametrize(
+    ("secret_name", "secret_value", "quote"),
+    [
+        (
+            "AWS_" + "SECRET_ACCESS_KEY",
+            "abcdefghijklmnopqrstuvwx",
+            "",
+        ),
+        ("HF_" + "TOKEN", "hf_" + "abcdefghijklmnopqrstuvwxyz", "'"),
+        (
+            "GITHUB_" + "TOKEN",
+            "github_" + "pat_abcdefghijklmnopqrstuvwxyz",
+            '"',
+        ),
+        ("api_" + "token", "abcdefghijklmnopqrstuvwxyz012345", ""),
+        ("TO" + "KEN", "abcdefghijklmnopqrstuvwxyz012345", '"'),
+        (
+            "OPENAI_" + "API_KEY",
+            "sk-" + "abcdefghijklmnopqrstuvwxyz012345",
+            '"',
+        ),
+    ],
+)
+def test_packager_rejects_quoted_and_unquoted_common_secret_assignments(
+    tmp_path,
+    package_module,
+    secret_name,
+    secret_value,
+    quote,
+):
+    secret_bytes = (
+        f"{secret_name} = {quote}{secret_value}{quote}\n".encode()
+    )
+    source = _minimal_repo(tmp_path)
+    leak = source / "msctl" / "leak.py"
+    leak.write_bytes(secret_bytes)
+    _git(source, "add", "msctl/leak.py")
+    _git(source, "commit", "-qm", "add secret fixture")
+
+    with pytest.raises(package_module.PackageError) as caught:
+        package_module.build_handoff(
+            source_root=source,
+            out_dir=tmp_path / "out",
+        )
+
+    message = str(caught.value)
+    assert "secret" in message.lower()
+    assert secret_bytes.strip().decode() not in message
+
+
+def test_packager_cli_defaults_to_json_dry_run_without_publication(tmp_path):
+    source = _minimal_repo(tmp_path)
+    out = tmp_path / "out"
+
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(SCRIPT),
+            "--source-root",
+            str(source),
+            "--out-dir",
+            str(out),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert completed.returncode == 0
+    assert completed.stderr == ""
+    lines = completed.stdout.splitlines()
+    assert len(lines) == 1
+    report = json.loads(lines[0])
+    assert report["ok"] is True
+    assert report["dry_run"] is True
+    assert report["published"] is False
+    assert not out.exists()
+
+
+@pytest.mark.parametrize("arguments", [["--help"], ["--not-an-option"]])
+def test_packager_help_and_usage_are_one_json_object(arguments):
+    completed = subprocess.run(
+        [sys.executable, str(SCRIPT), *arguments],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert completed.stderr == ""
+    lines = completed.stdout.splitlines()
+    assert len(lines) == 1
+    report = json.loads(lines[0])
+    assert isinstance(report, dict)
+    assert report["schema_version"] == 1
+    if arguments == ["--help"]:
+        assert completed.returncode == 0
+        assert report["ok"] is True
+        assert report["dry_run"] is True
+        assert "help" in report
+    else:
+        assert completed.returncode != 0
+        assert report["ok"] is False
+        assert report["error"]["code"] == "CLI_USAGE"
+
+
+def test_packager_apply_atomically_publishes_one_no_replace_release_directory(
+    tmp_path,
+):
+    source = _minimal_repo(tmp_path)
+    out = tmp_path / "out"
+    command = [
+        sys.executable,
+        str(SCRIPT),
+        "--source-root",
+        str(source),
+        "--out-dir",
+        str(out),
+        "--apply",
+    ]
+
+    first = subprocess.run(command, capture_output=True, text=True, check=False)
+    second = subprocess.run(command, capture_output=True, text=True, check=False)
+
+    assert first.returncode == 0
+    first_report = json.loads(first.stdout)
+    release_dir = Path(first_report["release_dir"])
+    assert release_dir.parent == out
+    assert release_dir.is_dir()
+    assert {path.name for path in release_dir.iterdir()} == {
+        Path(first_report["archive"]).name,
+        Path(first_report["sha256_file"]).name,
+        "RELEASE.json",
+    }
+    assert second.returncode != 0
+    second_report = json.loads(second.stdout)
+    assert second_report["error"]["code"] == "RELEASE_EXISTS"
+
+
+def test_packager_verifies_internal_checksums_before_publish(
+    tmp_path,
+    package_module,
+    monkeypatch,
+):
+    source = _minimal_repo(tmp_path)
+    original_write_zip = package_module._write_zip
+
+    def corrupting_write_zip(path, *, payload, directories):
+        corrupted = dict(payload)
+        corrupted["SHA256SUMS"] = b"0" * 64 + b"  AGENT-START.md\n"
+        original_write_zip(path, payload=corrupted, directories=directories)
+
+    monkeypatch.setattr(package_module, "_write_zip", corrupting_write_zip)
+
+    with pytest.raises(package_module.PackageError, match="checksum|duplicate"):
+        package_module.build_handoff(
+            source_root=source,
+            out_dir=tmp_path / "out",
+        )
+
+    assert not (tmp_path / "out").exists()

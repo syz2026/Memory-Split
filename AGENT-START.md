@@ -7,21 +7,27 @@ training, and evaluation through Slurm.
 
 ## Safety contract
 
-1. Verify the external ZIP SHA-256 and `RELEASE.json` before extraction.
-2. This archive may launch only seed 0, as one Dense/Split90 pair. Any request
-   to launch seed 1–4 from this archive is a contract violation; stop.
-3. Read `DATASET-POINTER.json` and set `MS_SHARED_ROOT` to an operator-approved
+1. Pass the unmodified `RELEASE.json` to every run lifecycle command. `msctl`
+   resolves the ZIP beside that file and authenticates its type, exact byte
+   count, external and internal SHA-256 manifests, metadata, and complete member
+   set before rendering, submitting, resuming, evaluating, cancelling, or
+   reconciling status.
+2. Read `DATASET-POINTER.json` and set `MS_SHARED_ROOT` to an operator-approved
    directory under `/illumina`.
-4. Invoke `python -m msctl ...` and parse its one JSON object from stdout.
-5. Run the dry-run first and inspect every hash, run ID, resource, and command.
-6. Use `--apply` only after the required signed approval receipt is present.
-7. Stop on any authentication, approval, provenance, dataset, checkpoint,
+3. Invoke `python -m msctl ...` and parse its one JSON object from stdout.
+4. Run the dry-run first and inspect every hash, run ID, resource, and command.
+5. Use `--apply` only after the required signed approval receipt is present.
+6. Stop on any authentication, approval, provenance, dataset, checkpoint,
    Slurm-reconciliation, or hash error. Do not work around a failed gate.
-8. Never print, copy into a job, or include in a report any secret, token, or
+7. Never print, copy into a job, or include in a report any secret, token, or
    `MSCTL_APPROVAL_KEY`.
-9. Never duplicate or manually resubmit a run ID. Let `msctl status` reconcile
+8. Never duplicate or manually resubmit a run ID. Let `msctl status` reconcile
    `squeue` and `sacct`; use `msctl resume` only with a matching checkpoint
    receipt.
+9. If submission is interrupted after intent is recorded, rerun the same
+   command. `msctl` searches `squeue` and then `sacct` by its exact deterministic
+   comment. Zero or multiple matches remain failed and recoverable; never invoke
+   `sbatch` manually to work around that state.
 
 ## Ordered bring-up
 
@@ -30,21 +36,64 @@ msctl auth check
 msctl capacity check
 msctl env ensure
 msctl dataset ensure
-msctl dataset verify
-msctl runs render
-msctl submit
-msctl status
-msctl evaluate
+msctl dataset verify --verification-out DATASET-VERIFICATION.json
+msctl dataset verify --verification-out DATASET-VERIFICATION.json --apply
+msctl runs render --dataset-verification DATASET-VERIFICATION.json
+msctl submit --dataset-verification DATASET-VERIFICATION.json
+msctl status --release RELEASE.json
+msctl evaluate --dataset-verification DATASET-VERIFICATION.json
 msctl collect
 msctl cleanup plan
 ```
 
+Supply `--release`, `--manifest`, and `--dataset-pointer` wherever the command
+requires them. Run the full `dataset verify` command in a Slurm CPU job: it
+recomputes all receipted artifact hashes plus ordered-stream and Merkle
+commitments. Its applied output is a strict v1 verification receipt bound to the
+release, run manifest, source lock, native corpus receipt, and pinned filesystem
+identities. Login-side run commands can use that receipt and recheck only the
+small native receipt and filesystem metadata. Alternatively, `--dataset-root`
+requests a direct full verification. Exactly one of `--dataset-root` and
+`--dataset-verification` is required.
+
 Mutation is always a separate invocation with `--apply`. Paid GPU submission,
 resume, cancellation, sealed scoring, and cleanup additionally require an
 unexpired approval bound to the exact provider, release SHA-256, run-manifest
-SHA-256, job limit, and GPU-hour limit.
+SHA-256, operation, rendered resource request, job limit, and GPU-hour limit.
+Submit and resume currently request one 7-GPU, 36-hour allocation: approvals
+must therefore permit at least 252 GPU-hours, even though only six GPUs train.
+Evaluation is independently charged as its rendered GPU count times wall time.
+Cancellation and cleanup request zero scheduler resources.
+
+Per Slurm's `sbatch --export` contract, `--export=NAME,NAME=value` exports only
+those user variables when `ALL` is omitted (Slurm still supplies its
+`SLURM_*`/SPANK variables and documents implicit `--get-user-env` behavior).
+The renderer intentionally uses that supported explicit form and never combines
+assignments with `ALL` or `NONE`; each payload therefore establishes the final
+boundary again with `env -i`. Do not add `#SBATCH --export=NONE`, ambient token
+forwarding, or approval-key forwarding.
 
 Seed 0 is one precommitted Dense/Split90 pair: three A100s per arm, symmetrically
 scheduled, with the seventh allocated A100 reserved for evaluation or
 verification. Report it only as `directional_only (1/5 complete)`. Its outcome
 must not decide whether seeds 1–4 continue.
+
+## Deliberate fail-closed integration gates
+
+- Environment creation remains blocked until the operator supplies the exact
+  site CPython and CUDA versions in the profile and generates
+  `requirements-illumina.lock` for that Linux x86_64 contract. No portable or
+  fabricated lock is included. Repackage the release after pinning them: run
+  operations reject a local profile, Slurm script, or run config whose bytes
+  differ from the authenticated release.
+- Training remains blocked until `scripts/run_train.py` declares
+  `MSCTL_DDP_CONTRACT = "memorysplit-ddp-v1"`, actually supports one
+  three-process DDP writer per arm, and exposes
+  `--resume-path <verified-checkpoint>`. Initial submit never uses
+  `--resume auto`; resume exports and passes one exact path and SHA-256 per arm.
+- Evaluation remains blocked until `evals/confirmatory/runner.py` declares
+  `MSCTL_EVALUATOR_CONTRACT = "memorysplit-confirmatory-evaluator-v1"` and
+  implements the preflighted `evaluate --run --sealed-release --device`
+  interface.
+- Production corpus materialization and its canonical parallel-corpus receipt
+  must exist under the approved shared root before verification.

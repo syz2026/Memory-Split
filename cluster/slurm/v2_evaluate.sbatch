@@ -26,17 +26,60 @@ MS_ENV_ROOT="${MS_ENV_ROOT:-$MS_SHARED_ROOT/memorysplit/env}"
 MS_DATA_ROOT="${MS_DATA_ROOT:-$MS_SHARED_ROOT/memorysplit/data}"
 MS_OUT_ROOT="${MS_OUT_ROOT:-$MS_SHARED_ROOT/memorysplit/runs}"
 MS_SEALED_ROOT="${MS_SEALED_ROOT:-$MS_SHARED_ROOT/memorysplit/sealed-eval}"
+MS_JOB_HOME="$MS_SHARED_ROOT/memorysplit/job-home"
 PYTHON="$MS_ENV_ROOT/bin/python"
 [[ -x "$PYTHON" ]]
 [[ -d "$MS_SEALED_ROOT" && ! -L "$MS_SEALED_ROOT" ]]
+mkdir -p "$MS_JOB_HOME"
 
 IFS=: read -r -a run_ids <<< "$MS_RUN_IDS"
 [[ "${#run_ids[@]}" -gt 0 ]]
 cd "${SLURM_SUBMIT_DIR:?}"
+EVALUATOR_ENTRYPOINT="evals/confirmatory/runner.py"
+[[ -f "$EVALUATOR_ENTRYPOINT" && ! -L "$EVALUATOR_ENTRYPOINT" ]] || {
+  echo "evaluation preflight failed: explicit runner is unavailable" >&2
+  exit 64
+}
+env -i "PATH=/usr/bin:/bin" "$PYTHON" - "$EVALUATOR_ENTRYPOINT" <<'PY'
+import ast
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+contract = None
+for node in tree.body:
+    if not isinstance(node, ast.Assign):
+        continue
+    if any(
+        isinstance(target, ast.Name)
+        and target.id == "MSCTL_EVALUATOR_CONTRACT"
+        for target in node.targets
+    ):
+        contract = ast.literal_eval(node.value)
+if contract != "memorysplit-confirmatory-evaluator-v1":
+    raise SystemExit(
+        "evaluation preflight failed: runner contract marker is missing"
+    )
+PY
+evaluator_help="$(
+  env -i \
+    "HOME=$MS_JOB_HOME" \
+    "PATH=/usr/bin:/bin" \
+    "PYTHONPATH=$SLURM_SUBMIT_DIR" \
+    "$PYTHON" "$EVALUATOR_ENTRYPOINT" --help
+)"
+for expected in evaluate --run --sealed-release --device; do
+  grep -q -- "$expected" <<< "$evaluator_help" || {
+    echo "evaluation preflight failed: runner interface is incomplete" >&2
+    exit 64
+  }
+done
+
 for run_id in "${run_ids[@]}"; do
   [[ "$run_id" =~ ^[a-z0-9][a-z0-9._-]+[a-z0-9]$ ]]
   env -i \
-    "HOME=$HOME" \
+    "HOME=$MS_JOB_HOME" \
     "PATH=/usr/bin:/bin" \
     "PYTHONPATH=$SLURM_SUBMIT_DIR" \
     "CUDA_VISIBLE_DEVICES=0" \
@@ -48,7 +91,7 @@ for run_id in "${run_ids[@]}"; do
     "MS_DATA_ROOT=$MS_DATA_ROOT" \
     "MS_OUT_ROOT=$MS_OUT_ROOT" \
     "MS_SEALED_ROOT=$MS_SEALED_ROOT" \
-    "$PYTHON" -m evals.confirmatory evaluate \
+    "$PYTHON" "$EVALUATOR_ENTRYPOINT" evaluate \
       --run "$MS_OUT_ROOT/$run_id" \
       --sealed-release "$MS_SEALED_ROOT" \
       --device cuda

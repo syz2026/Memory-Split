@@ -4,8 +4,10 @@ import hashlib
 import hmac
 import json
 import os
+import stat
 import subprocess
 import sys
+import zipfile
 from pathlib import Path
 
 import pytest
@@ -36,34 +38,135 @@ def _write_json(path: Path, value: object) -> Path:
 
 
 def _release(tmp_path: Path) -> Path:
+    release_path = tmp_path / "RELEASE.json"
+    if release_path.is_file():
+        return release_path
+    pointer, _ = _dataset_fixture(tmp_path)
+    source_lock = tmp_path / "configs" / "reasoning-dataset-v2.json"
+    source_lock.parent.mkdir(parents=True, exist_ok=True)
+    source_lock.write_text('{"schema_version":2,"fixture":true}\n')
+    profile_copy = tmp_path / "cluster" / "profiles" / PROFILE.name
+    profile_copy.parent.mkdir(parents=True, exist_ok=True)
+    profile_copy.write_bytes(PROFILE.read_bytes())
+    dense = _write_json(
+        tmp_path / "configs" / "v2" / "dense-s0.json",
+        {"arm": "dense", "seed": 0},
+    )
+    split = _write_json(
+        tmp_path / "configs" / "v2" / "split90-s0.json",
+        {"arm": "split90", "seed": 0},
+    )
+    seed_script = tmp_path / "cluster" / "slurm" / "v2_seed0.sbatch"
+    evaluate_script = tmp_path / "cluster" / "slurm" / "v2_evaluate.sbatch"
+    seed_script.parent.mkdir(parents=True, exist_ok=True)
+    seed_script.write_bytes(
+        (REPO_ROOT / "cluster" / "slurm" / seed_script.name).read_bytes()
+    )
+    evaluate_script.write_bytes(
+        (REPO_ROOT / "cluster" / "slurm" / evaluate_script.name).read_bytes()
+    )
+    source_members = {
+        "DATASET-POINTER.json": pointer.read_bytes(),
+        "cluster/profiles/illumina-usfc-prd.json": profile_copy.read_bytes(),
+        "cluster/slurm/v2_evaluate.sbatch": evaluate_script.read_bytes(),
+        "cluster/slurm/v2_seed0.sbatch": seed_script.read_bytes(),
+        "configs/reasoning-dataset-v2.json": source_lock.read_bytes(),
+        "configs/v2/dense-s0.json": dense.read_bytes(),
+        "configs/v2/split90-s0.json": split.read_bytes(),
+    }
+    member_rows = [
+        {
+            "path": relative,
+            "bytes": len(data),
+            "sha256": hashlib.sha256(data).hexdigest(),
+            "git_blob": "2" * 40,
+        }
+        for relative, data in sorted(source_members.items())
+    ]
+    metadata = (
+        json.dumps(
+            {
+                "schema_version": 1,
+                "provider": "illumina-usfc-prd",
+                "source": {"commit": "2" * 40, "dirty": False},
+                "profile_sha256": hashlib.sha256(
+                    source_members[
+                        "cluster/profiles/illumina-usfc-prd.json"
+                    ]
+                ).hexdigest(),
+                "environment_hashes": {},
+                "members": member_rows,
+            },
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n"
+    ).encode("ascii")
+    payload = {**source_members, "RELEASE-METADATA.json": metadata}
+    sums = "".join(
+        f"{hashlib.sha256(payload[name]).hexdigest()}  {name}\n"
+        for name in sorted(payload)
+    ).encode("ascii")
+    payload["SHA256SUMS"] = sums
+    archive = tmp_path / "ms-illumina-r1-test.zip"
+    with zipfile.ZipFile(
+        archive,
+        "w",
+        compression=zipfile.ZIP_DEFLATED,
+        compresslevel=9,
+    ) as handle:
+        for name, data in sorted(payload.items()):
+            info = zipfile.ZipInfo(name, date_time=(1980, 1, 1, 0, 0, 0))
+            info.create_system = 3
+            info.external_attr = (stat.S_IFREG | 0o644) << 16
+            handle.writestr(info, data)
+    archive_hash = _sha256(archive)
+    (tmp_path / f"{archive.name}.sha256").write_text(
+        f"{archive_hash}  {archive.name}\n"
+    )
     return _write_json(
-        tmp_path / "RELEASE.json",
+        release_path,
         {
             "schema_version": 1,
             "release_id": "r1-test",
             "provider": "illumina-usfc-prd",
             "archive": {
-                "path": "ms-illumina-r1-test.zip",
-                "sha256": "1" * 64,
-                "bytes": 123,
+                "path": archive.name,
+                "sha256": archive_hash,
+                "bytes": archive.stat().st_size,
             },
             "source": {"commit": "2" * 40, "dirty": False},
-            "members_sha256": "3" * 64,
+            "members_sha256": hashlib.sha256(sums).hexdigest(),
         },
     )
 
 
 def _runs(tmp_path: Path) -> tuple[Path, dict]:
+    release = _release(tmp_path)
     configs = tmp_path / "configs" / "v2"
     dense = configs / "dense-s0.json"
     split = configs / "split90-s0.json"
     _write_json(dense, {"arm": "dense", "seed": 0})
     _write_json(split, {"arm": "split90", "seed": 0})
+    pointer, dataset_root = _dataset_fixture(tmp_path)
+    parallel_receipt = json.loads(
+        (dataset_root / "receipt.json").read_text()
+    )
+    source_lock = tmp_path / "configs" / "reasoning-dataset-v2.json"
+    from msctl.dataset import dataset_identity
+
+    identity = dataset_identity(
+        pointer=json.loads(pointer.read_text()),
+        parallel_receipt=parallel_receipt,
+        receipt_sha256=_sha256(dataset_root / "receipt.json"),
+        source_lock_sha256=_sha256(source_lock),
+    )
+    release_value = json.loads(release.read_text())
     value = {
         "schema_version": 1,
         "provider": "illumina-usfc-prd",
-        "release_sha256": "1" * 64,
-        "dataset_sha256": "4" * 64,
+        "release_sha256": release_value["archive"]["sha256"],
+        "dataset_sha256": hashlib.sha256(_canonical(identity)).hexdigest(),
         "runs": [
             {
                 "run_id": "v2-dense-s0",
@@ -92,9 +195,18 @@ def _approval(
     operation: str,
     runs: dict,
     key: str,
-    release_sha256: str = "1" * 64,
+    release_sha256: str | None = None,
     expires_at: str = "2999-01-01T00:00:00Z",
+    gpu_hours: float | None = None,
 ) -> Path:
+    from msctl.profile import load_profile
+    from msctl.slurm import resource_request
+
+    resources = resource_request(load_profile(PROFILE), operation)
+    if release_sha256 is None:
+        release_sha256 = str(runs["release_sha256"])
+    if gpu_hours is None:
+        gpu_hours = float(resources["gpu_hours"])
     unsigned = {
         "schema_version": 1,
         "receipt_id": f"approve-{operation}",
@@ -102,7 +214,8 @@ def _approval(
         "operation": operation,
         "release_sha256": release_sha256,
         "run_manifest_sha256": hashlib.sha256(_canonical(runs)).hexdigest(),
-        "limits": {"gpu_hours": 250.0, "jobs": 2},
+        "resources": resources,
+        "limits": {"gpu_hours": gpu_hours, "jobs": int(resources["jobs"])},
         "expires_at": expires_at,
         "key_id": "operator-test",
     }
@@ -116,13 +229,42 @@ def _run_msctl(
     *arguments: str,
     cwd: Path = REPO_ROOT,
     env: dict[str, str] | None = None,
+    bind_dataset: bool = True,
 ) -> subprocess.CompletedProcess[str]:
+    rendered = list(arguments)
+    if bind_dataset and "--repo-root" in rendered:
+        root = Path(rendered[rendered.index("--repo-root") + 1])
+        if any(
+            command in rendered
+            for command in ("submit", "resume", "evaluate")
+        ) or ("runs" in rendered and "render" in rendered):
+            if "--dataset-pointer" not in rendered:
+                rendered.extend(
+                    [
+                        "--dataset-pointer",
+                        str(root / "DATASET-POINTER.json"),
+                        "--dataset-root",
+                        str(root / "dataset"),
+                    ]
+                )
+        if "dataset" in rendered and "verify" in rendered:
+            release = _release(root)
+            manifest, _ = _runs(root)
+            if "--release" not in rendered:
+                rendered.extend(
+                    [
+                        "--release",
+                        str(release),
+                        "--manifest",
+                        str(manifest),
+                    ]
+                )
     merged = dict(os.environ)
     merged["PYTHONPATH"] = str(REPO_ROOT)
     if env:
         merged.update(env)
     return subprocess.run(
-        [sys.executable, "-m", "msctl", *arguments],
+        [sys.executable, "-m", "msctl", *rendered],
         cwd=cwd,
         env=merged,
         capture_output=True,
@@ -210,8 +352,9 @@ def test_runs_render_is_deterministic_dry_run_with_explicit_environment(tmp_path
     assert command[:2] == ["sbatch", "--parsable"]
     assert "--gres=gpu:a100:7" in command
     exports = next(item for item in command if item.startswith("--export="))
-    assert exports.startswith("--export=NONE,")
+    assert not exports.startswith("--export=NONE,")
     assert "ALL" not in exports
+    assert "NONE" not in exports
     assert "MSCTL_APPROVAL_KEY" not in exports
     assert command[-1] == "cluster/slurm/v2_seed0.sbatch"
 
@@ -354,6 +497,122 @@ def test_submit_uses_parsable_job_id_and_is_idempotent_for_active_runs(tmp_path)
 
 
 @pytest.mark.parametrize(
+    ("discovery", "expected_code"),
+    [
+        ("one", None),
+        ("none", "SUBMISSION_UNCERTAIN"),
+        ("multiple", "SUBMISSION_MULTIPLE_MATCHES"),
+    ],
+)
+def test_submit_recovers_exact_intent_or_refuses_uncertain_resubmission(
+    tmp_path,
+    discovery,
+    expected_code,
+):
+    release = _release(tmp_path)
+    manifest, runs = _runs(tmp_path)
+    key = "r" * 32
+    approval = _approval(
+        tmp_path,
+        operation="submit",
+        runs=runs,
+        key=key,
+    )
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    _write_executable(bin_dir / "sbatch", "printf 'not-a-job-id\\n'\n")
+    args = [
+        *_base_args(tmp_path),
+        "submit",
+        "--release",
+        str(release),
+        "--manifest",
+        str(manifest),
+        "--approval",
+        str(approval),
+        "--apply",
+    ]
+    env = {
+        "PATH": str(bin_dir),
+        "MSCTL_APPROVAL_KEY": key,
+    }
+
+    interrupted = _run_msctl(*args, env=env)
+    assert interrupted.returncode != 0
+    state = json.loads(
+        (tmp_path / "state" / "runs" / "v2-dense-s0.json").read_text()
+    )
+    submission_key = state["submission_key"]
+    marker = tmp_path / "unexpected-resubmit"
+    _write_executable(bin_dir / "sbatch", f"touch '{marker}'\n")
+    submission_comment = f"msctl:{submission_key}"
+    if discovery == "one":
+        queue_output = f"printf '777|{submission_comment}|RUNNING\\n'\n"
+    elif discovery == "multiple":
+        queue_output = (
+            f"printf '777|{submission_comment}|RUNNING\\n"
+            f"778|{submission_comment}|PENDING\\n'\n"
+        )
+    else:
+        queue_output = "exit 0\n"
+    _write_executable(bin_dir / "squeue", queue_output)
+    _write_executable(bin_dir / "sacct", "exit 0\n")
+
+    recovered = _run_msctl(*args, env=env)
+
+    assert not marker.exists()
+    report = _single_report(recovered)
+    if expected_code is None:
+        assert recovered.returncode == 0
+        assert report["result"]["job_id"] == "777"
+        assert report["result"]["submitted"] == 0
+        assert report["result"]["idempotent"] is True
+    else:
+        assert recovered.returncode != 0
+        assert report["error"]["code"] == expected_code
+        if expected_code == "SUBMISSION_UNCERTAIN":
+            assert report["error"]["details"]["recoverable"] is True
+
+
+def test_submit_recovery_repairs_a_partial_post_sbatch_state_update(tmp_path):
+    release, manifest, _, key, bin_dir = _submitted_pair(tmp_path)
+    dense_path = tmp_path / "state" / "runs" / "v2-dense-s0.json"
+    split_path = tmp_path / "state" / "runs" / "v2-split90-s0.json"
+    dense = json.loads(dense_path.read_text())
+    split = json.loads(split_path.read_text())
+    split["job_id"] = None
+    split["status"] = "SUBMITTING"
+    _write_json(split_path, split)
+    submission_comment = f"msctl:{dense['submission_key']}"
+    _write_executable(
+        bin_dir / "squeue",
+        f"printf '777|{submission_comment}|RUNNING\\n'\n",
+    )
+    _write_executable(bin_dir / "sacct", "exit 0\n")
+    marker = tmp_path / "unexpected-resubmit"
+    _write_executable(bin_dir / "sbatch", f"touch '{marker}'\n")
+
+    recovered = _run_msctl(
+        *_base_args(tmp_path),
+        "submit",
+        "--release",
+        str(release),
+        "--manifest",
+        str(manifest),
+        "--approval",
+        str(tmp_path / "submit-approval.json"),
+        "--apply",
+        env={"PATH": str(bin_dir), "MSCTL_APPROVAL_KEY": key},
+    )
+
+    assert recovered.returncode == 0
+    assert not marker.exists()
+    assert _single_report(recovered)["result"]["job_id"] == "777"
+    assert json.loads(dense_path.read_text())["job_id"] == "777"
+    assert json.loads(split_path.read_text())["job_id"] == "777"
+
+
+@pytest.mark.parametrize(
     ("mutation", "expected_code"),
     [
         ("expired", "APPROVAL_EXPIRED"),
@@ -376,7 +635,9 @@ def test_submit_fails_closed_on_invalid_approval(
         runs=runs,
         key=key,
         release_sha256=(
-            "9" * 64 if mutation == "wrong_release" else "1" * 64
+            "9" * 64
+            if mutation == "wrong_release"
+            else str(runs["release_sha256"])
         ),
         expires_at=(
             "2000-01-01T00:00:00Z"
@@ -389,7 +650,7 @@ def test_submit_fails_closed_on_invalid_approval(
         value["signature"] = "0" * 64
         _write_json(approval, value)
     elif mutation == "job_limit":
-        value["limits"]["jobs"] = 1
+        value["limits"]["jobs"] = 0
         unsigned = {key_: item for key_, item in value.items() if key_ != "signature"}
         value["signature"] = hmac.new(
             key.encode(), _canonical(unsigned), hashlib.sha256
@@ -450,7 +711,8 @@ def test_seed0_slurm_script_is_symmetric_and_reserves_gpu_seven():
     assert "3,4,5" in text
     assert "GPU 6" in text or "gpu 6" in text
     assert text.count("--nproc_per_node=3") == 2
-    assert "--resume auto" in text
+    assert "--resume auto" not in text
+    assert "memorysplit-ddp-v1" in text
 
 
 def test_agent_start_and_project_skill_enforce_plan_then_apply():
@@ -516,13 +778,20 @@ def _scope_approval(
     jobs: int,
     gpu_hours: float = 0.0,
 ) -> Path:
+    from msctl.profile import load_profile
+    from msctl.slurm import resource_request
+
+    release_sha256 = json.loads(_release(tmp_path).read_text())["archive"][
+        "sha256"
+    ]
     unsigned = {
         "schema_version": 1,
         "receipt_id": f"approve-{operation}-scope",
         "provider": "illumina-usfc-prd",
         "operation": operation,
-        "release_sha256": "1" * 64,
+        "release_sha256": release_sha256,
         "run_manifest_sha256": scope_sha256,
+        "resources": resource_request(load_profile(PROFILE), operation),
         "limits": {"gpu_hours": gpu_hours, "jobs": jobs},
         "expires_at": "2999-01-01T00:00:00Z",
         "key_id": "operator-test",
@@ -533,9 +802,7 @@ def _scope_approval(
     return _write_json(tmp_path / f"{operation}-scope-approval.json", unsigned)
 
 
-def test_env_ensure_apply_builds_hash_bound_environment_and_is_idempotent(
-    tmp_path,
-):
+def test_env_ensure_dry_run_reports_missing_site_contract(tmp_path):
     lock = tmp_path / "requirements-illumina.lock"
     lock.write_text("# empty test lock; production lock contains hashes\n")
     environment = tmp_path / "environment"
@@ -547,46 +814,45 @@ def test_env_ensure_apply_builds_hash_bound_environment_and_is_idempotent(
         str(environment),
         "--lock",
         str(lock),
-        "--apply",
     ]
 
-    first = _run_msctl(*args)
-    second = _run_msctl(*args)
+    completed = _run_msctl(*args)
 
-    assert first.returncode == second.returncode == 0
-    first_report = _single_report(first)
-    second_report = _single_report(second)
-    assert first_report["result"]["created"] is True
-    assert second_report["result"]["created"] is False
-    assert (environment / "bin" / "python").is_file()
-    receipt = json.loads((environment / "msctl-env-receipt.json").read_text())
-    assert receipt["lock_sha256"] == _sha256(lock)
-    assert receipt["provider"] == "illumina-usfc-prd"
+    assert completed.returncode == 0
+    report = _single_report(completed)
+    assert report["dry_run"] is True
+    assert report["result"]["created"] is False
+    assert report["result"]["missing_operator_inputs"] == [
+        "python_version",
+        "cuda_version",
+    ]
+    assert not environment.exists()
 
 
 def _dataset_fixture(tmp_path: Path) -> tuple[Path, Path]:
+    from corpusgen.parallel import (
+        FixtureRenderer,
+        ParallelBuildConfig,
+        build_parallel_corpus,
+        fixture_catalog,
+    )
+
     root = tmp_path / "dataset"
-    shard = root / "shards" / "000.bin"
-    shard.parent.mkdir(parents=True)
-    shard.write_bytes(b"deterministic shard")
-    files = [
-        {
-            "path": "shards/000.bin",
-            "bytes": shard.stat().st_size,
-            "sha256": _sha256(shard),
-        }
-    ]
-    receipt = {
-        "schema_version": 1,
-        "dataset_id": "memorysplit-v2-20x-seed0",
-        "provider": "illumina-usfc-prd",
-        "release_sha256": "1" * 64,
-        "dataset_sha256": "4" * 64,
-        "ordered_stream_sha256": "5" * 64,
-        "merkle_root": "6" * 64,
-        "files": files,
-    }
-    _write_json(root / "dataset-receipt.json", receipt)
+    if not root.exists():
+        build_parallel_corpus(
+            fixture_catalog(record_count=6),
+            FixtureRenderer(),
+            ParallelBuildConfig(
+                lane_weights=(
+                    ("natural", 1),
+                    ("facts", 1),
+                    ("reasoning", 1),
+                ),
+                update_tokens=64,
+                allow_fewer_shards=True,
+            ),
+            root,
+        )
     pointer = _write_json(
         tmp_path / "DATASET-POINTER.json",
         {
@@ -599,7 +865,12 @@ def _dataset_fixture(tmp_path: Path) -> tuple[Path, Path]:
             "materialization": "slurm",
             "full_corpus_in_release": False,
             "source_lock_manifest": "configs/reasoning-dataset-v2.json",
-            "required_receipt": "dataset-receipt.json",
+            "required_receipt": "receipt.json",
+            "receipt_format": "memorysplit-parallel-corpus-v1",
+            "identity_scheme": "memorysplit-dataset-binding-v1",
+            "verification_receipt_format": (
+                "memorysplit-dataset-verification-v1"
+            ),
         },
     )
     return pointer, root
@@ -620,15 +891,23 @@ def test_dataset_verify_hashes_every_receipted_file_and_rejects_tampering(
     ]
 
     valid = _run_msctl(*args)
-    (root / "shards" / "000.bin").write_bytes(b"tampered")
+    shard = next((root / "shards").glob("*.bin"))
+    shard.write_bytes(b"tampered")
     invalid = _run_msctl(*args)
 
     assert valid.returncode == 0
     valid_report = _single_report(valid)
-    assert valid_report["result"]["verified_files"] == 1
-    assert valid_report["result"]["dataset_sha256"] == "4" * 64
+    assert valid_report["result"]["verified_files"] >= 5
+    manifest = json.loads((tmp_path / "runs.json").read_text())
+    assert (
+        valid_report["result"]["dataset_sha256"]
+        == manifest["dataset_sha256"]
+    )
     assert invalid.returncode != 0
-    assert _single_report(invalid)["error"]["code"] == "DATASET_HASH_MISMATCH"
+    assert (
+        _single_report(invalid)["error"]["code"]
+        == "DATASET_RECEIPT_INVALID"
+    )
 
 
 def test_dataset_ensure_apply_fails_closed_without_cluster_builder(tmp_path):
@@ -651,12 +930,14 @@ def test_dataset_ensure_apply_fails_closed_without_cluster_builder(tmp_path):
 
 
 def test_status_reconciles_squeue_and_cached_mode_never_calls_slurm(tmp_path):
-    _, manifest, _, _, bin_dir = _submitted_pair(tmp_path)
+    release, manifest, _, _, bin_dir = _submitted_pair(tmp_path)
     _write_executable(bin_dir / "squeue", "printf '777|RUNNING\\n'\n")
     _write_executable(bin_dir / "sacct", "exit 0\n")
     live = _run_msctl(
         *_base_args(tmp_path),
         "status",
+        "--release",
+        str(release),
         "--manifest",
         str(manifest),
         env={"PATH": str(bin_dir)},
@@ -666,6 +947,8 @@ def test_status_reconciles_squeue_and_cached_mode_never_calls_slurm(tmp_path):
     cached = _run_msctl(
         *_base_args(tmp_path),
         "status",
+        "--release",
+        str(release),
         "--manifest",
         str(manifest),
         "--cached",
@@ -707,11 +990,11 @@ def _checkpoint_receipt(
         {
             "schema_version": 1,
             "provider": "illumina-usfc-prd",
-            "release_sha256": "1" * 64,
+            "release_sha256": runs["release_sha256"],
             "run_manifest_sha256": hashlib.sha256(
                 _canonical(runs)
             ).hexdigest(),
-            "dataset_sha256": "4" * 64,
+            "dataset_sha256": runs["dataset_sha256"],
             "checkpoints": checkpoints,
         },
     )
@@ -755,6 +1038,40 @@ def test_resume_reconciles_terminal_job_and_requires_matching_checkpoints(tmp_pa
         )
         assert state["attempt"] == 2
         assert state["job_id"] == "888"
+
+
+def test_resume_never_resubmits_when_slurm_cannot_prove_terminal_state(tmp_path):
+    release, manifest, runs, key, bin_dir = _submitted_pair(tmp_path)
+    _write_executable(bin_dir / "squeue", "exit 0\n")
+    _write_executable(bin_dir / "sacct", "exit 0\n")
+    marker = tmp_path / "unexpected-resume"
+    _write_executable(bin_dir / "sbatch", f"touch '{marker}'\n")
+    receipt = _checkpoint_receipt(tmp_path, runs=runs)
+    approval = _approval(
+        tmp_path,
+        operation="resume",
+        runs=runs,
+        key=key,
+    )
+
+    completed = _run_msctl(
+        *_base_args(tmp_path),
+        "resume",
+        "--release",
+        str(release),
+        "--manifest",
+        str(manifest),
+        "--checkpoint-receipt",
+        str(receipt),
+        "--approval",
+        str(approval),
+        "--apply",
+        env={"PATH": str(bin_dir), "MSCTL_APPROVAL_KEY": key},
+    )
+
+    assert completed.returncode != 0
+    assert _single_report(completed)["error"]["code"] == "STATUS_UNKNOWN"
+    assert not marker.exists()
 
 
 def test_resume_rejects_checkpoint_provenance_before_sbatch(tmp_path):
@@ -976,6 +1293,76 @@ def test_cleanup_apply_is_hash_bound_and_preflights_races(tmp_path):
     assert checkpoint.exists()
 
 
+def test_cleanup_quarantines_and_checks_the_exact_opened_inode(
+    tmp_path,
+    monkeypatch,
+):
+    import msctl.cleanup as cleanup_module
+    from msctl.errors import MsctlError
+    from msctl.profile import load_profile
+
+    release = _release(tmp_path)
+    root = tmp_path / "runs"
+    target = root / "v2-dense-s0" / "logs" / "worker.log"
+    target.parent.mkdir(parents=True)
+    target.write_bytes(b"planned inode")
+    replacement = tmp_path / "replacement"
+    replacement.write_bytes(b"replacement inode")
+    plan = cleanup_module.make_cleanup_plan(root)
+    plan_path = _write_json(tmp_path / "cleanup-plan.json", plan)
+    key = "q" * 32
+    approval = _scope_approval(
+        tmp_path,
+        operation="cleanup",
+        scope_sha256=hashlib.sha256(_canonical(plan)).hexdigest(),
+        key=key,
+        jobs=1,
+    )
+    real_rename = os.rename
+    raced = False
+
+    def racing_rename(
+        source,
+        destination,
+        *,
+        src_dir_fd=None,
+        dst_dir_fd=None,
+    ):
+        nonlocal raced
+        if source == target.name and src_dir_fd is not None and not raced:
+            raced = True
+            real_rename(
+                source,
+                "displaced.log",
+                src_dir_fd=src_dir_fd,
+                dst_dir_fd=src_dir_fd,
+            )
+            os.replace(replacement, target)
+        return real_rename(
+            source,
+            destination,
+            src_dir_fd=src_dir_fd,
+            dst_dir_fd=dst_dir_fd,
+        )
+
+    monkeypatch.setattr(cleanup_module.os, "rename", racing_rename)
+
+    with pytest.raises(MsctlError) as caught:
+        cleanup_module.apply_cleanup(
+            profile=load_profile(PROFILE),
+            plan_path=plan_path,
+            release_path=release,
+            approval_path=approval,
+            apply=True,
+            environ={"MSCTL_APPROVAL_KEY": key},
+        )
+
+    assert caught.value.code == "CLEANUP_RACE"
+    assert raced is True
+    assert target.read_bytes() == b"replacement inode"
+    assert (target.parent / "displaced.log").read_bytes() == b"planned inode"
+
+
 def test_external_errors_redact_approval_key_and_token(tmp_path):
     release = _release(tmp_path)
     manifest, runs = _runs(tmp_path)
@@ -990,7 +1377,11 @@ def test_external_errors_redact_approval_key_and_token(tmp_path):
     bin_dir = tmp_path / "bin"
     _write_executable(
         bin_dir / "sbatch",
-        f"printf 'token={fake_token}\\n' >&2\nexit 1\n",
+        (
+            f"printf 'token={fake_token}\\n' >&2\n"
+            f"printf '{fake_token}\\n' >&2\n"
+            "exit 1\n"
+        ),
     )
 
     completed = _run_msctl(
@@ -1075,7 +1466,10 @@ def test_dataset_verify_rejects_unreceipted_symlinks(tmp_path):
     )
 
     assert completed.returncode != 0
-    assert _single_report(completed)["error"]["code"] == "DATASET_FILE_UNSAFE"
+    assert (
+        _single_report(completed)["error"]["code"]
+        == "DATASET_RECEIPT_INVALID"
+    )
 
 
 def test_collection_idempotence_authenticates_existing_receipt(tmp_path):
@@ -1095,7 +1489,9 @@ def test_collection_idempotence_authenticates_existing_receipt(tmp_path):
     ]
     first = _run_msctl(*args)
     assert first.returncode == 0
-    (out / "COLLECTION.json").write_text('{"tampered":true}\n')
+    receipt = json.loads((out / "COLLECTION.json").read_text())
+    receipt["schema_version"] = True
+    _write_json(out / "COLLECTION.json", receipt)
 
     second = _run_msctl(*args)
 
@@ -1130,3 +1526,790 @@ def test_render_exports_runtime_roots_by_name_and_seed_script_hashes_configs(
     assert "MS_DENSE_CONFIG_SHA256" in script
     assert "MS_SPLIT_CONFIG_SHA256" in script
     assert "hashlib.sha256" in script
+
+
+def test_slurm_export_is_an_explicit_supported_allowlist_without_all_or_none(
+    tmp_path,
+):
+    release = _release(tmp_path)
+    manifest, _ = _runs(tmp_path)
+
+    completed = _run_msctl(
+        *_base_args(tmp_path),
+        "runs",
+        "render",
+        "--release",
+        str(release),
+        "--manifest",
+        str(manifest),
+    )
+
+    assert completed.returncode == 0
+    command = _single_report(completed)["result"]["commands"][0]
+    export = next(item for item in command if item.startswith("--export="))
+    exported_names = {
+        item.split("=", 1)[0]
+        for item in export.removeprefix("--export=").split(",")
+    }
+    assert "ALL" not in exported_names
+    assert "NONE" not in exported_names
+    assert {
+        "MS_SHARED_ROOT",
+        "MS_ENV_ROOT",
+        "MS_DATA_ROOT",
+        "MS_OUT_ROOT",
+        "MS_PROVIDER",
+    } <= exported_names
+
+
+def test_load_release_rejects_missing_archive_before_returning(tmp_path):
+    from msctl.contracts import load_release
+    from msctl.errors import MsctlError
+
+    release = _release(tmp_path)
+    release_value = json.loads(release.read_text())
+    (tmp_path / release_value["archive"]["path"]).unlink()
+
+    with pytest.raises(MsctlError) as caught:
+        load_release(release)
+
+    assert caught.value.code == "RELEASE_ARCHIVE_INVALID"
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ["archive_symlink", "archive_bytes", "external_symlink", "missing_member"],
+)
+def test_load_release_authenticates_all_external_and_internal_bytes(
+    tmp_path,
+    mutation,
+):
+    from msctl.contracts import load_release
+    from msctl.errors import MsctlError
+
+    release = _release(tmp_path)
+    release_value = json.loads(release.read_text())
+    archive = tmp_path / release_value["archive"]["path"]
+    checksum = archive.with_name(archive.name + ".sha256")
+    if mutation == "archive_symlink":
+        outside = tmp_path / "outside.zip"
+        outside.write_bytes(archive.read_bytes())
+        archive.unlink()
+        archive.symlink_to(outside)
+    elif mutation == "archive_bytes":
+        archive.write_bytes(archive.read_bytes() + b"tamper")
+    elif mutation == "external_symlink":
+        outside = tmp_path / "outside.sha256"
+        outside.write_bytes(checksum.read_bytes())
+        checksum.unlink()
+        checksum.symlink_to(outside)
+    else:
+        rewritten = tmp_path / "rewritten.zip"
+        with zipfile.ZipFile(archive) as source, zipfile.ZipFile(
+            rewritten,
+            "w",
+            compression=zipfile.ZIP_DEFLATED,
+            compresslevel=9,
+        ) as destination:
+            for info in source.infolist():
+                if info.filename != "DATASET-POINTER.json":
+                    destination.writestr(info, source.read(info.filename))
+        os.replace(rewritten, archive)
+        archive_hash = _sha256(archive)
+        release_value["archive"]["bytes"] = archive.stat().st_size
+        release_value["archive"]["sha256"] = archive_hash
+        _write_json(release, release_value)
+        checksum.write_text(f"{archive_hash}  {archive.name}\n")
+
+    with pytest.raises(MsctlError) as caught:
+        load_release(release)
+
+    assert caught.value.code in {
+        "RELEASE_ARCHIVE_INVALID",
+        "RELEASE_INTERNAL_INVALID",
+    }
+
+
+@pytest.mark.parametrize(
+    ("runtime_member", "expected_code"),
+    [
+        ("profile", "PROFILE_RELEASE_MISMATCH"),
+        ("slurm", "RELEASE_MEMBER_MISMATCH"),
+        ("config", "RELEASE_MEMBER_MISMATCH"),
+    ],
+)
+def test_run_operations_execute_only_local_bytes_bound_to_release(
+    tmp_path,
+    runtime_member,
+    expected_code,
+):
+    release = _release(tmp_path)
+    manifest, _ = _runs(tmp_path)
+    profile = PROFILE
+    if runtime_member == "profile":
+        profile = tmp_path / "alternate-profile.json"
+        profile.write_text(
+            json.dumps(
+                json.loads(PROFILE.read_text()),
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+        )
+    elif runtime_member == "slurm":
+        with (tmp_path / "cluster" / "slurm" / "v2_seed0.sbatch").open("a") as file:
+            file.write("# changed after release\n")
+    else:
+        config = tmp_path / "configs" / "v2" / "dense-s0.json"
+        with config.open("a") as file:
+            file.write(" ")
+        manifest_value = json.loads(manifest.read_text())
+        dense_run = next(
+            row for row in manifest_value["runs"] if row["arm"] == "dense"
+        )
+        dense_run["config_sha256"] = _sha256(config)
+        _write_json(manifest, manifest_value)
+
+    completed = _run_msctl(
+        "--profile",
+        str(profile),
+        "--repo-root",
+        str(tmp_path),
+        "runs",
+        "render",
+        "--release",
+        str(release),
+        "--manifest",
+        str(manifest),
+        "--dataset-pointer",
+        str(tmp_path / "DATASET-POINTER.json"),
+        "--dataset-root",
+        str(tmp_path / "dataset"),
+        bind_dataset=False,
+    )
+
+    assert completed.returncode != 0
+    assert _single_report(completed)["error"]["code"] == expected_code
+
+
+def test_run_submission_requires_explicit_dataset_verification_inputs(tmp_path):
+    release = _release(tmp_path)
+    manifest, _ = _runs(tmp_path)
+
+    completed = _run_msctl(
+        *_base_args(tmp_path),
+        "submit",
+        "--release",
+        str(release),
+        "--manifest",
+        str(manifest),
+        bind_dataset=False,
+    )
+
+    assert completed.returncode != 0
+    assert _single_report(completed)["error"]["code"] == "CLI_USAGE"
+
+
+def test_submit_accepts_exact_prior_dataset_verification_and_rejects_staleness(
+    tmp_path,
+):
+    release = _release(tmp_path)
+    manifest, _ = _runs(tmp_path)
+    pointer = tmp_path / "DATASET-POINTER.json"
+    root = tmp_path / "dataset"
+    verified = _run_msctl(
+        *_base_args(tmp_path),
+        "dataset",
+        "verify",
+        "--pointer",
+        str(pointer),
+        "--dataset-root",
+        str(root),
+        "--release",
+        str(release),
+        "--manifest",
+        str(manifest),
+        bind_dataset=False,
+    )
+    assert verified.returncode == 0
+    verification = _write_json(
+        tmp_path / "dataset-verification.json",
+        _single_report(verified)["result"],
+    )
+    args = [
+        *_base_args(tmp_path),
+        "submit",
+        "--release",
+        str(release),
+        "--manifest",
+        str(manifest),
+        "--dataset-pointer",
+        str(pointer),
+        "--dataset-verification",
+        str(verification),
+    ]
+
+    accepted = _run_msctl(*args, bind_dataset=False)
+    assert accepted.returncode == 0
+    assert (
+        _single_report(accepted)["result"]["dataset_verification"][
+            "verification_sha256"
+        ]
+        == json.loads(verification.read_text())["verification_sha256"]
+    )
+
+    shard = next((root / "shards").glob("*.bin"))
+    shard.write_bytes(shard.read_bytes() + b"stale")
+    rejected = _run_msctl(*args, bind_dataset=False)
+    assert rejected.returncode != 0
+    assert (
+        _single_report(rejected)["error"]["code"]
+        == "DATASET_VERIFICATION_STALE"
+    )
+
+
+def test_dataset_verification_receipt_write_is_dry_run_first_and_strict(
+    tmp_path,
+):
+    release = _release(tmp_path)
+    manifest, _ = _runs(tmp_path)
+    verification = tmp_path / "dataset-verification.json"
+    args = [
+        *_base_args(tmp_path),
+        "dataset",
+        "verify",
+        "--pointer",
+        str(tmp_path / "DATASET-POINTER.json"),
+        "--dataset-root",
+        str(tmp_path / "dataset"),
+        "--release",
+        str(release),
+        "--manifest",
+        str(manifest),
+        "--verification-out",
+        str(verification),
+    ]
+
+    planned = _run_msctl(*args, bind_dataset=False)
+    assert planned.returncode == 0
+    assert _single_report(planned)["dry_run"] is True
+    assert not verification.exists()
+
+    written = _run_msctl(*args, "--apply", bind_dataset=False)
+    assert written.returncode == 0
+    assert _single_report(written)["dry_run"] is False
+    value = json.loads(verification.read_text())
+    assert value == _single_report(written)["result"]
+    value["schema_version"] = True
+    unsigned = {
+        key: item
+        for key, item in value.items()
+        if key != "verification_sha256"
+    }
+    value["verification_sha256"] = hashlib.sha256(
+        _canonical(unsigned)
+    ).hexdigest()
+    _write_json(verification, value)
+
+    rejected = _run_msctl(
+        *_base_args(tmp_path),
+        "submit",
+        "--release",
+        str(release),
+        "--manifest",
+        str(manifest),
+        "--dataset-pointer",
+        str(tmp_path / "DATASET-POINTER.json"),
+        "--dataset-verification",
+        str(verification),
+        bind_dataset=False,
+    )
+    assert rejected.returncode != 0
+    assert (
+        _single_report(rejected)["error"]["code"]
+        == "DATASET_VERIFICATION_INVALID"
+    )
+
+
+def test_legacy_dataset_receipt_scalar_claims_are_not_trusted(tmp_path):
+    pointer, root = _dataset_fixture(tmp_path)
+    receipt = json.loads((root / "receipt.json").read_text())
+    receipt["ordered_stream_sha256"] = "5" * 64
+    (root / "receipt.json").write_text(
+        json.dumps(receipt, sort_keys=True, separators=(",", ":"))
+    )
+
+    completed = _run_msctl(
+        *_base_args(tmp_path),
+        "dataset",
+        "verify",
+        "--pointer",
+        str(pointer),
+        "--dataset-root",
+        str(root),
+    )
+
+    assert completed.returncode != 0
+    assert (
+        _single_report(completed)["error"]["code"]
+        == "DATASET_RECEIPT_INVALID"
+    )
+
+
+@pytest.mark.parametrize("binding", ["pointer", "source_lock"])
+def test_dataset_verification_binds_release_pointer_and_source_lock(
+    tmp_path,
+    binding,
+):
+    release = _release(tmp_path)
+    manifest, _ = _runs(tmp_path)
+    pointer = tmp_path / "DATASET-POINTER.json"
+    if binding == "pointer":
+        value = json.loads(pointer.read_text())
+        value["relative_path"] = value["relative_path"] + "-different"
+        _write_json(pointer, value)
+    else:
+        (tmp_path / "configs" / "reasoning-dataset-v2.json").write_text(
+            '{"schema_version":2,"fixture":"changed"}\n'
+        )
+
+    completed = _run_msctl(
+        *_base_args(tmp_path),
+        "dataset",
+        "verify",
+        "--pointer",
+        str(pointer),
+        "--dataset-root",
+        str(tmp_path / "dataset"),
+        "--release",
+        str(release),
+        "--manifest",
+        str(manifest),
+        bind_dataset=False,
+    )
+
+    assert completed.returncode != 0
+    assert _single_report(completed)["error"]["code"] in {
+        "DATASET_RELEASE_MISMATCH",
+        "DATASET_SOURCE_LOCK_MISMATCH",
+    }
+
+
+def test_submit_approval_uses_rendered_252_gpu_hour_allocation(tmp_path):
+    from msctl.approval import verify_approval
+    from msctl.contracts import load_run_manifest
+    from msctl.errors import MsctlError
+    from msctl.profile import load_profile
+
+    _, runs = _runs(tmp_path)
+    manifest = load_run_manifest(tmp_path / "runs.json", repo_root=tmp_path)
+    key = "r" * 32
+    approval = _approval(
+        tmp_path,
+        operation="submit",
+        runs=runs,
+        key=key,
+        gpu_hours=250.0,
+    )
+
+    with pytest.raises(MsctlError) as caught:
+        verify_approval(
+            approval,
+            operation="submit",
+            release_sha256=str(runs["release_sha256"]),
+            run_manifest=manifest,
+            profile=load_profile(PROFILE),
+            environ={"MSCTL_APPROVAL_KEY": key},
+        )
+
+    assert caught.value.code == "APPROVAL_LIMIT_EXCEEDED"
+    assert caught.value.details["requested_gpu_hours"] == 252.0
+
+
+@pytest.mark.parametrize(
+    "loader_name",
+    ["profile", "release", "run_manifest", "dataset_pointer"],
+)
+@pytest.mark.parametrize("invalid_version", [True, 1.0])
+def test_schema_versions_reject_non_integer_values(
+    tmp_path,
+    loader_name,
+    invalid_version,
+):
+    from msctl.contracts import load_release, load_run_manifest
+    from msctl.dataset import load_pointer
+    from msctl.errors import MsctlError
+    from msctl.profile import load_profile
+
+    if loader_name == "profile":
+        value = json.loads(PROFILE.read_text())
+        value["schema_version"] = invalid_version
+        path = _write_json(tmp_path / "profile.json", value)
+
+        def invoke():
+            return load_profile(path)
+
+    elif loader_name == "release":
+        path = _release(tmp_path)
+        value = json.loads(path.read_text())
+        value["schema_version"] = invalid_version
+        _write_json(path, value)
+
+        def invoke():
+            return load_release(path)
+
+    elif loader_name == "run_manifest":
+        path, _ = _runs(tmp_path)
+        value = json.loads(path.read_text())
+        value["schema_version"] = invalid_version
+        _write_json(path, value)
+
+        def invoke():
+            return load_run_manifest(path, repo_root=tmp_path)
+
+    else:
+        path, _ = _dataset_fixture(tmp_path)
+        value = json.loads(path.read_text())
+        value["schema_version"] = invalid_version
+        _write_json(path, value)
+
+        def invoke():
+            return load_pointer(path, load_profile(PROFILE))
+
+    with pytest.raises(MsctlError) as caught:
+        invoke()
+
+    assert caught.value.code in {
+        "PROFILE_INVALID",
+        "RELEASE_INVALID",
+        "RUN_MANIFEST_INVALID",
+        "DATASET_POINTER_INVALID",
+        "SCHEMA_INVALID",
+    }
+
+
+def test_approval_and_checkpoint_schema_versions_reject_json_booleans(tmp_path):
+    from msctl.approval import verify_approval
+    from msctl.contracts import (
+        load_release,
+        load_run_manifest,
+        verify_checkpoint_receipt,
+    )
+    from msctl.errors import MsctlError
+    from msctl.profile import load_profile
+
+    release_path = _release(tmp_path)
+    manifest_path, runs = _runs(tmp_path)
+    release = load_release(release_path)
+    manifest = load_run_manifest(manifest_path, repo_root=tmp_path)
+    key = "v" * 32
+    approval = _approval(
+        tmp_path,
+        operation="submit",
+        runs=runs,
+        key=key,
+    )
+    approval_value = json.loads(approval.read_text())
+    approval_value["schema_version"] = True
+    _write_json(approval, approval_value)
+    with pytest.raises(MsctlError) as approval_error:
+        verify_approval(
+            approval,
+            operation="submit",
+            release_sha256=release.archive_sha256,
+            run_manifest=manifest,
+            profile=load_profile(PROFILE),
+            environ={"MSCTL_APPROVAL_KEY": key},
+        )
+    assert approval_error.value.code == "APPROVAL_INVALID"
+
+    checkpoint = _checkpoint_receipt(tmp_path, runs=runs)
+    checkpoint_value = json.loads(checkpoint.read_text())
+    checkpoint_value["schema_version"] = True
+    _write_json(checkpoint, checkpoint_value)
+    with pytest.raises(MsctlError) as checkpoint_error:
+        verify_checkpoint_receipt(
+            checkpoint,
+            release=release,
+            manifest=manifest,
+        )
+    assert checkpoint_error.value.code == "CHECKPOINT_PROVENANCE_MISMATCH"
+
+
+def test_environment_and_cleanup_schema_versions_reject_json_booleans(tmp_path):
+    import msctl.cleanup as cleanup_module
+    import msctl.environment as environment_module
+    from msctl.errors import MsctlError
+    from msctl.profile import load_profile
+
+    environment_receipt = _write_json(
+        tmp_path / "ENVIRONMENT.json",
+        {
+            "schema_version": True,
+            "provider": "illumina-usfc-prd",
+            "profile_sha256": "1" * 64,
+            "lock_sha256": "2" * 64,
+            "python": "3.11.9",
+            "platform": "linux_x86_64",
+            "cuda_version": "12.4",
+            "created_at": "2026-01-01T00:00:00Z",
+        },
+    )
+    with pytest.raises(MsctlError) as environment_error:
+        environment_module._read_receipt(environment_receipt)
+    assert environment_error.value.code == "ENV_RECEIPT_INVALID"
+
+    root = tmp_path / "runs"
+    (root / "logs").mkdir(parents=True)
+    (root / "logs" / "worker.log").write_text("log\n")
+    plan = cleanup_module.make_cleanup_plan(root)
+    plan["schema_version"] = True
+    plan_path = _write_json(tmp_path / "cleanup-plan-bool.json", plan)
+    with pytest.raises(MsctlError) as cleanup_error:
+        cleanup_module.apply_cleanup(
+            profile=load_profile(PROFILE),
+            plan_path=plan_path,
+            release_path=tmp_path / "unused-release.json",
+            approval_path=None,
+            apply=True,
+            environ={},
+        )
+    assert cleanup_error.value.code == "CLEANUP_PLAN_INVALID"
+
+
+def test_state_store_rejects_symlinked_child_directories(tmp_path):
+    from msctl.errors import MsctlError
+    from msctl.state import StateStore
+
+    state_root = tmp_path / "state"
+    attacker = tmp_path / "attacker"
+    state_root.mkdir()
+    attacker.mkdir()
+    os.symlink(attacker, state_root / "runs")
+    store = StateStore(state_root)
+
+    with pytest.raises(MsctlError) as caught:
+        with store.locked():
+            store.write_run(
+                "v2-dense-s0",
+                {
+                    "schema_version": 1,
+                    "run_id": "v2-dense-s0",
+                },
+            )
+
+    assert caught.value.code == "UNSAFE_STATE"
+    assert not (attacker / "v2-dense-s0.json").exists()
+
+
+def test_collection_copies_bytes_from_the_descriptor_it_hashed(
+    tmp_path,
+    monkeypatch,
+):
+    import msctl.collect as collect_module
+
+    source = tmp_path / "source"
+    evidence = source / "v2-dense-s0" / "log.jsonl"
+    evidence.parent.mkdir(parents=True)
+    evidence.write_bytes(b"original\n")
+    replacement = tmp_path / "replacement"
+    replacement.write_bytes(b"attacker\n")
+    original_inode = evidence.stat().st_ino
+    original_read = collect_module.read_fd
+    raced = False
+
+    def racing_read(descriptor):
+        nonlocal raced
+        data = original_read(descriptor)
+        if os.fstat(descriptor).st_ino == original_inode and not raced:
+            raced = True
+            displaced = tmp_path / "displaced"
+            os.replace(evidence, displaced)
+            os.replace(replacement, evidence)
+        return data
+
+    monkeypatch.setattr(collect_module, "read_fd", racing_read)
+
+    result = collect_module.collect_evidence(
+        source=source,
+        out=tmp_path / "collected",
+        apply=True,
+    )
+
+    assert result["collected_files"] == 1
+    assert raced is True
+    assert (
+        tmp_path / "collected" / "v2-dense-s0" / "log.jsonl"
+    ).read_bytes() == b"original\n"
+
+
+def test_collection_publication_never_replaces_a_racing_destination(
+    tmp_path,
+    monkeypatch,
+):
+    import msctl.collect as collect_module
+    from msctl.errors import MsctlError
+
+    source = tmp_path / "source"
+    evidence = source / "v2-dense-s0" / "log.jsonl"
+    evidence.parent.mkdir(parents=True)
+    evidence.write_text('{"step":1}\n')
+    destination = tmp_path / "collected"
+    original_rename = collect_module.rename_noreplace_at
+
+    def racing_rename(source_fd, source_name, destination_fd, destination_name):
+        os.mkdir(destination_name, dir_fd=destination_fd)
+        attacker_fd = os.open(
+            destination_name,
+            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+            dir_fd=destination_fd,
+        )
+        try:
+            marker_fd = os.open(
+                "attacker-marker",
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                0o600,
+                dir_fd=attacker_fd,
+            )
+            os.close(marker_fd)
+        finally:
+            os.close(attacker_fd)
+        original_rename(
+            source_fd,
+            source_name,
+            destination_fd,
+            destination_name,
+        )
+
+    monkeypatch.setattr(
+        collect_module,
+        "rename_noreplace_at",
+        racing_rename,
+    )
+
+    with pytest.raises(MsctlError) as caught:
+        collect_module.collect_evidence(
+            source=source,
+            out=destination,
+            apply=True,
+        )
+
+    assert caught.value.code == "COLLECT_DESTINATION_EXISTS"
+    assert (destination / "attacker-marker").is_file()
+    assert not (destination / "v2-dense-s0" / "log.jsonl").exists()
+
+
+def test_production_environment_apply_fails_closed_until_site_contract_is_pinned(
+    tmp_path,
+):
+    lock = tmp_path / "requirements-illumina.lock"
+    lock.write_text("# deliberately empty test lock\n")
+
+    completed = _run_msctl(
+        *_base_args(tmp_path),
+        "env",
+        "ensure",
+        "--root",
+        str(tmp_path / "environment"),
+        "--lock",
+        str(lock),
+        "--apply",
+    )
+
+    assert completed.returncode != 0
+    assert (
+        _single_report(completed)["error"]["code"]
+        == "ENV_CONTRACT_INCOMPLETE"
+    )
+
+
+def test_environment_rejects_a_lock_without_exact_platform_headers_and_hashes(
+    tmp_path,
+):
+    profile_value = json.loads(PROFILE.read_text())
+    profile_value["environment"] = {
+        "status": "pinned",
+        "lock_path": "requirements-illumina.lock",
+        "contract": {
+            "python_implementation": "CPython",
+            "python_version": "3.11.9",
+            "platform": "linux_x86_64",
+            "cuda_version": "12.4",
+        },
+    }
+    profile = _write_json(tmp_path / "profile.json", profile_value)
+    lock = tmp_path / "requirements-illumina.lock"
+    lock.write_text("example==1.0 --hash=sha256:" + "0" * 64 + "\n")
+
+    completed = _run_msctl(
+        "--profile",
+        str(profile),
+        "--repo-root",
+        str(tmp_path),
+        "env",
+        "ensure",
+        "--root",
+        str(tmp_path / "environment"),
+        "--lock",
+        str(lock),
+        "--apply",
+    )
+
+    assert completed.returncode != 0
+    assert _single_report(completed)["error"]["code"] == "ENV_LOCK_INVALID"
+
+
+def test_resume_exports_verified_checkpoint_paths_and_never_uses_auto(tmp_path):
+    release = _release(tmp_path)
+    manifest, runs = _runs(tmp_path)
+    receipt = _checkpoint_receipt(tmp_path, runs=runs)
+
+    completed = _run_msctl(
+        *_base_args(tmp_path),
+        "resume",
+        "--release",
+        str(release),
+        "--manifest",
+        str(manifest),
+        "--checkpoint-receipt",
+        str(receipt),
+    )
+
+    assert completed.returncode == 0
+    command = _single_report(completed)["result"]["command"]
+    export = next(item for item in command if item.startswith("--export="))
+    assert "MS_DENSE_RESUME_PATH=" in export
+    assert "MS_SPLIT_RESUME_PATH=" in export
+    script = (REPO_ROOT / "cluster" / "slurm" / "v2_seed0.sbatch").read_text()
+    assert "--resume auto" not in script
+    assert "--resume-path" in script
+    assert "memorysplit-ddp-v1" in script
+
+
+def test_evaluation_script_uses_one_preflighted_runner_contract():
+    script = (REPO_ROOT / "cluster" / "slurm" / "v2_evaluate.sbatch").read_text()
+
+    assert "python -m evals.confirmatory" not in script
+    assert "evals/confirmatory/runner.py" in script
+    assert "memorysplit-confirmatory-evaluator-v1" in script
+
+
+def test_rendered_submission_has_manifest_bound_job_name_and_comment(tmp_path):
+    release = _release(tmp_path)
+    manifest, _ = _runs(tmp_path)
+
+    completed = _run_msctl(
+        *_base_args(tmp_path),
+        "runs",
+        "render",
+        "--release",
+        str(release),
+        "--manifest",
+        str(manifest),
+    )
+
+    command = _single_report(completed)["result"]["commands"][0]
+    job_name = next(item for item in command if item.startswith("--job-name="))
+    comment = next(item for item in command if item.startswith("--comment="))
+    assert job_name != "--job-name=ms-v2-seed0"
+    assert comment.startswith("--comment=msctl:")
+    assert len(comment.removeprefix("--comment=msctl:")) == 64
