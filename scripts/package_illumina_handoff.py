@@ -24,7 +24,22 @@ MODULE_ROOT = Path(__file__).resolve().parents[1]
 if str(MODULE_ROOT) not in sys.path:
     sys.path.insert(0, str(MODULE_ROOT))
 
+from msctl.cohort import load_cohort_assignment_bytes
+
 PROVIDER = "illumina-usfc-prd"
+COHORT_ASSIGNMENT = "configs/cohort-assignment-v2.json"
+PREREGISTRATION = "configs/preregistration-v2.yaml"
+_COHORT_CONFIGS = frozenset(
+    f"configs/360m-v2/{arm}-s{seed}.yaml"
+    for seed in range(5)
+    for arm in ("dense", "split90")
+)
+_ILLUMINA_CONFIGS = frozenset(
+    {
+        "configs/360m-v2/dense-s0.yaml",
+        "configs/360m-v2/split90-s0.yaml",
+    }
+)
 NORMALIZED_TIME = (1980, 1, 1, 0, 0, 0)
 PLANNED_DIRECTORIES = (
     ".cursor/skills/memorysplit-cluster/",
@@ -49,6 +64,9 @@ REQUIRED_MEMBERS = {
     "cluster/profiles/illumina-usfc-prd.json",
     "cluster/slurm/v2_evaluate.sbatch",
     "cluster/slurm/v2_seed0.sbatch",
+    COHORT_ASSIGNMENT,
+    PREREGISTRATION,
+    *_ILLUMINA_CONFIGS,
     "msctl/__init__.py",
     "msctl/__main__.py",
     "scripts/package_illumina_handoff.py",
@@ -300,6 +318,8 @@ def _classification(path: str) -> str:
         return "included"
     if parts[0] == "fixtures":
         return "unknown"
+    if path in _COHORT_CONFIGS:
+        return "included" if path in _ILLUMINA_CONFIGS else "excluded"
     suffixes = _INCLUDED_SUFFIXES.get(parts[0])
     if parts[0] in _INCLUDED_SUFFIXES:
         if suffixes is None or PurePosixPath(path).suffix.lower() in suffixes:
@@ -449,6 +469,33 @@ def _collect_payload(
     if missing:
         raise PackageError(f"required release member is not tracked: {missing[0]}")
 
+    tracked_by_path = {item.path: item for item in tracked}
+    cohort_paths = {COHORT_ASSIGNMENT, PREREGISTRATION, *_COHORT_CONFIGS}
+    missing_cohort = sorted(cohort_paths - set(tracked_by_path))
+    if missing_cohort:
+        raise PackageError(
+            f"cohort snapshot member is not tracked: {missing_cohort[0]}"
+        )
+    cohort_bytes = {
+        path: _read_blob(source, tracked_by_path[path].object_id)
+        for path in cohort_paths
+    }
+    try:
+        cohort = load_cohort_assignment_bytes(
+            assignment_data=cohort_bytes[COHORT_ASSIGNMENT],
+            preregistration_data=cohort_bytes[PREREGISTRATION],
+            config_data={
+                path: cohort_bytes[path] for path in _COHORT_CONFIGS
+            },
+        )
+    except Exception as error:
+        raise PackageError(
+            "immutable cohort snapshot violates the frozen contract"
+        ) from error
+    expected_config_hashes = {
+        config.path: config.sha256 for config in cohort.configs
+    }
+
     payload: dict[str, bytes] = {}
     member_rows = []
     environment_hashes: dict[str, str] = {}
@@ -456,6 +503,22 @@ def _collect_payload(
         data = _read_blob(source, item.object_id)
         _scan_secret(item.path, data)
         digest = _sha256(data)
+        if (
+            item.path == COHORT_ASSIGNMENT
+            and digest != cohort.assignment_sha256
+        ):
+            raise PackageError("cohort assignment hash mismatch")
+        if (
+            item.path == PREREGISTRATION
+            and digest != cohort.preregistration_sha256
+        ):
+            raise PackageError("preregistration hash mismatch")
+        expected_config_hash = expected_config_hashes.get(item.path)
+        if (
+            expected_config_hash is not None
+            and digest != expected_config_hash
+        ):
+            raise PackageError(f"cohort config hash mismatch: {item.path}")
         payload[item.path] = data
         member_rows.append(
             {
@@ -476,7 +539,14 @@ def _collect_payload(
             "provider": PROVIDER,
             "source": {"commit": revision, "dirty": False},
             "profile_sha256": profile_hash,
+            "preregistration_sha256": cohort.preregistration_sha256,
             "environment_hashes": environment_hashes,
+            "seed_assignment": {
+                "cohort_id": cohort.cohort_id,
+                "provider": PROVIDER,
+                "seeds": list(cohort.illumina_seeds),
+                "arms": ["dense", "split90"],
+            },
             "members": member_rows,
         }
     )
