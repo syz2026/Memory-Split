@@ -1,0 +1,30 @@
+{
+  "account": null,
+  "cpus": 16,
+  "environment_allowlist": [
+    "HOME",
+    "PATH",
+    "PYTHONPATH",
+    "MS135_VENV",
+    "CUDA_VISIBLE_DEVICES",
+    "SLURM_JOB_ID",
+    "SLURM_JOB_NAME",
+    "SLURM_SUBMIT_DIR",
+    "SLURM_CPUS_PER_TASK",
+    "TMPDIR",
+    "NCCL_DEBUG",
+    "TOKENIZERS_PARALLELISM"
+  ],
+  "gpu_name_regex": "L40S",
+  "gpus_per_pair": 2,
+  "gres": "gpu:L40S:2",
+  "memory_gb": 112,
+  "partition": "gpu",
+  "platform": "farmshare",
+  "profile_id": "farmshare-l40s",
+  "python": "${MS135_VENV}/bin/python",
+  "qos": "gpu",
+  "schema_version": 1,
+  "site_id": "farmshare-l40s",
+  "wall_minutes": 2820
+}

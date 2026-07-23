@@ -1,0 +1,30 @@
+{
+  "account": null,
+  "cpus": 16,
+  "environment_allowlist": [
+    "HOME",
+    "PATH",
+    "PYTHONPATH",
+    "MS135_VENV",
+    "CUDA_VISIBLE_DEVICES",
+    "SLURM_JOB_ID",
+    "SLURM_JOB_NAME",
+    "SLURM_SUBMIT_DIR",
+    "SLURM_CPUS_PER_TASK",
+    "TMPDIR",
+    "NCCL_DEBUG",
+    "TOKENIZERS_PARALLELISM"
+  ],
+  "gpu_name_regex": "H100|H200|L40S|A100",
+  "gpus_per_pair": 2,
+  "gres": "gpu:2",
+  "memory_gb": 128,
+  "partition": "chosen_partition",
+  "platform": "mit",
+  "profile_id": "mit-collaborator-b",
+  "python": "${MS135_VENV}/bin/python",
+  "qos": null,
+  "schema_version": 1,
+  "site_id": "mit-discovered-b",
+  "wall_minutes": 360
+}

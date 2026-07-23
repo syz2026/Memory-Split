@@ -92,6 +92,25 @@ class Trainer:
         self.ckpt_path = self.out_dir / "ckpt.pt"
         self.log_path = self.out_dir / "log.jsonl"
         self.snap_every = max(1, int(self.max_steps * cfg.get("snap_frac", 0.10)))
+        requested_snapshots = cfg.get("checkpoint_updates")
+        if requested_snapshots is None:
+            self.checkpoint_updates: tuple[int, ...] = ()
+        else:
+            if (
+                not isinstance(requested_snapshots, list)
+                or any(
+                    isinstance(step, bool)
+                    or not isinstance(step, int)
+                    or step <= 0
+                    or step > self.max_steps
+                    for step in requested_snapshots
+                )
+                or requested_snapshots != sorted(set(requested_snapshots))
+            ):
+                raise ValueError(
+                    "checkpoint_updates must be sorted unique updates within the run"
+                )
+            self.checkpoint_updates = tuple(requested_snapshots)
         self.ckpt_seconds = cfg.get("ckpt_minutes", 30) * 60
         self.log_every = cfg.get("log_every", 20)
         self.eval_every = cfg.get("eval_every", 250)
@@ -217,7 +236,11 @@ class Trainer:
                     f.write(json.dumps(row) + "\n")
                 t0 = time.time()
                 tokens_seen = 0
-            if self.step % self.snap_every == 0:
+            if (
+                self.step in self.checkpoint_updates
+                if self.checkpoint_updates
+                else self.step % self.snap_every == 0
+            ):
                 self.save_snapshot()
             if time.time() - last_ckpt > self.ckpt_seconds:
                 self.save_ckpt()
