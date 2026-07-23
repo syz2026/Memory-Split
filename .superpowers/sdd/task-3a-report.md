@@ -103,3 +103,59 @@ PYTHONDONTWRITEBYTECODE=1 python -m pytest -q -p no:cacheprovider \
 Report path:
 
 `/Users/stephenzhang/Documents/MemorySplit/.worktrees/memorysplit-v3-aws-n10/.superpowers/sdd/task-3a-report.md`
+
+## Review-fix follow-up
+
+Status: complete.
+
+Review-fix commit:
+
+- `22c480d457f5cd7a2ac9c2eeda9f59c06ee5849d` —
+  `fix: harden AWS environment attestation`
+
+The follow-up closes every reported Task 3A boundary:
+
+- Python runtime facts now use the exact `/usr/bin/python3` argv with `-I -P`,
+  the minimal command environment, and the explicit root-owned,
+  group/world-non-writable `/usr` working directory. Writable `platform.py`
+  and `torch.py` attack fixtures can no longer supply matching lock facts;
+  unsupported or missing trusted runtimes fail closed.
+- Version validation rejects embedded and separator/case-obfuscated floating
+  markers, including digit-bearing `latest`, `main`, `master`, `head`, `dev`,
+  `nightly`, `snapshot`, `rolling`, and `unknown` forms, while preserving
+  concrete Python, PyTorch/CUDA, driver, release-candidate, and CPU outputs.
+- `msctl.aws_contracts.validate_digest_pinned_oci_image` is now the one shared
+  pure validator used by the receipt producer/parser, profile runtime
+  validation, and remote argv validation. It requires one valid registry,
+  nonempty canonical repository components, no tag, one exact lowercase
+  SHA-256 digest, and exact image/digest agreement.
+- V3 `env ensure` rejects legacy `--lock` and `--release` before backend
+  construction. Existing non-v3 `env ensure --lock` behavior remains covered
+  by the unchanged legacy suite.
+
+TDD evidence:
+
+- RED attestation slice: **11 failed, 9 passed** (probe isolation, shadow
+  attacks, floating markers, malformed OCI paths).
+- RED remote OCI slice: **6 failed, 4 passed**.
+- RED profile OCI slice: **3 failed, 16 passed**.
+- RED v3 CLI slice: backend-construction sentinel failed as expected.
+- GREEN focused slices: **25 passed**, **10 passed**, **19 passed**, and
+  **1 passed**, respectively.
+
+Fresh verification:
+
+- Required Task 3A suite: **497 passed in 140.09s**.
+- Changed AWS launcher suite: **135 passed in 6.38s**.
+- `python -m py_compile` for every changed Python file: **passed**.
+- `git diff --check`: **passed**.
+- Package/runtime/receipt consistency:
+  `receipt=18 lock=10 runtime_facts=10; shared contracts match`.
+
+Follow-up concerns:
+
+- No Task 3A blocker remains.
+- The frozen v3 runtime lock requires a Python supporting `-P`; an older
+  `/usr/bin/python3` fails closed rather than weakening probe isolation.
+- No live AWS call was made; the trust-anchor and Task 5 provisioning
+  boundaries recorded above remain unchanged.
