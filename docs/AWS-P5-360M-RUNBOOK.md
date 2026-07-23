@@ -23,10 +23,10 @@ set -euo pipefail
 umask 077
 
 export MS_COHORT_AULC_INTERFACE_REF=70c1951fedce3a61e24b7d761fa330749b71618c
-export MS_AWS_PACKAGE_INTERFACE_REF=2629a8e00987508e5ef7fffae98697d4bda7f00c
-export MS_AWS_PACKAGE_LINEAGE_REF=df2f5e1c0f690a5c358ec777e9b6ae99a7d84738
+export MS_AWS_PACKAGE_INTERFACE_REF=e01cee358288684c801c2bfff277ee0700e6034b
+export MS_AWS_PACKAGE_LINEAGE_REF=81543c216d1a8dcdb6a5ed92fd7c34681ab4894b
 export MS_CONFIRMATORY_RUNNER_INTERFACE_REF=ac4b5a0033817fe1fcd4e0c9514c13252e7d560f
-export MS_TASK_6_INTERFACE_REF=84bd93cd3d64089bd4ce9064e5eac057d6f5210e
+export MS_TASK_6_INTERFACE_REF=a2361588286f0050a0151ffdff88343e5eec4836
 
 export AWS_REGION=us-east-1
 export MS_COHORT_ID=memorysplit-confirmatory-v2-360m-n5
@@ -47,7 +47,6 @@ export MS_ILLUMINA_RELEASE="$PWD/../memorysplit-releases/illumina/RELEASE.json"
 export MS_AWS_RELEASE="$MS_RELEASE_ROOT/RELEASE-AWS-P5.json"
 export MS_DATASET_POINTER="$PWD/DATASET-POINTER-AWS.json"
 export MS_DATASET_RECEIPT="$PWD/dataset/corpus-receipt.json"
-export MS_ENVIRONMENT_RECEIPT="$PWD/environment/aws-p5-environment-receipt.json"
 export MS_SEALED_RELEASE="$PWD/evaluation/sealed-release"
 export MS_STUDY_LOCK="$MS_SEALED_RELEASE/STUDY-LOCK.json"
 export MS_TERMINATE_AT=REPLACE_WITH_RFC3339_UTC_DEADLINE
@@ -102,6 +101,7 @@ release_sha256 = release["archive"]["sha256"]
 manifest_sha256 = hashlib.sha256(canonical(manifest)).hexdigest()
 runtime = {
     "ami_id": os.environ["MS_AWS_AMI_ID"],
+    "container_image": os.environ["MS_CONTAINER_IMAGE"],
     "container_digest": os.environ["MS_CONTAINER_DIGEST"],
     "gid": int(os.environ["MS_RUNTIME_GID"]),
     "region": os.environ["AWS_REGION"],
@@ -125,6 +125,7 @@ resources = {
     "gres": "gpu:h100:8",
     "script": script,
     "ami_id": runtime["ami_id"],
+    "container_image": runtime["container_image"],
     "container_digest": runtime["container_digest"],
     "instance_id": instance_id,
     "profile_sha256": profile_sha256,
@@ -564,6 +565,39 @@ MSCTL=(
   --repo-root "$PWD"
   --state-root "$MS_STATE_ROOT"
 )
+profile_sha256="$(file_sha256 cluster/profiles/aws-p5.48xlarge.json)"
+jq -e --arg profile_sha256 "$profile_sha256" '
+  .profile_sha256 == $profile_sha256 and
+  .environment == {
+    "mode": "runtime_attested",
+    "profile_sha256": $profile_sha256,
+    "container_image_digest_env": "MS_CONTAINER_DIGEST",
+    "container_image_digest_pattern": "^sha256:[0-9a-f]{64}$",
+    "runtime_environment_receipt": {
+      "required_at_launch": true,
+      "authentication": "aws_instance_identity_document_pkcs7",
+      "required_fields": [
+        "schema_version",
+        "profile_sha256",
+        "container_image_digest",
+        "aws_instance_identity_document",
+        "aws_instance_identity_pkcs7"
+      ]
+    }
+  }
+' "$MS_AWS_RELEASE" >/dev/null
+python - <<'PY'
+import os
+import re
+
+digest = os.environ["MS_CONTAINER_DIGEST"]
+image = os.environ["MS_CONTAINER_IMAGE"]
+if re.fullmatch(r"sha256:[0-9a-f]{64}", digest) is None:
+    raise SystemExit("MS_CONTAINER_DIGEST must be an immutable sha256 digest")
+if image.rpartition("@")[2] != digest:
+    raise SystemExit("MS_CONTAINER_IMAGE must be image@MS_CONTAINER_DIGEST")
+PY
+
 mkdir -p run-manifests
 
 for seed in 1 2 3 4; do
@@ -587,13 +621,18 @@ for seed in 1 2 3 4; do
     --release "$MS_AWS_RELEASE" \
     --manifest "run-manifests/aws-p5-s${seed}.json" \
     --dataset-pointer "$MS_DATASET_POINTER" \
-    --dataset-root "$(dirname "$MS_DATASET_RECEIPT")" \
-    --environment-receipt "$MS_ENVIRONMENT_RECEIPT"
+    --dataset-root "$(dirname "$MS_DATASET_RECEIPT")"
 done
 ```
 
 Every `submit`/`resume` plan must name the selected instance and render the
-Task 3/5 launcher:
+Task 3/5 launcher. On that selected instance, the sole bootstrap step must
+emit and authenticate the `runtime_environment_receipt` before training. Its
+fields are exactly `schema_version`, `profile_sha256`,
+`container_image_digest`, `aws_instance_identity_document`, and
+`aws_instance_identity_pkcs7`; the authenticated profile and digest must equal
+the release contract and `MS_CONTAINER_DIGEST`. A local/static receipt is not
+valid.
 
 ```text
 python cluster/aws/p5/launch_seed_pair.py \
@@ -784,14 +823,43 @@ for seed in 1 2 3 4; do
     --manifest "$manifest" \
     --dataset-pointer "$MS_DATASET_POINTER" \
     --dataset-root "$(dirname "$MS_DATASET_RECEIPT")" \
-    --environment-receipt "$MS_ENVIRONMENT_RECEIPT" \
     --terminate-at "$MS_TERMINATE_AT" |
     tee "$MS_APPROVAL_ROOT/submit-s${seed}-plan.json"
-  jq -e --arg instance "$MS_INSTANCE_ID" '
+  jq -e \
+    --arg instance "$MS_INSTANCE_ID" \
+    --arg image "$MS_CONTAINER_IMAGE" \
+    --arg digest "$MS_CONTAINER_DIGEST" \
+    --arg profile_sha256 "$profile_sha256" '
     .dry_run == true and
     .result.instance_id == $instance and
+    .result.operation_intent.environment == {
+      "mode": "runtime_attested",
+      "profile_sha256": $profile_sha256,
+      "container_image_digest_env": "MS_CONTAINER_DIGEST",
+      "container_image_digest_pattern": "^sha256:[0-9a-f]{64}$",
+      "runtime_environment_receipt": {
+        "required_at_launch": true,
+        "authentication": "aws_instance_identity_document_pkcs7",
+        "required_fields": [
+          "schema_version",
+          "profile_sha256",
+          "container_image_digest",
+          "aws_instance_identity_document",
+          "aws_instance_identity_pkcs7"
+        ]
+      }
+    } and
+    .result.operation_intent.runtime.container_image == $image and
+    .result.operation_intent.runtime.container_image_digest == $digest and
     ([.result.operation_intent.steps[]
       | select(.name == "bootstrap")] | length) == 1 and
+    ([.result.operation_intent.steps[]
+      | select(.name == "bootstrap")][0].argv
+      | index("--container-image") as $index
+      | .[$index + 1] == $image) and
+    ([.result.operation_intent.steps[]
+      | select(.name == "build-launcher-manifest")][0].argv
+      | index("--bootstrap-receipt") != null) and
     ([.result.operation_intent.steps[]
       | select(.name == "paired-launch")] | length) == 1
   ' "$MS_APPROVAL_ROOT/submit-s${seed}-plan.json" >/dev/null
@@ -811,7 +879,6 @@ for seed in 1 2 3 4; do
     --manifest "$manifest" \
     --dataset-pointer "$MS_DATASET_POINTER" \
     --dataset-root "$(dirname "$MS_DATASET_RECEIPT")" \
-    --environment-receipt "$MS_ENVIRONMENT_RECEIPT" \
     --terminate-at "$MS_TERMINATE_AT" \
     --approval "$approval" \
     --apply
@@ -845,7 +912,6 @@ for seed in 1 2 3 4; do
     --manifest "$manifest" \
     --dataset-pointer "$MS_DATASET_POINTER" \
     --dataset-root "$(dirname "$MS_DATASET_RECEIPT")" \
-    --environment-receipt "$MS_ENVIRONMENT_RECEIPT" \
     --terminate-at "$MS_TERMINATE_AT" |
     tee "$MS_APPROVAL_ROOT/deadline-submit-s${seed}-plan.json"
   planned_instance="$(
@@ -869,7 +935,6 @@ for seed in 1 2 3 4; do
     --manifest "$manifest" \
     --dataset-pointer "$MS_DATASET_POINTER" \
     --dataset-root "$(dirname "$MS_DATASET_RECEIPT")" \
-    --environment-receipt "$MS_ENVIRONMENT_RECEIPT" \
     --terminate-at "$MS_TERMINATE_AT" \
     --approval "$approval" \
     --apply
@@ -899,7 +964,6 @@ jq -e '
   --manifest "$manifest" \
   --dataset-pointer "$MS_DATASET_POINTER" \
   --dataset-root "$(dirname "$MS_DATASET_RECEIPT")" \
-  --environment-receipt "$MS_ENVIRONMENT_RECEIPT" \
   --checkpoint-receipt "$checkpoint_receipt" |
   tee "$MS_APPROVAL_ROOT/resume-s${seed}-plan.json"
 jq -e '
@@ -920,7 +984,6 @@ test "$answer" = "APPLY-RESUME-${seed}"
   --manifest "$manifest" \
   --dataset-pointer "$MS_DATASET_POINTER" \
   --dataset-root "$(dirname "$MS_DATASET_RECEIPT")" \
-  --environment-receipt "$MS_ENVIRONMENT_RECEIPT" \
   --checkpoint-receipt "$checkpoint_receipt" \
   --approval "$MS_APPROVAL_ROOT/resume-s${seed}.json" \
   --apply

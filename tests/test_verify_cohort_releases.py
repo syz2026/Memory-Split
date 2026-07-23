@@ -25,10 +25,10 @@ RUNBOOK = REPO_ROOT / "docs" / "AWS-P5-360M-RUNBOOK.md"
 
 # Final interface refs. Update only after the owning task publishes a commit.
 COHORT_AULC_REF = "70c1951fedce3a61e24b7d761fa330749b71618c"
-AWS_PACKAGE_REF = "2629a8e00987508e5ef7fffae98697d4bda7f00c"
-AWS_PACKAGE_LINEAGE_REF = "df2f5e1c0f690a5c358ec777e9b6ae99a7d84738"
+AWS_PACKAGE_REF = "e01cee358288684c801c2bfff277ee0700e6034b"
+AWS_PACKAGE_LINEAGE_REF = "81543c216d1a8dcdb6a5ed92fd7c34681ab4894b"
 CONFIRMATORY_RUNNER_REF = "ac4b5a0033817fe1fcd4e0c9514c13252e7d560f"
-TASK_6_REF = "84bd93cd3d64089bd4ce9064e5eac057d6f5210e"
+TASK_6_REF = "a2361588286f0050a0151ffdff88343e5eec4836"
 
 COHORT_ID = "memorysplit-confirmatory-v2-360m-n5"
 ILLUMINA = "illumina-usfc-prd"
@@ -122,6 +122,26 @@ def _aws_profile() -> dict[str, object]:
             "container_digest_env": "MS_CONTAINER_DIGEST",
         },
         "assigned_seeds": [1, 2, 3, 4],
+    }
+
+
+def _runtime_environment_contract(profile_sha256: str) -> dict[str, object]:
+    return {
+        "mode": "runtime_attested",
+        "profile_sha256": profile_sha256,
+        "container_image_digest_env": "MS_CONTAINER_DIGEST",
+        "container_image_digest_pattern": "^sha256:[0-9a-f]{64}$",
+        "runtime_environment_receipt": {
+            "required_at_launch": True,
+            "authentication": "aws_instance_identity_document_pkcs7",
+            "required_fields": [
+                "schema_version",
+                "profile_sha256",
+                "container_image_digest",
+                "aws_instance_identity_document",
+                "aws_instance_identity_pkcs7",
+            ],
+        },
     }
 
 
@@ -234,24 +254,19 @@ def _build_release(
         )
     )
     requirements_content = (
-        (
-            b"PyYAML==6.0.2 "
-            b"--hash=sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-            b"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n"
-        )
+        b"pytest==8.4.1\npyyaml==6.0.2\n"
         if environment_bytes is None
         else environment_bytes
     )
-    environment_path = (
-        "requirements.txt" if provider == ILLUMINA else "requirements-aws-p5.lock"
-    )
+    environment_path = "requirements.txt"
     payload = {
         ASSIGNMENT_PATH: assignment_content,
         CORPUS_IDENTITY_PATH: corpus_content,
         EVALUATION_IDENTITY_PATH: evaluation_content,
         profile_path: profile_content,
-        environment_path: requirements_content,
     }
+    if provider == ILLUMINA:
+        payload[environment_path] = requirements_content
     dataset_pointer_path = "DATASET-POINTER-AWS.json"
     dataset_pointer_content = _canonical_pretty(
         {
@@ -334,8 +349,7 @@ def _build_release(
                 "sha256": _sha256(profile_content),
             },
             "environment": {
-                "path": environment_path,
-                "sha256": _sha256(requirements_content),
+                **_runtime_environment_contract(_sha256(profile_content)),
             },
             "dataset_pointer": {
                 "path": dataset_pointer_path,
@@ -398,7 +412,6 @@ def _build_release(
                 "profile": metadata["profile"],
                 "profile_sha256": _sha256(profile_content),
                 "environment": metadata["environment"],
-                "environment_sha256": _sha256(requirements_content),
                 "dataset_pointer": metadata["dataset_pointer"],
                 "dataset_pointer_sha256": _sha256(dataset_pointer_content),
                 "config_sha256": metadata["config_sha256"],
@@ -712,7 +725,7 @@ def test_accepts_release_built_by_integrated_illumina_packager(
     assert json.loads(completed.stdout)["ok"] is True
 
 
-def test_aws_profile_fixture_matches_current_packager_schema(
+def test_accepts_release_built_by_final_aws_packager(
     tmp_path: Path,
 ) -> None:
     integration_root = _materialize_integration_ref(
@@ -721,10 +734,39 @@ def test_aws_profile_fixture_matches_current_packager_schema(
     )
     package_tests = _load_module(
         integration_root / "tests/test_package_aws_p5_handoff.py",
-        "integrated_aws_package_tests",
+        "final_aws_package_tests",
+    )
+    package_module = _load_module(
+        integration_root / "scripts/package_aws_p5_handoff.py",
+        "final_aws_packager",
+    )
+    fixture_root = tmp_path / "real-aws"
+    fixture_root.mkdir()
+    source = package_tests._minimal_repo(fixture_root)
+    aws = package_module.build_handoff(
+        source_root=source,
+        out_dir=tmp_path / "real-aws-release",
+        apply=True,
+    )
+    with zipfile.ZipFile(aws.archive) as archive:
+        assignment = archive.read(ASSIGNMENT_PATH)
+        corpus = archive.read(CORPUS_IDENTITY_PATH)
+        evaluation = archive.read(EVALUATION_IDENTITY_PATH)
+    receipt = json.loads(aws.release.read_text(encoding="utf-8"))
+    illumina = _build_release(
+        tmp_path / "illumina",
+        provider=ILLUMINA,
+        seeds=(0,),
+        source_commit=receipt["source"]["commit"],
+        assignment_bytes=assignment,
+        corpus_bytes=corpus,
+        evaluation_bytes=evaluation,
     )
 
-    assert _aws_profile() == package_tests._profile()
+    completed = _invoke(illumina.receipt, aws.release)
+
+    assert completed.returncode == 0, completed.stdout
+    assert json.loads(completed.stdout)["ok"] is True
 
 
 def test_rejects_snap_frac_even_when_every_hash_is_rebound(
@@ -1114,16 +1156,81 @@ def test_rejects_t3_zero_gpu_seed0_profile_when_fully_rehashed(
     _assert_rejected(_invoke(illumina.receipt, aws.receipt))
 
 
-def test_rejects_empty_hash_bound_aws_environment_lock(
+def test_rejects_static_aws_environment_lock_claim_when_fully_rehashed(
     tmp_path: Path,
 ) -> None:
     illumina, aws = _pair(tmp_path)
-    _replace_aws_bound_member(
+    entries = dict(_archive_entries(aws))
+    entries.pop("SHA256SUMS")
+    lock_path = "requirements-aws-p5.lock"
+    lock = b"fabricated==1 --hash=sha256:" + b"0" * 64 + b"\n"
+    digest = _sha256(lock)
+    entries[lock_path] = lock
+    metadata = json.loads(entries["RELEASE-METADATA.json"])
+    metadata["environment"] = {"path": lock_path, "sha256": digest}
+    metadata["members"].append(
+        {
+            "path": lock_path,
+            "bytes": len(lock),
+            "sha256": digest,
+            "git_blob": "b" * 40,
+            "git_mode": "100644",
+        }
+    )
+    metadata["members"].sort(key=lambda row: row["path"])
+    entries["RELEASE-METADATA.json"] = _canonical_pretty(metadata)
+    receipt = json.loads(aws.receipt.read_text(encoding="utf-8"))
+    receipt["environment"] = metadata["environment"]
+    receipt["environment_sha256"] = digest
+    aws.receipt.write_bytes(_canonical_pretty(receipt))
+    _rewrite_release(
         aws,
-        path="requirements-aws-p5.lock",
-        content=b"",
-        metadata_field="environment",
-        receipt_field="environment_sha256",
+        _resign_sums(list(entries.items())),
+        bind_new_sums=True,
+    )
+
+    _assert_rejected(_invoke(illumina.receipt, aws.receipt))
+
+
+def test_rejects_runtime_attested_contract_without_required_receipt(
+    tmp_path: Path,
+) -> None:
+    illumina, aws = _pair(tmp_path)
+    entries = dict(_archive_entries(aws))
+    entries.pop("SHA256SUMS")
+    metadata = json.loads(entries["RELEASE-METADATA.json"])
+    del metadata["environment"]["runtime_environment_receipt"][
+        "required_at_launch"
+    ]
+    entries["RELEASE-METADATA.json"] = _canonical_pretty(metadata)
+    receipt = json.loads(aws.receipt.read_text(encoding="utf-8"))
+    receipt["environment"] = metadata["environment"]
+    aws.receipt.write_bytes(_canonical_pretty(receipt))
+    _rewrite_release(
+        aws,
+        _resign_sums(list(entries.items())),
+        bind_new_sums=True,
+    )
+
+    _assert_rejected(_invoke(illumina.receipt, aws.receipt))
+
+
+def test_rejects_runtime_attested_contract_with_fabricated_profile_hash(
+    tmp_path: Path,
+) -> None:
+    illumina, aws = _pair(tmp_path)
+    entries = dict(_archive_entries(aws))
+    entries.pop("SHA256SUMS")
+    metadata = json.loads(entries["RELEASE-METADATA.json"])
+    metadata["environment"]["profile_sha256"] = "0" * 64
+    entries["RELEASE-METADATA.json"] = _canonical_pretty(metadata)
+    receipt = json.loads(aws.receipt.read_text(encoding="utf-8"))
+    receipt["environment"] = metadata["environment"]
+    aws.receipt.write_bytes(_canonical_pretty(receipt))
+    _rewrite_release(
+        aws,
+        _resign_sums(list(entries.items())),
+        bind_new_sums=True,
     )
 
     _assert_rejected(_invoke(illumina.receipt, aws.receipt))
@@ -1414,6 +1521,17 @@ def test_runbook_is_dry_run_first_and_covers_complete_p5_lifecycle() -> None:
         TASK_6_REF,
         "p5.48xlarge",
         "ms_aws_instance_profile_arn",
+        "runtime_attested",
+        "profile_sha256",
+        "container_image_digest_env",
+        "container_image_digest_pattern",
+        "runtime_environment_receipt",
+        "required_at_launch",
+        "aws_instance_identity_document_pkcs7",
+        "aws_instance_identity_document",
+        "aws_instance_identity_pkcs7",
+        "container_image",
+        "container_image_digest",
         "aws pricing get-products",
         "running on-demand p instances",
         "s3://",
@@ -1428,7 +1546,6 @@ def test_runbook_is_dry_run_first_and_covers_complete_p5_lifecycle() -> None:
         "runs instantiate",
         "--dataset-pointer",
         "--dataset-root",
-        "--environment-receipt",
         "ms_runtime_uid",
         "ms_runtime_gid",
         "--owner-uid",
@@ -1457,6 +1574,15 @@ def test_runbook_is_dry_run_first_and_covers_complete_p5_lifecycle() -> None:
         "AWS_SECRET_ACCESS_KEY",
         "AWS_SESSION_TOKEN",
         "run-instances",
+        "requirements-aws-p5.lock",
+        "lock_sha256",
+        "environment_sha256",
+        '"contract": "runtime_attested"',
+        '"receipt_required": true',
+        "write_runtime_environment_receipt",
+        "memorysplit-aws-environment",
+        "--environment-receipt",
+        ":latest",
     ):
         assert forbidden not in text
     evaluator = re.compile(

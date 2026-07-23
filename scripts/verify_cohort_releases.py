@@ -326,7 +326,6 @@ def _receipt(content: bytes, expected_provider: str) -> Mapping[str, object]:
                 "profile",
                 "profile_sha256",
                 "environment",
-                "environment_sha256",
                 "dataset_pointer",
                 "dataset_pointer_sha256",
                 "config_sha256",
@@ -383,10 +382,17 @@ def _receipt(content: bytes, expected_provider: str) -> Mapping[str, object]:
             expected_seeds=EXPECTED_SEEDS[expected_provider],
             label="AWS receipt seed_assignment",
         )
+        _runtime_attested_environment(
+            value["environment"],
+            label="AWS receipt environment",
+            expected_profile_sha256=_hash(
+                value["profile_sha256"],
+                "AWS receipt profile_sha256",
+            ),
+        )
         for field in (
             "cohort_assignment_sha256",
             "profile_sha256",
-            "environment_sha256",
             "dataset_pointer_sha256",
         ):
             _hash(value[field], field)
@@ -400,11 +406,6 @@ def _receipt(content: bytes, expected_provider: str) -> Mapping[str, object]:
                 "profile",
                 "cluster/profiles/aws-p5.48xlarge.json",
                 "profile_sha256",
-            ),
-            (
-                "environment",
-                "requirements-aws-p5.lock",
-                "environment_sha256",
             ),
             (
                 "dataset_pointer",
@@ -662,6 +663,10 @@ def _inspect_zip(
             }
             if expected_provider == AWS_PROVIDER:
                 required.add("DATASET-POINTER-AWS.json")
+                if "requirements-aws-p5.lock" in regular_names:
+                    raise VerificationError(
+                        "AWS release must not claim a static environment lock"
+                    )
             missing = required - regular_names
             if missing:
                 raise VerificationError(
@@ -705,14 +710,6 @@ def _inspect_zip(
                 path=profile_path,
             )
             if expected_provider == AWS_PROVIDER:
-                environment_path = str(metadata["environment"]["path"])
-                _environment_lock(
-                    _member_bytes(
-                        archive,
-                        by_name[environment_path],
-                        environment_path,
-                    )
-                )
                 _dataset_pointer(
                     _member_bytes(
                         archive,
@@ -802,28 +799,34 @@ def _exact_contract(value: object, expected: object, *, label: str) -> None:
         raise VerificationError(f"{label} does not match the strict contract")
 
 
-def _environment_lock(content: bytes) -> None:
-    try:
-        text = content.decode("utf-8")
-    except UnicodeDecodeError as error:
-        raise VerificationError("AWS environment lock must be valid UTF-8") from error
-    substantive = [
-        line
-        for raw_line in text.splitlines()
-        if (line := raw_line.strip()) and not line.startswith("#")
-    ]
-    if not substantive:
-        raise VerificationError("AWS environment lock must be non-empty")
-    for line in substantive:
-        if (
-            line.startswith("-")
-            or "==" not in line
-            or re.search(r"(?:^|\s)--hash=sha256:[0-9a-f]{64}(?:\s|$)", line)
-            is None
-        ):
-            raise VerificationError(
-                "AWS environment lock entries must be exact and SHA-256 pinned"
-            )
+def _runtime_attested_environment(
+    value: object,
+    *,
+    label: str,
+    expected_profile_sha256: str,
+) -> Mapping[str, object]:
+    expected = {
+        "mode": "runtime_attested",
+        "profile_sha256": expected_profile_sha256,
+        "container_image_digest_env": "MS_CONTAINER_DIGEST",
+        "container_image_digest_pattern": "^sha256:[0-9a-f]{64}$",
+        "runtime_environment_receipt": {
+            "required_at_launch": True,
+            "authentication": "aws_instance_identity_document_pkcs7",
+            "required_fields": [
+                "schema_version",
+                "profile_sha256",
+                "container_image_digest",
+                "aws_instance_identity_document",
+                "aws_instance_identity_pkcs7",
+            ],
+        },
+    }
+    _exact_contract(value, expected, label=label)
+    environment = value
+    if not isinstance(environment, Mapping):
+        raise VerificationError(f"{label} must be an object")
+    return environment
 
 
 def _dataset_pointer(content: bytes) -> None:
@@ -1072,11 +1075,10 @@ def _metadata(
         sums=sums,
         label="AWS profile",
     )
-    environment_binding = _path_hash_binding(
+    environment_contract = _runtime_attested_environment(
         value["environment"],
-        expected_path="requirements-aws-p5.lock",
-        sums=sums,
         label="AWS environment",
+        expected_profile_sha256=str(profile_binding["sha256"]),
     )
     dataset_binding = _path_hash_binding(
         value["dataset_pointer"],
@@ -1115,10 +1117,8 @@ def _metadata(
         raise VerificationError("AWS profile bindings disagree")
     if receipt["profile"] != profile_binding:
         raise VerificationError("AWS profile binding objects disagree")
-    if receipt["environment_sha256"] != environment_binding["sha256"]:
-        raise VerificationError("AWS environment bindings disagree")
-    if receipt["environment"] != environment_binding:
-        raise VerificationError("AWS environment binding objects disagree")
+    if receipt["environment"] != environment_contract:
+        raise VerificationError("AWS runtime environment contracts disagree")
     if receipt["dataset_pointer_sha256"] != dataset_binding["sha256"]:
         raise VerificationError("AWS dataset pointer bindings disagree")
     if receipt["dataset_pointer"] != dataset_binding:

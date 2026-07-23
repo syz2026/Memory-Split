@@ -17,19 +17,26 @@ one canonical JSON decision.
 The accepted cohort is exactly Illumina seed 0 plus AWS seeds 1–4, with one
 Dense/Split90 pair per seed, unique run IDs, a clean common source commit, and
 byte-identical cohort, corpus, and evaluation identities. The AWS receipt
-supports the current `2629a8e` bindings, including the clean source tree ID.
+supports the current source-tree bindings and exact strict AWS profile SHA.
 Illumina metadata requires and binds `preregistration_sha256`. Every run config
 requires exact AULC `snapshot_steps: [1358,3396,6791,10187,13582]`;
-`snap_frac` is rejected. The AWS profile matches the current package schema,
-and every environment entry must be exact-version and SHA-256 pinned.
+`snap_frac` is rejected. AWS releases must declare the exact
+profile-bound `runtime_attested` contract from `e01cee3`: the digest
+environment name/pattern and an at-launch receipt authenticated by the AWS
+instance identity document PKCS7. Static environment locks, static receipt
+hashes, malformed receipt requirements, and fabricated profile bindings are
+rejected.
 
 The AWS runbook provides dry-run-first commands for current pricing, quota,
 versioned S3, an explicitly selected On-Demand P5, SSM, private role-only AWS
 state, one Task 6-owned destructive bootstrap, digest-pinned canaries with
 executable child-PID waits and checkpoint-bound resume, exact signed approvals,
 current `.result.instance_id` parsing, sequential/four-instance modes, and
-digest-pinned canonical evaluation. Capacity creation remains outside the
-lifecycle.
+digest-pinned canonical evaluation. It verifies the exact release environment
+contract and immutable `image@sha256` runtime; the selected-instance bootstrap
+must emit and authenticate the exact runtime receipt before paired training.
+It never fabricates a local/static environment receipt. Capacity creation
+remains outside the lifecycle.
 
 ## Files
 
@@ -48,22 +55,25 @@ real Illumina package from `70c1951` rejected by the stale `snap_frac` parser.
 Current AWS `source.tree` and profile fixtures failed the stale Task 3/5 shape.
 Runbook RED covered stale refs, missing profile ARN, wrong JSON nesting,
 missing approvals, subshell-owned PIDs, non-resuming probes, duplicate
-destructive bootstrap, and printed-but-unexecuted evaluation.
+destructive bootstrap, and printed-but-unexecuted evaluation. The authoritative
+environment RED then showed a no-lock `runtime_attested` release rejected by
+the stale lock schema; fully rehashed static-lock, missing receipt fields, and
+a fabricated environment profile hash remain rejected. A real release built
+by the final AWS packager is accepted.
 
 ## Verification
 
-- Task 9: `45 passed`, including a real package from cohort/AULC `70c1951`.
+- Task 9: `47 passed`, including real packages from cohort/AULC `70c1951` and
+  AWS P5 packager `e01cee3`.
 - Current Illumina packager branch: `20 passed`.
-- AWS P5 packager at `2629a8e`: `79 passed`.
-- Total focused tests: `144 passed`; all runbook Bash blocks pass `bash -n`.
+- Final AWS P5 packager `e01cee3`: `83 passed`.
+- All 14 runbook Bash blocks pass `bash -n`.
 - `git diff --check` passed. Ruff was unavailable in the active environment.
 
 ## Integration concerns
 
-- AWS package `2629a8e` has the current receipt/profile/environment envelope,
-  but its config validator and fixture still emit `snap_frac`; a raw package is
-  rejected until that owner ports `70c1951` `snapshot_steps`.
-- Task 6 `84bd93c` still parses AWS `source` without `tree` and renders host
-  `runner.py` evaluation. The runbook uses the corrected envelope and executes
-  `ac4b5a0` in a digest-pinned container, but Task 6 must publish its pending
-  source/evaluator correction before production launch.
+- AWS package `e01cee3` is aligned and tested; its lineage ref is `81543c2`.
+- Task 6 commit `a236158` rejects the retired static environment path but has
+  not published the selected-instance PKCS7 attestation operation/result
+  interface required by this runbook. Production launch remains blocked until
+  Task 6 emits and authenticates the exact `e01cee3` receipt before training.
