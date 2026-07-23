@@ -8,6 +8,7 @@ import hashlib
 import json
 import stat
 import sys
+import tempfile
 import zipfile
 from pathlib import Path, PurePosixPath
 
@@ -26,12 +27,15 @@ from msctl.cohort import (  # noqa: E402
     validate_run_config,
 )
 from scripts.package_135m_slurm_cohort import (  # noqa: E402
+    AWS_BUNDLE_NAME,
     FIXED_ZIP_TIME,
     PROFILE_BY_ROLE,
+    _aws_bundle_manifest,
     _identity,
     _read_source,
     _sha,
     assignment_document,
+    aws_bundle_readme,
     common_source_paths,
     expected_member_paths,
 )
@@ -320,6 +324,78 @@ def verify_release_set(
     }
 
 
+def verify_aws_bundle(
+    path: Path | str,
+    *,
+    source_root: Path | str = ROOT,
+) -> dict:
+    bundle = Path(path)
+    infos, payload = _read_archive(bundle)
+    expected = {
+        "README-AWS.md",
+        "SHA256SUMS",
+        "bundle-manifest.json",
+        "roles/SHA256SUMS",
+        *(f"roles/{role}.zip" for role in ROLES),
+    }
+    if set(payload) != expected:
+        raise ReleaseVerificationError(
+            "AWS bundle has missing or extra members; "
+            f"missing={sorted(expected - set(payload))}, "
+            f"extra={sorted(set(payload) - expected)}"
+        )
+    if bundle.name != AWS_BUNDLE_NAME:
+        raise ReleaseVerificationError("AWS bundle filename is not canonical")
+    if [info.filename for info in infos] != sorted(payload):
+        raise ReleaseVerificationError(
+            "AWS bundle members are not deterministically sorted"
+        )
+    for info in infos:
+        if (
+            info.date_time != FIXED_ZIP_TIME
+            or info.compress_type != zipfile.ZIP_DEFLATED
+            or info.create_system != 3
+            or info.external_attr >> 16 != 0o100644
+        ):
+            raise ReleaseVerificationError(
+                f"AWS bundle metadata is not deterministic: {info.filename}"
+            )
+    _verify_inventory(payload)
+
+    with tempfile.TemporaryDirectory(prefix="ms135-aws-bundle-") as temporary:
+        role_dir = Path(temporary) / "roles"
+        role_dir.mkdir()
+        archives = {}
+        for role in ROLES:
+            archive = role_dir / f"{role}.zip"
+            archive.write_bytes(payload[f"roles/{role}.zip"])
+            archives[role] = archive
+        outer = role_dir / "SHA256SUMS"
+        outer.write_bytes(payload["roles/SHA256SUMS"])
+        release_report = verify_release_set(
+            list(archives.values()),
+            source_root=source_root,
+            outer_index=outer,
+        )
+        revision = release_report["identities"]["source_revision"]
+        expected_manifest = _aws_bundle_manifest(
+            archives,
+            revision=revision,
+        )
+    if _json_member(payload, "bundle-manifest.json") != expected_manifest:
+        raise ReleaseVerificationError("AWS bundle manifest is inconsistent")
+    if payload["README-AWS.md"] != aws_bundle_readme(revision):
+        raise ReleaseVerificationError("AWS bundle run instructions differ")
+    return {
+        "archive": str(bundle.resolve()),
+        "archive_sha256": _sha(bundle.read_bytes()),
+        "identities": release_report["identities"],
+        "roles": release_report["roles"],
+        "schema_version": 1,
+        "verified": True,
+    }
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -327,7 +403,20 @@ def main(argv: list[str] | None = None) -> int:
         default="artifacts/135m-slurm-releases",
     )
     parser.add_argument("--source-root", default=str(ROOT))
+    parser.add_argument("--bundle")
     args = parser.parse_args(argv)
+    if args.bundle:
+        print(
+            json.dumps(
+                verify_aws_bundle(
+                    args.bundle,
+                    source_root=args.source_root,
+                ),
+                indent=2,
+                sort_keys=True,
+            )
+        )
+        return 0
     directory = Path(args.release_dir)
     report = verify_release_set(
         [directory / f"{role}.zip" for role in ROLES],

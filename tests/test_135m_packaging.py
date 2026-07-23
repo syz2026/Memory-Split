@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import stat
 import zipfile
@@ -8,8 +9,12 @@ from pathlib import Path
 import pytest
 
 from msctl.cohort import EXPECTED_CONFIG_PATHS, ROLES
-from scripts.package_135m_slurm_cohort import package_all
-from scripts.verify_135m_slurm_releases import ReleaseVerificationError, verify_release_set
+from scripts.package_135m_slurm_cohort import AWS_BUNDLE_NAME, package_all
+from scripts.verify_135m_slurm_releases import (
+    ReleaseVerificationError,
+    verify_aws_bundle,
+    verify_release_set,
+)
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -35,6 +40,9 @@ def test_five_role_archives_are_deterministic_and_partition_all_cells(tmp_path):
     assert (first_dir / "SHA256SUMS").read_bytes() == (
         second_dir / "SHA256SUMS"
     ).read_bytes()
+    assert (first_dir / AWS_BUNDLE_NAME).read_bytes() == (
+        second_dir / AWS_BUNDLE_NAME
+    ).read_bytes()
 
     report = verify_release_set(
         list(first.values()),
@@ -47,6 +55,12 @@ def test_five_role_archives_are_deterministic_and_partition_all_cells(tmp_path):
         for seed in range(10)
         for arm in ("dense", "split90")
     }
+    bundle_report = verify_aws_bundle(
+        first_dir / AWS_BUNDLE_NAME,
+        source_root=ROOT,
+    )
+    assert bundle_report["verified"] is True
+    assert bundle_report["roles"] == list(ROLES)
 
 
 def test_each_archive_contains_only_its_four_configs_and_no_corpus(tmp_path):
@@ -66,7 +80,43 @@ def test_each_archive_contains_only_its_four_configs_and_no_corpus(tmp_path):
             )
 
 
-def _copy_with_extra(source: Path, destination: Path, name: str, data: bytes, mode=0o100644):
+def test_aws_bundle_contains_five_role_archives_and_run_instructions(tmp_path):
+    release_dir, archives = _build(tmp_path, "releases")
+    bundle = release_dir / AWS_BUNDLE_NAME
+    with zipfile.ZipFile(bundle) as release:
+        names = set(release.namelist())
+        assert names == {
+            "README-AWS.md",
+            "SHA256SUMS",
+            "bundle-manifest.json",
+            "roles/SHA256SUMS",
+            *(f"roles/{role}.zip" for role in ROLES),
+        }
+        manifest = json.loads(release.read("bundle-manifest.json"))
+        assert manifest["bundle_format"] == "memorysplit-135m-n10-all-roles-aws-v1"
+        assert [entry["role"] for entry in manifest["role_archives"]] == list(
+            ROLES
+        )
+        assert {
+            entry["role"]: entry["sha256"]
+            for entry in manifest["role_archives"]
+        } == {
+            role: hashlib.sha256(path.read_bytes()).hexdigest()
+            for role, path in archives.items()
+        }
+        readme = release.read("README-AWS.md").decode()
+        assert "aws s3 cp" in readme
+        assert "production corpus" in readme
+        assert "does not turn them into AWS-native jobs" in readme
+
+
+def _copy_with_extra(
+    source: Path,
+    destination: Path,
+    name: str,
+    data: bytes,
+    mode=0o100644,
+):
     with zipfile.ZipFile(source) as old, zipfile.ZipFile(
         destination, "w", compression=zipfile.ZIP_DEFLATED
     ) as new:

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build five deterministic, role-scoped 135M Slurm ZIP releases."""
+"""Build five role-scoped releases and one deterministic AWS transfer bundle."""
 
 from __future__ import annotations
 
@@ -73,6 +73,7 @@ PROFILE_BY_ROLE = {
     "mit-collaborator-b": "cluster/profiles/mit-collaborator-b.example.json",
 }
 FIXED_ZIP_TIME = (1980, 1, 1, 0, 0, 0)
+AWS_BUNDLE_NAME = "memorysplit-135m-n10-all-roles-aws.zip"
 
 
 def _git(source_root: Path, *args: str) -> str:
@@ -314,6 +315,115 @@ def _write_zip(path: Path, payload: Mapping[str, bytes]) -> None:
         raise
 
 
+def aws_bundle_readme(revision: str) -> bytes:
+    return f"""# MemorySplit 135M N=10 all-role AWS transfer bundle
+
+Source revision: `{revision}`
+
+This archive transports all five role-scoped paired-Slurm releases through
+Amazon S3 or an AWS instance filesystem. It does not contain AWS credentials,
+the external production corpus, checkpoints, or an AWS-native scheduler.
+
+## Transfer with Amazon S3
+
+Upload from a machine with AWS credentials:
+
+```bash
+aws s3 cp {AWS_BUNDLE_NAME} s3://YOUR-BUCKET/YOUR-PREFIX/{AWS_BUNDLE_NAME}
+```
+
+Download on the target machine:
+
+```bash
+aws s3 cp s3://YOUR-BUCKET/YOUR-PREFIX/{AWS_BUNDLE_NAME} .
+unzip {AWS_BUNDLE_NAME} -d memorysplit-135m-n10
+cd memorysplit-135m-n10
+sha256sum -c SHA256SUMS
+```
+
+Cross-verify all role releases using the verifier shipped in any role:
+
+```bash
+unzip roles/farmshare-lead.zip -d verifier
+python verifier/scripts/verify_135m_slurm_releases.py --release-dir roles
+```
+
+Each role ZIP contains two assigned seeds; each seed is one Dense/Split90
+two-GPU pair. Extract only the intended operator ZIP and follow its
+`docs/SLURM-135M-RUNBOOK.md`.
+
+## External launch gates
+
+The production `memorysplit-parallel-corpus-v2` receipt is not included and
+remains required. Real site canaries remain required. MIT operators must bind
+their discovered Slurm profile. These role packages target paired Slurm; merely
+copying this bundle to AWS does not turn them into AWS-native jobs.
+""".encode()
+
+
+def _aws_bundle_manifest(
+    archives: Mapping[str, Path],
+    *,
+    revision: str,
+) -> dict:
+    return {
+        "aws_access": {
+            "credentials_included": False,
+            "transport": "amazon-s3-or-instance-filesystem",
+        },
+        "bundle_format": "memorysplit-135m-n10-all-roles-aws-v1",
+        "cohort_id": COHORT_ID,
+        "execution_contract": "paired-slurm-role-releases",
+        "external_launch_gates": {
+            "mit_site_profiles": "operator_binding_required",
+            "production_dataset_receipt": "unfrozen",
+            "site_gpu_preflights": "pending_external",
+        },
+        "role_archives": [
+            {
+                "archive": f"roles/{role}.zip",
+                "platform": ROLES[role]["platform"],
+                "provider": ROLES[role]["provider"],
+                "role": role,
+                "seeds": list(ROLES[role]["seeds"]),
+                "sha256": _sha(archives[role].read_bytes()),
+            }
+            for role in ROLES
+        ],
+        "schema_version": 1,
+        "source_revision": revision,
+    }
+
+
+def build_aws_bundle(
+    output: Path,
+    archives: Mapping[str, Path],
+    *,
+    revision: str,
+) -> Path:
+    if set(archives) != set(ROLES):
+        raise ValueError("AWS transfer bundle requires all five role archives")
+    payload = {
+        "README-AWS.md": aws_bundle_readme(revision),
+        "bundle-manifest.json": _json_bytes(
+            _aws_bundle_manifest(archives, revision=revision)
+        ),
+        "roles/SHA256SUMS": "".join(
+            f"{_sha(archives[role].read_bytes())}  {role}.zip\n"
+            for role in ROLES
+        ).encode(),
+    }
+    for role in ROLES:
+        payload[f"roles/{role}.zip"] = archives[role].read_bytes()
+    payload["SHA256SUMS"] = "".join(
+        f"{_sha(payload[path])}  {path}\n"
+        for path in sorted(payload)
+    ).encode()
+    path = output / AWS_BUNDLE_NAME
+    _write_zip(path, payload)
+    return path
+
+
 def package_all(
     out_dir: Path | str,
     *,
@@ -340,6 +450,7 @@ def package_all(
             for path in archives.values()
         )
     )
+    build_aws_bundle(output, archives, revision=revision)
     return archives
 
 
@@ -361,14 +472,21 @@ def main(argv: list[str] | None = None) -> int:
         source_root=args.source_root,
         require_clean=not args.test_allow_dirty,
     )
+    bundle = Path(args.out_dir) / AWS_BUNDLE_NAME
     print(
         json.dumps(
             {
-                role: {
-                    "archive": str(path),
-                    "sha256": _sha(path.read_bytes()),
-                }
-                for role, path in archives.items()
+                "all_roles_aws_bundle": {
+                    "archive": str(bundle),
+                    "sha256": _sha(bundle.read_bytes()),
+                },
+                "roles": {
+                    role: {
+                        "archive": str(path),
+                        "sha256": _sha(path.read_bytes()),
+                    }
+                    for role, path in archives.items()
+                },
             },
             indent=2,
             sort_keys=True,
