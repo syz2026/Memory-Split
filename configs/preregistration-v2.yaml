@@ -1,0 +1,292 @@
+schema_version: 2
+preregistration_id: memorysplit-confirmatory-v2
+frozen: true
+current_scientific_status: incomplete
+protected_launch_allowed: false
+canonical_hypothesis: >-
+  At matched parameters, initialization, raw tokens, token order, optimizer
+  schedule and inference budget, removing direct next-token loss from selected
+  factual payloads improves OOD relational reasoning.
+
+status_policy:
+  precedence:
+    - invalid
+    - incomplete
+    - directional_only
+    - sign_consistent_only
+    - inconclusive
+    - supports_effect
+    - supports_practical_null
+  invalid_precedes_incomplete_on_measured_failure: true
+  rules:
+    invalid: measured_protocol_provenance_endpoint_or_instrument_failure
+    incomplete: missing_required_runs_evaluations_instruments_or_replication
+    directional_only: exactly_one_valid_360m_pair
+    sign_consistent_only: three_same_sign_pairs_without_completed_confirmatory_test
+    inconclusive: complete_valid_procedure_crosses_neither_superiority_nor_equivalence
+    supports_effect: completed_preregistered_holm_adjusted_superiority_procedure
+    supports_practical_null: completed_preregistered_equivalence_procedure
+  forbidden_labels:
+    - failed_to_reject
+    - statistically_significant_single_seed
+    - reasoning_optimal_sprint
+
+protected_cohort:
+  condition_pair:
+    - dense
+    - split90
+  model_parameters: 356033536
+  terminal_n_pairs: 5
+  seeds:
+    - 0
+    - 1
+    - 2
+    - 3
+    - 4
+  precommit_before_seed0_unblinding: true
+  continue_after_seed0_regardless_of_effect: true
+  continuation_may_stop_only_for:
+    - measured_validity_failure
+    - infrastructure_failure
+  seed0:
+    analysis_label: directional_only
+    completion_label: 1/5
+    retained_in_terminal_cohort: true
+    stop_only_for_validity_or_infrastructure_failure: true
+  training:
+    nominal_tokens_per_parameter: 20
+    targets_per_update: 524288
+    optimizer_steps: 13582
+    raw_target_tokens: 7120879616
+  matched_pair_invariants:
+    - model_architecture
+    - parameters
+    - initialization
+    - data_seed
+    - raw_target_tokens
+    - token_bytes
+    - token_order
+    - packing_boundaries
+    - optimizer
+    - optimizer_schedule
+    - targets_per_update
+    - training_steps
+    - inference_budget
+    - evaluation_items
+    - exact_graph_memory
+  claim_bearing_difference: direct_target_weights_on_routed_factual_payloads
+  memory:
+    kind: exact_non_trainable_graph
+    identical_between_arms: true
+    byte_identity_required: true
+    answer_or_proof_generation_forbidden: true
+  seed0_allocation:
+    accelerator: A100_80GB
+    total_gpus: 7
+    dense_training_gpus:
+      - 0
+      - 1
+      - 2
+    split_training_gpus:
+      - 3
+      - 4
+      - 5
+    evaluation_verification_gpus:
+      - 6
+    symmetric_training: true
+    four_vs_three_training_forbidden: true
+
+development_diagnostics_29m:
+  required: true
+  run_count: 6
+  model_parameters: 28969216
+  targets_per_update: 524288
+  optimizer_steps: 1106
+  raw_target_tokens: 579862528
+  protected_launch_requires_all_pass: true
+  selection_use_forbidden: true
+  runs:
+    - id: full_corpus_dense
+      pair_id: full_corpus
+      arm: dense
+      token_matched_replacement: none
+      state: pending
+    - id: full_corpus_split90
+      pair_id: full_corpus
+      arm: split90
+      token_matched_replacement: none
+      state: pending
+    - id: no_arc_conceptarc_dense
+      pair_id: no_arc_conceptarc
+      arm: dense
+      token_matched_replacement: fineweb_edu
+      state: pending
+    - id: no_arc_conceptarc_split90
+      pair_id: no_arc_conceptarc
+      arm: split90
+      token_matched_replacement: fineweb_edu
+      state: pending
+    - id: no_refinement_dense
+      pair_id: no_refinement
+      arm: dense
+      token_matched_replacement: verified_standard_relational_records
+      state: pending
+    - id: no_refinement_split90
+      pair_id: no_refinement
+      arm: split90
+      token_matched_replacement: verified_standard_relational_records
+      state: pending
+
+intervention_gates:
+  minimum_offload_percent:
+    distinct_offloadable_atomic_facts: 90.0
+    train_only_information_weighted_burden: 90.0
+  semantic_mask_closure_required: true
+  rules_operators_schemas_and_proof_procedures_internal: true
+  random_fact_and_matched_nonfactual_controls_required: true
+
+evaluation:
+  primary_endpoint: counterfactual_pair_and_proof_accuracy
+  verifier_required: true
+  pair_credit: one_iff_both_twins_have_correct_answers_and_verifier_accepted_proofs
+  equal_weight_by:
+    - reasoning_family
+    - ood_stratum
+  reasoning_families:
+    - graph
+    - non_path
+  model_visible_and_sealed_gold_separate: true
+  sealed_strata:
+    - iid
+    - composition_ood
+    - length_ood
+    - joint_ood
+  required_controls:
+    - correct_memory
+    - memory_off
+    - shuffled_returns
+    - relevant_edge_swap
+    - irrelevant_edge_swap
+    - gold_path_replay
+    - no_query
+    - entity_rename
+    - graph_isomorphism
+    - page_order_permutation
+  syntax_only_action_validation: true
+  allowed_actions_may_not_be_derived_from_gold_or_store_topology: true
+  fixed_action_slots: 12
+
+analysis:
+  independent_unit: paired_training_bundle
+  hierarchical_bootstrap:
+    draws: 20000
+    resampling_levels:
+      - seed
+      - world
+      - counterfactual_pair
+  paired_effect_test:
+    method: exact_sign_flip
+    alternative: split90_greater_than_dense
+  cohort_direction_test:
+    method: exact_one_sided_sign_test
+    n_pairs: 5
+    all_positive_p: 0.03125
+  three_pair_sign_consistency:
+    n_pairs: 3
+    all_positive_p: 0.125
+    maximum_status: sign_consistent_only
+  multiple_testing:
+    method: holm
+    family: confirmatory_primary_stratum_and_reasoning_family_contrasts
+  noninferiority_and_equivalence:
+    enabled: true
+    margins_frozen_before_unblinding: true
+    all_required_instruments_must_pass: true
+  fixed_checkpoint_aulc:
+    enabled: true
+    checkpoints_frozen_before_unblinding: true
+  effect_direction_may_not_change_continuation: true
+
+protected_run_gates:
+  all_required: true
+  required_order:
+    - scientific_contract
+    - route_dose
+    - semantic_closure
+    - proof_verification
+    - ood_seal
+    - corpus_identity
+    - paired_training
+    - checkpoint_resume
+    - evaluation_validity
+    - six_29m_diagnostics
+  gates:
+    - id: scientific_contract
+      state: pending
+      evidence_state: unfrozen
+      evidence_sha256: null
+    - id: route_dose
+      state: pending
+      evidence_state: unfrozen
+      evidence_sha256: null
+    - id: semantic_closure
+      state: pending
+      evidence_state: unfrozen
+      evidence_sha256: null
+    - id: proof_verification
+      state: pending
+      evidence_state: unfrozen
+      evidence_sha256: null
+    - id: ood_seal
+      state: pending
+      evidence_state: unfrozen
+      evidence_sha256: null
+    - id: corpus_identity
+      state: pending
+      evidence_state: unfrozen
+      evidence_sha256: null
+    - id: paired_training
+      state: pending
+      evidence_state: unfrozen
+      evidence_sha256: null
+    - id: checkpoint_resume
+      state: pending
+      evidence_state: unfrozen
+      evidence_sha256: null
+    - id: evaluation_validity
+      state: pending
+      evidence_state: unfrozen
+      evidence_sha256: null
+    - id: six_29m_diagnostics
+      state: pending
+      evidence_state: unfrozen
+      evidence_sha256: null
+
+artifact_bindings:
+  expanded_fineweb_snapshot:
+    state: unfrozen
+    sha256: null
+  finemath_snapshot:
+    state: unfrozen
+    sha256: null
+  reasoning_corpus:
+    state: unfrozen
+    sha256: null
+  route_manifest:
+    state: unfrozen
+    sha256: null
+  exact_graph_memory:
+    state: unfrozen
+    sha256: null
+  model_visible_evaluation:
+    state: unfrozen
+    sha256: null
+  sealed_gold_evaluation:
+    state: unfrozen
+    sha256: null
+  environment_lock:
+    state: unfrozen
+    sha256: null
+  run_manifest:
+    state: unfrozen
+    sha256: null
