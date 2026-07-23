@@ -1046,6 +1046,8 @@ def test_v2_slurm_templates_encode_real_partition_and_safe_publication():
     assert "SLURM_ARRAY_JOB_ID" in build_text
     assert "MS_RUN_NONCE" in build_text
     assert "build-fixture" not in build_text
+    assert "#SBATCH --export=NONE" not in build_text
+    assert "sbatch --export=MS_REPO=" in build_text
 
     assert "#SBATCH --array" not in verify_text
     assert "MS_BUILD_ID" in verify_text
@@ -1056,7 +1058,6 @@ def test_v2_slurm_templates_encode_real_partition_and_safe_publication():
     for template, text in ((build, build_text), (verify, verify_text)):
         text = template.read_text(encoding="utf-8")
         assert "#SBATCH --partition=normal" in text
-        assert "#SBATCH --export=NONE" in text
         assert "--export=ALL" not in text
         assert "#SBATCH --gres" not in text
         assert "MS_SHARED_ROOT" in text
@@ -1071,6 +1072,53 @@ def test_v2_slurm_templates_encode_real_partition_and_safe_publication():
             text=True,
         )
         assert syntax.returncode == 0, syntax.stderr
+
+
+@pytest.mark.parametrize(
+    ("finalize_status", "expected_status"),
+    ((0, 0), (75, 0), (1, 1)),
+)
+def test_v2_slurm_build_propagates_finalize_status(
+    tmp_path,
+    finalize_status,
+    expected_status,
+):
+    root = Path(__file__).resolve().parents[1]
+    build_script = root / "cluster" / "slurm" / "v2_corpus_build.sbatch"
+    fake_python = tmp_path / f"fake-python-{finalize_status}"
+    fake_python.write_text(
+        "#!/usr/bin/env bash\n"
+        "if [[ \" $* \" == *\" render-fixture-task \"* ]]; then\n"
+        "    exit 0\n"
+        "fi\n"
+        "if [[ \" $* \" == *\" finalize-fixture-tasks \"* ]]; then\n"
+        f"    exit {finalize_status}\n"
+        "fi\n"
+        "exit 99\n",
+        encoding="utf-8",
+    )
+    fake_python.chmod(0o755)
+    result = subprocess.run(
+        ["bash", str(build_script)],
+        cwd=root,
+        env={
+            **os.environ,
+            "MS_REPO": str(root),
+            "MS_PYTHON": str(fake_python),
+            "MS_SHARED_ROOT": str(tmp_path / "shared"),
+            "MS_RUN_NONCE": "status-test",
+            "SLURM_ARRAY_JOB_ID": "status-array",
+            "SLURM_ARRAY_TASK_COUNT": "3",
+            "SLURM_ARRAY_TASK_ID": "0",
+            "SLURM_CPUS_PER_TASK": "1",
+            "SLURM_JOB_ID": "status-array-0",
+        },
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == expected_status, result.stderr
 
 
 def test_v2_slurm_scripts_run_locally_as_disjoint_array_and_single_verify(tmp_path):

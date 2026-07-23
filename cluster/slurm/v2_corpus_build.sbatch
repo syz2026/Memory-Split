@@ -5,7 +5,6 @@
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=16G
 #SBATCH --time=02:00:00
-#SBATCH --export=NONE
 #SBATCH --output=v2-corpus-%A_%a.out
 #
 # Submit with an explicit allowlist, for example:
@@ -59,8 +58,9 @@ if run_python finalize-fixture-tasks \
     "${COMMON_ARGS[@]}" \
     --allow-incomplete; then
     exit 0
+else
+    status=$?
 fi
-status=$?
 if [[ "$status" -eq 75 ]]; then
     exit 0
 fi
