@@ -15,21 +15,18 @@ capacity implicitly.
 
 ## 0. Integration constants
 
-These are the last committed interfaces used to write this runbook. Re-pin the
+These are the exact committed interfaces used by this runbook. Re-pin a
 constant only after the owning task publishes and its focused tests pass.
-Task 3/5 currently has uncommitted launcher review work, and Task 6 does not yet
-publish the selected-instance interface used below; those are release blockers,
-not reasons to add compatibility branches here.
 
 ```bash
 set -euo pipefail
 umask 077
 
-export MS_ILLUMINA_INTERFACE_REF=a85eb13ff2bf41046ab4a77d4f1924ed7e66c32e
-export MS_TASK_3_5_INTERFACE_REF=4b796a5
-export MS_TASK_6_INTERFACE_REF=0c9f20b
-export MS_TASK_7_INTERFACE_REF=48cfacb
-export MS_TASK_8_INTERFACE_REF=f22f6ad
+export MS_COHORT_AULC_INTERFACE_REF=70c1951fedce3a61e24b7d761fa330749b71618c
+export MS_AWS_PACKAGE_INTERFACE_REF=2629a8e00987508e5ef7fffae98697d4bda7f00c
+export MS_AWS_PACKAGE_LINEAGE_REF=df2f5e1c0f690a5c358ec777e9b6ae99a7d84738
+export MS_CONFIRMATORY_RUNNER_INTERFACE_REF=ac4b5a0033817fe1fcd4e0c9514c13252e7d560f
+export MS_TASK_6_INTERFACE_REF=84bd93cd3d64089bd4ce9064e5eac057d6f5210e
 
 export AWS_REGION=us-east-1
 export MS_COHORT_ID=memorysplit-confirmatory-v2-360m-n5
@@ -51,12 +48,15 @@ export MS_AWS_RELEASE="$MS_RELEASE_ROOT/RELEASE-AWS-P5.json"
 export MS_DATASET_POINTER="$PWD/DATASET-POINTER-AWS.json"
 export MS_DATASET_RECEIPT="$PWD/dataset/corpus-receipt.json"
 export MS_ENVIRONMENT_RECEIPT="$PWD/environment/aws-p5-environment-receipt.json"
-export MS_SEALED_RELEASE="$PWD/evaluation/SEALED-RELEASE.json"
-export MS_STUDY_LOCK="$PWD/evaluation/STUDY-LOCK.json"
+export MS_SEALED_RELEASE="$PWD/evaluation/sealed-release"
+export MS_STUDY_LOCK="$MS_SEALED_RELEASE/STUDY-LOCK.json"
 export MS_TERMINATE_AT=REPLACE_WITH_RFC3339_UTC_DEADLINE
+export MS_APPROVAL_EXPIRES_AT=REPLACE_WITH_RFC3339_UTC_APPROVAL_EXPIRY
+export MS_APPROVAL_KEY_ID=REPLACE_WITH_OPERATOR_KEY_ID
 export MS_APPROVAL_ROOT="$PWD/approvals/aws-p5"
 export MS_STATE_ROOT="$PWD/.msctl-state/aws-p5"
 mkdir -p "$MS_APPROVAL_ROOT" "$MS_STATE_ROOT"
+: "${MSCTL_APPROVAL_KEY:?export a minimum 32-byte approval key}"
 
 file_sha256() {
   python - "$1" <<'PY'
@@ -69,6 +69,100 @@ with Path(sys.argv[1]).open("rb") as stream:
     for chunk in iter(lambda: stream.read(1024 * 1024), b""):
         digest.update(chunk)
 print(digest.hexdigest())
+PY
+}
+
+write_approval() {
+  local operation="$1" manifest="$2" instance_id="$3" output="$4"
+  local checkpoint_receipt="${5:-}"
+  python - "$operation" "$manifest" "$instance_id" "$output" \
+    "$checkpoint_receipt" <<'PY'
+from pathlib import Path
+import hashlib
+import hmac
+import json
+import os
+import sys
+
+operation, manifest_path, instance_id, output_path, checkpoint_path = sys.argv[1:]
+
+def canonical(value):
+    return json.dumps(
+        value, sort_keys=True, separators=(",", ":"), allow_nan=False
+    ).encode("ascii")
+
+def load(path):
+    return json.loads(Path(path).read_text(encoding="utf-8"))
+
+release = load(os.environ["MS_AWS_RELEASE"])
+manifest = load(manifest_path)
+profile_path = Path("cluster/profiles/aws-p5.48xlarge.json")
+profile_sha256 = hashlib.sha256(profile_path.read_bytes()).hexdigest()
+release_sha256 = release["archive"]["sha256"]
+manifest_sha256 = hashlib.sha256(canonical(manifest)).hexdigest()
+runtime = {
+    "ami_id": os.environ["MS_AWS_AMI_ID"],
+    "container_digest": os.environ["MS_CONTAINER_DIGEST"],
+    "gid": int(os.environ["MS_RUNTIME_GID"]),
+    "region": os.environ["AWS_REGION"],
+    "s3_root": os.environ["MS_S3_ROOT"],
+    "uid": int(os.environ["MS_RUNTIME_UID"]),
+}
+runtime_sha256 = hashlib.sha256(canonical(runtime)).hexdigest()
+policies = {
+    "submit": (8, 1440, "scripts/run_train.py"),
+    "resume": (8, 1440, "scripts/run_train.py"),
+    "evaluate": (8, 360, "evals/confirmatory/runner.py"),
+}
+gpus, wall_minutes, script = policies[operation]
+resources = {
+    "schema_version": 1,
+    "operation": operation,
+    "jobs": 1,
+    "allocated_gpus": gpus,
+    "wall_minutes": wall_minutes,
+    "gpu_hours": gpus * wall_minutes / 60.0,
+    "gres": "gpu:h100:8",
+    "script": script,
+    "ami_id": runtime["ami_id"],
+    "container_digest": runtime["container_digest"],
+    "instance_id": instance_id,
+    "profile_sha256": profile_sha256,
+    "release_sha256": release_sha256,
+    "run_manifest_sha256": manifest_sha256,
+    "runtime_sha256": runtime_sha256,
+    "seed": manifest["seed"],
+    "terminate_at": os.environ["MS_TERMINATE_AT"],
+}
+if operation == "resume":
+    if not checkpoint_path:
+        raise SystemExit("resume approval requires a checkpoint receipt")
+    resources["checkpoint_receipt_sha256"] = hashlib.sha256(
+        Path(checkpoint_path).read_bytes()
+    ).hexdigest()
+unsigned = {
+    "schema_version": 1,
+    "receipt_id": f"aws-{operation}-s{manifest['seed']}-{instance_id}",
+    "provider": "aws-p5.48xlarge",
+    "operation": operation,
+    "release_sha256": release_sha256,
+    "run_manifest_sha256": manifest_sha256,
+    "resources": resources,
+    "limits": {"gpu_hours": resources["gpu_hours"], "jobs": 1},
+    "expires_at": os.environ["MS_APPROVAL_EXPIRES_AT"],
+    "key_id": os.environ["MS_APPROVAL_KEY_ID"],
+}
+key = os.environ["MSCTL_APPROVAL_KEY"].encode("utf-8")
+if len(key) < 32:
+    raise SystemExit("MSCTL_APPROVAL_KEY must contain at least 32 bytes")
+receipt = {
+    **unsigned,
+    "signature": hmac.new(key, canonical(unsigned), hashlib.sha256).hexdigest(),
+}
+flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+descriptor = os.open(output_path, flags, 0o600)
+with os.fdopen(descriptor, "wb") as stream:
+    stream.write(canonical(receipt) + b"\n")
 PY
 }
 
@@ -178,6 +272,12 @@ jq -e \
   ($instances[0].MetadataOptions.HttpTokens == "required") and
   ($instances[0].State.Name | IN("pending","running","stopped"))
 ' "$MS_APPROVAL_ROOT/selected-instance.json" >/dev/null
+export MS_AWS_INSTANCE_PROFILE_ARN="$(
+  jq -er '.Reservations[0].Instances[0].IamInstanceProfile.Arn' \
+    "$MS_APPROVAL_ROOT/selected-instance.json"
+)"
+printf '%s\n' "$MS_AWS_INSTANCE_PROFILE_ARN" |
+  grep -Eq '^arn:aws:iam::[0-9]{12}:instance-profile/[A-Za-z0-9+=,.@_-]+$'
 ```
 
 Before deadline mode, repeat the selected-instance check for four distinct IDs
@@ -441,23 +541,14 @@ jq -e '
   | length == 1
 ' /var/tmp/memorysplit-input/bootstrap-plan.json >/dev/null
 
-read -r -p 'Type DESTROY-SELECTED-INSTANCE-STORE: ' MS_STORAGE_APPROVAL
-test "$MS_STORAGE_APPROVAL" = DESTROY-SELECTED-INSTANCE-STORE
-# APPLY: the authorization flag is mandatory and deliberately adjacent.
-"${BOOTSTRAP[@]}" \
-  --authorize-destructive-instance-store \
-  --apply |
-  tee /var/tmp/memorysplit-input/bootstrap-result.json
-jq -e '.ok == true and .dry_run == false' \
-  /var/tmp/memorysplit-input/bootstrap-result.json >/dev/null
-
-findmnt -n -o SOURCE,FSTYPE,OPTIONS /mnt/memorysplit
-test "$(stat -f -c %T /mnt/memorysplit)" = xfs
-test "$(stat -c %u /mnt/memorysplit)" = "$MS_RUNTIME_UID"
-test "$(stat -c %g /mnt/memorysplit)" = "$MS_RUNTIME_GID"
+# Do not apply bootstrap here. Task 6 submit owns the sole destructive call,
+# including --authorize-destructive-instance-store and --apply, after its
+# selected-instance approval is verified.
 ```
 
-The bootstrap owns destructive storage admission. Never run `mdadm --create`,
+The Task 6 operation must contain exactly one
+`cluster/aws/p5/bootstrap.py` step and one Task 3/5 paired launcher step. The
+bootstrap owns destructive storage admission. Never run `mdadm --create`,
 filesystem creation, or mounting by hand. `/mnt/memorysplit` is disposable;
 only hash-verified S3 object versions are durable.
 
@@ -544,6 +635,7 @@ source, updates, output = Path(sys.argv[1]), int(sys.argv[2]), Path(sys.argv[3])
 value = yaml.safe_load(source.read_text(encoding="utf-8"))
 value["max_steps"] = updates
 value["total_tokens"] = updates * value["tokens_per_step"]
+value["snapshot_steps"] = [updates]
 value["out_dir"] = "/output/run"
 output.parent.mkdir(parents=True, exist_ok=True)
 output.write_text(yaml.safe_dump(value, sort_keys=False), encoding="utf-8")
@@ -552,9 +644,24 @@ PY
 
 run_canary_arm() {
   local mode="$1" label="$2" arm="$3" gpu_ids="$4" nproc="$5"
+  local resume_label="$6" pid_variable="$7"
   local config="$MS_CANARY_ROOT/$label/$arm.yaml"
   local output="$MS_CANARY_ROOT/$label/$arm-output"
+  local -a resume=(--resume none)
+  local -a resume_mount=()
   mkdir -p "$output"
+  if [[ "$resume_label" != none ]]; then
+    local checkpoint="$MS_CANARY_ROOT/$resume_label/${arm}-output/run/checkpoint.pt"
+    local checkpoint_sha256
+    checkpoint_sha256="$(sha256sum "$checkpoint" | cut -d' ' -f1)"
+    resume_mount=(
+      --mount "type=bind,src=${checkpoint},dst=/resume/checkpoint.pt,readonly"
+    )
+    resume=(
+      --resume-path /resume/checkpoint.pt
+      --resume-sha256 "$checkpoint_sha256"
+    )
+  fi
   local -a command=(
     docker run --rm
     --read-only
@@ -569,6 +676,7 @@ run_canary_arm() {
     --mount "type=bind,src=/mnt/memorysplit/dataset,dst=/dataset,readonly"
     --mount "type=bind,src=${config},dst=/runtime/config.yaml,readonly"
     --mount "type=bind,src=${output},dst=/output"
+    "${resume_mount[@]}"
     --env HOME=/tmp/home
     "$MS_CONTAINER_IMAGE"
     /opt/conda/bin/python -m torch.distributed.run
@@ -578,18 +686,20 @@ run_canary_arm() {
     "--rdzv_endpoint=127.0.0.1:$([[ "$arm" = dense ]] && echo 29611 || echo 29612)"
     /workspace/scripts/run_train.py
     --config /runtime/config.yaml
-    --resume none
+    "${resume[@]}"
   )
   printf '%q ' "${command[@]}"
   printf '\n'
   if [[ "$mode" = apply ]]; then
     "${command[@]}" >"$output/container.log" 2>&1 &
-    printf '%s\n' "$!"
+    printf -v "$pid_variable" '%s' "$!"
   fi
 }
 
 run_canary_pair() {
   local mode="$1" label="$2" updates="$3" nproc="$4"
+  local resume_label="${5:-none}"
+  local dense_gpus split_gpus dense_pid split_pid status=0
   make_canary_config dense "$updates" "$MS_CANARY_ROOT/$label/dense.yaml"
   make_canary_config split90 "$updates" "$MS_CANARY_ROOT/$label/split90.yaml"
   if [[ "$nproc" = 1 ]]; then
@@ -600,14 +710,15 @@ run_canary_pair() {
     split_gpus=4,5,6,7
   fi
   if [[ "$mode" = plan ]]; then
-    run_canary_arm plan "$label" dense "$dense_gpus" "$nproc"
-    run_canary_arm plan "$label" split90 "$split_gpus" "$nproc"
+    run_canary_arm plan "$label" dense "$dense_gpus" "$nproc" "$resume_label" dense_pid
+    run_canary_arm plan "$label" split90 "$split_gpus" "$nproc" "$resume_label" split_pid
     return
   fi
-  dense_pid="$(run_canary_arm apply "$label" dense "$dense_gpus" "$nproc" | tail -1)"
-  split_pid="$(run_canary_arm apply "$label" split90 "$split_gpus" "$nproc" | tail -1)"
-  wait "$dense_pid"
-  wait "$split_pid"
+  run_canary_arm apply "$label" dense "$dense_gpus" "$nproc" "$resume_label" dense_pid
+  run_canary_arm apply "$label" split90 "$split_gpus" "$nproc" "$resume_label" split_pid
+  wait "$dense_pid" || status=$?
+  wait "$split_pid" || status=$?
+  return "$status"
 }
 
 # DRY RUN.
@@ -629,6 +740,12 @@ for arm in dense split90; do
   )
 done
 printf '%s\n' "paired resume probe checkpoint hashes verified"
+# DRY RUN: the rendered argv contains the authenticated path and SHA-256.
+run_canary_pair plan resume-probe 2 1 functional
+read -r -p 'Type APPLY-RESUME-CANARY: ' MS_RESUME_CANARY_APPROVAL
+test "$MS_RESUME_CANARY_APPROVAL" = APPLY-RESUME-CANARY
+# APPLY.
+run_canary_pair apply resume-probe 2 1 functional
 
 # DRY RUN.
 run_canary_pair plan throughput-100 100 4
@@ -668,12 +785,22 @@ for seed in 1 2 3 4; do
     --dataset-pointer "$MS_DATASET_POINTER" \
     --dataset-root "$(dirname "$MS_DATASET_RECEIPT")" \
     --environment-receipt "$MS_ENVIRONMENT_RECEIPT" \
-    --terminate-at "$MS_TERMINATE_AT" \
-    --approval "$approval" |
+    --terminate-at "$MS_TERMINATE_AT" |
     tee "$MS_APPROVAL_ROOT/submit-s${seed}-plan.json"
   jq -e --arg instance "$MS_INSTANCE_ID" '
-    .dry_run == true and .instance_id == $instance
+    .dry_run == true and
+    .result.instance_id == $instance and
+    ([.result.operation_intent.steps[]
+      | select(.name == "bootstrap")] | length) == 1 and
+    ([.result.operation_intent.steps[]
+      | select(.name == "paired-launch")] | length) == 1
   ' "$MS_APPROVAL_ROOT/submit-s${seed}-plan.json" >/dev/null
+  planned_instance="$(
+    jq -er '.result.instance_id' \
+      "$MS_APPROVAL_ROOT/submit-s${seed}-plan.json"
+  )"
+  test "$planned_instance" = "$MS_INSTANCE_ID"
+  write_approval submit "$manifest" "$planned_instance" "$approval"
 
   read -r -p "Type APPLY-SEED-${seed}: " answer
   test "$answer" = "APPLY-SEED-${seed}"
@@ -719,8 +846,14 @@ for seed in 1 2 3 4; do
     --dataset-pointer "$MS_DATASET_POINTER" \
     --dataset-root "$(dirname "$MS_DATASET_RECEIPT")" \
     --environment-receipt "$MS_ENVIRONMENT_RECEIPT" \
-    --terminate-at "$MS_TERMINATE_AT" \
-    --approval "$approval"
+    --terminate-at "$MS_TERMINATE_AT" |
+    tee "$MS_APPROVAL_ROOT/deadline-submit-s${seed}-plan.json"
+  planned_instance="$(
+    jq -er '.result.instance_id' \
+      "$MS_APPROVAL_ROOT/deadline-submit-s${seed}-plan.json"
+  )"
+  test "$planned_instance" = "$instance"
+  write_approval submit "$manifest" "$planned_instance" "$approval"
 done
 
 read -r -p 'Type APPLY-FOUR-INSTANCE-DEADLINE: ' MS_DEADLINE_APPROVAL
@@ -754,10 +887,9 @@ manifest="run-manifests/aws-p5-s${seed}.json"
 checkpoint_receipt="$PWD/checkpoints/seed-${seed}/pair-checkpoint-receipt.json"
 jq -e '
   .schema_version == 2 and
-  .pair_complete == true and
-  .resumable == true and
-  (.arms | keys | sort) == ["dense","split90"] and
-  ([.arms[].checkpoint_sha256
+  .provider == "aws-p5.48xlarge" and
+  ([.checkpoints[].arm] | sort) == ["dense","split90"] and
+  ([.checkpoints[].sha256
     | select(type == "string" and test("^[0-9a-f]{64}$"))] | length) == 2
 ' "$checkpoint_receipt" >/dev/null
 
@@ -768,8 +900,18 @@ jq -e '
   --dataset-pointer "$MS_DATASET_POINTER" \
   --dataset-root "$(dirname "$MS_DATASET_RECEIPT")" \
   --environment-receipt "$MS_ENVIRONMENT_RECEIPT" \
-  --checkpoint-receipt "$checkpoint_receipt" \
-  --approval "$MS_APPROVAL_ROOT/resume-s${seed}.json"
+  --checkpoint-receipt "$checkpoint_receipt" |
+  tee "$MS_APPROVAL_ROOT/resume-s${seed}-plan.json"
+jq -e '
+  .dry_run == true and
+  ([.result.operation_intent.checkpoint_receipt.checkpoints[]
+    | select(
+        (.resume_path | type == "string") and
+        (.resume_sha256 | test("^[0-9a-f]{64}$"))
+      )] | length) == 2
+' "$MS_APPROVAL_ROOT/resume-s${seed}-plan.json" >/dev/null
+write_approval resume "$manifest" "$MS_INSTANCE_ID" \
+  "$MS_APPROVAL_ROOT/resume-s${seed}.json" "$checkpoint_receipt"
 read -r -p "Type APPLY-RESUME-${seed}: " answer
 test "$answer" = "APPLY-RESUME-${seed}"
 # APPLY.
@@ -788,37 +930,50 @@ The Task 8 evaluator has one canonical argv. Build it as an array and pass it
 to the same digest-pinned container; do not execute it in the host environment.
 
 ```bash
-export MS_RUN="/mnt/memorysplit/runs/seed-${seed}"
-export MS_EVAL_OUT="/mnt/memorysplit/evaluations/seed-${seed}"
-EVALUATOR=(python -m evals.confirmatory evaluate --run /run --sealed-release /sealed/SEALED-RELEASE.json --expected-study-lock-sha256 "$MS_STUDY_LOCK_SHA256" --device cuda --output-dir /output)
-printf '%q ' docker run --rm --read-only --gpus all --network=none \
-  --user "${MS_RUNTIME_UID}:${MS_RUNTIME_GID}" --workdir /workspace \
-  --mount "type=bind,src=${MS_RELEASE_CODE},dst=/workspace,readonly" \
-  --mount "type=bind,src=${MS_RUN},dst=/run,readonly" \
-  --mount "type=bind,src=$(dirname "$MS_SEALED_RELEASE"),dst=/sealed,readonly" \
-  --mount "type=bind,src=${MS_EVAL_OUT},dst=/output" \
-  "$MS_CONTAINER_IMAGE" "${EVALUATOR[@]}"
-printf '\n'
+export MS_RUN_ROOT="/mnt/memorysplit/runs/seed-${seed}"
+export MS_EVAL_PARENT="/mnt/memorysplit/evaluations/seed-${seed}"
+test -d "$MS_SEALED_RELEASE"
+mkdir -p "$MS_EVAL_PARENT"
+
+run_evaluation_arm() {
+  local mode="$1" arm="$2"
+  test ! -e "$MS_EVAL_PARENT/$arm"
+  local -a evaluation=(
+    docker run --rm --read-only --gpus all --network=none
+    --user "${MS_RUNTIME_UID}:${MS_RUNTIME_GID}"
+    --workdir /workspace
+    --security-opt no-new-privileges
+    --cap-drop ALL
+    --mount "type=bind,src=${MS_RELEASE_CODE},dst=/workspace,readonly"
+    --mount "type=bind,src=${MS_RUN_ROOT}/${arm}/run,dst=/run,readonly"
+    --mount "type=bind,src=${MS_SEALED_RELEASE},dst=/sealed-release,readonly"
+    --mount "type=bind,src=${MS_EVAL_PARENT},dst=/output"
+    "$MS_CONTAINER_IMAGE"
+    python -m evals.confirmatory evaluate
+    --run /run
+    --sealed-release /sealed-release
+    --expected-study-lock-sha256 "$MS_STUDY_LOCK_SHA256"
+    --device cuda
+    --output-dir "/output/$arm"
+  )
+  if [[ "$mode" = plan ]]; then
+    printf '%q ' "${evaluation[@]}"
+    printf '\n'
+  else
+    "${evaluation[@]}"
+  fi
+}
 
 # DRY RUN.
-"${MSCTL[@]}" evaluate \
-  --release "$MS_AWS_RELEASE" \
-  --manifest "$manifest" \
-  --dataset-pointer "$MS_DATASET_POINTER" \
-  --dataset-root "$(dirname "$MS_DATASET_RECEIPT")" \
-  --environment-receipt "$MS_ENVIRONMENT_RECEIPT" \
-  --approval "$MS_APPROVAL_ROOT/evaluate-s${seed}.json"
+run_evaluation_arm plan dense
+run_evaluation_arm plan split90
+write_approval evaluate "$manifest" "$MS_INSTANCE_ID" \
+  "$MS_APPROVAL_ROOT/evaluate-s${seed}.json"
 read -r -p "Type APPLY-EVALUATE-${seed}: " answer
 test "$answer" = "APPLY-EVALUATE-${seed}"
 # APPLY.
-"${MSCTL[@]}" evaluate \
-  --release "$MS_AWS_RELEASE" \
-  --manifest "$manifest" \
-  --dataset-pointer "$MS_DATASET_POINTER" \
-  --dataset-root "$(dirname "$MS_DATASET_RECEIPT")" \
-  --environment-receipt "$MS_ENVIRONMENT_RECEIPT" \
-  --approval "$MS_APPROVAL_ROOT/evaluate-s${seed}.json" \
-  --apply
+run_evaluation_arm apply dense
+run_evaluation_arm apply split90
 
 # DRY RUN.
 "${MSCTL[@]}" collect \

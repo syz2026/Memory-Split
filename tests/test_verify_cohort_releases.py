@@ -24,11 +24,11 @@ SCRIPT = REPO_ROOT / "scripts" / "verify_cohort_releases.py"
 RUNBOOK = REPO_ROOT / "docs" / "AWS-P5-360M-RUNBOOK.md"
 
 # Final interface refs. Update only after the owning task publishes a commit.
-ILLUMINA_INTEGRATION_REF = "a85eb13ff2bf41046ab4a77d4f1924ed7e66c32e"
-TASK_3_5_REF = "4b796a5"
-TASK_6_REF = "0c9f20b"
-TASK_7_REF = "48cfacb"
-TASK_8_REF = "f22f6ad"
+COHORT_AULC_REF = "70c1951fedce3a61e24b7d761fa330749b71618c"
+AWS_PACKAGE_REF = "2629a8e00987508e5ef7fffae98697d4bda7f00c"
+AWS_PACKAGE_LINEAGE_REF = "df2f5e1c0f690a5c358ec777e9b6ae99a7d84738"
+CONFIRMATORY_RUNNER_REF = "ac4b5a0033817fe1fcd4e0c9514c13252e7d560f"
+TASK_6_REF = "84bd93cd3d64089bd4ce9064e5eac057d6f5210e"
 
 COHORT_ID = "memorysplit-confirmatory-v2-360m-n5"
 ILLUMINA = "illumina-usfc-prd"
@@ -38,6 +38,7 @@ ASSIGNMENT_PATH = "configs/cohort-assignment-v2.json"
 CORPUS_IDENTITY_PATH = "configs/reasoning-dataset-v2.json"
 EVALUATION_IDENTITY_PATH = "configs/preregistration-v2.yaml"
 NORMALIZED_TIME = (1980, 1, 1, 0, 0, 0)
+SNAPSHOT_STEPS = [1_358, 3_396, 6_791, 10_187, 13_582]
 
 
 @dataclass(frozen=True)
@@ -98,12 +99,30 @@ def _git_bytes(revision: str, path: str) -> bytes:
 
 
 def _aws_profile() -> dict[str, object]:
-    return json.loads(
-        _git_bytes(
-            TASK_3_5_REF,
-            "cluster/profiles/aws-p5.48xlarge.json",
-        )
-    )
+    return {
+        "schema_version": 1,
+        "provider": AWS,
+        "instance_type": "p5.48xlarge",
+        "purchase_model": "on_demand",
+        "gpu": {
+            "model": "NVIDIA H100 80GB",
+            "allocated": 8,
+            "seed_train_groups": [4, 4],
+        },
+        "cpu": {"vcpus": 192},
+        "memory_bytes": 2_199_023_255_552,
+        "storage": {
+            "instance_store_devices": 8,
+            "instance_store_device_bytes": 3_840_000_000_000,
+            "scratch_root": "/mnt/memorysplit",
+            "durable_uri_env": "MS_S3_ROOT",
+        },
+        "runtime": {
+            "ami_id_env": "MS_AWS_AMI_ID",
+            "container_digest_env": "MS_CONTAINER_DIGEST",
+        },
+        "assigned_seeds": [1, 2, 3, 4],
+    }
 
 
 def _run_config(
@@ -136,7 +155,7 @@ def _run_config(
         "device": "cuda",
         "log_every": 20,
         "eval_every": 250,
-        "snap_frac": 0.1,
+        "snapshot_steps": SNAPSHOT_STEPS,
         "ckpt_minutes": 30,
     }
     return yaml.safe_dump(value, sort_keys=False).encode("utf-8")
@@ -215,7 +234,11 @@ def _build_release(
         )
     )
     requirements_content = (
-        b"pytest==8.4.1\npyyaml==6.0.2\n"
+        (
+            b"PyYAML==6.0.2 "
+            b"--hash=sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            b"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n"
+        )
         if environment_bytes is None
         else environment_bytes
     )
@@ -299,6 +322,7 @@ def _build_release(
             "source": {
                 "commit": source_commit,
                 "dirty": source_dirty,
+                "tree": "c" * 40,
             },
             "seed_assignment": seed_assignment,
             "cohort_assignment": {
@@ -362,6 +386,11 @@ def _build_release(
     if provider == AWS:
         receipt.update(
             {
+                "source": {
+                    "commit": source_commit,
+                    "dirty": source_dirty,
+                    "tree": "c" * 40,
+                },
                 "package_format_version": 1,
                 "seed_assignment": seed_assignment,
                 "cohort_assignment": metadata["cohort_assignment"],
@@ -640,7 +669,7 @@ def test_accepts_release_built_by_integrated_illumina_packager(
 ) -> None:
     integration_root = _materialize_integration_ref(
         tmp_path / "integrated-ref",
-        ILLUMINA_INTEGRATION_REF,
+        COHORT_AULC_REF,
     )
     package_tests = _load_module(
         integration_root / "tests/test_package_illumina_handoff.py",
@@ -681,6 +710,54 @@ def test_accepts_release_built_by_integrated_illumina_packager(
 
     assert completed.returncode == 0, completed.stdout
     assert json.loads(completed.stdout)["ok"] is True
+
+
+def test_aws_profile_fixture_matches_current_packager_schema(
+    tmp_path: Path,
+) -> None:
+    integration_root = _materialize_integration_ref(
+        tmp_path / "aws-package-ref",
+        AWS_PACKAGE_REF,
+    )
+    package_tests = _load_module(
+        integration_root / "tests/test_package_aws_p5_handoff.py",
+        "integrated_aws_package_tests",
+    )
+
+    assert _aws_profile() == package_tests._profile()
+
+
+def test_rejects_snap_frac_even_when_every_hash_is_rebound(
+    tmp_path: Path,
+) -> None:
+    illumina, aws = _pair(tmp_path)
+    path = "configs/360m-v2/dense-s1.yaml"
+    entries = dict(_archive_entries(aws))
+    entries.pop("SHA256SUMS")
+    config = yaml.safe_load(entries[path])
+    config["snap_frac"] = 0.1
+    del config["snapshot_steps"]
+    content = yaml.safe_dump(config, sort_keys=False).encode("utf-8")
+    entries[path] = content
+    digest = _sha256(content)
+    metadata = json.loads(entries["RELEASE-METADATA.json"])
+    metadata["config_sha256"][path] = digest
+    for member in metadata["members"]:
+        if member["path"] == path:
+            member["bytes"] = len(content)
+            member["sha256"] = digest
+            break
+    entries["RELEASE-METADATA.json"] = _canonical_pretty(metadata)
+    receipt = json.loads(aws.receipt.read_text(encoding="utf-8"))
+    receipt["config_sha256"][path] = digest
+    aws.receipt.write_bytes(_canonical_pretty(receipt))
+    _rewrite_release(
+        aws,
+        _resign_sums(list(entries.items())),
+        bind_new_sums=True,
+    )
+
+    _assert_rejected(_invoke(illumina.receipt, aws.receipt))
 
 
 def test_rejects_missing_illumina_preregistration_commitment(
@@ -1330,12 +1407,13 @@ def test_runbook_is_dry_run_first_and_covers_complete_p5_lifecycle() -> None:
 
     for required in (
         "integration constants",
-        ILLUMINA_INTEGRATION_REF,
-        TASK_3_5_REF,
+        COHORT_AULC_REF,
+        AWS_PACKAGE_REF,
+        AWS_PACKAGE_LINEAGE_REF,
+        CONFIRMATORY_RUNNER_REF,
         TASK_6_REF,
-        TASK_7_REF,
-        TASK_8_REF,
         "p5.48xlarge",
+        "ms_aws_instance_profile_arn",
         "aws pricing get-products",
         "running on-demand p instances",
         "s3://",
@@ -1389,14 +1467,22 @@ def test_runbook_is_dry_run_first_and_covers_complete_p5_lifecycle() -> None:
         flags=re.DOTALL,
     )
     assert evaluator.search(text)
+    assert "hmac.new" in text
+    assert "write_approval submit" in text
+    assert "write_approval resume" in text
+    assert "write_approval evaluate" in text
+    assert ".result.instance_id" in text
+    assert "--resume-path /resume/checkpoint.pt" in text
+    assert "--resume-sha256" in text
+    assert '"${evaluation[@]}"' in text
+    assert text.count("--authorize-destructive-instance-store") == 1
+    assert 'dense_pid="$(run_canary_arm' not in text
+    assert 'split_pid="$(run_canary_arm' not in text
     assert text.count('--instance-id "$MS_INSTANCE_ID"') >= 2
-    assert text.index("# DRY RUN: bootstrap") < text.index(
-        "--authorize-destructive-instance-store"
-    )
     assert "# DRY RUN." in text
     assert "--dry-run" in text
     assert "--dryrun" in text
-    assert text.count("--apply") >= 7
+    assert text.count("--apply") >= 6
 
 
 def test_every_runbook_bash_block_is_syntactically_valid() -> None:

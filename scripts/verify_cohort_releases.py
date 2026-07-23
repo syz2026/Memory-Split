@@ -29,6 +29,7 @@ EXPECTED_SEEDS = {
     AWS_PROVIDER: (1, 2, 3, 4),
 }
 EXPECTED_ARMS = ("dense", "split90")
+SNAPSHOT_STEPS = (1_358, 3_396, 6_791, 10_187, 13_582)
 ASSIGNMENT_PATH = "configs/cohort-assignment-v2.json"
 CORPUS_IDENTITY_PATH = "configs/reasoning-dataset-v2.json"
 EVALUATION_IDENTITY_PATH = "configs/preregistration-v2.yaml"
@@ -40,38 +41,27 @@ _OBJECT_ID = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})")
 _MAX_CONTROL_FILE_BYTES = 16 * 1024 * 1024
 _AWS_PROFILE_CONTRACT = {
     "schema_version": 1,
-    "profile_id": AWS_PROVIDER,
     "provider": AWS_PROVIDER,
     "instance_type": "p5.48xlarge",
     "purchase_model": "on_demand",
-    "cpu": {
-        "vcpus": 192,
-        "memory_gib": 2048,
-    },
     "gpu": {
         "model": "NVIDIA H100 80GB",
         "allocated": 8,
         "seed_train_groups": [4, 4],
     },
+    "cpu": {"vcpus": 192},
+    "memory_bytes": 2_199_023_255_552,
     "storage": {
+        "instance_store_devices": 8,
+        "instance_store_device_bytes": 3_840_000_000_000,
         "scratch_root": "/mnt/memorysplit",
         "durable_uri_env": "MS_S3_ROOT",
-        "instance_store": {
-            "model": "Amazon EC2 NVMe Instance Storage",
-            "devices": 8,
-            "device_bytes": 3_840_000_000_000,
-            "raid_level": "0",
-        },
     },
     "runtime": {
-        "region_env": "AWS_REGION",
         "ami_id_env": "MS_AWS_AMI_ID",
         "container_digest_env": "MS_CONTAINER_DIGEST",
-        "runtime_uid_env": "MS_RUNTIME_UID",
-        "runtime_gid_env": "MS_RUNTIME_GID",
     },
     "assigned_seeds": [1, 2, 3, 4],
-    "process_env_allowlist": ["AWS_REGION", "LANG", "LC_ALL"],
 }
 
 
@@ -369,7 +359,11 @@ def _receipt(content: bytes, expected_provider: str) -> Mapping[str, object]:
     size = _integer(archive["bytes"], "archive.bytes")
     if size < 1:
         raise VerificationError("archive.bytes must be positive")
-    source = _source(value["source"], "release receipt source")
+    source = _source(
+        value["source"],
+        "release receipt source",
+        expected_provider=expected_provider,
+    )
     _hash(value["members_sha256"], "members_sha256")
     release_prefix = "r1" if expected_provider == ILLUMINA_PROVIDER else "aws-p5-r1"
     if release_id != f"{release_prefix}-{value['members_sha256'][:16]}":
@@ -452,10 +446,18 @@ def _receipt(content: bytes, expected_provider: str) -> Mapping[str, object]:
     return value
 
 
-def _source(value: object, name: str) -> Mapping[str, object]:
+def _source(
+    value: object,
+    name: str,
+    *,
+    expected_provider: str,
+) -> Mapping[str, object]:
+    fields = {"commit", "dirty"}
+    if expected_provider == AWS_PROVIDER:
+        fields.add("tree")
     source = _strict_object(
         value,
-        frozenset({"commit", "dirty"}),
+        frozenset(fields),
         name,
     )
     commit = source["commit"]
@@ -463,6 +465,10 @@ def _source(value: object, name: str) -> Mapping[str, object]:
         raise VerificationError(f"{name} commit must be a full lowercase ID")
     if not isinstance(source["dirty"], bool):
         raise VerificationError(f"{name} dirty must be Boolean")
+    if expected_provider == AWS_PROVIDER:
+        tree = source["tree"]
+        if not isinstance(tree, str) or _OBJECT_ID.fullmatch(tree) is None:
+            raise VerificationError(f"{name} tree must be a full lowercase ID")
     return source
 
 
@@ -808,6 +814,16 @@ def _environment_lock(content: bytes) -> None:
     ]
     if not substantive:
         raise VerificationError("AWS environment lock must be non-empty")
+    for line in substantive:
+        if (
+            line.startswith("-")
+            or "==" not in line
+            or re.search(r"(?:^|\s)--hash=sha256:[0-9a-f]{64}(?:\s|$)", line)
+            is None
+        ):
+            raise VerificationError(
+                "AWS environment lock entries must be exact and SHA-256 pinned"
+            )
 
 
 def _dataset_pointer(content: bytes) -> None:
@@ -994,7 +1010,11 @@ def _metadata(
         )
     if value["provider"] != expected_provider:
         raise VerificationError("release metadata provider is incorrect")
-    source = _source(value["source"], "release metadata source")
+    source = _source(
+        value["source"],
+        "release metadata source",
+        expected_provider=expected_provider,
+    )
     if source != receipt["source"] or source["dirty"] is not False:
         raise VerificationError("release metadata source binding is inconsistent")
     assignment = _seed_assignment(
@@ -1190,7 +1210,7 @@ _RUN_FIELDS = frozenset(
         "device",
         "log_every",
         "eval_every",
-        "snap_frac",
+        "snapshot_steps",
         "ckpt_minutes",
     }
 )
@@ -1257,7 +1277,7 @@ def _run_cells(
             "device": "cuda",
             "log_every": 20,
             "eval_every": 250,
-            "snap_frac": 0.1,
+            "snapshot_steps": list(SNAPSHOT_STEPS),
             "ckpt_minutes": 30,
         }
         for field, expected in expected_values.items():
@@ -1268,6 +1288,10 @@ def _run_cells(
                 valid_type = type(actual) is int
             elif isinstance(expected, float):
                 valid_type = type(actual) is float
+            elif isinstance(expected, list):
+                valid_type = isinstance(actual, list) and all(
+                    type(item) is int for item in actual
+                )
             else:
                 valid_type = isinstance(actual, str)
             if not valid_type or actual != expected:
