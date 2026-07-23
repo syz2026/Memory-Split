@@ -313,11 +313,17 @@ def _status(**changes):
     return status_module.classify_status(**values)
 
 
-def test_status_axes_keep_measured_invalidity_when_evidence_is_incomplete():
-    result = _status(complete=False, valid=False, observed_seeds=2)
+@pytest.mark.parametrize("observed_seeds", [1, 3])
+def test_invalid_status_suppresses_all_interim_evidence(observed_seeds):
+    result = _status(
+        complete=False,
+        valid=False,
+        observed_seeds=observed_seeds,
+        sign_consistent=True,
+    )
 
     assert result.scientific_status == "invalid"
-    assert result.interim_evidence_label == "directional_only"
+    assert result.interim_evidence_label == "none"
     assert result.final_inference_conclusion == "not_evaluated"
 
 

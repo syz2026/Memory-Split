@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections import defaultdict
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import secrets
@@ -14,9 +16,21 @@ from types import MappingProxyType
 from typing import Any
 
 from evals.confirmatory.contracts import (
+    Arm,
+    CheckpointRecord,
     CONTRACT_VERSION,
+    Control,
+    ItemRecord,
+    MemoryMode,
     canonical_json_bytes,
     canonical_sha256,
+)
+from evals.confirmatory.inference import ExactTestResult, exact_sign_flip_test
+from evals.confirmatory.metrics import (
+    ItemOutcome,
+    PairMetricSummary,
+    balanced_counterfactual_pair_metric,
+    validate_item_outcome_binding,
 )
 from evals.confirmatory.status import (
     FinalInferenceConclusion,
@@ -29,6 +43,20 @@ from evals.confirmatory.status import (
 
 ARTIFACT_REPORT_SCHEMA = "memorysplit.confirmatory.artifact-report.v2"
 INFERENCE_EVIDENCE_SCHEMA = "memorysplit.confirmatory.inference-evidence.v2"
+METRICS_SCHEMA = "memorysplit.confirmatory.metrics.v2"
+PRIMARY_CONTRAST_ID = (
+    "primary_omnibus_pair_and_proof__graph_non_path__"
+    "composition_joint_ood__split90_minus_dense"
+)
+PRIMARY_TEST_METHOD = "exact_one_sided_exhaustive_sign_flip"
+PRACTICAL_NULL_REPLAY_STATUS = "unavailable_unfrozen_rng_seed"
+PRACTICAL_NULL_REPLAY_GAP = (
+    "The frozen practical-null procedure requires 20,000 hierarchical-bootstrap "
+    "draws, but preregistration-v2 does not freeze an RNG seed; "
+    "supports_practical_null cannot be replayed before amendment."
+)
+_FROZEN_SEEDS = tuple(range(5))
+_FROZEN_ARMS = (Arm.DENSE, Arm.SPLIT)
 REQUIRED_ARTIFACTS = (
     "checkpoints.jsonl",
     "inference.json",
@@ -45,6 +73,8 @@ _REPORT_FIELDS = frozenset(
         "scientific_status",
         "interim_evidence_label",
         "final_inference_conclusion",
+        "practical_null_replay_status",
+        "paired_seed_bundle_deltas",
         "expected_cells",
         "observed_cells",
         "artifacts",
@@ -56,14 +86,28 @@ _INFERENCE_FIELDS = frozenset(
     {
         "record_type",
         "schema_version",
-        "terminal_evidence_complete",
         "measured_validity_failure",
-        "observed_valid_seed_pairs",
-        "required_seed_pairs",
-        "same_sign_preterminal_pairs",
-        "supports_effect",
-        "supports_practical_null",
+        "primary_test",
+        "paired_seed_bundle_deltas",
+        "exact_test_result",
     }
+)
+_PRIMARY_TEST_FIELDS = frozenset(
+    {
+        "contrast_id",
+        "method",
+        "alternative",
+        "alpha",
+        "n_pairs",
+        "sign_assignments",
+        "equality_counted",
+    }
+)
+_EXACT_RESULT_FIELDS = frozenset(
+    {"statistic", "extreme_count", "p_value", "reject_null"}
+)
+_METRICS_FIELDS = frozenset(
+    {"record_type", "schema_version", "summaries"}
 )
 _HEX = frozenset("0123456789abcdef")
 _DIR_RELATIVE_PUBLICATION_SUPPORTED = (
@@ -118,68 +162,146 @@ def _boolean(value: object, name: str) -> bool:
     return value
 
 
+def _number(value: object, name: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{name} must be a finite number")
+    result = float(value)
+    if not math.isfinite(result):
+        raise ValueError(f"{name} must be a finite number")
+    return result
+
+
+@dataclass(frozen=True)
+class PrimaryTestIdentity:
+    contrast_id: str
+    method: str
+    alternative: str
+    alpha: float
+    n_pairs: int
+    sign_assignments: int
+    equality_counted: bool
+
+    def __post_init__(self) -> None:
+        expected = (
+            self.contrast_id == PRIMARY_CONTRAST_ID
+            and self.method == PRIMARY_TEST_METHOD
+            and self.alternative == "greater"
+            and _number(self.alpha, "primary test alpha") == 0.05
+            and type(self.n_pairs) is int
+            and self.n_pairs == 5
+            and type(self.sign_assignments) is int
+            and self.sign_assignments == 32
+            and self.equality_counted is True
+        )
+        if not expected:
+            raise ValueError("primary test identity disagrees with frozen contract")
+
+    @classmethod
+    def from_dict(cls, raw: Mapping[str, Any]) -> "PrimaryTestIdentity":
+        value = _strict_fields(raw, _PRIMARY_TEST_FIELDS, "primary test")
+        return cls(**dict(value))
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "contrast_id": self.contrast_id,
+            "method": self.method,
+            "alternative": self.alternative,
+            "alpha": self.alpha,
+            "n_pairs": self.n_pairs,
+            "sign_assignments": self.sign_assignments,
+            "equality_counted": self.equality_counted,
+        }
+
+
+@dataclass(frozen=True)
+class PersistedExactTestResult:
+    statistic: float
+    extreme_count: int
+    p_value: float
+    reject_null: bool
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "statistic",
+            _number(self.statistic, "exact test statistic"),
+        )
+        if (
+            type(self.extreme_count) is not int
+            or not 0 <= self.extreme_count <= 32
+        ):
+            raise ValueError("exact test extreme_count is invalid")
+        object.__setattr__(
+            self,
+            "p_value",
+            _number(self.p_value, "exact test p_value"),
+        )
+        if (
+            not 0.0 <= self.p_value <= 1.0
+            or self.p_value != self.extreme_count / 32
+        ):
+            raise ValueError(
+                "exact test p_value disagrees with exhaustive assignments"
+            )
+        _boolean(self.reject_null, "exact test reject_null")
+
+    @classmethod
+    def from_dict(
+        cls,
+        raw: Mapping[str, Any],
+    ) -> "PersistedExactTestResult":
+        value = _strict_fields(
+            raw,
+            _EXACT_RESULT_FIELDS,
+            "exact test result",
+        )
+        return cls(**dict(value))
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "statistic": self.statistic,
+            "extreme_count": self.extreme_count,
+            "p_value": self.p_value,
+            "reject_null": self.reject_null,
+        }
+
+
 @dataclass(frozen=True)
 class InferenceEvidence:
     record_type: str
     schema_version: int
-    terminal_evidence_complete: bool
     measured_validity_failure: bool
-    observed_valid_seed_pairs: int
-    required_seed_pairs: int
-    same_sign_preterminal_pairs: int
-    supports_effect: bool
-    supports_practical_null: bool
+    primary_test: PrimaryTestIdentity
+    paired_seed_bundle_deltas: tuple[float, ...]
+    exact_test_result: PersistedExactTestResult | None
 
     def __post_init__(self) -> None:
         if self.record_type != INFERENCE_EVIDENCE_SCHEMA:
             raise ValueError("inference evidence schema identity is invalid")
         _schema_version(self.schema_version, "inference evidence")
-        terminal_complete = _boolean(
-            self.terminal_evidence_complete,
-            "terminal_evidence_complete",
-        )
-        measured_failure = _boolean(
+        _boolean(
             self.measured_validity_failure,
             "measured_validity_failure",
         )
-        observed = _count(
-            self.observed_valid_seed_pairs,
-            "observed_valid_seed_pairs",
+        if not isinstance(self.primary_test, PrimaryTestIdentity):
+            raise ValueError("inference evidence primary_test is invalid")
+        if not isinstance(self.paired_seed_bundle_deltas, (list, tuple)):
+            raise ValueError("paired seed-bundle deltas must be ordered")
+        deltas = tuple(
+            _number(value, f"paired seed-bundle delta {index}")
+            for index, value in enumerate(self.paired_seed_bundle_deltas)
         )
-        required = _count(
-            self.required_seed_pairs,
-            "required_seed_pairs",
-            positive=True,
-        )
-        same_sign = _count(
-            self.same_sign_preterminal_pairs,
-            "same_sign_preterminal_pairs",
-        )
-        supports_effect = _boolean(self.supports_effect, "supports_effect")
-        supports_null = _boolean(
-            self.supports_practical_null,
-            "supports_practical_null",
-        )
-        if required != 5:
-            raise ValueError("required_seed_pairs must equal the frozen value five")
-        if observed > required:
-            raise ValueError("observed_valid_seed_pairs exceeds required_seed_pairs")
-        if same_sign > observed:
-            raise ValueError(
-                "same_sign_preterminal_pairs exceeds observed valid pairs"
-            )
-        if terminal_complete and observed != required:
-            raise ValueError(
-                "terminal evidence requires every frozen seed pair"
-            )
-        if supports_effect and supports_null:
-            raise ValueError("terminal conclusions are mutually exclusive")
-        if (
-            supports_effect or supports_null
-        ) and (measured_failure or not terminal_complete):
-            raise ValueError(
-                "supports_effect/supports_practical_null require complete valid evidence"
-            )
+        if len(deltas) > 5:
+            raise ValueError("paired seed-bundle deltas exceed frozen N=5")
+        object.__setattr__(self, "paired_seed_bundle_deltas", deltas)
+        if len(deltas) == 5:
+            if not isinstance(
+                self.exact_test_result,
+                PersistedExactTestResult,
+            ):
+                raise ValueError("complete N=5 evidence requires an exact test result")
+        elif self.exact_test_result is not None:
+            raise ValueError("pre-terminal evidence cannot persist a final exact test")
 
     @classmethod
     def from_dict(cls, raw: Mapping[str, Any]) -> "InferenceEvidence":
@@ -188,19 +310,34 @@ class InferenceEvidence:
             _INFERENCE_FIELDS,
             "inference evidence",
         )
-        return cls(**dict(value))
+        raw_result = value["exact_test_result"]
+        return cls(
+            record_type=value["record_type"],
+            schema_version=value["schema_version"],
+            measured_validity_failure=value["measured_validity_failure"],
+            primary_test=PrimaryTestIdentity.from_dict(value["primary_test"]),
+            paired_seed_bundle_deltas=value["paired_seed_bundle_deltas"],
+            exact_test_result=(
+                None
+                if raw_result is None
+                else PersistedExactTestResult.from_dict(raw_result)
+            ),
+        )
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "record_type": self.record_type,
             "schema_version": self.schema_version,
-            "terminal_evidence_complete": self.terminal_evidence_complete,
             "measured_validity_failure": self.measured_validity_failure,
-            "observed_valid_seed_pairs": self.observed_valid_seed_pairs,
-            "required_seed_pairs": self.required_seed_pairs,
-            "same_sign_preterminal_pairs": self.same_sign_preterminal_pairs,
-            "supports_effect": self.supports_effect,
-            "supports_practical_null": self.supports_practical_null,
+            "primary_test": self.primary_test.to_dict(),
+            "paired_seed_bundle_deltas": list(
+                self.paired_seed_bundle_deltas
+            ),
+            "exact_test_result": (
+                None
+                if self.exact_test_result is None
+                else self.exact_test_result.to_dict()
+            ),
         }
 
 
@@ -221,36 +358,315 @@ def _inference_evidence(content: bytes) -> InferenceEvidence:
         raise ValueError("inference evidence is invalid") from exc
 
 
-def _derive_status_axes(
-    evidence: InferenceEvidence,
+def _canonical_jsonl(
+    content: bytes,
     *,
-    expected_cells: int,
-    observed_cells: int,
-) -> StatusAxes:
+    name: str,
+    parser: Callable[[Mapping[str, Any]], Any],
+) -> tuple[Any, ...]:
+    lines = content.splitlines(keepends=True)
+    if not lines or any(not line.endswith(b"\n") for line in lines):
+        raise ValueError(f"{name} must be non-empty canonical JSONL")
+    records = []
+    for index, line in enumerate(lines):
+        try:
+            raw = json.loads(line)
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ValueError(f"{name} line {index} is invalid JSON") from exc
+        if not isinstance(raw, Mapping) or canonical_json_bytes(raw) != line:
+            raise ValueError(f"{name} line {index} is not canonical")
+        records.append(parser(raw))
+    return tuple(records)
+
+
+def _parse_items(content: bytes) -> tuple[ItemRecord, ...]:
+    records = _canonical_jsonl(
+        content,
+        name="items.jsonl",
+        parser=ItemRecord.from_dict,
+    )
+    identities = tuple(record.item_id for record in records)
+    if len(set(identities)) != len(identities):
+        raise ValueError("items.jsonl contains a duplicate item_id")
+    if identities != tuple(sorted(identities)):
+        raise ValueError("items.jsonl is not ordered by item_id")
+    return records
+
+
+def _parse_checkpoints(content: bytes) -> tuple[CheckpointRecord, ...]:
+    records = _canonical_jsonl(
+        content,
+        name="checkpoints.jsonl",
+        parser=CheckpointRecord.from_dict,
+    )
+    identities = tuple(record.checkpoint_sha256 for record in records)
+    if len(set(identities)) != len(identities):
+        raise ValueError("checkpoints.jsonl contains a duplicate hash")
+    slots = tuple((record.seed, record.arm) for record in records)
+    allowed = {
+        (seed, arm)
+        for seed in _FROZEN_SEEDS
+        for arm in _FROZEN_ARMS
+    }
+    if len(set(slots)) != len(slots) or not set(slots) <= allowed:
+        raise ValueError("checkpoints.jsonl has an invalid frozen seed/arm slot")
+    if slots != tuple(sorted(slots, key=lambda slot: (slot[0], slot[1].value))):
+        raise ValueError("checkpoints.jsonl is not ordered by seed and arm")
+    return records
+
+
+def _parse_outcomes(content: bytes) -> tuple[ItemOutcome, ...]:
+    records = _canonical_jsonl(
+        content,
+        name="outcomes.jsonl",
+        parser=ItemOutcome.from_dict,
+    )
+    order = tuple(
+        (record.seed, record.arm.value, record.item_id)
+        for record in records
+    )
+    if order != tuple(sorted(order)):
+        raise ValueError("outcomes.jsonl is not ordered by seed, arm, and item")
+    return records
+
+
+def _parse_metrics(content: bytes) -> tuple[PairMetricSummary, ...]:
+    try:
+        raw = json.loads(content)
+        if not isinstance(raw, Mapping) or canonical_json_bytes(raw) != content:
+            raise ValueError("metrics.json must be canonical JSON")
+        value = _strict_fields(raw, _METRICS_FIELDS, "metrics artifact")
+        if value["record_type"] != METRICS_SCHEMA:
+            raise ValueError("metrics artifact record_type is invalid")
+        _schema_version(value["schema_version"], "metrics artifact")
+        if not isinstance(value["summaries"], list):
+            raise ValueError("metrics summaries must be an ordered list")
+        return tuple(
+            PairMetricSummary.from_dict(summary)
+            for summary in value["summaries"]
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError) as exc:
+        raise ValueError(f"metrics artifact is invalid: {exc}") from exc
+
+
+@dataclass(frozen=True)
+class ArtifactReplay:
+    axes: StatusAxes
+    expected_cells: int
+    observed_cells: int
+    seed_deltas: tuple[float, ...]
+    exact_test_result: ExactTestResult | None
+
+
+def _metric_sort_key(
+    summary: PairMetricSummary,
+    checkpoints: Mapping[str, CheckpointRecord],
+) -> tuple[int, str, str, str]:
+    checkpoint = checkpoints[summary.checkpoint_sha256]
+    return (
+        checkpoint.seed,
+        checkpoint.arm.value,
+        summary.memory_mode.value,
+        summary.control.value,
+    )
+
+
+def _recomputed_metrics(
+    *,
+    items: Mapping[str, ItemRecord],
+    checkpoints: Mapping[str, CheckpointRecord],
+    outcomes: Sequence[ItemOutcome],
+) -> tuple[PairMetricSummary, ...]:
+    item_cells: dict[tuple[MemoryMode, Control], set[str]] = defaultdict(set)
+    for item in items.values():
+        item_cells[(item.memory_mode, item.control)].add(item.item_id)
+    grouped: dict[
+        tuple[str, MemoryMode, Control],
+        list[ItemOutcome],
+    ] = defaultdict(list)
+    for outcome in outcomes:
+        grouped[
+            (
+                outcome.checkpoint_sha256,
+                outcome.memory_mode,
+                outcome.control,
+            )
+        ].append(outcome)
+
+    summaries = []
+    for (checkpoint_hash, memory_mode, control), rows in grouped.items():
+        expected_items = item_cells[(memory_mode, control)]
+        if (
+            {row.item_id for row in rows} != expected_items
+            or any(not row.complete or not row.valid for row in rows)
+        ):
+            continue
+        summaries.append(
+            balanced_counterfactual_pair_metric(
+                rows,
+                items={item_id: items[item_id] for item_id in expected_items},
+                checkpoints={
+                    checkpoint_hash: checkpoints[checkpoint_hash],
+                },
+            )
+        )
+    return tuple(
+        sorted(
+            summaries,
+            key=lambda summary: _metric_sort_key(summary, checkpoints),
+        )
+    )
+
+
+def _metrics_bytes(summaries: Sequence[PairMetricSummary]) -> bytes:
+    return canonical_json_bytes(
+        {
+            "record_type": METRICS_SCHEMA,
+            "schema_version": CONTRACT_VERSION,
+            "summaries": [summary.to_dict() for summary in summaries],
+        }
+    )
+
+
+def _seed_deltas(
+    summaries: Sequence[PairMetricSummary],
+    checkpoints: Mapping[str, CheckpointRecord],
+) -> tuple[float, ...]:
+    by_slot: dict[tuple[int, Arm], float] = {}
+    for summary in summaries:
+        if (
+            summary.memory_mode is not MemoryMode.MEMORY_ON
+            or summary.control is not Control.CORRECT
+        ):
+            continue
+        checkpoint = checkpoints[summary.checkpoint_sha256]
+        slot = checkpoint.seed, checkpoint.arm
+        if slot in by_slot:
+            raise ValueError("metrics contain a duplicate primary seed/arm cell")
+        by_slot[slot] = summary.primary_accuracy
+    return tuple(
+        by_slot[(seed, Arm.SPLIT)] - by_slot[(seed, Arm.DENSE)]
+        for seed in _FROZEN_SEEDS
+        if (seed, Arm.SPLIT) in by_slot and (seed, Arm.DENSE) in by_slot
+    )
+
+
+def _validate_exact_result(
+    evidence: InferenceEvidence,
+    replayed: ExactTestResult | None,
+) -> bool:
+    if replayed is None:
+        if evidence.exact_test_result is not None:
+            raise ValueError("exact test result exists without replayable N=5 data")
+        return False
+    persisted = evidence.exact_test_result
+    if persisted is None:
+        raise ValueError("replayable N=5 data is missing an exact test result")
+    decision = replayed.statistic > 0.0 and replayed.p_value <= 0.05
+    if (
+        persisted.statistic != replayed.statistic
+        or persisted.extreme_count != replayed.extreme_count
+        or persisted.p_value != replayed.p_value
+        or persisted.reject_null is not decision
+    ):
+        raise ValueError("persisted exact test result disagrees with replay")
+    return decision
+
+
+def _replay_artifacts(
+    content: Mapping[str, bytes],
+) -> ArtifactReplay:
+    items = _parse_items(content["items.jsonl"])
+    checkpoints = _parse_checkpoints(content["checkpoints.jsonl"])
+    outcomes = _parse_outcomes(content["outcomes.jsonl"])
+    persisted_metrics = _parse_metrics(content["metrics.json"])
+    evidence = _inference_evidence(content["inference.json"])
+
+    item_map = {item.item_id: item for item in items}
+    checkpoint_map = {
+        checkpoint.checkpoint_sha256: checkpoint
+        for checkpoint in checkpoints
+    }
+    observed_keys: set[tuple[str, int, Arm]] = set()
+    for outcome in outcomes:
+        try:
+            item = item_map[outcome.item_id]
+            checkpoint = checkpoint_map[outcome.checkpoint_sha256]
+        except KeyError as exc:
+            raise ValueError("outcome references an unbound record") from exc
+        validate_item_outcome_binding(
+            outcome=outcome,
+            item=item,
+            checkpoint=checkpoint,
+        )
+        key = outcome.item_id, outcome.seed, outcome.arm
+        if key in observed_keys:
+            raise ValueError("outcomes.jsonl contains a duplicate evaluation cell")
+        observed_keys.add(key)
+
+    expected_keys = {
+        (item.item_id, seed, arm)
+        for item in items
+        for seed in _FROZEN_SEEDS
+        for arm in _FROZEN_ARMS
+    }
+    if not observed_keys <= expected_keys:
+        raise ValueError("outcomes contain a cell outside the frozen registry")
+
+    recomputed_metrics = _recomputed_metrics(
+        items=item_map,
+        checkpoints=checkpoint_map,
+        outcomes=outcomes,
+    )
+    if _metrics_bytes(persisted_metrics) != content["metrics.json"]:
+        raise ValueError("metrics artifact is not canonical")
+    if _metrics_bytes(recomputed_metrics) != content["metrics.json"]:
+        raise ValueError("metrics artifact disagrees with recomputed outcomes")
+
+    deltas = _seed_deltas(recomputed_metrics, checkpoint_map)
+    if deltas != evidence.paired_seed_bundle_deltas:
+        raise ValueError("paired seed-bundle deltas disagree with replay")
+    replayed_test = (
+        exact_sign_flip_test(deltas, alternative="greater")
+        if len(deltas) == 5
+        else None
+    )
+    effect_decision = _validate_exact_result(evidence, replayed_test)
+
     complete = (
-        evidence.terminal_evidence_complete
-        and observed_cells == expected_cells
+        observed_keys == expected_keys
+        and set((checkpoint.seed, checkpoint.arm) for checkpoint in checkpoints)
+        == {
+            (seed, arm)
+            for seed in _FROZEN_SEEDS
+            for arm in _FROZEN_ARMS
+        }
+        and all(outcome.complete for outcome in outcomes)
+    )
+    measured_failure = (
+        evidence.measured_validity_failure
+        or any(not outcome.valid for outcome in outcomes)
+    )
+    same_sign = bool(deltas) and (
+        all(delta > 0.0 for delta in deltas)
+        or all(delta < 0.0 for delta in deltas)
     )
     axes = classify_status(
         complete=complete,
-        valid=not evidence.measured_validity_failure,
-        observed_seeds=evidence.observed_valid_seed_pairs,
-        required_seeds=evidence.required_seed_pairs,
-        sign_consistent=evidence.same_sign_preterminal_pairs >= 3,
-        supports_effect=evidence.supports_effect,
-        supports_practical_null=evidence.supports_practical_null,
+        valid=not measured_failure,
+        observed_seeds=len(deltas),
+        required_seeds=5,
+        sign_consistent=same_sign,
+        supports_effect=effect_decision,
+        supports_practical_null=False,
     )
-    if (
-        axes.scientific_status is not ScientificStatus.COMPLETE
-        and (
-            evidence.supports_effect
-            or evidence.supports_practical_null
-        )
-    ):
-        raise ValueError(
-            "terminal conclusion is inconsistent with incomplete or invalid evidence"
-        )
-    return axes
+    return ArtifactReplay(
+        axes=axes,
+        expected_cells=len(expected_keys),
+        observed_cells=len(observed_keys),
+        seed_deltas=deltas,
+        exact_test_result=replayed_test,
+    )
 
 
 def _artifact_bindings(
@@ -279,6 +695,7 @@ def _artifact_bindings(
 def _report_payload(
     *,
     axes: StatusAxes,
+    seed_deltas: Sequence[float],
     expected_cells: int,
     observed_cells: int,
     artifacts: Mapping[str, Mapping[str, str | int]],
@@ -287,6 +704,8 @@ def _report_payload(
         "record_type": ARTIFACT_REPORT_SCHEMA,
         "schema_version": CONTRACT_VERSION,
         **axes.to_dict(),
+        "practical_null_replay_status": PRACTICAL_NULL_REPLAY_STATUS,
+        "paired_seed_bundle_deltas": list(seed_deltas),
         "expected_cells": expected_cells,
         "observed_cells": observed_cells,
         "artifacts": {
@@ -302,6 +721,8 @@ class ArtifactReport:
     scientific_status: ScientificStatus
     interim_evidence_label: InterimEvidenceLabel
     final_inference_conclusion: FinalInferenceConclusion
+    practical_null_replay_status: str
+    paired_seed_bundle_deltas: tuple[float, ...]
     expected_cells: int
     observed_cells: int
     artifacts: Mapping[str, Mapping[str, str | int]]
@@ -316,6 +737,16 @@ class ArtifactReport:
             self.interim_evidence_label,
             self.final_inference_conclusion,
         )
+        if self.practical_null_replay_status != PRACTICAL_NULL_REPLAY_STATUS:
+            raise ValueError("practical-null replay status is invalid")
+        if not isinstance(self.paired_seed_bundle_deltas, (list, tuple)):
+            raise ValueError("report seed-bundle deltas must be ordered")
+        seed_deltas = tuple(
+            _number(value, f"report seed-bundle delta {index}")
+            for index, value in enumerate(self.paired_seed_bundle_deltas)
+        )
+        if len(seed_deltas) > 5:
+            raise ValueError("report seed-bundle deltas exceed frozen N=5")
         expected = _count(self.expected_cells, "expected_cells", positive=True)
         observed = _count(self.observed_cells, "observed_cells")
         if observed > expected:
@@ -328,6 +759,7 @@ class ArtifactReport:
         bindings = _artifact_bindings(self.artifacts)
         payload = _report_payload(
             axes=axes,
+            seed_deltas=seed_deltas,
             expected_cells=expected,
             observed_cells=observed,
             artifacts=bindings,
@@ -360,6 +792,11 @@ class ArtifactReport:
             "final_inference_conclusion",
             axes.final_inference_conclusion,
         )
+        object.__setattr__(
+            self,
+            "paired_seed_bundle_deltas",
+            seed_deltas,
+        )
 
     @classmethod
     def from_dict(cls, raw: Mapping[str, Any]) -> "ArtifactReport":
@@ -374,6 +811,7 @@ class ArtifactReport:
                     self.interim_evidence_label,
                     self.final_inference_conclusion,
                 ),
+                seed_deltas=self.paired_seed_bundle_deltas,
                 expected_cells=self.expected_cells,
                 observed_cells=self.observed_cells,
                 artifacts=self.artifacts,
@@ -401,20 +839,9 @@ def _artifact_bytes(
 def build_artifact_report(
     *,
     artifacts: Mapping[str, bytes],
-    expected_cells: int,
-    observed_cells: int,
 ) -> ArtifactReport:
     content = _artifact_bytes(artifacts)
-    expected = _count(expected_cells, "expected_cells", positive=True)
-    observed = _count(observed_cells, "observed_cells")
-    if observed > expected:
-        raise ValueError("observed_cells exceeds expected_cells")
-    evidence = _inference_evidence(content["inference.json"])
-    axes = _derive_status_axes(
-        evidence,
-        expected_cells=expected,
-        observed_cells=observed,
-    )
+    replay = _replay_artifacts(content)
     bindings = {
         name: {
             "sha256": hashlib.sha256(content[name]).hexdigest(),
@@ -423,9 +850,10 @@ def build_artifact_report(
         for name in REQUIRED_ARTIFACTS
     }
     payload = _report_payload(
-        axes=axes,
-        expected_cells=expected,
-        observed_cells=observed,
+        axes=replay.axes,
+        seed_deltas=replay.seed_deltas,
+        expected_cells=replay.expected_cells,
+        observed_cells=replay.observed_cells,
         artifacts=bindings,
     )
     return ArtifactReport.from_dict(
@@ -452,19 +880,21 @@ def validate_artifact_report(
             raise ValueError(f"artifact {name} size mismatch")
         if hashlib.sha256(content[name]).hexdigest() != binding["sha256"]:
             raise ValueError(f"artifact {name} hash mismatch")
-    evidence = _inference_evidence(content["inference.json"])
-    axes = _derive_status_axes(
-        evidence,
-        expected_cells=typed.expected_cells,
-        observed_cells=typed.observed_cells,
-    )
+    replay = _replay_artifacts(content)
     reported_axes = StatusAxes(
         typed.scientific_status,
         typed.interim_evidence_label,
         typed.final_inference_conclusion,
     )
-    if reported_axes != axes:
+    if reported_axes != replay.axes:
         raise ValueError("artifact report status axes disagree with bound evidence")
+    if (
+        typed.expected_cells != replay.expected_cells
+        or typed.observed_cells != replay.observed_cells
+    ):
+        raise ValueError("artifact report counts disagree with bound evidence")
+    if typed.paired_seed_bundle_deltas != replay.seed_deltas:
+        raise ValueError("artifact report seed effects disagree with bound evidence")
     return typed
 
 

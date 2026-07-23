@@ -5,12 +5,15 @@ from __future__ import annotations
 from collections import defaultdict
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
+import math
 import re
 from types import MappingProxyType
+from typing import Any, ClassVar
 
 from evals.confirmatory.contracts import (
     Arm,
     CheckpointRecord,
+    CONTRACT_VERSION,
     Control,
     ItemRecord,
     MemoryMode,
@@ -21,6 +24,7 @@ from evals.confirmatory.contracts import (
 
 
 _SHA256_RE = re.compile(r"[0-9a-f]{64}")
+OUTCOME_SCHEMA = "memorysplit.confirmatory.outcome.v2"
 PRIMARY_CELLS = (
     (ReasoningFamily.GRAPH, Stratum.COMPOSITION_OOD),
     (ReasoningFamily.GRAPH, Stratum.JOINT_OOD),
@@ -45,6 +49,33 @@ def _nonempty(value: object, name: str) -> str:
     return value
 
 
+def _strict_fields(
+    value: object,
+    expected: frozenset[str],
+    name: str,
+) -> Mapping[str, Any]:
+    if not isinstance(value, Mapping):
+        raise ValueError(f"{name} must be an object")
+    if set(value) != expected:
+        raise ValueError(f"{name} fields are not exact")
+    return value
+
+
+def _schema_version(value: object, name: str) -> int:
+    if type(value) is not int or value != CONTRACT_VERSION:
+        raise ValueError(f"{name} schema_version is invalid")
+    return value
+
+
+def _finite(value: object, name: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{name} must be finite")
+    result = float(value)
+    if not math.isfinite(result):
+        raise ValueError(f"{name} must be finite")
+    return result
+
+
 @dataclass(frozen=True)
 class ItemOutcome:
     item_id: str
@@ -62,6 +93,28 @@ class ItemOutcome:
     answer_valid: bool
     complete: bool
     valid: bool
+
+    FIELDS: ClassVar[frozenset[str]] = frozenset(
+        {
+            "record_type",
+            "schema_version",
+            "item_id",
+            "pair_id",
+            "twin",
+            "stratum",
+            "family",
+            "seed",
+            "world_id",
+            "checkpoint_sha256",
+            "arm",
+            "memory_mode",
+            "control",
+            "proof_valid",
+            "answer_valid",
+            "complete",
+            "valid",
+        }
+    )
 
     def __post_init__(self) -> None:
         for field in ("item_id", "pair_id", "world_id"):
@@ -102,6 +155,41 @@ class ItemOutcome:
         for field in ("proof_valid", "answer_valid", "complete", "valid"):
             if not isinstance(getattr(self, field), bool):
                 raise ValueError(f"{field} must be Boolean")
+
+    @classmethod
+    def from_dict(cls, raw: Mapping[str, Any]) -> "ItemOutcome":
+        value = _strict_fields(raw, cls.FIELDS, "ItemOutcome")
+        if value["record_type"] != OUTCOME_SCHEMA:
+            raise ValueError(f"outcome record_type must be {OUTCOME_SCHEMA}")
+        _schema_version(value["schema_version"], "outcome")
+        return cls(
+            **{
+                key: field_value
+                for key, field_value in value.items()
+                if key not in {"record_type", "schema_version"}
+            }
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "record_type": OUTCOME_SCHEMA,
+            "schema_version": CONTRACT_VERSION,
+            "item_id": self.item_id,
+            "pair_id": self.pair_id,
+            "twin": self.twin.value,
+            "stratum": self.stratum.value,
+            "family": self.family.value,
+            "seed": self.seed,
+            "world_id": self.world_id,
+            "checkpoint_sha256": self.checkpoint_sha256,
+            "arm": self.arm.value,
+            "memory_mode": self.memory_mode.value,
+            "control": self.control.value,
+            "proof_valid": self.proof_valid,
+            "answer_valid": self.answer_valid,
+            "complete": self.complete,
+            "valid": self.valid,
+        }
 
     @property
     def verified_correct(self) -> bool:
@@ -166,6 +254,19 @@ class Rate:
     def value(self) -> float:
         return self.numerator / self.denominator
 
+    @classmethod
+    def from_dict(cls, raw: Mapping[str, Any], name: str = "rate") -> "Rate":
+        value = _strict_fields(
+            raw,
+            frozenset({"value", "numerator", "denominator"}),
+            name,
+        )
+        rate = cls(value["numerator"], value["denominator"])
+        claimed = _finite(value["value"], f"{name} value")
+        if claimed != rate.value:
+            raise ValueError(f"{name} value disagrees with its exact counts")
+        return rate
+
     def to_dict(self) -> dict[str, int | float]:
         return {
             "value": self.value,
@@ -186,15 +287,84 @@ class PairMetricSummary:
     memory_mode: MemoryMode
     control: Control
 
+    FIELDS: ClassVar[frozenset[str]] = frozenset(
+        {
+            "primary_accuracy",
+            "primary_cells",
+            "overall_pair_accuracy",
+            "by_stratum",
+            "by_family",
+            "checkpoint_sha256",
+            "arm",
+            "memory_mode",
+            "control",
+        }
+    )
+
     def __post_init__(self) -> None:
-        if not 0.0 <= self.primary_accuracy <= 1.0:
+        primary_accuracy = _finite(
+            self.primary_accuracy,
+            "primary_accuracy",
+        )
+        if not 0.0 <= primary_accuracy <= 1.0:
             raise ValueError("primary accuracy must be in [0, 1]")
+        if (
+            not isinstance(self.checkpoint_sha256, str)
+            or _SHA256_RE.fullmatch(self.checkpoint_sha256) is None
+        ):
+            raise ValueError("checkpoint_sha256 must be a lowercase SHA-256")
+        object.__setattr__(self, "arm", _enum(self.arm, Arm, "arm"))
+        object.__setattr__(
+            self,
+            "memory_mode",
+            _enum(self.memory_mode, MemoryMode, "memory_mode"),
+        )
+        object.__setattr__(
+            self,
+            "control",
+            _enum(self.control, Control, "control"),
+        )
+        if not isinstance(self.primary_cells, Mapping):
+            raise ValueError("primary_cells must be an object")
         if tuple(self.primary_cells) != PRIMARY_CELL_IDS:
             raise ValueError("primary metric must contain the four frozen cells")
-        if not self.by_stratum or not set(self.by_stratum) <= set(Stratum):
+        if any(not isinstance(rate, Rate) for rate in self.primary_cells.values()):
+            raise ValueError("primary cells must contain exact rates")
+        if not isinstance(self.overall_pair_accuracy, Rate):
+            raise ValueError("overall_pair_accuracy must be an exact rate")
+        if (
+            not isinstance(self.by_stratum, Mapping)
+            or not self.by_stratum
+            or not set(self.by_stratum) <= set(Stratum)
+            or any(not isinstance(rate, Rate) for rate in self.by_stratum.values())
+        ):
             raise ValueError("stratum diagnostics are invalid")
-        if set(self.by_family) != set(ReasoningFamily):
+        if (
+            not isinstance(self.by_family, Mapping)
+            or set(self.by_family) != set(ReasoningFamily)
+            or any(not isinstance(rate, Rate) for rate in self.by_family.values())
+        ):
             raise ValueError("family diagnostics must contain both families")
+        expected_primary = sum(
+            rate.value for rate in self.primary_cells.values()
+        ) / len(PRIMARY_CELLS)
+        if primary_accuracy != expected_primary:
+            raise ValueError("primary_accuracy disagrees with primary cells")
+        for name, rates in (
+            ("stratum", self.by_stratum.values()),
+            ("family", self.by_family.values()),
+        ):
+            materialized = tuple(rates)
+            if (
+                sum(rate.numerator for rate in materialized)
+                != self.overall_pair_accuracy.numerator
+                or sum(rate.denominator for rate in materialized)
+                != self.overall_pair_accuracy.denominator
+            ):
+                raise ValueError(
+                    f"{name} diagnostics disagree with overall pair accuracy"
+                )
+        object.__setattr__(self, "primary_accuracy", primary_accuracy)
         object.__setattr__(
             self,
             "primary_cells",
@@ -216,6 +386,50 @@ class PairMetricSummary:
         """Compatibility name for the frozen equal-primary-cell accuracy."""
 
         return self.primary_accuracy
+
+    @classmethod
+    def from_dict(cls, raw: Mapping[str, Any]) -> "PairMetricSummary":
+        value = _strict_fields(raw, cls.FIELDS, "PairMetricSummary")
+        primary_raw = _strict_fields(
+            value["primary_cells"],
+            frozenset(PRIMARY_CELL_IDS),
+            "primary_cells",
+        )
+        if not isinstance(value["by_stratum"], Mapping):
+            raise ValueError("by_stratum must be an object")
+        if not isinstance(value["by_family"], Mapping):
+            raise ValueError("by_family must be an object")
+        try:
+            by_stratum = {
+                Stratum(name): Rate.from_dict(rate, f"by_stratum.{name}")
+                for name, rate in value["by_stratum"].items()
+            }
+            by_family = {
+                ReasoningFamily(name): Rate.from_dict(
+                    rate,
+                    f"by_family.{name}",
+                )
+                for name, rate in value["by_family"].items()
+            }
+        except (TypeError, ValueError) as exc:
+            raise ValueError("metric diagnostics contain an unknown key") from exc
+        return cls(
+            primary_accuracy=value["primary_accuracy"],
+            primary_cells={
+                name: Rate.from_dict(primary_raw[name], f"primary_cells.{name}")
+                for name in PRIMARY_CELL_IDS
+            },
+            overall_pair_accuracy=Rate.from_dict(
+                value["overall_pair_accuracy"],
+                "overall_pair_accuracy",
+            ),
+            by_stratum=by_stratum,
+            by_family=by_family,
+            checkpoint_sha256=value["checkpoint_sha256"],
+            arm=value["arm"],
+            memory_mode=value["memory_mode"],
+            control=value["control"],
+        )
 
     def to_dict(self) -> dict:
         return {

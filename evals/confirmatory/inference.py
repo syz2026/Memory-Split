@@ -246,6 +246,8 @@ class ExactTestResult:
     alternative: str
     n: int
     statistic: float | int
+    extreme_count: int
+    assignments: int
     p_value: float
 
     def __post_init__(self) -> None:
@@ -255,9 +257,20 @@ class ExactTestResult:
         if isinstance(self.n, bool) or not isinstance(self.n, int) or self.n < 0:
             raise ValueError("exact test n must be non-negative")
         _finite(self.statistic, "exact test statistic")
+        if (
+            isinstance(self.extreme_count, bool)
+            or not isinstance(self.extreme_count, int)
+            or isinstance(self.assignments, bool)
+            or not isinstance(self.assignments, int)
+            or self.assignments < 1
+            or not 0 <= self.extreme_count <= self.assignments
+        ):
+            raise ValueError("exact test assignment counts are invalid")
         p_value = _finite(self.p_value, "exact test p-value")
         if not 0.0 <= p_value <= 1.0:
             raise ValueError("exact test p-value must be in [0, 1]")
+        if p_value != self.extreme_count / self.assignments:
+            raise ValueError("exact test p-value disagrees with assignment counts")
 
 
 def _differences(values: Sequence[float]) -> tuple[float, ...]:
@@ -308,6 +321,8 @@ def exact_sign_flip_test(
         alternative=alternative_value,
         n=len(values),
         statistic=observed,
+        extreme_count=extreme,
+        assignments=total,
         p_value=extreme / total,
     )
 
@@ -325,23 +340,26 @@ def exact_paired_sign_test(
     n = len(nonzero)
     positives = sum(value > 0.0 for value in nonzero)
     if n == 0:
-        p_value = 1.0
+        assignments = 1
+        extreme_count = 1
     else:
-        denominator = 1 << n
+        assignments = 1 << n
         lower = sum(math.comb(n, count) for count in range(positives + 1))
         upper = sum(math.comb(n, count) for count in range(positives, n + 1))
         if alternative_value == "greater":
-            p_value = upper / denominator
+            extreme_count = upper
         elif alternative_value == "less":
-            p_value = lower / denominator
+            extreme_count = lower
         else:
-            p_value = min(1.0, 2.0 * min(lower, upper) / denominator)
+            extreme_count = min(assignments, 2 * min(lower, upper))
     return ExactTestResult(
         method="paired_sign",
         alternative=alternative_value,
         n=n,
         statistic=positives,
-        p_value=p_value,
+        extreme_count=extreme_count,
+        assignments=assignments,
+        p_value=extreme_count / assignments,
     )
 
 

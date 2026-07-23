@@ -135,7 +135,10 @@ def classify_status(
     else:
         scientific = ScientificStatus.COMPLETE
 
-    if scientific is ScientificStatus.COMPLETE or observed_seeds == 0:
+    if (
+        scientific in {ScientificStatus.COMPLETE, ScientificStatus.INVALID}
+        or observed_seeds == 0
+    ):
         interim = InterimEvidenceLabel.NONE
     elif sign_consistent and observed_seeds >= 3:
         interim = InterimEvidenceLabel.SIGN_CONSISTENT_ONLY

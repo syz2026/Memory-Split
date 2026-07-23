@@ -29,6 +29,15 @@ def test_confirmatory_package_exports_the_supported_core_api():
     assert confirmatory.StoreRecord is StoreRecord
     assert confirmatory.CheckpointRecord is CheckpointRecord
     assert confirmatory.ReasoningFamily is contracts_module.ReasoningFamily
+    assert (
+        confirmatory.OUTCOME_SCHEMA
+        == "memorysplit.confirmatory.outcome.v2"
+    )
+    assert (
+        confirmatory.METRICS_SCHEMA
+        == "memorysplit.confirmatory.metrics.v2"
+    )
+    assert "RNG seed" in confirmatory.PRACTICAL_NULL_REPLAY_GAP
     assert callable(confirmatory.balanced_counterfactual_pair_metric)
     assert callable(confirmatory.hierarchical_paired_bootstrap)
     assert callable(confirmatory.verify_proof_and_answer)

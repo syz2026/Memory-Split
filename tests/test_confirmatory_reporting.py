@@ -28,46 +28,20 @@ from evals.confirmatory.reporting import (
     validate_artifact_report,
 )
 from evals.confirmatory import reporting as reporting_module
-from evals.confirmatory.status import classify_status
 
 
-def _inference(**changes) -> bytes:
-    value = {
-        "record_type": "memorysplit.confirmatory.inference-evidence.v2",
-        "schema_version": CONTRACT_VERSION,
-        "terminal_evidence_complete": True,
-        "measured_validity_failure": False,
-        "observed_valid_seed_pairs": 5,
-        "required_seed_pairs": 5,
-        "same_sign_preterminal_pairs": 0,
-        "supports_effect": True,
-        "supports_practical_null": False,
+def _artifacts(name: str = "positive") -> dict[str, bytes]:
+    fixtures = {
+        "positive": positive_fixture,
+        "null": null_fixture,
+        "invalid": invalid_fixture,
     }
-    value.update(changes)
-    return canonical_json_bytes(value)
-
-
-def _artifacts(**inference_changes) -> dict[str, bytes]:
-    artifacts = {
-        name: canonical_json_bytes(
-            {
-                "artifact": name,
-                "payload": [1, 2, 3],
-            }
-        )
-        for name in REQUIRED_ARTIFACTS
-    }
-    artifacts["inference.json"] = _inference(**inference_changes)
-    return artifacts
+    return dict(fixtures[name]().artifacts)
 
 
 def test_artifact_report_round_trips_and_authenticates_every_required_file():
     artifacts = _artifacts()
-    report = build_artifact_report(
-        artifacts=artifacts,
-        expected_cells=35,
-        observed_cells=35,
-    )
+    report = build_artifact_report(artifacts=artifacts)
 
     assert report.record_type == ARTIFACT_REPORT_SCHEMA
     assert report.schema_version == CONTRACT_VERSION
@@ -85,11 +59,7 @@ def test_artifact_report_fails_closed_on_missing_extra_or_tampered_files(
     mutation,
 ):
     artifacts = _artifacts()
-    report = build_artifact_report(
-        artifacts=artifacts,
-        expected_cells=35,
-        observed_cells=35,
-    )
+    report = build_artifact_report(artifacts=artifacts)
     changed = dict(artifacts)
     if mutation == "missing":
         changed.pop(next(iter(changed)))
@@ -105,46 +75,33 @@ def test_artifact_report_fails_closed_on_missing_extra_or_tampered_files(
 
 def test_artifact_report_rejects_dishonest_status_counts_and_schema_drift():
     artifacts = _artifacts()
-    with pytest.raises(ValueError, match="complete|conclusion|evidence"):
-        build_artifact_report(
-            artifacts=artifacts,
-            expected_cells=35,
-            observed_cells=34,
-        )
-    incomplete_artifacts = _artifacts(
-        terminal_evidence_complete=False,
-        observed_valid_seed_pairs=1,
-        same_sign_preterminal_pairs=1,
-        supports_effect=False,
-    )
-    incomplete = build_artifact_report(
-        artifacts=incomplete_artifacts,
-        expected_cells=35,
-        observed_cells=34,
-    )
-    assert incomplete.scientific_status == "incomplete"
-    assert incomplete.interim_evidence_label == "directional_only"
-    assert incomplete.final_inference_conclusion == "not_evaluated"
-
-    drifted = incomplete.to_dict()
+    report = build_artifact_report(artifacts=artifacts)
+    drifted = report.to_dict()
     drifted["unexpected"] = True
     with pytest.raises(ValueError, match="fields"):
         ArtifactReport.from_dict(drifted)
 
-    dishonest = incomplete.to_dict()
-    dishonest["observed_cells"] = 35
-    with pytest.raises(ValueError, match="report_sha256|status"):
-        ArtifactReport.from_dict(dishonest)
+    dishonest = report.to_dict()
+    dishonest.update(
+        scientific_status="incomplete",
+        final_inference_conclusion="not_evaluated",
+        observed_cells=79,
+    )
+    payload = {
+        key: value
+        for key, value in dishonest.items()
+        if key != "report_sha256"
+    }
+    dishonest["report_sha256"] = canonical_sha256(payload)
+    typed = ArtifactReport.from_dict(dishonest)
+    with pytest.raises(ValueError, match="counts|status"):
+        validate_artifact_report(typed, artifacts)
 
 
 @pytest.mark.parametrize("schema_version", [True, 2.0])
 def test_report_schema_version_is_an_exact_integer(schema_version):
     artifacts = _artifacts()
-    report = build_artifact_report(
-        artifacts=artifacts,
-        expected_cells=35,
-        observed_cells=35,
-    )
+    report = build_artifact_report(artifacts=artifacts)
     raw_report = report.to_dict()
     raw_report["schema_version"] = schema_version
     with pytest.raises(ValueError, match="schema"):
@@ -161,51 +118,28 @@ def test_inference_evidence_schema_version_is_an_exact_integer(
     raw_evidence["schema_version"] = schema_version
     changed_artifacts["inference.json"] = canonical_json_bytes(raw_evidence)
     with pytest.raises(ValueError, match="schema"):
-        build_artifact_report(
-            artifacts=changed_artifacts,
-            expected_cells=35,
-            observed_cells=35,
-        )
+        build_artifact_report(artifacts=changed_artifacts)
 
 
 def test_measured_invalidity_overrides_missing_cells_and_rejects_strong_claims():
-    invalid_artifacts = _artifacts(
-        terminal_evidence_complete=False,
-        measured_validity_failure=True,
-        observed_valid_seed_pairs=2,
-        same_sign_preterminal_pairs=2,
-        supports_effect=False,
-    )
-    report = build_artifact_report(
-        artifacts=invalid_artifacts,
-        expected_cells=35,
-        observed_cells=17,
-    )
+    invalid_artifacts = _artifacts("invalid")
+    report = build_artifact_report(artifacts=invalid_artifacts)
 
     assert report.scientific_status == "invalid"
-    assert report.interim_evidence_label == "directional_only"
+    assert report.interim_evidence_label == "none"
     assert report.final_inference_conclusion == "not_evaluated"
 
-    claiming_effect = _artifacts(
-        terminal_evidence_complete=False,
-        measured_validity_failure=True,
-        supports_effect=True,
-    )
-    with pytest.raises(ValueError, match="supports_effect|conclusion"):
-        build_artifact_report(
-            artifacts=claiming_effect,
-            expected_cells=35,
-            observed_cells=17,
-        )
+    claiming_effect = dict(invalid_artifacts)
+    raw = json.loads(claiming_effect["inference.json"])
+    raw["supports_effect"] = True
+    claiming_effect["inference.json"] = canonical_json_bytes(raw)
+    with pytest.raises(ValueError, match="fields"):
+        build_artifact_report(artifacts=claiming_effect)
 
 
 def test_report_axes_are_derived_from_strict_hash_bound_inference_evidence():
     artifacts = _artifacts()
-    report = build_artifact_report(
-        artifacts=artifacts,
-        expected_cells=35,
-        observed_cells=35,
-    )
+    report = build_artifact_report(artifacts=artifacts)
     dishonest = report.to_dict()
     dishonest.update(
         scientific_status="invalid",
@@ -226,11 +160,7 @@ def test_report_axes_are_derived_from_strict_hash_bound_inference_evidence():
     raw["unregistered_claim"] = True
     drifted["inference.json"] = canonical_json_bytes(raw)
     with pytest.raises(ValueError, match="fields"):
-        build_artifact_report(
-            artifacts=drifted,
-            expected_cells=35,
-            observed_cells=35,
-        )
+        build_artifact_report(artifacts=drifted)
 
     assert (
         reporting_module.INFERENCE_EVIDENCE_SCHEMA
@@ -241,15 +171,8 @@ def test_report_axes_are_derived_from_strict_hash_bound_inference_evidence():
 def test_artifact_report_publication_is_canonical_atomic_and_nonoverwriting(
     tmp_path,
 ):
-    artifacts = _artifacts(
-        supports_effect=False,
-        supports_practical_null=True,
-    )
-    report = build_artifact_report(
-        artifacts=artifacts,
-        expected_cells=35,
-        observed_cells=35,
-    )
+    artifacts = _artifacts("null")
+    report = build_artifact_report(artifacts=artifacts)
     output = tmp_path / "confirmatory-report.json"
 
     assert publish_artifact_report(output, report, artifacts) == output
@@ -263,11 +186,7 @@ def test_publication_pins_parent_across_directory_swap(
     monkeypatch,
 ):
     artifacts = _artifacts()
-    report = build_artifact_report(
-        artifacts=artifacts,
-        expected_cells=35,
-        observed_cells=35,
-    )
+    report = build_artifact_report(artifacts=artifacts)
     parent = tmp_path / "validated-parent"
     moved_parent = tmp_path / "pinned-parent"
     attacker = tmp_path / "attacker"
@@ -304,11 +223,7 @@ def test_publication_rejects_symlink_components_and_unsupported_platforms(
     monkeypatch,
 ):
     artifacts = _artifacts()
-    report = build_artifact_report(
-        artifacts=artifacts,
-        expected_cells=35,
-        observed_cells=35,
-    )
+    report = build_artifact_report(artifacts=artifacts)
     real_parent = tmp_path / "real"
     real_parent.mkdir()
     alias = tmp_path / "alias"
@@ -345,17 +260,15 @@ def test_positive_null_and_invalid_fixtures_are_deterministic_and_decisive():
 
     for fixture in (positive, practical_null, invalid):
         assert len({row.seed for row in fixture.observations}) == 5
+        report = build_artifact_report(artifacts=fixture.artifacts)
         assert (
-            classify_status(
-                complete=fixture.complete,
-                valid=fixture.valid,
-                observed_seeds=5,
-                required_seeds=5,
-                sign_consistent=fixture.sign_consistent,
-                supports_effect=fixture.supports_effect,
-                supports_practical_null=fixture.supports_practical_null,
-            )
-            == fixture.expected_status
+            report.scientific_status,
+            report.interim_evidence_label,
+            report.final_inference_conclusion,
+        ) == (
+            fixture.expected_status.scientific_status,
+            fixture.expected_status.interim_evidence_label,
+            fixture.expected_status.final_inference_conclusion,
         )
 
     estimate = hierarchical_paired_bootstrap(
