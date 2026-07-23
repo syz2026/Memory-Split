@@ -17,6 +17,7 @@ from bisect import bisect_right
 from dataclasses import dataclass
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import stat
@@ -58,6 +59,33 @@ bind a named target-weight stream of equal packed length and require zero at
 every padding target. Version 1 has no such namespace and remains unsupported
 for Split90 sidecars.
 """
+
+
+def strict_json_identity(left: object, right: object) -> bool:
+    """Compare JSON values recursively without Python numeric coercions."""
+
+    if type(left) is not type(right):
+        return False
+    if left is None:
+        return True
+    if type(left) in (str, bool, int):
+        return left == right
+    if type(left) is float:
+        return math.isfinite(left) and math.isfinite(right) and left == right
+    if type(left) is list:
+        return len(left) == len(right) and all(
+            strict_json_identity(left_item, right_item)
+            for left_item, right_item in zip(left, right, strict=True)
+        )
+    if type(left) is dict:
+        if (
+            any(type(key) is not str for key in left)
+            or any(type(key) is not str for key in right)
+            or set(left) != set(right)
+        ):
+            return False
+        return all(strict_json_identity(left[key], right[key]) for key in left)
+    return False
 
 
 @dataclass(frozen=True)
@@ -1025,7 +1053,10 @@ class PackedShards:
         if type(state["format_version"]) is not int or state["format_version"] != 2:
             raise ValueError("data state version is incompatible")
         saved_provenance = state.get("provenance")
-        if type(saved_provenance) is not dict or saved_provenance != self.provenance:
+        if (
+            type(saved_provenance) is not dict
+            or not strict_json_identity(saved_provenance, self.provenance)
+        ):
             raise ValueError("data shard provenance does not match checkpoint")
         global_cursor = state.get("global_cursor")
         if type(global_cursor) is not int or global_cursor < 0:

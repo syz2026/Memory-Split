@@ -1,3 +1,4 @@
+import copy
 import hashlib
 import json
 import os
@@ -389,6 +390,71 @@ def test_checkpoint_rejects_data_provenance_mismatch(tmp_path):
             resume_path=mismatched,
             resume_sha256=file_sha256(mismatched),
         )
+
+
+def test_checkpoint_rejects_nested_data_provenance_numeric_type_drift(tmp_path):
+    bp, mp = write_corpus(tmp_path, n=64)
+    cfg = base_cfg(tmp_path, bp, mp)
+    cfg.update(
+        {
+            "model": {
+                "n_layer": 1,
+                "n_head": 1,
+                "d_model": 8,
+                "ctx": 4,
+                "vocab_size": 256,
+            },
+            "tokens_per_step": 8,
+            "micro_batch_size": 2,
+            "max_steps": 1,
+        }
+    )
+    trainer = Trainer(cfg)
+    trainer.save_ckpt()
+    state = torch.load(trainer.ckpt_path, weights_only=False)
+    state["data_provenance"] = copy.deepcopy(state["data_provenance"])
+    byte_count = state["data_provenance"]["tokens"]["bytes"]
+    state["data_provenance"]["tokens"]["bytes"] = float(byte_count)
+    drifted = tmp_path / "provenance-type-drift.pt"
+    torch.save(state, drifted)
+
+    with pytest.raises(ValueError, match="provenance"):
+        trainer.load_ckpt(drifted, sha256=file_sha256(drifted))
+    trainer.close()
+
+
+def test_checkpoint_rejects_adamw_parameter_step_drift(tmp_path):
+    bp, mp = write_corpus(tmp_path, n=64)
+    cfg = base_cfg(tmp_path, bp, mp)
+    cfg.update(
+        {
+            "model": {
+                "n_layer": 1,
+                "n_head": 1,
+                "d_model": 8,
+                "ctx": 4,
+                "vocab_size": 256,
+            },
+            "tokens_per_step": 8,
+            "micro_batch_size": 2,
+            "max_steps": 2,
+        }
+    )
+    trainer = Trainer(cfg)
+    trainer.train_steps(1)
+    state = torch.load(trainer.ckpt_path, weights_only=False)
+    assert state["step"] == 1
+    parameter_state = next(iter(state["opt"]["state"].values()))
+    original_step = parameter_state["step"]
+    parameter_state["step"] = original_step + 1
+    assert parameter_state["step"].dtype == original_step.dtype
+    assert parameter_state["step"].device == original_step.device
+    drifted = tmp_path / "adamw-step-drift.pt"
+    torch.save(state, drifted)
+
+    with pytest.raises(ValueError, match="AdamW step"):
+        trainer.load_ckpt(drifted, sha256=file_sha256(drifted))
+    trainer.close()
 
 
 def test_checkpoint_rejects_training_config_mismatch(tmp_path):

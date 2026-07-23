@@ -25,6 +25,7 @@ import torch
 from train.data import (
     PackedShards,
     rank_sequence_counts,
+    strict_json_identity,
     synchronized_rank_batch_plan,
 )
 from train.model import GPT, GPTConfig, PRESETS
@@ -732,6 +733,7 @@ class Trainer:
                 or step_value.dtype != torch.float32
                 or not torch.isfinite(step_value).item()
                 or step_value.item() < 0
+                or step_value.item() != saved_step
             ):
                 raise ValueError("checkpoint AdamW step is invalid")
 
@@ -826,7 +828,7 @@ class Trainer:
         provenance = state["data_provenance"]
         if (
             type(provenance) is not dict
-            or provenance != self.data.provenance
+            or not strict_json_identity(provenance, self.data.provenance)
         ):
             raise ValueError(
                 "checkpoint data provenance does not match current dataset"

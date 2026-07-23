@@ -1,3 +1,4 @@
+import copy
 import hashlib
 import os
 
@@ -250,6 +251,41 @@ def test_cursor_state_rejects_extra_fields_without_mutating(tmp_path):
     with pytest.raises(ValueError, match="fields"):
         shard.load_state_dict(state)
     assert shard.global_cursor == 0
+
+
+def test_cursor_state_rejects_nested_provenance_numeric_type_drift(tmp_path):
+    bp, _ = make_shards(tmp_path, n=64, masked_span=(64, 64))
+    shard = PackedShards(bp, None, ctx=4, batch_size=2)
+    state = shard.state_dict()
+    state["provenance"] = copy.deepcopy(state["provenance"])
+    byte_count = state["provenance"]["tokens"]["bytes"]
+    state["provenance"]["tokens"]["bytes"] = float(byte_count)
+
+    with pytest.raises(ValueError, match="provenance"):
+        shard.load_state_dict(state)
+    assert shard.global_cursor == 0
+
+
+def test_strict_json_identity_distinguishes_types_order_and_nonfinite_values():
+    expected = {
+        "values": [True, 1, 1.0, "first", "second"],
+        "nested": {"value": None},
+    }
+    assert data_module.strict_json_identity(expected, copy.deepcopy(expected))
+    assert not data_module.strict_json_identity(
+        expected,
+        {**expected, "values": [1, 1, 1.0, "first", "second"]},
+    )
+    assert not data_module.strict_json_identity(
+        expected,
+        {**expected, "values": [True, 1.0, 1.0, "first", "second"]},
+    )
+    assert not data_module.strict_json_identity(
+        expected,
+        {**expected, "values": [True, 1, 1.0, "second", "first"]},
+    )
+    assert not data_module.strict_json_identity(float("inf"), float("inf"))
+    assert not data_module.strict_json_identity({1: "value"}, {1: "value"})
 
 
 def test_unverified_multiple_shards_fail_closed(tmp_path):
