@@ -33,9 +33,10 @@ PACKAGE_FORMAT_VERSION = 1
 NORMALIZED_TIME = (1980, 1, 1, 0, 0, 0)
 COHORT_PATH = "configs/cohort-assignment-v2.json"
 PROFILE_PATH = "cluster/profiles/aws-p5.48xlarge.json"
-ENVIRONMENT_PATH = "requirements-aws-p5.lock"
+STATIC_ENVIRONMENT_LOCK_PATH = "requirements-aws-p5.lock"
 DATASET_POINTER_PATH = "DATASET-POINTER-AWS.json"
 RELEASE_RECEIPT_NAME = "RELEASE-AWS-P5.json"
+CONTAINER_IMAGE_DIGEST_PATTERN = "^sha256:[0-9a-f]{64}$"
 EXPECTED_CONFIGS = {
     f"configs/360m-v2/{arm}-s{seed}.yaml"
     for seed in AWS_SEEDS
@@ -47,7 +48,6 @@ SEED_ZERO_CONFIGS = {
 REQUIRED_MEMBERS = EXPECTED_CONFIGS | {
     "AWS-P5-START.md",
     DATASET_POINTER_PATH,
-    ENVIRONMENT_PATH,
     COHORT_PATH,
     "configs/preregistration-v2.yaml",
     PROFILE_PATH,
@@ -68,7 +68,6 @@ REQUIRED_MEMBERS = EXPECTED_CONFIGS | {
 _ROOT_INCLUDED = {
     "AWS-P5-START.md",
     DATASET_POINTER_PATH,
-    ENVIRONMENT_PATH,
     "LICENSE",
     "LICENSE.txt",
     "pyproject.toml",
@@ -347,7 +346,7 @@ class _Collected:
     members_sha256: str
     cohort_sha256: str
     profile_sha256: str
-    environment_sha256: str
+    environment: dict[str, object]
     dataset_pointer_sha256: str
     config_sha256: dict[str, str]
     seed_assignment: dict[str, object]
@@ -922,6 +921,8 @@ def _classification(path: str) -> str:
     parts = PurePosixPath(path).parts
     if not parts:
         return "unknown"
+    if path == STATIC_ENVIRONMENT_LOCK_PATH:
+        return "forbidden"
     if path in _ROOT_EXCLUDED or path in _PROVIDER_EXCLUDED:
         return "excluded"
     if parts[0] in _EXCLUDED_TOP_LEVEL:
@@ -1249,6 +1250,14 @@ def _reject_sensitive_fields(value: object, *, label: str) -> None:
 def _validate_profile(data: bytes) -> None:
     profile = _load_json_object(data, label="AWS P5 profile")
     _reject_sensitive_fields(profile, label="AWS P5 profile")
+    runtime = _nested_value(profile, ("runtime",), label="AWS P5 profile")
+    if not isinstance(runtime, dict) or set(runtime) != {
+        "ami_id_env",
+        "container_digest_env",
+    }:
+        raise PackageError(
+            "AWS P5 profile runtime must not claim a static environment identity"
+        )
     expected_values = {
         ("provider",): PROVIDER,
         ("instance_type",): "p5.48xlarge",
@@ -1272,6 +1281,26 @@ def _validate_profile(data: bytes) -> None:
                 "AWS P5 profile field "
                 f"{'.'.join(path)} does not match the frozen contract"
             )
+
+
+def _runtime_environment_contract(profile_sha256: str) -> dict[str, object]:
+    return {
+        "mode": "runtime_attested",
+        "profile_sha256": profile_sha256,
+        "container_image_digest_env": "MS_CONTAINER_DIGEST",
+        "container_image_digest_pattern": CONTAINER_IMAGE_DIGEST_PATTERN,
+        "runtime_environment_receipt": {
+            "required_at_launch": True,
+            "authentication": "aws_instance_identity_document_pkcs7",
+            "required_fields": [
+                "schema_version",
+                "profile_sha256",
+                "container_image_digest",
+                "aws_instance_identity_document",
+                "aws_instance_identity_pkcs7",
+            ],
+        },
+    }
 
 
 def _validate_dataset_pointer(data: bytes) -> None:
@@ -1348,15 +1377,13 @@ def _collect_payload(
             _validate_config(path, payload[path], seed=seed, arm=arm)
     _validate_profile(payload[PROFILE_PATH])
     _validate_dataset_pointer(payload[DATASET_POINTER_PATH])
-    if not payload[ENVIRONMENT_PATH].strip():
-        raise PackageError("AWS environment lock must not be empty")
 
     config_sha256 = {
         path: _sha256(payload[path]) for path in sorted(EXPECTED_CONFIGS)
     }
     cohort_sha256 = _sha256(payload[COHORT_PATH])
     profile_sha256 = _sha256(payload[PROFILE_PATH])
-    environment_sha256 = _sha256(payload[ENVIRONMENT_PATH])
+    environment = _runtime_environment_contract(profile_sha256)
     dataset_pointer_sha256 = _sha256(payload[DATASET_POINTER_PATH])
     seed_assignment: dict[str, object] = {
         "cohort_id": assignment["cohort_id"],
@@ -1383,10 +1410,7 @@ def _collect_payload(
                 "path": PROFILE_PATH,
                 "sha256": profile_sha256,
             },
-            "environment": {
-                "path": ENVIRONMENT_PATH,
-                "sha256": environment_sha256,
-            },
+            "environment": environment,
             "dataset_pointer": {
                 "path": DATASET_POINTER_PATH,
                 "sha256": dataset_pointer_sha256,
@@ -1408,7 +1432,7 @@ def _collect_payload(
         members_sha256=_sha256(sums),
         cohort_sha256=cohort_sha256,
         profile_sha256=profile_sha256,
-        environment_sha256=environment_sha256,
+        environment=environment,
         dataset_pointer_sha256=dataset_pointer_sha256,
         config_sha256=config_sha256,
         seed_assignment=seed_assignment,
@@ -1721,17 +1745,13 @@ def _build_staging(
                 "path": PROFILE_PATH,
                 "sha256": collected.profile_sha256,
             },
-            "environment": {
-                "path": ENVIRONMENT_PATH,
-                "sha256": collected.environment_sha256,
-            },
+            "environment": collected.environment,
             "dataset_pointer": {
                 "path": DATASET_POINTER_PATH,
                 "sha256": collected.dataset_pointer_sha256,
             },
             "cohort_assignment_sha256": collected.cohort_sha256,
             "profile_sha256": collected.profile_sha256,
-            "environment_sha256": collected.environment_sha256,
             "dataset_pointer_sha256": collected.dataset_pointer_sha256,
             "config_sha256": collected.config_sha256,
             "members_sha256": collected.members_sha256,

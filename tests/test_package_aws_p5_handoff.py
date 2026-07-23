@@ -191,6 +191,26 @@ def _dataset_pointer() -> dict[str, object]:
     }
 
 
+def _runtime_environment_contract(profile_sha256: str) -> dict[str, object]:
+    return {
+        "mode": "runtime_attested",
+        "profile_sha256": profile_sha256,
+        "container_image_digest_env": "MS_CONTAINER_DIGEST",
+        "container_image_digest_pattern": "^sha256:[0-9a-f]{64}$",
+        "runtime_environment_receipt": {
+            "required_at_launch": True,
+            "authentication": "aws_instance_identity_document_pkcs7",
+            "required_fields": [
+                "schema_version",
+                "profile_sha256",
+                "container_image_digest",
+                "aws_instance_identity_document",
+                "aws_instance_identity_pkcs7",
+            ],
+        },
+    }
+
+
 def _minimal_repo(tmp_path: Path, *, name: str = "source") -> Path:
     root = tmp_path / name
     root.mkdir()
@@ -199,11 +219,6 @@ def _minimal_repo(tmp_path: Path, *, name: str = "source") -> Path:
             "# Fixture P5 start\nSeeds 1-4 only; seed 0 is forbidden.\n"
         ),
         "DATASET-POINTER-AWS.json": _canonical_json(_dataset_pointer()),
-        "requirements-aws-p5.lock": (
-            "PyYAML==6.0.2 "
-            "--hash=sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n"
-        ),
         "requirements.txt": "PyYAML>=6.0\npytest>=8.0\n",
         "pytest.ini": "[pytest]\n",
         "configs/cohort-assignment-v2.json": _canonical_json(_cohort()),
@@ -422,10 +437,13 @@ def test_archive_contains_only_semantic_seed_pairs_and_hash_bound_metadata(
                 archive.read("cluster/profiles/aws-p5.48xlarge.json")
             ),
         }
-        assert metadata["environment"] == {
-            "path": "requirements-aws-p5.lock",
-            "sha256": _sha256_bytes(archive.read("requirements-aws-p5.lock")),
-        }
+        environment = _runtime_environment_contract(
+            metadata["profile"]["sha256"]
+        )
+        assert metadata["environment"] == environment
+        assert "requirements-aws-p5.lock" not in names
+        assert "environment_sha256" not in metadata
+        assert "credential" not in json.dumps(environment).lower()
         assert metadata["config_sha256"] == {
             name: _sha256_bytes(archive.read(name))
             for name in sorted(EXPECTED_CONFIGS)
@@ -459,7 +477,7 @@ def test_archive_contains_only_semantic_seed_pairs_and_hash_bound_metadata(
         "cohort_assignment"
     ]["sha256"]
     assert receipt["profile_sha256"] == metadata["profile"]["sha256"]
-    assert receipt["environment_sha256"] == metadata["environment"]["sha256"]
+    assert "environment_sha256" not in receipt
     assert receipt["dataset_pointer_sha256"] == metadata["dataset_pointer"][
         "sha256"
     ]
@@ -469,6 +487,62 @@ def test_archive_contains_only_semantic_seed_pairs_and_hash_bound_metadata(
     assert receipt["profile"] == metadata["profile"]
     assert receipt["environment"] == metadata["environment"]
     assert receipt["dataset_pointer"] == metadata["dataset_pointer"]
+
+
+def test_packager_rejects_claimed_static_aws_environment_identity(tmp_path):
+    module = _load_module()
+    source = _minimal_repo(tmp_path)
+    _write(
+        source / "requirements-aws-p5.lock",
+        _canonical_json(
+            {
+                "schema_version": 1,
+                "profile_sha256": "0" * 64,
+                "container_image_digest": "sha256:" + "1" * 64,
+                "runtime_environment_receipt_sha256": "2" * 64,
+            }
+        ),
+    )
+    _commit(source, "add fabricated static AWS environment identity")
+
+    with pytest.raises(module.PackageError, match="environment|lock|forbidden"):
+        module.build_handoff(
+            source_root=source,
+            out_dir=tmp_path / "out",
+            apply=True,
+        )
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("ami_id", "ami-fabricated"),
+        ("container_image_digest", "sha256:" + "1" * 64),
+        (
+            "runtime_environment_receipt",
+            {"profile_sha256": "2" * 64},
+        ),
+    ],
+)
+def test_packager_rejects_fabricated_profile_runtime_identity(
+    tmp_path,
+    field,
+    value,
+):
+    module = _load_module()
+    source = _minimal_repo(tmp_path)
+    path = source / "cluster/profiles/aws-p5.48xlarge.json"
+    profile = json.loads(path.read_text())
+    profile["runtime"][field] = value
+    path.write_text(_canonical_json(profile))
+    _commit(source, f"add fabricated runtime identity: {field}")
+
+    with pytest.raises(module.PackageError, match="runtime|environment|identity"):
+        module.build_handoff(
+            source_root=source,
+            out_dir=tmp_path / "out",
+            apply=True,
+        )
 
 
 def test_archive_excludes_materialized_provider_and_sealed_content(tmp_path):
