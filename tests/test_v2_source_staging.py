@@ -103,7 +103,7 @@ def _write_lock(path: Path, value: object) -> str:
     return _sha(content)
 
 
-def _fixture_lock(tmp_path: Path):
+def _fixture_lock(tmp_path: Path, *, contaminated_sealed: bool = False):
     inputs = tmp_path / "inputs"
     lock_root = tmp_path / "contract" / "locks"
     lock_root.mkdir(parents=True)
@@ -206,6 +206,11 @@ def _fixture_lock(tmp_path: Path):
     }
 
     wikidata_root = inputs / "wikidata"
+    inductive_valid = (
+        b"Q1\tP1\tQ2\nQ3\tP1\tQ4\nQ1\tP1\tQ2\n"
+        if contaminated_sealed
+        else b"Q3\tP1\tQ4\n"
+    )
     wikidata_archives = {
         "wikidata5m_alias.tar.gz": {
             "wikidata5m_entity.txt": b"Q1\tOne\nQ2\tTwo\nQ3\tThree\nQ4\tFour\nQ5\tFive\n",
@@ -215,7 +220,7 @@ def _fixture_lock(tmp_path: Path):
             "wikidata5m_inductive_train.txt": (
                 b"Q1\tP1\tQ2\nQ1\tP1\tQ2\n"
             ),
-            "wikidata5m_inductive_valid.txt": b"Q3\tP1\tQ4\n",
+            "wikidata5m_inductive_valid.txt": inductive_valid,
             "wikidata5m_inductive_test.txt": b"Q4\tP2\tQ5\n",
         },
         "wikidata5m_transductive.tar.gz": {
@@ -363,6 +368,16 @@ def _fixture_lock(tmp_path: Path):
     master_path = lock_root / "source-set.lock.json"
     _write_lock(master_path, master)
     return load_v2_source_lock(master_path)
+
+
+def _rebind_receipt_inventory(source_root: Path, receipt: dict) -> None:
+    files = v2_sources._inventory(
+        source_root,
+        exclude={v2_sources.RECEIPT_NAME},
+    )
+    receipt["files"] = files
+    receipt["inventory_sha256"] = v2_sources._tree_digest(files)
+    (source_root / v2_sources.RECEIPT_NAME).write_bytes(_json_bytes(receipt))
 
 
 def test_committed_source_locks_bind_real_upstream_bytes_and_licenses():
@@ -539,6 +554,21 @@ def test_fixture_stage_cross_deduplicates_and_completes_wikidata_once(tmp_path):
         "dropped_duplicate_rows": 2,
         "training_rows": 4,
     }
+    sealed = receipt["sources"]["wikidata5m"]["sealed_evaluation"]
+    assert sealed["source_files_retained"] is True
+    assert sealed["training_index"]["bytes"] == 48
+    assert sealed["training_index"]["distinct_triples"] == 2
+    assert sealed["totals"] == {
+        "eligible_distinct_triples": 4,
+        "eligible_duplicate_rows": 0,
+        "eligible_rows": 4,
+        "eligible_training_overlap_rows": 0,
+        "excluded_training_overlap_distinct_triples": 0,
+        "excluded_training_overlap_rows": 0,
+        "official_source_distinct_triples": 4,
+        "official_source_duplicate_rows": 0,
+        "official_source_rows": 4,
+    }
     assert receipt["stage_complete"] is True
     assert receipt["production_corpus_ready"] is False
     assert receipt["missing_source_locks"] == _MISSING_SOURCE_LOCKS
@@ -565,6 +595,212 @@ def test_fixture_stage_cross_deduplicates_and_completes_wikidata_once(tmp_path):
         )
         == receipt
     )
+
+
+def test_wikidata_training_duplicates_are_deterministically_excluded(tmp_path):
+    lock = _fixture_lock(tmp_path, contaminated_sealed=True)
+    first_receipt = stage_v2_sources(
+        lock,
+        tmp_path / "first-data",
+        execute=True,
+        reserve_bytes=0,
+        disk_free_bytes=10 * 1024**3,
+    )
+    first_root = tmp_path / "first-data" / lock.dataset_id
+    audit = first_receipt["sources"]["wikidata5m"]["sealed_evaluation"]
+    split = next(
+        item
+        for item in audit["splits"]
+        if item["input_path"] == "wikidata5m_inductive_valid.txt"
+    )
+
+    assert (
+        first_root / "wikidata5m" / split["eligibility_sidecar"]["path"]
+    ).read_bytes() == b"\x00\x01\x00"
+    assert split["source_rows"] == 3
+    assert split["source_distinct_triples"] == 2
+    assert split["source_duplicate_rows"] == 1
+    assert split["eligible_rows"] == 1
+    assert split["excluded_training_overlap_rows"] == 2
+    assert split["excluded_training_overlap_distinct_triples"] == 1
+    evidence_path = first_root / "wikidata5m" / split["exclusion_evidence"]["path"]
+    evidence = json.loads(evidence_path.read_bytes())
+    overlapping_digest = _sha(b"Q1\tP1\tQ2\n")
+    assert evidence["records"] == [
+        {"canonical_triple_sha256": overlapping_digest, "row_index": 0},
+        {"canonical_triple_sha256": overlapping_digest, "row_index": 2},
+    ]
+    assert split["exclusion_evidence"] == {
+        "bytes": evidence_path.stat().st_size,
+        "path": "selection/"
+        "wikidata5m_inductive_valid.txt.training-overlap-exclusions.json",
+        "records": 2,
+        "sha256": _sha(evidence_path.read_bytes()),
+    }
+    assert audit["totals"] == {
+        "eligible_distinct_triples": 4,
+        "eligible_duplicate_rows": 0,
+        "eligible_rows": 4,
+        "eligible_training_overlap_rows": 0,
+        "excluded_training_overlap_distinct_triples": 1,
+        "excluded_training_overlap_rows": 2,
+        "official_source_distinct_triples": 5,
+        "official_source_duplicate_rows": 1,
+        "official_source_rows": 6,
+    }
+    assert (
+        first_root / "wikidata5m" / "files" / "wikidata5m_inductive_valid.txt"
+    ).read_bytes() == b"Q1\tP1\tQ2\nQ3\tP1\tQ4\nQ1\tP1\tQ2\n"
+
+    second_receipt = stage_v2_sources(
+        lock,
+        tmp_path / "second-data",
+        execute=True,
+        reserve_bytes=0,
+        disk_free_bytes=10 * 1024**3,
+    )
+    assert second_receipt == first_receipt
+
+
+def test_wikidata_sealed_exclusion_evidence_is_bound_to_receipt(tmp_path):
+    lock = _fixture_lock(tmp_path, contaminated_sealed=True)
+    data_root = tmp_path / "data"
+    receipt = stage_v2_sources(
+        lock,
+        data_root,
+        execute=True,
+        reserve_bytes=0,
+        disk_free_bytes=10 * 1024**3,
+    )
+    source_root = data_root / lock.dataset_id
+    split = next(
+        item
+        for item in receipt["sources"]["wikidata5m"]["sealed_evaluation"]["splits"]
+        if item["excluded_training_overlap_rows"]
+    )
+    evidence_path = source_root / "wikidata5m" / split["exclusion_evidence"]["path"]
+    evidence = json.loads(evidence_path.read_bytes())
+    evidence["records"][0]["canonical_triple_sha256"] = "0" * 64
+    evidence_path.write_bytes(_json_bytes(evidence))
+
+    forged_receipt = json.loads((source_root / v2_sources.RECEIPT_NAME).read_bytes())
+    _rebind_receipt_inventory(source_root, forged_receipt)
+    with pytest.raises(SourceDriftError, match="sealed exclusion evidence drift"):
+        verify_v2_source_stage(lock, source_root)
+
+
+def test_wikidata_eligible_sidecar_cannot_hide_training_overlap(tmp_path):
+    lock = _fixture_lock(tmp_path, contaminated_sealed=True)
+    data_root = tmp_path / "data"
+    stage_v2_sources(
+        lock,
+        data_root,
+        execute=True,
+        reserve_bytes=0,
+        disk_free_bytes=10 * 1024**3,
+    )
+    source_root = data_root / lock.dataset_id
+    manifest_path = source_root / "wikidata5m" / "selection-manifest.json"
+    manifest = json.loads(manifest_path.read_bytes())
+    split = next(
+        item
+        for item in manifest["sealed_evaluation_audit"]["splits"]
+        if item["excluded_training_overlap_rows"]
+    )
+    sidecar_path = source_root / "wikidata5m" / split["eligibility_sidecar"]["path"]
+    content = bytearray(sidecar_path.read_bytes())
+    assert content[0] == 0
+    content[0] = 1
+    sidecar_path.write_bytes(content)
+
+    # Rebind every declared hash so ordinary inventory/receipt checks pass.
+    # Semantic verification must still discover the concealed train overlap.
+    split["eligibility_sidecar"]["sha256"] = _sha(bytes(content))
+    manifest_path.write_bytes(_json_bytes(manifest))
+    forged_receipt = json.loads((source_root / v2_sources.RECEIPT_NAME).read_bytes())
+    forged_receipt["sources"]["wikidata5m"]["sealed_evaluation"] = manifest[
+        "sealed_evaluation_audit"
+    ]
+    forged_receipt["sources"]["wikidata5m"]["selection_manifest_sha256"] = _sha(
+        manifest_path.read_bytes()
+    )
+    _rebind_receipt_inventory(source_root, forged_receipt)
+
+    with pytest.raises(
+        SourceDriftError,
+        match="eligible Wikidata sealed subset contains a training triple",
+    ):
+        verify_v2_source_stage(lock, source_root)
+
+
+def test_wikidata_sealed_derivation_resumes_completed_training_state(
+    tmp_path,
+    monkeypatch,
+):
+    lock = _fixture_lock(tmp_path, contaminated_sealed=True)
+    data_root = tmp_path / "data"
+    original = v2_sources._derive_wikidata_sealed_audit
+
+    def interrupt_after_training_index(*args, **kwargs):
+        if kwargs["publish"]:
+            raise RuntimeError("simulated sealed derivation interruption")
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(
+        v2_sources,
+        "_derive_wikidata_sealed_audit",
+        interrupt_after_training_index,
+    )
+    with pytest.raises(RuntimeError, match="sealed derivation interruption"):
+        stage_v2_sources(
+            lock,
+            data_root,
+            execute=True,
+            reserve_bytes=0,
+            disk_free_bytes=10 * 1024**3,
+        )
+
+    private = data_root / ".memorysplit-v2-source-stage" / lock.sha256
+    training_sidecar = (
+        private
+        / "payload"
+        / "wikidata5m"
+        / "selection"
+        / "wikidata5m_inductive_train.txt.keep.u8"
+    )
+    training_index = (
+        private / "payload" / "wikidata5m" / "selection" / "training-triples.u64be"
+    )
+    state_database = private / "state" / "wikidata-complete-once.sqlite3"
+    assert state_database.stat().st_size > 0
+    sidecar_mtime = training_sidecar.stat().st_mtime_ns
+    index_mtime = training_index.stat().st_mtime_ns
+
+    monkeypatch.setattr(
+        v2_sources,
+        "_derive_wikidata_sealed_audit",
+        original,
+    )
+    receipt = stage_v2_sources(
+        lock,
+        data_root,
+        execute=True,
+        reserve_bytes=0,
+        disk_free_bytes=10 * 1024**3,
+    )
+    source_root = data_root / lock.dataset_id
+    assert (
+        receipt["sources"]["wikidata5m"]["sealed_evaluation"]["totals"][
+            "eligible_training_overlap_rows"
+        ]
+        == 0
+    )
+    assert (
+        source_root / "wikidata5m" / "selection" / training_sidecar.name
+    ).stat().st_mtime_ns == sidecar_mtime
+    assert (
+        source_root / "wikidata5m" / "selection" / training_index.name
+    ).stat().st_mtime_ns == index_mtime
 
 
 def test_completed_http_partial_resumes_without_redownload(tmp_path):

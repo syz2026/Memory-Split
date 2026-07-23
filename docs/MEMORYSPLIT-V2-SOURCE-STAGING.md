@@ -40,9 +40,26 @@ Each FineMath parquet receives a one-byte-per-row `.keep.u8` sidecar (`1` keep,
 
 Wikidata uses the locked inductive-training split before the locked
 transductive-training split and emits equivalent keep sidecars, so every exact
-training triple is selected once. Test and validation splits remain staged as
-sealed source material and are audited for zero overlap with the selected
-training graph.
+training triple is selected once. The official test and validation files are
+retained byte-for-byte for provenance. They are not assumed to be clean:
+staging emits a row-aligned `.eligible.u8` sidecar for each file and excludes
+every exact triple present in the complete-once training union from future
+sealed evaluation. A canonical exclusion-evidence file binds each excluded row
+index and triple digest to the source-file hash.
+
+The frozen revision contains substantial cross-regime contamination. Of 23,889
+official sealed-source rows, 23,823 occur in the combined training graph. The
+eligible remainder has 66 rows and 62 distinct triples; four rows duplicate
+eligible triples across official splits. Staging records these counts rather
+than silently changing training coverage or deleting source evidence.
+
+An exact, sorted, fixed-width index commits all 20,624,513 distinct selected
+training triples. Verification uses it to recompute every eligibility marker,
+requires the eligible subset to have zero training overlap, rejects unjustified
+exclusions, and binds the index, sidecars, evidence files, per-split counts, and
+hashes into both the selection manifest and source-stage receipt. Evaluation
+consumers must use the eligible sidecars and must not read the official files
+as unfiltered evaluation sets.
 
 Only training-eligible ARC/ARC-AGI-2 and ConceptARC files are extracted.
 Published ProntoQA data/model-output ZIPs, CLRS model-accuracy outputs, and ARC
@@ -86,7 +103,9 @@ Re-run the same command after interruption. Downloads, per-file deduplication
 transactions, and safely extracted trees resume under a private directory
 keyed by the source-set lock SHA-256. Publication is one atomic rename and
 never replaces an existing destination. `--restart` explicitly discards only
-that private partial stage.
+that private partial stage. In particular, recovery from a sealed-evaluation
+audit failure must omit `--restart`; the completed FineMath and Wikidata
+training transactions remain valid and are reused.
 
 On success, the command prints the immutable receipt path and SHA-256. The
 receipt is:

@@ -16,6 +16,10 @@ scripts/stage_v2_sources.py --data-root "$DATA_ROOT" --execute
 Its receipt remains `production_corpus_ready: false`; this command does not
 materialize any of the eight final lanes. See
 `docs/MEMORYSPLIT-V2-SOURCE-STAGING.md` for its disk and resume contract.
+The official Wikidata test/validation files are retained for provenance, but
+their receipt-bound eligibility sidecars are authoritative for evaluation:
+rows duplicated in the complete-once training union are contaminated and must
+not be evaluated.
 
 ## Materialize the eight lanes
 

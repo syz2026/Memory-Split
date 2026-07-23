@@ -6,10 +6,12 @@ import contextlib
 import fcntl
 import hashlib
 import json
+import mmap
 import os
 import re
 import shutil
 import sqlite3
+import struct
 import subprocess
 import tarfile
 import urllib.error
@@ -80,6 +82,17 @@ _EXPECTED_HF_PINS = {
         "CC0-1.0",
     ),
 }
+_WIKIDATA_SEALED_SPLITS = (
+    "wikidata5m_inductive_test.txt",
+    "wikidata5m_inductive_valid.txt",
+    "wikidata5m_transductive_test.txt",
+    "wikidata5m_transductive_valid.txt",
+)
+_WIKIDATA_TRAINING_INDEX_STRUCT = struct.Struct(">QQQ")
+_WIKIDATA_TRAINING_INDEX_ENCODING = "three_big_endian_uint64_subject_relation_object"
+_WIKIDATA_SEALED_POLICY = (
+    "retain_official_sources_exclude_exact_training_overlaps_from_evaluation"
+)
 
 
 class V2SourceStageError(RuntimeError):
@@ -684,9 +697,10 @@ def _locked_derived_bytes(lock: V2SourceSetLock) -> int:
         int(item["rows"])
         for item in lock.sources["finemath"]["subset_metadata"].values()
     )
-    # Reserve a second uncompressed-Wikidata allowance for one-byte-per-row
-    # keep sidecars.  It is deliberately conservative because row counts are
-    # learned only after the pinned archives have been parsed.
+    # Reserve a second uncompressed-Wikidata allowance for complete-once
+    # sidecars, the fixed-width exact training index, and sealed-exclusion
+    # evidence. It is deliberately conservative because row counts are learned
+    # only after the pinned archives have been parsed.
     return (2 * wikidata) + auxiliary + finemath_sidecars
 
 
@@ -1680,43 +1694,457 @@ def _process_wikidata_split(
     }
 
 
+def _wikidata_triple_tuple(triple: Any) -> tuple[int, int, int]:
+    return (triple.subject, int(triple.relation[1:]), triple.object)
+
+
+def _wikidata_triple_bytes(triple: tuple[int, int, int]) -> bytes:
+    subject, relation, object_id = triple
+    return f"Q{subject}\tP{relation}\tQ{object_id}\n".encode("ascii")
+
+
+def _wikidata_triple_sequence_sha256(
+    triples: Sequence[tuple[int, int, int]],
+) -> str:
+    digest = hashlib.sha256()
+    for triple in triples:
+        digest.update(_wikidata_triple_bytes(triple))
+    return digest.hexdigest()
+
+
+def _pack_wikidata_training_rows(
+    rows: Sequence[Sequence[Any]],
+) -> bytes:
+    content = bytearray()
+    try:
+        for row in rows:
+            content.extend(
+                _WIKIDATA_TRAINING_INDEX_STRUCT.pack(
+                    int(row[0]),
+                    int(row[1]),
+                    int(row[2]),
+                )
+            )
+    except (IndexError, OverflowError, struct.error, TypeError, ValueError) as error:
+        raise SourceDriftError(
+            "Wikidata training triple exceeds index encoding"
+        ) from error
+    return bytes(content)
+
+
+def _build_wikidata_training_index(
+    connection: sqlite3.Connection,
+    selection_root: Path,
+) -> Mapping[str, Any]:
+    """Publish a deterministic, exact index supporting independent overlap checks."""
+
+    destination = selection_root / "training-triples.u64be"
+    selection_root.mkdir(parents=True, exist_ok=True)
+    count = int(connection.execute("SELECT COUNT(*) FROM seen").fetchone()[0])
+    expected_size = count * _WIKIDATA_TRAINING_INDEX_STRUCT.size
+    query = """
+        SELECT subject, relation, object
+        FROM seen
+        ORDER BY subject, relation, object
+    """
+    digest = hashlib.sha256()
+
+    if destination.exists() or destination.is_symlink():
+        if (
+            not destination.is_file()
+            or destination.is_symlink()
+            or destination.stat().st_size != expected_size
+        ):
+            raise SourceDriftError("resumed Wikidata training index drift")
+        with destination.open("rb") as stream:
+            cursor = connection.execute(query)
+            while rows := cursor.fetchmany(8192):
+                expected = _pack_wikidata_training_rows(rows)
+                actual = stream.read(len(expected))
+                if actual != expected:
+                    raise SourceDriftError(
+                        "resumed Wikidata training index content drift"
+                    )
+                digest.update(actual)
+            if stream.read(1):
+                raise SourceDriftError("resumed Wikidata training index is too long")
+    else:
+        temporary = destination.with_name(f".{destination.name}.partial")
+        if temporary.exists() or temporary.is_symlink():
+            if temporary.is_symlink() or not temporary.is_file():
+                raise SourceDriftError(
+                    f"unsafe Wikidata training index partial: {temporary}"
+                )
+            temporary.unlink()
+        try:
+            with temporary.open("xb") as stream:
+                cursor = connection.execute(query)
+                while rows := cursor.fetchmany(8192):
+                    content = _pack_wikidata_training_rows(rows)
+                    stream.write(content)
+                    digest.update(content)
+                stream.flush()
+                os.fsync(stream.fileno())
+            if temporary.stat().st_size != expected_size:
+                raise SourceDriftError("Wikidata training index size drift")
+            temporary.chmod(0o644)
+            temporary.replace(destination)
+        except BaseException:
+            temporary.unlink(missing_ok=True)
+            raise
+
+    return {
+        "bytes": expected_size,
+        "distinct_triples": count,
+        "encoding": _WIKIDATA_TRAINING_INDEX_ENCODING,
+        "ordering": "ascending_numeric_subject_relation_object",
+        "path": destination.relative_to(selection_root.parent).as_posix(),
+        "sha256": digest.hexdigest(),
+    }
+
+
+@contextlib.contextmanager
+def _open_wikidata_training_index(
+    wikidata_root: Path,
+    raw_record: Mapping[str, Any],
+    *,
+    verify_hash: bool,
+) -> Iterator[tuple[mmap.mmap, int]]:
+    record = _mapping(raw_record, "Wikidata training index")
+    if set(record) != {
+        "bytes",
+        "distinct_triples",
+        "encoding",
+        "ordering",
+        "path",
+        "sha256",
+    }:
+        raise SourceDriftError("Wikidata training index descriptor drift")
+    count = record["distinct_triples"]
+    size = record["bytes"]
+    if (
+        isinstance(count, bool)
+        or not isinstance(count, int)
+        or count <= 0
+        or isinstance(size, bool)
+        or not isinstance(size, int)
+        or size != count * _WIKIDATA_TRAINING_INDEX_STRUCT.size
+        or record["encoding"] != _WIKIDATA_TRAINING_INDEX_ENCODING
+        or record["ordering"] != "ascending_numeric_subject_relation_object"
+        or record["path"] != "selection/training-triples.u64be"
+        or not isinstance(record["sha256"], str)
+        or not _SHA256_RE.fullmatch(record["sha256"])
+    ):
+        raise SourceDriftError("Wikidata training index descriptor is invalid")
+    path = _safe_destination(wikidata_root, str(record["path"]))
+    if verify_hash:
+        _verify_file(path, record, "Wikidata training triple index")
+    elif not path.is_file() or path.is_symlink() or path.stat().st_size != size:
+        raise SourceDriftError(f"missing regular Wikidata training index: {path}")
+    with (
+        path.open("rb") as stream,
+        mmap.mmap(stream.fileno(), length=0, access=mmap.ACCESS_READ) as index,
+    ):
+        yield index, count
+
+
+def _wikidata_training_index_contains(
+    index: mmap.mmap,
+    count: int,
+    triple: tuple[int, int, int],
+) -> bool:
+    try:
+        key = _WIKIDATA_TRAINING_INDEX_STRUCT.pack(*triple)
+    except (OverflowError, struct.error) as error:
+        raise SourceDriftError(
+            "Wikidata sealed triple exceeds index encoding"
+        ) from error
+    low = 0
+    high = count
+    width = _WIKIDATA_TRAINING_INDEX_STRUCT.size
+    while low < high:
+        middle = (low + high) // 2
+        candidate = index[middle * width : (middle + 1) * width]
+        if candidate < key:
+            low = middle + 1
+        else:
+            high = middle
+    return low < count and index[low * width : (low + 1) * width] == key
+
+
+def _write_exact_derived_file(path: Path, content: bytes, label: str) -> None:
+    if path.exists() or path.is_symlink():
+        if not path.is_file() or path.is_symlink() or path.read_bytes() != content:
+            raise SourceDriftError(f"resumed {label} drift: {path}")
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.partial")
+    if temporary.exists() or temporary.is_symlink():
+        if temporary.is_symlink() or not temporary.is_file():
+            raise SourceDriftError(f"unsafe {label} partial: {temporary}")
+        temporary.unlink()
+    try:
+        with temporary.open("xb") as stream:
+            stream.write(content)
+            stream.flush()
+            os.fsync(stream.fileno())
+        temporary.chmod(0o644)
+        temporary.replace(path)
+    except BaseException:
+        temporary.unlink(missing_ok=True)
+        raise
+
+
+def _derive_wikidata_sealed_split(
+    *,
+    split: str,
+    path: Path,
+    input_sha256: str,
+    training_index_sha256: str,
+    index: mmap.mmap,
+    training_count: int,
+) -> tuple[
+    Mapping[str, Any],
+    bytes,
+    bytes,
+    list[tuple[int, int, int]],
+    list[tuple[int, int, int]],
+    list[tuple[int, int, int]],
+]:
+    triples = [_wikidata_triple_tuple(item) for item in iter_triples(path)]
+    eligible: list[tuple[int, int, int]] = []
+    excluded: list[tuple[int, int, int]] = []
+    evidence_records = []
+    mask = bytearray()
+    for row_index, triple in enumerate(triples):
+        overlaps_training = _wikidata_training_index_contains(
+            index,
+            training_count,
+            triple,
+        )
+        mask.append(0 if overlaps_training else 1)
+        if overlaps_training:
+            excluded.append(triple)
+            evidence_records.append(
+                {
+                    "canonical_triple_sha256": hashlib.sha256(
+                        _wikidata_triple_bytes(triple)
+                    ).hexdigest(),
+                    "row_index": row_index,
+                }
+            )
+        else:
+            eligible.append(triple)
+
+    sidecar_relative = f"selection/{split}.eligible.u8"
+    evidence_relative = f"selection/{split}.training-overlap-exclusions.json"
+    evidence = {
+        "format": "memorysplit-v2-wikidata-sealed-exclusions",
+        "input_path": split,
+        "input_sha256": input_sha256,
+        "policy": _WIKIDATA_SEALED_POLICY,
+        "reason": "exact_triple_present_in_complete_once_training",
+        "records": evidence_records,
+        "row_indexing": "zero_based_nonempty_parsed_source_rows",
+        "schema_version": 1,
+        "training_index_sha256": training_index_sha256,
+    }
+    sidecar_content = bytes(mask)
+    evidence_content = _canonical_bytes(evidence)
+    record = {
+        "eligibility_sidecar": {
+            "bytes": len(sidecar_content),
+            "encoding": "one_unsigned_byte_per_source_row_1_eligible_0_excluded",
+            "path": sidecar_relative,
+            "sha256": hashlib.sha256(sidecar_content).hexdigest(),
+        },
+        "eligible_distinct_triples": len(set(eligible)),
+        "eligible_duplicate_rows": len(eligible) - len(set(eligible)),
+        "eligible_rows": len(eligible),
+        "eligible_triples_sha256": _wikidata_triple_sequence_sha256(eligible),
+        "excluded_training_overlap_distinct_triples": len(set(excluded)),
+        "excluded_training_overlap_rows": len(excluded),
+        "excluded_training_overlap_triples_sha256": (
+            _wikidata_triple_sequence_sha256(excluded)
+        ),
+        "exclusion_evidence": {
+            "bytes": len(evidence_content),
+            "path": evidence_relative,
+            "records": len(evidence_records),
+            "sha256": hashlib.sha256(evidence_content).hexdigest(),
+        },
+        "input_path": split,
+        "input_sha256": input_sha256,
+        "source_distinct_triples": len(set(triples)),
+        "source_duplicate_rows": len(triples) - len(set(triples)),
+        "source_rows": len(triples),
+    }
+    return record, sidecar_content, evidence_content, triples, eligible, excluded
+
+
+def _synchronize_wikidata_sealed_artifact(
+    path: Path,
+    expected: bytes,
+    *,
+    label: str,
+    publish: bool,
+    sidecar: bool = False,
+) -> None:
+    if not path.is_file() or path.is_symlink():
+        if not publish:
+            raise SourceDriftError(f"missing regular {label}: {path}")
+        _write_exact_derived_file(path, expected, label)
+        return
+    actual = path.read_bytes()
+    if actual == expected:
+        return
+    if sidecar and len(actual) == len(expected):
+        for expected_marker, actual_marker in zip(expected, actual, strict=True):
+            if actual_marker == 1 and expected_marker == 0:
+                raise SourceDriftError(
+                    "eligible Wikidata sealed subset contains a training triple"
+                )
+            if actual_marker not in (0, 1):
+                raise SourceDriftError(
+                    "Wikidata sealed eligibility sidecar contains invalid bytes"
+                )
+    raise SourceDriftError(f"{label} drift: {path}")
+
+
+def _derive_wikidata_sealed_audit(
+    *,
+    files_root: Path,
+    extracted: Mapping[str, Mapping[str, Any]],
+    selection_root: Path,
+    training_index: Mapping[str, Any],
+    publish: bool,
+    verify_index_hash: bool,
+) -> Mapping[str, Any]:
+    split_records = []
+    source_triples: list[tuple[int, int, int]] = []
+    eligible_triples: list[tuple[int, int, int]] = []
+    excluded_triples: list[tuple[int, int, int]] = []
+    with _open_wikidata_training_index(
+        selection_root.parent,
+        training_index,
+        verify_hash=verify_index_hash,
+    ) as (index, training_count):
+        for split in _WIKIDATA_SEALED_SPLITS:
+            if split not in extracted:
+                raise SourceDriftError(
+                    f"Wikidata sealed file is not inventoried: {split}"
+                )
+            record, sidecar, evidence, source, eligible, excluded = (
+                _derive_wikidata_sealed_split(
+                    split=split,
+                    path=files_root / split,
+                    input_sha256=str(extracted[split]["sha256"]),
+                    training_index_sha256=str(training_index["sha256"]),
+                    index=index,
+                    training_count=training_count,
+                )
+            )
+            _synchronize_wikidata_sealed_artifact(
+                _safe_destination(
+                    selection_root.parent, record["eligibility_sidecar"]["path"]
+                ),
+                sidecar,
+                label="Wikidata sealed eligibility sidecar",
+                publish=publish,
+                sidecar=True,
+            )
+            _synchronize_wikidata_sealed_artifact(
+                _safe_destination(
+                    selection_root.parent, record["exclusion_evidence"]["path"]
+                ),
+                evidence,
+                label="Wikidata sealed exclusion evidence",
+                publish=publish,
+            )
+            split_records.append(record)
+            source_triples.extend(source)
+            eligible_triples.extend(eligible)
+            excluded_triples.extend(excluded)
+
+    return {
+        "eligibility_sidecar_encoding": (
+            "one_unsigned_byte_per_source_row_1_eligible_0_excluded"
+        ),
+        "format": "memorysplit-v2-wikidata-sealed-evaluation-audit",
+        "policy": _WIKIDATA_SEALED_POLICY,
+        "schema_version": 1,
+        "source_files_retained": True,
+        "splits": split_records,
+        "totals": {
+            "eligible_distinct_triples": len(set(eligible_triples)),
+            "eligible_duplicate_rows": (
+                len(eligible_triples) - len(set(eligible_triples))
+            ),
+            "eligible_rows": len(eligible_triples),
+            "eligible_training_overlap_rows": 0,
+            "excluded_training_overlap_distinct_triples": len(set(excluded_triples)),
+            "excluded_training_overlap_rows": len(excluded_triples),
+            "official_source_distinct_triples": len(set(source_triples)),
+            "official_source_duplicate_rows": (
+                len(source_triples) - len(set(source_triples))
+            ),
+            "official_source_rows": len(source_triples),
+        },
+        "training_index": dict(training_index),
+    }
+
+
 def _audit_sealed_wikidata(
     connection: sqlite3.Connection,
     files_root: Path,
     extracted: Mapping[str, Mapping[str, Any]],
+    selection_root: Path,
 ) -> Mapping[str, Any]:
-    sealed = (
-        "wikidata5m_inductive_test.txt",
-        "wikidata5m_inductive_valid.txt",
-        "wikidata5m_transductive_test.txt",
-        "wikidata5m_transductive_valid.txt",
+    training_index = _build_wikidata_training_index(connection, selection_root)
+    return _derive_wikidata_sealed_audit(
+        files_root=files_root,
+        extracted=extracted,
+        selection_root=selection_root,
+        training_index=training_index,
+        publish=True,
+        verify_index_hash=False,
     )
-    counts: dict[str, int] = {}
-    for split in sealed:
-        rows = 0
-        batch: list[tuple[int, int, int]] = []
-        for triple in iter_triples(files_root / split):
-            rows += 1
-            batch.append((triple.subject, int(triple.relation[1:]), triple.object))
-            if len(batch) == 4096:
-                overlap = _existing_triples(connection, batch)
-                if overlap:
-                    raise SourceDriftError(
-                        f"Wikidata sealed triple occurs in training: "
-                        f"{sorted(overlap)[0]}"
-                    )
-                batch.clear()
-        if batch:
-            overlap = _existing_triples(connection, batch)
-            if overlap:
-                raise SourceDriftError(
-                    f"Wikidata sealed triple occurs in training: "
-                    f"{sorted(overlap)[0]}"
-                )
-        counts[split] = rows
-        if split not in extracted:
-            raise SourceDriftError(f"Wikidata sealed file is not inventoried: {split}")
-    return {"split_rows": counts, "train_sealed_overlap": 0}
+
+
+def _verify_wikidata_sealed_audit(
+    wikidata_root: Path,
+    extracted: Mapping[str, Mapping[str, Any]],
+    raw_audit: Mapping[str, Any],
+) -> Mapping[str, Any]:
+    try:
+        audit = _mapping(raw_audit, "Wikidata sealed evaluation audit")
+        training_index = _mapping(
+            audit["training_index"],
+            "Wikidata sealed training index",
+        )
+        expected = _derive_wikidata_sealed_audit(
+            files_root=wikidata_root / "files",
+            extracted=extracted,
+            selection_root=wikidata_root / "selection",
+            training_index=training_index,
+            publish=False,
+            verify_index_hash=True,
+        )
+    except SourceDriftError:
+        raise
+    except (KeyError, TypeError, ValueError) as error:
+        raise SourceDriftError(
+            "Wikidata sealed evaluation audit schema drift"
+        ) from error
+    if audit != expected:
+        raise SourceDriftError(
+            "Wikidata sealed evaluation audit does not match eligible rows"
+        )
+    if expected["totals"]["eligible_training_overlap_rows"] != 0:
+        raise SourceDriftError(
+            "eligible Wikidata sealed subset overlaps complete-once training"
+        )
+    return expected
 
 
 def _build_wikidata_selection(
@@ -1757,7 +2185,12 @@ def _build_wikidata_selection(
                     selection_root=payload / "wikidata5m" / "selection",
                 )
             )
-        sealed_audit = _audit_sealed_wikidata(connection, files_root, extracted)
+        sealed_audit = _audit_sealed_wikidata(
+            connection,
+            files_root,
+            extracted,
+            payload / "wikidata5m" / "selection",
+        )
         distinct = int(connection.execute("SELECT COUNT(*) FROM seen").fetchone()[0])
     finally:
         connection.close()
@@ -1978,6 +2411,7 @@ def _build_receipt(
                 "license": lock.sources["wikidata5m"]["license"],
                 "repository": lock.sources["wikidata5m"]["repository"],
                 "revision": lock.sources["wikidata5m"]["revision"],
+                "sealed_evaluation": wikidata_selection["sealed_evaluation_audit"],
                 "selection_manifest_sha256": hashlib.sha256(
                     _canonical_bytes(wikidata_selection)
                 ).hexdigest(),
@@ -2074,6 +2508,11 @@ def verify_v2_source_stage(
     wikidata_selection = _read_canonical_mapping(
         root / "wikidata5m" / "selection-manifest.json",
         "Wikidata selection manifest",
+    )
+    _verify_wikidata_sealed_audit(
+        root / "wikidata5m",
+        {str(item["path"]): item for item in extracted_wikidata},
+        wikidata_selection.get("sealed_evaluation_audit"),
     )
     expected_receipt = _build_receipt(
         lock,
