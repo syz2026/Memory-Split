@@ -29,12 +29,35 @@ class AtomicGraphStore:
             self.hits += 1
         return row
 
+    def pages(self, address: GraphAddress) -> tuple[GraphRow, ...]:
+        """Return every page for one entity/relation/direction in page order."""
+
+        prefix = (address.source_id, address.relation_id, address.direction)
+        return tuple(
+            row
+            for key, row in sorted(
+                self._rows.items(),
+                key=lambda item: item[0].sort_key(),
+            )
+            if (key.source_id, key.relation_id, key.direction) == prefix
+        )
+
+    def addresses_for(self, source_id) -> tuple[GraphAddress, ...]:
+        return tuple(
+            address
+            for address in sorted(self._rows, key=GraphAddress.sort_key)
+            if address.source_id == source_id
+        )
+
     def reset_counters(self) -> None:
         self.hits = 0
         self.misses = 0
 
     def rows(self) -> tuple[GraphRow, ...]:
-        return tuple(self._rows[key] for key in sorted(self._rows))
+        return tuple(
+            self._rows[key]
+            for key in sorted(self._rows, key=GraphAddress.sort_key)
+        )
 
     def canonical_bytes(self) -> bytes:
         lines = [

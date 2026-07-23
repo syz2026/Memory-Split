@@ -1,5 +1,9 @@
 #!/usr/bin/env python
-"""Build one relational token stream and three aligned target-weight files."""
+"""Build the legacy pilot corpus.
+
+Current seven-lane builds use ``scripts/build_current_dataset.py`` so the
+verified Task 1 source contract cannot be bypassed accidentally.
+"""
 
 from __future__ import annotations
 
@@ -41,9 +45,13 @@ def iter_bed_jsonl(path: Path | str):
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description=(
-            "Build a shared relational corpus with dense, split, and "
-            "matched-random target weights."
-        )
+            "Build the legacy synthetic relational pilot with dense, split, "
+            "and matched-random target weights."
+        ),
+        epilog=(
+            "For relational-chinchilla current data, run "
+            "scripts/build_current_dataset.py with a verified source root."
+        ),
     )
     parser.add_argument("--out", required=True)
     parser.add_argument("--entities", type=int, required=True)

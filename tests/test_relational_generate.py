@@ -398,3 +398,224 @@ def test_relational_eval_command_is_repo_relative():
     assert completed.returncode == 0, completed.stderr
     assert "--run" in completed.stdout
     assert "--guardrails-json" not in completed.stdout
+
+
+def test_read_uses_exact_qid_pid_direction_and_page_address():
+    page_zero = GraphRow(
+        "Q1", "P31", "out", "entity", "Q2", (), "page-zero", page=0
+    )
+    page_one = GraphRow(
+        "Q1", "P31", "out", "entity", "Q3", (), "page-one", page=1
+    )
+    state = GraphDecodeState(["Q1", None, None, None])
+    store = AtomicGraphStore([page_zero, page_one])
+
+    returned = apply_action(
+        state,
+        GraphAction(0, "P31", "out", True, False, page=1),
+        store,
+    )
+
+    assert returned == page_one
+    assert state.slots[0] == "Q3"
+    assert state.rows == [page_one]
+
+
+def test_current_items_decode_twelve_slots_with_post_halt_noops():
+    tok = get_tok()
+    item = _item()
+    item.meta["action_slots"] = 12
+
+    result = decode_item(ScriptedModel(tok), tok, item, store=None)
+
+    assert len(result.actions) == 12
+    assert len(result.rows) == 12
+    assert len(result.provisional_answers) == 12
+    assert result.actions[1].halt
+    assert all(
+        action == GraphAction(0, "r0", "out", False, False)
+        for action in result.actions[2:]
+    )
+
+
+def test_graph_state_rejects_more_than_ten_reads():
+    state = GraphDecodeState([7, None, None, None])
+    store = _store()
+    action = GraphAction(0, "r0", "out", True, False)
+
+    for _ in range(10):
+        state.slots[0] = 7
+        apply_action(state, action, store)
+
+    state.slots[0] = 7
+    with pytest.raises(ValueError, match="at most ten graph reads"):
+        apply_action(state, action, store)
+
+
+def test_decoders_constrain_the_model_to_at_most_ten_reads():
+    tok = get_tok()
+
+    class AlwaysReadModel(ScriptedModel):
+        def _next(self, history):
+            if history[-1] in (tok.DIR_OUT, tok.DIR_IN):
+                return tok.GRAPH_READ
+            return super()._next(history)
+
+    items = [_item("a"), _item("b")]
+    for item in items:
+        item.meta["action_slots"] = 12
+
+    single = decode_item(AlwaysReadModel(tok), tok, items[0], store=None)
+    batched = decode_items(
+        AlwaysReadModel(tok),
+        tok,
+        items,
+        store=None,
+        batch_size=2,
+    )
+
+    assert sum(action.read for action in single.actions) == 10
+    assert all(
+        sum(action.read for action in state.actions) == 10 for state in batched
+    )
+
+
+def test_state_rows_accept_current_twelve_slot_traces():
+    item = _item()
+    item.meta["action_slots"] = 12
+    item.meta["gold_actions"].extend(
+        {
+            "source_slot": 0,
+            "relation_id": "r0",
+            "direction": "out",
+            "read": False,
+            "halt": False,
+        }
+        for _ in range(6)
+    )
+    returned = _store().rows()[0]
+    state = GraphDecodeState(
+        slots=[9, 8, None, None],
+        actions=[
+            GraphAction(0, "r0", "out", True, False),
+            GraphAction(0, "r0", "out", False, True),
+            *[
+                GraphAction(0, "r0", "out", False, False)
+                for _ in range(10)
+            ],
+        ],
+        rows=[returned, *([None] * 11)],
+        provisional_answers=["<|slot_0|>"] * 12,
+        halt_step=2,
+    )
+
+    result = _states_to_rows([item], [state])[0]
+
+    assert result["n_steps"] == 12
+    assert len(result["all_actions"]) == 12
+    assert len(result["gold_all_actions"]) == 12
+
+
+def test_decoder_can_emit_delimited_pid_and_select_exact_page():
+    tok = get_tok()
+    relation_ids = tok.encode("P31")
+    page_ids = tok.encode("1")
+
+    class PageModel(ScriptedModel):
+        def _next(self, history):
+            last = history[-1]
+            already_read = tok.GRAPH_READ in history
+            if last == tok.GRAPH_START:
+                return tok.SLOTS[0]
+            if last in tok.SLOTS:
+                return tok.RELATIONS["r0"] if already_read else tok.RELATION_START
+            if last == tok.RELATION_START:
+                return relation_ids[0]
+            for index, token_id in enumerate(relation_ids):
+                if last == token_id:
+                    return (
+                        relation_ids[index + 1]
+                        if index + 1 < len(relation_ids)
+                        else tok.RELATION_END
+                    )
+            if last == tok.RELATION_END:
+                return tok.DIR_OUT
+            if last in tok.RELATIONS.values():
+                return tok.DIR_OUT
+            if last == tok.DIR_OUT:
+                return tok.GRAPH_HALT if already_read else tok.PAGE_START
+            if last == tok.PAGE_START:
+                return page_ids[0]
+            for index, token_id in enumerate(page_ids):
+                if last == token_id:
+                    return (
+                        page_ids[index + 1]
+                        if index + 1 < len(page_ids)
+                        else tok.PAGE_END
+                    )
+            if last == tok.PAGE_END:
+                return tok.GRAPH_READ
+            if last == tok.ANSWER_STATE:
+                return tok.encode("yes")[0]
+            return tok.GRAPH_START
+
+    item = _item()
+    item.prompt = "Read exact page one."
+    item.answer = "yes"
+    item.meta.update(
+        {
+            "entity_slots": ["Q1", None, None, None],
+            "answer_choices": ["yes", "no"],
+            "action_slots": 12,
+            "gold_addresses": [["Q1", "P31", "out", 1]],
+            "gold_actions": [
+                {
+                    "source_slot": 0,
+                    "relation_id": "P31",
+                    "direction": "out",
+                    "read": True,
+                    "halt": False,
+                    "page": 1,
+                },
+                {
+                    "source_slot": 0,
+                    "relation_id": "r0",
+                    "direction": "out",
+                    "read": False,
+                    "halt": True,
+                    "page": 0,
+                },
+                *[
+                    {
+                        "source_slot": 0,
+                        "relation_id": "r0",
+                        "direction": "out",
+                        "read": False,
+                        "halt": False,
+                        "page": 0,
+                    }
+                    for _ in range(10)
+                ],
+            ],
+        }
+    )
+    page = GraphRow(
+        "Q1",
+        "P31",
+        "out",
+        "entity",
+        "Q9",
+        (),
+        "page-one",
+        page=1,
+    )
+
+    result = decode_item(PageModel(tok), tok, item, AtomicGraphStore([page]))
+
+    assert result.actions[0] == GraphAction(
+        0, "P31", "out", True, False, page=1
+    )
+    assert result.rows[0] == page
+    assert result.slots[0] == "Q9"
+    assert result.actions[1].halt
+    assert all(not action.read and not action.halt for action in result.actions[2:])

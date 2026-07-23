@@ -43,3 +43,58 @@ def test_snapshot_round_trip_is_sorted_and_hash_stable(tmp_path):
     loaded = AtomicGraphStore.load(path)
     assert loaded.rows() == (second, first)
     assert loaded.snapshot_sha256() == store.snapshot_sha256()
+
+
+def test_page_is_part_of_the_exact_graph_address():
+    first = GraphRow(
+        "Q1",
+        "P31",
+        "out",
+        "entity",
+        "Q2",
+        (),
+        "wikidata:first",
+        page=0,
+        targets=("Q2", "Q3"),
+    )
+    second = GraphRow(
+        "Q1",
+        "P31",
+        "out",
+        "entity",
+        "Q4",
+        (),
+        "wikidata:second",
+        page=1,
+        targets=("Q4", "Q5"),
+    )
+    store = AtomicGraphStore([second, first])
+
+    assert store.lookup(GraphAddress("Q1", "P31", "out", 0)) == first
+    assert store.lookup(GraphAddress("Q1", "P31", "out", 1)) == second
+    assert store.pages(GraphAddress("Q1", "P31", "out")) == (first, second)
+    assert store.rows() == (first, second)
+
+
+def test_set_valued_graph_rows_round_trip_without_scalar_api_breakage(tmp_path):
+    paged = GraphRow(
+        "Q9",
+        "P999999",
+        "out",
+        "entity",
+        "Q10",
+        (),
+        "wikidata:set",
+        page=3,
+        targets=("Q10", "Q20"),
+    )
+    scalar = row()
+    path = tmp_path / "paged.jsonl"
+
+    AtomicGraphStore([paged, scalar]).save(path)
+    loaded = AtomicGraphStore.load(path)
+
+    assert loaded.lookup(paged.address) == paged
+    assert loaded.lookup(GraphAddress(1, "r0", "out")) == scalar
+    assert scalar.address.page == 0
+    assert scalar.values == ("2",)

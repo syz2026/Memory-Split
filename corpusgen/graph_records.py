@@ -5,12 +5,15 @@ from typing import Literal
 
 Direction = Literal["out", "in"]
 TargetKind = Literal["entity", "literal"]
+CanonicalEntityID = int | str
 SegmentRole = Literal[
     "plain",
     "payload",
     "random_control",
     "rule",
     "action",
+    "query",
+    "candidate_state",
     "provisional_answer",
     "final_answer",
 ]
@@ -35,42 +38,81 @@ def relative_position_bin(
 
 @dataclass(frozen=True, order=True)
 class GraphAddress:
-    source_id: int
+    source_id: CanonicalEntityID
     relation_id: str
     direction: Direction
+    page: int = 0
 
     def __post_init__(self) -> None:
-        if self.source_id < 0:
+        if isinstance(self.source_id, bool) or not isinstance(
+            self.source_id, (int, str)
+        ):
+            raise ValueError("source_id must be an integer or canonical identity")
+        if isinstance(self.source_id, int) and self.source_id < 0:
             raise ValueError("source_id must be non-negative")
+        if isinstance(self.source_id, str) and not self.source_id:
+            raise ValueError("source_id must be non-empty")
         if not self.relation_id:
             raise ValueError("relation_id must be non-empty")
         if self.direction not in ("out", "in"):
             raise ValueError(f"invalid direction: {self.direction}")
+        if isinstance(self.page, bool) or not isinstance(self.page, int) or self.page < 0:
+            raise ValueError("page must be a non-negative integer")
+
+    @property
+    def entity_id(self) -> CanonicalEntityID:
+        return self.source_id
+
+    def sort_key(self) -> tuple[str, str, str, int]:
+        source = (
+            f"I{self.source_id:020d}"
+            if isinstance(self.source_id, int)
+            else f"S{self.source_id}"
+        )
+        return source, self.relation_id, self.direction, self.page
 
 
 @dataclass(frozen=True, order=True)
 class GraphRow:
-    source_id: int
+    source_id: CanonicalEntityID
     relation_id: str
     direction: Direction
     target_kind: TargetKind
     target: str
     qualifiers: tuple[tuple[str, str], ...] = ()
     provenance_id: str = ""
+    page: int = 0
+    targets: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
-        GraphAddress(self.source_id, self.relation_id, self.direction)
+        GraphAddress(self.source_id, self.relation_id, self.direction, self.page)
         if self.target_kind not in ("entity", "literal"):
             raise ValueError(f"invalid target_kind: {self.target_kind}")
         if not self.target:
             raise ValueError("target must be non-empty")
+        if self.targets:
+            if self.targets[0] != self.target:
+                raise ValueError("target must be the first set-valued member")
+            if any(not value for value in self.targets):
+                raise ValueError("set-valued targets must be non-empty")
+            if len(self.targets) != len(set(self.targets)):
+                raise ValueError("set-valued targets must be distinct")
 
     @property
     def address(self) -> GraphAddress:
-        return GraphAddress(self.source_id, self.relation_id, self.direction)
+        return GraphAddress(
+            self.source_id,
+            self.relation_id,
+            self.direction,
+            self.page,
+        )
+
+    @property
+    def values(self) -> tuple[str, ...]:
+        return self.targets or (self.target,)
 
     def as_json(self) -> dict:
-        return {
+        value = {
             "source_id": self.source_id,
             "relation_id": self.relation_id,
             "direction": self.direction,
@@ -79,17 +121,26 @@ class GraphRow:
             "qualifiers": [list(q) for q in self.qualifiers],
             "provenance_id": self.provenance_id,
         }
+        if self.page or self.targets:
+            value["page"] = self.page
+            value["targets"] = list(self.values)
+        return value
 
     @classmethod
     def from_json(cls, value: dict) -> "GraphRow":
+        source_id = value["source_id"]
+        if not isinstance(source_id, (int, str)) or isinstance(source_id, bool):
+            raise ValueError("source_id must be an integer or canonical identity")
         return cls(
-            source_id=int(value["source_id"]),
+            source_id=source_id,
             relation_id=str(value["relation_id"]),
             direction=value["direction"],
             target_kind=value["target_kind"],
             target=str(value["target"]),
             qualifiers=tuple((str(k), str(v)) for k, v in value["qualifiers"]),
             provenance_id=str(value["provenance_id"]),
+            page=int(value.get("page", 0)),
+            targets=tuple(str(item) for item in value.get("targets", ())),
         )
 
 
@@ -145,9 +196,16 @@ class GraphAction:
     direction: Direction
     read: bool
     halt: bool
+    page: int = 0
 
     def __post_init__(self) -> None:
         if self.source_slot not in range(4):
             raise ValueError("source_slot must be in [0, 3]")
+        if not self.relation_id:
+            raise ValueError("relation_id must be non-empty")
+        if self.direction not in ("out", "in"):
+            raise ValueError(f"invalid direction: {self.direction}")
         if self.halt and self.read:
             raise ValueError("HALT cannot also read")
+        if isinstance(self.page, bool) or not isinstance(self.page, int) or self.page < 0:
+            raise ValueError("page must be a non-negative integer")

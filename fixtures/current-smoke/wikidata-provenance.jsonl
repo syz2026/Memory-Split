@@ -1,0 +1,9 @@
+{"fact_id":"wikidata:Q1:P31:Q2","object":"Q2","page":0,"relation":"P31","source_row":1,"split":"inductive_train","subject":"Q1"}
+{"fact_id":"wikidata:Q1:P31:Q3","object":"Q3","page":0,"relation":"P31","source_row":2,"split":"inductive_train","subject":"Q1"}
+{"fact_id":"wikidata:Q1:P31:Q4","object":"Q4","page":0,"relation":"P31","source_row":3,"split":"inductive_train","subject":"Q1"}
+{"fact_id":"wikidata:Q2:P279:Q5","object":"Q5","page":0,"relation":"P279","source_row":4,"split":"inductive_train","subject":"Q2"}
+{"fact_id":"wikidata:Q5:P279:Q6","object":"Q6","page":0,"relation":"P279","source_row":5,"split":"inductive_train","subject":"Q5"}
+{"fact_id":"wikidata:Q6:P279:Q7","object":"Q7","page":0,"relation":"P279","source_row":1,"split":"transductive_train","subject":"Q6"}
+{"fact_id":"wikidata:Q10:P999999:Q11","object":"Q11","page":0,"relation":"P999999","source_row":2,"split":"transductive_train","subject":"Q10"}
+{"fact_id":"wikidata:Q20:P17:Q21","object":"Q21","page":0,"relation":"P17","source_row":3,"split":"transductive_train","subject":"Q20"}
+{"fact_id":"wikidata:Q20:P17:Q22","object":"Q22","page":0,"relation":"P17","source_row":4,"split":"transductive_train","subject":"Q20"}

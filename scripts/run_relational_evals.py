@@ -118,22 +118,30 @@ def store_for_item(
 
 
 def _action_json(action: GraphAction) -> list:
-    return [
+    value = [
         action.source_slot,
         action.relation_id,
         action.direction,
         action.read,
         action.halt,
     ]
+    if action.page:
+        value.append(action.page)
+    return value
 
 
 def _gold_actions(item) -> list[GraphAction]:
     meta = _item_meta(item)
     raw_actions = meta["gold_actions"]
-    if not isinstance(raw_actions, list) or len(raw_actions) != 6:
-        raise ValueError("gold_actions must contain exactly six actions")
+    expected_slots = int(meta.get("action_slots", len(raw_actions)))
+    if (
+        not isinstance(raw_actions, list)
+        or expected_slots not in (6, 12)
+        or len(raw_actions) != expected_slots
+    ):
+        raise ValueError("gold_actions must contain exactly 6 or 12 actions")
     actions = []
-    required = {
+    legacy_fields = {
         "source_slot",
         "relation_id",
         "direction",
@@ -141,7 +149,10 @@ def _gold_actions(item) -> list[GraphAction]:
         "halt",
     }
     for raw in raw_actions:
-        if not isinstance(raw, dict) or set(raw) != required:
+        if not isinstance(raw, dict) or set(raw) not in (
+            legacy_fields,
+            legacy_fields | {"page"},
+        ):
             raise ValueError("gold action fields do not match the contract")
         actions.append(GraphAction(**raw))
     halt_positions = [
@@ -163,6 +174,7 @@ def _gold_actions(item) -> list[GraphAction]:
     if any(
         action.relation_id != str(address[1])
         or action.direction != str(address[2])
+        or action.page != (int(address[3]) if len(address) == 4 else 0)
         for action, address in zip(read_actions, addresses)
     ):
         raise ValueError("gold actions do not match gold addresses")
@@ -175,20 +187,28 @@ def _states_to_rows(items, states: list[GraphDecodeState]) -> list[dict]:
         raise ValueError("every eval item requires exactly one decoded state")
     rows = []
     for item, state in zip(materialized, states):
-        if (
-            len(state.actions) != 6
-            or len(state.rows) != 6
-            or len(state.provisional_answers) != 6
-        ):
-            raise ValueError("every decoded state must contain six steps")
         meta = _item_meta(item)
+        expected_slots = int(meta.get("action_slots", len(state.actions)))
+        if (
+            expected_slots not in (6, 12)
+            or len(state.actions) != expected_slots
+            or len(state.rows) != expected_slots
+            or len(state.provisional_answers) != expected_slots
+        ):
+            raise ValueError("decoded state does not match its action-slot contract")
         gold_all_actions = _gold_actions(item)
         gold_actions = [
             action for action in gold_all_actions if action.read
         ]
         gold_addresses = [
-            GraphAddress(int(source), str(relation), direction)
-            for source, relation, direction in meta["gold_addresses"]
+            GraphAddress(
+                source if isinstance(source, str) else int(source),
+                str(address[1]),
+                address[2],
+                int(address[3]) if len(address) == 4 else 0,
+            )
+            for address in meta["gold_addresses"]
+            for source in [address[0]]
         ]
         read_pairs = [
             (action, row)

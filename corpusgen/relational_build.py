@@ -32,6 +32,8 @@ from corpusgen.srgm_worlds import (
 WRITE_COST_GRID = (0.25, 0.5, 1.0, 2.0, 4.0, 8.0)
 COMPONENT_SHARES = {"bed": 0.45, "graph": 0.30, "reasoning": 0.25}
 POSITION_BIN_COUNT = RANDOM_CONTROL_POSITION_BINS
+MAX_GRAPH_ACTION_SLOTS = 12
+MAX_GRAPH_READS = 10
 _RANDOM_CANDIDATE_POOL_LIMIT = 64
 _EVAL_TASKS = (
     "path_composition",
@@ -1191,9 +1193,14 @@ def validate_eval_sets(
 ) -> dict[str, bool]:
     def validate_gold_actions(meta: dict) -> list[GraphAction]:
         raw_actions = meta.get("gold_actions")
-        if not isinstance(raw_actions, list) or len(raw_actions) != 6:
-            raise ValueError("gold actions must contain exactly six steps")
-        required = {
+        action_slots = int(meta.get("action_slots", 6))
+        if (
+            not isinstance(raw_actions, list)
+            or action_slots not in (6, MAX_GRAPH_ACTION_SLOTS)
+            or len(raw_actions) != action_slots
+        ):
+            raise ValueError("gold actions must contain exactly 6 or 12 steps")
+        legacy_fields = {
             "source_slot",
             "relation_id",
             "direction",
@@ -1202,7 +1209,10 @@ def validate_eval_sets(
         }
         actions = []
         for raw in raw_actions:
-            if not isinstance(raw, dict) or set(raw) != required:
+            if not isinstance(raw, dict) or set(raw) not in (
+                legacy_fields,
+                legacy_fields | {"page"},
+            ):
                 raise ValueError("gold actions have invalid fields")
             actions.append(GraphAction(**raw))
         halts = [
@@ -1219,9 +1229,12 @@ def validate_eval_sets(
             raise ValueError("gold actions after HALT must be NOOP")
         addresses = meta["gold_addresses"]
         reads = [action for action in actions if action.read]
+        if len(reads) > MAX_GRAPH_READS:
+            raise ValueError("gold actions may contain at most ten reads")
         if len(reads) != len(addresses) or any(
             action.relation_id != str(address[1])
             or action.direction != str(address[2])
+            or action.page != (int(address[3]) if len(address) == 4 else 0)
             for action, address in zip(reads, addresses)
         ):
             raise ValueError("gold actions do not match gold addresses")

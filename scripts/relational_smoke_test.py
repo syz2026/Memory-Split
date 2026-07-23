@@ -1,10 +1,10 @@
 #!/usr/bin/env python
-"""Run the deterministic two-step relational pipeline on CPU."""
+"""Run the packaged current smoke bytes through training and memory modes."""
 
 from __future__ import annotations
 
 import argparse
-import itertools
+import hashlib
 import json
 import sys
 from pathlib import Path
@@ -14,19 +14,9 @@ if __package__ in (None, ""):
 
 import torch
 
-from corpusgen.relational_build import (
-    RelationalBuildConfig,
-    build_relational_corpus,
-)
+from corpusgen.current_dataset import verify_current_dataset
 from evals.relational_generate import decode_items
 from organizer.graph_store import AtomicGraphStore
-from scripts.run_relational_evals import (
-    _load_eval_items,
-    _states_to_rows,
-    _summary,
-    _write_jsonl,
-    store_for_item,
-)
 from train.tokenizer import get_tok
 from train.trainer import Trainer
 
@@ -50,26 +40,7 @@ _MODEL = {
     "ctx": 320,
     "vocab_size": 50_304,
 }
-_BED = (
-    "Glaciers carved the valley and left long ridges of gravel behind.",
-    "Wind turbines convert moving air into electricity for the local grid.",
-    "The old observatory records each comet crossing the night sky.",
-    "Bees communicate the location of food through patterned movements.",
-)
-_ROUTE_POLICY_SHA256 = (
-    "bfaa8178633e5ca9078b88ae5d619bfbaeea0d6898e4cf6d068a076c7a9f7649"
-)
-_ROUTE_POLICY_PATH = (
-    Path(__file__).resolve().parents[1]
-    / "tests"
-    / "fixtures"
-    / "relational-smoke-route-policy.json"
-)
-
-
-def _bed_stream():
-    for index in itertools.count():
-        yield f"{_BED[index % len(_BED)]} Deterministic passage {index}."
+_DEFAULT_FIXTURE = Path(__file__).resolve().parents[1] / "fixtures" / "current-smoke"
 
 
 def _trainer_config(
@@ -87,14 +58,14 @@ def _trainer_config(
         "train_weights": str(corpus / f"{arm}.weights.bin"),
         "micro_batch_size": 1,
         "tokens_per_step": _MODEL["ctx"],
-        "max_steps": steps,
+        "max_steps": steps + 1,
         "lr": 1e-3,
         "warmup_steps": 1,
         "seed": 19,
         "device": device,
         "out_dir": str(root / "runs" / arm),
-        "log_every": steps,
-        "eval_every": steps,
+        "log_every": 1,
+        "eval_every": 1,
         "snap_frac": 1.0,
         "ckpt_minutes": 999,
     }
@@ -150,10 +121,13 @@ def _evaluate_modes(
     trainer: Trainer,
     tok,
 ) -> list[str]:
-    items = _load_eval_items(
-        corpus,
-        SMOKE_FIXTURE["eval_pairs_per_task"],
-    )
+    items = [
+        json.loads(line)
+        for line in (corpus / "eval" / "items.jsonl").read_text().splitlines()
+        if line
+    ]
+    if not items:
+        raise ValueError("packaged current smoke fixture has no eval items")
     base_store = AtomicGraphStore.load(corpus / "eval" / "graph.jsonl")
     modes = []
     trainer.model.eval()
@@ -163,22 +137,46 @@ def _evaluate_modes(
             trainer.model,
             tok,
             items,
-            lambda item, enabled=memory_on: store_for_item(
-                base_store,
-                item,
-                memory_on=enabled,
-            ),
+            base_store if memory_on else None,
             device="cpu",
             batch_size=8,
         )
-        rows = _states_to_rows(items, states)
+        rows = [
+            {
+                "qid": item["qid"],
+                "memory": memory,
+                "actions": [
+                    [
+                        action.source_slot,
+                        action.relation_id,
+                        action.direction,
+                        action.page,
+                        action.read,
+                        action.halt,
+                    ]
+                    for action in state.actions
+                ],
+                "misses": state.misses,
+                "halt_step": state.halt_step,
+                "n_steps": len(state.actions),
+                "prediction": state.provisional_answers[-1],
+            }
+            for item, state in zip(items, states)
+        ]
         mode_dir = root / "evals" / f"memory_{memory}"
-        _write_jsonl(mode_dir / "rows.jsonl", rows)
-        summary = _summary(
-            rows,
-            SMOKE_FIXTURE["eval_pairs_per_task"],
-            memory,
+        mode_dir.mkdir(parents=True)
+        (mode_dir / "rows.jsonl").write_text(
+            "".join(
+                json.dumps(row, sort_keys=True, separators=(",", ":")) + "\n"
+                for row in rows
+            )
         )
+        summary = {
+            "memory": memory,
+            "n_items": len(rows),
+            "action_slots": 12,
+            "all_items_complete": all(row["n_steps"] == 12 for row in rows),
+        }
         (mode_dir / "summary.json").write_text(
             json.dumps(summary, indent=2, sort_keys=True) + "\n"
         )
@@ -186,13 +184,35 @@ def _evaluate_modes(
     return modes
 
 
+def _fixture_hashes(root: Path) -> dict[str, str]:
+    return {
+        path.relative_to(root).as_posix(): hashlib.sha256(
+            path.read_bytes()
+        ).hexdigest()
+        for path in sorted(root.rglob("*"))
+        if path.is_file()
+    }
+
+
+def _resume_one_step(trainer: Trainer, root: Path) -> int:
+    resumed_cfg = dict(
+        trainer.cfg,
+        out_dir=str(root / "runs" / "resume-one-step"),
+    )
+    resumed = Trainer(resumed_cfg)
+    resumed.load_ckpt(trainer.ckpt_path)
+    resumed.train_steps(1)
+    return resumed.step
+
+
 def run_smoke(
     out_dir: Path | str,
     *,
+    fixture: Path | str = _DEFAULT_FIXTURE,
     steps: int = SMOKE_STEPS,
     device: str = "cpu",
 ) -> dict:
-    """Build, train, resume, and evaluate the real tiny relational pipeline."""
+    """Train and evaluate directly from immutable packaged current bytes."""
 
     if steps != SMOKE_STEPS:
         raise ValueError("the local smoke contract requires exactly two steps")
@@ -203,18 +223,12 @@ def run_smoke(
     if any(root.iterdir()):
         raise ValueError(f"smoke output directory must be empty: {root}")
 
+    corpus = Path(fixture).resolve()
+    build_report = verify_current_dataset(corpus, "smoke")
+    fixture_before = _fixture_hashes(corpus)
     tok = get_tok()
-    corpus = root / "corpus"
-    build_report = build_relational_corpus(
-        RelationalBuildConfig(**SMOKE_FIXTURE),
-        tok,
-        _bed_stream(),
-        corpus,
-        route_policy_path=_ROUTE_POLICY_PATH,
-        expected_policy_sha256=_ROUTE_POLICY_SHA256,
-    )
     if not all(build_report["checks"].values()):
-        raise AssertionError("smoke corpus failed relational build checks")
+        raise AssertionError("packaged current smoke corpus failed build checks")
 
     dense = Trainer(
         _trainer_config(root, corpus, "dense", steps=steps, device=device)
@@ -234,15 +248,16 @@ def run_smoke(
     dense.train_steps(steps)
     split.train_steps(steps)
     resume_exact = _resume_is_exact(dense, root)
+    resume_step = _resume_one_step(dense, root)
     modes = _evaluate_modes(root, corpus, split, tok)
-    pair_count = SMOKE_FIXTURE["eval_pairs_per_task"]
     pairs_complete = all(
         json.loads(
             (root / "evals" / f"memory_{mode}" / "summary.json").read_text()
-        )["n_pairs_per_task"]
-        == pair_count
+        )["all_items_complete"]
         for mode in modes
     )
+    verify_current_dataset(corpus, "smoke")
+    fixture_unchanged = _fixture_hashes(corpus) == fixture_before
 
     report = {
         "shared_stream": (
@@ -252,16 +267,24 @@ def run_smoke(
         "dense_steps": dense.step,
         "split_steps": split.step,
         "resume_exact": resume_exact,
+        "resume_step": resume_step,
         "memory_modes": modes,
         "pairs_complete": pairs_complete,
+        "fixture_unchanged": fixture_unchanged,
+        "profile": build_report["profile"],
+        "scientific_result": build_report["scientific_result"],
     }
     if not (
         report["shared_stream"]
         and report["dense_steps"] == steps
         and report["split_steps"] == steps
         and report["resume_exact"]
+        and report["resume_step"] == steps + 1
         and report["memory_modes"] == ["off", "on"]
         and report["pairs_complete"]
+        and report["fixture_unchanged"]
+        and report["profile"] == "smoke"
+        and report["scientific_result"] is False
     ):
         raise AssertionError(f"local relational smoke failed: {report}")
     (root / "smoke-report.json").write_text(
@@ -272,12 +295,13 @@ def run_smoke(
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
-        description="Run the deterministic two-step relational CPU smoke."
+        description="Run two-step CPU smoke directly from packaged current bytes."
     )
     parser.add_argument("--out", default="outputs/relational-smoke")
+    parser.add_argument("--fixture", default=str(_DEFAULT_FIXTURE))
     parser.add_argument("--device", default="cpu", choices=["cpu"])
     args = parser.parse_args(argv)
-    report = run_smoke(args.out, device=args.device)
+    report = run_smoke(args.out, fixture=args.fixture, device=args.device)
     print(json.dumps(report, sort_keys=True))
     return 0
 

@@ -2,7 +2,7 @@
 
 Special token ids are frozen (see plan, Global Constraints):
     <|db_start|>=50257  <|db_retrieve|>=50258  <|db_end|>=50259  <|eot|>=50260
-Graph-control token ids occupy the reserved range 50261-50291.
+Graph-control token ids occupy the reserved range 50261-50295.
 Vocab is padded to 50304 (multiple of 64) at the model level.
 
 `encode_segments` encodes each segment independently so masked spans map
@@ -73,6 +73,10 @@ GRAPH_SPECIAL_TOKENS = {
     "<|answer_state|>": 50274,
     "<|graph_miss|>": 50275,
     **{f"<|rel_{i}|>": 50276 + i for i in range(16)},
+    "<|relation_start|>": 50292,
+    "<|relation_end|>": 50293,
+    "<|page_start|>": 50294,
+    "<|page_end|>": 50295,
 }
 SPECIAL_TOKENS = {**DB_SPECIAL_TOKENS, **GRAPH_SPECIAL_TOKENS}
 
@@ -106,6 +110,10 @@ class Tok:
         self.GRAPH_MISS = GRAPH_SPECIAL_TOKENS["<|graph_miss|>"]
         self.DIR_OUT = GRAPH_SPECIAL_TOKENS["<|dir_out|>"]
         self.DIR_IN = GRAPH_SPECIAL_TOKENS["<|dir_in|>"]
+        self.RELATION_START = GRAPH_SPECIAL_TOKENS["<|relation_start|>"]
+        self.RELATION_END = GRAPH_SPECIAL_TOKENS["<|relation_end|>"]
+        self.PAGE_START = GRAPH_SPECIAL_TOKENS["<|page_start|>"]
+        self.PAGE_END = GRAPH_SPECIAL_TOKENS["<|page_end|>"]
         self.SLOTS = tuple(GRAPH_SPECIAL_TOKENS[f"<|slot_{i}|>"] for i in range(4))
         self.RELATIONS = {
             f"r{i}": GRAPH_SPECIAL_TOKENS[f"<|rel_{i}|>"] for i in range(16)

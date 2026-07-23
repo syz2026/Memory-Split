@@ -13,7 +13,15 @@ Stubs mirror tests/test_generate.py:
 
 import torch
 
-from evals.constrain import QueryTrie, QueryWalker, build_query_tries, extract_spans
+from corpusgen.graph_records import GraphAction
+from corpusgen.graph_trace import serialize_action
+from evals.constrain import (
+    GraphActionTrie,
+    QueryTrie,
+    QueryWalker,
+    build_query_tries,
+    extract_spans,
+)
 from evals.generate import generate_batch_with_stats
 from organizer.store import Organizer
 from train.tokenizer import get_tok
@@ -469,3 +477,21 @@ def test_constrained_cap_hit_resets_walker_to_root():
     used = trie.last_walker
     assert used is not None
     assert set(used.allowed()) == root_allowed
+
+
+def test_graph_action_trie_constrains_arbitrary_pid_and_exact_page():
+    actions = [
+        GraphAction(0, "P31", "out", True, False, page=0),
+        GraphAction(0, "P31", "out", True, False, page=1),
+        GraphAction(1, "P999999", "in", True, False, page=7),
+    ]
+    trie = GraphActionTrie(TOK, actions)
+    selected = serialize_action(actions[-1], TOK)
+    walker = trie.walker()
+
+    for token_id in selected:
+        assert token_id in walker.allowed()
+        walker.advance(token_id)
+
+    assert walker.complete
+    assert walker.value == actions[-1]

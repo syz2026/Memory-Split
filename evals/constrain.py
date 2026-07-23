@@ -14,6 +14,9 @@ leading space (see corpusgen/records.py::lookup_segments).
 
 from __future__ import annotations
 
+from corpusgen.graph_records import GraphAction
+from corpusgen.graph_trace import serialize_action
+
 _PUNCT = ".,?!:;'\"()[]"
 _MAX_SPAN_CHARS = 60
 
@@ -150,3 +153,59 @@ class QueryWalker:
 def build_query_tries(prompts: list[str], relations: list[str], tok) -> list[QueryTrie]:
     """One trie per prompt, built from that prompt's spans only."""
     return [QueryTrie(tok, extract_spans(p), relations) for p in prompts]
+
+
+class _ActionNode:
+    __slots__ = ("children", "value")
+
+    def __init__(self) -> None:
+        self.children: dict[int, _ActionNode] = {}
+        self.value: GraphAction | None = None
+
+
+class GraphActionTrie:
+    """Token trie for finite page-aware graph-action candidates."""
+
+    def __init__(self, tok, actions) -> None:
+        self._root = _ActionNode()
+        saw_action = False
+        for action in actions:
+            if not isinstance(action, GraphAction):
+                raise TypeError("graph action candidates must be GraphAction values")
+            saw_action = True
+            node = self._root
+            for token_id in serialize_action(action, tok):
+                node = node.children.setdefault(token_id, _ActionNode())
+            if node.value is not None and node.value != action:
+                raise ValueError("graph actions have ambiguous token serialization")
+            node.value = action
+        if not saw_action:
+            raise ValueError("graph action trie requires at least one candidate")
+
+    def walker(self) -> "GraphActionWalker":
+        return GraphActionWalker(self)
+
+
+class GraphActionWalker:
+    def __init__(self, trie: GraphActionTrie) -> None:
+        self._trie = trie
+        self._node = trie._root
+
+    def allowed(self) -> list[int]:
+        return list(self._node.children)
+
+    def advance(self, token_id: int) -> None:
+        child = self._node.children.get(int(token_id))
+        if child is None:
+            raise ValueError("token is not allowed by the graph action trie")
+        self._node = child
+
+    @property
+    def complete(self) -> bool:
+        return self._node.value is not None
+
+    @property
+    def value(self) -> GraphAction:
+        if self._node.value is None:
+            raise ValueError("graph action trie walk is incomplete")
+        return self._node.value

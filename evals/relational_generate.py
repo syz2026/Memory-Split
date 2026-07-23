@@ -14,15 +14,21 @@ from typing import Callable, Iterable
 import torch
 
 from corpusgen.graph_records import GraphAction, GraphAddress, GraphRow
-from corpusgen.graph_trace import serialize_action, serialize_return
+from corpusgen.graph_trace import (
+    parse_serialized_action,
+    serialize_action,
+    serialize_return,
+)
+from evals.constrain import GraphActionTrie
 from organizer.graph_store import AtomicGraphStore
 
-N_GRAPH_STEPS = 6
+N_GRAPH_STEPS = 12
+MAX_GRAPH_READS = 10
 
 
 @dataclass
 class GraphDecodeState:
-    slots: list[int | None]
+    slots: list[int | str | None]
     actions: list[GraphAction] = field(default_factory=list)
     rows: list[GraphRow | None] = field(default_factory=list)
     provisional_answers: list[str] = field(default_factory=list)
@@ -32,8 +38,21 @@ class GraphDecodeState:
     def __post_init__(self) -> None:
         if len(self.slots) != 4:
             raise ValueError("exactly four working slots are required")
-        if any(slot is not None and slot < 0 for slot in self.slots):
-            raise ValueError("working slots must contain non-negative entity ids")
+        if any(
+            isinstance(slot, bool)
+            or (
+                slot is not None
+                and (
+                    not isinstance(slot, (int, str))
+                    or (isinstance(slot, int) and slot < 0)
+                    or (isinstance(slot, str) and not slot)
+                )
+            )
+            for slot in self.slots
+        ):
+            raise ValueError(
+                "working slots must contain canonical non-negative entity ids"
+            )
 
 
 class OverlayStore:
@@ -69,6 +88,9 @@ class OverlayStore:
             for row in self.base.rows()
         )
 
+    def addresses_for(self, source_id) -> tuple[GraphAddress, ...]:
+        return self.base.addresses_for(source_id)
+
     def reset_counters(self) -> None:
         self.hits = 0
         self.misses = 0
@@ -78,36 +100,7 @@ class OverlayStore:
 
 
 def parse_action(ids: Iterable[int], tok) -> GraphAction:
-    values = [int(value) for value in ids]
-    if len(values) != 6:
-        raise ValueError("graph actions require six tokens")
-    if values[0] != tok.GRAPH_START or values[-1] != tok.GRAPH_END:
-        raise ValueError("invalid graph action frame")
-    try:
-        source_slot = tok.SLOTS.index(values[1])
-        relation_id = next(
-            name
-            for name, token_id in tok.RELATIONS.items()
-            if token_id == values[2]
-        )
-    except (ValueError, StopIteration) as error:
-        raise ValueError("invalid slot or relation token") from error
-    if values[3] == tok.DIR_OUT:
-        direction = "out"
-    elif values[3] == tok.DIR_IN:
-        direction = "in"
-    else:
-        raise ValueError("invalid direction token")
-    terminal = values[4]
-    if terminal not in (tok.GRAPH_READ, tok.GRAPH_NOOP, tok.GRAPH_HALT):
-        raise ValueError("invalid graph terminal token")
-    return GraphAction(
-        source_slot=source_slot,
-        relation_id=relation_id,
-        direction=direction,
-        read=terminal == tok.GRAPH_READ,
-        halt=terminal == tok.GRAPH_HALT,
-    )
+    return parse_serialized_action(ids, tok)
 
 
 def apply_action(
@@ -117,6 +110,8 @@ def apply_action(
 ) -> GraphRow | None:
     """Apply one model-selected action; ``store=None`` is memory OFF."""
 
+    if action.read and sum(existing.read for existing in state.actions) >= MAX_GRAPH_READS:
+        raise ValueError("at most ten graph reads are permitted")
     state.actions.append(action)
     if action.halt:
         if state.halt_step is None:
@@ -133,17 +128,25 @@ def apply_action(
         state.rows.append(None)
         return None
     row = store.lookup(
-        GraphAddress(source_id, action.relation_id, action.direction)
+        GraphAddress(
+            source_id,
+            action.relation_id,
+            action.direction,
+            action.page,
+        )
     )
     if row is None:
         state.misses += 1
-    elif row.target_kind == "entity":
-        try:
-            target_id = int(row.target)
-        except ValueError as error:
-            raise ValueError("entity graph targets must be integer ids") from error
-        if target_id < 0:
+    elif row.target_kind == "entity" and len(row.values) == 1:
+        target = row.target
+        if target.isascii() and target.isdigit():
+            target_id: int | str = int(target)
+        else:
+            target_id = target
+        if isinstance(target_id, int) and target_id < 0:
             raise ValueError("entity graph targets must be non-negative")
+        if isinstance(target_id, str) and not target_id:
+            raise ValueError("entity graph targets must be non-empty")
         state.slots[action.source_slot] = target_id
     state.rows.append(row)
     return row
@@ -207,6 +210,86 @@ def _generate_action(model, logits, cache, tok, device: torch.device):
         ids.append(token_id)
         logits, cache = _step_token(model, token_id, cache, device)
     return parse_action(ids, tok), logits, cache
+
+
+def _page_aware_action_candidates(
+    state: GraphDecodeState,
+    item,
+    store: AtomicGraphStore | OverlayStore | None,
+    tok,
+) -> tuple[GraphAction, ...]:
+    candidates: set[GraphAction] = set()
+    if store is not None:
+        addresses_for = getattr(store, "addresses_for", None)
+        if callable(addresses_for):
+            for source_slot, source_id in enumerate(state.slots):
+                if source_id is None:
+                    continue
+                for address in addresses_for(source_id):
+                    candidates.add(
+                        GraphAction(
+                            source_slot,
+                            address.relation_id,
+                            address.direction,
+                            True,
+                            False,
+                            page=address.page,
+                        )
+                    )
+    raw_actions = _item_meta(item).get("gold_actions")
+    if isinstance(raw_actions, list):
+        for raw in raw_actions:
+            if not isinstance(raw, dict):
+                continue
+            try:
+                action = GraphAction(**raw)
+            except (TypeError, ValueError):
+                continue
+            if action.read:
+                candidates.add(action)
+    if not any(
+        action.relation_id not in tok.RELATIONS or action.page
+        for action in candidates
+    ):
+        return ()
+    candidates.add(_canonical_noop())
+    candidates.add(GraphAction(0, "r0", "out", False, True))
+    return tuple(
+        sorted(
+            candidates,
+            key=lambda action: (
+                action.source_slot,
+                action.relation_id,
+                action.direction,
+                action.page,
+                action.halt,
+                action.read,
+            ),
+        )
+    )
+
+
+def _generate_page_aware_action(
+    model,
+    logits,
+    cache,
+    tok,
+    device: torch.device,
+    candidates: tuple[GraphAction, ...],
+):
+    del logits
+    walker = GraphActionTrie(tok, candidates).walker()
+    allowed = walker.allowed()
+    if allowed != [tok.GRAPH_START]:
+        raise AssertionError("every graph action candidate must share fixed framing")
+    token_id = tok.GRAPH_START
+    walker.advance(token_id)
+    logits, cache = _step_token(model, token_id, cache, device)
+    while not walker.complete:
+        token_id = _choose(logits, walker.allowed())
+        walker.advance(token_id)
+        logits, cache = _step_token(model, token_id, cache, device)
+    return walker.value, logits, cache
 
 
 def _encoded_answer_choices(item, tok) -> tuple[tuple[int, ...], ...]:
@@ -275,6 +358,33 @@ def _canonical_noop() -> GraphAction:
     )
 
 
+def _action_slot_count(item) -> int:
+    meta = _item_meta(item)
+    configured = meta.get("action_slots")
+    if configured is None:
+        legacy_actions = meta.get("gold_actions")
+        configured = (
+            len(legacy_actions)
+            if isinstance(legacy_actions, list) and legacy_actions
+            else N_GRAPH_STEPS
+        )
+    if (
+        isinstance(configured, bool)
+        or not isinstance(configured, int)
+        or not 1 <= configured <= N_GRAPH_STEPS
+    ):
+        raise ValueError("action_slots must be in [1, 12]")
+    return configured
+
+
+def _canonical_slot(value):
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, (int, str)):
+        raise ValueError("entity slots require integer or canonical text identities")
+    return value
+
+
 def _decode_prefilled(
     model,
     tok,
@@ -289,16 +399,38 @@ def _decode_prefilled(
     if not isinstance(slots, list):
         raise ValueError("entity_slots must be a list")
     state = GraphDecodeState(
-        [None if value is None else int(value) for value in slots]
+        [_canonical_slot(value) for value in slots]
     )
     choices = _encoded_answer_choices(item, tok)
 
     with torch.no_grad():
-        for _ in range(N_GRAPH_STEPS):
+        for _ in range(_action_slot_count(item)):
             if state.halt_step is None:
-                action, logits, cache = _generate_action(
-                    model, logits, cache, tok, device
-                )
+                if sum(action.read for action in state.actions) >= MAX_GRAPH_READS:
+                    candidates = (
+                        _canonical_noop(),
+                        GraphAction(0, "r0", "out", False, True),
+                    )
+                else:
+                    candidates = _page_aware_action_candidates(
+                        state,
+                        item,
+                        store,
+                        tok,
+                    )
+                if candidates:
+                    action, logits, cache = _generate_page_aware_action(
+                        model,
+                        logits,
+                        cache,
+                        tok,
+                        device,
+                        candidates,
+                    )
+                else:
+                    action, logits, cache = _generate_action(
+                        model, logits, cache, tok, device
+                    )
             else:
                 action = _canonical_noop()
                 action_ids = serialize_action(action, tok)
@@ -403,11 +535,18 @@ def _batch_actions(
     for frame_position, allowed in enumerate(allowed_classes, 1):
         token_ids = []
         for row, state in enumerate(group.states):
-            token_id = (
-                noop_ids[frame_position]
-                if state.halt_step is not None
-                else _choose(logits[row], allowed)
-            )
+            if state.halt_step is not None:
+                token_id = noop_ids[frame_position]
+            elif (
+                frame_position == 4
+                and sum(action.read for action in state.actions) >= MAX_GRAPH_READS
+            ):
+                token_id = _choose(
+                    logits[row],
+                    (tok.GRAPH_NOOP, tok.GRAPH_HALT),
+                )
+            else:
+                token_id = _choose(logits[row], allowed)
             frames[row].append(token_id)
             token_ids.append(token_id)
         logits, cache = _batch_step_tokens(
@@ -593,6 +732,10 @@ def _decode_batch_prefilled(
     logits: torch.Tensor,
     cache,
 ) -> dict[int, GraphDecodeState]:
+    slot_counts = {_action_slot_count(item) for item in items}
+    if len(slot_counts) != 1:
+        raise ValueError("batched graph items must use the same action-slot count")
+    action_slots = next(iter(slot_counts))
     states = []
     choices = []
     for item in items:
@@ -601,7 +744,7 @@ def _decode_batch_prefilled(
             raise ValueError("entity_slots must be a list")
         states.append(
             GraphDecodeState(
-                [None if value is None else int(value) for value in slots]
+                [_canonical_slot(value) for value in slots]
             )
         )
         choices.append(_encoded_answer_choices(item, tok))
@@ -617,7 +760,7 @@ def _decode_batch_prefilled(
         )
     ]
     with torch.no_grad():
-        for _ in range(N_GRAPH_STEPS):
+        for _ in range(action_slots):
             next_groups = []
             for group in groups:
                 actions = _batch_actions(model, group, tok, device)
@@ -689,21 +832,46 @@ def decode_items(
     if not materialized:
         return []
     resolved_device = _resolve_device(model, device)
+    store_for_item: Callable = (
+        store if callable(store) else lambda _item: store
+    )
+    resolved_stores = [store_for_item(item) for item in materialized]
+    if any(
+        _page_aware_action_candidates(
+            GraphDecodeState(
+                [
+                    None if value is None else value
+                    for value in _item_meta(item)["entity_slots"]
+                ]
+            ),
+            item,
+            item_store,
+            tok,
+        )
+        for item, item_store in zip(materialized, resolved_stores)
+    ):
+        return [
+            decode_item(
+                model,
+                tok,
+                item,
+                item_store,
+                device=resolved_device,
+            )
+            for item, item_store in zip(materialized, resolved_stores)
+        ]
     encoded: list[list[int]] = []
-    buckets: dict[int, list[int]] = defaultdict(list)
+    buckets: dict[tuple[int, int], list[int]] = defaultdict(list)
     for index, item in enumerate(materialized):
         prompt_ids = tok.encode(str(_item_value(item, "prompt")))
         if not prompt_ids:
             raise ValueError("eval prompt must encode to at least one token")
         encoded.append(prompt_ids)
-        buckets[len(prompt_ids)].append(index)
+        buckets[(len(prompt_ids), _action_slot_count(item))].append(index)
 
-    store_for_item: Callable = (
-        store if callable(store) else lambda _item: store
-    )
     results: list[GraphDecodeState | None] = [None] * len(materialized)
-    for prompt_length in sorted(buckets):
-        indexes = buckets[prompt_length]
+    for bucket in sorted(buckets):
+        indexes = buckets[bucket]
         for start in range(0, len(indexes), batch_size):
             chunk_indexes = indexes[start : start + batch_size]
             prompt = torch.tensor(
@@ -718,7 +886,7 @@ def decode_items(
                 tok,
                 [materialized[index] for index in chunk_indexes],
                 [
-                    store_for_item(materialized[index])
+                    resolved_stores[index]
                     for index in chunk_indexes
                 ],
                 chunk_indexes,

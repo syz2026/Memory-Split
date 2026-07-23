@@ -130,3 +130,20 @@ def test_graph_special_token_ids_are_reserved_and_atomic():
     assert tok.RELATIONS["r15"] == 50291
     for text, token_id in tok.graph_special_tokens.items():
         assert tok.encode(text) == [token_id]
+
+
+def test_paged_identity_delimiters_use_reserved_ids_without_growing_vocab():
+    tok = get_tok()
+
+    assert tok.VOCAB_SIZE == 50_304
+    assert tok.RELATION_START == 50_292
+    assert tok.RELATION_END == 50_293
+    assert tok.PAGE_START == 50_294
+    assert tok.PAGE_END == 50_295
+    for text in (
+        "<|relation_start|>",
+        "<|relation_end|>",
+        "<|page_start|>",
+        "<|page_end|>",
+    ):
+        assert len(tok.encode(text)) == 1
