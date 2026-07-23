@@ -14,6 +14,7 @@ import re
 import stat
 import sys
 from typing import BinaryIO
+import unicodedata
 import zipfile
 
 import yaml
@@ -37,6 +38,41 @@ _SHA256 = re.compile(r"[0-9a-f]{64}")
 _COMMIT = re.compile(r"[0-9a-f]{40}")
 _OBJECT_ID = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})")
 _MAX_CONTROL_FILE_BYTES = 16 * 1024 * 1024
+_AWS_PROFILE_CONTRACT = {
+    "schema_version": 1,
+    "profile_id": AWS_PROVIDER,
+    "provider": AWS_PROVIDER,
+    "instance_type": "p5.48xlarge",
+    "purchase_model": "on_demand",
+    "cpu": {
+        "vcpus": 192,
+        "memory_gib": 2048,
+    },
+    "gpu": {
+        "model": "NVIDIA H100 80GB",
+        "allocated": 8,
+        "seed_train_groups": [4, 4],
+    },
+    "storage": {
+        "scratch_root": "/mnt/memorysplit",
+        "durable_uri_env": "MS_S3_ROOT",
+        "instance_store": {
+            "model": "Amazon EC2 NVMe Instance Storage",
+            "devices": 8,
+            "device_bytes": 3_840_000_000_000,
+            "raid_level": "0",
+        },
+    },
+    "runtime": {
+        "region_env": "AWS_REGION",
+        "ami_id_env": "MS_AWS_AMI_ID",
+        "container_digest_env": "MS_CONTAINER_DIGEST",
+        "runtime_uid_env": "MS_RUNTIME_UID",
+        "runtime_gid_env": "MS_RUNTIME_GID",
+    },
+    "assigned_seeds": [1, 2, 3, 4],
+    "process_env_allowlist": ["AWS_REGION", "LANG", "LC_ALL"],
+}
 
 
 class VerificationError(ValueError):
@@ -442,7 +478,7 @@ def _hash_stream(stream: BinaryIO) -> tuple[str, int]:
     return digest.hexdigest(), size
 
 
-def _safe_member_name(info: zipfile.ZipInfo) -> None:
+def _safe_member_name(info: zipfile.ZipInfo) -> str:
     name = info.filename
     if (
         not name
@@ -470,6 +506,40 @@ def _safe_member_name(info: zipfile.ZipInfo) -> None:
         raise VerificationError("ZIP member is not a regular file")
     if info.flag_bits & 0x1:
         raise VerificationError("encrypted ZIP members are forbidden")
+    return "/".join(unicodedata.normalize("NFC", part) for part in parts)
+
+
+@dataclass
+class _MemberTrieNode:
+    kind: str | None
+    children: dict[str, "_MemberTrieNode"]
+
+
+def _validate_member_topology(infos: list[zipfile.ZipInfo]) -> None:
+    root = _MemberTrieNode(kind="directory", children={})
+    for info in infos:
+        canonical = _safe_member_name(info)
+        parts = canonical.split("/")
+        node = root
+        for index, part in enumerate(parts):
+            if node.kind == "file":
+                raise VerificationError("ZIP member topology has a file collision")
+            child = node.children.setdefault(
+                part,
+                _MemberTrieNode(kind=None, children={}),
+            )
+            is_last = index == len(parts) - 1
+            if not is_last:
+                node = child
+                continue
+            kind = "directory" if info.is_dir() else "file"
+            if child.kind is not None:
+                raise VerificationError(
+                    "ZIP member topology has a normalized path collision"
+                )
+            if kind == "file" and child.children:
+                raise VerificationError("ZIP member topology has a file collision")
+            child.kind = kind
 
 
 def _member_bytes(
@@ -534,8 +604,7 @@ def _inspect_zip(
             names = [info.filename for info in infos]
             if len(names) != len(set(names)):
                 raise VerificationError("release ZIP contains duplicate members")
-            for info in infos:
-                _safe_member_name(info)
+            _validate_member_topology(infos)
             by_name = {info.filename: info for info in infos}
             if SUMS_PATH not in by_name or by_name[SUMS_PATH].is_dir():
                 raise VerificationError("release ZIP is missing SHA256SUMS")
@@ -630,6 +699,14 @@ def _inspect_zip(
                 path=profile_path,
             )
             if expected_provider == AWS_PROVIDER:
+                environment_path = str(metadata["environment"]["path"])
+                _environment_lock(
+                    _member_bytes(
+                        archive,
+                        by_name[environment_path],
+                        environment_path,
+                    )
+                )
                 _dataset_pointer(
                     _member_bytes(
                         archive,
@@ -681,6 +758,56 @@ def _provider_profile(
         raise VerificationError("provider profile provider is incorrect")
     if "profile_id" in value and value["profile_id"] != expected_provider:
         raise VerificationError("provider profile profile_id is incorrect")
+    if expected_provider == AWS_PROVIDER:
+        _exact_contract(
+            value,
+            _AWS_PROFILE_CONTRACT,
+            label="AWS P5 profile",
+        )
+
+
+def _exact_contract(value: object, expected: object, *, label: str) -> None:
+    if isinstance(expected, Mapping):
+        actual = _strict_object(
+            value,
+            frozenset(expected),
+            label,
+        )
+        for field, expected_value in expected.items():
+            _exact_contract(
+                actual[field],
+                expected_value,
+                label=f"{label}.{field}",
+            )
+        return
+    if isinstance(expected, list):
+        if not isinstance(value, list) or len(value) != len(expected):
+            raise VerificationError(f"{label} does not match the strict contract")
+        for index, (item, expected_item) in enumerate(
+            zip(value, expected, strict=True)
+        ):
+            _exact_contract(
+                item,
+                expected_item,
+                label=f"{label}[{index}]",
+            )
+        return
+    if type(value) is not type(expected) or value != expected:
+        raise VerificationError(f"{label} does not match the strict contract")
+
+
+def _environment_lock(content: bytes) -> None:
+    try:
+        text = content.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise VerificationError("AWS environment lock must be valid UTF-8") from error
+    substantive = [
+        line
+        for raw_line in text.splitlines()
+        if (line := raw_line.strip()) and not line.startswith("#")
+    ]
+    if not substantive:
+        raise VerificationError("AWS environment lock must be non-empty")
 
 
 def _dataset_pointer(content: bytes) -> None:
@@ -829,6 +956,7 @@ def _metadata(
                 "provider",
                 "source",
                 "profile_sha256",
+                "preregistration_sha256",
                 "environment_hashes",
                 "members",
                 "seed_assignment",
@@ -891,6 +1019,14 @@ def _metadata(
         profile_hash = _hash(value["profile_sha256"], "profile_sha256")
         if sums.get(profile_path) != profile_hash:
             raise VerificationError("profile_sha256 does not bind the provider profile")
+        preregistration_hash = _hash(
+            value["preregistration_sha256"],
+            "preregistration_sha256",
+        )
+        if sums.get(EVALUATION_IDENTITY_PATH) != preregistration_hash:
+            raise VerificationError(
+                "preregistration_sha256 does not bind the preregistration member"
+            )
         environments = value["environment_hashes"]
         if (
             not isinstance(environments, Mapping)
@@ -1195,7 +1331,9 @@ def _verify_release(
                 archive_fd,
                 f"{expected_provider} archive",
             )
-            with os.fdopen(archive_fd, "rb", closefd=True) as stream:
+            stream = os.fdopen(archive_fd, "rb", closefd=True)
+            archive_fd = -1
+            with stream:
                 before = os.fstat(stream.fileno())
                 archive_hash, archive_size = _hash_stream(stream)
                 after_hash = os.fstat(stream.fileno())
@@ -1236,9 +1374,9 @@ def _verify_release(
                     f"{expected_provider} archive",
                 )
                 return verified
-        except BaseException:
-            # os.fdopen owns archive_fd after successful construction.
-            raise
+        finally:
+            if archive_fd >= 0:
+                os.close(archive_fd)
     finally:
         os.close(parent_fd)
 
