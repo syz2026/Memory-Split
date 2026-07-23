@@ -78,6 +78,8 @@ class VerifiedObjectStore(Protocol):
         expected_sha256: str,
         deadline: float,
         monotonic: Callable[[], float],
+        wall_deadline: float | None = None,
+        wall_monotonic: Callable[[], float] = time.monotonic,
     ) -> UploadedObject | None: ...
 
 
@@ -274,9 +276,9 @@ class S3ObjectStore:
         expected_sha256: str,
         deadline: float,
         monotonic: Callable[[], float] = time.monotonic,
+        wall_deadline: float | None = None,
+        wall_monotonic: Callable[[], float] = time.monotonic,
     ) -> UploadedObject | None:
-        if path.is_symlink() or not path.is_file():
-            return None
         if (
             not isinstance(expected_sha256, str)
             or _SHA256_RE.fullmatch(expected_sha256) is None
@@ -289,27 +291,40 @@ class S3ObjectStore:
             or monotonic() >= float(deadline)
         ):
             return None
+        if wall_deadline is None:
+            wall_deadline = wall_monotonic() + max(
+                0.0,
+                float(deadline) - monotonic(),
+            )
+        if wall_monotonic() >= wall_deadline:
+            return None
         bucket, key = _split_s3_uri(uri)
-        before = path.stat()
-        raw_digest = hashlib.sha256(path.read_bytes()).digest()
-        after_hash = path.stat()
+        hashed = _wait_for_io(
+            _ForkIoJob(lambda: _hash_file_sync(path)),
+            deadline=deadline,
+            monotonic=monotonic,
+            wall_deadline=wall_deadline,
+            wall_monotonic=wall_monotonic,
+        )
         if (
-            before.st_ino,
-            before.st_dev,
-            before.st_size,
-            before.st_mtime_ns,
-        ) != (
-            after_hash.st_ino,
-            after_hash.st_dev,
-            after_hash.st_size,
-            after_hash.st_mtime_ns,
+            not isinstance(hashed, dict)
+            or set(hashed) != {"bytes", "sha256"}
+            or type(hashed["bytes"]) is not int
+            or not isinstance(hashed["sha256"], str)
         ):
             return None
-        digest = raw_digest.hex()
+        digest = hashed["sha256"]
+        size = hashed["bytes"]
         if digest != expected_sha256:
             return None
+        raw_digest = bytes.fromhex(digest)
         checksum = base64.b64encode(raw_digest).decode("ascii")
-        remaining = float(deadline) - monotonic()
+        remaining = _remaining_seconds(
+            deadline=deadline,
+            monotonic=monotonic,
+            wall_deadline=wall_deadline,
+            wall_monotonic=wall_monotonic,
+        )
         if remaining <= 0:
             return None
         put = None
@@ -348,20 +363,12 @@ class S3ObjectStore:
             put_value = _load_json_output(put)
             if put_value is None or put_value.get("ChecksumSHA256") != checksum:
                 return None
-        after_upload = path.stat()
-        if (
-            before.st_ino,
-            before.st_dev,
-            before.st_size,
-            before.st_mtime_ns,
-        ) != (
-            after_upload.st_ino,
-            after_upload.st_dev,
-            after_upload.st_size,
-            after_upload.st_mtime_ns,
-        ):
-            return None
-        remaining = float(deadline) - monotonic()
+        remaining = _remaining_seconds(
+            deadline=deadline,
+            monotonic=monotonic,
+            wall_deadline=wall_deadline,
+            wall_monotonic=wall_monotonic,
+        )
         if remaining <= 0:
             return None
         try:
@@ -391,15 +398,21 @@ class S3ObjectStore:
         if (
             head_value is None
             or head_value.get("ChecksumSHA256") != checksum
-            or head_value.get("ContentLength") != before.st_size
+            or head_value.get("ContentLength") != size
             or head_value.get("Metadata") != {"sha256": digest}
-            or monotonic() >= float(deadline)
+            or _remaining_seconds(
+                deadline=deadline,
+                monotonic=monotonic,
+                wall_deadline=wall_deadline,
+                wall_monotonic=wall_monotonic,
+            )
+            <= 0
         ):
             return None
         return UploadedObject(
             uri=uri,
             sha256=digest,
-            bytes=before.st_size,
+            bytes=size,
         )
 
 
@@ -416,6 +429,136 @@ def _canonical_json(value: object) -> bytes:
     ).encode("ascii")
 
 
+def _remaining_seconds(
+    *,
+    deadline: float,
+    monotonic: Callable[[], float],
+    wall_deadline: float,
+    wall_monotonic: Callable[[], float],
+) -> float:
+    return min(
+        float(deadline) - monotonic(),
+        float(wall_deadline) - wall_monotonic(),
+    )
+
+
+class _ForkIoJob:
+    """Run potentially blocking local I/O in one killable child process."""
+
+    def __init__(self, worker: Callable[[], object]) -> None:
+        if not hasattr(os, "fork"):
+            raise RuntimeError("bounded local I/O requires os.fork")
+        read_fd, write_fd = os.pipe()
+        pid = os.fork()
+        if pid == 0:
+            os.close(read_fd)
+            try:
+                try:
+                    result = worker()
+                    envelope = {"ok": True, "result": result}
+                except BaseException:
+                    envelope = {"ok": False, "result": None}
+                payload = _canonical_json(envelope)
+                offset = 0
+                while offset < len(payload):
+                    offset += os.write(write_fd, payload[offset:])
+            finally:
+                os.close(write_fd)
+                os._exit(0)
+        os.close(write_fd)
+        os.set_blocking(read_fd, False)
+        self._pid: int | None = pid
+        self._read_fd: int | None = read_fd
+        self._payload = bytearray()
+
+    def _drain(self) -> None:
+        if self._read_fd is None:
+            return
+        while True:
+            try:
+                chunk = os.read(self._read_fd, 65536)
+            except BlockingIOError:
+                return
+            if not chunk:
+                return
+            self._payload.extend(chunk)
+            if len(self._payload) > 65536:
+                return
+
+    def poll(self) -> tuple[bool, object | None]:
+        if self._pid is None:
+            return True, None
+        self._drain()
+        waited, status = os.waitpid(self._pid, os.WNOHANG)
+        if waited == 0:
+            return False, None
+        self._pid = None
+        self._drain()
+        if self._read_fd is not None:
+            os.close(self._read_fd)
+            self._read_fd = None
+        if (
+            not os.WIFEXITED(status)
+            or os.WEXITSTATUS(status) != 0
+            or len(self._payload) > 65536
+        ):
+            return True, None
+        try:
+            envelope = json.loads(bytes(self._payload).decode("ascii"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            return True, None
+        if (
+            not isinstance(envelope, dict)
+            or set(envelope) != {"ok", "result"}
+            or envelope["ok"] is not True
+        ):
+            return True, None
+        return True, envelope["result"]
+
+    def cancel(self) -> None:
+        if self._pid is not None:
+            try:
+                os.kill(self._pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            while True:
+                try:
+                    os.waitpid(self._pid, 0)
+                    break
+                except InterruptedError:
+                    continue
+                except ChildProcessError:
+                    break
+            self._pid = None
+        if self._read_fd is not None:
+            os.close(self._read_fd)
+            self._read_fd = None
+
+
+def _wait_for_io(
+    job: _ForkIoJob,
+    *,
+    deadline: float,
+    monotonic: Callable[[], float],
+    wall_deadline: float,
+    wall_monotonic: Callable[[], float],
+) -> object | None:
+    while True:
+        complete, result = job.poll()
+        if complete:
+            return result
+        remaining = _remaining_seconds(
+            deadline=deadline,
+            monotonic=monotonic,
+            wall_deadline=wall_deadline,
+            wall_monotonic=wall_monotonic,
+        )
+        if remaining <= 0:
+            job.cancel()
+            return None
+        time.sleep(min(0.01, remaining))
+
+
 def _identity(metadata: os.stat_result) -> _FileIdentity:
     return _FileIdentity(
         device=metadata.st_dev,
@@ -428,6 +571,31 @@ def _identity(metadata: os.stat_result) -> _FileIdentity:
         uid=metadata.st_uid,
         gid=metadata.st_gid,
     )
+
+
+def _hash_file_sync(path: Path) -> dict[str, object] | None:
+    descriptor = _open_checkpoint(path)
+    if descriptor is None:
+        return None
+    try:
+        before = _identity(os.fstat(descriptor))
+        digest = hashlib.sha256()
+        total = 0
+        while True:
+            chunk = os.read(descriptor, 1 << 20)
+            if not chunk:
+                break
+            digest.update(chunk)
+            total += len(chunk)
+        after = _identity(os.fstat(descriptor))
+        if before != after or total != before.size:
+            return None
+        return {
+            "bytes": total,
+            "sha256": digest.hexdigest(),
+        }
+    finally:
+        os.close(descriptor)
 
 
 def _open_checkpoint(path: Path) -> int | None:
@@ -521,6 +689,65 @@ def _stage_checkpoint(
         temporary.unlink(missing_ok=True)
 
 
+def _stage_job(
+    arm: str,
+    source: Path,
+    expected: _FileIdentity,
+    staging: Path,
+) -> _ForkIoJob:
+    def worker() -> object:
+        pinned = _stage_checkpoint(arm, source, expected, staging)
+        if pinned is None:
+            return None
+        return {
+            "arm": pinned.arm,
+            "bytes": pinned.bytes,
+            "identity": dict(pinned.identity.__dict__),
+            "path": str(pinned.path),
+            "sha256": pinned.sha256,
+        }
+
+    return _ForkIoJob(worker)
+
+
+def _pinned_result(
+    arm: str,
+    value: object,
+    staging: Path,
+) -> _PinnedCheckpoint | None:
+    if not isinstance(value, dict) or set(value) != {
+        "arm",
+        "bytes",
+        "identity",
+        "path",
+        "sha256",
+    }:
+        return None
+    identity_value = value["identity"]
+    if (
+        value["arm"] != arm
+        or type(value["bytes"]) is not int
+        or value["bytes"] <= 0
+        or not isinstance(value["sha256"], str)
+        or _SHA256_RE.fullmatch(value["sha256"]) is None
+        or not isinstance(identity_value, dict)
+        or set(identity_value) != set(_FileIdentity.__dataclass_fields__)
+        or any(type(item) is not int for item in identity_value.values())
+    ):
+        return None
+    path = Path(str(value["path"]))
+    expected_path = staging / f"{arm}-{value['sha256']}.pt"
+    if path != expected_path:
+        return None
+    return _PinnedCheckpoint(
+        arm=arm,
+        path=path,
+        bytes=value["bytes"],
+        sha256=value["sha256"],
+        identity=_FileIdentity(**identity_value),
+    )
+
+
 def _stabilize_checkpoints(
     request: InterruptionRequest,
     *,
@@ -528,44 +755,68 @@ def _stabilize_checkpoints(
     staging: Path,
     deadline: float,
     monotonic: Callable[[], float],
+    wall_deadline: float,
+    wall_monotonic: Callable[[], float],
     sleep: Callable[[float], None],
 ) -> dict[str, _PinnedCheckpoint | None]:
     previous: dict[str, _FileIdentity | None] = {arm: None for arm in _ARMS}
     resolved: dict[str, _PinnedCheckpoint | None] = {
         arm: None for arm in _ARMS
     }
-    while monotonic() <= deadline and any(
-        resolved[arm] is None for arm in _ARMS
-    ):
-        for arm in _ARMS:
-            if resolved[arm] is not None:
-                continue
-            current = _checkpoint_identity(request.checkpoint_paths[arm])
-            if (
-                current is None
-                or current.size <= 0
-                or not _generation_changed(baselines[arm], current)
-            ):
-                previous[arm] = None
-                continue
-            if previous[arm] == current:
-                resolved[arm] = _stage_checkpoint(
-                    arm,
-                    request.checkpoint_paths[arm],
-                    current,
-                    staging,
-                )
+    jobs: dict[str, _ForkIoJob] = {}
+    try:
+        while _remaining_seconds(
+            deadline=deadline,
+            monotonic=monotonic,
+            wall_deadline=wall_deadline,
+            wall_monotonic=wall_monotonic,
+        ) > 0 and any(resolved[arm] is None for arm in _ARMS):
+            for arm in tuple(jobs):
+                complete, value = jobs[arm].poll()
+                if not complete:
+                    continue
+                del jobs[arm]
+                resolved[arm] = _pinned_result(arm, value, staging)
                 if resolved[arm] is None:
                     previous[arm] = None
-            else:
-                previous[arm] = current
-        if all(resolved[arm] is not None for arm in _ARMS):
-            break
-        remaining = deadline - monotonic()
-        if remaining <= 0:
-            break
-        sleep(min(0.25, remaining))
-    return resolved
+            for arm in _ARMS:
+                if resolved[arm] is not None or arm in jobs:
+                    continue
+                current = _checkpoint_identity(request.checkpoint_paths[arm])
+                if (
+                    current is None
+                    or current.size <= 0
+                    or not _generation_changed(baselines[arm], current)
+                ):
+                    previous[arm] = None
+                    continue
+                if previous[arm] == current:
+                    jobs[arm] = _stage_job(
+                        arm,
+                        request.checkpoint_paths[arm],
+                        current,
+                        staging,
+                    )
+                else:
+                    previous[arm] = current
+            if all(resolved[arm] is not None for arm in _ARMS):
+                break
+            remaining = _remaining_seconds(
+                deadline=deadline,
+                monotonic=monotonic,
+                wall_deadline=wall_deadline,
+                wall_monotonic=wall_monotonic,
+            )
+            if remaining <= 0:
+                break
+            sleep(min(0.01, remaining))
+            # Yield to both killable staging workers even when tests inject a
+            # logical clock whose sleep does not block the host scheduler.
+            time.sleep(min(0.001, remaining))
+        return resolved
+    finally:
+        for job in jobs.values():
+            job.cancel()
 
 
 def _checkpoint_uri(
@@ -599,8 +850,15 @@ def _write_immutable_json(
     *,
     deadline: float,
     monotonic: Callable[[], float],
+    wall_deadline: float,
+    wall_monotonic: Callable[[], float],
 ) -> tuple[bytes, str] | None:
-    if monotonic() >= deadline:
+    if _remaining_seconds(
+        deadline=deadline,
+        monotonic=monotonic,
+        wall_deadline=wall_deadline,
+        wall_monotonic=wall_monotonic,
+    ) <= 0:
         return None
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     if path.exists() or path.is_symlink():
@@ -616,7 +874,12 @@ def _write_immutable_json(
         os.fsync(directory_fd)
     finally:
         os.close(directory_fd)
-    if monotonic() >= deadline:
+    if _remaining_seconds(
+        deadline=deadline,
+        monotonic=monotonic,
+        wall_deadline=wall_deadline,
+        wall_monotonic=wall_monotonic,
+    ) <= 0:
         return None
     return payload, hashlib.sha256(payload).hexdigest()
 
@@ -627,8 +890,20 @@ def _publish_local_handoff(
     *,
     deadline: float,
     monotonic: Callable[[], float],
+    wall_deadline: float,
+    wall_monotonic: Callable[[], float],
 ) -> bool:
-    if monotonic() >= deadline or destination.exists() or destination.is_symlink():
+    if (
+        _remaining_seconds(
+            deadline=deadline,
+            monotonic=monotonic,
+            wall_deadline=wall_deadline,
+            wall_monotonic=wall_monotonic,
+        )
+        <= 0
+        or destination.exists()
+        or destination.is_symlink()
+    ):
         return False
     destination.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     try:
@@ -640,7 +915,12 @@ def _publish_local_handoff(
         os.fsync(directory_fd)
     finally:
         os.close(directory_fd)
-    if monotonic() >= deadline:
+    if _remaining_seconds(
+        deadline=deadline,
+        monotonic=monotonic,
+        wall_deadline=wall_deadline,
+        wall_monotonic=wall_monotonic,
+    ) <= 0:
         destination.unlink(missing_ok=True)
         return False
     return True
@@ -667,14 +947,20 @@ def handle_interruption(
     signal_process: Callable[[int, int], None] = os.kill,
     object_store: VerifiedObjectStore,
     monotonic: Callable[[], float] = time.monotonic,
+    wall_monotonic: Callable[[], float] = time.monotonic,
     sleep: Callable[[float], None] = time.sleep,
     commit_nonce: Callable[[], str] = lambda: secrets.token_hex(16),
 ) -> InterruptionResult:
     """Publish immutable evidence and one verified resume-commit handoff."""
 
     start = monotonic()
+    wall_start = wall_monotonic()
     deadline = start + float(request.timeout_seconds)
+    wall_deadline = wall_start + float(request.timeout_seconds)
     checkpoint_deadline = deadline - float(request.upload_reserve_seconds)
+    checkpoint_wall_deadline = wall_deadline - float(
+        request.upload_reserve_seconds
+    )
     if os.path.lexists(request.receipt_path):
         raise ValueError("immutable interruption handoff already exists")
     baselines = {
@@ -701,6 +987,8 @@ def handle_interruption(
             staging=staging,
             deadline=checkpoint_deadline,
             monotonic=monotonic,
+            wall_deadline=checkpoint_wall_deadline,
+            wall_monotonic=wall_monotonic,
             sleep=sleep,
         )
         checkpoint_rows = []
@@ -713,13 +1001,20 @@ def handle_interruption(
                 if pinned is None
                 else _checkpoint_uri(request, arm, pinned.sha256)
             )
-            if pinned is not None and monotonic() < deadline:
+            if pinned is not None and _remaining_seconds(
+                deadline=deadline,
+                monotonic=monotonic,
+                wall_deadline=wall_deadline,
+                wall_monotonic=wall_monotonic,
+            ) > 0:
                 uploaded = object_store.put_verified(
                     pinned.path,
                     checkpoint_uri,
                     expected_sha256=pinned.sha256,
                     deadline=deadline,
                     monotonic=monotonic,
+                    wall_deadline=wall_deadline,
+                    wall_monotonic=wall_monotonic,
                 )
             if (
                 pinned is None
@@ -750,9 +1045,20 @@ def handle_interruption(
             )
 
         deadline_exhausted = (
-            monotonic() >= checkpoint_deadline
+            _remaining_seconds(
+                deadline=checkpoint_deadline,
+                monotonic=monotonic,
+                wall_deadline=checkpoint_wall_deadline,
+                wall_monotonic=wall_monotonic,
+            )
+            <= 0
             and any(stable[arm] is None for arm in _ARMS)
-        ) or monotonic() >= deadline
+        ) or _remaining_seconds(
+            deadline=deadline,
+            monotonic=monotonic,
+            wall_deadline=wall_deadline,
+            wall_monotonic=wall_monotonic,
+        ) <= 0
         candidate = {
             "checkpoints": checkpoint_rows,
             "code_commit": request.code_commit,
@@ -773,6 +1079,8 @@ def handle_interruption(
             candidate,
             deadline=deadline,
             monotonic=monotonic,
+            wall_deadline=wall_deadline,
+            wall_monotonic=wall_monotonic,
         )
         candidate_uploaded = None
         candidate_digest = None
@@ -786,6 +1094,8 @@ def handle_interruption(
                 expected_sha256=candidate_digest,
                 deadline=deadline,
                 monotonic=monotonic,
+                wall_deadline=wall_deadline,
+                wall_monotonic=wall_monotonic,
             )
 
         marker_path = staging / "commit.json"
@@ -800,7 +1110,13 @@ def handle_interruption(
             and candidate_uploaded.uri == candidate_uri
             and candidate_uploaded.sha256 == candidate_digest
             and candidate_uploaded.bytes == len(_candidate_bytes)
-            and monotonic() < deadline
+            and _remaining_seconds(
+                deadline=deadline,
+                monotonic=monotonic,
+                wall_deadline=wall_deadline,
+                wall_monotonic=wall_monotonic,
+            )
+            > 0
         ):
             nonce = commit_nonce()
             if (
@@ -825,6 +1141,8 @@ def handle_interruption(
                 marker,
                 deadline=deadline,
                 monotonic=monotonic,
+                wall_deadline=wall_deadline,
+                wall_monotonic=wall_monotonic,
             )
             if marker_written is not None:
                 marker_bytes, marker_digest = marker_written
@@ -835,6 +1153,8 @@ def handle_interruption(
                     expected_sha256=marker_digest,
                     deadline=deadline,
                     monotonic=monotonic,
+                    wall_deadline=wall_deadline,
+                    wall_monotonic=wall_monotonic,
                 )
 
         resumable = (
@@ -844,12 +1164,14 @@ def handle_interruption(
             and marker_bytes is not None
             and marker_uploaded.bytes == len(marker_bytes)
             and marker_digest
-            == hashlib.sha256(marker_path.read_bytes()).hexdigest()
+            == hashlib.sha256(marker_bytes).hexdigest()
             and _publish_local_handoff(
                 marker_path,
                 request.receipt_path,
                 deadline=deadline,
                 monotonic=monotonic,
+                wall_deadline=wall_deadline,
+                wall_monotonic=wall_monotonic,
             )
         )
         if not resumable and candidate_written is not None:
@@ -858,6 +1180,8 @@ def handle_interruption(
                 request.receipt_path,
                 deadline=deadline,
                 monotonic=monotonic,
+                wall_deadline=wall_deadline,
+                wall_monotonic=wall_monotonic,
             )
 
     return InterruptionResult(

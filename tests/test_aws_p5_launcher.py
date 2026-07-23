@@ -1257,8 +1257,16 @@ def test_supervisor_preflights_both_output_directories_before_spawning(tmp_path)
 def test_supervisor_propagates_failure_and_terminates_peer(tmp_path):
     fixture = _launcher_fixture(tmp_path)
     plan = _load_fixture_plan(fixture)
-    dense = _FakeProcess(101, [7])
-    split90 = _FakeProcess(202, [None])
+    dense = _FakeProcess(
+        101,
+        [7],
+        stop_leaves_container_running=True,
+    )
+    split90 = _FakeProcess(
+        202,
+        [None],
+        stop_leaves_container_running=True,
+    )
     spawner = _FakeSpawner({"dense": dense, "split90": split90})
 
     result = supervise_pair(
@@ -1274,6 +1282,26 @@ def test_supervisor_propagates_failure_and_terminates_peer(tmp_path):
     assert result.failed_arm == "dense"
     assert result.peer_terminated is True
     assert split90.terminated is True
+    assert dense.container_events == ["stop", "verify", "kill", "verify"]
+    assert split90.container_events == ["stop", "verify", "kill", "verify"]
+
+
+def test_cleanup_processes_every_known_cid_after_clients_exit():
+    dense = _FakeProcess(
+        101,
+        [7],
+        stop_leaves_container_running=True,
+    )
+    split90 = _FakeProcess(
+        202,
+        [0],
+        stop_leaves_container_running=True,
+    )
+
+    launch_module._terminate_all((dense, split90))
+
+    assert dense.container_events == ["stop", "verify", "kill", "verify"]
+    assert split90.container_events == ["stop", "verify", "kill", "verify"]
 
 
 def test_supervisor_terminates_first_arm_when_second_spawn_fails(tmp_path):
@@ -1523,6 +1551,8 @@ class _FakeStore:
         expected_sha256: str,
         deadline=float("inf"),
         monotonic=time.monotonic,
+        wall_deadline=float("inf"),
+        wall_monotonic=time.monotonic,
     ):
         payload = path.read_bytes()
         digest = hashlib.sha256(payload).hexdigest()
@@ -1549,7 +1579,7 @@ class _FakeStore:
             assert path.stat().st_mode & 0o222 == 0
         if self.on_put is not None:
             self.on_put(path, uri)
-        if monotonic() >= deadline:
+        if monotonic() >= deadline or wall_monotonic() >= wall_deadline:
             return None
         if self.fail_contains is not None and self.fail_contains in uri:
             return None
@@ -1938,6 +1968,99 @@ class _Clock:
         self.now += delay
 
 
+def _short_interruption_request(
+    request: InterruptionRequest,
+    *,
+    timeout_seconds: float,
+    upload_reserve_seconds: float,
+) -> InterruptionRequest:
+    values = dict(request.__dict__)
+    values["timeout_seconds"] = timeout_seconds
+    values["upload_reserve_seconds"] = upload_reserve_seconds
+    return InterruptionRequest(**values)
+
+
+def test_checkpoint_staging_cannot_overrun_wall_deadline(
+    tmp_path,
+    monkeypatch,
+):
+    request = _short_interruption_request(
+        _interruption_request(tmp_path),
+        timeout_seconds=0.3,
+        upload_reserve_seconds=0.15,
+    )
+    original_stage = interruption_module._stage_checkpoint
+
+    def blocked_stage(*args, **kwargs):
+        time.sleep(1.0)
+        return original_stage(*args, **kwargs)
+
+    monkeypatch.setattr(interruption_module, "_stage_checkpoint", blocked_stage)
+
+    def signal_process(pid, _signal):
+        arm = {101: "dense", 202: "split90"}[pid]
+        _atomic_checkpoint(request.checkpoint_paths[arm], arm.encode())
+
+    store = _FakeStore()
+    started = time.monotonic()
+    result = handle_interruption(
+        request,
+        signal_process=signal_process,
+        object_store=store,
+        sleep=lambda _delay: None,
+    )
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 0.8
+    assert result.resumable is False
+    assert not any("/resume-commits/" in call[1] for call in store.calls)
+
+
+def test_checkpoint_staging_gives_each_arm_bounded_opportunity(
+    tmp_path,
+    monkeypatch,
+):
+    request = _short_interruption_request(
+        _interruption_request(tmp_path),
+        timeout_seconds=0.6,
+        upload_reserve_seconds=0.3,
+    )
+    original_stage = interruption_module._stage_checkpoint
+    started_at = {
+        "test": time.monotonic(),
+    }
+
+    def asymmetric_stage(arm, *args, **kwargs):
+        marker = tmp_path / f"{arm}.stage-started"
+        marker.write_text(str(time.monotonic()), encoding="ascii")
+        if arm == "dense":
+            time.sleep(1.0)
+        return original_stage(arm, *args, **kwargs)
+
+    monkeypatch.setattr(interruption_module, "_stage_checkpoint", asymmetric_stage)
+
+    def signal_process(pid, _signal):
+        arm = {101: "dense", 202: "split90"}[pid]
+        _atomic_checkpoint(request.checkpoint_paths[arm], arm.encode())
+
+    result = handle_interruption(
+        request,
+        signal_process=signal_process,
+        object_store=_FakeStore(),
+        sleep=lambda _delay: None,
+    )
+
+    dense_started = float(
+        (tmp_path / "dense.stage-started").read_text(encoding="ascii")
+    )
+    split_started = float(
+        (tmp_path / "split90.stage-started").read_text(encoding="ascii")
+    )
+    assert dense_started - started_at["test"] < 0.5
+    assert split_started - started_at["test"] < 0.5
+    assert result.resumable is False
+
+
 def test_checkpoint_stability_observes_both_arms_concurrently(tmp_path):
     request = _interruption_request(tmp_path)
     clock = _Clock()
@@ -2088,6 +2211,54 @@ def test_s3_object_store_uses_argv_and_checksum_verification(tmp_path):
         "AWS_SECRET_ACCESS_KEY" not in environment
         for _, environment, _timeout in calls
     )
+
+
+def test_s3_prehash_is_cancelled_at_wall_deadline(tmp_path, monkeypatch):
+    artifact = tmp_path / "checkpoint.pt"
+    artifact.write_bytes(b"checkpoint")
+    artifact.chmod(0o400)
+    digest = hashlib.sha256(b"checkpoint").hexdigest()
+    private_home = tmp_path / "aws-home"
+    private_home.mkdir(mode=0o700)
+    calls = []
+
+    def blocked_hash(*_args, **_kwargs):
+        time.sleep(1.0)
+        return None
+
+    monkeypatch.setattr(
+        interruption_module,
+        "_hash_file_sync",
+        blocked_hash,
+        raising=False,
+    )
+    store = S3ObjectStore(
+        region="us-east-1",
+        runner=lambda argv, environment, timeout: (
+            calls.append((argv, environment, timeout))
+            or CommandResult(1, "", "must not run")
+        ),
+        environment={
+            "AWS_REGION": "us-east-1",
+            "PATH": "/usr/bin:/bin",
+            "HOME": str(private_home),
+            "LANG": "C.UTF-8",
+            "LC_ALL": "C.UTF-8",
+        },
+    )
+
+    started = time.monotonic()
+    uploaded = store.put_verified(
+        artifact,
+        "s3://memorysplit-prod/cohort-v2/checkpoints/dense.pt",
+        expected_sha256=digest,
+        deadline=started + 0.2,
+        monotonic=time.monotonic,
+    )
+
+    assert time.monotonic() - started < 0.7
+    assert uploaded is None
+    assert calls == []
 
 
 def test_imdsv2_client_refreshes_an_expired_token(monkeypatch):

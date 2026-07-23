@@ -1634,12 +1634,13 @@ def _safe_terminate(process: ProcessHandle) -> None:
 
 
 def _terminate_all(processes: Sequence[ProcessHandle]) -> None:
+    known = tuple(processes)
     active = tuple(
-        process for process in processes if process.poll() is None
+        process for process in known if process.poll() is None
     )
     container_deadline = time.monotonic() + 15.0
     needs_container_kill: set[int] = set()
-    for process in active:
+    for process in known:
         stop_container = getattr(process, "stop_container", None)
         if stop_container is None:
             continue
@@ -1652,7 +1653,7 @@ def _terminate_all(processes: Sequence[ProcessHandle]) -> None:
             process.terminate_tree()
         except (OSError, subprocess.SubprocessError):
             pass
-    for process in active:
+    for process in known:
         container_stopped = getattr(process, "container_stopped", None)
         if container_stopped is None:
             continue
@@ -1663,7 +1664,7 @@ def _terminate_all(processes: Sequence[ProcessHandle]) -> None:
                 needs_container_kill.add(id(process))
         except (OSError, ValueError, subprocess.SubprocessError):
             needs_container_kill.add(id(process))
-    for process in active:
+    for process in known:
         if id(process) not in needs_container_kill:
             continue
         kill_container = getattr(process, "kill_container", None)
@@ -1674,7 +1675,7 @@ def _terminate_all(processes: Sequence[ProcessHandle]) -> None:
         except (OSError, ValueError, subprocess.SubprocessError):
             pass
     containers_verified = True
-    for process in active:
+    for process in known:
         if id(process) not in needs_container_kill:
             continue
         container_stopped = getattr(process, "container_stopped", None)
@@ -1946,11 +1947,10 @@ def _supervise_pair_locked(
                 None,
             )
             if failed is not None:
-                peer_terminated = False
-                for arm, process in processes.items():
-                    if arm != failed and statuses[arm] is None:
-                        _safe_terminate(process)
-                        peer_terminated = True
+                peer_terminated = any(
+                    arm != failed and statuses[arm] is None for arm in _ARMS
+                )
+                _terminate_all(tuple(processes.values()))
                 return SupervisionResult(
                     status="failed",
                     returncode=int(statuses[failed]),
@@ -1959,6 +1959,7 @@ def _supervise_pair_locked(
                     peer_terminated=peer_terminated,
                 )
             if all(status == 0 for status in statuses.values()):
+                _terminate_all(tuple(processes.values()))
                 return SupervisionResult(
                     status="completed",
                     returncode=0,
