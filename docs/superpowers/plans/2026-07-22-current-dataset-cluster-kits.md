@@ -167,8 +167,19 @@ git commit -m "feat: add current dataset source staging"
 - Create: `tests/test_current_dataset.py`
 - Create: `fixtures/current-smoke/` (generated)
 - Modify: `corpusgen/relational_build.py`
+- Modify: `corpusgen/graph_records.py`
+- Modify: `corpusgen/graph_trace.py`
+- Modify: `train/tokenizer.py`
+- Modify: `organizer/graph_store.py`
+- Modify: `evals/constrain.py`
+- Modify: `evals/relational_generate.py`
 - Modify: `scripts/build_relational_corpus.py`
 - Modify: `scripts/relational_smoke_test.py`
+- Modify: `tests/test_graph_store.py`
+- Modify: `tests/test_graph_trace.py`
+- Modify: `tests/test_tokenizer.py`
+- Modify: `tests/test_constrain.py`
+- Modify: `tests/test_relational_generate.py`
 - Modify: `tests/test_relational_smoke.py`
 
 **Interfaces:**
@@ -225,20 +236,30 @@ every lane.
 - Puzzle auxiliary: original plus at most 63 unique hash-ordered transforms per
   task.
 
-- [ ] **Step 5: Implement current sidecar ledger**
+- [ ] **Step 5: Implement paged graph actions and twelve-slot traces**
+
+Represent each graph address as canonical entity ID, relation ID, direction,
+and page. Group multivalued rows in stable numeric-QID order and page them
+before any record exceeds 1,024 tokens. Unique functional rows remain page
+zero. Serialize arbitrary PIDs as delimited identity text while keeping the
+50,304-token vocabulary unchanged. Extend constrained generation and the
+organizer interface to twelve action slots, exact page reads, deterministic
+post-HALT no-ops, and at most ten reads.
+
+- [ ] **Step 6: Implement current sidecar ledger**
 
 Write every factual span to `factual-span-ledger.jsonl`. Split masks only routed
 payload spans. Random candidates match source, record type, exact payload-token
 length, and one of ten packed-position bins. Rules, actions, queries, and final
 answers are never masked.
 
-- [ ] **Step 6: Implement atomic output publication**
+- [ ] **Step 7: Implement atomic output publication**
 
 Build into `.<name>.partial-<pid>`, fsync files, write and verify
 `manifest.json`, then atomically rename. Existing matching output verifies and
 returns; conflicting output fails.
 
-- [ ] **Step 7: Build the deterministic smoke fixture**
+- [ ] **Step 8: Build the deterministic smoke fixture**
 
 Run twice and require byte-identical output:
 
@@ -250,18 +271,22 @@ diff -ru /tmp/current-smoke-a /tmp/current-smoke-b
 
 Copy verified output into `fixtures/current-smoke/`.
 
-- [ ] **Step 8: Run smoke training**
+- [ ] **Step 9: Run smoke training**
 
 Train Dense and Split for two steps from packaged bytes, resume one step, and
 assert memory ON/OFF evaluation paths execute without modifying fixture bytes.
 
-- [ ] **Step 9: Commit**
+- [ ] **Step 10: Commit**
 
 ```bash
 git add corpusgen/current_dataset.py corpusgen/relational_build.py \
+  corpusgen/graph_records.py corpusgen/graph_trace.py train/tokenizer.py \
+  organizer/graph_store.py evals/constrain.py evals/relational_generate.py \
   scripts/build_current_dataset.py scripts/build_current_smoke.py \
   scripts/build_relational_corpus.py scripts/relational_smoke_test.py \
   fixtures/current-smoke tests/test_current_dataset.py \
+  tests/test_graph_store.py tests/test_graph_trace.py tests/test_tokenizer.py \
+  tests/test_constrain.py tests/test_relational_generate.py \
   tests/test_relational_smoke.py
 git commit -m "feat: compile current seven-lane dataset"
 ```
