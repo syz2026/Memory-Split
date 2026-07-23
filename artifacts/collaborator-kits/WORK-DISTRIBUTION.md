@@ -7,11 +7,10 @@ Each archive is self-contained and has a platform-specific closed inventory:
 one assignment-specific `README.md`, `assignment.json`, `SHA256SUMS`, the
 frozen `relational-run.tar.gz`, and the needed launch/build/verification
 helpers.
-Each archive also carries
-`2026-07-22-chinchilla-multisource-corpus-design.md` for review. That document
-describes the planned relational-v2 experiment; the enclosed runnable bundle
-and assignments remain frozen relational-v1 artifacts and must not be used to
-claim a v2 run.
+Each archive also carries `Memory-split-design.md`, the only current design and
+dataset specification. The enclosed runnable bundle and assignments are
+historical pilot artifacts and must not be used to claim a run on the current
+dataset.
 `SHA256SUMS` enumerates every payload file except itself. The four outer ZIP
 digests are recorded in `artifacts/COLLABORATOR-ZIP-SHA256SUMS`; verify that
 file before distribution.

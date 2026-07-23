@@ -3,9 +3,9 @@
 This kit owns Dense seed 1, Split seed 1, and Split seed 2. It owns the seed-1
 and seed-2 corpora. MIT collaborator A owns the shared FineWeb snapshot, the
 seed-0 corpus, and the combined six-probe preflight.
-This ZIP remains a frozen relational-v1 launcher. The included
-`2026-07-22-chinchilla-multisource-corpus-design.md` is review material only;
-do not substitute v2 data, budgets, or manifests for this assignment.
+This ZIP is a frozen pilot launcher. The included `Memory-split-design.md`
+defines the only current dataset; do not substitute its data, budgets, or
+manifests into this historical assignment.
 
 ## Unpack and verify
 

@@ -1,9 +1,9 @@
-# Chinchilla-Scale Multi-Source Relational Corpus v2
+# MemorySplit: Current Design and Dataset
 
 **Date:** 2026-07-22  
-**Status:** design approved in session; written-spec review pending  
-**Scope:** a new corpus and evaluation version for the matched
-Dense-versus-Split Transformer experiment
+**Status:** approved current design; implementation pending
+**Scope:** the only current corpus, model, and evaluation specification for the
+matched Dense-versus-Split Transformer experiment
 
 ## 1. Goal
 
@@ -23,15 +23,16 @@ The claim-bearing hypothesis remains:
 > direct next-token loss from selected arbitrary fact payloads improves
 > acquisition of reusable relational reasoning procedures.
 
-The new data version is `relational-v2`. Existing approximately
-10-token-per-parameter runs remain valid pilots under their original manifests,
-but their results must not be pooled with v2.
+This document defines the only current dataset. Existing approximately
+10-token-per-parameter outputs are historical pilot artifacts, not alternate
+dataset versions, and their results must not be pooled with the current
+experiment.
 
 Where this document conflicts with
 `2026-07-21-selective-recursive-graph-memory-design.md`, it supersedes that
 document's corpus mixture, six-slot trace, atomic-only memory-row, token-budget,
-OOD-suite, and primary-endpoint requirements. Unchanged model-matching and
-platform-control requirements are inherited.
+OOD-suite, and primary-endpoint requirements. Older design documents are
+historical provenance only and are not normative.
 
 Twenty tokens per parameter is the classic Chinchilla rule of thumb. It is not
 proof of the exact compute optimum for a structured, partially masked corpus.
@@ -56,6 +57,42 @@ The following choices are frozen by the design discussion:
   lengths at seven through ten hops; and
 - use update-aligned token budgets of at least 20 tokens per parameter.
 
+### 2.1 Model and memory architecture
+
+Every condition uses the same ordinary decoder-only Transformer:
+
+- RMSNorm, RoPE, causal attention, and SwiGLU;
+- no bias or dropout;
+- untied input and output embeddings;
+- vocabulary size 50,304;
+- context length 1,024; and
+- identical initialization and data-order seeds within each matched pair.
+
+The claim-bearing scales are 162,220,800 parameters and 356,033,536 parameters.
+The 28,969,216-parameter model is a development gate. There is no recurrent
+neural block, trainable router, graph neural network, query adapter, semantic
+retriever, or fuzzy linker. Graph-control tokens use the already padded
+vocabulary, so no condition gains trainable parameters.
+
+The development, 160M, and 360M models respectively use 4 layers at width 256,
+12 layers at width 768, and 20 layers at width 1,024 with 16 heads at the
+largest scale. Every arm uses AdamW with the same betas, matrix-only weight
+decay, warmup, cosine schedule, gradient clipping, precision, batch size, and
+524,288 target tokens per optimizer update. Condition never changes model or
+optimizer configuration.
+
+External memory is a non-trainable directed typed graph. It resolves canonical
+entity/relation addresses exactly, returns a row or `MISS`, and never infers a
+path or final answer. Multivalued Wikidata rows are returned as deterministic
+sorted pages. Path tasks use functional rows so each graph step has one answer.
+
+Reasoning is expressed as 12 fixed autoregressive action slots. The Transformer
+emits graph actions, receives exact graph returns, refines a candidate state,
+and eventually emits `HALT`. Training uses one through six reads; held-out
+length evaluation uses seven through ten. This is TRM-inspired iterative
+refinement implemented through ordinary tokens and context, not new recurrent
+weights.
+
 ## 3. Source contracts
 
 ### 3.1 FineWeb-Edu natural text
@@ -79,7 +116,7 @@ duplicate source strings.
 
 ### 3.2 Complete Wikidata5M graph source
 
-The named source scope is `wikidata5m-graph-3archive-v1`. It means the complete
+The named source scope is `wikidata5m-graph-3archive`. It means the complete
 three-archive graph distribution pinned by this project, not an official
 Wikimedia dump and not every historical Wikidata field.
 
@@ -131,7 +168,7 @@ Pin the TRM augmentation reference implementation to:
 - code license: MIT.
 
 TRM has no natural-language pretraining corpus. Its data is supervised grid
-puzzles. The v2 auxiliary lane uses only sources with a clear redistribution
+puzzles. The auxiliary lane uses only sources with a clear redistribution
 license:
 
 - ARC-AGI-1, revision
@@ -144,8 +181,8 @@ license:
 Only official training tasks and their outputs may enter the corpus. Canonical
 task hashes must remove cross-repository duplicates and exclude any task whose
 hash appears in an official evaluation directory. ConceptARC is treated wholly
-as training auxiliary data, so v2 must not report ConceptARC benchmark results.
-No ARC evaluation solution may be ingested.
+as training auxiliary data, so this experiment must not report ConceptARC
+benchmark results. No ARC evaluation solution may be ingested.
 
 Sudoku-Extreme and Maze-Hard are excluded. The source repositories' code
 licenses do not establish a redistribution license for all puzzle rows.
@@ -403,7 +440,7 @@ The model sizes and update size remain:
 - 360M: 356,033,536 parameters; and
 - 524,288 target tokens per optimizer update.
 
-The minimum update-aligned v2 budgets are:
+The minimum update-aligned budgets are:
 
 - **29M:** 1,106 updates and 579,862,528 tokens
   (20.0165 tokens/parameter);
@@ -420,18 +457,18 @@ Retain the existing protected run structure:
 
 Those 21 protected runs process exactly 91,397,554,176 raw target tokens.
 
-The 29M gate runs six matched diagnostics: full-v2 Dense/Split,
+The 29M gate runs six matched diagnostics: full-corpus Dense/Split,
 no-ARC Dense/Split with token-matched FineWeb replacement, and no-refinement
 Dense/Split with token-matched standard relational records. These ablations
 measure component contribution; they do not authorize post-hoc mixture
-selection. Full v2 must pass its preregistered gates or the protected launch
-stops for redesign.
+selection. The full corpus must pass its preregistered gates or the protected
+launch stops for redesign.
 
 ## 9. Evaluation and guardrails
 
 ### 9.1 Primary endpoint
 
-The v2 primary endpoint is equal-weight counterfactual pair accuracy over:
+The primary endpoint is equal-weight counterfactual pair accuracy over:
 
 - synthetic composition OOD; and
 - synthetic joint OOD.
@@ -485,7 +522,7 @@ negative.
 
 ### 9.4 Frozen verdict
 
-Let `delta_scale,seed` be Split minus Dense on the v2 primary endpoint.
+Let `delta_scale,seed` be Split minus Dense on the primary endpoint.
 Validate the hypothesis in this regime only if:
 
 1. all three 360M deltas are positive;
@@ -553,9 +590,9 @@ Fail closed on:
 
 ## 11. Execution isolation
 
-All v2 artifacts and jobs use a new namespace such as `relational-v2-*`.
-Existing local and FarmShare jobs remain v1 pilots and must not be resumed from
-v2 data or checkpoints.
+Current artifacts and jobs use the `relational-chinchilla-*` namespace.
+Historical local and FarmShare pilot jobs must not be resumed with current data
+or checkpoints.
 
 No protected 160M or 360M job may launch until:
 
@@ -563,7 +600,7 @@ No protected 160M or 360M job may launch until:
 2. the complete source audit passes;
 3. deterministic rebuild tests pass;
 4. the six 29M diagnostics finish;
-5. the full-v2 29M pair passes learnability, language, routing, masking, and
+5. the full-corpus 29M pair passes learnability, language, routing, masking, and
    resume gates; and
 6. the final corpus, evaluation, and run manifests are signed off by hash.
 
