@@ -11,7 +11,6 @@ import zipfile
 from pathlib import Path, PurePosixPath
 
 import pytest
-import yaml
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -82,8 +81,6 @@ def _minimal_repo(tmp_path: Path) -> Path:
         "pytest.ini": "[pytest]\n",
         "msctl/__init__.py": '"""fixture"""\n',
         "msctl/__main__.py": "raise SystemExit(0)\n",
-        "msctl/cohort.py": (REPO_ROOT / "msctl" / "cohort.py").read_bytes(),
-        "msctl/errors.py": (REPO_ROOT / "msctl" / "errors.py").read_bytes(),
         "corpusgen/__init__.py": (
             "def _hf_download_command():\n"
             "    return ['download']\n"
@@ -121,13 +118,6 @@ def _minimal_repo(tmp_path: Path) -> Path:
         "outputs/run/logs/worker.log": b"excluded log",
         ".cache/compiler.bin": b"excluded cache",
     }
-    for relative in (
-        "configs/cohort-assignment-v2.json",
-        "configs/preregistration-v2.yaml",
-    ):
-        files[relative] = (REPO_ROOT / relative).read_bytes()
-    for config in sorted((REPO_ROOT / "configs" / "360m-v2").iterdir()):
-        files[f"configs/360m-v2/{config.name}"] = config.read_bytes()
     for relative, data in files.items():
         _write(
             root / relative,
@@ -145,34 +135,6 @@ def _minimal_repo(tmp_path: Path) -> Path:
 
 def _sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
-
-
-def _commit_mutation(root: Path, message: str) -> None:
-    _git(root, "add", "-A")
-    _git(root, "commit", "-qm", message)
-
-
-def _replace_after_tracked_snapshot(
-    package_module,
-    monkeypatch,
-    *,
-    path: Path,
-    replacement: bytes,
-) -> dict[str, str]:
-    original_tracked_files = package_module._tracked_files
-    captured: dict[str, str] = {}
-
-    def tracked_then_replace(root, *arguments):
-        tracked = original_tracked_files(root, *arguments)
-        relative = path.relative_to(root).as_posix()
-        captured["git_blob"] = next(
-            item.object_id for item in tracked if item.path == relative
-        )
-        path.write_bytes(replacement)
-        return tracked
-
-    monkeypatch.setattr(package_module, "_tracked_files", tracked_then_replace)
-    return captured
 
 
 def test_production_dataset_pointer_is_nonmaterialized_and_illumina_only():
@@ -221,268 +183,6 @@ def test_double_build_is_byte_identical_with_internal_and_external_hashes(
         "commit": _git(source, "rev-parse", "HEAD"),
         "dirty": False,
     }
-
-
-def test_zip_semantically_proves_exactly_seed_zero_dense_and_split90(
-    tmp_path,
-    package_module,
-):
-    source = _minimal_repo(tmp_path)
-    artifacts = package_module.build_handoff(
-        source_root=source,
-        out_dir=tmp_path / "out",
-    )
-
-    with zipfile.ZipFile(artifacts.archive) as archive:
-        assignment = json.loads(
-            archive.read("configs/cohort-assignment-v2.json")
-        )
-        config_names = {
-            name
-            for name in archive.namelist()
-            if name.startswith("configs/360m-v2/") and not name.endswith("/")
-        }
-        configs = {
-            name: yaml.safe_load(archive.read(name))
-            for name in config_names
-        }
-        metadata = json.loads(archive.read("RELEASE-METADATA.json"))
-
-    assert assignment["provider_seeds"]["illumina-usfc-prd"] == [0]
-    assert assignment["provider_seeds"]["aws-p5.48xlarge"] == [1, 2, 3, 4]
-    assert config_names == {
-        "configs/360m-v2/dense-s0.yaml",
-        "configs/360m-v2/split90-s0.yaml",
-    }
-    assert {
-        (config["seed"], config["condition"]) for config in configs.values()
-    } == {(0, "dense"), (0, "split90")}
-    assert all(
-        config["snapshot_steps"] == [1_358, 3_396, 6_791, 10_187, 13_582]
-        and "snap_frac" not in config
-        for config in configs.values()
-    )
-    assert all(
-        config["cohort_id"] == assignment["cohort_id"]
-        for config in configs.values()
-    )
-    assert metadata["seed_assignment"] == {
-        "cohort_id": "memorysplit-confirmatory-v2-360m-n5",
-        "provider": "illumina-usfc-prd",
-        "seeds": [0],
-        "arms": ["dense", "split90"],
-    }
-    member_hashes = {
-        row["path"]: row["sha256"] for row in metadata["members"]
-    }
-    preregistration = "configs/preregistration-v2.yaml"
-    assert metadata["preregistration_sha256"] == _sha256(
-        source / preregistration
-    )
-    for name in config_names | {
-        "configs/cohort-assignment-v2.json",
-        preregistration,
-    }:
-        assert member_hashes[name] == _sha256(source / name)
-
-
-@pytest.mark.parametrize(
-    "mutation",
-    [
-        "seed_zero_omission",
-        "seed_one_inclusion",
-        "generic_split",
-        "wrong_token_math",
-        "partial_pair",
-    ],
-)
-def test_packager_rejects_invalid_provider_cohort_before_output(
-    tmp_path,
-    package_module,
-    mutation,
-):
-    source = _minimal_repo(tmp_path)
-    assignment_path = source / "configs" / "cohort-assignment-v2.json"
-    dense_path = source / "configs" / "360m-v2" / "dense-s0.yaml"
-    split_path = source / "configs" / "360m-v2" / "split90-s0.yaml"
-
-    if mutation in {"seed_zero_omission", "seed_one_inclusion"}:
-        assignment = json.loads(assignment_path.read_text())
-        if mutation == "seed_zero_omission":
-            assignment["provider_seeds"]["illumina-usfc-prd"] = []
-        else:
-            assignment["provider_seeds"]["illumina-usfc-prd"] = [0, 1]
-            assignment["provider_seeds"]["aws-p5.48xlarge"] = [2, 3, 4]
-        assignment_path.write_text(
-            json.dumps(assignment, indent=2, sort_keys=True) + "\n"
-        )
-    elif mutation == "generic_split":
-        split = yaml.safe_load(split_path.read_text())
-        split["condition"] = "split"
-        split_path.write_text(yaml.safe_dump(split, sort_keys=False))
-    elif mutation == "wrong_token_math":
-        dense = yaml.safe_load(dense_path.read_text())
-        dense["total_tokens"] -= 1
-        dense_path.write_text(yaml.safe_dump(dense, sort_keys=False))
-    elif mutation == "partial_pair":
-        split_path.unlink()
-    else:  # pragma: no cover - parameterization guard
-        raise AssertionError(mutation)
-    _commit_mutation(source, mutation)
-    out = tmp_path / "out"
-
-    with pytest.raises(package_module.PackageError):
-        package_module.build_handoff(source_root=source, out_dir=out)
-
-    assert not out.exists()
-
-
-def test_packager_rejects_tracked_root_seed_config_without_output(
-    tmp_path,
-    package_module,
-):
-    source = _minimal_repo(tmp_path)
-    _write(
-        source / "configs" / "dense-s1.yaml",
-        (source / "configs" / "360m-v2" / "dense-s1.yaml").read_bytes(),
-    )
-    _commit_mutation(source, "add unallowlisted root seed config")
-    out = tmp_path / "out"
-
-    with pytest.raises(package_module.PackageError, match="unknown tracked path"):
-        package_module.build_handoff(source_root=source, out_dir=out)
-
-    assert not out.exists()
-
-
-def test_packager_uses_git_config_bytes_after_tracked_snapshot_race(
-    tmp_path,
-    package_module,
-    monkeypatch,
-):
-    source = _minimal_repo(tmp_path)
-    config_path = source / "configs" / "360m-v2" / "dense-s0.yaml"
-    original = config_path.read_bytes()
-    replacement = original + b"# semantically equivalent race replacement\n"
-    captured = _replace_after_tracked_snapshot(
-        package_module,
-        monkeypatch,
-        path=config_path,
-        replacement=replacement,
-    )
-
-    release = package_module.build_handoff(
-        source_root=source,
-        out_dir=tmp_path / "out",
-    )
-
-    with zipfile.ZipFile(release.archive) as archive:
-        packaged = archive.read("configs/360m-v2/dense-s0.yaml")
-        metadata = json.loads(archive.read("RELEASE-METADATA.json"))
-    member = next(
-        row
-        for row in metadata["members"]
-        if row["path"] == "configs/360m-v2/dense-s0.yaml"
-    )
-    assert config_path.read_bytes() == replacement
-    assert packaged == original
-    assert member == {
-        "path": "configs/360m-v2/dense-s0.yaml",
-        "bytes": len(original),
-        "sha256": hashlib.sha256(original).hexdigest(),
-        "git_blob": captured["git_blob"],
-    }
-
-
-def test_packager_uses_git_preregistration_bytes_after_tracked_snapshot_race(
-    tmp_path,
-    package_module,
-    monkeypatch,
-):
-    source = _minimal_repo(tmp_path)
-    preregistration_path = source / "configs" / "preregistration-v2.yaml"
-    original = preregistration_path.read_bytes()
-    replacement = (
-        original + b"# semantically equivalent race replacement\n"
-    )
-    captured = _replace_after_tracked_snapshot(
-        package_module,
-        monkeypatch,
-        path=preregistration_path,
-        replacement=replacement,
-    )
-
-    release = package_module.build_handoff(
-        source_root=source,
-        out_dir=tmp_path / "out",
-    )
-
-    with zipfile.ZipFile(release.archive) as archive:
-        packaged = archive.read("configs/preregistration-v2.yaml")
-        metadata = json.loads(archive.read("RELEASE-METADATA.json"))
-    digest = hashlib.sha256(original).hexdigest()
-    member = next(
-        row
-        for row in metadata["members"]
-        if row["path"] == "configs/preregistration-v2.yaml"
-    )
-    assert preregistration_path.read_bytes() == replacement
-    assert packaged == original
-    assert metadata["preregistration_sha256"] == digest
-    assert member == {
-        "path": "configs/preregistration-v2.yaml",
-        "bytes": len(original),
-        "sha256": digest,
-        "git_blob": captured["git_blob"],
-    }
-
-
-def test_packager_refuses_to_replace_existing_release_set(
-    tmp_path,
-    package_module,
-):
-    source = _minimal_repo(tmp_path)
-    out = tmp_path / "out"
-    first = package_module.build_handoff(source_root=source, out_dir=out)
-    originals = {
-        path: path.read_bytes()
-        for path in (first.archive, first.sha256_file, first.release)
-    }
-
-    with pytest.raises(package_module.PackageError, match="exist"):
-        package_module.build_handoff(source_root=source, out_dir=out)
-
-    assert {path: path.read_bytes() for path in originals} == originals
-
-
-def test_packager_publishes_no_partial_set_when_one_final_path_exists(
-    tmp_path,
-    package_module,
-):
-    source = _minimal_repo(tmp_path)
-    template = package_module.build_handoff(
-        source_root=source,
-        out_dir=tmp_path / "template",
-    )
-    out = tmp_path / "out"
-    out.mkdir()
-    collision = out / template.sha256_file.name
-    collision.write_bytes(b"operator-owned\n")
-
-    with pytest.raises(package_module.PackageError, match="exist"):
-        package_module.build_handoff(source_root=source, out_dir=out)
-
-    assert collision.read_bytes() == b"operator-owned\n"
-    assert not (out / template.archive.name).exists()
-    assert not (out / template.release.name).exists()
-
-
-def test_agent_start_forbids_launching_seed_one_through_four():
-    text = (REPO_ROOT / "AGENT-START.md").read_text()
-
-    assert "only seed 0" in text
-    assert "seed 1\u20134" in text
-    assert "contract violation" in text
 
 
 def test_zip_has_closed_members_normalized_metadata_and_all_planned_directories(

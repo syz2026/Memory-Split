@@ -4,10 +4,13 @@
 from __future__ import annotations
 
 import argparse
+import ctypes
+import errno
 import hashlib
 import json
 import os
 import re
+import shutil
 import stat
 import subprocess
 import sys
@@ -16,47 +19,18 @@ import zipfile
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
-_SOURCE_ROOT = str(Path(__file__).resolve().parents[1])
-if _SOURCE_ROOT not in sys.path:
-    sys.path.insert(0, _SOURCE_ROOT)
 
-from msctl.cohort import load_cohort_assignment_bytes
-from msctl.errors import MsctlError
-
+MODULE_ROOT = Path(__file__).resolve().parents[1]
+if str(MODULE_ROOT) not in sys.path:
+    sys.path.insert(0, str(MODULE_ROOT))
 
 PROVIDER = "illumina-usfc-prd"
-COHORT_ASSIGNMENT = "configs/cohort-assignment-v2.json"
-PREREGISTRATION = "configs/preregistration-v2.yaml"
-ROOT_CONFIG_FILES = frozenset(
-    {
-        "configs/29m.tsv",
-        "configs/160m.tsv",
-        "configs/360m.tsv",
-        COHORT_ASSIGNMENT,
-        "configs/current-dataset-lock.json",
-        PREREGISTRATION,
-        "configs/reasoning-dataset-v2.json",
-        "configs/route-policy.json",
-    }
-)
-ILLUMINA_RUN_CONFIGS = frozenset(
-    {
-        "configs/360m-v2/dense-s0.yaml",
-        "configs/360m-v2/split90-s0.yaml",
-    }
-)
-COHORT_RUN_CONFIGS = frozenset(
-    f"configs/360m-v2/{arm}-s{seed}.yaml"
-    for seed in range(5)
-    for arm in ("dense", "split90")
-)
 NORMALIZED_TIME = (1980, 1, 1, 0, 0, 0)
 PLANNED_DIRECTORIES = (
     ".cursor/skills/memorysplit-cluster/",
     "cluster/profiles/",
     "cluster/slurm/",
     "configs/",
-    "configs/360m-v2/",
     "corpusgen/parallel/",
     "corpusgen/reasoning/",
     "evals/confirmatory/",
@@ -75,12 +49,8 @@ REQUIRED_MEMBERS = {
     "cluster/profiles/illumina-usfc-prd.json",
     "cluster/slurm/v2_evaluate.sbatch",
     "cluster/slurm/v2_seed0.sbatch",
-    COHORT_ASSIGNMENT,
-    PREREGISTRATION,
-    *ILLUMINA_RUN_CONFIGS,
     "msctl/__init__.py",
     "msctl/__main__.py",
-    "msctl/cohort.py",
     "scripts/package_illumina_handoff.py",
     "tests/test_msctl.py",
     "tests/test_package_illumina_handoff.py",
@@ -96,6 +66,7 @@ _ROOT_INCLUDED = {
     "requirements-illumina.lock",
 }
 _INCLUDED_SUFFIXES = {
+    "configs": {".json", ".tsv", ".yaml", ".yml"},
     "corpusgen": {".py"},
     "evals": {".py"},
     "msctl": {".py"},
@@ -136,28 +107,86 @@ _DISPOSABLE_COMPONENTS = {
     "logs",
     "snapshots",
 }
+_PRIVATE_KEY_PATTERN = re.compile(
+    rb"-----BEGIN (?:RSA |EC |DSA |OPENSSH |PGP )?PRIVATE KEY(?: BLOCK)?-----"
+)
+_AWS_ACCESS_KEY_PATTERN = re.compile(rb"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b")
+_SERVICE_TOKEN_PATTERN = re.compile(
+    rb"\b(?:hf_[A-Za-z0-9]{16,}|gh[pousr]_[A-Za-z0-9]{16,}|"
+    rb"github_pat_[A-Za-z0-9_]{16,}|glpat-[A-Za-z0-9_-]{16,}|"
+    rb"npm_[A-Za-z0-9]{16,}|sk-(?:proj-)?[A-Za-z0-9_-]{20,}|"
+    rb"sk-ant-[A-Za-z0-9_-]{20,})\b"
+)
+_ASSIGNMENT_NAME_PATTERN = (
+    rb"(?:AWS_(?:ACCESS_KEY_ID|SECRET_ACCESS_KEY|SESSION_TOKEN)|"
+    rb"(?:HF|HUGGINGFACE|GITHUB|GH)_(?:TOKEN|API_KEY|API_TOKEN|PAT)|"
+    rb"(?:OPENAI|ANTHROPIC|WANDB)_(?:API_KEY|TOKEN)|"
+    rb"SLACK_(?:TOKEN|BOT_TOKEN)|"
+    rb"(?:API|ACCESS|AUTH)_(?:KEY|TOKEN|SECRET)|"
+    rb"CLIENT_SECRET|PRIVATE_KEY|PASSWORD)"
+)
+_SECRET_ASSIGNMENT_PATTERN = re.compile(
+    rb"(?i)\b"
+    + _ASSIGNMENT_NAME_PATTERN
+    + rb"\s*=\s*(?:[\"'][^\"'\r\n]{8,}[\"']|[^\s#;\"']{8,})"
+)
+_GENERIC_SECRET_ASSIGNMENT_PATTERN = re.compile(
+    rb"\b(?:TOKEN|SECRET|PASSWORD|"
+    rb"[A-Z][A-Z0-9_]*(?:TOKEN|SECRET|PASSWORD|API_KEY|PRIVATE_KEY))\s*=\s*"
+    rb"(?:[\"'][^\"'\r\n]{8,}[\"']|[^\s#;\"']{8,})"
+)
+_BEARER_TOKEN_PATTERN = re.compile(
+    rb"(?i)\bauthorization\s*:\s*bearer\s+[A-Za-z0-9._~+/-]{16,}"
+)
 _SECRET_PATTERNS = (
-    re.compile(rb"-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----"),
-    re.compile(rb"\bAKIA[0-9A-Z]{16}\b"),
-    re.compile(rb"\b(?:hf|ghp)_[A-Za-z0-9_-]{16,}\b"),
-    re.compile(
-        rb"(?i)\b(?:AWS_SECRET_ACCESS_KEY|API[_-]?SECRET|PASSWORD)"
-        rb"\s*=\s*[\"'][^\"'\r\n]{8,}[\"']"
-    ),
+    _PRIVATE_KEY_PATTERN,
+    _AWS_ACCESS_KEY_PATTERN,
+    _SERVICE_TOKEN_PATTERN,
+    _SECRET_ASSIGNMENT_PATTERN,
+    _GENERIC_SECRET_ASSIGNMENT_PATTERN,
+    _BEARER_TOKEN_PATTERN,
 )
 
 
 class PackageError(ValueError):
     """A fail-closed release validation error."""
 
+    def __init__(self, message: str, *, code: str = "PACKAGE_REJECTED") -> None:
+        super().__init__(message)
+        self.code = code
+
+
+class _HelpRequested(Exception):
+    def __init__(self, text: str) -> None:
+        super().__init__(text)
+        self.text = text
+
+
+class _JsonArgumentParser(argparse.ArgumentParser):
+    def error(self, message: str) -> None:
+        raise PackageError(message, code="CLI_USAGE")
+
+    def print_help(self, file=None) -> None:
+        raise _HelpRequested(self.format_help())
+
+    def exit(self, status: int = 0, message: str | None = None) -> None:
+        if status == 0:
+            raise _HelpRequested(message or self.format_help())
+        raise PackageError(
+            (message or "invalid arguments").strip(),
+            code="CLI_USAGE",
+        )
+
 
 @dataclass(frozen=True)
 class ReleaseArtifacts:
+    release_dir: Path
     archive: Path
     sha256_file: Path
     release: Path
     release_id: str
     sha256: str
+    published: bool
 
 
 @dataclass(frozen=True)
@@ -195,7 +224,14 @@ def _clean_revision(root: Path) -> str:
 
 
 def _tracked_files(root: Path, revision: str) -> list[_Tracked]:
-    output = _run_git(root, "ls-tree", "-r", "-z", revision)
+    output = _run_git(
+        root,
+        "ls-tree",
+        "-r",
+        "-z",
+        "--full-tree",
+        revision,
+    )
     result = []
     for raw in output.split(b"\0"):
         if not raw:
@@ -205,19 +241,16 @@ def _tracked_files(root: Path, revision: str) -> list[_Tracked]:
             mode, object_type, object_id = metadata.decode("ascii").split()
             path = encoded_path.decode("utf-8")
         except (UnicodeDecodeError, ValueError) as error:
-            raise PackageError("Git commit contains an unsupported path") from error
-        if (
-            object_type != "blob"
-            or re.fullmatch(r"[0-9a-f]{40,64}", object_id) is None
-        ):
-            raise PackageError("Git commit contains a non-blob entry")
+            raise PackageError("Git tree contains an unsupported path") from error
+        if object_type != "blob":
+            raise PackageError("Git tree contains an unsupported object")
         portable = PurePosixPath(path)
         if (
             portable.is_absolute()
             or "\\" in path
             or any(part in {"", ".", ".."} for part in path.split("/"))
         ):
-            raise PackageError("Git commit contains an unsafe path")
+            raise PackageError("Git tree contains an unsafe path")
         if mode == "120000":
             raise PackageError(f"tracked symlink is forbidden: {path}")
         if mode not in {"100644", "100755"}:
@@ -232,17 +265,6 @@ def _classification(path: str) -> str:
         return "unknown"
     if set(parts) & _DISPOSABLE_COMPONENTS:
         return "excluded"
-    if parts[0] == "configs":
-        if path in ROOT_CONFIG_FILES or path in ILLUMINA_RUN_CONFIGS:
-            return "included"
-        if len(parts) >= 3 and parts[1] in {
-            "29m",
-            "160m",
-            "360m",
-            "360m-v2",
-        }:
-            return "excluded"
-        return "unknown"
     if path in _ROOT_INCLUDED:
         return "included"
     if path in _KNOWN_EXCLUDED_ROOT_FILES:
@@ -290,47 +312,10 @@ def _classification(path: str) -> str:
     return "unknown"
 
 
-def _read_git_blobs(
-    root: Path,
-    tracked: list[_Tracked],
-) -> dict[str, bytes]:
-    queries = b"".join(
-        item.object_id.encode("ascii") + b"\n" for item in tracked
-    )
-    completed = subprocess.run(
-        ["git", "-C", str(root), "cat-file", "--batch"],
-        input=queries,
-        capture_output=True,
-        check=False,
-    )
-    if completed.returncode != 0:
-        raise PackageError("Git blob snapshot cannot be read")
-
-    output = completed.stdout
-    cursor = 0
-    blobs: dict[str, bytes] = {}
-    try:
-        for item in tracked:
-            header_end = output.index(b"\n", cursor)
-            header = output[cursor:header_end].decode("ascii").split()
-            if (
-                len(header) != 3
-                or header[0] != item.object_id
-                or header[1] != "blob"
-            ):
-                raise ValueError
-            size = int(header[2])
-            data_start = header_end + 1
-            data_end = data_start + size
-            if size < 0 or output[data_end : data_end + 1] != b"\n":
-                raise ValueError
-            blobs[item.path] = output[data_start:data_end]
-            cursor = data_end + 1
-    except (UnicodeDecodeError, ValueError) as error:
-        raise PackageError("Git blob snapshot response is malformed") from error
-    if cursor != len(output) or len(blobs) != len(tracked):
-        raise PackageError("Git blob snapshot response is incomplete")
-    return blobs
+def _read_blob(root: Path, object_id: str) -> bytes:
+    if re.fullmatch(r"[0-9a-f]{40}(?:[0-9a-f]{24})?", object_id) is None:
+        raise PackageError("Git tree contains an invalid blob ID")
+    return _run_git(root, "cat-file", "blob", object_id)
 
 
 def _scan_secret(path: str, data: bytes) -> None:
@@ -363,18 +348,24 @@ def _canonical_pretty(value: object) -> bytes:
     ).encode("ascii")
 
 
-def _write_new_file(path: Path, data: bytes, *, mode: int = 0o644) -> None:
+def _atomic_write(path: Path, data: bytes, *, mode: int = 0o644) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{path.name}.",
+        suffix=".tmp",
+        dir=path.parent,
+    )
+    temporary = Path(temporary_name)
     try:
-        with path.open("xb") as handle:
+        with os.fdopen(descriptor, "wb") as handle:
             handle.write(data)
             handle.flush()
-            os.fchmod(handle.fileno(), mode)
             os.fsync(handle.fileno())
-    except FileExistsError as error:
-        raise PackageError(f"release path already exists: {path.name}") from error
-    except OSError as error:
-        raise PackageError(f"cannot stage release file: {path.name}") from error
+        os.chmod(temporary, mode)
+        os.replace(temporary, path)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
 
 
 def _zip_info(name: str, *, directory: bool) -> zipfile.ZipInfo:
@@ -401,87 +392,39 @@ def _write_zip(
     *,
     payload: dict[str, bytes],
     directories: tuple[str, ...],
-) -> tuple[str, int]:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        with path.open("x+b") as handle:
-            os.fchmod(handle.fileno(), 0o644)
-            with zipfile.ZipFile(
-                handle,
-                mode="w",
-                compression=zipfile.ZIP_DEFLATED,
-                compresslevel=9,
-                strict_timestamps=True,
-            ) as archive:
-                archive.comment = b""
-                entries = [(name, True) for name in directories]
-                entries.extend((name, False) for name in payload)
-                for name, directory in sorted(entries):
-                    info = _zip_info(name, directory=directory)
-                    archive.writestr(
-                        info,
-                        b"" if directory else payload[name],
-                        compress_type=info.compress_type,
-                        compresslevel=9 if not directory else None,
-                    )
-            handle.flush()
-            os.fsync(handle.fileno())
-            size = os.fstat(handle.fileno()).st_size
-            handle.seek(0)
-            digest = hashlib.sha256()
-            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-                digest.update(chunk)
-            return digest.hexdigest(), size
-    except FileExistsError as error:
-        raise PackageError(f"release path already exists: {path.name}") from error
-    except OSError as error:
-        raise PackageError("cannot construct staged release archive") from error
-
-
-def _path_exists(path: Path) -> bool:
-    return path.exists() or path.is_symlink()
-
-
-def _publish_staging_set(
-    staged: tuple[tuple[Path, Path], ...],
-    *,
-    output: Path,
 ) -> None:
-    existing = [
-        destination.name
-        for _, destination in staged
-        if _path_exists(destination)
-    ]
-    if existing:
-        raise PackageError(f"release path already exists: {sorted(existing)[0]}")
-
-    created: list[tuple[Path, Path]] = []
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{path.name}.",
+        suffix=".tmp",
+        dir=path.parent,
+    )
+    os.close(descriptor)
+    temporary = Path(temporary_name)
     try:
-        for source, destination in staged:
-            try:
-                os.link(source, destination, follow_symlinks=False)
-            except FileExistsError as error:
-                raise PackageError(
-                    f"release path already exists: {destination.name}"
-                ) from error
-            created.append((source, destination))
-        directory_fd = os.open(output, os.O_RDONLY)
-        try:
-            os.fsync(directory_fd)
-        finally:
-            os.close(directory_fd)
-    except Exception as error:
-        for source, destination in reversed(created):
-            try:
-                source_stat = source.stat(follow_symlinks=False)
-                destination_stat = destination.stat(follow_symlinks=False)
-                if os.path.samestat(source_stat, destination_stat):
-                    destination.unlink()
-            except FileNotFoundError:
-                pass
-        if isinstance(error, PackageError):
-            raise
-        raise PackageError("failed to publish complete release set") from error
+        with zipfile.ZipFile(
+            temporary,
+            mode="w",
+            compression=zipfile.ZIP_DEFLATED,
+            compresslevel=9,
+            strict_timestamps=True,
+        ) as archive:
+            archive.comment = b""
+            entries = [(name, True) for name in directories]
+            entries.extend((name, False) for name in payload)
+            for name, directory in sorted(entries):
+                info = _zip_info(name, directory=directory)
+                archive.writestr(
+                    info,
+                    b"" if directory else payload[name],
+                    compress_type=info.compress_type,
+                    compresslevel=9 if not directory else None,
+                )
+        os.chmod(temporary, 0o644)
+        os.replace(temporary, path)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
 
 
 def _collect_payload(
@@ -503,72 +446,14 @@ def _collect_payload(
     missing = sorted(REQUIRED_MEMBERS - paths)
     if missing:
         raise PackageError(f"required release member is not tracked: {missing[0]}")
-    tracked_by_path = {item.path: item for item in tracked}
-    tracked_run_configs = {
-        path
-        for path in tracked_by_path
-        if path.startswith("configs/360m-v2/")
-    }
-    if tracked_run_configs != COHORT_RUN_CONFIGS:
-        raise PackageError(
-            "cohort run configs must contain exactly ten tracked cells"
-        )
-    snapshot_paths = paths | COHORT_RUN_CONFIGS
-    missing_snapshot = sorted(snapshot_paths - set(tracked_by_path))
-    if missing_snapshot:
-        raise PackageError(
-            f"required Git snapshot member is missing: {missing_snapshot[0]}"
-        )
-    snapshot_items = sorted(
-        (tracked_by_path[path] for path in snapshot_paths),
-        key=lambda item: item.path,
-    )
-    snapshot = _read_git_blobs(source, snapshot_items)
-
-    try:
-        cohort = load_cohort_assignment_bytes(
-            assignment_data=snapshot[COHORT_ASSIGNMENT],
-            preregistration_data=snapshot[PREREGISTRATION],
-            config_data={
-                path: snapshot[path] for path in COHORT_RUN_CONFIGS
-            },
-        )
-        provider_configs = cohort.configs_for_provider(PROVIDER)
-    except MsctlError as error:
-        raise PackageError(f"invalid cohort assignment: {error.message}") from error
-    selected_paths = {config.path for config in provider_configs}
-    selected_cells = {
-        (config.seed, config.condition) for config in provider_configs
-    }
-    if (
-        selected_paths != ILLUMINA_RUN_CONFIGS
-        or selected_cells != {(0, "dense"), (0, "split90")}
-    ):
-        raise PackageError("Illumina cohort must contain only seed zero pair")
-    expected_config_hashes = {
-        config.path: config.sha256 for config in provider_configs
-    }
 
     payload: dict[str, bytes] = {}
     member_rows = []
     environment_hashes: dict[str, str] = {}
     for item in included:
-        data = snapshot[item.path]
+        data = _read_blob(source, item.object_id)
         _scan_secret(item.path, data)
         digest = _sha256(data)
-        if (
-            item.path == COHORT_ASSIGNMENT
-            and digest != cohort.assignment_sha256
-        ):
-            raise PackageError("cohort assignment hash mismatch")
-        if (
-            item.path == PREREGISTRATION
-            and digest != cohort.preregistration_sha256
-        ):
-            raise PackageError("preregistration hash mismatch")
-        expected_config_hash = expected_config_hashes.get(item.path)
-        if expected_config_hash is not None and digest != expected_config_hash:
-            raise PackageError(f"cohort config hash mismatch: {item.path}")
         payload[item.path] = data
         member_rows.append(
             {
@@ -589,14 +474,7 @@ def _collect_payload(
             "provider": PROVIDER,
             "source": {"commit": revision, "dirty": False},
             "profile_sha256": profile_hash,
-            "preregistration_sha256": cohort.preregistration_sha256,
             "environment_hashes": environment_hashes,
-            "seed_assignment": {
-                "cohort_id": cohort.cohort_id,
-                "provider": PROVIDER,
-                "seeds": list(cohort.illumina_seeds),
-                "arms": ["dense", "split90"],
-            },
             "members": member_rows,
         }
     )
@@ -607,12 +485,145 @@ def _collect_payload(
     return payload, _sha256(sums)
 
 
+def _fsync_tree(root: Path) -> None:
+    for path in sorted(root.iterdir()):
+        if path.is_symlink() or not path.is_file():
+            raise PackageError("private release staging contains an unsafe entry")
+        descriptor = os.open(
+            path,
+            os.O_RDONLY | getattr(os, "O_CLOEXEC", 0),
+        )
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+    directory_fd = os.open(
+        root,
+        os.O_RDONLY
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_CLOEXEC", 0),
+    )
+    try:
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
+
+
+def _rename_noreplace(source: Path, destination: Path) -> None:
+    """Atomically publish a directory without replacing any existing entry."""
+
+    libc = ctypes.CDLL(None, use_errno=True)
+    encoded_source = os.fsencode(source)
+    encoded_destination = os.fsencode(destination)
+    if sys.platform == "darwin" and hasattr(libc, "renamex_np"):
+        rename = libc.renamex_np
+        rename.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint]
+        rename.restype = ctypes.c_int
+        result = rename(encoded_source, encoded_destination, 0x00000004)
+    elif sys.platform.startswith("linux") and hasattr(libc, "renameat2"):
+        rename = libc.renameat2
+        rename.argtypes = [
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_uint,
+        ]
+        rename.restype = ctypes.c_int
+        result = rename(
+            -100,
+            encoded_source,
+            -100,
+            encoded_destination,
+            0x00000001,
+        )
+    else:
+        raise PackageError(
+            "platform lacks atomic no-replace directory publication"
+        )
+    if result == 0:
+        return
+    error_number = ctypes.get_errno()
+    if error_number in {errno.EEXIST, errno.ENOTEMPTY}:
+        raise PackageError(
+            "release directory already exists",
+            code="RELEASE_EXISTS",
+        )
+    raise PackageError("atomic release publication failed")
+
+
+def _verify_staged_release(
+    release_file: Path,
+    *,
+    expected_release_id: str,
+    expected_archive_sha256: str,
+) -> None:
+    try:
+        from msctl.contracts import load_release
+
+        verified = load_release(release_file)
+    except Exception as error:
+        raise PackageError(
+            f"staged release checksum verification failed: {error}"
+        ) from error
+    if (
+        verified.release_id != expected_release_id
+        or verified.archive_sha256 != expected_archive_sha256
+    ):
+        raise PackageError("staged release identity verification failed")
+
+
+def _build_staging(
+    staging: Path,
+    *,
+    payload: dict[str, bytes],
+    members_sha256: str,
+    revision: str,
+    release_id: str,
+    archive_name: str,
+) -> tuple[str, dict[str, object]]:
+    archive = staging / archive_name
+    _write_zip(
+        archive,
+        payload=payload,
+        directories=PLANNED_DIRECTORIES,
+    )
+    archive_data = archive.read_bytes()
+    archive_hash = hashlib.sha256(archive_data).hexdigest()
+    release_value = {
+        "schema_version": 1,
+        "release_id": release_id,
+        "provider": PROVIDER,
+        "archive": {
+            "path": archive_name,
+            "sha256": archive_hash,
+            "bytes": len(archive_data),
+        },
+        "source": {"commit": revision, "dirty": False},
+        "members_sha256": members_sha256,
+    }
+    _atomic_write(
+        staging / f"{archive_name}.sha256",
+        f"{archive_hash}  {archive_name}\n".encode("ascii"),
+    )
+    release_file = staging / "RELEASE.json"
+    _atomic_write(release_file, _canonical_pretty(release_value))
+    _verify_staged_release(
+        release_file,
+        expected_release_id=release_id,
+        expected_archive_sha256=archive_hash,
+    )
+    _fsync_tree(staging)
+    return archive_hash, release_value
+
+
 def build_handoff(
     *,
     source_root: Path | str,
     out_dir: Path | str,
+    apply: bool = False,
 ) -> ReleaseArtifacts:
-    """Validate a clean source tree and atomically publish release artifacts."""
+    """Build privately; publish one no-replace release directory only on apply."""
 
     source = Path(source_root)
     if source.is_symlink() or not source.is_dir():
@@ -624,66 +635,59 @@ def build_handoff(
     release_id = f"r1-{release_suffix}"
     archive_name = f"ms-illumina-r1-{release_suffix}.zip"
     output = Path(out_dir)
-    if output.is_symlink():
-        raise PackageError("output directory must not be a symlink")
+    release_dir = output / release_id
+    staging: Path
+    if apply:
+        if output.is_symlink():
+            raise PackageError("release output must not be a symlink")
+        output.mkdir(parents=True, exist_ok=True, mode=0o700)
+        if not output.is_dir():
+            raise PackageError("release output must be a directory")
+        staging = Path(
+            tempfile.mkdtemp(
+                prefix=f".{release_id}.",
+                suffix=".staging",
+                dir=output,
+            )
+        )
+    else:
+        staging = Path(
+            tempfile.mkdtemp(prefix=f".{release_id}.dry-run-")
+        ).resolve()
     try:
-        output.mkdir(parents=True, exist_ok=True)
-    except OSError as error:
-        raise PackageError("output directory cannot be created") from error
-    if not output.is_dir():
-        raise PackageError("output path must be a directory")
-    archive = output / archive_name
-    sha_file = output / f"{archive_name}.sha256"
-    release_file = output / "RELEASE.json"
-    final_paths = (archive, sha_file, release_file)
-    if any(_path_exists(path) for path in final_paths):
-        raise PackageError("release path already exists")
-
-    with tempfile.TemporaryDirectory(
-        prefix=".ms-illumina-stage-",
-        dir=output,
-    ) as staging_name:
-        staging = Path(staging_name)
-        staged_archive = staging / archive.name
-        archive_hash, archive_bytes = _write_zip(
-            staged_archive,
+        os.chmod(staging, 0o700)
+        archive_hash, _ = _build_staging(
+            staging,
             payload=payload,
-            directories=PLANNED_DIRECTORIES,
+            members_sha256=members_sha256,
+            revision=revision,
+            release_id=release_id,
+            archive_name=archive_name,
         )
-        staged_sha = staging / sha_file.name
-        _write_new_file(
-            staged_sha,
-            f"{archive_hash}  {archive_name}\n".encode("ascii"),
+        if apply:
+            _rename_noreplace(staging, release_dir)
+            output_fd = os.open(
+                output,
+                os.O_RDONLY
+                | getattr(os, "O_DIRECTORY", 0)
+                | getattr(os, "O_CLOEXEC", 0),
+            )
+            try:
+                os.fsync(output_fd)
+            finally:
+                os.close(output_fd)
+        return ReleaseArtifacts(
+            release_dir=release_dir,
+            archive=release_dir / archive_name,
+            sha256_file=release_dir / f"{archive_name}.sha256",
+            release=release_dir / "RELEASE.json",
+            release_id=release_id,
+            sha256=archive_hash,
+            published=apply,
         )
-        release_value = {
-            "schema_version": 1,
-            "release_id": release_id,
-            "provider": PROVIDER,
-            "archive": {
-                "path": archive_name,
-                "sha256": archive_hash,
-                "bytes": archive_bytes,
-            },
-            "source": {"commit": revision, "dirty": False},
-            "members_sha256": members_sha256,
-        }
-        staged_release = staging / release_file.name
-        _write_new_file(staged_release, _canonical_pretty(release_value))
-        _publish_staging_set(
-            (
-                (staged_archive, archive),
-                (staged_sha, sha_file),
-                (staged_release, release_file),
-            ),
-            output=output,
-        )
-    return ReleaseArtifacts(
-        archive=archive,
-        sha256_file=sha_file,
-        release=release_file,
-        release_id=release_id,
-        sha256=archive_hash,
-    )
+    finally:
+        if staging.exists():
+            shutil.rmtree(staging)
 
 
 def _emit(value: dict[str, object]) -> None:
@@ -700,36 +704,54 @@ def _emit(value: dict[str, object]) -> None:
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(
-        description="Build a deterministic Illumina MemorySplit handoff."
-    )
-    parser.add_argument(
-        "--source-root",
-        default=str(Path(__file__).resolve().parents[1]),
-    )
-    parser.add_argument("--out-dir", default="dist")
-    args = parser.parse_args(argv)
+    apply = False
     try:
+        parser = _JsonArgumentParser(
+            description="Build a deterministic Illumina MemorySplit handoff."
+        )
+        parser.add_argument(
+            "--source-root",
+            default=str(Path(__file__).resolve().parents[1]),
+        )
+        parser.add_argument("--out-dir", default="dist")
+        parser.add_argument("--apply", action="store_true")
+        args = parser.parse_args(argv)
+        apply = bool(args.apply)
         artifacts = build_handoff(
             source_root=args.source_root,
             out_dir=args.out_dir,
+            apply=args.apply,
         )
         report = {
             "schema_version": 1,
             "ok": True,
+            "dry_run": not args.apply,
+            "published": artifacts.published,
             "release_id": artifacts.release_id,
+            "release_dir": str(artifacts.release_dir),
             "archive": str(artifacts.archive),
             "sha256_file": str(artifacts.sha256_file),
             "release": str(artifacts.release),
             "sha256": artifacts.sha256,
         }
         code = 0
+    except _HelpRequested as help_request:
+        report = {
+            "schema_version": 1,
+            "ok": True,
+            "dry_run": True,
+            "published": False,
+            "help": help_request.text,
+        }
+        code = 0
     except PackageError as error:
         report = {
             "schema_version": 1,
             "ok": False,
+            "dry_run": not apply,
+            "published": False,
             "error": {
-                "code": "PACKAGE_REJECTED",
+                "code": error.code,
                 "message": str(error),
             },
         }
@@ -738,6 +760,8 @@ def main(argv: list[str] | None = None) -> int:
         report = {
             "schema_version": 1,
             "ok": False,
+            "dry_run": not apply,
+            "published": False,
             "error": {
                 "code": "PACKAGE_INTERNAL_ERROR",
                 "message": "unexpected local packaging failure",

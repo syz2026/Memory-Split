@@ -12,23 +12,25 @@ training, and evaluation through Slurm.
    count, external and internal SHA-256 manifests, metadata, and complete member
    set before rendering, submitting, resuming, evaluating, cancelling, or
    reconciling status.
-2. Read `DATASET-POINTER.json` and set `MS_SHARED_ROOT` to an operator-approved
+2. This Illumina release may launch only seed 0. Attempting seed 1–4 from this
+   archive is a contract violation; use the AWS P5 release for those seeds.
+3. Read `DATASET-POINTER.json` and set `MS_SHARED_ROOT` to an operator-approved
    directory under `/illumina`.
-3. Invoke `python -m msctl ...` and parse its one JSON object from stdout.
-4. Run the dry-run first and inspect every hash, run ID, resource, and command.
-5. Use `--apply` only after the required signed approval receipt is present.
-6. Stop on any authentication, approval, provenance, dataset, checkpoint,
+4. Invoke `python -m msctl ...` and parse its one JSON object from stdout.
+5. Run the dry-run first and inspect every hash, run ID, resource, and command.
+6. Use `--apply` only after the required signed approval receipt is present.
+7. Stop on any authentication, approval, provenance, dataset, checkpoint,
    Slurm-reconciliation, or hash error. Do not work around a failed gate.
-7. Never print, copy into a job, or include in a report any secret, token, or
+8. Never print, copy into a job, or include in a report any secret, token, or
    `MSCTL_APPROVAL_KEY`.
-8. Never duplicate or manually resubmit a run ID. Let `msctl status` reconcile
+9. Never duplicate or manually resubmit a run ID. Let `msctl status` reconcile
    `squeue` and `sacct`; use `msctl resume` only with a matching checkpoint
    receipt.
-9. If submission is interrupted after intent is recorded, rerun the same
+10. If submission is interrupted after intent is recorded, rerun the same
    command. `msctl` searches `squeue` and then `sacct` by its exact deterministic
    comment. Zero or multiple matches remain failed and recoverable; never invoke
    `sbatch` manually to work around that state.
-10. Paired submit/resume operations persist one strict pair journal before
+11. Paired submit/resume operations persist one strict pair journal before
     either per-run record and repair an interrupted first record from it.
 
 ## Ordered bring-up
