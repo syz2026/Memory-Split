@@ -212,7 +212,7 @@ def test_zip_has_closed_members_normalized_metadata_and_all_planned_directories(
         assert PLANNED_DIRECTORIES <= names
         assert "SHA256SUMS" in names
         assert "RELEASE-METADATA.json" in names
-        assert "fixtures/current-smoke/train.bin" in names
+        assert "fixtures/current-smoke/train.bin" not in names
         assert "sources/wikidata5m.lock.json" in names
         assert "schemas/mit-cluster-profile-v1.schema.json" not in names
         assert "README.md" not in names

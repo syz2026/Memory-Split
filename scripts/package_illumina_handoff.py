@@ -315,7 +315,7 @@ def _classification(path: str) -> str:
         and parts[0:2] == ("fixtures", "current-smoke")
         and PurePosixPath(path).suffix.lower() in {".bin", ".json", ".jsonl"}
     ):
-        return "included"
+        return "excluded"
     if parts[0] == "fixtures":
         return "unknown"
     if path in _COHORT_CONFIGS:
