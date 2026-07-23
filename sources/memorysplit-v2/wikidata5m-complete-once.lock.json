@@ -1,0 +1,88 @@
+{
+  "complete_once": {
+    "sidecar_encoding": "one_unsigned_byte_per_source_row_1_keep_0_drop",
+    "split_order": [
+      "wikidata5m_inductive_train.txt",
+      "wikidata5m_transductive_train.txt"
+    ],
+    "triple_identity": "exact_subject_relation_object"
+  },
+  "files": [
+    {
+      "bytes": 197449751,
+      "git_blob_sha1": "11cefbaa8b2508845d667861be0edd4a072fb5a1",
+      "members": [
+        {
+          "bytes": 551790340,
+          "path": "wikidata5m_entity.txt",
+          "sha256": "e71a0bf6344742abcbe2e398e38874008fee048f513f0e6108c12f859fa52c67"
+        },
+        {
+          "bytes": 56415,
+          "path": "wikidata5m_relation.txt",
+          "sha256": "dfe6e647a9a57a1e58ea1f9dfd73b3a91d3fdb43bf44599d8c586aa2ae0a79be"
+        }
+      ],
+      "path": "wikidata5m_alias.tar.gz",
+      "sha256": "0330f580c9f7a57cbad949ac380835fdd2a2e14d96cc0f13fc435401d6b463a8"
+    },
+    {
+      "bytes": 167247416,
+      "git_blob_sha1": "b47750fae997eaaf722ff05657bdd99df11a3e32",
+      "members": [
+        {
+          "bytes": 152547,
+          "path": "wikidata5m_inductive_test.txt",
+          "sha256": "d611f65049b722260b6e6c8487357926c776813d511f76e85ea47292eaee090a"
+        },
+        {
+          "bytes": 417843395,
+          "path": "wikidata5m_inductive_train.txt",
+          "sha256": "0ec75c242d5193604bf8055a64fce3dedbf1d9d13ab555ed727b3252af4178ba"
+        },
+        {
+          "bytes": 148199,
+          "path": "wikidata5m_inductive_valid.txt",
+          "sha256": "da385f10362ed3e94021fdc78f2abf30c7b91fd0be904a929d05d5c651aa31a0"
+        }
+      ],
+      "path": "wikidata5m_inductive.tar.gz",
+      "sha256": "955081232cc2de859710bfe3a147f7d8314524010fe5f8c420bb74fdfee4f42a"
+    },
+    {
+      "bytes": 168258214,
+      "git_blob_sha1": "353cbe041b7f08418c15ea334282996cd04513f2",
+      "members": [
+        {
+          "bytes": 104851,
+          "path": "wikidata5m_transductive_test.txt",
+          "sha256": "69ee37d99f609a085bf13b1b29ce21bc2d8fd04a93787d0f1855dd4a53f13150"
+        },
+        {
+          "bytes": 420329153,
+          "path": "wikidata5m_transductive_train.txt",
+          "sha256": "b3d312fbb168c1c45944f38742af19507d157c0ad65b87059b27ff793e87fab2"
+        },
+        {
+          "bytes": 105310,
+          "path": "wikidata5m_transductive_valid.txt",
+          "sha256": "e6c468b17be80ae590cdadec2b1dc28d203eb5041a890586b2800d4e9a8bec6b"
+        }
+      ],
+      "path": "wikidata5m_transductive.tar.gz",
+      "sha256": "383160990b41c0905fc03f4a8afbb9b12be1ca3591e026bde6cdc94a59542597"
+    }
+  ],
+  "format": "memorysplit-v2-huggingface-source-lock",
+  "license": "CC0-1.0",
+  "license_evidence": {
+    "notice_path": "../Wikidata-CC0-1.0.txt",
+    "notice_sha256": "a2010f343487d3f7618affe54f789f5487602331c0a8d03f49e9a7c547cf0499"
+  },
+  "repo_type": "dataset",
+  "repository": "intfloat/wikidata5m",
+  "revision": "6b2b09672129e280c0c9da97ab58154e9d535e6b",
+  "schema_version": 1,
+  "source_id": "wikidata5m",
+  "total_bytes": 532955381
+}

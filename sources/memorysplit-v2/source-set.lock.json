@@ -1,0 +1,53 @@
+{
+  "contract_id": "memorysplit-reasoning-dataset-v2",
+  "dataset_id": "memorysplit-v2-frozen-upstream-sources",
+  "format": "memorysplit-v2-source-set-lock",
+  "production_readiness": {
+    "missing_materialized_lanes": [
+      "fineweb_edu",
+      "finemath",
+      "wikidata_graph",
+      "synthetic_graph",
+      "verified_synthetic_multihop",
+      "wikidata_path_reasoning",
+      "relational_refinement",
+      "objective_auxiliary"
+    ],
+    "missing_source_locks": [
+      "synthetic_graph_generator",
+      "verified_synthetic_multihop_generator",
+      "wikidata_path_reasoning_generator",
+      "relational_refinement_generator",
+      "reasoning_solver"
+    ],
+    "ready": false,
+    "reason": "upstream data locks are frozen, but production generator and solver locks plus materialized lane artifacts remain absent"
+  },
+  "schema_version": 1,
+  "scientific_requirements": {
+    "path": "../../configs/reasoning-dataset-v2.json",
+    "sha256": "c704baf9e07acb93ffab8b33027b310fc9b3d68e0c036a6d8cc1d45b86872ce8"
+  },
+  "source_locks": [
+    {
+      "id": "fineweb_edu",
+      "path": "fineweb-edu.lock.json",
+      "sha256": "f5cf872bd5aa5ba68584646a9f2726c261ca25f3b052e735c5c6334e140959d9"
+    },
+    {
+      "id": "finemath",
+      "path": "finemath.lock.json",
+      "sha256": "a1b3219b07686a24f1b44ff8ba2cf812d474911ff42fcabc5fb95a94041f2765"
+    },
+    {
+      "id": "wikidata5m",
+      "path": "wikidata5m-complete-once.lock.json",
+      "sha256": "f83838cf8bf80dc6cfe99f5bf89edf1de92162053533f000759a3aa0c0719ec8"
+    },
+    {
+      "id": "objective_auxiliary",
+      "path": "objective-auxiliaries.lock.json",
+      "sha256": "95ce787904bf5e727496162ea70d6513877f4f29d02822e297da62f4eeb1cb42"
+    }
+  ]
+}
