@@ -23,8 +23,10 @@ PLANNED_DIRECTORIES = {
     "corpusgen/parallel/",
     "corpusgen/reasoning/",
     "evals/confirmatory/",
+    "fixtures/current-smoke/",
     "msctl/",
     "scripts/",
+    "sources/",
     "tests/",
     "train/",
     "vendor/tiktoken/",
@@ -84,6 +86,7 @@ def _minimal_repo(tmp_path: Path) -> Path:
             "    return ['download']\n"
         ),
         "evals/__init__.py": "",
+        "fixtures/current-smoke/train.bin": b"tiny smoke corpus",
         "train/__init__.py": "",
         "scripts/package_illumina_handoff.py": SCRIPT.read_bytes(),
         "tests/test_msctl.py": "def test_fixture():\n    assert True\n",
@@ -107,6 +110,9 @@ def _minimal_repo(tmp_path: Path) -> Path:
         "Memory-split-design.md": "known excluded design documentation\n",
         "README.md": "known excluded documentation\n",
         "docs/history.md": "known excluded documentation\n",
+        "schemas/mit-cluster-profile-v1.schema.json": "{}\n",
+        "sources/Wikidata-CC0-1.0.txt": "CC0 fixture\n",
+        "sources/wikidata5m.lock.json": "{}\n",
         "data/full-corpus.bin": b"excluded corpus",
         "outputs/run/checkpoint.pt": b"excluded checkpoint",
         "outputs/run/logs/worker.log": b"excluded log",
@@ -193,6 +199,9 @@ def test_zip_has_closed_members_normalized_metadata_and_all_planned_directories(
         assert PLANNED_DIRECTORIES <= names
         assert "SHA256SUMS" in names
         assert "RELEASE-METADATA.json" in names
+        assert "fixtures/current-smoke/train.bin" in names
+        assert "sources/wikidata5m.lock.json" in names
+        assert "schemas/mit-cluster-profile-v1.schema.json" not in names
         assert "README.md" not in names
         assert not any(name.startswith("docs/") for name in names)
         assert not any(name.startswith("data/") for name in names)

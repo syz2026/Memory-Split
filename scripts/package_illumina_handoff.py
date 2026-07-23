@@ -27,8 +27,10 @@ PLANNED_DIRECTORIES = (
     "corpusgen/parallel/",
     "corpusgen/reasoning/",
     "evals/confirmatory/",
+    "fixtures/current-smoke/",
     "msctl/",
     "scripts/",
+    "sources/",
     "tests/",
     "train/",
     "vendor/tiktoken/",
@@ -63,6 +65,7 @@ _INCLUDED_SUFFIXES = {
     "msctl": {".py"},
     "organizer": {".py"},
     "scripts": {".py"},
+    "sources": {".json", ".txt"},
     "tests": {".bin", ".json", ".jsonl", ".md", ".py", ".txt", ".yaml", ".yml"},
     "train": {".py"},
     "vendor": None,
@@ -211,6 +214,18 @@ def _classification(path: str) -> str:
         return "included"
     if parts[0] == "cluster":
         return "excluded"
+    if path == "schemas/mit-cluster-profile-v1.schema.json":
+        return "excluded"
+    if parts[0] == "schemas":
+        return "unknown"
+    if (
+        len(parts) >= 3
+        and parts[0:2] == ("fixtures", "current-smoke")
+        and PurePosixPath(path).suffix.lower() in {".bin", ".json", ".jsonl"}
+    ):
+        return "included"
+    if parts[0] == "fixtures":
+        return "unknown"
     suffixes = _INCLUDED_SUFFIXES.get(parts[0])
     if parts[0] in _INCLUDED_SUFFIXES:
         if suffixes is None or PurePosixPath(path).suffix.lower() in suffixes:
