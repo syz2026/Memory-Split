@@ -111,26 +111,20 @@ _DISPOSABLE_COMPONENTS = {
     "caches",
     "snapshots",
 }
-_FORBIDDEN_DIRECTORY_COMPONENTS = {
-    "checkpoint",
-    "checkpoints",
-    "credential",
-    "credentials",
-    "data",
-    "gold",
-    "log",
-    "logs",
-    "output",
-    "outputs",
-    "sealed",
-    "sealed-gold",
-    "sealed_gold",
-}
-_FORBIDDEN_FILE_STEMS = _FORBIDDEN_DIRECTORY_COMPONENTS | {
-    "password",
-    "private-key",
-    "private_key",
-}
+_FORBIDDEN_COMPONENT_PATTERNS = tuple(
+    re.compile(pattern)
+    for pattern in (
+        r"checkpoints?(?:v[0-9]+)?",
+        r"credentials?(?:v[0-9]+)?",
+        r"data(?:set)?s?(?:v[0-9]+)?",
+        r"gold(?:v[0-9]+)?",
+        r"logs?(?:v[0-9]+)?",
+        r"outputs?(?:v[0-9]+)?",
+        r"pass(?:word|phrase)(?:v[0-9]+)?",
+        r"privatekeys?(?:v[0-9]+)?",
+        r"corpus(?:es)?(?:v[0-9]+)?",
+    )
+)
 _SHARED_SUFFIXES: dict[str, set[str]] = {
     "corpusgen": {".py"},
     "evals": {".py"},
@@ -214,10 +208,25 @@ _SECRET_PATTERNS = (
     _GENERIC_SECRET_ASSIGNMENT_PATTERN,
     _BEARER_TOKEN_PATTERN,
 )
-_SENSITIVE_FIELD_PATTERN = re.compile(
-    r"(?:^|_)(?:access_key|api_key|auth_token|client_secret|credential|"
-    r"password|private_key|secret|session_token|token)(?:$|_)",
-    re.IGNORECASE,
+_SENSITIVE_FIELD_EXACT = {
+    "credential",
+    "credentials",
+    "secret",
+    "token",
+}
+_SENSITIVE_FIELD_AFFIXES = (
+    "accesskey",
+    "accesstoken",
+    "apikey",
+    "authtoken",
+    "clientsecret",
+    "credential",
+    "credentials",
+    "passphrase",
+    "password",
+    "privatekey",
+    "secretkey",
+    "sessiontoken",
 )
 _TEXT_SUFFIXES = {".json", ".lock", ".md", ".py", ".sh", ".txt", ".yaml", ".yml"}
 _OBJECT_ID_PATTERN = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})")
@@ -327,6 +336,7 @@ class _Tracked:
 class _Collected:
     payload: dict[str, bytes]
     modes: dict[str, str]
+    tree_id: str
     members_sha256: str
     cohort_sha256: str
     profile_sha256: str
@@ -341,6 +351,8 @@ class _Staged:
     archive_fd: int
     archive_sha256: str
     archive_bytes: int
+    checksum_bytes: bytes
+    release_bytes: bytes
 
 
 class _UniqueSafeLoader(yaml.SafeLoader):
@@ -725,7 +737,11 @@ def _sanitized_git_environment() -> dict[str, str]:
     return environment
 
 
-def _run_git(repository: _Repository, *arguments: str) -> bytes:
+def _run_git(
+    repository: _Repository,
+    *arguments: str,
+    input_data: bytes | None = None,
+) -> bytes:
     _assert_repository_bindings(repository)
     try:
         completed = subprocess.run(
@@ -741,6 +757,7 @@ def _run_git(repository: _Repository, *arguments: str) -> bytes:
                 "core.untrackedCache=false",
                 *arguments,
             ],
+            input=input_data,
             capture_output=True,
             check=False,
             cwd="/",
@@ -781,6 +798,22 @@ def _clean_revision(repository: _Repository) -> str:
     if before != after:
         raise PackageError("Git HEAD changed during clean-tree verification")
     return before
+
+
+def _commit_tree(repository: _Repository, revision: str) -> str:
+    tree_id = (
+        _run_git(
+            repository,
+            "rev-parse",
+            "--verify",
+            f"{revision}^{{tree}}",
+        )
+        .decode("ascii", errors="strict")
+        .strip()
+    )
+    if _OBJECT_ID_PATTERN.fullmatch(tree_id) is None:
+        raise PackageError("Git commit does not identify a full tree ID")
+    return tree_id
 
 
 def _assert_repository_unchanged(
@@ -842,20 +875,38 @@ def _tracked_files(repository: _Repository, revision: str) -> list[_Tracked]:
     return sorted(result, key=lambda item: item.path)
 
 
+def _canonical_security_name(value: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "", value.lower())
+
+
+def _is_forbidden_component(value: str) -> bool:
+    canonical = _canonical_security_name(value)
+    if canonical.startswith("sealed"):
+        return True
+    return any(
+        pattern.fullmatch(canonical) is not None
+        for pattern in _FORBIDDEN_COMPONENT_PATTERNS
+    )
+
+
+def _is_sensitive_field_name(value: str) -> bool:
+    canonical = _canonical_security_name(value)
+    if canonical in _SENSITIVE_FIELD_EXACT:
+        return True
+    if canonical.endswith(("secret", "token")):
+        return True
+    return any(
+        concept in canonical for concept in _SENSITIVE_FIELD_AFFIXES
+    )
+
+
 def _path_contains_forbidden_content(path: str) -> bool:
-    parts = tuple(part.lower() for part in PurePosixPath(path).parts)
+    parts = PurePosixPath(path).parts
     if not parts:
         return False
-    if any(part in _FORBIDDEN_DIRECTORY_COMPONENTS for part in parts[:-1]):
+    if any(_is_forbidden_component(part) for part in parts[:-1]):
         return True
-    filename = parts[-1]
-    stem = PurePosixPath(filename).stem
-    return (
-        stem in _FORBIDDEN_FILE_STEMS
-        or "credential" in stem
-        or "sealed-gold" in stem
-        or "sealed_gold" in stem
-    )
+    return _is_forbidden_component(PurePosixPath(parts[-1]).stem)
 
 
 def _classification(path: str) -> str:
@@ -904,10 +955,43 @@ def _classification(path: str) -> str:
     return "unknown"
 
 
-def _read_blob(repository: _Repository, object_id: str) -> bytes:
-    if _OBJECT_ID_PATTERN.fullmatch(object_id) is None:
-        raise PackageError("Git tree contains an invalid blob ID")
-    return _run_git(repository, "cat-file", "blob", object_id)
+def _read_git_blobs(
+    repository: _Repository,
+    tracked: list[_Tracked],
+) -> dict[str, bytes]:
+    queries = b"".join(
+        item.object_id.encode("ascii") + b"\n" for item in tracked
+    )
+    output = _run_git(
+        repository,
+        "cat-file",
+        "--batch",
+        input_data=queries,
+    )
+    cursor = 0
+    blobs: dict[str, bytes] = {}
+    try:
+        for item in tracked:
+            header_end = output.index(b"\n", cursor)
+            header = output[cursor:header_end].decode("ascii").split()
+            if (
+                len(header) != 3
+                or header[0] != item.object_id
+                or header[1] != "blob"
+            ):
+                raise ValueError
+            size = int(header[2])
+            data_start = header_end + 1
+            data_end = data_start + size
+            if size < 0 or output[data_end : data_end + 1] != b"\n":
+                raise ValueError
+            blobs[item.path] = output[data_start:data_end]
+            cursor = data_end + 1
+    except (UnicodeDecodeError, ValueError) as error:
+        raise PackageError("Git blob snapshot response is malformed") from error
+    if cursor != len(output) or len(blobs) != len(tracked):
+        raise PackageError("Git blob snapshot response is incomplete")
+    return blobs
 
 
 def _scan_secret(path: str, data: bytes) -> None:
@@ -1128,7 +1212,7 @@ def _reject_sensitive_fields(value: object, *, label: str) -> None:
         for key, child in value.items():
             if not isinstance(key, str):
                 raise PackageError(f"{label} contains a non-string field")
-            if _SENSITIVE_FIELD_PATTERN.search(key):
+            if _is_sensitive_field_name(key):
                 raise PackageError(
                     f"{label} contains a static credential or secret field"
                 )
@@ -1187,6 +1271,7 @@ def _collect_payload(
     repository: _Repository,
     tracked: list[_Tracked],
     revision: str,
+    tree_id: str,
 ) -> _Collected:
     included: list[_Tracked] = []
     unknown: list[str] = []
@@ -1215,8 +1300,10 @@ def _collect_payload(
     payload: dict[str, bytes] = {}
     modes: dict[str, str] = {}
     member_rows: list[dict[str, object]] = []
+    _assert_repository_unchanged(repository, revision)
+    snapshot = _read_git_blobs(repository, included)
     for item in included:
-        data = _read_blob(repository, item.object_id)
+        data = snapshot[item.path]
         _scan_secret(item.path, data)
         payload[item.path] = data
         modes[item.path] = item.mode
@@ -1258,7 +1345,11 @@ def _collect_payload(
             "schema_version": 1,
             "package_format_version": PACKAGE_FORMAT_VERSION,
             "provider": PROVIDER,
-            "source": {"commit": revision, "dirty": False},
+            "source": {
+                "commit": revision,
+                "dirty": False,
+                "tree": tree_id,
+            },
             "seed_assignment": seed_assignment,
             "cohort_assignment": {
                 "path": COHORT_PATH,
@@ -1289,6 +1380,7 @@ def _collect_payload(
     return _Collected(
         payload=payload,
         modes=modes,
+        tree_id=tree_id,
         members_sha256=_sha256(sums),
         cohort_sha256=cohort_sha256,
         profile_sha256=profile_sha256,
@@ -1591,7 +1683,11 @@ def _build_staging(
                 "sha256": archive_hash,
                 "bytes": archive_bytes,
             },
-            "source": {"commit": revision, "dirty": False},
+            "source": {
+                "commit": revision,
+                "dirty": False,
+                "tree": collected.tree_id,
+            },
             "seed_assignment": collected.seed_assignment,
             "cohort_assignment": {
                 "path": COHORT_PATH,
@@ -1634,10 +1730,57 @@ def _build_staging(
             archive_fd=archive_fd,
             archive_sha256=archive_hash,
             archive_bytes=archive_bytes,
+            checksum_bytes=checksum_bytes,
+            release_bytes=release_bytes,
         )
     except Exception:
         os.close(archive_fd)
         raise
+
+
+def _verify_installed_release(
+    directory_fd: int,
+    *,
+    staged: _Staged,
+    collected: _Collected,
+    archive_name: str,
+) -> None:
+    expected_entries = {
+        archive_name,
+        f"{archive_name}.sha256",
+        RELEASE_RECEIPT_NAME,
+    }
+    if set(os.listdir(directory_fd)) != expected_entries:
+        raise PackageError("installed release has unexpected artifacts")
+    _assert_descriptor_names_entry(
+        directory_fd,
+        archive_name,
+        staged.archive_fd,
+    )
+    digest, size = _hash_descriptor(staged.archive_fd)
+    if digest != staged.archive_sha256 or size != staged.archive_bytes:
+        raise PackageError("installed archive identity verification failed")
+    _verify_zip_descriptor(
+        staged.archive_fd,
+        payload=collected.payload,
+        modes=collected.modes,
+    )
+    _verify_new_file_at(
+        directory_fd,
+        f"{archive_name}.sha256",
+        staged.checksum_bytes,
+    )
+    _verify_new_file_at(
+        directory_fd,
+        RELEASE_RECEIPT_NAME,
+        staged.release_bytes,
+    )
+    _assert_descriptor_names_entry(
+        directory_fd,
+        archive_name,
+        staged.archive_fd,
+    )
+    os.fsync(directory_fd)
 
 
 def _open_or_create_output(path: Path) -> tuple[Path, int]:
@@ -1863,10 +2006,64 @@ def _publish_staging_at(
     staging_name: str,
     staging_fd: int,
     release_id: str,
+    *,
+    staged: _Staged,
+    collected: _Collected,
+    archive_name: str,
 ) -> None:
     _assert_output_control(output_fd)
     _assert_staging_path(output_fd, staging_name, staging_fd)
     _rename_noreplace_at(output_fd, staging_name, release_id)
+    try:
+        _assert_staging_path(output_fd, release_id, staging_fd)
+        _verify_installed_release(
+            staging_fd,
+            staged=staged,
+            collected=collected,
+            archive_name=archive_name,
+        )
+        _assert_staging_path(output_fd, release_id, staging_fd)
+    except Exception as install_error:
+        try:
+            _quarantine_installed_release(output_fd, release_id)
+            os.fsync(output_fd)
+        except Exception as quarantine_error:
+            raise PackageError(
+                "unsafe installed release could not be quarantined"
+            ) from quarantine_error
+        raise PackageError(
+            "installed release identity or artifact verification failed"
+        ) from install_error
+
+
+def _quarantine_installed_release(
+    output_fd: int,
+    release_id: str,
+) -> str | None:
+    try:
+        os.stat(
+            release_id,
+            dir_fd=output_fd,
+            follow_symlinks=False,
+        )
+    except FileNotFoundError:
+        return None
+    for _ in range(128):
+        quarantine_name = (
+            f".{release_id}.{secrets.token_hex(8)}.quarantine"
+        )
+        try:
+            _rename_noreplace_at(
+                output_fd,
+                release_id,
+                quarantine_name,
+            )
+            return quarantine_name
+        except PackageError as error:
+            if error.code == "RELEASE_EXISTS":
+                continue
+            raise
+    raise PackageError("cannot allocate a unique release quarantine name")
 
 
 def _assert_external_output(
@@ -1903,9 +2100,14 @@ def build_handoff(
         if apply:
             _assert_external_output(repository, output_requested)
         revision = _clean_revision(repository)
-        tracked = _tracked_files(repository, revision)
-        collected = _collect_payload(repository, tracked, revision)
-        _assert_repository_unchanged(repository, revision)
+        tree_id = _commit_tree(repository, revision)
+        tracked = _tracked_files(repository, tree_id)
+        collected = _collect_payload(
+            repository,
+            tracked,
+            revision,
+            tree_id,
+        )
         release_suffix = collected.members_sha256[:16]
         release_id = f"aws-p5-r1-{release_suffix}"
         archive_name = f"ms-aws-p5-r1-{release_suffix}.zip"
@@ -1925,7 +2127,6 @@ def build_handoff(
                         release_id=release_id,
                         archive_name=archive_name,
                     )
-                    _assert_repository_unchanged(repository, revision)
                     _assert_descriptor_names_entry(
                         staging_fd,
                         archive_name,
@@ -1961,7 +2162,6 @@ def build_handoff(
                 release_id=release_id,
                 archive_name=archive_name,
             )
-            _assert_repository_unchanged(repository, revision)
             _assert_descriptor_names_entry(
                 staging_fd,
                 archive_name,
@@ -1973,9 +2173,12 @@ def build_handoff(
                 staging_name,
                 staging_fd,
                 release_id,
+                staged=staged,
+                collected=collected,
+                archive_name=archive_name,
             )
-            published = True
             os.fsync(output_fd)
+            published = True
             release_dir = output / release_id
             return ReleaseArtifacts(
                 release_dir=release_dir,

@@ -355,6 +355,7 @@ def test_double_build_is_byte_identical_and_emits_external_receipts(tmp_path):
     assert receipt["source"] == {
         "commit": _git(source, "rev-parse", "HEAD"),
         "dirty": False,
+        "tree": _git(source, "rev-parse", "HEAD^{tree}"),
     }
     assert receipt["seed_assignment"] == {
         "cohort_id": COHORT_ID,
@@ -402,6 +403,7 @@ def test_archive_contains_only_semantic_seed_pairs_and_hash_bound_metadata(
         assert metadata["source"] == {
             "commit": _git(source, "rev-parse", "HEAD"),
             "dirty": False,
+            "tree": _git(source, "rev-parse", "HEAD^{tree}"),
         }
         assert metadata["seed_assignment"] == {
             "cohort_id": COHORT_ID,
@@ -571,6 +573,77 @@ def test_inherited_git_controls_cannot_redirect_a_dirty_source(
     assert not out.exists()
 
 
+def test_snapshot_packages_requested_commit_after_source_path_substitution(
+    tmp_path,
+    monkeypatch,
+):
+    module = _load_module()
+    source = _minimal_repo(tmp_path, name="source")
+    alternate = _minimal_repo(tmp_path, name="alternate")
+    _write(
+        alternate / "AWS-P5-START.md",
+        "alternate repository bytes must never be packaged\n",
+    )
+    _commit(alternate, "change alternate package member")
+    expected_member = subprocess.check_output(
+        ["git", "-C", str(source), "show", "HEAD:AWS-P5-START.md"]
+    )
+    expected_commit = _git(source, "rev-parse", "HEAD")
+    expected_tree = _git(source, "rev-parse", "HEAD^{tree}")
+    original_snapshot = module._read_git_blobs
+    captured_source = tmp_path / "captured-source"
+    substituted = False
+
+    def substituting_snapshot(*args, **kwargs):
+        nonlocal substituted
+        snapshot = original_snapshot(*args, **kwargs)
+        os.rename(source, captured_source)
+        os.rename(alternate, source)
+        substituted = True
+        return snapshot
+
+    monkeypatch.setattr(module, "_read_git_blobs", substituting_snapshot)
+
+    artifacts = module.build_handoff(
+        source_root=source,
+        out_dir=tmp_path / "out",
+        apply=True,
+    )
+
+    assert substituted is True
+    with zipfile.ZipFile(artifacts.archive) as archive:
+        assert archive.read("AWS-P5-START.md") == expected_member
+        metadata = json.loads(archive.read("RELEASE-METADATA.json"))
+    assert metadata["source"] == {
+        "commit": expected_commit,
+        "dirty": False,
+        "tree": expected_tree,
+    }
+
+
+def test_snapshot_loads_release_members_in_one_batched_object_read(
+    tmp_path,
+    monkeypatch,
+):
+    module = _load_module()
+    source = _minimal_repo(tmp_path)
+    original_run = subprocess.run
+    cat_file_commands: list[tuple[str, ...]] = []
+
+    def recording_run(command, *args, **kwargs):
+        rendered = tuple(os.fspath(part) for part in command)
+        if "cat-file" in rendered:
+            cat_file_commands.append(rendered)
+        return original_run(command, *args, **kwargs)
+
+    monkeypatch.setattr(module.subprocess, "run", recording_run)
+
+    _build(module, source, tmp_path / "out")
+
+    assert len(cat_file_commands) == 1
+    assert cat_file_commands[0][-2:] == ("cat-file", "--batch")
+
+
 def test_packager_rejects_any_tracked_symlink(tmp_path):
     module = _load_module()
     source = _minimal_repo(tmp_path)
@@ -633,6 +706,13 @@ def test_packager_rejects_static_credential_fields_in_profile(tmp_path):
         "msctl/runtime/logs/helper.py",
         "evals/confirmatory/sealed/gold.py",
         "train/private/credentials/key.py",
+        "tests/helpers/sealed_gold_v2/answers.py",
+        "msctl/private/sealedGold/answers.py",
+        "evals/private/da-ta/corpus.py",
+        "train/private/out-puts/result.py",
+        "scripts/private/lo-gs/worker.py",
+        "tests/private/check_points/state.py",
+        "msctl/private/creden-tials/key.py",
     ],
 )
 def test_packager_rejects_forbidden_content_nested_in_allowed_trees(
@@ -716,6 +796,79 @@ def test_packager_recursively_rejects_secret_keys_without_echoing_values(
 
     assert "secret" in str(caught.value).lower()
     assert secret_value not in str(caught.value)
+
+
+@pytest.mark.parametrize(
+    ("relative", "sensitive_key"),
+    [
+        ("configs/current-dataset-lock.json", "client-secret"),
+        ("configs/preregistration-v2.yaml", "clientSecret"),
+        ("configs/current-dataset-lock.json", "apiKey"),
+        ("configs/preregistration-v2.yaml", "api-key"),
+        ("configs/current-dataset-lock.json", "accessKey"),
+        ("configs/preregistration-v2.yaml", "privateKey"),
+        ("configs/current-dataset-lock.json", "password"),
+        ("configs/preregistration-v2.yaml", "passphrase"),
+        ("configs/current-dataset-lock.json", "token"),
+        ("configs/preregistration-v2.yaml", "credentials"),
+    ],
+)
+def test_structured_credential_key_variants_are_rejected_without_values(
+    tmp_path,
+    relative,
+    sensitive_key,
+):
+    module = _load_module()
+    source = _minimal_repo(tmp_path)
+    credential_value = "structured-value-must-never-be-echoed"
+    if relative.endswith(".json"):
+        content = _canonical_json(
+            {
+                "schema_version": 1,
+                "nested": {sensitive_key: credential_value},
+            }
+        )
+    else:
+        content = (
+            "schema_version: 2\n"
+            "nested:\n"
+            f"  {sensitive_key}: {credential_value}\n"
+        )
+    (source / relative).write_text(content)
+    _commit(source, "add structured credential key variant")
+
+    with pytest.raises(module.PackageError) as caught:
+        module.build_handoff(
+            source_root=source,
+            out_dir=tmp_path / "out",
+            apply=True,
+        )
+
+    assert "secret" in str(caught.value).lower()
+    assert credential_value not in str(caught.value)
+
+
+def test_structured_scanner_allows_benign_token_measurement_keys(tmp_path):
+    module = _load_module()
+    source = _minimal_repo(tmp_path)
+    benign = {
+        "schema_version": 1,
+        "token_count": 1024,
+        "tokenizer_name": "fixture-tokenizer",
+        "tokens_per_step": 524_288,
+        "raw_target_tokens": 7_120_879_616,
+    }
+    (source / "configs/current-dataset-lock.json").write_text(
+        _canonical_json(benign)
+    )
+    _commit(source, "add benign token measurement keys")
+
+    artifacts = _build(module, source, tmp_path / "out")
+
+    with zipfile.ZipFile(artifacts.archive) as archive:
+        assert json.loads(
+            archive.read("configs/current-dataset-lock.json")
+        ) == benign
 
 
 def test_packager_rejects_unknown_tracked_path(tmp_path):
@@ -950,6 +1103,43 @@ def test_staging_path_replacement_cannot_publish_a_release(
             not path.name.startswith(".") or path.name == "RELEASE-AWS-P5.json"
             for path in out.iterdir()
         )
+
+
+def test_last_boundary_staging_replacement_is_quarantined(
+    tmp_path,
+    monkeypatch,
+):
+    module = _load_module()
+    source = _minimal_repo(tmp_path)
+    out = tmp_path / "out"
+    original_rename = module._rename_noreplace_at
+    raced = False
+
+    def racing_rename(directory_fd, source_name, destination_name):
+        nonlocal raced
+        if not raced and source_name.endswith(".staging"):
+            moved = f"{source_name}.last-boundary"
+            os.rename(
+                source_name,
+                moved,
+                src_dir_fd=directory_fd,
+                dst_dir_fd=directory_fd,
+            )
+            os.mkdir(source_name, 0o700, dir_fd=directory_fd)
+            raced = True
+        return original_rename(directory_fd, source_name, destination_name)
+
+    monkeypatch.setattr(module, "_rename_noreplace_at", racing_rename)
+
+    with pytest.raises(
+        module.PackageError,
+        match="installed|staging|identity|replaced|descriptor",
+    ):
+        module.build_handoff(source_root=source, out_dir=out, apply=True)
+
+    assert raced is True
+    if out.exists():
+        assert not any(not path.name.startswith(".") for path in out.iterdir())
 
 
 def test_apply_rejects_group_or_world_writable_output_parent(tmp_path):
