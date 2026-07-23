@@ -41,7 +41,7 @@ MyDrive/memorysplit/compose_split_s0/
 The notebook writes continued checkpoints and evaluations under:
 
 ```text
-MyDrive/memorysplit/kqa/runs/
+MyDrive/memorysplit_kqa_outputs/runs/
 ```
 
 KQA JSON, prepared artifacts, packed `*.bin` shards, and tokenizer cache stay
@@ -49,6 +49,10 @@ under `/content` while active. Do not train directly from Drive-backed memmaps;
 Drive FUSE is too slow and unreliable for random packed-shard reads.
 The notebook also stages source weights onto local disk before loading them and
 verifies their SHA-256 digests.
+
+The source `memorysplit` folder may be a read-only shared-folder shortcut.
+Outputs deliberately go to a separate writable folder owned by the account
+mounted in Colab.
 
 ## Colab runtime
 
