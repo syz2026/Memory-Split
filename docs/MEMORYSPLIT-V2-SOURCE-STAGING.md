@@ -107,6 +107,14 @@ that private partial stage. In particular, recovery from a sealed-evaluation
 audit failure must omit `--restart`; the completed FineMath and Wikidata
 training transactions remain valid and are reused.
 
+Objective workers run from private work scratch with
+`PYTHONDONTWRITEBYTECODE=1`, never from a staged source directory. If an older
+worker already left PEP 3147 bytecode in a private partial objective tree,
+resume removes only `__pycache__` artifacts that map to a locked Python source
+inside that component. Published verification performs no cleanup, and any
+unrecognized, orphaned, symlinked, or unrelated extra still fails strict tree
+verification.
+
 On success, the command prints the immutable receipt path and SHA-256. The
 receipt is:
 

@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import fcntl
 import hashlib
+import importlib.util
 import io
 import json
+import py_compile
 import tarfile
 from pathlib import Path
 
@@ -378,6 +380,33 @@ def _rebind_receipt_inventory(source_root: Path, receipt: dict) -> None:
     receipt["files"] = files
     receipt["inventory_sha256"] = v2_sources._tree_digest(files)
     (source_root / v2_sources.RECEIPT_NAME).write_bytes(_json_bytes(receipt))
+
+
+def _private_stage_after_objective_extraction(
+    lock,
+    data_root: Path,
+    monkeypatch,
+) -> Path:
+    original = v2_sources._build_finemath_selection
+
+    def interrupt_after_objective(*args, **kwargs):
+        raise RuntimeError("simulated post-objective interruption")
+
+    monkeypatch.setattr(
+        v2_sources,
+        "_build_finemath_selection",
+        interrupt_after_objective,
+    )
+    with pytest.raises(RuntimeError, match="post-objective interruption"):
+        stage_v2_sources(
+            lock,
+            data_root,
+            execute=True,
+            reserve_bytes=0,
+            disk_free_bytes=10 * 1024**3,
+        )
+    monkeypatch.setattr(v2_sources, "_build_finemath_selection", original)
+    return data_root / ".memorysplit-v2-source-stage" / lock.sha256
 
 
 def test_committed_source_locks_bind_real_upstream_bytes_and_licenses():
@@ -801,6 +830,143 @@ def test_wikidata_sealed_derivation_resumes_completed_training_state(
     assert (
         source_root / "wikidata5m" / "selection" / training_index.name
     ).stat().st_mtime_ns == index_mtime
+
+
+def test_private_objective_resume_removes_only_locked_python_bytecode(
+    tmp_path,
+    monkeypatch,
+):
+    lock = _fixture_lock(tmp_path)
+    data_root = tmp_path / "data"
+    private = _private_stage_after_objective_extraction(
+        lock,
+        data_root,
+        monkeypatch,
+    )
+    source = lock.sources["objective_auxiliary"]["sources"][0]
+    component = source["components"][0]
+    python_record = next(
+        record for record in component["files"] if record["path"].endswith(".py")
+    )
+    component_root = (
+        private
+        / "payload"
+        / "objective_auxiliary"
+        / source["id"]
+        / component["id"]
+    )
+    python_source = component_root / python_record["path"]
+    original_source = python_source.read_bytes()
+    bytecode = Path(importlib.util.cache_from_source(str(python_source)))
+    bytecode.parent.mkdir(parents=True, exist_ok=True)
+    py_compile.compile(
+        str(python_source),
+        cfile=str(bytecode),
+        doraise=True,
+    )
+
+    receipt = stage_v2_sources(
+        lock,
+        data_root,
+        execute=True,
+        reserve_bytes=0,
+        disk_free_bytes=10 * 1024**3,
+    )
+    published_component = (
+        data_root
+        / lock.dataset_id
+        / "objective_auxiliary"
+        / source["id"]
+        / component["id"]
+    )
+    assert receipt["stage_complete"] is True
+    assert not (
+        published_component
+        / bytecode.relative_to(component_root)
+    ).exists()
+    assert (
+        published_component / python_record["path"]
+    ).read_bytes() == original_source
+
+
+@pytest.mark.parametrize(
+    "extra_relative",
+    [
+        "unexpected.txt",
+        "__pycache__/unexpected.txt",
+        "__pycache__/orphan.cpython-312.pyc",
+        "locked-invalid-pyc",
+    ],
+)
+def test_private_objective_resume_still_rejects_arbitrary_extras(
+    tmp_path,
+    monkeypatch,
+    extra_relative,
+):
+    lock = _fixture_lock(tmp_path)
+    data_root = tmp_path / "data"
+    private = _private_stage_after_objective_extraction(
+        lock,
+        data_root,
+        monkeypatch,
+    )
+    source = lock.sources["objective_auxiliary"]["sources"][0]
+    component = source["components"][0]
+    component_root = (
+        private
+        / "payload"
+        / "objective_auxiliary"
+        / source["id"]
+        / component["id"]
+    )
+    if extra_relative == "locked-invalid-pyc":
+        python_record = next(
+            record
+            for record in component["files"]
+            if record["path"].endswith(".py")
+        )
+        extra = Path(
+            importlib.util.cache_from_source(
+                str(component_root / python_record["path"])
+            )
+        )
+    else:
+        extra = component_root / extra_relative
+    extra.parent.mkdir(parents=True, exist_ok=True)
+    extra.write_bytes(b"arbitrary extra")
+
+    with pytest.raises(SourceDriftError, match="tree namespace drift"):
+        stage_v2_sources(
+            lock,
+            data_root,
+            execute=True,
+            reserve_bytes=0,
+            disk_free_bytes=10 * 1024**3,
+        )
+    assert extra.read_bytes() == b"arbitrary extra"
+
+
+def test_private_objective_bytecode_cleanup_is_path_confined(tmp_path):
+    lock = _fixture_lock(tmp_path)
+    private = tmp_path / "private" / lock.sha256
+    private.mkdir(parents=True)
+    outside = tmp_path / "outside"
+    source = outside / "locked.py"
+    source.parent.mkdir()
+    source.write_bytes(b"VALUE = 1\n")
+    bytecode = Path(importlib.util.cache_from_source(str(source)))
+    bytecode.parent.mkdir()
+    bytecode.write_bytes(b"outside bytecode")
+
+    with pytest.raises(SourceDriftError, match="escapes private stage"):
+        v2_sources._remove_private_objective_bytecode(
+            outside,
+            [{"path": "locked.py"}],
+            private_stage_root=private,
+            source_set_lock_sha256=lock.sha256,
+        )
+    assert source.read_bytes() == b"VALUE = 1\n"
+    assert bytecode.read_bytes() == b"outside bytecode"
 
 
 def test_completed_http_partial_resumes_without_redownload(tmp_path):

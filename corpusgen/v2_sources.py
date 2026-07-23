@@ -5,6 +5,7 @@ from __future__ import annotations
 import contextlib
 import fcntl
 import hashlib
+import importlib.util
 import json
 import mmap
 import os
@@ -1066,14 +1067,89 @@ def _verify_tree(
         _verify_file(root / relative, expected[relative], f"{label} file")
 
 
+def _remove_private_objective_bytecode(
+    destination: Path,
+    records: Sequence[Mapping[str, Any]],
+    *,
+    private_stage_root: Path,
+    source_set_lock_sha256: str,
+) -> list[str]:
+    """Remove only PEP 3147 caches for locked Python files in a private stage."""
+
+    stage = Path(os.path.abspath(private_stage_root))
+    target = Path(os.path.abspath(destination))
+    if (
+        stage.name != source_set_lock_sha256
+        or not _SHA256_RE.fullmatch(source_set_lock_sha256)
+        or not stage.is_dir()
+        or stage.is_symlink()
+    ):
+        raise SourceDriftError("objective bytecode cleanup stage identity drift")
+    try:
+        relative = target.relative_to(stage)
+    except ValueError as error:
+        raise SourceDriftError(
+            "objective bytecode cleanup target escapes private stage"
+        ) from error
+    if (
+        len(relative.parts) != 4
+        or relative.parts[:2] != ("payload", "objective_auxiliary")
+        or _safe_destination(stage, relative.as_posix()) != target
+        or not target.is_dir()
+        or target.is_symlink()
+    ):
+        raise SourceDriftError(
+            "objective bytecode cleanup target is not a private component tree"
+        )
+
+    locked_python_sources = {
+        _safe_destination(target, str(record["path"]))
+        for record in records
+        if str(record["path"]).endswith(".py")
+    }
+    removed: list[str] = []
+    for directory, _, _ in os.walk(target, topdown=False):
+        cache = Path(directory)
+        if cache.name != "__pycache__" or cache.is_symlink() or not cache.is_dir():
+            continue
+        for artifact in sorted(cache.iterdir(), key=lambda path: path.name):
+            if artifact.is_symlink() or not artifact.is_file():
+                continue
+            try:
+                source = Path(importlib.util.source_from_cache(str(artifact)))
+            except ValueError:
+                continue
+            if source not in locked_python_sources or artifact.stat().st_size < 16:
+                continue
+            with artifact.open("rb") as stream:
+                if stream.read(4) != importlib.util.MAGIC_NUMBER:
+                    continue
+            if source.is_symlink() or not source.is_file():
+                continue
+            artifact.unlink()
+            removed.append(artifact.relative_to(target).as_posix())
+        if not any(cache.iterdir()):
+            cache.rmdir()
+    return removed
+
+
 def _extract_auxiliary_component(
     archive_path: Path,
     source_id: str,
     component: Mapping[str, Any],
     destination: Path,
+    *,
+    private_stage_root: Path,
+    source_set_lock_sha256: str,
 ) -> None:
     records = component["files"]
     if destination.exists() or destination.is_symlink():
+        _remove_private_objective_bytecode(
+            destination,
+            records,
+            private_stage_root=private_stage_root,
+            source_set_lock_sha256=source_set_lock_sha256,
+        )
         _verify_tree(destination, records, label=f"{source_id}/{component['id']}")
         return
     expected = {str(item["path"]): item for item in records}
@@ -2647,6 +2723,8 @@ def stage_v2_sources(
                     str(source["id"]),
                     component,
                     objective_root / str(source["id"]) / str(component["id"]),
+                    private_stage_root=paths["stage"],
+                    source_set_lock_sha256=lock.sha256,
                 )
 
         extracted_wikidata = _extract_wikidata(

@@ -2180,11 +2180,27 @@ class _ObjectiveWorkerClient:
         python: Path,
         log_root: Path,
     ) -> None:
-        log_root.mkdir(parents=True, exist_ok=True)
         self.provider = provider
+        worker_cwd = log_root / "workers" / provider
+        source_resolved = source_dir.resolve()
+        worker_cwd_resolved = worker_cwd.resolve()
+        if (
+            source_resolved == worker_cwd_resolved
+            or source_resolved in worker_cwd_resolved.parents
+            or worker_cwd_resolved in source_resolved.parents
+        ):
+            raise V2MaterializationError(
+                "objective_work_root_overlaps_source",
+                "objective worker scratch directory overlaps its staged source",
+                lane="objective_auxiliary",
+                action="use a work root disjoint from the immutable source stage",
+            )
+        log_root.mkdir(parents=True, exist_ok=True)
         self.log_handle = (log_root / f"{provider}.stderr.log").open("ab")
+        worker_cwd.mkdir(parents=True, exist_ok=True)
         env = dict(os.environ)
         repository = str(Path(__file__).resolve().parents[1])
+        env["PYTHONDONTWRITEBYTECODE"] = "1"
         env["PYTHONHASHSEED"] = "0"
         env["PYTHONNOUSERSITE"] = "1"
         env["PYTHONPATH"] = repository
@@ -2200,7 +2216,7 @@ class _ObjectiveWorkerClient:
                     "--source-dir",
                     str(source_dir),
                 ],
-                cwd=source_dir,
+                cwd=worker_cwd,
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 stderr=self.log_handle,
@@ -3299,6 +3315,19 @@ def materialize_v2_source_root(
     )
     if checkpoint_tokens <= 0 or finish_window <= 0 or max_finish_candidates <= 0:
         raise ValueError("materializer checkpoint and finish options must be positive")
+    stage_resolved = stage.resolve()
+    work_resolved = work.resolve()
+    if (
+        stage_resolved == work_resolved
+        or stage_resolved in work_resolved.parents
+        or work_resolved in stage_resolved.parents
+    ):
+        raise V2MaterializationError(
+            "work_root_overlaps_source_stage",
+            "materializer work root overlaps the immutable source stage",
+            lane="objective_auxiliary",
+            action="use a work root disjoint from the immutable source stage",
+        )
     work.mkdir(parents=True, exist_ok=True)
     stage_receipt = verify_v2_source_stage(lock, stage)
     objective_runtime = _preflight_objective_runtime(

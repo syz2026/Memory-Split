@@ -1,3 +1,4 @@
+import io
 import json
 import sqlite3
 import subprocess
@@ -144,6 +145,121 @@ def test_objective_seed_schedule_is_collision_free_over_record_attempts():
         for attempt in range(4)
     }
     assert len(seeds) == 8_000
+
+
+def test_objective_worker_disables_bytecode_and_uses_scratch_cwd(
+    tmp_path,
+    monkeypatch,
+):
+    source = tmp_path / "immutable-source"
+    source.mkdir()
+    log_root = tmp_path / "work" / "logs"
+    captured = {}
+
+    class _Process:
+        def __init__(self):
+            self.stdin = io.BytesIO()
+            self.stdout = io.BytesIO(
+                json.dumps(
+                    {
+                        "format": materialize_module.WORKER_FORMAT,
+                        "provider": "fixture",
+                        "ready": True,
+                        "runtime": {"python": "fixture"},
+                    }
+                ).encode()
+                + b"\n"
+            )
+
+        def poll(self):
+            return None
+
+        def terminate(self):
+            return None
+
+        def wait(self, timeout):
+            return 0
+
+    def popen(argv, **kwargs):
+        captured["argv"] = argv
+        captured.update(kwargs)
+        return _Process()
+
+    monkeypatch.setenv("PYTHONDONTWRITEBYTECODE", "0")
+    monkeypatch.setattr(materialize_module.subprocess, "Popen", popen)
+    client = materialize_module._ObjectiveWorkerClient(
+        "fixture",
+        source,
+        python=Path(sys.executable),
+        log_root=log_root,
+    )
+    client.close()
+
+    assert captured["env"]["PYTHONDONTWRITEBYTECODE"] == "1"
+    assert captured["cwd"] == log_root / "workers" / "fixture"
+    assert captured["cwd"] != source
+    assert list(source.iterdir()) == []
+
+
+def test_objective_worker_rejects_scratch_inside_staged_source(tmp_path):
+    source = tmp_path / "immutable-source"
+    source.mkdir()
+
+    with pytest.raises(V2MaterializationError) as captured:
+        materialize_module._ObjectiveWorkerClient(
+            "fixture",
+            source,
+            python=Path(sys.executable),
+            log_root=source / "work",
+        )
+
+    assert captured.value.code == "objective_work_root_overlaps_source"
+    assert list(source.iterdir()) == []
+
+
+def test_materializer_rejects_work_root_inside_source_stage(tmp_path):
+    stage = tmp_path / "stage"
+    stage.mkdir()
+    work = stage / "work"
+
+    with pytest.raises(V2MaterializationError) as captured:
+        materialize_module.materialize_v2_source_root(
+            stage,
+            tmp_path / "published",
+            work,
+        )
+
+    assert captured.value.code == "work_root_overlaps_source_stage"
+    assert not work.exists()
+
+
+def test_prontoqa_import_reads_locked_relative_resource_from_scratch(
+    tmp_path,
+    monkeypatch,
+):
+    source = tmp_path / "prontoqa"
+    source.mkdir()
+    (source / "bad_patterns.txt").write_text("locked pattern\n", encoding="utf-8")
+    (source / "run_experiment.py").write_text(
+        "from pathlib import Path\n"
+        "RESOURCE = Path('bad_patterns.txt').read_text(encoding='utf-8')\n",
+        encoding="utf-8",
+    )
+    scratch = tmp_path / "scratch"
+    scratch.mkdir()
+    original_path = list(sys.path)
+    monkeypatch.chdir(scratch)
+    monkeypatch.setattr(sys, "dont_write_bytecode", True)
+    monkeypatch.delitem(sys.modules, "run_experiment", raising=False)
+    try:
+        provider = objective_module._ProntoQA(source)
+    finally:
+        sys.path[:] = original_path
+        sys.modules.pop("run_experiment", None)
+
+    assert provider._module.RESOURCE == "locked pattern\n"
+    assert Path.cwd() == scratch
+    assert not (source / "__pycache__").exists()
 
 
 def test_prontoqa_rejection_sampling_resets_state_and_rotates_depth():

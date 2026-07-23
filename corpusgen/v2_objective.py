@@ -331,7 +331,11 @@ class _ProntoQA:
 
     def __init__(self, root: Path):
         sys.path.insert(0, str(root))
-        import run_experiment
+        # Upstream reads bad_patterns.txt relative to the process directory at
+        # import time. Resolve that locked resource without leaving the worker
+        # in the immutable source tree for subsequent generation.
+        with contextlib.chdir(root):
+            import run_experiment
 
         self._module = run_experiment
 
