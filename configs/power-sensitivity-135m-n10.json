@@ -1,0 +1,13 @@
+{
+  "approximate_power": 0.8,
+  "claim_90_percent_power": false,
+  "cohort_id": "memorysplit-confirmatory-v2-135m-n10",
+  "fixed_cohort": true,
+  "independent_pilot_required_for_90_percent_claim": true,
+  "n_pairs": 10,
+  "paired_seed_sd_absolute_accuracy": 0.02,
+  "planning_effect_absolute_accuracy": 0.02,
+  "planning_method": "conservative_exact-sign-flip sensitivity approximation",
+  "preregistered_before_protected_launch": true,
+  "schema_version": 1
+}

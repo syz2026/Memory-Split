@@ -46,6 +46,7 @@ COMMON_FILES = frozenset(
         "cluster/profiles/paired-slurm-profile-v1.schema.json",
         "cluster/slurm/v2_pair_evaluate.sbatch",
         "cluster/slurm/v2_pair_train.sbatch",
+        "configs/power-sensitivity-135m-n10.json",
         "configs/preregistration-135m-v1.yaml",
         "configs/reasoning-dataset-v2.json",
         "docs/SLURM-135M-RUNBOOK.md",
@@ -56,6 +57,7 @@ COMMON_FILES = frozenset(
         "scripts/make_135m_role_manifest.py",
         "scripts/package_135m_slurm_cohort.py",
         "scripts/run_135m_pair.py",
+        "scripts/run_confirmatory_135m.py",
         "scripts/run_evals.py",
         "scripts/run_train.py",
         "scripts/stage_135m_dataset.py",
@@ -229,6 +231,7 @@ def _release_payload(
 
     eval_paths = [path for path in common if path.startswith("evals/")]
     scientific_paths = [
+        "configs/power-sensitivity-135m-n10.json",
         "configs/preregistration-135m-v1.yaml",
         "configs/reasoning-dataset-v2.json",
         "DATASET-POINTER-SLURM-135M.json",

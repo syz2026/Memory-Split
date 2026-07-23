@@ -221,6 +221,7 @@ def _verify_one(path: Path, *, source_root: Path) -> dict:
 
     eval_paths = [member for member in common if member.startswith("evals/")]
     scientific = [
+        "configs/power-sensitivity-135m-n10.json",
         "configs/preregistration-135m-v1.yaml",
         "configs/reasoning-dataset-v2.json",
         "DATASET-POINTER-SLURM-135M.json",
