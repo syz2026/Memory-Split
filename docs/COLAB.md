@@ -19,25 +19,29 @@ create structure-only skeleton labels, and enforce leakage checks.
 ## Drive layout
 
 Each source model must be a complete run directory containing `config.yaml`
-and either the model-only `model.pt` (preferred) or a full `ckpt.pt`. The
-checkpoint must contain its completed training `step` metadata. The two source
-configs must agree on architecture, seed, schedule, optimizer settings,
-microbatching, precision, and completion step:
+and one of: model-only `model.pt`, full `ckpt.pt`, or
+`snapshots/step*.pt`. The notebook selects the latest numbered snapshot when
+no root checkpoint exists; explicit snapshot overrides are available in the
+first cell. The selected checkpoint must contain its training `step`
+metadata. The two source configs must agree on architecture, seed, schedule,
+optimizer settings, microbatching, precision, and selected completion step:
 
 ```text
-MyDrive/memory-split/models/dense_run/
+MyDrive/memorysplit/compose_dense_s0/
 ├── config.yaml
-└── model.pt  # or ckpt.pt
+└── snapshots/
+    └── stepNNNNNNN.pt
 
-MyDrive/memory-split/models/split_run/
+MyDrive/memorysplit/compose_split_s0/
 ├── config.yaml
-└── model.pt  # or ckpt.pt
+└── snapshots/
+    └── stepNNNNNNN.pt
 ```
 
 The notebook writes continued checkpoints and evaluations under:
 
 ```text
-MyDrive/memory-split/kqa/runs/
+MyDrive/memorysplit/kqa/runs/
 ```
 
 KQA JSON, prepared artifacts, packed `*.bin` shards, and tokenizer cache stay
