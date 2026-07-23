@@ -10,9 +10,11 @@ import json
 import math
 import os
 import re
+import secrets
 import signal
 import stat
 import subprocess
+import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -38,15 +40,45 @@ class CommandResult:
     stderr: str
 
 
+@dataclass(frozen=True)
+class UploadedObject:
+    uri: str
+    sha256: str
+    bytes: int
+
+
+@dataclass(frozen=True)
+class _FileIdentity:
+    device: int
+    inode: int
+    size: int
+    mtime_ns: int
+    ctime_ns: int
+    mode: int
+    links: int
+    uid: int
+    gid: int
+
+
+@dataclass(frozen=True)
+class _PinnedCheckpoint:
+    arm: str
+    path: Path
+    bytes: int
+    sha256: str
+    identity: _FileIdentity
+
+
 class VerifiedObjectStore(Protocol):
     def put_verified(
         self,
         path: Path,
         uri: str,
         *,
+        expected_sha256: str,
         deadline: float,
         monotonic: Callable[[], float],
-    ) -> bool: ...
+    ) -> UploadedObject | None: ...
 
 
 @dataclass(frozen=True)
@@ -85,6 +117,8 @@ class InterruptionRequest:
             not isinstance(path, Path) for path in self.checkpoint_paths.values()
         ):
             raise ValueError("checkpoint paths must be pathlib Paths")
+        if not isinstance(self.receipt_path, Path):
+            raise ValueError("interruption receipt path must be a pathlib Path")
         for label, digest in (
             ("release", self.release_sha256),
             ("corpus receipt", self.corpus_receipt_sha256),
@@ -237,18 +271,24 @@ class S3ObjectStore:
         path: Path,
         uri: str,
         *,
+        expected_sha256: str,
         deadline: float,
         monotonic: Callable[[], float] = time.monotonic,
-    ) -> bool:
+    ) -> UploadedObject | None:
         if path.is_symlink() or not path.is_file():
-            return False
+            return None
+        if (
+            not isinstance(expected_sha256, str)
+            or _SHA256_RE.fullmatch(expected_sha256) is None
+        ):
+            raise ValueError("expected object SHA-256 must be lowercase hex")
         if (
             isinstance(deadline, bool)
             or not isinstance(deadline, (int, float))
             or not math.isfinite(deadline)
             or monotonic() >= float(deadline)
         ):
-            return False
+            return None
         bucket, key = _split_s3_uri(uri)
         before = path.stat()
         raw_digest = hashlib.sha256(path.read_bytes()).digest()
@@ -264,11 +304,15 @@ class S3ObjectStore:
             after_hash.st_size,
             after_hash.st_mtime_ns,
         ):
-            return False
+            return None
+        digest = raw_digest.hex()
+        if digest != expected_sha256:
+            return None
         checksum = base64.b64encode(raw_digest).decode("ascii")
         remaining = float(deadline) - monotonic()
         if remaining <= 0:
-            return False
+            return None
+        put = None
         try:
             put = self._runner(
                 [
@@ -285,6 +329,10 @@ class S3ObjectStore:
                     "SHA256",
                     "--checksum-sha256",
                     checksum,
+                    "--metadata",
+                    f"sha256={digest}",
+                    "--if-none-match",
+                    "*",
                     "--region",
                     self._region,
                     "--output",
@@ -295,10 +343,11 @@ class S3ObjectStore:
                 remaining,
             )
         except (OSError, subprocess.SubprocessError):
-            return False
-        put_value = _load_json_output(put)
-        if put_value is None or put_value.get("ChecksumSHA256") != checksum:
-            return False
+            put = None
+        if put is not None and put.returncode == 0:
+            put_value = _load_json_output(put)
+            if put_value is None or put_value.get("ChecksumSHA256") != checksum:
+                return None
         after_upload = path.stat()
         if (
             before.st_ino,
@@ -311,10 +360,10 @@ class S3ObjectStore:
             after_upload.st_size,
             after_upload.st_mtime_ns,
         ):
-            return False
+            return None
         remaining = float(deadline) - monotonic()
         if remaining <= 0:
-            return False
+            return None
         try:
             head = self._runner(
                 [
@@ -337,12 +386,20 @@ class S3ObjectStore:
                 remaining,
             )
         except (OSError, subprocess.SubprocessError):
-            return False
+            return None
         head_value = _load_json_output(head)
-        return (
-            head_value is not None
-            and head_value.get("ChecksumSHA256") == checksum
-            and monotonic() < float(deadline)
+        if (
+            head_value is None
+            or head_value.get("ChecksumSHA256") != checksum
+            or head_value.get("ContentLength") != before.st_size
+            or head_value.get("Metadata") != {"sha256": digest}
+            or monotonic() >= float(deadline)
+        ):
+            return None
+        return UploadedObject(
+            uri=uri,
+            sha256=digest,
+            bytes=before.st_size,
         )
 
 
@@ -359,64 +416,249 @@ def _canonical_json(value: object) -> bytes:
     ).encode("ascii")
 
 
-def _write_receipt(path: Path, value: object) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    if path.is_symlink():
-        raise ValueError("interruption receipt path must not be a symlink")
-    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+def _identity(metadata: os.stat_result) -> _FileIdentity:
+    return _FileIdentity(
+        device=metadata.st_dev,
+        inode=metadata.st_ino,
+        size=metadata.st_size,
+        mtime_ns=metadata.st_mtime_ns,
+        ctime_ns=metadata.st_ctime_ns,
+        mode=metadata.st_mode,
+        links=metadata.st_nlink,
+        uid=metadata.st_uid,
+        gid=metadata.st_gid,
+    )
+
+
+def _open_checkpoint(path: Path) -> int | None:
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
     try:
-        with temporary.open("xb") as handle:
-            handle.write(_canonical_json(value))
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.chmod(temporary, 0o600)
-        os.replace(temporary, path)
+        descriptor = os.open(path, flags)
+    except FileNotFoundError:
+        return None
+    except OSError as error:
+        raise ValueError(f"checkpoint path is unsafe: {path}") from error
+    metadata = os.fstat(descriptor)
+    if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+        os.close(descriptor)
+        raise ValueError(f"checkpoint must be a singly linked regular file: {path}")
+    return descriptor
+
+
+def _checkpoint_identity(path: Path) -> _FileIdentity | None:
+    descriptor = _open_checkpoint(path)
+    if descriptor is None:
+        return None
+    try:
+        return _identity(os.fstat(descriptor))
     finally:
-        if temporary.exists():
-            temporary.unlink()
+        os.close(descriptor)
 
 
-def _stable_checkpoint(
-    path: Path,
+def _generation_changed(
+    baseline: _FileIdentity | None,
+    current: _FileIdentity,
+) -> bool:
+    return baseline is None or (
+        baseline.device,
+        baseline.inode,
+    ) != (
+        current.device,
+        current.inode,
+    )
+
+
+def _stage_checkpoint(
+    arm: str,
+    source: Path,
+    expected: _FileIdentity,
+    staging: Path,
+) -> _PinnedCheckpoint | None:
+    descriptor = _open_checkpoint(source)
+    if descriptor is None:
+        return None
+    temporary = staging / f".{arm}.checkpoint.tmp"
+    try:
+        before = _identity(os.fstat(descriptor))
+        if before != expected or before.size <= 0:
+            return None
+        digest = hashlib.sha256()
+        copied = 0
+        with temporary.open("xb") as output:
+            while True:
+                chunk = os.read(descriptor, 1 << 20)
+                if not chunk:
+                    break
+                output.write(chunk)
+                digest.update(chunk)
+                copied += len(chunk)
+            output.flush()
+            os.fsync(output.fileno())
+        after = _identity(os.fstat(descriptor))
+        if after != before or copied != before.size:
+            temporary.unlink(missing_ok=True)
+            return None
+        checkpoint_digest = digest.hexdigest()
+        pinned = staging / f"{arm}-{checkpoint_digest}.pt"
+        os.chmod(temporary, 0o400)
+        os.rename(temporary, pinned)
+        directory_fd = os.open(staging, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+        return _PinnedCheckpoint(
+            arm=arm,
+            path=pinned,
+            bytes=copied,
+            sha256=checkpoint_digest,
+            identity=before,
+        )
+    finally:
+        os.close(descriptor)
+        temporary.unlink(missing_ok=True)
+
+
+def _stabilize_checkpoints(
+    request: InterruptionRequest,
     *,
+    baselines: Mapping[str, _FileIdentity | None],
+    staging: Path,
     deadline: float,
     monotonic: Callable[[], float],
     sleep: Callable[[float], None],
-) -> tuple[int, str] | None:
-    previous: tuple[int, int, int] | None = None
-    while monotonic() <= deadline:
-        if not path.is_symlink() and path.is_file():
-            first = path.stat()
-            identity = (first.st_ino, first.st_size, first.st_mtime_ns)
-            if first.st_size > 0 and identity == previous:
-                data = path.read_bytes()
-                second = path.stat()
-                if (
-                    (second.st_ino, second.st_size, second.st_mtime_ns)
-                    == identity
-                    and len(data) == first.st_size
-                ):
-                    return len(data), hashlib.sha256(data).hexdigest()
-            previous = identity
+) -> dict[str, _PinnedCheckpoint | None]:
+    previous: dict[str, _FileIdentity | None] = {arm: None for arm in _ARMS}
+    resolved: dict[str, _PinnedCheckpoint | None] = {
+        arm: None for arm in _ARMS
+    }
+    while monotonic() <= deadline and any(
+        resolved[arm] is None for arm in _ARMS
+    ):
+        for arm in _ARMS:
+            if resolved[arm] is not None:
+                continue
+            current = _checkpoint_identity(request.checkpoint_paths[arm])
+            if (
+                current is None
+                or current.size <= 0
+                or not _generation_changed(baselines[arm], current)
+            ):
+                previous[arm] = None
+                continue
+            if previous[arm] == current:
+                resolved[arm] = _stage_checkpoint(
+                    arm,
+                    request.checkpoint_paths[arm],
+                    current,
+                    staging,
+                )
+                if resolved[arm] is None:
+                    previous[arm] = None
+            else:
+                previous[arm] = current
+        if all(resolved[arm] is not None for arm in _ARMS):
+            break
         remaining = deadline - monotonic()
         if remaining <= 0:
             break
         sleep(min(0.25, remaining))
-    return None
+    return resolved
 
 
-def _checkpoint_uri(request: InterruptionRequest, arm: str) -> str:
+def _checkpoint_uri(
+    request: InterruptionRequest,
+    arm: str,
+    digest: str,
+) -> str:
     return (
         f"{request.s3_root.rstrip('/')}/checkpoints/seed-{request.seed}/"
-        f"{arm}/checkpoint.pt"
+        f"{arm}/sha256/{digest}.pt"
     )
 
 
-def _receipt_uri(request: InterruptionRequest) -> str:
+def _evidence_uri(request: InterruptionRequest, digest: str) -> str:
+    return (
+        f"{request.s3_root.rstrip('/')}/receipts/interruption/evidence/"
+        f"sha256/{digest}.json"
+    )
+
+
+def _commit_uri(request: InterruptionRequest, nonce: str) -> str:
     return (
         f"{request.s3_root.rstrip('/')}/receipts/interruption/"
-        f"seed-{request.seed}.json"
+        f"resume-commits/seed-{request.seed}/{nonce}.json"
     )
+
+
+def _write_immutable_json(
+    path: Path,
+    value: object,
+    *,
+    deadline: float,
+    monotonic: Callable[[], float],
+) -> tuple[bytes, str] | None:
+    if monotonic() >= deadline:
+        return None
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    if path.exists() or path.is_symlink():
+        raise ValueError(f"immutable interruption object already exists: {path}")
+    payload = _canonical_json(value)
+    with path.open("xb") as handle:
+        handle.write(payload)
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.chmod(path, 0o400)
+    directory_fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
+    if monotonic() >= deadline:
+        return None
+    return payload, hashlib.sha256(payload).hexdigest()
+
+
+def _publish_local_handoff(
+    source: Path,
+    destination: Path,
+    *,
+    deadline: float,
+    monotonic: Callable[[], float],
+) -> bool:
+    if monotonic() >= deadline or destination.exists() or destination.is_symlink():
+        return False
+    destination.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    try:
+        os.link(source, destination, follow_symlinks=False)
+    except OSError:
+        return False
+    directory_fd = os.open(destination.parent, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
+    if monotonic() >= deadline:
+        destination.unlink(missing_ok=True)
+        return False
+    return True
+
+
+def _identity_evidence(value: _FileIdentity | None) -> dict[str, int] | None:
+    if value is None:
+        return None
+    return {
+        "ctime_ns": value.ctime_ns,
+        "device": value.device,
+        "gid": value.gid,
+        "inode": value.inode,
+        "mode": value.mode,
+        "mtime_ns": value.mtime_ns,
+        "size": value.size,
+        "uid": value.uid,
+    }
 
 
 def handle_interruption(
@@ -426,130 +668,197 @@ def handle_interruption(
     object_store: VerifiedObjectStore,
     monotonic: Callable[[], float] = time.monotonic,
     sleep: Callable[[float], None] = time.sleep,
+    commit_nonce: Callable[[], str] = lambda: secrets.token_hex(16),
 ) -> InterruptionResult:
-    """Checkpoint both arms and durably receipt them as one resumable pair."""
+    """Publish immutable evidence and one verified resume-commit handoff."""
 
     start = monotonic()
     deadline = start + float(request.timeout_seconds)
     checkpoint_deadline = deadline - float(request.upload_reserve_seconds)
+    if os.path.lexists(request.receipt_path):
+        raise ValueError("immutable interruption handoff already exists")
+    baselines = {
+        arm: _checkpoint_identity(request.checkpoint_paths[arm])
+        for arm in _ARMS
+    }
     signal_errors: dict[str, str] = {}
-    for arm in _ARMS:
-        try:
-            signal_process(request.rank_zero_pids[arm], signal.SIGUSR1)
-        except OSError as error:
-            signal_errors[arm] = type(error).__name__
+    request.receipt_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    with tempfile.TemporaryDirectory(
+        prefix=".interruption-upload-",
+        dir=request.receipt_path.parent,
+    ) as staging_text:
+        staging = Path(staging_text)
+        os.chmod(staging, 0o700)
+        for arm in _ARMS:
+            try:
+                signal_process(request.rank_zero_pids[arm], signal.SIGUSR1)
+            except OSError as error:
+                signal_errors[arm] = type(error).__name__
 
-    stable_by_arm: dict[str, tuple[int, str] | None] = {}
-    for arm in _ARMS:
-        path = request.checkpoint_paths[arm]
-        stable_by_arm[arm] = _stable_checkpoint(
-            path,
+        stable = _stabilize_checkpoints(
+            request,
+            baselines=baselines,
+            staging=staging,
             deadline=checkpoint_deadline,
             monotonic=monotonic,
             sleep=sleep,
         )
-    checkpoint_rows = []
-    all_verified = not signal_errors and all(
-        stable_by_arm[arm] is not None for arm in _ARMS
-    )
-    for arm in _ARMS:
-        path = request.checkpoint_paths[arm]
-        stable = stable_by_arm[arm]
-        uri = _checkpoint_uri(request, arm)
-        if stable is None:
-            row = {
-                "arm": arm,
-                "bytes": None,
-                "config_sha256": request.config_sha256[arm],
-                "path": path.name,
-                "sha256": None,
-                "s3_uri": uri,
-                "upload_verified": False,
-            }
-            all_verified = False
-        else:
-            size, digest = stable
-            uploaded = (
-                monotonic() < deadline
-                and object_store.put_verified(
-                    path,
-                    uri,
-                    deadline=deadline,
-                    monotonic=monotonic,
-                )
+        checkpoint_rows = []
+        all_verified = not signal_errors
+        for arm in _ARMS:
+            pinned = stable[arm]
+            uploaded = None
+            checkpoint_uri = (
+                None
+                if pinned is None
+                else _checkpoint_uri(request, arm, pinned.sha256)
             )
-            row = {
-                "arm": arm,
-                "bytes": size,
-                "config_sha256": request.config_sha256[arm],
-                "path": path.name,
-                "sha256": digest,
-                "s3_uri": uri,
-                "upload_verified": uploaded,
-            }
-            all_verified = all_verified and uploaded
-        checkpoint_rows.append(row)
-
-    deadline_exhausted = monotonic() >= checkpoint_deadline and any(
-        stable_by_arm[arm] is None for arm in _ARMS
-    )
-    if monotonic() >= deadline:
-        all_verified = False
-        deadline_exhausted = True
-    receipt = {
-        "checkpoints": checkpoint_rows,
-        "code_commit": request.code_commit,
-        "corpus_receipt_sha256": request.corpus_receipt_sha256,
-        "notice": request.notice,
-        "paired": True,
-        "provider": PROVIDER,
-        "receipt_type": "aws-p5-paired-interruption",
-        "release_sha256": request.release_sha256,
-        "deadline_exhausted": deadline_exhausted,
-        "resumable": False,
-        "schema_version": 2,
-        "seed": request.seed,
-        "signal_errors": signal_errors,
-        "timeout_seconds": float(request.timeout_seconds),
-        "upload_reserve_seconds": float(request.upload_reserve_seconds),
-    }
-    _write_receipt(request.receipt_path, receipt)
-    receipt_uploaded = (
-        monotonic() < deadline
-        and object_store.put_verified(
-            request.receipt_path,
-            _receipt_uri(request),
-            deadline=deadline,
-            monotonic=monotonic,
-        )
-    )
-    resumable = False
-    if all_verified and receipt_uploaded and monotonic() < deadline:
-        receipt["resumable"] = True
-        _write_receipt(request.receipt_path, receipt)
-        receipt_uploaded = object_store.put_verified(
-            request.receipt_path,
-            _receipt_uri(request),
-            deadline=deadline,
-            monotonic=monotonic,
-        )
-        resumable = receipt_uploaded and monotonic() < deadline
-        if not resumable:
-            receipt["resumable"] = False
-            receipt["deadline_exhausted"] = monotonic() >= deadline
-            _write_receipt(request.receipt_path, receipt)
-            if monotonic() < deadline:
-                receipt_uploaded = object_store.put_verified(
-                    request.receipt_path,
-                    _receipt_uri(request),
+            if pinned is not None and monotonic() < deadline:
+                uploaded = object_store.put_verified(
+                    pinned.path,
+                    checkpoint_uri,
+                    expected_sha256=pinned.sha256,
                     deadline=deadline,
                     monotonic=monotonic,
                 )
-    else:
-        receipt["deadline_exhausted"] = (
-            receipt["deadline_exhausted"] or monotonic() >= deadline
+            if (
+                pinned is None
+                or uploaded is None
+                or uploaded.uri != checkpoint_uri
+                or uploaded.sha256 != pinned.sha256
+                or uploaded.bytes != pinned.bytes
+            ):
+                all_verified = False
+            checkpoint_rows.append(
+                {
+                    "arm": arm,
+                    "baseline": _identity_evidence(baselines[arm]),
+                    "bytes": None if pinned is None else pinned.bytes,
+                    "config_sha256": request.config_sha256[arm],
+                    "generation": (
+                        None
+                        if pinned is None
+                        else _identity_evidence(pinned.identity)
+                    ),
+                    "object_uri": None if uploaded is None else uploaded.uri,
+                    "sha256": (
+                        None
+                        if uploaded is None
+                        else uploaded.sha256
+                    ),
+                }
+            )
+
+        deadline_exhausted = (
+            monotonic() >= checkpoint_deadline
+            and any(stable[arm] is None for arm in _ARMS)
+        ) or monotonic() >= deadline
+        candidate = {
+            "checkpoints": checkpoint_rows,
+            "code_commit": request.code_commit,
+            "corpus_receipt_sha256": request.corpus_receipt_sha256,
+            "deadline_exhausted": deadline_exhausted,
+            "notice": request.notice,
+            "paired": True,
+            "provider": PROVIDER,
+            "receipt_type": "aws-p5-interruption-candidate",
+            "release_sha256": request.release_sha256,
+            "schema_version": 3,
+            "seed": request.seed,
+            "signal_errors": signal_errors,
+        }
+        candidate_path = staging / "candidate.json"
+        candidate_written = _write_immutable_json(
+            candidate_path,
+            candidate,
+            deadline=deadline,
+            monotonic=monotonic,
         )
-        _write_receipt(request.receipt_path, receipt)
+        candidate_uploaded = None
+        candidate_digest = None
+        candidate_uri = None
+        if candidate_written is not None:
+            _candidate_bytes, candidate_digest = candidate_written
+            candidate_uri = _evidence_uri(request, candidate_digest)
+            candidate_uploaded = object_store.put_verified(
+                candidate_path,
+                candidate_uri,
+                expected_sha256=candidate_digest,
+                deadline=deadline,
+                monotonic=monotonic,
+            )
+
+        marker_path = staging / "commit.json"
+        marker_uploaded = None
+        marker_digest = None
+        marker_uri = None
+        marker_bytes = None
+        if (
+            all_verified
+            and candidate_written is not None
+            and candidate_uploaded is not None
+            and candidate_uploaded.uri == candidate_uri
+            and candidate_uploaded.sha256 == candidate_digest
+            and candidate_uploaded.bytes == len(_candidate_bytes)
+            and monotonic() < deadline
+        ):
+            nonce = commit_nonce()
+            if (
+                not isinstance(nonce, str)
+                or re.fullmatch(r"[0-9a-f]{32}", nonce) is None
+            ):
+                raise ValueError("resume commit nonce must be 32 lowercase hex")
+            marker = {
+                "candidate": {
+                    "bytes": candidate_uploaded.bytes,
+                    "sha256": candidate_uploaded.sha256,
+                    "uri": candidate_uploaded.uri,
+                },
+                "commit_id": nonce,
+                "protocol": "aws-p5-resume-commit-v1",
+                "receipt_type": "aws-p5-paired-interruption",
+                "schema_version": 1,
+                "seed": request.seed,
+            }
+            marker_written = _write_immutable_json(
+                marker_path,
+                marker,
+                deadline=deadline,
+                monotonic=monotonic,
+            )
+            if marker_written is not None:
+                marker_bytes, marker_digest = marker_written
+                marker_uri = _commit_uri(request, nonce)
+                marker_uploaded = object_store.put_verified(
+                    marker_path,
+                    marker_uri,
+                    expected_sha256=marker_digest,
+                    deadline=deadline,
+                    monotonic=monotonic,
+                )
+
+        resumable = (
+            marker_uploaded is not None
+            and marker_uploaded.uri == marker_uri
+            and marker_uploaded.sha256 == marker_digest
+            and marker_bytes is not None
+            and marker_uploaded.bytes == len(marker_bytes)
+            and marker_digest
+            == hashlib.sha256(marker_path.read_bytes()).hexdigest()
+            and _publish_local_handoff(
+                marker_path,
+                request.receipt_path,
+                deadline=deadline,
+                monotonic=monotonic,
+            )
+        )
+        if not resumable and candidate_written is not None:
+            _publish_local_handoff(
+                candidate_path,
+                request.receipt_path,
+                deadline=deadline,
+                monotonic=monotonic,
+            )
 
     return InterruptionResult(
         resumable=resumable,
@@ -557,8 +866,172 @@ def handle_interruption(
             RESUMABLE_EXIT_CODE if resumable else NON_RESUMABLE_EXIT_CODE
         ),
         receipt_path=request.receipt_path,
-        receipt_upload_verified=receipt_uploaded,
+        receipt_upload_verified=resumable,
     )
+
+
+def _canonical_payload(payload: bytes, *, label: str) -> dict[str, object]:
+    try:
+        value = json.loads(payload.decode("ascii"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ValueError(f"{label} is not canonical JSON") from error
+    if not isinstance(value, dict) or _canonical_json(value) != payload:
+        raise ValueError(f"{label} is not canonical JSON")
+    return value
+
+
+def verify_resume_commit(
+    *,
+    candidate_bytes: bytes,
+    marker_bytes: bytes,
+    checkpoint_objects: Mapping[str, bytes],
+) -> bool:
+    """Derive resume eligibility from immutable fetched bytes only."""
+
+    candidate = _canonical_payload(candidate_bytes, label="resume candidate")
+    marker = _canonical_payload(marker_bytes, label="resume commit marker")
+    if set(marker) != {
+        "candidate",
+        "commit_id",
+        "protocol",
+        "receipt_type",
+        "schema_version",
+        "seed",
+    }:
+        raise ValueError("resume commit marker fields do not match")
+    if (
+        marker["protocol"] != "aws-p5-resume-commit-v1"
+        or marker["receipt_type"] != "aws-p5-paired-interruption"
+        or marker["schema_version"] != 1
+        or not isinstance(marker["commit_id"], str)
+        or re.fullmatch(r"[0-9a-f]{32}", marker["commit_id"]) is None
+    ):
+        raise ValueError("resume commit marker identity does not match")
+    candidate_ref = marker["candidate"]
+    candidate_digest = hashlib.sha256(candidate_bytes).hexdigest()
+    if (
+        not isinstance(candidate_ref, dict)
+        or set(candidate_ref) != {"bytes", "sha256", "uri"}
+        or candidate_ref["bytes"] != len(candidate_bytes)
+        or candidate_ref["sha256"] != candidate_digest
+        or not isinstance(candidate_ref["uri"], str)
+        or not candidate_ref["uri"].endswith(
+            f"/evidence/sha256/{candidate_digest}.json"
+        )
+    ):
+        raise ValueError("resume candidate hash binding does not match")
+    if set(candidate) != {
+        "checkpoints",
+        "code_commit",
+        "corpus_receipt_sha256",
+        "deadline_exhausted",
+        "notice",
+        "paired",
+        "provider",
+        "receipt_type",
+        "release_sha256",
+        "schema_version",
+        "seed",
+        "signal_errors",
+    }:
+        raise ValueError("resume candidate fields do not match")
+    if (
+        candidate["receipt_type"] != "aws-p5-interruption-candidate"
+        or candidate["provider"] != PROVIDER
+        or candidate["schema_version"] != 3
+        or candidate["paired"] is not True
+        or candidate["deadline_exhausted"] is not False
+        or candidate["signal_errors"] != {}
+        or marker["seed"] != candidate["seed"]
+    ):
+        raise ValueError("resume candidate is not eligible")
+    if (
+        type(candidate["seed"]) is not int
+        or candidate["seed"] not in {1, 2, 3, 4}
+        or not isinstance(candidate["notice"], str)
+        or not candidate["notice"]
+        or not isinstance(candidate["code_commit"], str)
+        or _COMMIT_RE.fullmatch(candidate["code_commit"]) is None
+        or not isinstance(candidate["release_sha256"], str)
+        or _SHA256_RE.fullmatch(candidate["release_sha256"]) is None
+        or not isinstance(candidate["corpus_receipt_sha256"], str)
+        or _SHA256_RE.fullmatch(candidate["corpus_receipt_sha256"]) is None
+    ):
+        raise ValueError("resume candidate identity binding is invalid")
+    rows = candidate["checkpoints"]
+    if not isinstance(rows, list) or len(rows) != len(_ARMS):
+        raise ValueError("resume candidate checkpoint pair is incomplete")
+    expected_uris: set[str] = set()
+    identity_fields = {
+        "ctime_ns",
+        "device",
+        "gid",
+        "inode",
+        "mode",
+        "mtime_ns",
+        "size",
+        "uid",
+    }
+    for arm, row in zip(_ARMS, rows, strict=True):
+        if (
+            not isinstance(row, dict)
+            or set(row)
+            != {
+                "arm",
+                "baseline",
+                "bytes",
+                "config_sha256",
+                "generation",
+                "object_uri",
+                "sha256",
+            }
+            or row["arm"] != arm
+            or type(row["bytes"]) is not int
+            or row["bytes"] <= 0
+            or not isinstance(row["sha256"], str)
+            or _SHA256_RE.fullmatch(row["sha256"]) is None
+            or not isinstance(row["object_uri"], str)
+            or not row["object_uri"].endswith(
+                f"/{arm}/sha256/{row['sha256']}.pt"
+            )
+            or not isinstance(row["generation"], dict)
+            or set(row["generation"]) != identity_fields
+            or any(type(value) is not int for value in row["generation"].values())
+            or not isinstance(row["config_sha256"], str)
+            or _SHA256_RE.fullmatch(row["config_sha256"]) is None
+        ):
+            raise ValueError("resume checkpoint evidence is invalid")
+        baseline = row["baseline"]
+        generation = row["generation"]
+        if (
+            baseline is not None
+            and (
+                not isinstance(baseline, dict)
+                or set(baseline) != identity_fields
+                or any(type(value) is not int for value in baseline.values())
+                or (
+                    baseline.get("device"),
+                    baseline.get("inode"),
+                )
+                == (
+                    generation.get("device"),
+                    generation.get("inode"),
+                )
+            )
+        ):
+            raise ValueError("resume checkpoint generation did not change")
+        uri = row["object_uri"]
+        payload = checkpoint_objects.get(uri)
+        if (
+            payload is None
+            or len(payload) != row["bytes"]
+            or hashlib.sha256(payload).hexdigest() != row["sha256"]
+        ):
+            raise ValueError("resume checkpoint object hash mismatch")
+        expected_uris.add(uri)
+    if set(checkpoint_objects) != expected_uris:
+        raise ValueError("resume checkpoint object namespace mismatch")
+    return True
 
 
 class ImdsV2Client:

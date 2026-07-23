@@ -10,6 +10,7 @@ import os
 import re
 import shutil
 import stat
+import subprocess
 import sys
 import time
 import zipfile
@@ -107,9 +108,32 @@ def _checked(
     operation: str,
     timeout_seconds: float = 30.0,
 ) -> CommandResult:
-    result = runner(argv, environment, timeout_seconds)
+    result = _bounded_result(
+        runner,
+        argv,
+        environment,
+        operation=operation,
+        timeout_seconds=timeout_seconds,
+    )
     if result.returncode != 0:
         raise BootstrapError(f"{operation} failed")
+    return result
+
+
+def _bounded_result(
+    runner: Callable[
+        [Sequence[str], Mapping[str, str], float], CommandResult
+    ],
+    argv: list[str],
+    environment: Mapping[str, str],
+    *,
+    operation: str,
+    timeout_seconds: float,
+) -> CommandResult:
+    try:
+        result = runner(argv, environment, timeout_seconds)
+    except (subprocess.TimeoutExpired, TimeoutError) as error:
+        raise BootstrapError(f"{operation} timed out") from error
     return result
 
 
@@ -249,10 +273,12 @@ def inspect_hardware(
     if any(_H100_RE.fullmatch(name) is None for name in gpu_names):
         raise BootstrapError("every accelerator must be an NVIDIA H100 80GB")
 
-    fabric = runner(
+    fabric = _bounded_result(
+        runner,
         ["systemctl", "is-active", "nvidia-fabricmanager"],
         command_environment,
-        30.0,
+        operation="NVIDIA Fabric Manager probe",
+        timeout_seconds=30.0,
     )
     if fabric.returncode != 0 or fabric.stdout.strip() != "active":
         raise BootstrapError("NVIDIA Fabric Manager must be active")
@@ -263,9 +289,10 @@ def inspect_hardware(
             "lsblk",
             "--json",
             "--bytes",
+            "--tree",
             "--output",
             (
-                "PATH,TYPE,MODEL,SIZE,MOUNTPOINTS,FSTYPE,FSVER,"
+                "NAME,PATH,TYPE,MODEL,SIZE,MOUNTPOINTS,FSTYPE,FSVER,"
                 "LABEL,UUID,PTTYPE,PARTTYPE"
             ),
         ],
@@ -373,10 +400,12 @@ def inspect_hardware(
         )
         if holders.stdout.strip():
             raise BootstrapError("instance-store device has active holders")
-        md_result = runner(
+        md_result = _bounded_result(
+            runner,
             ["mdadm", "--examine", "--brief", device],
             command_environment,
-            30.0,
+            operation="mdadm admission probe",
+            timeout_seconds=30.0,
         )
         if md_result.returncode == 0:
             raise BootstrapError(
@@ -1092,10 +1121,12 @@ def publish_bootstrap_receipt(
     finally:
         if temporary.exists():
             temporary.unlink()
+    receipt_digest = hashlib.sha256(receipt_path.read_bytes()).hexdigest()
     return bool(
         object_store.put_verified(
             receipt_path,
             receipt_uri,
+            expected_sha256=receipt_digest,
             deadline=monotonic() + timeout_seconds,
             monotonic=monotonic,
         )
@@ -1154,8 +1185,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             profile,
             runtime,
             metadata_get=client.get,
+            runner=_run_command,
             command_environment=command_environment,
             container_image=arguments.container_image,
+            boot_id_get=_default_boot_id,
         )
         commands = render_bootstrap_commands(
             profile,

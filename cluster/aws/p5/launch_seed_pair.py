@@ -7,6 +7,7 @@ import argparse
 import fcntl
 import hashlib
 import json
+import math
 import os
 import re
 import signal
@@ -166,6 +167,8 @@ class ArmLaunch:
     out_dir: Path
     checkpoint_path: Path
     rank_zero_pid_file: Path
+    cidfile_path: Path
+    container_name: str
     master_port: int
     cpu_affinity: tuple[int, int]
     data_loader_workers: int
@@ -211,6 +214,14 @@ class ProcessHandle(Protocol):
     def terminate_tree(self) -> None: ...
 
     def kill_tree(self) -> None: ...
+
+    def pin_container(self, timeout: float) -> None: ...
+
+    def stop_container(self, timeout: float) -> None: ...
+
+    def kill_container(self, timeout: float) -> None: ...
+
+    def container_stopped(self, timeout: float) -> bool: ...
 
 
 def _unique_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
@@ -1081,6 +1092,14 @@ def load_launch_plan(
             / f"{arm}.json"
         )
         gpu_ids = "0,1,2,3" if arm == "dense" else "4,5,6,7"
+        container_name = f"memorysplit-s{seed}-{arm}"
+        cidfile_path = (
+            scratch
+            / "staging"
+            / "container-cids"
+            / f"seed-{seed}"
+            / f"{arm}.cid"
+        )
         container_image = str(bootstrap_receipt["container_image"])
         runtime_uid = int(bootstrap_receipt["runtime_uid"])
         runtime_gid = int(bootstrap_receipt["runtime_gid"])
@@ -1101,7 +1120,9 @@ def load_launch_plan(
             "run",
             "--rm",
             "--name",
-            f"memorysplit-s{seed}-{arm}",
+            container_name,
+            "--cidfile",
+            str(cidfile_path),
             "--read-only",
             "--network=host",
             "--ipc=host",
@@ -1135,8 +1156,6 @@ def load_launch_plan(
             f"type=bind,src={mount_values['output']},dst=/output",
             "--env",
             "HOME=/tmp/home",
-            "--env",
-            f"CUDA_VISIBLE_DEVICES={gpu_ids}",
             "--env",
             f"MS_DATA_LOADER_WORKERS={workers}",
             "--env",
@@ -1175,6 +1194,8 @@ def load_launch_plan(
                 out_dir=out_dir,
                 checkpoint_path=checkpoint_path,
                 rank_zero_pid_file=pid_path,
+                cidfile_path=cidfile_path,
+                container_name=container_name,
                 master_port=port,
                 cpu_affinity=tuple(affinity),
                 data_loader_workers=workers,
@@ -1241,43 +1262,12 @@ def render_plan(plan: LaunchPlan) -> dict[str, object]:
 _TRAINER_CONTRACT_FIELDS = frozenset(
     {
         "rank_zero_pid_file",
+        "receipt_v2",
         "resume_sha256",
         "sidecar_name",
         "sigusr1_checkpoint",
-        "train_corpus",
     }
 )
-_TRAINER_CONTRACT_PROBE = """\
-import inspect
-import json
-from pathlib import Path
-from train import data, trainer
-
-data_source = inspect.getsource(data)
-trainer_source = inspect.getsource(trainer)
-runner_source = Path("/workspace/scripts/run_train.py").read_text(encoding="utf-8")
-train_parameters = inspect.signature(trainer.train).parameters
-combined = data_source + "\\n" + trainer_source + "\\n" + runner_source
-contract = {
-    "rank_zero_pid_file": "MS_RANK_ZERO_PID_FILE" in combined,
-    "resume_sha256": (
-        "resume_sha256" in train_parameters
-        and "--resume-sha256" in runner_source
-        and "--resume-path" in runner_source
-    ),
-    "sidecar_name": (
-        "sidecar_name" in data_source
-        and "memorysplit-parallel-corpus-v2" in data_source
-    ),
-    "sigusr1_checkpoint": (
-        "SIGUSR1" in combined
-        and "signal.signal" in combined
-        and ("save_ckpt" in combined or "checkpoint" in combined)
-    ),
-    "train_corpus": "train_corpus" in combined,
-}
-print(json.dumps(contract, sort_keys=True, separators=(",", ":")))
-"""
 
 
 def render_trainer_preflight(plan: LaunchPlan) -> tuple[str, ...]:
@@ -1311,8 +1301,8 @@ def render_trainer_preflight(plan: LaunchPlan) -> tuple[str, ...]:
         "HOME=/tmp/home",
         plan.container_image,
         "/opt/conda/bin/python",
-        "-c",
-        _TRAINER_CONTRACT_PROBE,
+        "/workspace/scripts/run_train.py",
+        "--capabilities-json",
     )
 
 
@@ -1366,8 +1356,14 @@ def preflight_trainer_contract(
     if result.stderr:
         raise LaunchError("trainer contract preflight wrote unexpected stderr")
     try:
-        contract = json.loads(result.stdout)
-    except json.JSONDecodeError as error:
+        contract = json.loads(
+            result.stdout,
+            object_pairs_hook=_unique_object,
+            parse_constant=lambda value: (_ for _ in ()).throw(
+                ValueError(f"non-finite capability value: {value}")
+            ),
+        )
+    except (json.JSONDecodeError, ValueError) as error:
         raise LaunchError("trainer contract preflight returned invalid JSON") from error
     if (
         not isinstance(contract, dict)
@@ -1375,14 +1371,26 @@ def preflight_trainer_contract(
         or any(type(value) is not bool for value in contract.values())
     ):
         raise LaunchError("trainer contract preflight returned invalid evidence")
+    canonical = (
+        json.dumps(
+            contract,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+            allow_nan=False,
+        )
+        + "\n"
+    )
+    if result.stdout != canonical:
+        raise LaunchError("trainer contract preflight returned noncanonical JSON")
     missing = sorted(name for name, supported in contract.items() if not supported)
     if missing:
         labels = {
             "rank_zero_pid_file": "rank-zero PID file",
+            "receipt_v2": "memorysplit-parallel-corpus-v2 receipt",
             "resume_sha256": "explicit resume SHA",
             "sidecar_name": "sidecar_name",
             "sigusr1_checkpoint": "SIGUSR1 checkpoint",
-            "train_corpus": "train_corpus",
         }
         raise LaunchError(
             "trainer contract is unavailable: "
@@ -1391,9 +1399,15 @@ def preflight_trainer_contract(
 
 
 class _SubprocessHandle:
-    def __init__(self, process: subprocess.Popen, log_handle) -> None:
+    def __init__(
+        self,
+        process: subprocess.Popen,
+        log_handle,
+        container: "_DockerContainerHandle",
+    ) -> None:
         self._process = process
         self._log_handle = log_handle
+        self._container = container
         self.pid = process.pid
 
     def poll(self) -> int | None:
@@ -1424,6 +1438,141 @@ class _SubprocessHandle:
         except ProcessLookupError:
             pass
 
+    def stop_container(self, timeout: float) -> None:
+        self._container.stop_container(timeout)
+
+    def pin_container(self, timeout: float) -> None:
+        self._container.pin_container(timeout)
+
+    def kill_container(self, timeout: float) -> None:
+        self._container.kill_container(timeout)
+
+    def container_stopped(self, timeout: float) -> bool:
+        return self._container.container_stopped(timeout)
+
+
+def _run_container_command(
+    argv: Sequence[str],
+    environment: Mapping[str, str],
+    timeout_seconds: float,
+) -> CommandResult:
+    try:
+        completed = subprocess.run(
+            list(argv),
+            env=dict(environment),
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=timeout_seconds,
+        )
+    except subprocess.TimeoutExpired as error:
+        raise LaunchError("container cleanup command timed out") from error
+    return CommandResult(
+        returncode=completed.returncode,
+        stdout=completed.stdout,
+        stderr=completed.stderr,
+    )
+
+
+class _DockerContainerHandle:
+    def __init__(
+        self,
+        cidfile_path: Path,
+        *,
+        runner: Callable[
+            [Sequence[str], Mapping[str, str], float], CommandResult
+        ] = _run_container_command,
+    ) -> None:
+        self._cidfile_path = Path(cidfile_path)
+        self._runner = runner
+        self._container_id: str | None = None
+
+    def _read_id(self, timeout: float) -> str:
+        if self._container_id is not None:
+            return self._container_id
+        if (
+            isinstance(timeout, bool)
+            or not isinstance(timeout, (int, float))
+            or not math.isfinite(timeout)
+            or timeout <= 0
+        ):
+            raise LaunchError("container cleanup timeout must be positive")
+        deadline = time.monotonic() + float(timeout)
+        while time.monotonic() < deadline:
+            flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+            if hasattr(os, "O_NOFOLLOW"):
+                flags |= os.O_NOFOLLOW
+            try:
+                descriptor = os.open(self._cidfile_path, flags)
+            except FileNotFoundError:
+                time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
+                continue
+            except OSError as error:
+                raise LaunchError("Docker cidfile is unsafe") from error
+            try:
+                metadata = os.fstat(descriptor)
+                if (
+                    not stat.S_ISREG(metadata.st_mode)
+                    or metadata.st_nlink != 1
+                    or metadata.st_size > 65
+                ):
+                    raise LaunchError("Docker cidfile is unsafe")
+                raw = os.read(descriptor, 66)
+            finally:
+                os.close(descriptor)
+            try:
+                container_id = raw.decode("ascii").strip()
+            except UnicodeDecodeError as error:
+                raise LaunchError("Docker cidfile is invalid") from error
+            if re.fullmatch(r"[0-9a-f]{64}", container_id) is None:
+                raise LaunchError("Docker cidfile must contain one full container ID")
+            self._container_id = container_id
+            return container_id
+        raise LaunchError("Docker cidfile was not created before shutdown")
+
+    def _call(self, argv: list[str], timeout: float) -> CommandResult:
+        return self._runner(
+            argv,
+            {"PATH": "/usr/bin:/bin"},
+            float(timeout),
+        )
+
+    def pin_container(self, timeout: float) -> None:
+        self._read_id(timeout)
+
+    def stop_container(self, timeout: float) -> None:
+        container_id = self._read_id(timeout)
+        self._call(
+            ["docker", "stop", "--time", "5", container_id],
+            timeout,
+        )
+
+    def kill_container(self, timeout: float) -> None:
+        container_id = self._read_id(timeout)
+        self._call(["docker", "kill", container_id], timeout)
+
+    def container_stopped(self, timeout: float) -> bool:
+        container_id = self._read_id(timeout)
+        result = self._call(
+            [
+                "docker",
+                "inspect",
+                "--format={{.State.Status}}",
+                container_id,
+            ],
+            timeout,
+        )
+        if result.returncode != 0:
+            absent = {
+                f"Error: No such object: {container_id}",
+                f"Error response from daemon: No such container: {container_id}",
+            }
+            if not result.stdout and result.stderr.strip() in absent:
+                return True
+            raise LaunchError("Docker inspect could not verify container absence")
+        return result.stdout.strip() in {"dead", "exited"}
+
 
 def _spawn_process(launch: ArmLaunch) -> ProcessHandle:
     log_path = launch.out_dir / "launcher.log"
@@ -1441,7 +1590,11 @@ def _spawn_process(launch: ArmLaunch) -> ProcessHandle:
     except BaseException:
         log_handle.close()
         raise
-    return _SubprocessHandle(process, log_handle)
+    return _SubprocessHandle(
+        process,
+        log_handle,
+        _DockerContainerHandle(launch.cidfile_path),
+    )
 
 
 def _revalidate_files(plan: LaunchPlan) -> None:
@@ -1484,11 +1637,59 @@ def _terminate_all(processes: Sequence[ProcessHandle]) -> None:
     active = tuple(
         process for process in processes if process.poll() is None
     )
+    container_deadline = time.monotonic() + 15.0
+    needs_container_kill: set[int] = set()
+    for process in active:
+        stop_container = getattr(process, "stop_container", None)
+        if stop_container is None:
+            continue
+        try:
+            stop_container(max(0.001, container_deadline - time.monotonic()))
+        except (OSError, ValueError, subprocess.SubprocessError):
+            needs_container_kill.add(id(process))
     for process in active:
         try:
             process.terminate_tree()
         except (OSError, subprocess.SubprocessError):
             pass
+    for process in active:
+        container_stopped = getattr(process, "container_stopped", None)
+        if container_stopped is None:
+            continue
+        try:
+            if not container_stopped(
+                max(0.001, container_deadline - time.monotonic())
+            ):
+                needs_container_kill.add(id(process))
+        except (OSError, ValueError, subprocess.SubprocessError):
+            needs_container_kill.add(id(process))
+    for process in active:
+        if id(process) not in needs_container_kill:
+            continue
+        kill_container = getattr(process, "kill_container", None)
+        if kill_container is None:
+            continue
+        try:
+            kill_container(max(0.001, container_deadline - time.monotonic()))
+        except (OSError, ValueError, subprocess.SubprocessError):
+            pass
+    containers_verified = True
+    for process in active:
+        if id(process) not in needs_container_kill:
+            continue
+        container_stopped = getattr(process, "container_stopped", None)
+        if container_stopped is None:
+            containers_verified = False
+            continue
+        try:
+            containers_verified = (
+                container_stopped(
+                    max(0.001, container_deadline - time.monotonic())
+                )
+                and containers_verified
+            )
+        except (OSError, ValueError, subprocess.SubprocessError):
+            containers_verified = False
     deadline = time.monotonic() + 10.0
     pending = []
     for process in active:
@@ -1516,6 +1717,8 @@ def _terminate_all(processes: Sequence[ProcessHandle]) -> None:
             process.wait(timeout=remaining)
         except (OSError, subprocess.SubprocessError):
             pass
+    if not containers_verified:
+        raise LaunchError("Docker containers could not be verified stopped")
 
 
 @contextmanager
@@ -1626,6 +1829,17 @@ def _supervise_pair_locked(
     try:
         for launch in plan.arms:
             _materialize_runtime_config(launch)
+        cidfile_roots = {launch.cidfile_path.parent for launch in plan.arms}
+        if len(cidfile_roots) != 1:
+            raise LaunchError("paired Docker cidfiles must share one private root")
+        cidfile_root = cidfile_roots.pop()
+        try:
+            cidfile_root.mkdir(parents=True, mode=0o700, exist_ok=False)
+        except OSError as error:
+            raise LaunchError(
+                "Docker cidfile root became stale before launch"
+            ) from error
+        os.chmod(cidfile_root, 0o700)
         for launch in plan.arms:
             try:
                 launch.out_dir.mkdir(parents=True, mode=0o700, exist_ok=False)
@@ -1646,6 +1860,17 @@ def _supervise_pair_locked(
         child_pids = {arm: process.pid for arm, process in processes.items()}
         if set(child_pids) != set(_ARMS):
             raise LaunchError("both child PIDs must be recorded before supervision")
+        pin_deadline = time.monotonic() + 30.0
+        try:
+            for arm in _ARMS:
+                processes[arm].pin_container(
+                    max(0.001, pin_deadline - time.monotonic())
+                )
+        except Exception as error:
+            _terminate_all(tuple(processes.values()))
+            raise LaunchError(
+                "both Docker container IDs must be pinned before supervision"
+            ) from error
         resolver = rank_zero_resolver or _resolve_rank_zero_pids
         try:
             rank_zero_pids = dict(resolver(plan, child_pids))

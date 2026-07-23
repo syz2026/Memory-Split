@@ -263,6 +263,18 @@ def _launcher_fixture(tmp_path: Path, seed: int = 1) -> dict[str, Path | dict]:
     release_sources = {
         "scripts/run_train.py": (
             "import argparse\n"
+            "import json\n"
+            "import sys\n"
+            "CAPABILITIES = {\n"
+            "    'rank_zero_pid_file': True,\n"
+            "    'receipt_v2': True,\n"
+            "    'resume_sha256': True,\n"
+            "    'sidecar_name': True,\n"
+            "    'sigusr1_checkpoint': True,\n"
+            "}\n"
+            "if sys.argv[1:] == ['--capabilities-json']:\n"
+            "    print(json.dumps(CAPABILITIES, sort_keys=True, separators=(',', ':')))\n"
+            "    raise SystemExit(0)\n"
             "parser = argparse.ArgumentParser()\n"
             "parser.add_argument('--resume-path')\n"
             "parser.add_argument('--resume-sha256')\n"
@@ -510,6 +522,15 @@ def test_dry_run_renders_exact_symmetric_four_plus_four_commands(tmp_path, seed)
     assert "--network=host" in dense["argv"]
     assert "--ipc=host" in dense["argv"]
     assert "--pid=host" in dense["argv"]
+    assert ["--name", f"memorysplit-s{seed}-dense"] == dense["argv"][
+        dense["argv"].index("--name") : dense["argv"].index("--name") + 2
+    ]
+    assert ["--cidfile", str(fixture["scratch_root"] / "staging" / "container-cids" / f"seed-{seed}" / "dense.cid")] == dense["argv"][
+        dense["argv"].index("--cidfile") : dense["argv"].index("--cidfile") + 2
+    ]
+    assert str(
+        fixture["scratch_root"] / "runs" / f"seed-{seed}" / "dense"
+    ) not in dense["argv"][dense["argv"].index("--cidfile") + 1]
     assert ["--user", f"{RUNTIME_UID}:{RUNTIME_GID}"] == dense["argv"][
         dense["argv"].index("--user") : dense["argv"].index("--user") + 2
     ]
@@ -527,6 +548,22 @@ def test_dry_run_renders_exact_symmetric_four_plus_four_commands(tmp_path, seed)
     assert split90["argv"][-6] == (
         f"--rdzv_endpoint=127.0.0.1:{base_port + 1}"
     )
+    assert "device=4,5,6,7" in split90["argv"]
+    dense_container_env = {
+        dense["argv"][index + 1]
+        for index, value in enumerate(dense["argv"])
+        if value == "--env"
+    }
+    split_container_env = {
+        split90["argv"][index + 1]
+        for index, value in enumerate(split90["argv"])
+        if value == "--env"
+    }
+    assert not any(
+        value.startswith("CUDA_VISIBLE_DEVICES=")
+        for value in dense_container_env | split_container_env
+    )
+    assert "device=0,1,2,3" in dense["argv"]
     assert "device=4,5,6,7" in split90["argv"]
     assert split90["cpu_affinity"] == [96, 191]
     assert dense["env"] == {"PATH": "/usr/bin:/bin"}
@@ -694,21 +731,18 @@ def test_trainer_contract_preflight_runs_inside_pinned_container(tmp_path):
 
     def runner(argv, environment, timeout):
         calls.append((list(argv), dict(environment), timeout))
-        return CommandResult(
-            0,
-            json.dumps(
-                {
-                    "rank_zero_pid_file": True,
-                    "resume_sha256": True,
-                    "sidecar_name": True,
-                    "sigusr1_checkpoint": True,
-                    "train_corpus": True,
-                },
-                sort_keys=True,
-            )
-            + "\n",
-            "",
+        completed = subprocess.run(
+            [
+                sys.executable,
+                fixture["repo_root"] / "scripts" / "run_train.py",
+                "--capabilities-json",
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=timeout,
         )
+        return CommandResult(completed.returncode, completed.stdout, completed.stderr)
 
     preflight_trainer_contract(plan, runner=runner, timeout_seconds=90)
 
@@ -719,6 +753,12 @@ def test_trainer_contract_preflight_runs_inside_pinned_container(tmp_path):
     assert "--network=none" in argv
     assert "--read-only" in argv
     assert CONTAINER_IMAGE in argv
+    assert argv[-3:] == [
+        "/opt/conda/bin/python",
+        "/workspace/scripts/run_train.py",
+        "--capabilities-json",
+    ]
+    assert "-c" not in argv
     assert (
         f"type=bind,src={fixture['repo_root']},dst=/workspace,readonly"
         in argv
@@ -759,10 +799,10 @@ def test_trainer_contract_preflight_rejects_missing_capability(tmp_path):
     plan = _load_fixture_plan(_launcher_fixture(tmp_path))
     contract = {
         "rank_zero_pid_file": True,
+        "receipt_v2": True,
         "resume_sha256": True,
         "sidecar_name": True,
         "sigusr1_checkpoint": False,
-        "train_corpus": True,
     }
 
     with pytest.raises(LaunchError, match="trainer contract|SIGUSR1"):
@@ -770,7 +810,52 @@ def test_trainer_contract_preflight_rejects_missing_capability(tmp_path):
             plan,
             runner=lambda _argv, _environment, _timeout: CommandResult(
                 0,
-                json.dumps(contract, sort_keys=True) + "\n",
+                json.dumps(contract, sort_keys=True, separators=(",", ":"))
+                + "\n",
+                "",
+            ),
+        )
+
+
+def test_trainer_preflight_rejects_source_tokens_without_behavior(tmp_path):
+    fixture = _launcher_fixture(tmp_path)
+    plan = _load_fixture_plan(fixture)
+    script = fixture["repo_root"] / "scripts" / "run_train.py"
+    script.chmod(0o644)
+    script.write_text(
+        "# --capabilities-json receipt_v2 sidecar_name resume_sha256\n"
+        "# rank_zero_pid_file SIGUSR1 checkpoint\n",
+        encoding="utf-8",
+    )
+
+    def run_fixture(_argv, _environment, timeout):
+        completed = subprocess.run(
+            [sys.executable, script, "--capabilities-json"],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=timeout,
+        )
+        return CommandResult(completed.returncode, completed.stdout, completed.stderr)
+
+    with pytest.raises(LaunchError, match="invalid JSON|capability"):
+        preflight_trainer_contract(plan, runner=run_fixture)
+
+
+def test_trainer_preflight_rejects_duplicate_or_noncanonical_json(tmp_path):
+    plan = _load_fixture_plan(_launcher_fixture(tmp_path))
+    duplicate = (
+        '{"rank_zero_pid_file":true,"rank_zero_pid_file":true,'
+        '"receipt_v2":true,"resume_sha256":true,"sidecar_name":true,'
+        '"sigusr1_checkpoint":true}\n'
+    )
+
+    with pytest.raises(LaunchError, match="JSON|evidence"):
+        preflight_trainer_contract(
+            plan,
+            runner=lambda _argv, _environment, _timeout: CommandResult(
+                0,
+                duplicate,
                 "",
             ),
         )
@@ -997,6 +1082,7 @@ class _FakeProcess:
         *,
         waited: int = -15,
         on_terminate=None,
+        stop_leaves_container_running: bool = False,
     ):
         self.pid = pid
         self._polls = list(polls)
@@ -1004,6 +1090,10 @@ class _FakeProcess:
         self.waited = waited
         self.terminated = False
         self.on_terminate = on_terminate
+        self.container_running = True
+        self.container_pinned = False
+        self.stop_leaves_container_running = stop_leaves_container_running
+        self.container_events = []
 
     def poll(self):
         if self._polls:
@@ -1018,6 +1108,35 @@ class _FakeProcess:
         if self.on_terminate is not None:
             self.on_terminate()
         self.terminated = True
+
+    def kill_tree(self):
+        self.terminated = True
+
+    def stop_container(self, timeout):
+        assert timeout > 0
+        self.container_events.append("stop")
+        if self.on_terminate is not None:
+            self.on_terminate()
+        if not self.stop_leaves_container_running:
+            self.container_running = False
+
+    def pin_container(self, timeout):
+        assert timeout > 0
+        self.container_pinned = True
+
+    def kill_container(self, timeout):
+        assert timeout > 0
+        self.container_events.append("kill")
+        if self.on_terminate is not None:
+            self.on_terminate()
+        self.container_running = False
+
+    def container_stopped(self, timeout):
+        assert timeout > 0
+        self.container_events.append("verify")
+        if self.on_terminate is not None:
+            self.on_terminate()
+        return not self.container_running
 
 
 class _FakeSpawner:
@@ -1064,6 +1183,27 @@ def test_supervisor_records_both_pids_and_accepts_only_paired_success(tmp_path):
     assert result.child_pids == {"dense": 101, "split90": 202}
     assert [launch.arm for launch in spawner.started] == ["dense", "split90"]
     assert all(launch.out_dir.is_dir() for launch in spawner.started)
+
+
+def test_supervisor_pins_both_container_ids_before_rank_zero_resolution(tmp_path):
+    plan = _load_fixture_plan(_launcher_fixture(tmp_path))
+    dense = _FakeProcess(101, [None, 0])
+    split90 = _FakeProcess(202, [None, 0])
+
+    def resolve(_plan, child_pids):
+        assert dense.container_pinned is True
+        assert split90.container_pinned is True
+        return dict(child_pids)
+
+    result = supervise_pair(
+        plan,
+        spawner=_FakeSpawner({"dense": dense, "split90": split90}),
+        sleep=lambda _delay: None,
+        trainer_preflight=_pass_trainer_preflight,
+        rank_zero_resolver=resolve,
+    )
+
+    assert result.status == "completed"
 
 
 def test_supervisor_rejects_a_second_seed_pair_on_the_same_p5(tmp_path):
@@ -1242,7 +1382,105 @@ def test_supervisor_holds_lock_while_signal_stops_both_process_groups(
     assert result.returncode == 128 + signum
     assert dense.terminated is True
     assert split90.terminated is True
-    assert lock_observations == [True, True]
+    assert dense.container_events == ["stop", "verify"]
+    assert split90.container_events == ["stop", "verify"]
+    assert lock_observations
+    assert all(lock_observations)
+
+
+def test_signal_shutdown_kills_running_containers_before_unlock(tmp_path):
+    fixture = _launcher_fixture(tmp_path)
+    plan = _load_fixture_plan(fixture)
+    lock_path = fixture["scratch_root"] / ".p5-seed-pair.lock"
+    lock_observations = []
+
+    def observe_lock():
+        with lock_path.open("r+b") as contender:
+            try:
+                fcntl.flock(
+                    contender.fileno(),
+                    fcntl.LOCK_EX | fcntl.LOCK_NB,
+                )
+            except BlockingIOError:
+                lock_observations.append(True)
+            else:
+                fcntl.flock(contender.fileno(), fcntl.LOCK_UN)
+                lock_observations.append(False)
+
+    dense = _FakeProcess(
+        101,
+        [None],
+        on_terminate=observe_lock,
+        stop_leaves_container_running=True,
+    )
+    split90 = _FakeProcess(
+        202,
+        [None],
+        on_terminate=observe_lock,
+        stop_leaves_container_running=True,
+    )
+    result = supervise_pair(
+        plan,
+        spawner=_FakeSpawner({"dense": dense, "split90": split90}),
+        sleep=lambda _delay: None,
+        trainer_preflight=_pass_trainer_preflight,
+        rank_zero_resolver=_pass_rank_zero_resolver,
+        shutdown_source=lambda: signal.SIGTERM,
+    )
+
+    assert result.status == "terminated"
+    assert dense.container_events == ["stop", "verify", "kill", "verify"]
+    assert split90.container_events == ["stop", "verify", "kill", "verify"]
+    assert lock_observations and all(lock_observations)
+
+
+def test_docker_cleanup_uses_full_cidfile_id_and_bounded_argv(tmp_path):
+    cid = "a" * 64
+    cidfile = tmp_path / "docker.cid"
+    cidfile.write_text(cid + "\n", encoding="ascii")
+    calls = []
+    inspections = iter(["running\n", "exited\n"])
+
+    def runner(argv, environment, timeout):
+        calls.append((list(argv), dict(environment), timeout))
+        if argv[1] == "inspect":
+            return CommandResult(0, next(inspections), "")
+        return CommandResult(0, "", "")
+
+    container = launch_module._DockerContainerHandle(
+        cidfile,
+        runner=runner,
+    )
+    container.stop_container(7.0)
+    assert container.container_stopped(7.0) is False
+    container.kill_container(7.0)
+    assert container.container_stopped(7.0) is True
+
+    assert [call[0][1] for call in calls] == [
+        "stop",
+        "inspect",
+        "kill",
+        "inspect",
+    ]
+    assert all(call[0][-1] == cid for call in calls)
+    assert all(call[1] == {"PATH": "/usr/bin:/bin"} for call in calls)
+    assert all(0 < call[2] <= 7.0 for call in calls)
+
+
+def test_docker_cleanup_does_not_treat_daemon_failure_as_absent(tmp_path):
+    cidfile = tmp_path / "docker.cid"
+    cidfile.write_text("a" * 64 + "\n", encoding="ascii")
+    container = launch_module._DockerContainerHandle(
+        cidfile,
+        runner=lambda _argv, _environment, _timeout: CommandResult(
+            1,
+            "",
+            "Cannot connect to the Docker daemon",
+        ),
+    )
+
+    with pytest.raises(LaunchError, match="inspect|verify|daemon"):
+        container.container_stopped(2.0)
 
 
 def test_installed_shutdown_handlers_capture_and_restore_all_signals(monkeypatch):
@@ -1272,8 +1510,9 @@ def test_installed_shutdown_handlers_capture_and_restore_all_signals(monkeypatch
 
 
 class _FakeStore:
-    def __init__(self, *, fail_suffix: str | None = None):
-        self.fail_suffix = fail_suffix
+    def __init__(self, *, fail_contains: str | None = None, on_put=None):
+        self.fail_contains = fail_contains
+        self.on_put = on_put
         self.calls = []
 
     def put_verified(
@@ -1281,13 +1520,44 @@ class _FakeStore:
         path: Path,
         uri: str,
         *,
+        expected_sha256: str,
         deadline=float("inf"),
         monotonic=time.monotonic,
-    ) -> bool:
-        self.calls.append((path, uri, deadline, monotonic()))
+    ):
+        payload = path.read_bytes()
+        digest = hashlib.sha256(payload).hexdigest()
+        self.calls.append(
+            (
+                path,
+                uri,
+                deadline,
+                monotonic(),
+                expected_sha256,
+                payload,
+                path.stat().st_mode,
+            )
+        )
+        assert digest == expected_sha256
+        if any(
+            marker in uri
+            for marker in (
+                "/checkpoints/",
+                "/evidence/sha256/",
+                "/resume-commits/",
+            )
+        ):
+            assert path.stat().st_mode & 0o222 == 0
+        if self.on_put is not None:
+            self.on_put(path, uri)
         if monotonic() >= deadline:
-            return False
-        return self.fail_suffix is None or not uri.endswith(self.fail_suffix)
+            return None
+        if self.fail_contains is not None and self.fail_contains in uri:
+            return None
+        return interruption_module.UploadedObject(
+            uri=uri,
+            sha256=digest,
+            bytes=len(payload),
+        )
 
 
 def _interruption_request(tmp_path: Path) -> InterruptionRequest:
@@ -1308,6 +1578,12 @@ def _interruption_request(tmp_path: Path) -> InterruptionRequest:
         timeout_seconds=5.0,
         upload_reserve_seconds=2.0,
     )
+
+
+def _atomic_checkpoint(path: Path, payload: bytes) -> None:
+    temporary = path.with_name(f".{path.name}.next")
+    temporary.write_bytes(payload)
+    os.replace(temporary, path)
 
 
 @pytest.mark.parametrize(
@@ -1343,7 +1619,10 @@ def test_interruption_signals_both_rank_zero_processes_and_emits_paired_receipt(
     def signal_process(pid, signum):
         signals.append((pid, signum))
         arm = pid_to_arm[pid]
-        request.checkpoint_paths[arm].write_bytes(f"{arm}-checkpoint".encode())
+        _atomic_checkpoint(
+            request.checkpoint_paths[arm],
+            f"{arm}-checkpoint".encode(),
+        )
 
     store = _FakeStore()
     result = handle_interruption(
@@ -1364,24 +1643,37 @@ def test_interruption_signals_both_rank_zero_processes_and_emits_paired_receipt(
     ).encode("ascii")
     assert receipt["receipt_type"] == "aws-p5-paired-interruption"
     assert receipt["seed"] == 1
-    assert receipt["resumable"] is True
-    assert [item["arm"] for item in receipt["checkpoints"]] == [
+    assert "resumable" not in receipt
+    assert receipt["protocol"] == "aws-p5-resume-commit-v1"
+    candidate_call = next(
+        call for call in store.calls if "/evidence/sha256/" in call[1]
+    )
+    candidate = json.loads(candidate_call[5])
+    assert [item["arm"] for item in candidate["checkpoints"]] == [
         "dense",
         "split90",
     ]
-    assert all(item["upload_verified"] for item in receipt["checkpoints"])
+    assert all(
+        item["object_uri"].endswith(f"/sha256/{item['sha256']}.pt")
+        for item in candidate["checkpoints"]
+    )
     assert len(store.calls) == 4
 
 
 def test_interruption_never_labels_failed_upload_resumable(tmp_path):
     request = _interruption_request(tmp_path)
-    for arm, path in request.checkpoint_paths.items():
-        path.write_bytes(f"{arm}-checkpoint".encode())
-    store = _FakeStore(fail_suffix="/split90/checkpoint.pt")
+    store = _FakeStore(fail_contains="/split90/")
+
+    def checkpoint(pid, _signal):
+        arm = {101: "dense", 202: "split90"}[pid]
+        _atomic_checkpoint(
+            request.checkpoint_paths[arm],
+            f"{arm}-checkpoint".encode(),
+        )
 
     result = handle_interruption(
         request,
-        signal_process=lambda _pid, _signal: None,
+        signal_process=checkpoint,
         object_store=store,
         sleep=lambda _delay: None,
     )
@@ -1389,8 +1681,250 @@ def test_interruption_never_labels_failed_upload_resumable(tmp_path):
     assert result.resumable is False
     assert result.exit_code == NON_RESUMABLE_EXIT_CODE
     receipt = json.loads(request.receipt_path.read_text(encoding="utf-8"))
-    assert receipt["resumable"] is False
-    assert any(not item["upload_verified"] for item in receipt["checkpoints"])
+    assert "resumable" not in receipt
+    assert receipt["receipt_type"] == "aws-p5-interruption-candidate"
+    assert not any("/resume-commits/" in call[1] for call in store.calls)
+
+
+def test_interruption_uploads_immutable_bytes_from_new_atomic_generation(tmp_path):
+    request = _interruption_request(tmp_path)
+    for path in request.checkpoint_paths.values():
+        path.write_bytes(b"old-generation")
+
+    def signal_process(pid, _signal):
+        arm = {101: "dense", 202: "split90"}[pid]
+        _atomic_checkpoint(
+            request.checkpoint_paths[arm],
+            f"{arm}-generation-one".encode(),
+        )
+
+    def mutate_original(_staged, uri):
+        if "/dense/" in uri:
+            request.checkpoint_paths["dense"].write_bytes(b"dense-generation-two")
+
+    store = _FakeStore(on_put=mutate_original)
+    result = handle_interruption(
+        request,
+        signal_process=signal_process,
+        object_store=store,
+        sleep=lambda _delay: None,
+        commit_nonce=lambda: "a" * 32,
+    )
+
+    assert result.resumable is True
+    dense_upload = next(call for call in store.calls if "/dense/" in call[1])
+    assert dense_upload[5] == b"dense-generation-one"
+    assert dense_upload[0] != request.checkpoint_paths["dense"]
+    assert dense_upload[6] & 0o222 == 0
+    candidate_call = next(
+        call for call in store.calls if "/evidence/sha256/" in call[1]
+    )
+    candidate = json.loads(candidate_call[5])
+    dense = next(item for item in candidate["checkpoints"] if item["arm"] == "dense")
+    assert dense["sha256"] == hashlib.sha256(b"dense-generation-one").hexdigest()
+    assert set(dense["generation"]) == {
+        "ctime_ns",
+        "device",
+        "gid",
+        "inode",
+        "mode",
+        "mtime_ns",
+        "size",
+        "uid",
+    }
+
+
+def test_interruption_rejects_in_place_checkpoint_rewrite(tmp_path):
+    request = _interruption_request(tmp_path)
+    for path in request.checkpoint_paths.values():
+        path.write_bytes(b"old-generation")
+
+    def signal_process(pid, _signal):
+        arm = {101: "dense", 202: "split90"}[pid]
+        request.checkpoint_paths[arm].write_bytes(b"in-place-rewrite")
+
+    clock = _Clock()
+    store = _FakeStore()
+    result = handle_interruption(
+        request,
+        signal_process=signal_process,
+        object_store=store,
+        monotonic=clock.monotonic,
+        sleep=clock.sleep,
+    )
+
+    assert result.resumable is False
+    assert not any("/checkpoints/" in call[1] for call in store.calls)
+    receipt = json.loads(request.receipt_path.read_bytes())
+    assert receipt["receipt_type"] == "aws-p5-interruption-candidate"
+    assert "resumable" not in receipt
+
+
+def test_interruption_rejects_preexisting_handoff_before_signaling(tmp_path):
+    request = _interruption_request(tmp_path)
+    request.receipt_path.write_bytes(b'{"stale":true}\n')
+    signals = []
+    store = _FakeStore()
+
+    with pytest.raises(ValueError, match="receipt|handoff|exists"):
+        handle_interruption(
+            request,
+            signal_process=lambda pid, signum: signals.append((pid, signum)),
+            object_store=store,
+            sleep=lambda _delay: None,
+        )
+
+    assert signals == []
+    assert store.calls == []
+
+
+def test_uncertain_commit_upload_leaves_only_noncommittal_handoff(tmp_path):
+    request = _interruption_request(tmp_path)
+
+    def signal_process(pid, _signal):
+        arm = {101: "dense", 202: "split90"}[pid]
+        _atomic_checkpoint(request.checkpoint_paths[arm], arm.encode())
+
+    store = _FakeStore(fail_contains="/resume-commits/")
+    result = handle_interruption(
+        request,
+        signal_process=signal_process,
+        object_store=store,
+        sleep=lambda _delay: None,
+        commit_nonce=lambda: "b" * 32,
+    )
+
+    assert result.resumable is False
+    local = json.loads(request.receipt_path.read_bytes())
+    assert local["receipt_type"] == "aws-p5-interruption-candidate"
+    assert "commit_uri" not in local
+    for call in store.calls:
+        if call[0].suffix == ".json":
+            assert "resumable" not in json.loads(call[5])
+
+
+def test_interruption_rejects_object_store_evidence_for_wrong_uri(tmp_path):
+    request = _interruption_request(tmp_path)
+
+    class WrongUriStore(_FakeStore):
+        def put_verified(self, *args, **kwargs):
+            uploaded = super().put_verified(*args, **kwargs)
+            if uploaded is not None and "/dense/" in uploaded.uri:
+                return interruption_module.UploadedObject(
+                    uri=uploaded.uri + ".wrong",
+                    sha256=uploaded.sha256,
+                    bytes=uploaded.bytes,
+                )
+            return uploaded
+
+    def signal_process(pid, _signal):
+        arm = {101: "dense", 202: "split90"}[pid]
+        _atomic_checkpoint(request.checkpoint_paths[arm], arm.encode())
+
+    result = handle_interruption(
+        request,
+        signal_process=signal_process,
+        object_store=WrongUriStore(),
+        sleep=lambda _delay: None,
+    )
+
+    assert result.resumable is False
+    assert json.loads(request.receipt_path.read_bytes())["receipt_type"] == (
+        "aws-p5-interruption-candidate"
+    )
+
+
+def test_resume_commit_is_derived_from_every_fetched_object_hash(tmp_path):
+    request = _interruption_request(tmp_path)
+
+    def signal_process(pid, _signal):
+        arm = {101: "dense", 202: "split90"}[pid]
+        _atomic_checkpoint(request.checkpoint_paths[arm], arm.encode())
+
+    store = _FakeStore()
+    result = handle_interruption(
+        request,
+        signal_process=signal_process,
+        object_store=store,
+        sleep=lambda _delay: None,
+        commit_nonce=lambda: "c" * 32,
+    )
+    assert result.resumable is True
+
+    candidate = next(call[5] for call in store.calls if "/evidence/" in call[1])
+    marker = next(call[5] for call in store.calls if "/resume-commits/" in call[1])
+    fetched = {
+        call[1]: call[5]
+        for call in store.calls
+        if "/checkpoints/" in call[1]
+    }
+    assert interruption_module.verify_resume_commit(
+        candidate_bytes=candidate,
+        marker_bytes=marker,
+        checkpoint_objects=fetched,
+    )
+    corrupted = dict(fetched)
+    corrupted[next(iter(corrupted))] = b"corrupt"
+    with pytest.raises(ValueError, match="hash|digest"):
+        interruption_module.verify_resume_commit(
+            candidate_bytes=candidate,
+            marker_bytes=marker,
+            checkpoint_objects=corrupted,
+        )
+    incomplete_candidate = json.loads(candidate)
+    incomplete_candidate["checkpoints"][0]["generation"].pop("uid")
+    incomplete_bytes = (
+        json.dumps(
+            incomplete_candidate,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        + "\n"
+    ).encode("ascii")
+    rebound_marker = json.loads(marker)
+    rebound_marker["candidate"]["bytes"] = len(incomplete_bytes)
+    rebound_marker["candidate"]["sha256"] = hashlib.sha256(
+        incomplete_bytes
+    ).hexdigest()
+    rebound_marker["candidate"]["uri"] = (
+        "s3://memorysplit-prod/cohort-v2/receipts/interruption/"
+        f"evidence/sha256/{rebound_marker['candidate']['sha256']}.json"
+    )
+    rebound_marker_bytes = (
+        json.dumps(rebound_marker, sort_keys=True, separators=(",", ":"))
+        + "\n"
+    ).encode("ascii")
+    with pytest.raises(ValueError, match="identity|evidence"):
+        interruption_module.verify_resume_commit(
+            candidate_bytes=incomplete_bytes,
+            marker_bytes=rebound_marker_bytes,
+            checkpoint_objects=fetched,
+        )
+    invalid_binding = json.loads(candidate)
+    invalid_binding["release_sha256"] = "not-a-digest"
+    invalid_binding_bytes = (
+        json.dumps(invalid_binding, sort_keys=True, separators=(",", ":"))
+        + "\n"
+    ).encode("ascii")
+    invalid_marker = json.loads(marker)
+    invalid_marker["candidate"]["bytes"] = len(invalid_binding_bytes)
+    invalid_marker["candidate"]["sha256"] = hashlib.sha256(
+        invalid_binding_bytes
+    ).hexdigest()
+    invalid_marker["candidate"]["uri"] = (
+        "s3://memorysplit-prod/cohort-v2/receipts/interruption/"
+        f"evidence/sha256/{invalid_marker['candidate']['sha256']}.json"
+    )
+    invalid_marker_bytes = (
+        json.dumps(invalid_marker, sort_keys=True, separators=(",", ":"))
+        + "\n"
+    ).encode("ascii")
+    with pytest.raises(ValueError, match="binding|digest"):
+        interruption_module.verify_resume_commit(
+            candidate_bytes=invalid_binding_bytes,
+            marker_bytes=invalid_marker_bytes,
+            checkpoint_objects=fetched,
+        )
 
 
 class _Clock:
@@ -1404,13 +1938,49 @@ class _Clock:
         self.now += delay
 
 
+def test_checkpoint_stability_observes_both_arms_concurrently(tmp_path):
+    request = _interruption_request(tmp_path)
+    clock = _Clock()
+    dense_written = False
+
+    def signal_process(pid, _signal):
+        arm = {101: "dense", 202: "split90"}[pid]
+        if arm == "split90":
+            _atomic_checkpoint(request.checkpoint_paths[arm], b"split-ready")
+
+    def sleep(delay):
+        nonlocal dense_written
+        clock.sleep(delay)
+        if not dense_written and clock.now >= 12.75:
+            _atomic_checkpoint(
+                request.checkpoint_paths["dense"],
+                b"dense-late",
+            )
+            dense_written = True
+
+    result = handle_interruption(
+        request,
+        signal_process=signal_process,
+        object_store=_FakeStore(),
+        monotonic=clock.monotonic,
+        sleep=sleep,
+        commit_nonce=lambda: "d" * 32,
+    )
+
+    assert result.resumable is True
+    assert clock.now <= 15.0
+
+
 def test_interruption_reserves_upload_time_inside_one_deadline(tmp_path):
     request = _interruption_request(tmp_path)
     clock = _Clock()
 
     def signal_process(pid, _signum):
         arm = {101: "dense", 202: "split90"}[pid]
-        request.checkpoint_paths[arm].write_bytes(arm.encode("ascii"))
+        _atomic_checkpoint(
+            request.checkpoint_paths[arm],
+            arm.encode("ascii"),
+        )
 
     store = _FakeStore()
     result = handle_interruption(
@@ -1446,7 +2016,7 @@ def test_interruption_deadline_exhaustion_is_nonresumable_and_stops_uploads(
     assert result.resumable is False
     assert result.exit_code == NON_RESUMABLE_EXIT_CODE
     receipt = json.loads(request.receipt_path.read_text(encoding="utf-8"))
-    assert receipt["resumable"] is False
+    assert "resumable" not in receipt
     assert receipt["deadline_exhausted"] is True
     assert all(call[3] < call[2] for call in store.calls)
 
@@ -1454,6 +2024,8 @@ def test_interruption_deadline_exhaustion_is_nonresumable_and_stops_uploads(
 def test_s3_object_store_uses_argv_and_checksum_verification(tmp_path):
     artifact = tmp_path / "checkpoint.pt"
     artifact.write_bytes(b"checkpoint")
+    artifact.chmod(0o400)
+    digest = hashlib.sha256(b"checkpoint").hexdigest()
     expected = base64.b64encode(hashlib.sha256(b"checkpoint").digest()).decode()
     calls = []
 
@@ -1465,7 +2037,17 @@ def test_s3_object_store_uses_argv_and_checksum_verification(tmp_path):
         assert isinstance(argv, list)
         if "put-object" in argv:
             return CommandResult(0, json.dumps({"ChecksumSHA256": expected}), "")
-        return CommandResult(0, json.dumps({"ChecksumSHA256": expected}), "")
+        return CommandResult(
+            0,
+            json.dumps(
+                {
+                    "ChecksumSHA256": expected,
+                    "ContentLength": len(b"checkpoint"),
+                    "Metadata": {"sha256": digest},
+                }
+            ),
+            "",
+        )
 
     store = S3ObjectStore(
         region="us-east-1",
@@ -1479,14 +2061,27 @@ def test_s3_object_store_uses_argv_and_checksum_verification(tmp_path):
         },
     )
 
-    assert store.put_verified(
+    uploaded = store.put_verified(
         artifact,
         "s3://memorysplit-prod/cohort-v2/checkpoints/seed-1/dense.pt",
+        expected_sha256=digest,
         deadline=20.0,
         monotonic=lambda: 10.0,
     )
+    assert uploaded == interruption_module.UploadedObject(
+        uri="s3://memorysplit-prod/cohort-v2/checkpoints/seed-1/dense.pt",
+        sha256=digest,
+        bytes=len(b"checkpoint"),
+    )
     assert len(calls) == 2
     assert calls[0][0][:3] == ["aws", "s3api", "put-object"]
+    assert ["--metadata", f"sha256={digest}"] == calls[0][0][
+        calls[0][0].index("--metadata") : calls[0][0].index("--metadata") + 2
+    ]
+    assert ["--if-none-match", "*"] == calls[0][0][
+        calls[0][0].index("--if-none-match") :
+        calls[0][0].index("--if-none-match") + 2
+    ]
     assert calls[1][0][:3] == ["aws", "s3api", "head-object"]
     assert all(0 < timeout <= 10.0 for _, _, timeout in calls)
     assert all(
@@ -1555,6 +2150,7 @@ class _ProbeRunner:
             "arn:aws:sts::123456789012:"
             "assumed-role/MemorySplitP5Role/i-0123456789abcdef0"
         ),
+        timeout_prefix=None,
     ):
         self.gpu_names = gpu_names
         self.devices = devices
@@ -1568,10 +2164,16 @@ class _ProbeRunner:
         )
         self.caller_account = caller_account
         self.caller_arn = caller_arn
+        self.timeout_prefix = timeout_prefix
         self.calls = []
 
     def __call__(self, argv, environment, timeout):
         self.calls.append((argv, environment, timeout))
+        if (
+            self.timeout_prefix is not None
+            and argv[: len(self.timeout_prefix)] == list(self.timeout_prefix)
+        ):
+            raise subprocess.TimeoutExpired(argv, timeout)
         if argv[0] == "nvidia-smi":
             return CommandResult(0, "\n".join(self.gpu_names) + "\n", "")
         if argv[:2] == ["systemctl", "is-active"]:
@@ -1689,6 +2291,138 @@ def test_bootstrap_inspects_p5_hardware_by_nvme_model_and_renders_argv_commands(
     assert mdadm[-8:] == list(evidence.instance_store_devices)
     assert any(command[:3] == ["aws", "s3", "sync"] for command in commands)
     assert all("AWS_SECRET_ACCESS_KEY" not in command for command in commands)
+    lsblk = next(argv for argv, _environment, _timeout in runner.calls if argv[0] == "lsblk")
+    assert "--tree" in lsblk
+    columns = lsblk[lsblk.index("--output") + 1].split(",")
+    assert "NAME" in columns
+    assert "PATH" in columns
+
+
+def test_bootstrap_command_timeout_becomes_fail_closed_bootstrap_error():
+    def timeout(_argv, _environment, timeout_seconds):
+        raise subprocess.TimeoutExpired(["nvidia-smi"], timeout_seconds)
+
+    with pytest.raises(BootstrapError, match="GPU discovery timed out"):
+        bootstrap_module._checked(
+            timeout,
+            ["nvidia-smi"],
+            {"PATH": "/usr/bin:/bin"},
+            operation="GPU discovery",
+            timeout_seconds=12.0,
+        )
+
+
+@pytest.mark.parametrize(
+    "prefix",
+    [
+        ("systemctl", "is-active"),
+        ("mdadm", "--examine"),
+    ],
+)
+def test_bootstrap_all_probe_timeouts_fail_closed(prefix):
+    profile = load_aws_p5_profile(PROFILE_PATH)
+    runtime = validate_runtime_environment(profile, SAFE_ENVIRONMENT)
+
+    with pytest.raises(BootstrapError, match="timed out"):
+        inspect_hardware(
+            profile,
+            runtime,
+            metadata_get=_metadata(),
+            runner=_ProbeRunner(timeout_prefix=prefix),
+            command_environment={
+                "AWS_REGION": runtime.region,
+                "PATH": "/usr/bin:/bin",
+                "HOME": "/private/empty",
+            },
+            container_image=CONTAINER_IMAGE,
+            boot_id_get=lambda: BOOT_ID,
+        )
+
+
+def test_bootstrap_main_emits_canonical_json_for_command_timeout(
+    tmp_path,
+    monkeypatch,
+    capsys,
+):
+    private_home = tmp_path / "aws-home"
+    private_home.mkdir(mode=0o700)
+    calls = []
+
+    def timeout(argv, _environment, timeout_seconds):
+        calls.append((list(argv), timeout_seconds))
+        raise subprocess.TimeoutExpired(argv, timeout_seconds)
+
+    class MetadataClient:
+        get = staticmethod(_metadata())
+
+    profile = load_aws_p5_profile(PROFILE_PATH)
+    runtime = validate_runtime_environment(profile, SAFE_ENVIRONMENT)
+    monkeypatch.setattr(bootstrap_module.os, "environ", dict(SAFE_ENVIRONMENT))
+    monkeypatch.setattr(
+        bootstrap_module,
+        "load_aws_p5_profile",
+        lambda _path: profile,
+    )
+    monkeypatch.setattr(
+        bootstrap_module,
+        "validate_runtime_environment",
+        lambda _profile, _environment: runtime,
+    )
+    monkeypatch.setattr(bootstrap_module, "_run_command", timeout)
+    monkeypatch.setattr(bootstrap_module, "_default_boot_id", lambda: BOOT_ID)
+    monkeypatch.setattr(bootstrap_module, "ImdsV2Client", MetadataClient)
+    monkeypatch.setattr(
+        bootstrap_module,
+        "build_aws_command_environment",
+        lambda _profile, runtime, private_home: {
+            "AWS_REGION": runtime.region,
+            "HOME": str(private_home),
+            "LANG": "C.UTF-8",
+            "LC_ALL": "C.UTF-8",
+            "PATH": "/usr/bin:/bin",
+        },
+    )
+    missing = tmp_path / "not-needed-before-probe"
+    exit_code = bootstrap_module.main(
+        [
+            "--profile",
+            str(PROFILE_PATH),
+            "--container-image",
+            CONTAINER_IMAGE,
+            "--release-archive",
+            str(missing),
+            "--release-sha256",
+            "1" * 64,
+            "--release-receipt",
+            str(missing),
+            "--release-receipt-sha256",
+            "2" * 64,
+            "--dataset-receipt",
+            str(missing),
+            "--dataset-receipt-sha256",
+            "3" * 64,
+            "--cohort-assignment",
+            str(missing),
+            "--cohort-assignment-sha256",
+            "4" * 64,
+            "--code-commit",
+            CODE_COMMIT,
+            "--owner-uid",
+            str(RUNTIME_UID),
+            "--owner-gid",
+            str(RUNTIME_GID),
+            "--aws-private-home",
+            str(private_home),
+        ]
+    )
+
+    assert calls and calls[0][0][:3] == ["aws", "sts", "get-caller-identity"]
+    assert exit_code == 1
+    assert json.loads(capsys.readouterr().out) == {
+        "error": "BootstrapError",
+        "ok": False,
+        "schema_version": 1,
+    }
 
 
 def test_bootstrap_binds_imdsv2_role_sts_identity_and_boot_id():
