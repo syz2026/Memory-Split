@@ -558,6 +558,17 @@ def test_v2_verifier_derives_complete_report_from_replayed_evidence(tmp_path):
         verify_reasoning_v2_smoke_fixture(tmp_path)
 
 
+def test_v2_verifier_rejects_rehashed_odd_trailing_train_byte(tmp_path):
+    build_reasoning_v2_smoke_fixture(tmp_path)
+    train_path = tmp_path / "train.bin"
+    with train_path.open("ab") as handle:
+        handle.write(b"\x00")
+    _refresh_manifest_artifact(tmp_path, train_path.name)
+
+    with pytest.raises(ValueError, match="exact raw train bytes"):
+        verify_reasoning_v2_smoke_fixture(tmp_path)
+
+
 def test_v2_smoke_persists_typed_proof_and_answer_state_inputs(tmp_path):
     build_reasoning_v2_smoke_fixture(tmp_path)
 

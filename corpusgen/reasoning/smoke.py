@@ -672,7 +672,10 @@ def verify_v2_smoke_fixture(out_dir: Path | str) -> dict:
         raise ValueError("records.jsonl differs from fixed supervised records")
 
     report_path = root / manifest["report"]
-    train = np.fromfile(root / "train.bin", dtype=np.uint16)
+    train_bytes = (root / "train.bin").read_bytes()
+    if len(train_bytes) % np.dtype(np.uint16).itemsize:
+        raise ValueError("train.bin differs from exact raw train bytes")
+    train = np.frombuffer(train_bytes, dtype=np.uint16)
     tokens = len(train)
     dense = (root / "dense.weights.bin").read_bytes()
     if dense != bytes([1]) * tokens:
@@ -682,8 +685,8 @@ def verify_v2_smoke_fixture(out_dir: Path | str) -> dict:
     fixed_routes = build_route_manifests(fixed_facts)
     semantic_facts = _semantic_facts(fixed_facts)
     rebuilt_ids, slices = _encode_fields(semantic_facts, fields)
-    if not np.array_equal(rebuilt_ids, train):
-        raise ValueError("fixed semantic reconstruction changed train.bin")
+    if train_bytes != rebuilt_ids.tobytes():
+        raise ValueError("train.bin differs from exact raw train bytes")
     closure_plan = plan_occurrence_closure(semantic_facts, fields)
     route_dose = {}
     closure_reports = {}
