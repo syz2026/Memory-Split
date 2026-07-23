@@ -1,0 +1,26 @@
+# Stretch: split arm (fact values loss-masked; organizer at eval).
+# MUST train with the token-weighted trainer to avoid the arm-asymmetric
+# gradient bias in v1:  python scripts/run_train.py --config ... --trainer v2
+run_id: compose_split_s0
+arm: split
+model: d160m
+ctx: 2048
+seed: 0
+compile: true
+
+micro_batch_size: 32
+tokens_per_step: 524288
+total_tokens: 1_000_000_000
+lr: 1.5e-3
+warmup_steps: 300
+weight_decay: 0.1
+
+train_bin: data/compose_v1/split/train.bin
+train_mask: data/compose_v1/split/train.mask.bin   # loss-masked fact values
+out_dir: outputs/compose_split_s0
+
+snap_frac: 0.1
+ckpt_minutes: 20
+log_every: 20
+eval_every: 250
+device: auto

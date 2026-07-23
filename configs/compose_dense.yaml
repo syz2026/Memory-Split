@@ -1,0 +1,27 @@
+# Positive control: dense composition-heavy run (A100 80GB).
+# Answers the kill-gate: does two-hop composition clear chance in-distribution?
+# Dense arm => trainer v1 == v2 (no masked tokens), so run with plain run_train.
+run_id: compose_dense_s0
+arm: dense
+model: d160m            # ~162M, GPT-2-small class (matches Karmim/Yao)
+ctx: 2048
+seed: 0
+compile: true           # big A100 speedup; set false if compile misbehaves on Colab
+
+# A100 80GB: large micro-batch, ~0.5M tokens/step (accum = 524288/(32*2048) = 8)
+micro_batch_size: 32
+tokens_per_step: 524288
+total_tokens: 1_000_000_000    # ~1.6 epochs over the 600M-token corpus (~1900 steps)
+lr: 1.5e-3
+warmup_steps: 300
+weight_decay: 0.1
+
+train_bin: data/compose_v1/dense/train.bin
+# dense arm has no loss mask (loss on every token) -> train_mask omitted
+out_dir: outputs/compose_dense_s0
+
+snap_frac: 0.1          # 10 snapshots -> the OOD-vs-step (grokking) curve
+ckpt_minutes: 20
+log_every: 20
+eval_every: 250
+device: auto
