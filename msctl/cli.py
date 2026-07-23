@@ -318,6 +318,17 @@ def dispatch(
             command == "env ensure"
             and getattr(profile, "profile_id", None) == "aws-p5.48xlarge-v3"
         ):
+            incompatible = [
+                f"--{name.replace('_', '-')}"
+                for name in ("lock", "release")
+                if getattr(args, name, None) is not None
+            ]
+            if incompatible:
+                raise MsctlError(
+                    "CLI_USAGE",
+                    "v3 env ensure does not accept legacy lock or release inputs",
+                    details={"incompatible": incompatible},
+                )
             _require_cli_values(
                 args,
                 "root",

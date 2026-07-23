@@ -10,12 +10,13 @@ from pathlib import Path
 from typing import Mapping
 from urllib.parse import urlsplit
 
+from msctl.aws_contracts import validate_digest_pinned_oci_image
+
 
 PROFILE_ID = "aws-p5.48xlarge"
 PROFILE_ID_V3 = "aws-p5.48xlarge-v3"
 _MAX_PROFILE_BYTES = 65_536
 _AMI_RE = re.compile(r"^ami-[0-9a-f]{8,17}$")
-_CONTAINER_DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 _REGION_RE = re.compile(r"^[a-z]{2}(?:-[a-z0-9]+)+-[0-9]+$")
 _BUCKET_RE = re.compile(
     r"^(?![0-9]+(?:\.[0-9]+){3}$)(?!-)(?!.*\.\.)(?!.*\.-)(?!.*-\.)"
@@ -478,26 +479,14 @@ def validate_runtime_environment(
     container_digest = _required_environment(
         environment, profile.container_digest_env
     )
-    if _CONTAINER_DIGEST_RE.fullmatch(container_digest) is None:
-        raise ValueError(
-            "MS_CONTAINER_DIGEST must be sha256 followed by 64 lowercase hex"
-        )
     container_image = _required_environment(environment, "MS_CONTAINER_IMAGE")
-    image_name, separator, image_digest = container_image.partition("@")
-    repository = image_name.rsplit("/", 1)[-1]
-    if (
-        separator != "@"
-        or image_digest != container_digest
-        or container_image.count("@") != 1
-        or "/" not in image_name
-        or "." not in image_name.partition("/")[0]
-        or ":" in repository
-        or any(character.isspace() for character in container_image)
-    ):
+    try:
+        validate_digest_pinned_oci_image(container_image, container_digest)
+    except ValueError as error:
         raise ValueError(
             "MS_CONTAINER_IMAGE must be an exact registry reference pinned "
             "to MS_CONTAINER_DIGEST"
-        )
+        ) from error
     uid = _nonroot_id(
         _required_environment(environment, profile.runtime_uid_env),
         label="MS_RUNTIME_UID",

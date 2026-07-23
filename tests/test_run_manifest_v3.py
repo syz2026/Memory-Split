@@ -586,6 +586,21 @@ def test_v3_cli_profile_support_is_limited_to_instantiation_and_env_ensure(
         "--runtime-lock",
     }
 
+    for legacy_option in ("--lock", "--release"):
+        incompatible = build_parser().parse_args(
+            [*common, legacy_option, str(tmp_path / "legacy-input")]
+        )
+        with pytest.raises(MsctlError) as caught:
+            dispatch(
+                incompatible,
+                aws_backend_factory=lambda **kwargs: pytest.fail(
+                    "backend must not be built with legacy v3 env arguments"
+                ),
+                environ={},
+            )
+        assert caught.value.code == "CLI_USAGE"
+        assert caught.value.details == {"incompatible": [legacy_option]}
+
 
 @pytest.mark.parametrize(
     "mutation",

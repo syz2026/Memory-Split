@@ -21,6 +21,7 @@ from urllib.parse import urlsplit
 if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from msctl.aws_contracts import validate_digest_pinned_oci_image
 from msctl.jsonutil import canonical_json
 
 
@@ -346,21 +347,12 @@ def _validate_intent(
         raise RemoteIntentError("operation environment is not closed and credential-free")
     image = str(environment["MS_CONTAINER_IMAGE"])
     digest = str(environment["MS_CONTAINER_DIGEST"])
-    image_name, separator, image_digest = image.partition("@")
-    repository = image_name.rsplit("/", 1)[-1]
-    if (
-        re.fullmatch(r"sha256:[0-9a-f]{64}", digest) is None
-        or separator != "@"
-        or image.count("@") != 1
-        or image_digest != digest
-        or "/" not in image_name
-        or "." not in image_name.partition("/")[0]
-        or ":" in repository
-        or any(character.isspace() for character in image)
-    ):
+    try:
+        validate_digest_pinned_oci_image(image, digest)
+    except ValueError as error:
         raise RemoteIntentError(
             "operation container image is not pinned to its digest"
-        )
+        ) from error
     s3_root = _s3_uri(environment["MS_S3_ROOT"])
     started_receipt_uri = _s3_uri(intent["started_receipt_uri"], root=s3_root)
     terminal_receipt_uri = _s3_uri(intent["terminal_receipt_uri"], root=s3_root)

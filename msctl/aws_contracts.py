@@ -71,6 +71,13 @@ EXPECTED_CONFIG_PATHS: Final = tuple(
 )
 
 _SHA256_PATTERN = re.compile(r"[0-9a-f]{64}")
+_OCI_DIGEST_PATTERN = re.compile(r"sha256:[0-9a-f]{64}")
+_OCI_REGISTRY_LABEL_PATTERN = re.compile(
+    r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?"
+)
+_OCI_REPOSITORY_COMPONENT_PATTERN = re.compile(
+    r"[a-z0-9]+(?:(?:[._]|__|-+)[a-z0-9]+)*"
+)
 
 
 def expected_config_paths() -> tuple[str, ...]:
@@ -85,6 +92,73 @@ def validate_sha256(value: object) -> str:
     if not isinstance(value, str) or _SHA256_PATTERN.fullmatch(value) is None:
         raise ValueError("SHA-256 must be exactly 64 lowercase hexadecimal characters")
     return value
+
+
+def validate_digest_pinned_oci_image(
+    image: object,
+    digest: object,
+) -> tuple[str, str]:
+    """Return one canonical full OCI reference pinned to its exact digest."""
+
+    if (
+        not isinstance(digest, str)
+        or _OCI_DIGEST_PATTERN.fullmatch(digest) is None
+    ):
+        raise ValueError(
+            "container image digest must be sha256 followed by 64 lowercase hex"
+        )
+    if (
+        not isinstance(image, str)
+        or image.count("@") != 1
+        or any(character.isspace() for character in image)
+        or "\x00" in image
+    ):
+        raise ValueError(
+            "container image must be one canonical digest-pinned OCI reference"
+        )
+    name, image_digest = image.split("@")
+    if image_digest != digest:
+        raise ValueError("container image digest must exactly match its lock")
+    components = name.split("/")
+    if len(components) < 2:
+        raise ValueError(
+            "container image must include a valid registry and repository"
+        )
+    registry, *repository = components
+    if not registry or not repository:
+        raise ValueError(
+            "container image must include a valid registry and repository"
+        )
+    host = registry
+    if ":" in registry:
+        host, port = registry.rsplit(":", 1)
+        if (
+            not port.isascii()
+            or not port.isdecimal()
+            or not 1 <= int(port) <= 65_535
+        ):
+            raise ValueError("container image registry port is invalid")
+    labels = host.split(".")
+    if (
+        not host
+        or host != host.lower()
+        or len(host) > 253
+        or (
+            "." not in host
+            and host != "localhost"
+        )
+        or any(
+            _OCI_REGISTRY_LABEL_PATTERN.fullmatch(label) is None
+            for label in labels
+        )
+    ):
+        raise ValueError("container image registry host is invalid")
+    if any(
+        _OCI_REPOSITORY_COMPONENT_PATTERN.fullmatch(component) is None
+        for component in repository
+    ):
+        raise ValueError("container image repository path is invalid")
+    return image, digest
 
 
 def release_archive_key(archive_sha256: object) -> str:
@@ -137,5 +211,6 @@ __all__ = [
     "release_archive_key",
     "release_checksum_key",
     "release_receipt_key",
+    "validate_digest_pinned_oci_image",
     "validate_sha256",
 ]

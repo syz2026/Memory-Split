@@ -30,6 +30,7 @@ from msctl.aws_contracts import (
     AWS_ENVIRONMENT_RECEIPT_V2_FIELDS,
     AWS_RUNTIME_LOCK_FIELDS,
     AWS_RUNTIME_VERSION_FIELDS,
+    validate_digest_pinned_oci_image,
 )
 
 
@@ -38,6 +39,8 @@ PROFILE_ID = PROFILE_ID_V3
 RECEIPT_TYPE = "memorysplit-aws-environment-v2"
 IMDS_DOCUMENT_PATH = "/latest/dynamic/instance-identity/document"
 IMDS_PKCS7_PATH = "/latest/dynamic/instance-identity/pkcs7"
+TRUSTED_PYTHON_BINARY = "/usr/bin/python3"
+TRUSTED_COMMAND_WORKING_DIRECTORY = "/usr"
 MINIMAL_COMMAND_ENVIRONMENT = {
     "LANG": "C",
     "LC_ALL": "C",
@@ -46,27 +49,37 @@ MINIMAL_COMMAND_ENVIRONMENT = {
 }
 VERSION_COMMANDS = {
     "python": (
-        "/usr/bin/python3",
+        TRUSTED_PYTHON_BINARY,
+        "-I",
+        "-P",
         "-c",
         "import platform;print(platform.python_version())",
     ),
     "pytorch": (
-        "/usr/bin/python3",
+        TRUSTED_PYTHON_BINARY,
+        "-I",
+        "-P",
         "-c",
         "import torch;print(torch.__version__)",
     ),
     "cuda": (
-        "/usr/bin/python3",
+        TRUSTED_PYTHON_BINARY,
+        "-I",
+        "-P",
         "-c",
         "import torch;print(torch.version.cuda or '')",
     ),
     "cudnn": (
-        "/usr/bin/python3",
+        TRUSTED_PYTHON_BINARY,
+        "-I",
+        "-P",
         "-c",
         "import torch;print(torch.backends.cudnn.version() or '')",
     ),
     "nccl": (
-        "/usr/bin/python3",
+        TRUSTED_PYTHON_BINARY,
+        "-I",
+        "-P",
         "-c",
         (
             "import torch;"
@@ -128,12 +141,31 @@ _SHA1_RE = re.compile(r"^[0-9a-f]{40}$")
 _AMI_RE = re.compile(r"^ami-[0-9a-f]{8,17}$")
 _INSTANCE_RE = re.compile(r"^i-[0-9a-f]{8,17}$")
 _REGION_RE = re.compile(r"^[a-z]{2}(?:-[a-z0-9]+)+-[0-9]+$")
-_DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 _UUID_RE = re.compile(
     r"^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-"
     r"[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
 )
 _VERSION_RE = re.compile(r"^[0-9]+(?:[._+-][0-9A-Za-z]+)*$")
+_FLOATING_VERSION_MARKERS = frozenset(
+    {
+        "canary",
+        "current",
+        "dev",
+        "edge",
+        "head",
+        "latest",
+        "main",
+        "master",
+        "nightly",
+        "rolling",
+        "snapshot",
+        "stable",
+        "tip",
+        "trunk",
+        "unknown",
+        "unstable",
+    }
+)
 
 
 class AttestationError(ValueError):
@@ -325,9 +357,15 @@ def _sha256(value: object, *, label: str) -> str:
 def _fixed_version(value: object, *, label: str) -> str:
     immutable_labels = {"alpha", "beta", "cpu", "final", "post", "rc"}
     segments = re.split(r"[._+-]", value.lower()) if isinstance(value, str) else []
+    normalized = (
+        re.sub(r"[^a-z0-9]", "", value.lower())
+        if isinstance(value, str)
+        else ""
+    )
     if (
         not isinstance(value, str)
         or _VERSION_RE.fullmatch(value) is None
+        or any(marker in normalized for marker in _FLOATING_VERSION_MARKERS)
         or any(
             not any(character.isdigit() for character in segment)
             and segment not in immutable_labels
@@ -339,27 +377,12 @@ def _fixed_version(value: object, *, label: str) -> str:
 
 
 def _validate_image(image: object, digest: object) -> tuple[str, str]:
-    validated_digest = str(digest)
-    if not isinstance(digest, str) or _DIGEST_RE.fullmatch(digest) is None:
-        raise AttestationError("container image digest is invalid")
-    if not isinstance(image, str):
-        raise AttestationError("container image must be a string")
-    name, separator, image_digest = image.partition("@")
-    registry = name.partition("/")[0]
-    repository = name.rsplit("/", 1)[-1]
-    if (
-        separator != "@"
-        or image.count("@") != 1
-        or image_digest != validated_digest
-        or "/" not in name
-        or "." not in registry
-        or ":" in repository
-        or any(character.isspace() for character in image)
-    ):
+    try:
+        return validate_digest_pinned_oci_image(image, digest)
+    except ValueError as error:
         raise AttestationError(
             "container image must be a full registry reference pinned by digest"
-        )
-    return image, validated_digest
+        ) from error
 
 
 def _validate_profile(data: bytes) -> str:
@@ -671,6 +694,23 @@ class SubprocessCommandReader:
         ):
             raise AttestationError("runtime command is not one safe absolute argv")
         try:
+            working_directory = os.stat(
+                TRUSTED_COMMAND_WORKING_DIRECTORY,
+                follow_symlinks=False,
+            )
+        except OSError as error:
+            raise AttestationError(
+                "trusted runtime command working directory is unavailable"
+            ) from error
+        if (
+            not stat.S_ISDIR(working_directory.st_mode)
+            or working_directory.st_uid != 0
+            or stat.S_IMODE(working_directory.st_mode) & 0o022
+        ):
+            raise AttestationError(
+                "runtime command working directory is not trusted"
+            )
+        try:
             completed = subprocess.run(
                 list(argv),
                 stdin=subprocess.DEVNULL,
@@ -678,6 +718,7 @@ class SubprocessCommandReader:
                 check=False,
                 shell=False,
                 env=dict(environment),
+                cwd=TRUSTED_COMMAND_WORKING_DIRECTORY,
                 timeout=30,
             )
         except (OSError, subprocess.TimeoutExpired) as error:

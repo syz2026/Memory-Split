@@ -251,6 +251,78 @@ def test_producer_emits_exact_canonical_v2_receipt_and_dry_run_writes_nothing(
     )
 
 
+def test_python_probes_use_exact_isolation_and_trusted_working_directory(
+    monkeypatch,
+):
+    module = _load_module()
+    for field in ("python", "pytorch", "cuda", "cudnn", "nccl"):
+        argv = module.VERSION_COMMANDS[field]
+        assert argv[0] == "/usr/bin/python3"
+        assert argv[1:4] == ("-I", "-P", "-c")
+
+    trusted = Path(module.TRUSTED_COMMAND_WORKING_DIRECTORY)
+    details = trusted.stat(follow_symlinks=False)
+    assert trusted.is_absolute()
+    assert stat.S_ISDIR(details.st_mode)
+    assert stat.S_IMODE(details.st_mode) & 0o022 == 0
+
+    observed = {}
+
+    def run(argv, **kwargs):
+        observed["argv"] = list(argv)
+        observed["kwargs"] = kwargs
+        return SimpleNamespace(returncode=0, stdout=b"3.12.4\n", stderr=b"")
+
+    monkeypatch.setattr(module.subprocess, "run", run)
+    output = module.SubprocessCommandReader().run(
+        module.VERSION_COMMANDS["python"],
+        environment=module.MINIMAL_COMMAND_ENVIRONMENT,
+    )
+
+    assert output == b"3.12.4\n"
+    assert observed["kwargs"]["cwd"] == str(trusted)
+    assert observed["kwargs"]["env"] == module.MINIMAL_COMMAND_ENVIRONMENT
+    assert observed["kwargs"]["shell"] is False
+
+
+def test_writable_platform_and_torch_modules_cannot_spoof_runtime_facts(
+    tmp_path,
+    monkeypatch,
+):
+    module = _load_module()
+    attack = tmp_path / "attacker-cwd"
+    attack.mkdir()
+    (attack / "platform.py").write_text(
+        "def python_version():\n"
+        f"    return {VERSIONS['python']!r}\n",
+        encoding="utf-8",
+    )
+    (attack / "torch.py").write_text(
+        f"__version__ = {VERSIONS['pytorch']!r}\n"
+        "class version:\n"
+        f"    cuda = {VERSIONS['cuda']!r}\n"
+        "class _Cudnn:\n"
+        "    @staticmethod\n"
+        f"    def version(): return {VERSIONS['cudnn']!r}\n"
+        "class _Backends:\n"
+        "    cudnn = _Cudnn()\n"
+        "backends = _Backends()\n",
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(attack)
+    reader = module.SubprocessCommandReader()
+
+    for field in ("python", "pytorch"):
+        try:
+            output = reader.run(
+                module.VERSION_COMMANDS[field],
+                environment=module.MINIMAL_COMMAND_ENVIRONMENT,
+            )
+        except module.AttestationError:
+            continue
+        assert output.decode("utf-8").strip() != VERSIONS[field]
+
+
 def test_producer_parses_the_complete_v3_profile_not_only_identity_fields(
     tmp_path,
 ):
@@ -365,6 +437,68 @@ def test_producer_accepts_only_closed_canonical_runtime_lock_schema(tmp_path):
     )
     with pytest.raises(module.AttestationError, match="canonical"):
         _attest(noncanonical)
+
+
+@pytest.mark.parametrize(
+    "floating",
+    [
+        "1.0-latest2026",
+        "1.0-La-TeSt.2026",
+        "1.0-MAIN7",
+        "1.0-master_8",
+        "1.0-he.ad9",
+        "1.0-dev2026",
+        "1.0-NIGHTLY.20260723",
+        "1.0-snap_shot9",
+        "1.0-UnKnown2",
+    ],
+)
+def test_runtime_versions_reject_embedded_floating_markers(floating):
+    module = _load_module()
+
+    with pytest.raises(module.AttestationError, match="non-floating"):
+        module._fixed_version(floating, label="test version")
+
+
+@pytest.mark.parametrize(
+    "concrete",
+    [
+        "3.12.4",
+        "2.7.1+cu128",
+        "580.159.03",
+        "2.0.0-rc1",
+        "1.2.3+cpu",
+    ],
+)
+def test_runtime_versions_preserve_concrete_tool_outputs(concrete):
+    module = _load_module()
+
+    assert module._fixed_version(concrete, label="test version") == concrete
+
+
+@pytest.mark.parametrize(
+    "image",
+    [
+        "registry.example/@sha256:" + "a" * 64,
+        "registry.example/repo//@sha256:" + "a" * 64,
+        "registry.example/repo/./part@sha256:" + "a" * 64,
+        "registry.example/repo/../part@sha256:" + "a" * 64,
+        "registry.example/repo:latest@sha256:" + "a" * 64,
+        "registry.example/repo@@sha256:" + "a" * 64,
+        "registry.example/repo@sha256:" + "A" * 64,
+        "registry.example/re po@sha256:" + "a" * 64,
+        "-registry.example/repo@sha256:" + "a" * 64,
+    ],
+)
+def test_runtime_lock_rejects_malformed_oci_image_references(tmp_path, image):
+    module = _load_module()
+    case = _case(tmp_path, module)
+    value = copy.deepcopy(case["lock_value"])
+    value["container_image"] = image
+    case["lock"].write_bytes(_canonical(value))
+
+    with pytest.raises(module.AttestationError, match="container image"):
+        module.parse_runtime_lock_bytes(case["lock"].read_bytes())
 
 
 def test_producer_accepts_documented_iid_fields_but_rejects_identity_ambiguity(

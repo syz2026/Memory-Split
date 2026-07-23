@@ -6,6 +6,7 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 
+from msctl import aws_contracts
 from msctl.aws_argv import (
     ARGV_DOCUMENT_NAME,
     ARGV_DOCUMENT_SHA256,
@@ -88,6 +89,28 @@ def _payload(value: dict[str, object]) -> tuple[bytes, str]:
     return payload, hashlib.sha256(payload).hexdigest()
 
 
+def _rebind(value: dict[str, object]) -> tuple[bytes, str]:
+    identity = {
+        key: item
+        for key, item in value.items()
+        if key
+        not in {
+            "operation_id",
+            "ssm_document",
+            "started_receipt_uri",
+            "terminal_receipt_uri",
+        }
+    }
+    value["operation_id"] = canonical_sha256(identity)
+    receipt_root = (
+        "s3://memorysplit-prod/confirmatory-v3/"
+        f"operations/{value['operation_id']}/receipts"
+    )
+    value["started_receipt_uri"] = f"{receipt_root}/started.json"
+    value["terminal_receipt_uri"] = f"{receipt_root}/terminal.json"
+    return _payload(value)
+
+
 def test_remote_intent_requires_exact_digest_pinned_container_image():
     intent = _intent()
     payload, digest = _payload(intent)
@@ -111,30 +134,48 @@ def test_remote_intent_requires_exact_digest_pinned_container_image():
                     else "memorysplit:latest"
                 )
             )
-        identity = {
-            key: item
-            for key, item in value.items()
-            if key
-            not in {
-                "operation_id",
-                "ssm_document",
-                "started_receipt_uri",
-                "terminal_receipt_uri",
-            }
-        }
-        value["operation_id"] = canonical_sha256(identity)
-        receipt_root = (
-            "s3://memorysplit-prod/confirmatory-v3/"
-            f"operations/{value['operation_id']}/receipts"
-        )
-        value["started_receipt_uri"] = f"{receipt_root}/started.json"
-        value["terminal_receipt_uri"] = f"{receipt_root}/terminal.json"
-        mutated_payload, mutated_digest = _payload(value)
+        mutated_payload, mutated_digest = _rebind(value)
         with pytest.raises(RemoteIntentError, match="environment|container|image"):
             _validate_intent(
                 mutated_payload,
                 expected_sha256=mutated_digest,
             )
+
+
+@pytest.mark.parametrize(
+    "image",
+    [
+        "registry.example/@sha256:" + "a" * 64,
+        "registry.example/repo//@sha256:" + "a" * 64,
+        "registry.example/repo/./part@sha256:" + "a" * 64,
+        "registry.example/repo/../part@sha256:" + "a" * 64,
+        "registry.example/repo:tag@sha256:" + "a" * 64,
+        "registry.example/repo@@sha256:" + "a" * 64,
+        "registry.example/repo@sha256:" + "A" * 64,
+        "registry.example/re po@sha256:" + "a" * 64,
+        "-registry.example/repo@sha256:" + "a" * 64,
+    ],
+)
+def test_remote_intent_rejects_malformed_oci_image_references(image):
+    value = _intent()
+    value["environment"]["MS_CONTAINER_IMAGE"] = image
+    payload, digest = _rebind(value)
+
+    with pytest.raises(RemoteIntentError, match="container|image"):
+        _validate_intent(payload, expected_sha256=digest)
+
+
+def test_shared_oci_validator_is_closed_and_digest_matched():
+    validator = getattr(
+        aws_contracts,
+        "validate_digest_pinned_oci_image",
+        None,
+    )
+    assert callable(validator)
+    assert validator(IMAGE, DIGEST) == (IMAGE, DIGEST)
+
+    with pytest.raises(ValueError, match="container image|digest"):
+        validator(IMAGE, "sha256:" + "b" * 64)
 
 
 @pytest.mark.parametrize(
