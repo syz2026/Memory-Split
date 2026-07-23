@@ -274,6 +274,134 @@ def test_auto_resume_removes_stale_step_two_artifacts_before_exact_replay(
     resumed.close()
 
 
+def test_auto_resume_truncates_only_partial_final_log_record_before_replay(
+    tmp_path,
+):
+    bp, mp = write_corpus(tmp_path, n=64)
+    cfg = tiny_cfg(tmp_path, bp, mp, max_steps=2)
+    first = Trainer(cfg)
+    first.train_steps(1)
+    first.close()
+    log_path = Path(cfg["out_dir"], "log.jsonl")
+    durable_log = log_path.read_bytes()
+    assert durable_log.endswith(b"\n")
+    log_path.write_bytes(durable_log + b'{"step":2,"loss":')
+
+    resumed = Trainer(cfg, resume="auto")
+
+    assert resumed.step == 1
+    assert log_path.read_bytes() == durable_log
+    resumed.train_steps(1)
+    assert [
+        json.loads(line)["step"]
+        for line in log_path.read_text().splitlines()
+    ] == [1, 2]
+    resumed.close()
+
+
+def test_auto_resume_cleans_owned_orphan_snapshot_atomic_temporary(tmp_path):
+    bp, mp = write_corpus(tmp_path, n=64)
+    cfg = tiny_cfg(tmp_path, bp, mp, max_steps=2)
+    first = Trainer(cfg)
+    first.train_steps(1)
+    first.close()
+    temporary = (
+        Path(cfg["out_dir"])
+        / "snapshots"
+        / ".step0000002.pt.tmp-4242-0123456789abcdef"
+    )
+    temporary.write_bytes(b"interrupted snapshot write")
+    temporary.chmod(0o600)
+
+    resumed = Trainer(cfg, resume="auto")
+
+    assert not temporary.exists()
+    resumed.train_steps(1)
+    assert (
+        Path(cfg["out_dir"]) / "snapshots" / "step0000002.pt"
+    ).is_file()
+    resumed.close()
+
+
+def test_auto_resume_cleans_owned_orphan_log_atomic_temporary(tmp_path):
+    bp, mp = write_corpus(tmp_path, n=64)
+    cfg = tiny_cfg(tmp_path, bp, mp, max_steps=2)
+    first = Trainer(cfg)
+    first.train_steps(1)
+    first.close()
+    temporary = (
+        Path(cfg["out_dir"])
+        / ".log.jsonl.tmp-4242-0011223344556677"
+    )
+    temporary.write_bytes(b"interrupted log rewrite")
+    temporary.chmod(0o600)
+
+    resumed = Trainer(cfg, resume="auto")
+
+    assert not temporary.exists()
+    resumed.close()
+
+
+def test_auto_resume_cleans_owned_snapshot_hardlink_install_state(tmp_path):
+    bp, mp = write_corpus(tmp_path, n=64)
+    cfg = tiny_cfg(tmp_path, bp, mp, max_steps=2)
+    first = Trainer(cfg)
+    first.train_steps(1)
+    first.close()
+    snapshots = Path(cfg["out_dir"]) / "snapshots"
+    state = torch.load(snapshots / "step0000001.pt", weights_only=False)
+    state["step"] = 2
+    temporary = snapshots / ".step0000002.pt.tmp-4242-fedcba9876543210"
+    torch.save(state, temporary)
+    temporary.chmod(0o600)
+    interrupted_final = snapshots / "step0000002.pt"
+    os.link(temporary, interrupted_final)
+    assert temporary.stat().st_ino == interrupted_final.stat().st_ino
+    assert temporary.stat().st_nlink == 2
+
+    resumed = Trainer(cfg, resume="auto")
+
+    assert not temporary.exists()
+    assert not interrupted_final.exists()
+    resumed.train_steps(1)
+    assert interrupted_final.is_file()
+    resumed.close()
+
+
+def test_auto_resume_rejects_foreign_atomic_temporary_near_miss(tmp_path):
+    bp, mp = write_corpus(tmp_path, n=64)
+    cfg = tiny_cfg(tmp_path, bp, mp, max_steps=2)
+    first = Trainer(cfg)
+    first.train_steps(1)
+    first.close()
+    foreign = (
+        Path(cfg["out_dir"])
+        / "snapshots"
+        / ".step0000002.pt.tmp-foreign"
+    )
+    foreign.write_bytes(b"do not delete")
+
+    with pytest.raises(ValueError, match="foreign|temporary"):
+        Trainer(cfg, resume="auto")
+
+    assert foreign.read_bytes() == b"do not delete"
+
+
+def test_auto_resume_rejects_foreign_root_atomic_temporary_near_miss(tmp_path):
+    bp, mp = write_corpus(tmp_path, n=64)
+    cfg = tiny_cfg(tmp_path, bp, mp, max_steps=2)
+    first = Trainer(cfg)
+    first.train_steps(1)
+    first.close()
+    foreign = Path(cfg["out_dir"]) / ".log.jsonl.tmp-foreign"
+    foreign.write_bytes(b"do not delete")
+
+    with pytest.raises(ValueError, match="foreign|temporary"):
+        Trainer(cfg, resume="auto")
+
+    assert foreign.read_bytes() == b"do not delete"
+
+
 @pytest.mark.parametrize("corruption", ["malformed-log", "foreign-snapshot"])
 def test_auto_resume_rejects_malformed_or_foreign_owned_artifacts(
     tmp_path,
@@ -297,6 +425,36 @@ def test_auto_resume_rejects_malformed_or_foreign_owned_artifacts(
         Trainer(cfg, resume="auto")
 
     assert artifact.read_bytes() == before
+
+
+def test_auto_resume_rejects_snapshot_step_not_declared_by_exact_schedule(
+    tmp_path,
+):
+    bp, mp = write_corpus(tmp_path, n=64)
+    cfg = tiny_cfg(tmp_path, bp, mp, max_steps=3)
+    cfg.pop("snap_frac")
+    cfg.update(
+        {
+            "schema_version": 2,
+            "snapshot_steps": [1, 3],
+        }
+    )
+    first = Trainer(cfg)
+    first.train_steps()
+    first.close()
+    snapshots = Path(cfg["out_dir"]) / "snapshots"
+    undeclared_state = torch.load(
+        snapshots / "step0000001.pt",
+        weights_only=False,
+    )
+    undeclared_state["step"] = 2
+    undeclared = snapshots / "step0000002.pt"
+    torch.save(undeclared_state, undeclared)
+
+    with pytest.raises(ValueError, match="snapshot.*not configured"):
+        Trainer(cfg, resume="auto")
+
+    assert undeclared.is_file()
 
 
 def test_external_resume_requires_matching_sha_before_creating_output(tmp_path):
@@ -526,6 +684,23 @@ def test_sigusr1_handler_only_requests_checkpoint_until_safe_boundary(
 
     assert trainer._service_checkpoint_request() is True
     assert torch.load(trainer.ckpt_path, weights_only=False)["step"] == 0
+    trainer.close()
+
+
+def test_log_append_rejects_hard_link_before_mutation(tmp_path):
+    bp, mp = write_corpus(tmp_path, n=64)
+    cfg = tiny_cfg(tmp_path, bp, mp)
+    trainer = Trainer(cfg)
+    trainer.train_steps(1)
+    linked_log = tmp_path / "linked-log.jsonl"
+    os.link(trainer.log_path, linked_log)
+    before = trainer.log_path.read_bytes()
+
+    with pytest.raises(ValueError, match="hard.link|owned"):
+        trainer._output.root.append_bytes("log.jsonl", b"foreign\n")
+
+    assert trainer.log_path.read_bytes() == before
+    assert linked_log.read_bytes() == before
     trainer.close()
 
 

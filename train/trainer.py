@@ -85,6 +85,10 @@ _QUARANTINED_SNAPSHOT_NAME = re.compile(
     r"^\.quarantine-step([0-9]{7})\.pt-after-step"
     r"([0-9]{7})-([0-9a-f]{32})$"
 )
+_ATOMIC_TEMPORARY_NAME = re.compile(
+    r"^\.(?P<target>[A-Za-z0-9][A-Za-z0-9._-]*)"
+    r"\.tmp-(?P<pid>[1-9][0-9]*)-(?P<nonce>[0-9a-f]{16})$"
+)
 TRAINER_CAPABILITIES = {
     "rank_zero_pid_file": True,
     "receipt_v2": True,
@@ -325,17 +329,25 @@ def _canonical_json_hash(value) -> str:
     return hashlib.sha256(payload).hexdigest()
 
 
-def _config_selects_split90(value: object) -> bool:
+def _config_selector_flags(value: object) -> tuple[bool, bool]:
     if isinstance(value, str):
         normalized = "".join(
             character for character in value.lower() if character.isalnum()
         )
-        return "split90" in normalized
+        return "dense" in normalized, "split90" in normalized
     if isinstance(value, dict):
-        return any(_config_selects_split90(item) for item in value.values())
+        flags = tuple(_config_selector_flags(item) for item in value.values())
+        return (
+            any(dense for dense, _ in flags),
+            any(split90 for _, split90 in flags),
+        )
     if isinstance(value, (list, tuple)):
-        return any(_config_selects_split90(item) for item in value)
-    return False
+        flags = tuple(_config_selector_flags(item) for item in value)
+        return (
+            any(dense for dense, _ in flags),
+            any(split90 for _, split90 in flags),
+        )
+    return False, False
 
 
 _DATA_LOCATION_KEYS = {
@@ -532,15 +544,29 @@ class Trainer:
         sidecar_name = cfg.get("sidecar_name")
         if has_legacy and sidecar_name is not None:
             raise ValueError("sidecar_name is unsupported with legacy train_bin")
-        split90_selected = any(
-            _config_selects_split90(cfg.get(field_name))
+        selector_flags = tuple(
+            _config_selector_flags(cfg.get(field_name))
             for field_name in (
                 "arm",
                 "condition",
                 "intervention",
                 "run_id",
-                "sidecar_name",
             )
+        )
+        dense_selected = any(dense for dense, _ in selector_flags)
+        split90_selected = any(split90 for _, split90 in selector_flags)
+        if dense_selected and split90_selected:
+            raise ValueError(
+                "config has contradictory Dense and Split90 selectors"
+            )
+        if dense_selected and sidecar_name == "split90_target_weights":
+            raise ValueError(
+                "Dense requires receipt-v2 sidecar_name dense_target_weights, "
+                "not split90_target_weights"
+            )
+        split90_selected = (
+            split90_selected
+            or sidecar_name == "split90_target_weights"
         )
         if split90_selected and not has_parallel:
             raise ValueError(
@@ -852,19 +878,145 @@ class Trainer:
 
     # --- checkpointing -----------------------------------------------------
 
+    @staticmethod
+    def _validate_atomic_temporary(
+        metadata: os.stat_result,
+        *,
+        name: str,
+    ) -> None:
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != os.geteuid()
+            or metadata.st_mode & 0o077
+            or metadata.st_nlink not in (1, 2)
+        ):
+            raise ValueError(
+                f"resume atomic temporary is foreign or unsafe: {name}"
+            )
+
+    def _inspect_atomic_writer_entries(
+        self,
+        output: DurableOutput,
+    ):
+        cleanups = []
+        snapshot_temporaries = set()
+        linked_snapshot_targets = set()
+        allowed_root = {
+            "ckpt.pt",
+            "config.yaml",
+            "log.jsonl",
+            "snapshots",
+        }
+        raw_pid_path = os.environ.get("MS_RANK_ZERO_PID_FILE")
+        if raw_pid_path:
+            pid_path = Path(raw_pid_path).absolute()
+            if pid_path.parent == self.out_dir.absolute():
+                allowed_root.add(pid_path.name)
+        for name in output.root.entries():
+            if name in allowed_root:
+                continue
+            match = _ATOMIC_TEMPORARY_NAME.fullmatch(name)
+            if match is None or match.group("target") not in {
+                "ckpt.pt",
+                "log.jsonl",
+            }:
+                raise ValueError(
+                    f"resume output contains foreign entry: {name}"
+                )
+            metadata = output.root.entry_metadata(
+                name,
+                label="resume atomic temporary",
+            )
+            self._validate_atomic_temporary(metadata, name=name)
+            if metadata.st_nlink != 1:
+                raise ValueError(
+                    f"resume atomic temporary has foreign hard links: {name}"
+                )
+            cleanups.append((output.root, name, metadata))
+
+        for name in output.snapshots.entries():
+            if (
+                _SNAPSHOT_NAME.fullmatch(name) is not None
+                or _QUARANTINED_SNAPSHOT_NAME.fullmatch(name) is not None
+            ):
+                continue
+            match = _ATOMIC_TEMPORARY_NAME.fullmatch(name)
+            target_match = (
+                _SNAPSHOT_NAME.fullmatch(match.group("target"))
+                if match is not None
+                else None
+            )
+            if match is None or target_match is None:
+                raise ValueError(
+                    f"resume snapshots contain foreign entry: {name}"
+                )
+            target_name = match.group("target")
+            target_step = int(target_match.group(1))
+            if target_step not in self._snapshot_step_set:
+                raise ValueError(
+                    "resume atomic temporary targets a snapshot step "
+                    f"not configured by snapshot_steps: {target_step}"
+                )
+            metadata = output.snapshots.entry_metadata(
+                name,
+                label="resume snapshot atomic temporary",
+            )
+            self._validate_atomic_temporary(metadata, name=name)
+            if metadata.st_nlink == 2:
+                try:
+                    target_metadata = output.snapshots.entry_metadata(
+                        target_name,
+                        label="resume snapshot atomic target",
+                    )
+                except FileNotFoundError as error:
+                    raise ValueError(
+                        "resume snapshot atomic temporary has a foreign "
+                        f"hard link: {name}"
+                    ) from error
+                if (
+                    target_metadata.st_nlink != 2
+                    or (target_metadata.st_dev, target_metadata.st_ino)
+                    != (metadata.st_dev, metadata.st_ino)
+                ):
+                    raise ValueError(
+                        "resume snapshot atomic temporary has a foreign "
+                        f"hard link: {name}"
+                    )
+                linked_snapshot_targets.add(target_name)
+            cleanups.append((output.snapshots, name, metadata))
+            snapshot_temporaries.add(name)
+        return (
+            tuple(cleanups),
+            frozenset(snapshot_temporaries),
+            frozenset(linked_snapshot_targets),
+        )
+
     def _inspect_resume_log(
         self,
         output: DurableOutput,
     ) -> tuple[bytes | None, bool]:
         if "log.jsonl" not in output.root.entries():
             return None, False
+        metadata = output.root.entry_metadata(
+            "log.jsonl",
+            label="resume training log",
+        )
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+            raise ValueError(
+                "resume log.jsonl is symlinked, hard-linked, or unsafe"
+            )
         payload = output.root.read_regular(
             "log.jsonl",
             label="resume training log",
         ).payload
-        if payload and not payload.endswith(b"\n"):
-            raise ValueError("resume log.jsonl is not newline terminated")
-        lines = payload[:-1].split(b"\n") if payload else []
+        durable_end = payload.rfind(b"\n") + 1
+        durable_payload = payload[:durable_end]
+        partial_tail = durable_end != len(payload)
+        lines = (
+            durable_payload[:-1].split(b"\n")
+            if durable_payload
+            else []
+        )
         retained = []
         previous_step = 0
         stale_seen = False
@@ -940,7 +1092,7 @@ class Trainer:
                 retained.append(raw_line + b"\n")
             else:
                 stale_seen = True
-        return b"".join(retained), stale_seen
+        return b"".join(retained), stale_seen or partial_tail
 
     def _validate_snapshot_bytes(
         self,
@@ -985,9 +1137,14 @@ class Trainer:
     def _inspect_resume_snapshots(
         self,
         output: DurableOutput,
+        *,
+        atomic_temporaries: frozenset[str] = frozenset(),
+        linked_atomic_targets: frozenset[str] = frozenset(),
     ) -> tuple[str, ...]:
         stale = []
         for name in output.snapshots.entries():
+            if name in atomic_temporaries:
+                continue
             active_match = _SNAPSHOT_NAME.fullmatch(name)
             quarantined_match = _QUARANTINED_SNAPSHOT_NAME.fullmatch(name)
             if active_match is None and quarantined_match is None:
@@ -998,7 +1155,11 @@ class Trainer:
                 name,
                 label="resume snapshot",
             )
-            if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+            expected_nlink = 2 if name in linked_atomic_targets else 1
+            if (
+                not stat.S_ISREG(metadata.st_mode)
+                or metadata.st_nlink != expected_nlink
+            ):
                 raise ValueError(
                     f"resume snapshot is symlinked, linked, or unsafe: {name}"
                 )
@@ -1009,6 +1170,11 @@ class Trainer:
                     else quarantined_match
                 ).group(1)
             )
+            if expected_step not in self._snapshot_step_set:
+                raise ValueError(
+                    "resume snapshot step is not configured by "
+                    f"snapshot_steps: {expected_step}"
+                )
             payload = output.snapshots.read_regular(
                 name,
                 label="resume snapshot",
@@ -1023,8 +1189,23 @@ class Trainer:
         return tuple(stale)
 
     def _reconcile_resume_artifacts(self, output: DurableOutput) -> None:
+        (
+            atomic_cleanups,
+            snapshot_temporaries,
+            linked_snapshot_targets,
+        ) = self._inspect_atomic_writer_entries(output)
         retained_log, truncate_log = self._inspect_resume_log(output)
-        stale_snapshots = self._inspect_resume_snapshots(output)
+        stale_snapshots = self._inspect_resume_snapshots(
+            output,
+            atomic_temporaries=snapshot_temporaries,
+            linked_atomic_targets=linked_snapshot_targets,
+        )
+        for directory, name, metadata in atomic_cleanups:
+            directory.unlink_regular(
+                name,
+                expected=metadata,
+                label="resume atomic temporary",
+            )
         for name in stale_snapshots:
             quarantine_name = (
                 f".quarantine-{name}-after-step{self.step:07d}-"

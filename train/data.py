@@ -688,7 +688,7 @@ class PackedShards:
             except (UnicodeDecodeError, json.JSONDecodeError) as error:
                 raise ValueError("parallel corpus receipt is invalid JSON") from error
             if (
-                pinned_receipt != receipt
+                not strict_json_identity(pinned_receipt, receipt)
                 or canonical_json_bytes(pinned_receipt) != receipt_bytes
             ):
                 raise ValueError(

@@ -365,6 +365,41 @@ class PinnedDirectory:
         )
         os.fsync(self.fd)
 
+    def unlink_regular(
+        self,
+        name: str,
+        *,
+        expected: os.stat_result,
+        label: str,
+    ) -> None:
+        """Remove one inspected regular entry only if its identity is unchanged."""
+
+        self._verify_identity()
+        _safe_name(name, label=label)
+        current = os.stat(name, dir_fd=self.fd, follow_symlinks=False)
+        expected_identity = (expected.st_dev, expected.st_ino)
+        if (
+            not stat.S_ISREG(current.st_mode)
+            or (current.st_dev, current.st_ino) != expected_identity
+            or current.st_nlink != expected.st_nlink
+        ):
+            raise ValueError(f"{label} identity changed: {name}")
+        descriptor = -1
+        try:
+            descriptor = os.open(name, _FILE_FLAGS, dir_fd=self.fd)
+            pinned = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(pinned.st_mode)
+                or (pinned.st_dev, pinned.st_ino) != expected_identity
+                or pinned.st_nlink != expected.st_nlink
+            ):
+                raise ValueError(f"{label} identity changed: {name}")
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
+        os.unlink(name, dir_fd=self.fd)
+        os.fsync(self.fd)
+
     def write_atomic(
         self,
         name: str,
@@ -451,6 +486,10 @@ class PinnedDirectory:
             metadata = os.fstat(fd)
             if not stat.S_ISREG(metadata.st_mode):
                 raise ValueError(f"log path is not a regular file: {name}")
+            if metadata.st_nlink != 1:
+                raise ValueError(
+                    f"log path is hard-linked or not owned: {name}"
+                )
             view = memoryview(payload)
             while view:
                 written = os.write(fd, view)

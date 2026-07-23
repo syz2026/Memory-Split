@@ -211,6 +211,36 @@ def test_parallel_loader_rejects_receipt_symlink_swap_after_verification(
         PackedShards.from_parallel_corpus(publication, ctx=4, batch_size=2)
 
 
+def test_parallel_loader_rejects_equal_numeric_type_drift_after_verification(
+    tmp_path,
+    monkeypatch,
+):
+    publication = build_aligned_publication(tmp_path)
+    receipt_path = publication / "receipt.json"
+    original_verify = parallel.verify_parallel_corpus
+
+    def verify_then_change_integer_to_equal_float(source, **kwargs):
+        verified = original_verify(source, **kwargs)
+        changed = json.loads(receipt_path.read_bytes())
+        changed["logical_tokens"] = float(changed["logical_tokens"])
+        receipt_path.write_bytes(canonical_json_bytes(changed))
+        assert changed["logical_tokens"] == verified["logical_tokens"]
+        return verified
+
+    monkeypatch.setattr(
+        parallel,
+        "verify_parallel_corpus",
+        verify_then_change_integer_to_equal_float,
+    )
+
+    with pytest.raises(ValueError, match="receipt changed|identity"):
+        PackedShards.from_parallel_corpus(
+            receipt_path,
+            ctx=4,
+            batch_size=2,
+        )
+
+
 def test_v2_loader_selects_ordered_descriptor_pinned_split90_sidecar(tmp_path):
     publication, receipt, sidecars = build_weighted_publication(tmp_path)
     loader = PackedShards.from_parallel_corpus(
@@ -498,6 +528,41 @@ def test_trainer_rejects_split90_label_with_dense_receipt_sidecar(tmp_path):
         Trainer(cfg)
 
     assert not (tmp_path / "dense-labeled-split90").exists()
+
+
+def test_trainer_rejects_dense_label_with_split90_receipt_sidecar(tmp_path):
+    publication, _, _ = build_weighted_publication(tmp_path)
+    cfg = _tiny_trainer_config(tmp_path, out_name="split90-labeled-dense")
+    cfg.update(
+        {
+            "condition": "dense",
+            "train_corpus": str(publication / "receipt.json"),
+            "sidecar_name": "split90_target_weights",
+        }
+    )
+
+    with pytest.raises(ValueError, match="Dense.*dense_target_weights"):
+        Trainer(cfg)
+
+    assert not (tmp_path / "split90-labeled-dense").exists()
+
+
+def test_trainer_rejects_contradictory_dense_and_split90_selectors(tmp_path):
+    publication, _, _ = build_weighted_publication(tmp_path)
+    cfg = _tiny_trainer_config(tmp_path, out_name="contradictory-selectors")
+    cfg.update(
+        {
+            "arm": "dense",
+            "condition": "split90",
+            "train_corpus": str(publication / "receipt.json"),
+            "sidecar_name": "split90_target_weights",
+        }
+    )
+
+    with pytest.raises(ValueError, match="contradictory.*Dense.*Split90"):
+        Trainer(cfg)
+
+    assert not (tmp_path / "contradictory-selectors").exists()
 
 
 def test_trainer_rejects_ambiguous_legacy_and_parallel_sources(tmp_path):
