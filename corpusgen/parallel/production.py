@@ -12,20 +12,24 @@ import hashlib
 import json
 import os
 import re
+import sqlite3
 import stat
 import sys
 from array import array
 from collections import Counter
+from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
 from fractions import Fraction
 from pathlib import Path, PurePosixPath
-from typing import Any, Iterator, Mapping
+from typing import Any, Self
 
 from corpusgen.reasoning.proofs import (
     SOLVER_ID,
     CompositionPremise,
     EqualityPremise,
+    GraphTraversalPremise,
     solve_graph_composition,
+    solve_graph_traversal,
     solve_slot_equality,
 )
 
@@ -44,7 +48,6 @@ from .publication import (
     verify_parallel_corpus,
 )
 from .schedule import largest_deficit_schedule
-
 
 _ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_RECIPE_PATH = _ROOT / "configs" / "reasoning-dataset-v2.json"
@@ -212,9 +215,8 @@ class ProductionRecipe:
         for lane, quota in self.token_quotas:
             _required_text(lane, label="production quota lane")
             _positive_int(quota, label=f"{lane} production token quota")
-        if (
-            _positive_int(self.total_tokens, label="production total_tokens")
-            != sum(quota for _lane, quota in self.token_quotas)
+        if _positive_int(self.total_tokens, label="production total_tokens") != sum(
+            quota for _lane, quota in self.token_quotas
         ):
             raise ValueError("production token quotas do not sum to total_tokens")
         update_tokens = _positive_int(
@@ -229,8 +231,7 @@ class ProductionRecipe:
             )
         if (
             not isinstance(self.required_source_locks, tuple)
-            or tuple(lane for lane, _locks in self.required_source_locks)
-            != self.lanes
+            or tuple(lane for lane, _locks in self.required_source_locks) != self.lanes
         ):
             raise ValueError(
                 "production source locks must follow the frozen lane order"
@@ -269,7 +270,7 @@ class ProductionRecipe:
         required_source_locks: Mapping[str, tuple[str, ...]],
         reasoning_lanes: frozenset[str] = REASONING_LANES,
         objective_lane: str = OBJECTIVE_LANE,
-    ) -> "ProductionRecipe":
+    ) -> ProductionRecipe:
         lanes = tuple(token_quotas)
         if lanes != FROZEN_LANES:
             raise ValueError("test recipe must retain the eight authoritative lanes")
@@ -355,7 +356,7 @@ def _strict_object(payload: bytes, *, label: str) -> dict[str, Any]:
     except (UnicodeDecodeError, json.JSONDecodeError) as error:
         raise ValueError(f"{label} is not valid UTF-8 JSON") from error
     if not isinstance(value, dict):
-        raise ValueError(f"{label} must be a JSON object")
+        raise TypeError(f"{label} must be a JSON object")
     return value
 
 
@@ -430,11 +431,11 @@ def _size_sha256(path: Path) -> tuple[int, str]:
             digest.update(chunk)
             size += len(chunk)
         after = os.fstat(handle.fileno())
-    if (
-        (before.st_dev, before.st_ino, before.st_size)
-        != (after.st_dev, after.st_ino, after.st_size)
-        or size != after.st_size
-    ):
+    if (before.st_dev, before.st_ino, before.st_size) != (
+        after.st_dev,
+        after.st_ino,
+        after.st_size,
+    ) or size != after.st_size:
         raise ValueError(f"source artifact changed while hashing: {path}")
     return size, digest.hexdigest()
 
@@ -490,10 +491,10 @@ def load_production_recipe(
         raise ValueError("unexpected MemorySplit v2 contract_id")
     sprint = value.get("sprint_recipe")
     if not isinstance(sprint, dict):
-        raise ValueError("MemorySplit v2 sprint_recipe must be an object")
+        raise TypeError("MemorySplit v2 sprint_recipe must be an object")
     lanes = sprint.get("lanes")
     if not isinstance(lanes, list):
-        raise ValueError("MemorySplit v2 lanes must be a list")
+        raise TypeError("MemorySplit v2 lanes must be a list")
     lane_ids = tuple(
         _required_text(lane.get("id"), label="recipe lane id")
         if isinstance(lane, dict)
@@ -502,10 +503,10 @@ def load_production_recipe(
     )
     allocation = sprint.get("realized_token_allocation")
     if not isinstance(allocation, dict):
-        raise ValueError("frozen realized_token_allocation is missing")
+        raise TypeError("frozen realized_token_allocation is missing")
     raw_quotas = allocation.get("token_quotas")
     if not isinstance(raw_quotas, dict):
-        raise ValueError("frozen token_quotas are missing")
+        raise TypeError("frozen token_quotas are missing")
     quotas = tuple((lane, raw_quotas.get(lane)) for lane in FROZEN_LANES)
     publication = sprint.get("publication_requirements")
     expected_publication = {
@@ -538,7 +539,7 @@ def load_production_recipe(
         raise AssertionError("frozen optimizer budget constant drift")
     policy = sprint.get("source_policy")
     if not isinstance(policy, dict):
-        raise ValueError("frozen source_policy is missing")
+        raise TypeError("frozen source_policy is missing")
     if (
         policy.get("finemath_repository") != "HuggingFaceTB/finemath"
         or policy.get("finemath_subsets_in_order")
@@ -623,11 +624,9 @@ def _validate_source_manifest_value(
             )
         locks = lane["source_locks"]
         required_locks = recipe.locks_by_lane[lane_id]
-        if (
-            not isinstance(locks, list)
-            or [lock.get("id") if isinstance(lock, dict) else None for lock in locks]
-            != list(required_locks)
-        ):
+        if not isinstance(locks, list) or [
+            lock.get("id") if isinstance(lock, dict) else None for lock in locks
+        ] != list(required_locks):
             raise ValueError(
                 f"{lane_id} source locks must be exactly {list(required_locks)}"
             )
@@ -713,14 +712,10 @@ def _generic_lock_artifacts(
         if not isinstance(artifact, dict) or set(artifact) != _ARTIFACT_FIELDS:
             raise ValueError(f"{source_id} lock artifact fields do not match")
         paths.append(
-            _relative_path(
-                artifact["path"], label=f"{source_id} locked artifact path"
-            )
+            _relative_path(artifact["path"], label=f"{source_id} locked artifact path")
         )
         byte_validator = _nonnegative_int if allow_empty else _positive_int
-        byte_validator(
-            artifact["bytes"], label=f"{source_id} locked artifact bytes"
-        )
+        byte_validator(artifact["bytes"], label=f"{source_id} locked artifact bytes")
         _digest(artifact["sha256"], label=f"{source_id} locked artifact sha256")
     if paths != sorted(paths) or len(paths) != len(set(paths)):
         raise ValueError(f"{source_id} lock artifacts must be uniquely path-sorted")
@@ -752,13 +747,10 @@ def _validate_huggingface_files(
         byte_count = _positive_int(
             file_record["bytes"], label=f"{source_id} source file bytes"
         )
-        _digest(
-            file_record["sha256"], label=f"{source_id} source file sha256"
-        )
+        _digest(file_record["sha256"], label=f"{source_id} source file sha256")
         if (
             not isinstance(file_record["git_blob_sha1"], str)
-            or re.fullmatch(r"[0-9a-f]{40}", file_record["git_blob_sha1"])
-            is None
+            or re.fullmatch(r"[0-9a-f]{40}", file_record["git_blob_sha1"]) is None
         ):
             raise ValueError(f"{source_id} source file git_blob_sha1 is invalid")
         if with_members:
@@ -772,9 +764,7 @@ def _validate_huggingface_files(
                     "path",
                     "sha256",
                 }:
-                    raise ValueError(
-                        f"{source_id} archive member fields do not match"
-                    )
+                    raise ValueError(f"{source_id} archive member fields do not match")
                 member_paths.append(
                     _relative_path(
                         member["path"],
@@ -875,9 +865,7 @@ def _validate_huggingface_source_lock(
                 "finemath-4plus",
                 "finemath-3plus",
             ],
-            "sidecar_encoding": (
-                "one_unsigned_byte_per_source_row_1_keep_0_drop"
-            ),
+            "sidecar_encoding": ("one_unsigned_byte_per_source_row_1_keep_0_drop"),
         }
         if (
             value["selection"]
@@ -893,10 +881,11 @@ def _validate_huggingface_source_lock(
             or sum(path.startswith("finemath-4plus/") for path in paths) != 64
             or sum(path.startswith("finemath-3plus/") for path in paths) != 128
             or not isinstance(value["subset_metadata"], dict)
-            or set(value["subset_metadata"])
-            != {"finemath-3plus", "finemath-4plus"}
+            or set(value["subset_metadata"]) != {"finemath-3plus", "finemath-4plus"}
         ):
-            raise ValueError("FineMath lock does not implement the frozen source policy")
+            raise ValueError(
+                "FineMath lock does not implement the frozen source policy"
+            )
         for subset, metadata in value["subset_metadata"].items():
             if not isinstance(metadata, dict) or set(metadata) != {
                 "download_bytes",
@@ -914,20 +903,14 @@ def _validate_huggingface_source_lock(
             "wikidata5m_inductive.tar.gz",
             "wikidata5m_transductive.tar.gz",
         )
-        if (
-            paths != expected_paths
-            or value["complete_once"]
-            != {
-                "sidecar_encoding": (
-                    "one_unsigned_byte_per_source_row_1_keep_0_drop"
-                ),
-                "split_order": [
-                    "wikidata5m_inductive_train.txt",
-                    "wikidata5m_transductive_train.txt",
-                ],
-                "triple_identity": "exact_subject_relation_object",
-            }
-        ):
+        if paths != expected_paths or value["complete_once"] != {
+            "sidecar_encoding": ("one_unsigned_byte_per_source_row_1_keep_0_drop"),
+            "split_order": [
+                "wikidata5m_inductive_train.txt",
+                "wikidata5m_transductive_train.txt",
+            ],
+            "triple_identity": "exact_subject_relation_object",
+        }:
             raise ValueError(
                 "Wikidata5M lock does not bind the frozen complete-once policy"
             )
@@ -953,9 +936,7 @@ def _validate_objective_source_lock(value: Mapping[str, Any]) -> None:
             "training_use",
         }:
             raise ValueError("objective auxiliary source fields do not match")
-        source_id = _required_text(
-            source["id"], label="objective auxiliary source id"
-        )
+        source_id = _required_text(source["id"], label="objective auxiliary source id")
         _required_text(
             source["training_use"],
             label=f"{source_id} objective training_use",
@@ -1000,9 +981,7 @@ def _validate_objective_source_lock(value: Mapping[str, Any]) -> None:
                 "url",
             }:
                 raise ValueError(f"{component_id} archive fields do not match")
-            _positive_int(
-                archive["bytes"], label=f"{component_id} archive bytes"
-            )
+            _positive_int(archive["bytes"], label=f"{component_id} archive bytes")
             _required_text(archive["root"], label=f"{component_id} archive root")
             _digest(archive["sha256"], label=f"{component_id} archive sha256")
             _required_text(archive["url"], label=f"{component_id} archive URL")
@@ -1097,15 +1076,13 @@ def _validate_source_lock(source_id: str, payload: bytes) -> None:
     if _HEX_40_TO_64.fullmatch(revision) is None:
         raise ValueError(f"{source_id} lock revision must be an immutable hex digest")
     if not isinstance(value["policy"], dict):
-        raise ValueError(f"{source_id} lock policy must be an object")
+        raise TypeError(f"{source_id} lock policy must be an object")
     _generic_lock_artifacts(value["artifacts"], source_id=source_id)
 
-    if source_id == "reasoning_solver":
-        if (
-            value["kind"] != "solver"
-            or value["policy"].get("solver_id") != SOLVER_ID
-        ):
-            raise ValueError("reasoning solver lock does not bind the frozen solver")
+    if source_id == "reasoning_solver" and (
+        value["kind"] != "solver" or value["policy"].get("solver_id") != SOLVER_ID
+    ):
+        raise ValueError("reasoning solver lock does not bind the frozen solver")
 
 
 def _iter_canonical_jsonl(
@@ -1132,9 +1109,7 @@ def _burden(value: object, *, label: str) -> Fraction:
     if not isinstance(value, dict) or set(value) != _BURDEN_FIELDS:
         raise ValueError(f"{label} burden fields do not match")
     numerator = _nonnegative_int(value["numerator"], label=f"{label} numerator")
-    denominator = _positive_int(
-        value["denominator"], label=f"{label} denominator"
-    )
+    denominator = _positive_int(value["denominator"], label=f"{label} denominator")
     return Fraction(numerator, denominator)
 
 
@@ -1142,23 +1117,108 @@ def _load_route_ledger(
     path: Path,
     *,
     lane: str,
-) -> dict[str, tuple[bool, Fraction]]:
-    result: dict[str, tuple[bool, Fraction]] = {}
+    database: sqlite3.Connection,
+) -> dict[str, Any]:
+    database.execute("DELETE FROM lane_routes")
+    route_rows = 0
+    new_facts = 0
+    new_external_facts = 0
+    new_total_burden = Fraction()
+    new_external_burden = Fraction()
     for row in _iter_canonical_jsonl(
         path, label=f"{lane} route ledger", allow_empty=True
     ):
         if set(row) != _ROUTE_FIELDS:
             raise ValueError(f"{lane} route ledger fields do not match")
         fact_id = _required_text(row["fact_id"], label=f"{lane} fact_id")
-        if fact_id in result:
-            raise ValueError(f"{lane} route ledger repeats fact {fact_id!r}")
         if not isinstance(row["external"], bool):
-            raise ValueError(f"{lane} route ledger external must be boolean")
-        result[fact_id] = (
-            row["external"],
-            _burden(row["burden_bits"], label=f"{lane} fact {fact_id}"),
-        )
-    return result
+            raise TypeError(f"{lane} route ledger external must be boolean")
+        external = row["external"]
+        burden = _burden(row["burden_bits"], label=f"{lane} fact {fact_id}")
+        try:
+            database.execute(
+                "INSERT INTO lane_routes(fact_id, external, masked) VALUES (?, ?, 0)",
+                (fact_id, int(external)),
+            )
+        except sqlite3.IntegrityError as error:
+            raise ValueError(f"{lane} route ledger repeats fact {fact_id!r}") from error
+        previous = database.execute(
+            """
+            SELECT external, burden_numerator, burden_denominator, first_lane
+            FROM global_routes
+            WHERE fact_id = ?
+            """,
+            (fact_id,),
+        ).fetchone()
+        if previous is None:
+            database.execute(
+                """
+                INSERT INTO global_routes(
+                    fact_id, external, burden_numerator, burden_denominator,
+                    first_lane
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    fact_id,
+                    int(external),
+                    str(burden.numerator),
+                    str(burden.denominator),
+                    lane,
+                ),
+            )
+            new_facts += 1
+            new_external_facts += int(external)
+            new_total_burden += burden
+            if external:
+                new_external_burden += burden
+        else:
+            previous_burden = Fraction(int(previous[1]), int(previous[2]))
+            if bool(previous[0]) != external or previous_burden != burden:
+                raise ValueError(
+                    f"fact {fact_id!r} has inconsistent global routing evidence "
+                    f"across {previous[3]} and {lane}"
+                )
+        route_rows += 1
+        if route_rows % 100_000 == 0:
+            database.commit()
+    database.commit()
+    return {
+        "new_external_burden": new_external_burden,
+        "new_external_facts": new_external_facts,
+        "new_facts": new_facts,
+        "new_total_burden": new_total_burden,
+        "route_rows": route_rows,
+    }
+
+
+def _new_preflight_database() -> sqlite3.Connection:
+    # An empty SQLite filename creates a temporary, file-backed database that
+    # is removed on close.  SQLITE_TMPDIR/TMPDIR can point this external-memory
+    # verifier at scratch storage for full 7.12B-token source roots.
+    database = sqlite3.connect("")
+    database.execute("PRAGMA journal_mode=OFF")
+    database.execute("PRAGMA synchronous=OFF")
+    database.execute("PRAGMA temp_store=FILE")
+    database.executescript(
+        """
+        CREATE TABLE global_routes (
+            fact_id TEXT PRIMARY KEY,
+            external INTEGER NOT NULL CHECK(external IN (0, 1)),
+            burden_numerator TEXT NOT NULL,
+            burden_denominator TEXT NOT NULL,
+            first_lane TEXT NOT NULL
+        ) WITHOUT ROWID;
+        CREATE TABLE lane_routes (
+            fact_id TEXT PRIMARY KEY,
+            external INTEGER NOT NULL CHECK(external IN (0, 1)),
+            masked INTEGER NOT NULL CHECK(masked IN (0, 1))
+        ) WITHOUT ROWID;
+        CREATE TABLE verification_seen (
+            record_id TEXT PRIMARY KEY
+        ) WITHOUT ROWID;
+        """
+    )
+    return database
 
 
 def _require_repeated_byte(handle: Any, length: int, value: int, *, label: str) -> None:
@@ -1177,11 +1237,11 @@ def _verify_mask_ledger(
     *,
     lane: str,
     token_count: int,
-    routes: Mapping[str, tuple[bool, Fraction]],
+    database: sqlite3.Connection,
 ) -> dict[str, int]:
     position = 0
     zero_tokens = 0
-    masked_facts: set[str] = set()
+    mask_rows = 0
     with split_path.open("rb") as weights:
         for row in _iter_canonical_jsonl(
             mask_path, label=f"{lane} mask ledger", allow_empty=True
@@ -1193,8 +1253,11 @@ def _verify_mask_ledger(
             fact_id = _required_text(row["fact_id"], label=f"{lane} mask fact_id")
             if not position <= start < end <= token_count:
                 raise ValueError(f"{lane} mask spans overlap, reorder, or exceed quota")
-            route = routes.get(fact_id)
-            if route is None or route[0] is not True:
+            route = database.execute(
+                "SELECT external FROM lane_routes WHERE fact_id = ?",
+                (fact_id,),
+            ).fetchone()
+            if route is None or not bool(route[0]):
                 raise ValueError(
                     f"{lane} mask span references a missing or internal fact: {fact_id}"
                 )
@@ -1212,7 +1275,13 @@ def _verify_mask_ledger(
             )
             position = end
             zero_tokens += end - start
-            masked_facts.add(fact_id)
+            database.execute(
+                "UPDATE lane_routes SET masked = 1 WHERE fact_id = ?",
+                (fact_id,),
+            )
+            mask_rows += 1
+            if mask_rows % 100_000 == 0:
+                database.commit()
         _require_repeated_byte(
             weights,
             token_count - position,
@@ -1221,14 +1290,24 @@ def _verify_mask_ledger(
         )
         if weights.read(1):
             raise ValueError(f"{lane} Split90 sidecar exceeds its token quota")
-    expected_external = {fact_id for fact_id, (external, _burden) in routes.items() if external}
-    missing = expected_external - masked_facts
-    if missing:
-        raise ValueError(
-            f"{lane} routed fact has no masked occurrence: {sorted(missing)[0]}"
-        )
+    missing = database.execute(
+        """
+        SELECT fact_id FROM lane_routes
+        WHERE external = 1 AND masked = 0
+        ORDER BY fact_id
+        LIMIT 1
+        """
+    ).fetchone()
+    if missing is not None:
+        raise ValueError(f"{lane} routed fact has no masked occurrence: {missing[0]}")
+    database.commit()
+    masked_facts = int(
+        database.execute(
+            "SELECT COUNT(*) FROM lane_routes WHERE masked = 1"
+        ).fetchone()[0]
+    )
     return {
-        "masked_facts": len(masked_facts),
+        "masked_facts": masked_facts,
         "zero_tokens": zero_tokens,
     }
 
@@ -1239,7 +1318,7 @@ def _parse_solver_premises(family: str, values: object) -> tuple[Any, ...]:
     premises = []
     for value in values:
         if not isinstance(value, dict):
-            raise ValueError("solver premise must be an object")
+            raise TypeError("solver premise must be an object")
         if family == "graph_composition_mod4":
             if set(value) != {"compose_code", "fact_id", "hop", "type"}:
                 raise ValueError("composition premise fields do not match")
@@ -1264,6 +1343,27 @@ def _parse_solver_premises(family: str, values: object) -> tuple[Any, ...]:
                     value=value["value"],
                 )
             )
+        elif family == "graph_path_traversal":
+            if set(value) != {
+                "fact_id",
+                "hop",
+                "relation",
+                "source",
+                "target",
+                "type",
+            }:
+                raise ValueError("graph traversal premise fields do not match")
+            if value["type"] != "graph_traversal":
+                raise ValueError("graph traversal premise type mismatch")
+            premises.append(
+                GraphTraversalPremise(
+                    fact_id=value["fact_id"],
+                    hop=value["hop"],
+                    source=value["source"],
+                    relation=value["relation"],
+                    target=value["target"],
+                )
+            )
         else:
             raise ValueError(f"unsupported production solver family: {family}")
     return tuple(premises)
@@ -1280,6 +1380,8 @@ def _verify_solver_bundle(value: Mapping[str, Any]) -> None:
         expected = solve_graph_composition(premises)
     elif family == "slot_equality":
         expected = solve_slot_equality(premises)
+    elif family == "graph_path_traversal":
+        expected = solve_graph_traversal(premises)
     else:
         raise ValueError(f"unsupported production solver family: {family}")
     if value["proof"] != expected.as_dict():
@@ -1310,11 +1412,13 @@ def _verify_verification_ledger(
     token_count: int,
     source_ids: frozenset[str],
     recipe: ProductionRecipe,
+    database: sqlite3.Connection,
 ) -> dict[str, int]:
     position = 0
     solver_rows = 0
     objective_rows = 0
-    seen: set[str] = set()
+    verified_rows = 0
+    database.execute("DELETE FROM verification_seen")
     for row in _iter_canonical_jsonl(
         path, label=f"{lane} verification ledger", allow_empty=False
     ):
@@ -1323,12 +1427,16 @@ def _verify_verification_ledger(
         record_id = _required_text(
             row["record_id"], label=f"{lane} verification record_id"
         )
-        if record_id in seen:
+        try:
+            database.execute(
+                "INSERT INTO verification_seen(record_id) VALUES (?)",
+                (record_id,),
+            )
+        except sqlite3.IntegrityError as error:
             raise ValueError(
                 f"{lane} verification ledger repeats record {record_id!r}; "
                 "reasoning cycle-fill is forbidden"
-            )
-        seen.add(record_id)
+            ) from error
         source_id = _required_text(
             row["source_id"], label=f"{lane} verification source_id"
         )
@@ -1339,9 +1447,7 @@ def _verify_verification_ledger(
         start = _nonnegative_int(
             row["token_start"], label=f"{lane} verification token_start"
         )
-        end = _positive_int(
-            row["token_end"], label=f"{lane} verification token_end"
-        )
+        end = _positive_int(row["token_end"], label=f"{lane} verification token_end")
         if start != position or end <= start or end > token_count:
             raise ValueError(
                 f"{lane} verification ranges must cover the token stream "
@@ -1349,7 +1455,7 @@ def _verify_verification_ledger(
             )
         verification = row["verification"]
         if not isinstance(verification, dict):
-            raise ValueError(f"{lane} verification must be an object")
+            raise TypeError(f"{lane} verification must be an object")
         if verification.get("kind") == "solver":
             _verify_solver_bundle(verification)
             solver_rows += 1
@@ -1359,16 +1465,20 @@ def _verify_verification_ledger(
         else:
             raise ValueError(f"{lane} requires solver verification for every record")
         position = end
+        verified_rows += 1
+        if verified_rows % 100_000 == 0:
+            database.commit()
     if position != token_count:
         raise ValueError(
             f"{lane} verification ledger covers {position} of {token_count} tokens"
         )
-    if lane in recipe.reasoning_lanes and solver_rows != len(seen):
+    if lane in recipe.reasoning_lanes and solver_rows != verified_rows:
         raise ValueError(f"{lane} solver verification rate is below 1.0")
+    database.commit()
     return {
         "objective_verified_records": objective_rows,
         "solver_verified_records": solver_rows,
-        "verified_records": len(seen),
+        "verified_records": verified_rows,
     }
 
 
@@ -1413,21 +1523,23 @@ def production_preflight(
                 ),
             )
         )
-        report["required_paths"] = list(
-            expected_production_source_paths(recipe_value)
-        )
+        report["required_paths"] = list(expected_production_source_paths(recipe_value))
         return report
 
     root = manifest.root
     report["source_manifest_path"] = str(manifest.path)
     report["source_manifest_sha256"] = manifest.sha256
     lane_reports: dict[str, Any] = {}
-    all_routes: dict[str, tuple[str, bool, Fraction]] = {}
     all_source_locks: dict[str, str] = {}
     total_tokens = 0
     total_zero_tokens = 0
     total_solver_rows = 0
     total_objective_rows = 0
+    total_facts = 0
+    external_facts = 0
+    total_burden = Fraction()
+    external_burden = Fraction()
+    preflight_database = _new_preflight_database()
 
     for lane_id in recipe_value.lanes:
         lane = manifest.lane_by_id[lane_id]
@@ -1454,9 +1566,7 @@ def production_preflight(
                 label=f"{lane_id} mask ledger",
                 allow_empty=True,
             )
-            token_path = _verify_artifact(
-                root, token_descriptor, label=f"{lane_id} token artifact"
-            )
+            _verify_artifact(root, token_descriptor, label=f"{lane_id} token artifact")
             split_path = _verify_artifact(
                 root, split_descriptor, label=f"{lane_id} Split90 artifact"
             )
@@ -1491,10 +1601,7 @@ def production_preflight(
                 )
                 _validate_source_lock(lock["id"], lock_path.read_bytes())
                 previous_digest = all_source_locks.get(lock["id"])
-                if (
-                    previous_digest is not None
-                    and previous_digest != lock["sha256"]
-                ):
+                if previous_digest is not None and previous_digest != lock["sha256"]:
                     raise ValueError(
                         f"source lock {lock['id']!r} differs across production lanes"
                     )
@@ -1503,24 +1610,24 @@ def production_preflight(
                 lock_digests[lock["id"]] = lock["sha256"]
             lane_report["source_locks"] = lock_digests
 
-            routes = _load_route_ledger(route_path, lane=lane_id)
-            for fact_id, (external, burden) in routes.items():
-                if fact_id in all_routes:
-                    previous_lane = all_routes[fact_id][0]
-                    raise ValueError(
-                        f"fact {fact_id!r} is repeated across {previous_lane} "
-                        f"and {lane_id}"
-                    )
-                all_routes[fact_id] = (lane_id, external, burden)
+            routes = _load_route_ledger(
+                route_path,
+                lane=lane_id,
+                database=preflight_database,
+            )
+            total_facts += routes["new_facts"]
+            external_facts += routes["new_external_facts"]
+            total_burden += routes["new_total_burden"]
+            external_burden += routes["new_external_burden"]
             masks = _verify_mask_ledger(
                 split_path,
                 mask_path,
                 lane=lane_id,
                 token_count=token_count,
-                routes=routes,
+                database=preflight_database,
             )
             total_zero_tokens += masks["zero_tokens"]
-            lane_report["route_facts"] = len(routes)
+            lane_report["route_facts"] = routes["route_rows"]
             lane_report.update(masks)
 
             verification_descriptor = lane["verification_ledger"]
@@ -1541,13 +1648,12 @@ def production_preflight(
                     token_count=token_count,
                     source_ids=frozenset(source_ids),
                     recipe=recipe_value,
+                    database=preflight_database,
                 )
                 lane_report.update(verification)
                 total_solver_rows += verification["solver_verified_records"]
-                total_objective_rows += verification[
-                    "objective_verified_records"
-                ]
-        except (OSError, TypeError, ValueError) as error:
+                total_objective_rows += verification["objective_verified_records"]
+        except (OSError, TypeError, ValueError, sqlite3.Error) as error:
             issues.append(
                 _issue(
                     "lane_preflight_failed",
@@ -1559,6 +1665,7 @@ def production_preflight(
                     lane=lane_id,
                 )
             )
+    preflight_database.close()
 
     report["lanes"] = lane_reports
     report["observed_total_tokens"] = total_tokens
@@ -1575,20 +1682,6 @@ def production_preflight(
             )
         )
 
-    total_facts = len(all_routes)
-    external_facts = sum(external for _lane, external, _burden in all_routes.values())
-    total_burden = sum(
-        (burden for _lane, _external, burden in all_routes.values()),
-        Fraction(),
-    )
-    external_burden = sum(
-        (
-            burden
-            for _lane, external, burden in all_routes.values()
-            if external
-        ),
-        Fraction(),
-    )
     report["route_dose"] = {
         "distinct_external_facts": external_facts,
         "distinct_facts": total_facts,
@@ -1719,9 +1812,7 @@ def seal_production_sources(
             for source_id in recipe_value.locks_by_lane[lane]:
                 relative = f"locks/{source_id}.lock.json"
                 descriptor = _artifact_descriptor(root, relative)
-                _validate_source_lock(
-                    source_id, (root / relative).read_bytes()
-                )
+                _validate_source_lock(source_id, (root / relative).read_bytes())
                 lock_descriptors.append({"id": source_id, **descriptor})
             verification = (
                 _artifact_descriptor(root, f"ledgers/{lane}.verification.jsonl")
@@ -1764,9 +1855,7 @@ def seal_production_sources(
                     )
                 ],
                 "ready": False,
-                "required_paths": list(
-                    expected_production_source_paths(recipe_value)
-                ),
+                "required_paths": list(expected_production_source_paths(recipe_value)),
             }
         ) from error
     value = {
@@ -1789,9 +1878,7 @@ def seal_production_sources(
         raise ValueError(
             "source manifest destination must be a direct child of source_root"
         )
-    candidate = destination.with_name(
-        f".{destination.name}.candidate-{os.getpid()}"
-    )
+    candidate = destination.with_name(f".{destination.name}.candidate-{os.getpid()}")
     if candidate.exists() or candidate.is_symlink():
         raise FileExistsError(f"stale source manifest candidate: {candidate}")
     candidate.parent.mkdir(parents=True, exist_ok=True)
@@ -1825,11 +1912,13 @@ def seal_production_sources(
             os.close(directory_fd)
     finally:
         candidate.unlink(missing_ok=True)
-    return production_preflight(
-        root,
-        recipe=recipe_value,
-        manifest_path=destination,
-    )
+    # The candidate and destination contain identical canonical bytes (the
+    # latter is hard-linked or was already byte-identical), so repeating the
+    # external-memory route and verification scan would add no evidence and
+    # doubles full-corpus sealing time.
+    report = dict(report)
+    report["source_manifest_path"] = str(destination)
+    return report
 
 
 def _slice_payload(
@@ -1846,9 +1935,7 @@ def _slice_payload(
             "lane": lane["id"],
             "mask_ledger_sha256": lane["mask_ledger"]["sha256"],
             "route_ledger_sha256": lane["route_ledger"]["sha256"],
-            "source_lock_sha256s": [
-                lock["sha256"] for lock in lane["source_locks"]
-            ],
+            "source_lock_sha256s": [lock["sha256"] for lock in lane["source_locks"]],
             "source_manifest_sha256": manifest_sha256,
             "split90_sha256": lane["split90_target_weights"]["sha256"],
             "token_count": count,
@@ -1973,9 +2060,7 @@ class ProductionRenderer:
         path = _safe_path(self.manifest.root, descriptor["path"], label=label)
         descriptor_fd = os.open(
             path,
-            os.O_RDONLY
-            | getattr(os, "O_CLOEXEC", 0)
-            | getattr(os, "O_NOFOLLOW", 0),
+            os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
         )
         try:
             before = os.fstat(descriptor_fd)
@@ -2017,7 +2102,7 @@ class ProductionRenderer:
         if hasattr(self, "_files"):
             self._files.clear()
 
-    def __enter__(self) -> "ProductionRenderer":
+    def __enter__(self) -> Self:
         return self
 
     def __exit__(self, *_args: object) -> None:
@@ -2034,9 +2119,7 @@ class ProductionRenderer:
             or value["lane"] != record.lane
             or value["source_manifest_sha256"] != self.manifest.sha256
         ):
-            raise ValueError(
-                f"production catalog descriptor drift: {record.record_id}"
-            )
+            raise ValueError(f"production catalog descriptor drift: {record.record_id}")
         lane = self.manifest.lane_by_id.get(record.lane)
         if lane is None:
             raise ValueError(f"unknown production lane: {record.lane}")
@@ -2046,9 +2129,7 @@ class ProductionRenderer:
             "lane": record.lane,
             "mask_ledger_sha256": lane["mask_ledger"]["sha256"],
             "route_ledger_sha256": lane["route_ledger"]["sha256"],
-            "source_lock_sha256s": [
-                lock["sha256"] for lock in lane["source_locks"]
-            ],
+            "source_lock_sha256s": [lock["sha256"] for lock in lane["source_locks"]],
             "source_manifest_sha256": self.manifest.sha256,
             "split90_sha256": lane["split90_target_weights"]["sha256"],
             "token_count": value["token_count"],
@@ -2065,9 +2146,7 @@ class ProductionRenderer:
         offset = _nonnegative_int(
             value["token_offset"], label="production token_offset"
         )
-        count = _positive_int(
-            value["token_count"], label="production token_count"
-        )
+        count = _positive_int(value["token_count"], label="production token_count")
         if offset + count > self.recipe.quota_by_lane[record.lane]:
             raise ValueError(
                 f"production catalog slice exceeds lane quota: {record.record_id}"
@@ -2114,9 +2193,7 @@ class ProductionRenderer:
         token_ids.frombytes(payload)
         if sys.byteorder != "little":
             token_ids.byteswap()
-        flags = tuple(
-            sorted({*record.flags, f"renderer:{self.renderer_id}"})
-        )
+        flags = tuple(sorted({*record.flags, f"renderer:{self.renderer_id}"}))
         return RenderedRecord(tuple(token_ids), flags)
 
     def split90_weights(self, record: CatalogRecord) -> bytes:
@@ -2191,9 +2268,7 @@ def materialize_production_sidecars(
                 record = by_id[entry.record_id]
                 weights = renderer.split90_weights(record)
                 if len(weights) != entry.token_length:
-                    raise ValueError(
-                        f"Split90/catalog length drift: {entry.record_id}"
-                    )
+                    raise ValueError(f"Split90/catalog length drift: {entry.record_id}")
                 dense.write(b"\x01" * entry.token_length)
                 split.write(weights)
                 logical_tokens += entry.token_length
@@ -2213,8 +2288,7 @@ def materialize_production_sidecars(
                 if (
                     not existing.is_file()
                     or existing.is_symlink()
-                    or _size_sha256(existing)
-                    != (expected_size, expected_digest)
+                    or _size_sha256(existing) != (expected_size, expected_digest)
                 ):
                     raise ValueError(
                         f"conflicting production sidecar work file: {existing}"
@@ -2257,9 +2331,7 @@ def verify_production_corpus(
     metadata = metadata_from_bytes((publication / "metadata.jsonl").read_bytes())
     lane_tokens = _lane_token_counts(metadata)
     if lane_tokens != recipe.quota_by_lane:
-        raise ValueError(
-            f"published production lane quotas drifted: {lane_tokens}"
-        )
+        raise ValueError(f"published production lane quotas drifted: {lane_tokens}")
     for record in metadata:
         flags = set(record.flags)
         required = {
@@ -2270,23 +2342,18 @@ def verify_production_corpus(
             f"renderer:{expected_renderer}",
         }
         if not required <= flags:
-            raise ValueError(
-                f"published production flags drifted: {record.record_id}"
-            )
-        if record.lane in recipe.reasoning_lanes and not {
-            "no-cycle-fill",
-            "solver-verified",
-        } <= flags:
-            raise ValueError(
-                f"reasoning proof/cycle flags drifted: {record.record_id}"
-            )
+            raise ValueError(f"published production flags drifted: {record.record_id}")
         if (
-            record.lane == recipe.objective_lane
-            and "objective-verified" not in flags
+            record.lane in recipe.reasoning_lanes
+            and not {
+                "no-cycle-fill",
+                "solver-verified",
+            }
+            <= flags
         ):
-            raise ValueError(
-                f"objective verification flag drifted: {record.record_id}"
-            )
+            raise ValueError(f"reasoning proof/cycle flags drifted: {record.record_id}")
+        if record.lane == recipe.objective_lane and "objective-verified" not in flags:
+            raise ValueError(f"objective verification flag drifted: {record.record_id}")
     return receipt
 
 

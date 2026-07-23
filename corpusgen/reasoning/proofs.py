@@ -5,8 +5,8 @@ from __future__ import annotations
 import json
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
+from itertools import pairwise
 from typing import TypeVar
-
 
 _T = TypeVar("_T")
 PROOF_FORMAT = "memorysplit-canonical-proof-v1"
@@ -71,6 +71,29 @@ class EqualityPremise:
             raise TypeError("equality value must be a string")
         if not self.value:
             raise ValueError("equality value must be a non-empty string")
+
+
+@dataclass(frozen=True, order=True)
+class GraphTraversalPremise:
+    fact_id: str
+    hop: int
+    source: str
+    relation: str
+    target: str
+
+    def __post_init__(self) -> None:
+        for field, value in (
+            ("fact_id", self.fact_id),
+            ("source", self.source),
+            ("relation", self.relation),
+            ("target", self.target),
+        ):
+            if not isinstance(value, str):
+                raise TypeError(f"graph traversal {field} must be a string")
+            if not value:
+                raise ValueError(f"graph traversal {field} must be non-empty")
+        if isinstance(self.hop, bool) or not isinstance(self.hop, int) or self.hop < 0:
+            raise ValueError("graph traversal hop must be a non-negative integer")
 
 
 @dataclass(frozen=True)
@@ -210,9 +233,62 @@ def solve_slot_equality(
     )
 
 
+def _traversal_rows(
+    premises: Iterable[GraphTraversalPremise],
+) -> tuple[GraphTraversalPremise, ...]:
+    rows = tuple(premises)
+    if not rows:
+        raise ValueError("graph traversal requires at least one premise")
+    if any(not isinstance(row, GraphTraversalPremise) for row in rows):
+        raise TypeError("graph traversal premises have the wrong type")
+    rows = tuple(sorted(rows, key=lambda row: (row.hop, row.fact_id)))
+    if [row.hop for row in rows] != list(range(len(rows))):
+        raise ValueError("graph traversal hops must be unique and contiguous from zero")
+    ids = [row.fact_id for row in rows]
+    if len(ids) != len(set(ids)):
+        raise ValueError("graph traversal premise ids must be unique")
+    for previous, current in pairwise(rows):
+        if previous.target != current.source:
+            raise ProofSolveError(
+                "graph traversal premises do not form a contiguous path"
+            )
+    return rows
+
+
+def solve_graph_traversal(
+    premises: Iterable[GraphTraversalPremise],
+) -> ProofObject:
+    """Replay an exact directed path and prove its unique endpoint."""
+
+    rows = _traversal_rows(premises)
+    current = rows[0].source
+    steps = []
+    for row in rows:
+        if row.source != current:
+            raise AssertionError("validated graph path became discontinuous")
+        current = row.target
+        steps.append(
+            ProofStep(
+                premise_id=row.fact_id,
+                rule=f"follow:{row.relation}",
+                result=current,
+            )
+        )
+    return ProofObject(
+        family="graph_path_traversal",
+        premise_ids=tuple(row.fact_id for row in rows),
+        steps=tuple(steps),
+        conclusion=(("endpoint", current),),
+    )
+
+
 def verify_proof(
     proof: ProofObject,
-    premises: Iterable[CompositionPremise] | Iterable[EqualityPremise],
+    premises: (
+        Iterable[CompositionPremise]
+        | Iterable[EqualityPremise]
+        | Iterable[GraphTraversalPremise]
+    ),
 ) -> bool:
     """Deterministically re-solve premises and require canonical byte identity."""
 
@@ -224,6 +300,8 @@ def verify_proof(
             expected = solve_graph_composition(rows)
         elif proof.family == "slot_equality":
             expected = solve_slot_equality(rows)
+        elif proof.family == "graph_path_traversal":
+            expected = solve_graph_traversal(rows)
         else:
             return False
     except (TypeError, ValueError):

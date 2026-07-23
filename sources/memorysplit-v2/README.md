@@ -1,10 +1,11 @@
 # MemorySplit v2 production source staging
 
 The checked lock files freeze the upstream FineWeb-Edu, FineMath, Wikidata5M,
-and objective-auxiliary inputs. They are intentionally marked
-`production_readiness.ready: false`: the repository does not contain the
-materialized eight-lane token streams or the missing generator and solver
-locks.
+and objective-auxiliary inputs. The checked source-set lock remains
+intentionally marked `production_readiness.ready: false`: it describes only
+the upstream stage, not a completed production corpus. The lane materializer
+creates the missing streams and derives generator/solver receipts from the
+actual repository code and runtime used for that run.
 
 Stage that frozen upstream subset with:
 
@@ -15,6 +16,56 @@ scripts/stage_v2_sources.py --data-root "$DATA_ROOT" --execute
 Its receipt remains `production_corpus_ready: false`; this command does not
 materialize any of the eight final lanes. See
 `docs/MEMORYSPLIT-V2-SOURCE-STAGING.md` for its disk and resume contract.
+
+## Materialize the eight lanes
+
+After source staging succeeds, run:
+
+```bash
+python3 scripts/materialize_memorysplit_v2.py materialize \
+  --stage-root "$DATA_ROOT/memorysplit-v2-frozen-upstream-sources" \
+  --source-root /data/memorysplit-v2/source \
+  --work-root /scratch/memorysplit-v2-materialize \
+  --objective-python /opt/memorysplit-v2-objective/bin/python
+```
+
+The work root is resumable and may be much larger than memory. Lane tokens,
+verification rows, and factual occurrences are checkpointed; Wikidata,
+routing, uniqueness checks, and preflight verification use file-backed
+SQLite. Re-run the identical command after interruption. A changed source
+inventory, recipe, compiler artifact, runtime, or compiler option is rejected
+instead of being mixed into an existing checkpoint.
+
+The objective interpreter must contain the dependencies required by all five
+pinned procedural generators. Before any lane is written, the command starts
+each implementation from its staged source tree, generates ordinals 0 through
+127 in both forward and reverse order in isolated workers, and records exact
+runtime versions and probe hashes. Missing, incompatible, or order-dependent
+primitives are reported by provider; no fallback generator is used.
+
+Monitor a running or interrupted build without opening its large artifacts:
+
+```bash
+python3 scripts/materialize_memorysplit_v2.py status \
+  --work-root /scratch/memorysplit-v2-materialize
+```
+
+For full-scale preflight, point SQLite temporary storage at scratch:
+
+```bash
+export SQLITE_TMPDIR=/scratch/memorysplit-v2-preflight
+export TMPDIR="$SQLITE_TMPDIR"
+mkdir -p "$SQLITE_TMPDIR"
+```
+
+Exercise the same 45-artifact publication, routing, solver replay, sealing, and
+preflight path without claiming a scientific corpus:
+
+```bash
+python3 scripts/materialize_memorysplit_v2.py smoke \
+  --source-root /tmp/memorysplit-v2-smoke-source \
+  --work-root /tmp/memorysplit-v2-smoke-work
+```
 
 `source-production` never downloads, generates, repeats, or substitutes data.
 It only validates a complete external source root and seals its hashes into
@@ -33,7 +84,7 @@ ledgers/<reasoning-or-objective-lane>.verification.jsonl
 locks/<source-id>.lock.json
 ```
 
-Run the preflight command to obtain the complete path list:
+Run the preflight command to validate the complete path list:
 
 ```bash
 python3 scripts/build_parallel_corpus.py preflight-production \
