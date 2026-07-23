@@ -9,33 +9,23 @@
 #SBATCH --output=v2-corpus-%A_%a.out
 #
 # Submit with an explicit allowlist, for example:
-#   sbatch --export=MS_REPO=/shared/memorysplit,MS_PYTHON=/shared/venv/bin/python,MS_SHARED_ROOT=/shared/corpora cluster/slurm/v2_corpus_build.sbatch
+#   sbatch --export=MS_REPO=/shared/memorysplit,MS_PYTHON=/shared/venv/bin/python,MS_SHARED_ROOT=/shared/corpora,MS_RUN_NONCE=20260723T0202Z-random cluster/slurm/v2_corpus_build.sbatch
 #
-# This archive-free array is the operational smoke template. Production
-# catalogs use the same CLI boundary once their source renderer is implemented.
+# Each array task renders one disjoint ordinal partition. Every task then tries
+# the exact-N coordinator; all incomplete attempts exit cleanly and the final
+# task deterministically packs and atomically publishes the one fixture corpus.
+# Production source renderers remain explicitly unsupported.
 set -euo pipefail
 
 : "${MS_REPO:?submit MS_REPO explicitly}"
 : "${MS_PYTHON:?submit MS_PYTHON explicitly}"
 : "${MS_SHARED_ROOT:?submit MS_SHARED_ROOT explicitly}"
-: "${SLURM_TMPDIR:?cluster must provide node-local SLURM_TMPDIR}"
+: "${MS_RUN_NONCE:?submit a unique scheduler run nonce explicitly}"
+: "${SLURM_ARRAY_JOB_ID:?must run as one array job}"
 : "${SLURM_ARRAY_TASK_ID:?must run as an array task}"
+: "${SLURM_ARRAY_TASK_COUNT:?Slurm must set SLURM_ARRAY_TASK_COUNT}"
 : "${SLURM_CPUS_PER_TASK:?Slurm must set SLURM_CPUS_PER_TASK}"
 : "${SLURM_JOB_ID:?Slurm must set SLURM_JOB_ID}"
-
-TASK_ID=$(printf '%02d' "$SLURM_ARRAY_TASK_ID")
-LOCAL_ROOT="${SLURM_TMPDIR%/}/memorysplit-v2-corpus/${SLURM_JOB_ID}/${TASK_ID}"
-LOCAL_OUTPUT="$LOCAL_ROOT/corpus"
-FINAL_OUTPUT="${MS_SHARED_ROOT%/}/fixture-${TASK_ID}"
-SHARED_TMP=""
-
-cleanup() {
-    rm -rf "$LOCAL_ROOT"
-    if [[ -n "$SHARED_TMP" ]]; then
-        rm -rf "$SHARED_TMP"
-    fi
-}
-trap cleanup EXIT INT TERM
 
 run_python() {
     env -i \
@@ -47,26 +37,31 @@ run_python() {
         "$MS_PYTHON" -u "$MS_REPO/scripts/build_parallel_corpus.py" "$@"
 }
 
-mkdir -p "$LOCAL_ROOT" "$MS_SHARED_ROOT"
-if [[ -e "$FINAL_OUTPUT" ]]; then
-    run_python verify --output "$FINAL_OUTPUT"
+COMMON_ARGS=(
+    --shared-root "$MS_SHARED_ROOT"
+    --scheduler-id "$SLURM_ARRAY_JOB_ID"
+    --nonce "$MS_RUN_NONCE"
+    --records "${MS_RECORDS:-128}"
+    --task-count "$SLURM_ARRAY_TASK_COUNT"
+    --update-tokens "${MS_UPDATE_TOKENS:-64}"
+    --shards "${MS_SHARDS:-32}"
+)
+if [[ "${MS_ALLOW_FEWER_SHARDS:-0}" == "1" ]]; then
+    COMMON_ARGS+=(--allow-fewer-shards)
+fi
+
+run_python render-fixture-task \
+    "${COMMON_ARGS[@]}" \
+    --task-index "$SLURM_ARRAY_TASK_ID" \
+    --workers "$SLURM_CPUS_PER_TASK"
+
+if run_python finalize-fixture-tasks \
+    "${COMMON_ARGS[@]}" \
+    --allow-incomplete; then
     exit 0
 fi
-
-run_python build-fixture \
-    --output "$LOCAL_OUTPUT" \
-    --records "${MS_RECORDS:-128}" \
-    --workers "$SLURM_CPUS_PER_TASK" \
-    --update-tokens "${MS_UPDATE_TOKENS:-64}" \
-    --shards 32
-run_python verify --output "$LOCAL_OUTPUT"
-
-SHARED_TMP="${MS_SHARED_ROOT%/}/.fixture-${TASK_ID}.tmp-${SLURM_JOB_ID}"
-if [[ -e "$SHARED_TMP" ]]; then
-    echo "shared temporary output already exists: $SHARED_TMP" >&2
-    exit 1
+status=$?
+if [[ "$status" -eq 75 ]]; then
+    exit 0
 fi
-cp -a "$LOCAL_OUTPUT" "$SHARED_TMP"
-run_python verify --output "$SHARED_TMP"
-mv "$SHARED_TMP" "$FINAL_OUTPUT"
-SHARED_TMP=""
+exit "$status"
