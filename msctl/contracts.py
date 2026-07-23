@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 
+from .cohort import load_cohort_assignment as load_cohort_assignment
 from .errors import MsctlError
 from .jsonutil import (
     COMMIT_RE,

@@ -97,6 +97,7 @@ class CohortAssignment:
     aws_p5_seeds: tuple[int, ...]
     configs: tuple[CohortRunConfig, ...]
     assignment_sha256: str
+    preregistration_sha256: str
 
     @property
     def config_sha256s(self) -> dict[str, str]:
@@ -254,17 +255,22 @@ def _portable_logical_path(value: object, *, label: str) -> str:
     return path.as_posix()
 
 
-def _validate_preregistration(path: Path) -> None:
-    value = _yaml_object(
-        _read_regular(path, label="preregistration"),
-        label="preregistration",
-    )
+def _validate_preregistration(path: Path) -> str:
+    data = _read_regular(path, label="preregistration")
+    value = _yaml_object(data, label="preregistration")
     protected = value.get("protected_cohort")
     if not isinstance(protected, dict):
         _fail("preregistration protected_cohort is missing")
     training = protected.get("training")
     if not isinstance(training, dict):
         _fail("preregistration protected_cohort.training is missing")
+    raw_seeds = protected.get("seeds")
+    if not isinstance(raw_seeds, list):
+        _fail("preregistration protected_cohort.seeds must be a list")
+    preregistered_seeds = tuple(
+        _require_int(seed, label=f"preregistration seed[{index}]")
+        for index, seed in enumerate(raw_seeds)
+    )
     for label, candidate in (
         ("model_parameters", protected.get("model_parameters")),
         ("terminal_n_pairs", protected.get("terminal_n_pairs")),
@@ -278,12 +284,13 @@ def _validate_preregistration(path: Path) -> None:
         or protected.get("condition_pair") != list(ARMS)
         or protected.get("model_parameters") != MODEL_PARAMETERS
         or protected.get("terminal_n_pairs") != len(SEEDS)
-        or protected.get("seeds") != list(SEEDS)
+        or preregistered_seeds != SEEDS
         or training.get("targets_per_update") != TARGETS_PER_UPDATE
         or training.get("optimizer_steps") != OPTIMIZER_STEPS
         or training.get("raw_target_tokens") != RAW_TARGET_TOKENS
     ):
         _fail("cohort assignment conflicts with preregistration")
+    return hashlib.sha256(data).hexdigest()
 
 
 def _validate_assignment(
@@ -415,7 +422,9 @@ def load_cohort_assignment(path: Path | str) -> CohortAssignment:
 
     value = _json_object(assignment_data, label="cohort assignment")
     illumina, aws = _validate_assignment(value)
-    _validate_preregistration(configs_root / "preregistration-v2.yaml")
+    preregistration_sha256 = _validate_preregistration(
+        configs_root / "preregistration-v2.yaml"
+    )
 
     expected_names = {
         f"{arm}-s{seed}.yaml" for seed in SEEDS for arm in ARMS
@@ -469,4 +478,5 @@ def load_cohort_assignment(path: Path | str) -> CohortAssignment:
         aws_p5_seeds=aws,
         configs=tuple(configs),
         assignment_sha256=hashlib.sha256(assignment_data).hexdigest(),
+        preregistration_sha256=preregistration_sha256,
     )

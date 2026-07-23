@@ -26,6 +26,19 @@ from msctl.errors import MsctlError
 
 PROVIDER = "illumina-usfc-prd"
 COHORT_ASSIGNMENT = "configs/cohort-assignment-v2.json"
+PREREGISTRATION = "configs/preregistration-v2.yaml"
+ROOT_CONFIG_FILES = frozenset(
+    {
+        "configs/29m.tsv",
+        "configs/160m.tsv",
+        "configs/360m.tsv",
+        COHORT_ASSIGNMENT,
+        "configs/current-dataset-lock.json",
+        PREREGISTRATION,
+        "configs/reasoning-dataset-v2.json",
+        "configs/route-policy.json",
+    }
+)
 ILLUMINA_RUN_CONFIGS = frozenset(
     {
         "configs/360m-v2/dense-s0.yaml",
@@ -58,6 +71,7 @@ REQUIRED_MEMBERS = {
     "cluster/slurm/v2_evaluate.sbatch",
     "cluster/slurm/v2_seed0.sbatch",
     COHORT_ASSIGNMENT,
+    PREREGISTRATION,
     *ILLUMINA_RUN_CONFIGS,
     "msctl/__init__.py",
     "msctl/__main__.py",
@@ -211,10 +225,7 @@ def _classification(path: str) -> str:
     if set(parts) & _DISPOSABLE_COMPONENTS:
         return "excluded"
     if parts[0] == "configs":
-        suffix = PurePosixPath(path).suffix.lower()
-        if len(parts) == 2 and suffix in {".json", ".tsv", ".yaml", ".yml"}:
-            return "included"
-        if path in ILLUMINA_RUN_CONFIGS:
+        if path in ROOT_CONFIG_FILES or path in ILLUMINA_RUN_CONFIGS:
             return "included"
         if len(parts) >= 3 and parts[1] in {
             "29m",
@@ -505,6 +516,11 @@ def _collect_payload(
             and digest != cohort.assignment_sha256
         ):
             raise PackageError("cohort assignment hash mismatch")
+        if (
+            item.path == PREREGISTRATION
+            and digest != cohort.preregistration_sha256
+        ):
+            raise PackageError("preregistration hash mismatch")
         expected_config_hash = expected_config_hashes.get(item.path)
         if expected_config_hash is not None and digest != expected_config_hash:
             raise PackageError(f"cohort config hash mismatch: {item.path}")
@@ -528,6 +544,7 @@ def _collect_payload(
             "provider": PROVIDER,
             "source": {"commit": revision, "dirty": False},
             "profile_sha256": profile_hash,
+            "preregistration_sha256": cohort.preregistration_sha256,
             "environment_hashes": environment_hashes,
             "seed_assignment": {
                 "cohort_id": cohort.cohort_id,

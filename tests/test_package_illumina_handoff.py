@@ -245,7 +245,14 @@ def test_zip_semantically_proves_exactly_seed_zero_dense_and_split90(
     member_hashes = {
         row["path"]: row["sha256"] for row in metadata["members"]
     }
-    for name in config_names | {"configs/cohort-assignment-v2.json"}:
+    preregistration = "configs/preregistration-v2.yaml"
+    assert metadata["preregistration_sha256"] == _sha256(
+        source / preregistration
+    )
+    for name in config_names | {
+        "configs/cohort-assignment-v2.json",
+        preregistration,
+    }:
         assert member_hashes[name] == _sha256(source / name)
 
 
@@ -300,6 +307,24 @@ def test_packager_rejects_invalid_provider_cohort_before_output(
     assert not out.exists()
 
 
+def test_packager_rejects_tracked_root_seed_config_without_output(
+    tmp_path,
+    package_module,
+):
+    source = _minimal_repo(tmp_path)
+    _write(
+        source / "configs" / "dense-s1.yaml",
+        (source / "configs" / "360m-v2" / "dense-s1.yaml").read_bytes(),
+    )
+    _commit_mutation(source, "add unallowlisted root seed config")
+    out = tmp_path / "out"
+
+    with pytest.raises(package_module.PackageError, match="unknown tracked path"):
+        package_module.build_handoff(source_root=source, out_dir=out)
+
+    assert not out.exists()
+
+
 def test_packager_rejects_assignment_config_hash_mismatch(
     tmp_path,
     package_module,
@@ -321,6 +346,38 @@ def test_packager_rejects_assignment_config_hash_mismatch(
             source_root=source,
             out_dir=tmp_path / "out",
         )
+
+
+def test_packager_rejects_preregistration_replacement_after_snapshot(
+    tmp_path,
+    package_module,
+    monkeypatch,
+):
+    source = _minimal_repo(tmp_path)
+    original = package_module._read_member
+
+    def raced_read(root, relative):
+        data = original(root, relative)
+        if relative == "configs/preregistration-v2.yaml":
+            replaced = data.replace(
+                b"model_parameters: 356033536",
+                b"model_parameters: 356033535",
+                1,
+            )
+            assert replaced != data
+            return replaced
+        return data
+
+    monkeypatch.setattr(package_module, "_read_member", raced_read)
+    out = tmp_path / "out"
+
+    with pytest.raises(
+        package_module.PackageError,
+        match="preregistration hash mismatch",
+    ):
+        package_module.build_handoff(source_root=source, out_dir=out)
+
+    assert not out.exists()
 
 
 def test_packager_refuses_to_replace_existing_release_set(

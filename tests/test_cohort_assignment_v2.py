@@ -98,6 +98,9 @@ def test_frozen_cohort_is_disjoint_complete_and_hash_bound():
     assert cohort.model_parameters == 356_033_536
     assert cohort.targets_per_update * cohort.optimizer_steps == 7_120_879_616
     assert cohort.raw_target_tokens == 7_120_879_616
+    assert cohort.preregistration_sha256 == _sha256(
+        REPO_ROOT / "configs" / "preregistration-v2.yaml"
+    )
 
     assert {(config.seed, config.condition) for config in cohort.configs} == {
         (seed, arm) for seed in SEEDS for arm in ARMS
@@ -111,6 +114,13 @@ def test_frozen_cohort_is_disjoint_complete_and_hash_bound():
     assert set(cohort.config_sha256s) == expected_paths
     for relative, digest in cohort.config_sha256s.items():
         assert digest == _sha256(REPO_ROOT / relative)
+
+
+def test_contracts_exports_cohort_assignment_loader():
+    from msctl.contracts import load_cohort_assignment as contracts_loader
+
+    assert contracts_loader is load_cohort_assignment
+    assert contracts_loader(ASSIGNMENT) == load_cohort_assignment(ASSIGNMENT)
 
 
 def test_assignment_is_canonical_sorted_json_with_trailing_newline():
@@ -188,6 +198,29 @@ def test_assignment_rejects_malformed_cohorts(tmp_path, mutation):
     else:  # pragma: no cover - parameterization guard
         raise AssertionError(mutation)
     _write_json(assignment, value)
+
+    with pytest.raises(MsctlError):
+        load_cohort_assignment(assignment)
+
+
+@pytest.mark.parametrize(
+    "invalid_seed",
+    [False, 0.0],
+    ids=["bool", "float"],
+)
+def test_assignment_rejects_non_integer_preregistration_seed(
+    tmp_path,
+    invalid_seed,
+):
+    root, assignment = _fixture_repo(tmp_path)
+    preregistration = root / "configs" / "preregistration-v2.yaml"
+    value = _yaml_value(preregistration)
+    protected = value["protected_cohort"]
+    assert isinstance(protected, dict)
+    seeds = protected["seeds"]
+    assert isinstance(seeds, list)
+    seeds[0] = invalid_seed
+    _write_yaml(preregistration, value)
 
     with pytest.raises(MsctlError):
         load_cohort_assignment(assignment)
