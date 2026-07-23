@@ -79,6 +79,8 @@ _INCLUDED_SUFFIXES = {
 }
 _KNOWN_EXCLUDED_ROOT_FILES = {
     ".gitignore",
+    "AWS-P5-START.md",
+    "DATASET-POINTER-AWS.json",
     "HANDOFF-AGENT.md",
     "Memory-split-design.md",
     "README.md",
