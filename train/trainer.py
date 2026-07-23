@@ -15,6 +15,10 @@ import json
 import math
 import os
 import random
+import re
+import secrets
+import signal
+import stat
 import time
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
@@ -33,6 +37,7 @@ from train.safeio import (
     DurableOutput,
     read_regular_path,
     require_absent_path,
+    write_atomic_path,
 )
 
 
@@ -55,6 +60,37 @@ _DATA_STATE_FIELDS = {
     "format_version",
     "global_cursor",
     "provenance",
+}
+_LOG_REQUIRED_FIELDS = {
+    "epoch",
+    "global_tok_s",
+    "global_tokens",
+    "loss",
+    "loss_ema",
+    "lr",
+    "step",
+    "tok_s",
+    "tokens_per_step",
+}
+_LOG_OPTIONAL_FIELDS = {"loss_masked_values"}
+_SNAPSHOT_FIELDS = {
+    "data_provenance",
+    "model",
+    "model_cfg",
+    "step",
+    "world_size",
+}
+_SNAPSHOT_NAME = re.compile(r"^step([0-9]{7})\.pt$")
+_QUARANTINED_SNAPSHOT_NAME = re.compile(
+    r"^\.quarantine-step([0-9]{7})\.pt-after-step"
+    r"([0-9]{7})-([0-9a-f]{32})$"
+)
+TRAINER_CAPABILITIES = {
+    "rank_zero_pid_file": True,
+    "receipt_v2": True,
+    "resume_sha256": True,
+    "sidecar_name": True,
+    "sigusr1_checkpoint": True,
 }
 
 
@@ -210,6 +246,64 @@ def _positive_int(value: object, field_name: str) -> int:
     return value
 
 
+def trainer_capabilities() -> dict[str, bool]:
+    return dict(TRAINER_CAPABILITIES)
+
+
+def resolve_snapshot_steps(
+    cfg: dict,
+    *,
+    max_steps: int,
+) -> tuple[int, ...]:
+    if type(cfg) is not dict:
+        raise ValueError("training config must be a dictionary")
+    _positive_int(max_steps, "max_steps")
+    schema_version = cfg.get("schema_version", 1)
+    if type(schema_version) is not int or schema_version <= 0:
+        raise ValueError("schema_version must be a positive integer")
+    has_steps = "snapshot_steps" in cfg
+    has_fraction = "snap_frac" in cfg
+    if has_steps and has_fraction:
+        raise ValueError("snapshot_steps and snap_frac cannot both be specified")
+    if schema_version == 2 and not has_steps:
+        raise ValueError("v2 configs require exact snapshot_steps, not snap_frac")
+    if has_steps:
+        values = cfg["snapshot_steps"]
+        if type(values) is not list or not values:
+            raise ValueError("snapshot_steps must be a non-empty list")
+        if any(
+            type(step) is not int or not 1 <= step <= max_steps
+            for step in values
+        ):
+            raise ValueError(
+                "snapshot_steps must contain positive integers within max_steps"
+            )
+        if any(left >= right for left, right in zip(values, values[1:])):
+            raise ValueError("snapshot_steps must be increasing and unique")
+        if values[-1] != max_steps:
+            raise ValueError("final snapshot_steps entry must equal max_steps")
+        return tuple(values)
+
+    snap_frac = cfg.get("snap_frac", 0.10)
+    if (
+        type(snap_frac) not in (int, float)
+        or not math.isfinite(snap_frac)
+        or not 0 < snap_frac <= 1
+    ):
+        raise ValueError("snap_frac must be finite and in (0, 1]")
+    snap_every = max(1, int(max_steps * snap_frac))
+    return tuple(range(snap_every, max_steps + 1, snap_every))
+
+
+def _unique_json_object(pairs):
+    value = {}
+    for key, item in pairs:
+        if key in value:
+            raise ValueError(f"JSON object contains duplicate key: {key}")
+        value[key] = item
+    return value
+
+
 def _jsonable(value):
     if isinstance(value, Path):
         return str(value)
@@ -229,6 +323,19 @@ def _canonical_json_hash(value) -> str:
         allow_nan=False,
     ).encode("utf-8")
     return hashlib.sha256(payload).hexdigest()
+
+
+def _config_selects_split90(value: object) -> bool:
+    if isinstance(value, str):
+        normalized = "".join(
+            character for character in value.lower() if character.isalnum()
+        )
+        return "split90" in normalized
+    if isinstance(value, dict):
+        return any(_config_selects_split90(item) for item in value.values())
+    if isinstance(value, (list, tuple)):
+        return any(_config_selects_split90(item) for item in value)
+    return False
 
 
 _DATA_LOCATION_KEYS = {
@@ -287,6 +394,11 @@ class Trainer:
             raise ValueError("resume_sha256 requires resume_path")
         self.cfg = copy.deepcopy(cfg)
         cfg = self.cfg
+        self._checkpoint_request_generation = 0
+        self._checkpoint_request_consumed = 0
+        self._previous_sigusr1_handler = None
+        self._signal_handler_installed = False
+        self.rank_zero_pid_path: Path | None = None
         raw_out_dir = cfg.get("out_dir")
         if not isinstance(raw_out_dir, (str, Path)):
             raise ValueError("out_dir must be a path string")
@@ -417,6 +529,31 @@ class Trainer:
             raise ValueError(
                 "config must select exactly one of train_bin or train_corpus"
             )
+        sidecar_name = cfg.get("sidecar_name")
+        if has_legacy and sidecar_name is not None:
+            raise ValueError("sidecar_name is unsupported with legacy train_bin")
+        split90_selected = any(
+            _config_selects_split90(cfg.get(field_name))
+            for field_name in (
+                "arm",
+                "condition",
+                "intervention",
+                "run_id",
+                "sidecar_name",
+            )
+        )
+        if split90_selected and not has_parallel:
+            raise ValueError(
+                "Split90 requires a bound receipt-v2 sidecar publication"
+            )
+        if (
+            split90_selected
+            and sidecar_name != "split90_target_weights"
+        ):
+            raise ValueError(
+                "Split90 requires receipt-v2 sidecar_name "
+                "split90_target_weights"
+            )
         if has_parallel:
             self.data = PackedShards.from_parallel_corpus(
                 cfg["train_corpus"],
@@ -426,7 +563,7 @@ class Trainer:
                 seed=seed,
                 mask_path=cfg.get("train_mask"),
                 weights_path=cfg.get("train_weights"),
-                sidecar_name=cfg.get("sidecar_name"),
+                sidecar_name=sidecar_name,
             )
         else:
             self.data = PackedShards(
@@ -437,6 +574,16 @@ class Trainer:
                 device=self.device,
                 seed=seed,
                 weights_path=cfg.get("train_weights"),
+            )
+        if split90_selected and (
+            self.data.provenance.get("sidecar_name")
+            != "split90_target_weights"
+            or self.data.target_weights is None
+        ):
+            self.data.close()
+            raise ValueError(
+                "Split90 requires a bound receipt-v2 sidecar; "
+                "unweighted training is forbidden"
             )
         self.data.validate_update_alignment(tokens_per_step)
 
@@ -455,7 +602,11 @@ class Trainer:
         )
 
         self.step = 0
-        self.snap_every = max(1, int(self.max_steps * cfg.get("snap_frac", 0.10)))
+        self.snapshot_steps = resolve_snapshot_steps(
+            cfg,
+            max_steps=self.max_steps,
+        )
+        self._snapshot_step_set = frozenset(self.snapshot_steps)
         self.ckpt_seconds = cfg.get("ckpt_minutes", 30) * 60
         self.log_every = cfg.get("log_every", 20)
         self.eval_every = cfg.get("eval_every", 250)
@@ -472,27 +623,43 @@ class Trainer:
         def initialize_output() -> None:
             import yaml
 
-            if resume == "auto" and not self._external_resume:
-                output = DurableOutput.open_existing(self.out_dir)
-                saved_config = yaml.safe_load(
-                    output.root.read_regular(
+            output = None
+            try:
+                if resume == "auto" and not self._external_resume:
+                    output = DurableOutput.open_existing(self.out_dir)
+                    saved_config = yaml.safe_load(
+                        output.root.read_regular(
+                            "config.yaml",
+                            label="resume config",
+                        ).payload
+                    )
+                    if saved_config != _jsonable(cfg):
+                        raise ValueError(
+                            "resume config.yaml does not match current config"
+                        )
+                    self._reconcile_resume_artifacts(output)
+                else:
+                    output = DurableOutput.create(self.out_dir)
+                    payload = yaml.safe_dump(
+                        _jsonable(cfg),
+                        sort_keys=False,
+                    ).encode("utf-8")
+                    output.root.write_bytes(
                         "config.yaml",
-                        label="resume config",
-                    ).payload
-                )
-                if saved_config != _jsonable(cfg):
+                        payload,
+                        replace=False,
+                    )
+                self._output = output
+            except BaseException:
+                if output is not None:
                     output.close()
-                    raise ValueError("resume config.yaml does not match current config")
-            else:
-                output = DurableOutput.create(self.out_dir)
-                payload = yaml.safe_dump(
-                    _jsonable(cfg),
-                    sort_keys=False,
-                ).encode("utf-8")
-                output.root.write_bytes("config.yaml", payload, replace=False)
-            self._output = output
+                raise
 
         self._rank0_action(initialize_output, "output initialization")
+        self._rank0_action(
+            self._initialize_runtime_controls,
+            "runtime control initialization",
+        )
 
     def _barrier(self) -> None:
         if self.dist.process_group_initialized:
@@ -604,7 +771,64 @@ class Trainer:
             raise RuntimeError("global loader state diverged across ranks")
         return result
 
+    def _initialize_runtime_controls(self) -> None:
+        if not hasattr(signal, "SIGUSR1"):
+            raise RuntimeError("safe checkpoint requests require SIGUSR1")
+        previous = signal.getsignal(signal.SIGUSR1)
+
+        def request_checkpoint(_signum, _frame) -> None:
+            self._checkpoint_request_generation += 1
+
+        signal.signal(signal.SIGUSR1, request_checkpoint)
+        self._previous_sigusr1_handler = previous
+        self._signal_handler_installed = True
+        try:
+            raw_pid_path = os.environ.get("MS_RANK_ZERO_PID_FILE")
+            if raw_pid_path is None:
+                return
+            if not raw_pid_path or "\x00" in raw_pid_path:
+                raise ValueError("MS_RANK_ZERO_PID_FILE must be a safe path")
+            pid_path = Path(raw_pid_path)
+            write_atomic_path(
+                pid_path,
+                f"{os.getpid()}\n".encode("ascii"),
+                label="rank-zero PID file",
+            )
+            self.rank_zero_pid_path = pid_path
+        except BaseException:
+            self._restore_checkpoint_signal_handler()
+            raise
+
+    def _restore_checkpoint_signal_handler(self) -> None:
+        if not self._signal_handler_installed:
+            return
+        signal.signal(
+            signal.SIGUSR1,
+            self._previous_sigusr1_handler,
+        )
+        self._signal_handler_installed = False
+        self._previous_sigusr1_handler = None
+
+    def _service_checkpoint_request(
+        self,
+        *,
+        checkpoint_due: bool = False,
+    ) -> bool:
+        if type(checkpoint_due) is not bool:
+            raise ValueError("checkpoint_due must be boolean")
+        master_requested = False
+        if self.is_master:
+            generation = self._checkpoint_request_generation
+            master_requested = generation != self._checkpoint_request_consumed
+            self._checkpoint_request_consumed = generation
+        requested = self._broadcast_master_bool(master_requested)
+        if requested or checkpoint_due:
+            self.save_ckpt()
+        return requested
+
     def close(self) -> None:
+        if getattr(self, "is_master", False):
+            self._restore_checkpoint_signal_handler()
         output = getattr(self, "_output", None)
         if output is not None:
             output.close()
@@ -627,6 +851,193 @@ class Trainer:
             pass
 
     # --- checkpointing -----------------------------------------------------
+
+    def _inspect_resume_log(
+        self,
+        output: DurableOutput,
+    ) -> tuple[bytes | None, bool]:
+        if "log.jsonl" not in output.root.entries():
+            return None, False
+        payload = output.root.read_regular(
+            "log.jsonl",
+            label="resume training log",
+        ).payload
+        if payload and not payload.endswith(b"\n"):
+            raise ValueError("resume log.jsonl is not newline terminated")
+        lines = payload[:-1].split(b"\n") if payload else []
+        retained = []
+        previous_step = 0
+        stale_seen = False
+        for index, raw_line in enumerate(lines, start=1):
+            try:
+                row = json.loads(
+                    raw_line,
+                    object_pairs_hook=_unique_json_object,
+                )
+            except (
+                UnicodeDecodeError,
+                json.JSONDecodeError,
+                ValueError,
+            ) as error:
+                raise ValueError(
+                    f"resume log.jsonl row {index} is malformed"
+                ) from error
+            if (
+                type(row) is not dict
+                or set(row) - _LOG_OPTIONAL_FIELDS != _LOG_REQUIRED_FIELDS
+                or not set(row) <= _LOG_REQUIRED_FIELDS | _LOG_OPTIONAL_FIELDS
+            ):
+                raise ValueError(
+                    f"resume log.jsonl row {index} fields are foreign"
+                )
+            step = row["step"]
+            if (
+                type(step) is not int
+                or not 1 <= step <= self.max_steps
+                or step <= previous_step
+            ):
+                raise ValueError(
+                    "resume log.jsonl steps must be unique and increasing"
+                )
+            previous_step = step
+            for field_name in ("epoch", "global_tokens", "tokens_per_step"):
+                if type(row[field_name]) is not int or row[field_name] < 0:
+                    raise ValueError(
+                        f"resume log.jsonl {field_name} is invalid"
+                    )
+            if (
+                row["tokens_per_step"] != self.tokens_per_step
+                or row["global_tokens"] != step * self.tokens_per_step
+            ):
+                raise ValueError(
+                    "resume log.jsonl token counts do not match training"
+                )
+            for field_name in (
+                "global_tok_s",
+                "loss",
+                "loss_ema",
+                "lr",
+                "tok_s",
+                *(
+                    ("loss_masked_values",)
+                    if "loss_masked_values" in row
+                    else ()
+                ),
+            ):
+                value = row[field_name]
+                if (
+                    type(value) not in (int, float)
+                    or not math.isfinite(value)
+                ):
+                    raise ValueError(
+                        f"resume log.jsonl {field_name} is invalid"
+                    )
+            if step <= self.step:
+                if stale_seen:
+                    raise ValueError(
+                        "resume log.jsonl stale rows are not a suffix"
+                    )
+                retained.append(raw_line + b"\n")
+            else:
+                stale_seen = True
+        return b"".join(retained), stale_seen
+
+    def _validate_snapshot_bytes(
+        self,
+        payload: bytes,
+        *,
+        expected_step: int,
+        name: str,
+    ) -> None:
+        try:
+            state = torch.load(
+                io.BytesIO(payload),
+                map_location=self.device,
+                weights_only=False,
+            )
+        except BaseException as error:
+            raise ValueError(f"resume snapshot is malformed: {name}") from error
+        if type(state) is not dict or set(state) != _SNAPSHOT_FIELDS:
+            raise ValueError(f"resume snapshot fields are foreign: {name}")
+        if (
+            type(state["step"]) is not int
+            or state["step"] != expected_step
+            or not 0 <= expected_step <= self.max_steps
+        ):
+            raise ValueError(f"resume snapshot step is invalid: {name}")
+        if (
+            type(state["world_size"]) is not int
+            or state["world_size"] != self.world_size
+        ):
+            raise ValueError(f"resume snapshot world size is invalid: {name}")
+        if not strict_json_identity(
+            state["data_provenance"],
+            self.data.provenance,
+        ):
+            raise ValueError(f"resume snapshot provenance is invalid: {name}")
+        if not strict_json_identity(
+            state["model_cfg"],
+            self._raw_model().cfg.__dict__,
+        ):
+            raise ValueError(f"resume snapshot model config is invalid: {name}")
+        self._validate_model_state(state["model"])
+
+    def _inspect_resume_snapshots(
+        self,
+        output: DurableOutput,
+    ) -> tuple[str, ...]:
+        stale = []
+        for name in output.snapshots.entries():
+            active_match = _SNAPSHOT_NAME.fullmatch(name)
+            quarantined_match = _QUARANTINED_SNAPSHOT_NAME.fullmatch(name)
+            if active_match is None and quarantined_match is None:
+                raise ValueError(
+                    f"resume snapshots contain foreign entry: {name}"
+                )
+            metadata = output.snapshots.entry_metadata(
+                name,
+                label="resume snapshot",
+            )
+            if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+                raise ValueError(
+                    f"resume snapshot is symlinked, linked, or unsafe: {name}"
+                )
+            expected_step = int(
+                (
+                    active_match
+                    if active_match is not None
+                    else quarantined_match
+                ).group(1)
+            )
+            payload = output.snapshots.read_regular(
+                name,
+                label="resume snapshot",
+            ).payload
+            self._validate_snapshot_bytes(
+                payload,
+                expected_step=expected_step,
+                name=name,
+            )
+            if active_match is not None and expected_step > self.step:
+                stale.append(name)
+        return tuple(stale)
+
+    def _reconcile_resume_artifacts(self, output: DurableOutput) -> None:
+        retained_log, truncate_log = self._inspect_resume_log(output)
+        stale_snapshots = self._inspect_resume_snapshots(output)
+        for name in stale_snapshots:
+            quarantine_name = (
+                f".quarantine-{name}-after-step{self.step:07d}-"
+                f"{secrets.token_hex(16)}"
+            )
+            output.snapshots.quarantine_regular(name, quarantine_name)
+        if truncate_log:
+            assert retained_log is not None
+            output.root.write_bytes(
+                "log.jsonl",
+                retained_log,
+                replace=True,
+            )
 
     def _validate_model_state(self, state: object) -> None:
         if not isinstance(state, dict):
@@ -1141,13 +1552,15 @@ class Trainer:
                 self._rank0_action(write_log_row, "log write")
                 t0 = time.time()
                 tokens_seen = 0
-            if self.step % self.snap_every == 0:
+            if self.step in self._snapshot_step_set:
                 self.save_snapshot()
             checkpoint_due = self._broadcast_master_bool(
                 time.time() - last_ckpt > self.ckpt_seconds
             )
-            if checkpoint_due:
-                self.save_ckpt()
+            checkpoint_requested = self._service_checkpoint_request(
+                checkpoint_due=checkpoint_due,
+            )
+            if checkpoint_due or checkpoint_requested:
                 last_ckpt = time.time()
         self.save_ckpt()
         return running if running is not None else float("nan")

@@ -371,6 +371,119 @@ def _content_provenance(
     }
 
 
+def _resolve_parallel_receipt_path(source: Path) -> Path:
+    """Resolve a receipt file, retaining directory compatibility."""
+
+    try:
+        directory_fd = _open_directory_path(source)
+    except ValueError:
+        receipt = _PinnedFile.open_path(
+            source,
+            label="parallel corpus receipt",
+        )
+        receipt.handle.close()
+        return source
+    try:
+        receipt = _PinnedFile.open_at(
+            directory_fd,
+            "receipt.json",
+            path=source / "receipt.json",
+            label="parallel corpus receipt",
+        )
+        receipt.handle.close()
+        return source / "receipt.json"
+    finally:
+        os.close(directory_fd)
+
+
+def _require_receipt_integer(
+    record: dict,
+    field_name: str,
+    *,
+    minimum: int,
+    label: str,
+) -> int:
+    value = record.get(field_name)
+    if type(value) is not int or value < minimum:
+        qualifier = "non-negative" if minimum == 0 else "positive"
+        raise ValueError(
+            f"{label} {field_name} must be a {qualifier} integer"
+        )
+    return value
+
+
+def _validate_parallel_receipt_scalars(receipt: object) -> None:
+    if type(receipt) is not dict:
+        raise ValueError("parallel corpus receipt must be a mapping")
+    for field_name in (
+        "logical_tokens",
+        "packed_tokens",
+        "record_count",
+        "shard_count",
+    ):
+        _require_receipt_integer(
+            receipt,
+            field_name,
+            minimum=1,
+            label="parallel corpus receipt",
+        )
+    _require_receipt_integer(
+        receipt,
+        "padding_tokens",
+        minimum=0,
+        label="parallel corpus receipt",
+    )
+    config = receipt.get("config")
+    if type(config) is not dict:
+        raise ValueError("parallel corpus receipt config must be a mapping")
+    for field_name in ("shard_count", "update_tokens"):
+        _require_receipt_integer(
+            config,
+            field_name,
+            minimum=1,
+            label="parallel corpus receipt config",
+        )
+    lane_weights = config.get("lane_weights")
+    if type(lane_weights) is not list:
+        raise ValueError("parallel corpus receipt lane_weights must be a list")
+    for index, lane_weight in enumerate(lane_weights):
+        if type(lane_weight) is not dict:
+            raise ValueError(
+                "parallel corpus receipt lane weight must be a mapping"
+            )
+        _require_receipt_integer(
+            lane_weight,
+            "weight",
+            minimum=1,
+            label=f"parallel corpus receipt lane_weights[{index}]",
+        )
+    artifact_groups = [receipt.get("artifacts")]
+    for sidecar_set in receipt.get("sidecar_sets", []):
+        if type(sidecar_set) is not dict:
+            raise ValueError("parallel corpus sidecar set must be a mapping")
+        _require_receipt_integer(
+            sidecar_set,
+            "items",
+            minimum=1,
+            label="parallel corpus sidecar set",
+        )
+        artifact_groups.append(sidecar_set.get("artifacts"))
+    for artifacts in artifact_groups:
+        if type(artifacts) is not list:
+            raise ValueError("parallel corpus artifacts must be a list")
+        for artifact in artifacts:
+            if type(artifact) is not dict:
+                raise ValueError(
+                    "parallel corpus artifact must be a mapping"
+                )
+            _require_receipt_integer(
+                artifact,
+                "bytes",
+                minimum=0,
+                label="parallel corpus artifact",
+            )
+
+
 class PackedShards:
     def __init__(
         self,
@@ -481,8 +594,11 @@ class PackedShards:
         from corpusgen.parallel import assignments_from_bytes, verify_parallel_corpus
         from corpusgen.parallel.canonical import canonical_json_bytes
 
-        publication = Path(root)
-        receipt = verify_parallel_corpus(publication)
+        supplied = Path(root)
+        receipt_path = _resolve_parallel_receipt_path(supplied)
+        publication = receipt_path.parent
+        receipt = verify_parallel_corpus(receipt_path)
+        _validate_parallel_receipt_scalars(receipt)
         publication_format = receipt["format"]
         sidecar_set = None
         if publication_format == PARALLEL_SIDECAR_V2_CONTRACT["format"]:
@@ -561,8 +677,8 @@ class PackedShards:
 
             receipt_file = _PinnedFile.open_at(
                 root_fd,
-                "receipt.json",
-                path=publication / "receipt.json",
+                receipt_path.name,
+                path=receipt_path,
                 label="parallel corpus receipt",
             )
             opened.append(receipt_file)
@@ -641,10 +757,6 @@ class PackedShards:
 
             assignments = assignments_from_bytes(
                 artifacts["assignments.jsonl"].read_bytes()
-            )
-            token_paths = tuple(
-                publication / "shards" / f"{assignment.shard_id}.bin"
-                for assignment in assignments
             )
             token_files = tuple(
                 artifacts[f"shards/{assignment.shard_id}.bin"]

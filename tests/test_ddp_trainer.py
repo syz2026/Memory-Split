@@ -1,6 +1,7 @@
 import hashlib
 import json
 import os
+import signal
 import socket
 import time
 import traceback
@@ -312,6 +313,46 @@ def _startup_disagreement_worker(
             torch.distributed.destroy_process_group()
 
 
+def _signal_request_worker(
+    rank,
+    world_size,
+    port,
+    cfg,
+    pid_path,
+    result_dir,
+):
+    os.environ.update(
+        {
+            "MASTER_ADDR": "127.0.0.1",
+            "MASTER_PORT": str(port),
+            "MS_RANK_ZERO_PID_FILE": pid_path,
+            "RANK": str(rank),
+            "WORLD_SIZE": str(world_size),
+            "LOCAL_RANK": str(rank),
+        }
+    )
+    trainer = None
+    try:
+        trainer = Trainer(cfg)
+        Path(result_dir, f"ready-{rank}").write_text("ready")
+        release = Path(result_dir, "release")
+        deadline = time.monotonic() + 15
+        while not release.exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        if not release.exists():
+            raise RuntimeError("signal request test was not released")
+        serviced = trainer._service_checkpoint_request()
+        Path(result_dir, f"serviced-{rank}").write_text(str(serviced))
+    except BaseException:
+        Path(result_dir, f"rank-{rank}.txt").write_text(traceback.format_exc())
+        raise
+    finally:
+        if trainer is not None:
+            trainer.close()
+        elif torch.distributed.is_initialized():
+            torch.distributed.destroy_process_group()
+
+
 @pytest.mark.parametrize("mismatch", ["config", "data"])
 def test_ranks_must_agree_on_config_and_data_before_output_mutation(
     tmp_path,
@@ -416,6 +457,79 @@ def test_rank_local_checkpoint_read_failure_is_coordinated_without_hang(tmp_path
     assert "coordinated checkpoint load failed" in messages[0]
     assert "rank 1" in messages[0]
     assert not Path(resumed_cfg["out_dir"]).exists()
+
+
+def test_cpu_gloo_sigusr1_request_is_serviced_by_all_ranks_at_boundary(tmp_path):
+    token_path = tmp_path / "tokens.bin"
+    (np.arange(80) % 32).astype(np.uint16).tofile(token_path)
+    cfg = tiny_config(tmp_path / "signal-ddp", token_path)
+    world_size = 2
+    port = _free_port()
+    result_dir = tmp_path / f"signal-results-{port}"
+    result_dir.mkdir()
+    pid_path = tmp_path / "rank-zero.pid"
+    context = mp.get_context("spawn")
+    processes = [
+        context.Process(
+            target=_signal_request_worker,
+            args=(
+                rank,
+                world_size,
+                port,
+                cfg,
+                str(pid_path),
+                str(result_dir),
+            ),
+        )
+        for rank in range(world_size)
+    ]
+    for process in processes:
+        process.start()
+
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline:
+        if pid_path.exists() and all(
+            (result_dir / f"ready-{rank}").exists()
+            for rank in range(world_size)
+        ):
+            break
+        time.sleep(0.01)
+    ready = pid_path.exists() and all(
+        (result_dir / f"ready-{rank}").exists()
+        for rank in range(world_size)
+    )
+    if ready:
+        rank_zero_pid = int(pid_path.read_text(encoding="ascii"))
+        assert rank_zero_pid == processes[0].pid
+        os.kill(rank_zero_pid, signal.SIGUSR1)
+        (result_dir / "release").write_text("release")
+    else:
+        for process in processes:
+            process.terminate()
+
+    for process in processes:
+        process.join(15)
+    alive = [process for process in processes if process.is_alive()]
+    for process in alive:
+        process.terminate()
+        process.join()
+    errors = "\n".join(
+        path.read_text() for path in sorted(result_dir.glob("rank-*.txt"))
+    )
+
+    assert ready, "rank zero did not atomically publish its PID file"
+    assert not alive, f"DDP signal workers deadlocked\n{errors}"
+    assert [process.exitcode for process in processes] == [0, 0], errors
+    assert [
+        (result_dir / f"serviced-{rank}").read_text()
+        for rank in range(world_size)
+    ] == ["True", "True"]
+    checkpoint = torch.load(
+        Path(cfg["out_dir"]) / "ckpt.pt",
+        weights_only=False,
+    )
+    assert checkpoint["step"] == 0
+    assert len(checkpoint["rng_by_rank"]) == world_size
 
 
 def test_world_size_four_weighted_zero_quota_ranks_match_single_process(tmp_path):

@@ -3,13 +3,17 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import signal
 import stat
+import subprocess
+import sys
 
 import numpy as np
 import pytest
 import torch
 
 import train.safeio as safeio
+import train.trainer as trainer_module
 from train.model import GPT, GPTConfig
 from train.trainer import Trainer, cosine_lr
 
@@ -50,6 +54,127 @@ def base_cfg(tmp_path, bp, mp):
 
 def file_sha256(path):
     return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def tiny_cfg(tmp_path, bp, mp, *, out_name="out", max_steps=2):
+    cfg = base_cfg(tmp_path, bp, mp)
+    cfg.update(
+        {
+            "model": {
+                "n_layer": 1,
+                "n_head": 1,
+                "d_model": 8,
+                "ctx": 4,
+                "vocab_size": 256,
+            },
+            "tokens_per_step": 8,
+            "micro_batch_size": 2,
+            "max_steps": max_steps,
+            "out_dir": str(tmp_path / out_name),
+            "log_every": 1,
+            "eval_every": 100,
+            "snap_frac": 0.5,
+        }
+    )
+    return cfg
+
+
+def test_run_train_capabilities_json_is_strict_and_does_not_require_config():
+    root = Path(__file__).resolve().parents[1]
+    environment = dict(os.environ)
+    for name in (
+        "LOCAL_RANK",
+        "MS_RANK_ZERO_PID_FILE",
+        "RANK",
+        "WORLD_SIZE",
+    ):
+        environment.pop(name, None)
+
+    completed = subprocess.run(
+        [
+            sys.executable,
+            root / "scripts" / "run_train.py",
+            "--capabilities-json",
+        ],
+        cwd=root,
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    expected = {
+        "rank_zero_pid_file": True,
+        "receipt_v2": True,
+        "resume_sha256": True,
+        "sidecar_name": True,
+        "sigusr1_checkpoint": True,
+    }
+
+    assert completed.returncode == 0
+    assert completed.stderr == ""
+    assert completed.stdout == (
+        json.dumps(expected, sort_keys=True, separators=(",", ":")) + "\n"
+    )
+
+
+def test_preregistered_v2_snapshot_steps_are_preserved_exactly():
+    expected = (1358, 3396, 6791, 10187, 13582)
+
+    actual = trainer_module.resolve_snapshot_steps(
+        {
+            "schema_version": 2,
+            "snapshot_steps": list(expected),
+        },
+        max_steps=13582,
+    )
+
+    assert actual == expected
+
+
+@pytest.mark.parametrize(
+    ("config", "max_steps"),
+    [
+        ({"schema_version": 2, "snap_frac": 0.1}, 10),
+        (
+            {
+                "schema_version": 2,
+                "snap_frac": 0.1,
+                "snapshot_steps": [5, 10],
+            },
+            10,
+        ),
+        ({"schema_version": 2, "snapshot_steps": [5, True]}, 10),
+        ({"schema_version": 2, "snapshot_steps": [5.0, 10]}, 10),
+        ({"schema_version": 2, "snapshot_steps": [5, 5, 10]}, 10),
+        ({"schema_version": 2, "snapshot_steps": [6, 5, 10]}, 10),
+        ({"schema_version": 2, "snapshot_steps": [5, 11]}, 10),
+        ({"schema_version": 2, "snapshot_steps": [5, 9]}, 10),
+    ],
+)
+def test_v2_snapshot_steps_reject_legacy_or_inexact_schedules(config, max_steps):
+    with pytest.raises(ValueError, match="snapshot_steps|snap_frac"):
+        trainer_module.resolve_snapshot_steps(config, max_steps=max_steps)
+
+
+def test_explicit_snapshot_steps_save_only_the_declared_steps(tmp_path):
+    bp, mp = write_corpus(tmp_path, n=64)
+    cfg = tiny_cfg(tmp_path, bp, mp, max_steps=3)
+    cfg.pop("snap_frac")
+    cfg.update(
+        {
+            "schema_version": 2,
+            "snapshot_steps": [1, 3],
+        }
+    )
+
+    trainer = Trainer(cfg)
+    trainer.train_steps()
+
+    assert sorted(path.name for path in (trainer.out_dir / "snapshots").iterdir()) == [
+        "step0000001.pt",
+        "step0000003.pt",
+    ]
+    trainer.close()
 
 
 def test_fresh_launch_refuses_even_an_empty_existing_output_before_mutation(tmp_path):
@@ -108,6 +233,70 @@ def test_default_auto_resume_loads_existing_checkpoint_without_rewriting_config(
     assert resumed.step == 1
     assert (resumed.out_dir / "config.yaml").read_bytes() == config_before
     resumed.close()
+
+
+def test_auto_resume_removes_stale_step_two_artifacts_before_exact_replay(
+    tmp_path,
+):
+    bp, mp = write_corpus(tmp_path, n=64)
+    cfg = tiny_cfg(tmp_path, bp, mp, max_steps=2)
+    first = Trainer(cfg)
+    first.train_steps(1)
+    step_one_checkpoint = first.ckpt_path.read_bytes()
+    first.train_steps(1)
+    first.close()
+    Path(cfg["out_dir"], "ckpt.pt").write_bytes(step_one_checkpoint)
+
+    resumed = Trainer(cfg, resume="auto")
+
+    assert resumed.step == 1
+    assert [
+        json.loads(line)["step"]
+        for line in resumed.log_path.read_text().splitlines()
+    ] == [1]
+    assert sorted(
+        path.name
+        for path in (resumed.out_dir / "snapshots").glob("step*.pt")
+    ) == ["step0000001.pt"]
+
+    resumed.train_steps(1)
+
+    replayed_steps = [
+        json.loads(line)["step"]
+        for line in resumed.log_path.read_text().splitlines()
+    ]
+    assert replayed_steps == [1, 2]
+    assert len(replayed_steps) == len(set(replayed_steps))
+    assert sorted(
+        path.name
+        for path in (resumed.out_dir / "snapshots").glob("step*.pt")
+    ) == ["step0000001.pt", "step0000002.pt"]
+    resumed.close()
+
+
+@pytest.mark.parametrize("corruption", ["malformed-log", "foreign-snapshot"])
+def test_auto_resume_rejects_malformed_or_foreign_owned_artifacts(
+    tmp_path,
+    corruption,
+):
+    bp, mp = write_corpus(tmp_path, n=64)
+    cfg = tiny_cfg(tmp_path, bp, mp, max_steps=2)
+    first = Trainer(cfg)
+    first.train_steps(1)
+    first.close()
+    output = Path(cfg["out_dir"])
+    if corruption == "malformed-log":
+        artifact = output / "log.jsonl"
+        artifact.write_bytes(artifact.read_bytes() + b"not-json\n")
+    else:
+        artifact = output / "snapshots" / "foreign.pt"
+        artifact.write_bytes(b"foreign")
+    before = artifact.read_bytes()
+
+    with pytest.raises(ValueError, match="log|snapshot|foreign"):
+        Trainer(cfg, resume="auto")
+
+    assert artifact.read_bytes() == before
 
 
 def test_external_resume_requires_matching_sha_before_creating_output(tmp_path):
@@ -314,11 +503,37 @@ def test_checkpoint_and_snapshot_writes_reject_symlink_swaps(tmp_path):
     trainer.close()
 
 
+def test_sigusr1_handler_only_requests_checkpoint_until_safe_boundary(
+    tmp_path,
+    monkeypatch,
+):
+    bp, mp = write_corpus(tmp_path, n=64)
+    cfg = tiny_cfg(tmp_path, bp, mp)
+    pid_path = tmp_path / "rank-zero.pid"
+    installed = {}
+    monkeypatch.setenv("MS_RANK_ZERO_PID_FILE", str(pid_path))
+    monkeypatch.setattr(signal, "getsignal", lambda signum: f"previous-{signum}")
+
+    def install(signum, handler):
+        installed[signum] = handler
+
+    monkeypatch.setattr(signal, "signal", install)
+    trainer = Trainer(cfg)
+
+    assert pid_path.read_text(encoding="ascii") == f"{os.getpid()}\n"
+    installed[signal.SIGUSR1](signal.SIGUSR1, None)
+    assert not trainer.ckpt_path.exists()
+
+    assert trainer._service_checkpoint_request() is True
+    assert torch.load(trainer.ckpt_path, weights_only=False)["step"] == 0
+    trainer.close()
+
+
 def test_loss_decreases_and_logs(tmp_path):
     bp, mp = write_corpus(tmp_path)
     tr = Trainer(base_cfg(tmp_path, bp, mp))
     tr.train_steps()
-    rows = [json.loads(l) for l in open(tr.log_path)]
+    rows = [json.loads(line) for line in open(tr.log_path)]
     first, last = rows[0]["loss"], rows[-1]["loss_ema"]
     assert last < first * 0.8, (first, last)
     assert any("loss_masked_values" in r for r in rows)

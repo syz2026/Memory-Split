@@ -101,6 +101,14 @@ _SIDECAR_SET_FIELDS = {
     "name",
     "stream_sha256",
 }
+_RECEIPT_COUNT_FIELDS = {
+    "logical_tokens",
+    "packed_tokens",
+    "padding_tokens",
+    "record_count",
+    "shard_count",
+}
+_RECEIPT_NAMESPACE_KIND = object()
 
 
 class VerifiedParallelCorpus(dict[str, Any]):
@@ -939,6 +947,8 @@ def _publish_staging(
 
 def _artifact_contract(
     receipt: dict[str, Any],
+    *,
+    receipt_name: str = "receipt.json",
 ) -> tuple[dict[str, dict[str, Any]], set[tuple[str, ...]]]:
     primary_artifacts = receipt["artifacts"]
     if not isinstance(primary_artifacts, list) or not primary_artifacts:
@@ -1007,7 +1017,8 @@ def _artifact_contract(
                 or relative.as_posix() != relative_text
                 or not parts
                 or any(part in {"", ".", ".."} for part in parts)
-                or relative_text in {"receipt.json", _STAGE_OWNER_NAME}
+                or relative_text
+                in {"receipt.json", receipt_name, _STAGE_OWNER_NAME}
             ):
                 raise ValueError("artifact path must be a safe relative POSIX path")
             if (
@@ -1060,15 +1071,16 @@ def _open_artifact_namespace(
     directory_parts: set[tuple[str, ...]],
     receipt_metadata: os.stat_result,
     *,
+    receipt_name: str,
     allow_stage_owner: bool,
 ) -> tuple[dict[str, tuple[int, os.stat_result, int, str]], bytes | None]:
     file_parts = {
         tuple(PurePosixPath(path).parts): path for path in artifact_by_path
     }
-    reserved_files = {("receipt.json",): "receipt.json"}
+    reserved_files = {(receipt_name,): _RECEIPT_NAMESPACE_KIND}
     if allow_stage_owner:
         reserved_files[(_STAGE_OWNER_NAME,)] = _STAGE_OWNER_NAME
-    expected_children: dict[tuple[str, ...], dict[str, str]] = {
+    expected_children: dict[tuple[str, ...], dict[str, object]] = {
         directory: {} for directory in directory_parts
     }
     for directory in directory_parts:
@@ -1103,7 +1115,7 @@ def _open_artifact_namespace(
                     child_fd, _created = open_directory_at(directory_fd, name)
                     directory_fds[child_parts] = child_fd
                     continue
-                if kind == "receipt.json":
+                if kind is _RECEIPT_NAMESPACE_KIND:
                     current = entry_lstat(directory_fd, name)
                     if (
                         not stat.S_ISREG(current.st_mode)
@@ -1444,11 +1456,13 @@ def _verify_receipt_after_verification(
     initial_metadata: os.stat_result,
     initial_bytes: bytes,
     initial_sha256: str,
+    *,
+    receipt_name: str,
 ) -> None:
     expected_identity = _receipt_modification_identity(initial_metadata)
     try:
         before_eof = os.fstat(receipt_fd)
-        named_before_eof = entry_lstat(publication_fd, "receipt.json")
+        named_before_eof = entry_lstat(publication_fd, receipt_name)
         _require_receipt_identity(
             expected_identity,
             before_eof,
@@ -1456,13 +1470,13 @@ def _verify_receipt_after_verification(
         )
         trailing = os.read(receipt_fd, 1)
         after_eof = os.fstat(receipt_fd)
-        named_after_eof = entry_lstat(publication_fd, "receipt.json")
+        named_after_eof = entry_lstat(publication_fd, receipt_name)
         _require_receipt_identity(
             expected_identity,
             after_eof,
             named_after_eof,
         )
-        named_before = entry_lstat(publication_fd, "receipt.json")
+        named_before = entry_lstat(publication_fd, receipt_name)
         os.lseek(receipt_fd, 0, os.SEEK_SET)
         before_reread = os.fstat(receipt_fd)
         _require_receipt_identity(
@@ -1472,7 +1486,7 @@ def _verify_receipt_after_verification(
         )
         final_bytes = read_file_descriptor(receipt_fd)
         final_metadata = os.fstat(receipt_fd)
-        named_after = entry_lstat(publication_fd, "receipt.json")
+        named_after = entry_lstat(publication_fd, receipt_name)
         _require_receipt_identity(
             expected_identity,
             final_metadata,
@@ -1480,7 +1494,7 @@ def _verify_receipt_after_verification(
         )
         final_eof = os.read(receipt_fd, 1)
         after_final_eof = os.fstat(receipt_fd)
-        named_after_final_eof = entry_lstat(publication_fd, "receipt.json")
+        named_after_final_eof = entry_lstat(publication_fd, receipt_name)
         _require_receipt_identity(
             expected_identity,
             after_final_eof,
@@ -1505,13 +1519,22 @@ def _verify_receipt_after_verification(
 def _verify_parallel_corpus_fd(
     publication_fd: int,
     *,
+    receipt_name: str = "receipt.json",
     expected_build_id: str | None = None,
     allow_stage_owner: bool = False,
 ) -> dict[str, Any]:
+    if (
+        not isinstance(receipt_name, str)
+        or not receipt_name
+        or receipt_name in {".", ".."}
+        or "/" in receipt_name
+        or "\x00" in receipt_name
+    ):
+        raise ValueError("parallel corpus receipt name is unsafe")
     try:
         receipt_fd, receipt_metadata = open_regular_file_at(
             publication_fd,
-            "receipt.json",
+            receipt_name,
         )
     except (OSError, ValueError) as error:
         raise ValueError("parallel corpus receipt is missing or unsafe") from error
@@ -1520,6 +1543,7 @@ def _verify_parallel_corpus_fd(
             publication_fd,
             receipt_fd,
             receipt_metadata,
+            receipt_name=receipt_name,
             expected_build_id=expected_build_id,
             allow_stage_owner=allow_stage_owner,
         )
@@ -1532,12 +1556,13 @@ def _verify_parallel_corpus_with_receipt_fd(
     receipt_fd: int,
     receipt_metadata: os.stat_result,
     *,
+    receipt_name: str,
     expected_build_id: str | None = None,
     allow_stage_owner: bool = False,
 ) -> dict[str, Any]:
     expected_receipt_identity = _receipt_modification_identity(receipt_metadata)
     try:
-        named_before_read = entry_lstat(publication_fd, "receipt.json")
+        named_before_read = entry_lstat(publication_fd, receipt_name)
         before_read = os.fstat(receipt_fd)
         _require_receipt_identity(
             expected_receipt_identity,
@@ -1546,7 +1571,7 @@ def _verify_parallel_corpus_with_receipt_fd(
         )
         receipt_bytes = read_file_descriptor(receipt_fd)
         after_read = os.fstat(receipt_fd)
-        named_after_read = entry_lstat(publication_fd, "receipt.json")
+        named_after_read = entry_lstat(publication_fd, receipt_name)
         _require_receipt_identity(
             expected_receipt_identity,
             after_read,
@@ -1555,7 +1580,7 @@ def _verify_parallel_corpus_with_receipt_fd(
         if os.read(receipt_fd, 1):
             raise ValueError("parallel corpus receipt does not end at EOF")
         after_eof = os.fstat(receipt_fd)
-        named_after_eof = entry_lstat(publication_fd, "receipt.json")
+        named_after_eof = entry_lstat(publication_fd, receipt_name)
         _require_receipt_identity(
             expected_receipt_identity,
             after_eof,
@@ -1585,12 +1610,25 @@ def _verify_parallel_corpus_with_receipt_fd(
         or receipt["compiler_version"] != _COMPILER_VERSION
     ):
         raise ValueError("parallel corpus format identity mismatch")
-    artifact_by_path, directory_parts = _artifact_contract(receipt)
+    for field_name in _RECEIPT_COUNT_FIELDS:
+        value = receipt[field_name]
+        minimum = 0 if field_name == "padding_tokens" else 1
+        if type(value) is not int or value < minimum:
+            qualifier = "non-negative" if minimum == 0 else "positive"
+            raise ValueError(
+                f"parallel corpus receipt {field_name} must be a "
+                f"{qualifier} integer"
+            )
+    artifact_by_path, directory_parts = _artifact_contract(
+        receipt,
+        receipt_name=receipt_name,
+    )
     opened_files, owner_bytes = _open_artifact_namespace(
         publication_fd,
         artifact_by_path,
         directory_parts,
         receipt_metadata,
+        receipt_name=receipt_name,
         allow_stage_owner=allow_stage_owner,
     )
     try:
@@ -1770,6 +1808,7 @@ def _verify_parallel_corpus_with_receipt_fd(
             receipt_metadata,
             receipt_bytes,
             receipt_sha256,
+            receipt_name=receipt_name,
         )
         return receipt
     finally:
@@ -1786,19 +1825,28 @@ def verify_parallel_corpus(
 ) -> VerifiedParallelCorpus:
     parent_fd = -1
     publication_fd = -1
+    receipt_name = "receipt.json"
     try:
         parent_fd, name = open_parent_directory(root)
-        publication_fd, _created = open_directory_at(parent_fd, name)
+        try:
+            publication_fd, _created = open_directory_at(parent_fd, name)
+        except (OSError, ValueError):
+            metadata = entry_lstat(parent_fd, name)
+            if not stat.S_ISREG(metadata.st_mode):
+                raise ValueError("parallel corpus receipt is not a regular file")
+            publication_fd = os.dup(parent_fd)
+            receipt_name = name
     except (OSError, ValueError) as error:
         if parent_fd >= 0:
             os.close(parent_fd)
         raise ValueError(
-            "parallel corpus publication is missing or unsafe"
+            "parallel corpus publication or receipt is missing or unsafe"
         ) from error
     try:
         return _with_retained_tombstones(
             _verify_parallel_corpus_fd(
                 publication_fd,
+                receipt_name=receipt_name,
                 expected_build_id=expected_build_id,
                 allow_stage_owner=_allow_stage_owner,
             ),

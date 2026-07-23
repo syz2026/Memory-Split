@@ -1652,6 +1652,25 @@ def test_tiny_publication_is_worker_independent_and_self_verifying(tmp_path):
     assert all(len(artifact["sha256"]) == 64 for artifact in serial["artifacts"])
 
 
+def test_verifier_accepts_exact_receipt_file_path(tmp_path):
+    catalog, renderer, config = _fixture_build()
+    destination = tmp_path / "receipt-path-corpus"
+    receipt = build_parallel_corpus(catalog, renderer, config, destination)
+
+    assert verify_parallel_corpus(destination / "receipt.json") == receipt
+
+
+def test_verifier_rejects_float_logical_token_count(tmp_path):
+    catalog, renderer, config = _fixture_build()
+    destination = tmp_path / "float-count-corpus"
+    receipt = build_parallel_corpus(catalog, renderer, config, destination)
+    receipt["logical_tokens"] = float(receipt["logical_tokens"])
+    _write_receipt(destination, receipt)
+
+    with pytest.raises(ValueError, match="logical_tokens.*integer"):
+        verify_parallel_corpus(destination)
+
+
 def test_v2_publication_binds_ordered_dense_and_split90_weight_shards(tmp_path):
     catalog, renderer, config = _fixture_build(record_count=13)
     sidecar_paths, expected_values = _fixture_target_weight_sources(

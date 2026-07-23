@@ -311,6 +311,60 @@ class PinnedDirectory:
         self._verify_identity()
         return read_regular_at(self.fd, name, label=label)
 
+    def entries(self) -> tuple[str, ...]:
+        self._verify_identity()
+        return tuple(sorted(os.listdir(self.fd)))
+
+    def entry_metadata(self, name: str, *, label: str) -> os.stat_result:
+        self._verify_identity()
+        _safe_name(name, label=label)
+        try:
+            return os.stat(name, dir_fd=self.fd, follow_symlinks=False)
+        except FileNotFoundError as error:
+            raise FileNotFoundError(f"{label} is missing") from error
+
+    def quarantine_regular(self, name: str, quarantine_name: str) -> None:
+        """Atomically rename one pinned regular artifact out of its live name."""
+
+        self._verify_identity()
+        _safe_name(name, label="artifact")
+        _safe_name(quarantine_name, label="quarantine")
+        try:
+            source = os.stat(name, dir_fd=self.fd, follow_symlinks=False)
+        except FileNotFoundError as error:
+            raise FileNotFoundError(f"artifact is missing: {name}") from error
+        if not stat.S_ISREG(source.st_mode) or source.st_nlink != 1:
+            raise ValueError(f"artifact is not an owned regular file: {name}")
+        try:
+            os.stat(quarantine_name, dir_fd=self.fd, follow_symlinks=False)
+        except FileNotFoundError:
+            pass
+        else:
+            raise FileExistsError(
+                f"quarantine artifact already exists: {quarantine_name}"
+            )
+        descriptor = -1
+        try:
+            descriptor = os.open(name, _FILE_FLAGS, dir_fd=self.fd)
+            pinned = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(pinned.st_mode)
+                or pinned.st_nlink != 1
+                or (pinned.st_dev, pinned.st_ino)
+                != (source.st_dev, source.st_ino)
+            ):
+                raise ValueError(f"artifact identity changed: {name}")
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
+        os.rename(
+            name,
+            quarantine_name,
+            src_dir_fd=self.fd,
+            dst_dir_fd=self.fd,
+        )
+        os.fsync(self.fd)
+
     def write_atomic(
         self,
         name: str,
@@ -401,8 +455,10 @@ class PinnedDirectory:
             while view:
                 written = os.write(fd, view)
                 view = view[written:]
+            os.fsync(fd)
         finally:
             os.close(fd)
+        os.fsync(self.fd)
 
     def close(self) -> None:
         for attribute in ("fd", "_parent_fd"):
@@ -443,3 +499,20 @@ class DurableOutput:
     def close(self) -> None:
         self.snapshots.close()
         self.root.close()
+
+
+def write_atomic_path(
+    path: str | Path,
+    payload: bytes,
+    *,
+    label: str,
+) -> None:
+    candidate = Path(path)
+    parent = PinnedDirectory.open_existing(
+        candidate.parent,
+        label=f"{label} parent directory",
+    )
+    try:
+        parent.write_bytes(candidate.name, payload, replace=True)
+    finally:
+        parent.close()

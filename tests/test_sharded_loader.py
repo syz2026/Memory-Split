@@ -1,3 +1,4 @@
+import json
 import os
 import shutil
 
@@ -13,6 +14,7 @@ from corpusgen.parallel import (
     fixture_catalog,
     render_metadata,
 )
+from corpusgen.parallel.canonical import canonical_json_bytes
 from train.data import (
     PARALLEL_SIDECAR_V2_CONTRACT,
     BatchSlice,
@@ -123,6 +125,44 @@ def test_parallel_publication_rejects_noncanonical_receipt(tmp_path):
 
     with pytest.raises(ValueError, match="receipt"):
         PackedShards.from_parallel_corpus(publication, ctx=4, batch_size=2)
+
+
+def test_parallel_loader_opens_exact_supplied_receipt_file_and_relative_artifacts(
+    tmp_path,
+):
+    publication, receipt, _ = build_weighted_publication(tmp_path)
+    supplied_receipt = publication / "corpus-receipt.json"
+    (publication / "receipt.json").rename(supplied_receipt)
+
+    loader = PackedShards.from_parallel_corpus(
+        supplied_receipt,
+        ctx=4,
+        batch_size=2,
+        sidecar_name="split90_target_weights",
+    )
+
+    assert loader.provenance["build_id"] == receipt["build_id"]
+    assert loader.target_weights is not None
+    loader.close()
+
+
+def test_parallel_loader_requires_strict_integer_receipt_scalars_even_if_preverified(
+    tmp_path,
+    monkeypatch,
+):
+    publication = build_aligned_publication(tmp_path)
+    receipt_path = publication / "receipt.json"
+    receipt = json.loads(receipt_path.read_bytes())
+    receipt["logical_tokens"] = float(receipt["logical_tokens"])
+    receipt_path.write_bytes(canonical_json_bytes(receipt))
+    monkeypatch.setattr(parallel, "verify_parallel_corpus", lambda _source: receipt)
+
+    with pytest.raises(ValueError, match="logical_tokens.*integer"):
+        PackedShards.from_parallel_corpus(
+            receipt_path,
+            ctx=4,
+            batch_size=2,
+        )
 
 
 @pytest.mark.parametrize("relative", ["catalog.jsonl", "shards/shard-00000-of-00011.bin"])
@@ -389,6 +429,75 @@ def test_trainer_selects_verified_v2_target_weights_by_sidecar_name(tmp_path):
     assert trainer.data.target_weights is not None
     assert trainer.data.provenance["sidecar_name"] == "split90_target_weights"
     trainer.close()
+
+
+def _tiny_trainer_config(tmp_path, *, out_name):
+    return {
+        "model": {
+            "n_layer": 1,
+            "n_head": 1,
+            "d_model": 8,
+            "ctx": 4,
+            "vocab_size": 256,
+        },
+        "micro_batch_size": 2,
+        "tokens_per_step": 32,
+        "max_steps": 1,
+        "lr": 1e-3,
+        "seed": 9,
+        "out_dir": str(tmp_path / out_name),
+        "device": "cpu",
+    }
+
+
+def test_trainer_rejects_sidecar_name_with_legacy_train_bin(tmp_path):
+    tokens = tmp_path / "legacy.bin"
+    np.arange(64, dtype=np.uint16).tofile(tokens)
+    cfg = _tiny_trainer_config(tmp_path, out_name="legacy-sidecar-name")
+    cfg.update(
+        {
+            "train_bin": str(tokens),
+            "sidecar_name": "dense_target_weights",
+        }
+    )
+
+    with pytest.raises(ValueError, match="sidecar_name.*train_bin"):
+        Trainer(cfg)
+
+    assert not (tmp_path / "legacy-sidecar-name").exists()
+
+
+def test_trainer_rejects_split90_label_without_receipt_v2_sidecar(tmp_path):
+    publication = build_aligned_publication(tmp_path)
+    cfg = _tiny_trainer_config(tmp_path, out_name="unbound-split90")
+    cfg.update(
+        {
+            "condition": "split90",
+            "train_corpus": str(publication / "receipt.json"),
+        }
+    )
+
+    with pytest.raises(ValueError, match="Split90.*receipt-v2 sidecar"):
+        Trainer(cfg)
+
+    assert not (tmp_path / "unbound-split90").exists()
+
+
+def test_trainer_rejects_split90_label_with_dense_receipt_sidecar(tmp_path):
+    publication, _, _ = build_weighted_publication(tmp_path)
+    cfg = _tiny_trainer_config(tmp_path, out_name="dense-labeled-split90")
+    cfg.update(
+        {
+            "condition": "split90",
+            "train_corpus": str(publication / "receipt.json"),
+            "sidecar_name": "dense_target_weights",
+        }
+    )
+
+    with pytest.raises(ValueError, match="Split90.*split90_target_weights"):
+        Trainer(cfg)
+
+    assert not (tmp_path / "dense-labeled-split90").exists()
 
 
 def test_trainer_rejects_ambiguous_legacy_and_parallel_sources(tmp_path):
