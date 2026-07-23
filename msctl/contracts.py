@@ -29,12 +29,14 @@ from .jsonutil import (
     resolve_inside,
     sha256_file,
 )
-from .profile import SUPPORTED_PROFILE
+from .profile import AWS_P5_PROFILE, SUPPORTED_PROFILE
 
 
 @dataclass(frozen=True)
 class Release:
     release_id: str
+    provider: str
+    receipt_sha256: str
     archive_sha256: str
     archive_bytes: int
     archive_path: Path
@@ -58,9 +60,14 @@ class Run:
 
 @dataclass(frozen=True)
 class RunManifest:
+    schema_version: int
     provider: str
+    seed: int
     release_sha256: str
     dataset_sha256: str
+    cohort_assignment_sha256: str | None
+    study_lock_sha256: str | None
+    source_commit: str | None
     runs: tuple[Run, ...]
     sha256: str
     value: dict[str, object]
@@ -74,21 +81,76 @@ class RunManifest:
 class Checkpoint:
     run_id: str
     arm: str
+    seed: int
     path: Path
     sha256: str
     config_sha256: str
+    dataset_sha256: str
+    source_commit: str | None
     step: int
     world_size: int
 
 
 @dataclass(frozen=True)
 class CheckpointReceipt:
+    schema_version: int
     sha256: str
     checkpoints: tuple[Checkpoint, ...]
     value: dict[str, object]
 
 
 _GIT_OBJECT_RE = re.compile(r"^[0-9a-f]{40}(?:[0-9a-f]{24})?$")
+_RUNTIME_RECEIPT_FIELDS = [
+    "schema_version",
+    "profile_sha256",
+    "container_image_digest",
+    "aws_instance_identity_document",
+    "aws_instance_identity_pkcs7",
+]
+
+
+def validate_runtime_attested_contract(
+    value: object,
+    *,
+    profile_sha256: str,
+) -> dict[str, object]:
+    contract = require_object(value, label="AWS runtime environment contract")
+    require_exact_keys(
+        contract,
+        {
+            "mode",
+            "profile_sha256",
+            "container_image_digest_env",
+            "container_image_digest_pattern",
+            "runtime_environment_receipt",
+        },
+        label="AWS runtime environment contract",
+    )
+    receipt = require_object(
+        contract["runtime_environment_receipt"],
+        label="AWS runtime environment receipt contract",
+    )
+    require_exact_keys(
+        receipt,
+        {"required_at_launch", "authentication", "required_fields"},
+        label="AWS runtime environment receipt contract",
+    )
+    if (
+        contract["mode"] != "runtime_attested"
+        or contract["profile_sha256"] != profile_sha256
+        or contract["container_image_digest_env"] != "MS_CONTAINER_DIGEST"
+        or contract["container_image_digest_pattern"]
+        != "^sha256:[0-9a-f]{64}$"
+        or receipt["required_at_launch"] is not True
+        or receipt["authentication"]
+        != "aws_instance_identity_document_pkcs7"
+        or receipt["required_fields"] != _RUNTIME_RECEIPT_FIELDS
+    ):
+        raise MsctlError(
+            "RELEASE_INTERNAL_INVALID",
+            "AWS release runtime_attested contract is invalid",
+        )
+    return contract
 
 
 def _release_error(
@@ -323,16 +385,48 @@ def _verify_release_internals(
         payload["RELEASE-METADATA.json"],
         label="RELEASE-METADATA.json",
     )
-    require_exact_keys(
-        metadata,
-        {
+    aws_package = (
+        release_value["provider"] == AWS_P5_PROFILE
+        and "package_format_version" in metadata
+    )
+    if aws_package:
+        metadata_fields = {
+            "schema_version",
+            "package_format_version",
+            "provider",
+            "source",
+            "seed_assignment",
+            "cohort_assignment",
+            "profile",
+            "environment",
+            "dataset_pointer",
+            "config_sha256",
+            "members",
+        }
+    elif release_value["provider"] == AWS_P5_PROFILE:
+        metadata_fields = {
             "schema_version",
             "provider",
             "source",
             "profile_sha256",
             "environment_hashes",
             "members",
-        },
+            "seed_assignment",
+        }
+    else:
+        metadata_fields = {
+            "schema_version",
+            "provider",
+            "source",
+            "profile_sha256",
+            "environment_hashes",
+            "members",
+        }
+        if "seed_assignment" in metadata:
+            metadata_fields.add("seed_assignment")
+    require_exact_keys(
+        metadata,
+        metadata_fields,
         label="RELEASE-METADATA.json",
     )
     try:
@@ -353,10 +447,29 @@ def _verify_release_internals(
             "RELEASE_INTERNAL_INVALID",
             "internal metadata does not bind RELEASE.json",
         )
-    profile_hash = require_sha256(
-        metadata["profile_sha256"],
-        label="RELEASE-METADATA.json.profile_sha256",
-    )
+    if aws_package:
+        profile_binding = require_object(
+            metadata["profile"],
+            label="RELEASE-METADATA.json.profile",
+        )
+        require_exact_keys(
+            profile_binding,
+            {"path", "sha256"},
+            label="RELEASE-METADATA.json.profile",
+        )
+        profile_hash = require_sha256(
+            profile_binding["sha256"],
+            label="RELEASE-METADATA.json.profile.sha256",
+        )
+        validate_runtime_attested_contract(
+            metadata["environment"],
+            profile_sha256=profile_hash,
+        )
+    else:
+        profile_hash = require_sha256(
+            metadata["profile_sha256"],
+            label="RELEASE-METADATA.json.profile_sha256",
+        )
     raw_members = metadata["members"]
     if not isinstance(raw_members, list) or not raw_members:
         raise _release_error(
@@ -367,11 +480,10 @@ def _verify_release_internals(
     ordered_member_paths: list[str] = []
     for index, raw in enumerate(raw_members):
         row = require_object(raw, label=f"release member[{index}]")
-        require_exact_keys(
-            row,
-            {"path", "bytes", "sha256", "git_blob"},
-            label=f"release member[{index}]",
-        )
+        member_fields = {"path", "bytes", "sha256", "git_blob"}
+        if aws_package:
+            member_fields.add("git_mode")
+        require_exact_keys(row, member_fields, label=f"release member[{index}]")
         relative = portable_relative(
             row["path"],
             label=f"release member[{index}].path",
@@ -388,6 +500,10 @@ def _verify_release_internals(
             or size < 0
             or not isinstance(row["git_blob"], str)
             or _GIT_OBJECT_RE.fullmatch(row["git_blob"]) is None
+            or (
+                aws_package
+                and row["git_mode"] not in {"100644", "100755"}
+            )
         ):
             raise _release_error(
                 "RELEASE_INTERNAL_INVALID",
@@ -416,25 +532,111 @@ def _verify_release_internals(
             "RELEASE_INTERNAL_INVALID",
             "internal metadata is not sorted and member-complete",
         )
-    profile_member = members.get("cluster/profiles/illumina-usfc-prd.json")
+    profile_member_path = (
+        "cluster/profiles/illumina-usfc-prd.json"
+        if release_value["provider"] == SUPPORTED_PROFILE
+        else "cluster/profiles/aws-p5.48xlarge.json"
+    )
+    profile_member = members.get(profile_member_path)
     if profile_member is None or profile_member["sha256"] != profile_hash:
         raise _release_error(
             "RELEASE_INTERNAL_INVALID",
             "internal profile hash is not bound to its member",
         )
-    environment_hashes = require_object(
-        metadata["environment_hashes"],
-        label="RELEASE-METADATA.json.environment_hashes",
-    )
-    for relative, raw_digest in environment_hashes.items():
-        digest = require_sha256(
-            raw_digest,
-            label=f"environment hash {relative}",
-        )
-        if relative not in members or members[relative]["sha256"] != digest:
+    if aws_package:
+        if (
+            not isinstance(metadata["package_format_version"], str)
+            or not metadata["package_format_version"]
+            or metadata["package_format_version"]
+            != release_value["package_format_version"]
+        ):
             raise _release_error(
                 "RELEASE_INTERNAL_INVALID",
-                "environment hash does not bind a release member",
+                "AWS package format identity is invalid",
+            )
+        if profile_binding["path"] != profile_member_path:
+            raise _release_error(
+                "RELEASE_INTERNAL_INVALID",
+                "AWS release profile path is invalid",
+            )
+        for label in ("cohort_assignment", "dataset_pointer"):
+            binding = require_object(
+                metadata[label],
+                label=f"RELEASE-METADATA.json.{label}",
+            )
+            require_exact_keys(
+                binding,
+                {"path", "sha256"},
+                label=f"RELEASE-METADATA.json.{label}",
+            )
+            path = portable_relative(
+                binding["path"],
+                label=f"RELEASE-METADATA.json.{label}.path",
+            )
+            digest = require_sha256(
+                binding["sha256"],
+                label=f"RELEASE-METADATA.json.{label}.sha256",
+            )
+            if path not in members or members[path]["sha256"] != digest:
+                raise _release_error(
+                    "RELEASE_INTERNAL_INVALID",
+                    f"AWS {label} is not bound to a release member",
+                )
+        config_hashes = require_object(
+            metadata["config_sha256"],
+            label="RELEASE-METADATA.json.config_sha256",
+        )
+        for path, raw_digest in config_hashes.items():
+            relative = portable_relative(path, label="AWS config path")
+            digest = require_sha256(raw_digest, label="AWS config SHA-256")
+            if relative not in members or members[relative]["sha256"] != digest:
+                raise _release_error(
+                    "RELEASE_INTERNAL_INVALID",
+                    "AWS config hash is not bound to a release member",
+                )
+    else:
+        environment_hashes = require_object(
+            metadata["environment_hashes"],
+            label="RELEASE-METADATA.json.environment_hashes",
+        )
+        for relative, raw_digest in environment_hashes.items():
+            digest = require_sha256(
+                raw_digest,
+                label=f"environment hash {relative}",
+            )
+            if relative not in members or members[relative]["sha256"] != digest:
+                raise _release_error(
+                    "RELEASE_INTERNAL_INVALID",
+                    "environment hash does not bind a release member",
+                )
+    if "seed_assignment" in metadata:
+        assignment = require_object(
+            metadata["seed_assignment"],
+            label="RELEASE-METADATA.json.seed_assignment",
+        )
+        require_exact_keys(
+            assignment,
+            {"cohort_id", "provider", "seeds", "arms"},
+            label="RELEASE-METADATA.json.seed_assignment",
+        )
+        seeds = assignment["seeds"]
+        expected_seeds = (
+            [0]
+            if release_value["provider"] == SUPPORTED_PROFILE
+            else [1, 2, 3, 4]
+        )
+        if (
+            not isinstance(assignment["cohort_id"], str)
+            or not assignment["cohort_id"]
+            or assignment["provider"] != release_value["provider"]
+            or not isinstance(seeds, list)
+            or any(isinstance(seed, bool) or not isinstance(seed, int) for seed in seeds)
+            or seeds != expected_seeds
+            or assignment["arms"] != ["dense", "split90"]
+        ):
+            raise _release_error(
+                "RELEASE_INTERNAL_INVALID",
+                "release seed assignment is invalid",
             )
     archive_files = dict(checksum_rows)
     archive_files["SHA256SUMS"] = hashlib.sha256(sums_bytes).hexdigest()
@@ -444,16 +646,34 @@ def _verify_release_internals(
 def load_release(path: Path | str) -> Release:
     release_path = Path(os.path.abspath(os.fspath(path)))
     value = require_object(load_json(release_path, label="release"), label="release")
+    aws_package = (
+        value.get("provider") == AWS_P5_PROFILE
+        and "package_format_version" in value
+    )
+    release_fields = {
+        "schema_version",
+        "release_id",
+        "provider",
+        "archive",
+        "source",
+        "members_sha256",
+    }
+    if aws_package:
+        release_fields |= {
+            "package_format_version",
+            "seed_assignment",
+            "cohort_assignment",
+            "profile",
+            "environment",
+            "dataset_pointer",
+            "cohort_assignment_sha256",
+            "profile_sha256",
+            "dataset_pointer_sha256",
+            "config_sha256",
+        }
     require_exact_keys(
         value,
-        {
-            "schema_version",
-            "release_id",
-            "provider",
-            "archive",
-            "source",
-            "members_sha256",
-        },
+        release_fields,
         label="release",
     )
     try:
@@ -464,12 +684,12 @@ def load_release(path: Path | str) -> Release:
     except MsctlError as error:
         raise MsctlError(
             "RELEASE_INVALID",
-            "release is not an Illumina v1 release",
+            "release schema version is unsupported",
         ) from error
-    if value["provider"] != SUPPORTED_PROFILE:
+    if value["provider"] not in {SUPPORTED_PROFILE, AWS_P5_PROFILE}:
         raise MsctlError(
             "RELEASE_INVALID",
-            "release is not an Illumina v1 release",
+            "release provider is unsupported",
         )
     release_id = value["release_id"]
     if (
@@ -495,15 +715,21 @@ def load_release(path: Path | str) -> Release:
     ):
         raise MsctlError("RELEASE_INVALID", "release archive bytes are invalid")
     source = require_object(value["source"], label="release.source")
-    require_exact_keys(
-        source,
-        {"commit", "dirty"},
-        label="release.source",
-    )
+    source_fields = {"commit", "dirty"}
+    if aws_package:
+        source_fields.add("tree")
+    require_exact_keys(source, source_fields, label="release.source")
     if (
         not isinstance(source["commit"], str)
         or COMMIT_RE.fullmatch(source["commit"]) is None
         or source["dirty"] is not False
+        or (
+            aws_package
+            and (
+                not isinstance(source["tree"], str)
+                or _GIT_OBJECT_RE.fullmatch(source["tree"]) is None
+            )
+        )
     ):
         raise MsctlError(
             "RELEASE_INVALID",
@@ -551,8 +777,32 @@ def load_release(path: Path | str) -> Release:
         archive_data,
         release_value=value,
     )
+    if aws_package:
+        profile_hash = require_sha256(
+            value["profile_sha256"],
+            label="release.profile_sha256",
+        )
+        if (
+            value["profile"] != metadata["profile"]
+            or value["environment"] != metadata["environment"]
+            or value["dataset_pointer"] != metadata["dataset_pointer"]
+            or value["cohort_assignment"] != metadata["cohort_assignment"]
+            or value["seed_assignment"] != metadata["seed_assignment"]
+            or value["config_sha256"] != metadata["config_sha256"]
+            or value["cohort_assignment_sha256"]
+            != metadata["cohort_assignment"]["sha256"]
+            or profile_hash != metadata["profile"]["sha256"]
+            or value["dataset_pointer_sha256"]
+            != metadata["dataset_pointer"]["sha256"]
+        ):
+            raise _release_error(
+                "RELEASE_INTERNAL_INVALID",
+                "AWS release receipt does not bind internal package metadata",
+            )
     return Release(
         release_id=release_id,
+        provider=str(value["provider"]),
+        receipt_sha256=sha256_file(path),
         archive_sha256=archive_hash,
         archive_bytes=int(archive["bytes"]),
         archive_path=archive_path,
@@ -574,53 +824,71 @@ def load_run_manifest(
         load_json(path, label="run manifest"),
         label="run manifest",
     )
-    require_exact_keys(
-        value,
-        {
-            "schema_version",
-            "provider",
-            "release_sha256",
-            "dataset_sha256",
-            "runs",
-        },
-        label="run manifest",
-    )
-    try:
-        require_schema_version(
-            value["schema_version"],
-            label="run manifest.schema_version",
+    schema_version = value.get("schema_version")
+    if (
+        isinstance(schema_version, bool)
+        or not isinstance(schema_version, int)
+        or schema_version not in {1, 2}
+    ):
+        raise MsctlError(
+            "RUN_MANIFEST_INVALID",
+            "run manifest provider or schema is unsupported",
         )
-    except MsctlError as error:
+    root_fields = {
+        "schema_version",
+        "provider",
+        "release_sha256",
+        "dataset_sha256",
+        "runs",
+    }
+    if schema_version == 2:
+        root_fields |= {
+            "seed",
+            "cohort_assignment_sha256",
+            "study_lock_sha256",
+            "source_commit",
+        }
+    require_exact_keys(value, root_fields, label="run manifest")
+    provider = value["provider"]
+    if provider not in {SUPPORTED_PROFILE, AWS_P5_PROFILE} or (
+        schema_version == 1 and provider != SUPPORTED_PROFILE
+    ):
         raise MsctlError(
             "RUN_MANIFEST_INVALID",
             "run manifest provider or schema is unsupported",
-        ) from error
-    if value["provider"] != SUPPORTED_PROFILE:
+        )
+    manifest_seed = 0 if schema_version == 1 else value["seed"]
+    owned_seeds = (
+        (0,) if provider == SUPPORTED_PROFILE else (1, 2, 3, 4)
+    )
+    if (
+        isinstance(manifest_seed, bool)
+        or not isinstance(manifest_seed, int)
+        or manifest_seed not in owned_seeds
+    ):
         raise MsctlError(
-            "RUN_MANIFEST_INVALID",
-            "run manifest provider or schema is unsupported",
+            "SEED_OWNERSHIP_VIOLATION",
+            "run manifest seed is not owned by its provider",
         )
     raw_runs = value["runs"]
     if not isinstance(raw_runs, list) or len(raw_runs) != 2:
         raise MsctlError(
             "RUN_MANIFEST_INVALID",
-            "seed-0 launch requires exactly two runs",
+            "run manifest requires exactly one paired seed",
         )
     runs: list[Run] = []
     for index, item in enumerate(raw_runs):
         row = require_object(item, label=f"run manifest.runs[{index}]")
-        require_exact_keys(
-            row,
-            {
-                "run_id",
-                "arm",
-                "seed",
-                "config",
-                "config_sha256",
-                "estimated_gpu_hours",
-            },
-            label=f"run manifest.runs[{index}]",
-        )
+        run_fields = {
+            "run_id",
+            "arm",
+            "seed",
+            "config",
+            "config_sha256",
+        }
+        if schema_version == 1:
+            run_fields.add("estimated_gpu_hours")
+        require_exact_keys(row, run_fields, label=f"run manifest.runs[{index}]")
         run_id = row["run_id"]
         if (
             not isinstance(run_id, str)
@@ -631,10 +899,14 @@ def load_run_manifest(
                 "run_id is invalid",
                 details={"index": index},
             )
-        if row["arm"] not in {"dense", "split90"} or row["seed"] != 0:
+        if (
+            row["arm"] not in {"dense", "split90"}
+            or isinstance(row["seed"], bool)
+            or row["seed"] != manifest_seed
+        ):
             raise MsctlError(
                 "RUN_MANIFEST_INVALID",
-                "seed-0 runs must be Dense and Split90 at seed zero",
+                "paired runs must use the manifest seed and explicit arms",
             )
         relative = portable_relative(
             row["config"], label=f"run manifest.runs[{index}].config"
@@ -664,14 +936,18 @@ def load_run_manifest(
             Run(
                 run_id=run_id,
                 arm=str(row["arm"]),
-                seed=0,
+                seed=manifest_seed,
                 config=relative,
                 config_sha256=expected_hash,
-                estimated_gpu_hours=require_nonnegative_number(
-                    row["estimated_gpu_hours"],
-                    label=(
-                        f"run manifest.runs[{index}].estimated_gpu_hours"
-                    ),
+                estimated_gpu_hours=(
+                    require_nonnegative_number(
+                        row["estimated_gpu_hours"],
+                        label=(
+                            f"run manifest.runs[{index}].estimated_gpu_hours"
+                        ),
+                    )
+                    if schema_version == 1
+                    else 0.0
                 ),
             )
         )
@@ -684,8 +960,22 @@ def load_run_manifest(
             "RUN_MANIFEST_INVALID",
             "run IDs, configs, and Dense/Split90 arms must be unique",
         )
+    source_commit: str | None = None
+    if schema_version == 2:
+        raw_commit = value["source_commit"]
+        if (
+            not isinstance(raw_commit, str)
+            or COMMIT_RE.fullmatch(raw_commit) is None
+        ):
+            raise MsctlError(
+                "RUN_MANIFEST_INVALID",
+                "run manifest source commit is invalid",
+            )
+        source_commit = raw_commit
     return RunManifest(
-        provider=str(value["provider"]),
+        schema_version=schema_version,
+        provider=str(provider),
+        seed=manifest_seed,
         release_sha256=require_sha256(
             value["release_sha256"],
             label="run manifest.release_sha256",
@@ -694,6 +984,23 @@ def load_run_manifest(
             value["dataset_sha256"],
             label="run manifest.dataset_sha256",
         ),
+        cohort_assignment_sha256=(
+            require_sha256(
+                value["cohort_assignment_sha256"],
+                label="run manifest.cohort_assignment_sha256",
+            )
+            if schema_version == 2
+            else None
+        ),
+        study_lock_sha256=(
+            require_sha256(
+                value["study_lock_sha256"],
+                label="run manifest.study_lock_sha256",
+            )
+            if schema_version == 2
+            else None
+        ),
+        source_commit=source_commit,
         runs=tuple(sorted(runs, key=lambda run: run.run_id)),
         sha256=canonical_sha256(value),
         value=value,
@@ -701,7 +1008,14 @@ def load_run_manifest(
 
 
 def bind_release(release: Release, manifest: RunManifest) -> None:
-    if release.archive_sha256 != manifest.release_sha256:
+    if (
+        release.archive_sha256 != manifest.release_sha256
+        or release.provider != manifest.provider
+        or (
+            manifest.schema_version == 2
+            and release.source_commit != manifest.source_commit
+        )
+    ):
         raise MsctlError(
             "RELEASE_RUN_MISMATCH",
             "run manifest does not bind the supplied release",
@@ -865,33 +1179,40 @@ def verify_checkpoint_receipt(
         load_json(receipt_path, label="checkpoint receipt"),
         label="checkpoint receipt",
     )
-    require_exact_keys(
-        value,
-        {
-            "schema_version",
-            "provider",
-            "release_sha256",
-            "run_manifest_sha256",
-            "dataset_sha256",
-            "checkpoints",
-        },
-        label="checkpoint receipt",
-    )
-    try:
-        require_schema_version(
-            value["schema_version"],
-            label="checkpoint receipt.schema_version",
+    schema_version = value.get("schema_version")
+    if (
+        isinstance(schema_version, bool)
+        or not isinstance(schema_version, int)
+        or schema_version not in {1, 2}
+        or (
+            manifest.provider == AWS_P5_PROFILE
+            and schema_version != 2
         )
-    except MsctlError as error:
+    ):
         raise MsctlError(
             "CHECKPOINT_PROVENANCE_MISMATCH",
             "checkpoint receipt schema is unsupported",
-        ) from error
+        )
+    receipt_fields = {
+        "schema_version",
+        "provider",
+        "release_sha256",
+        "run_manifest_sha256",
+        "dataset_sha256",
+        "checkpoints",
+    }
+    if schema_version == 2:
+        receipt_fields.add("source_commit")
+    require_exact_keys(value, receipt_fields, label="checkpoint receipt")
     if (
         value["provider"] != manifest.provider
         or value["release_sha256"] != release.archive_sha256
         or value["run_manifest_sha256"] != manifest.sha256
         or value["dataset_sha256"] != manifest.dataset_sha256
+        or (
+            schema_version == 2
+            and value["source_commit"] != manifest.source_commit
+        )
     ):
         raise MsctlError(
             "CHECKPOINT_PROVENANCE_MISMATCH",
@@ -908,28 +1229,45 @@ def verify_checkpoint_receipt(
     checkpoints: list[Checkpoint] = []
     for index, item in enumerate(raw):
         row = require_object(item, label=f"checkpoint[{index}]")
-        require_exact_keys(
-            row,
-            {
-                "run_id",
-                "path",
-                "sha256",
-                "config_sha256",
-                "step",
-                "world_size",
-            },
-            label=f"checkpoint[{index}]",
-        )
+        row_fields = {
+            "run_id",
+            "path",
+            "sha256",
+            "config_sha256",
+            "step",
+            "world_size",
+        }
+        if schema_version == 2:
+            row_fields |= {
+                "arm",
+                "seed",
+                "dataset_sha256",
+                "source_commit",
+            }
+        require_exact_keys(row, row_fields, label=f"checkpoint[{index}]")
         run_id = row["run_id"]
+        expected_world_size = (
+            4 if manifest.provider == AWS_P5_PROFILE else 3
+        )
         if (
             not isinstance(run_id, str)
             or run_id not in by_id
             or run_id in seen
             or row["config_sha256"] != by_id[run_id].config_sha256
-            or row["world_size"] != 3
+            or isinstance(row["world_size"], bool)
+            or row["world_size"] != expected_world_size
             or isinstance(row["step"], bool)
             or not isinstance(row["step"], int)
             or row["step"] <= 0
+            or (
+                schema_version == 2
+                and (
+                    row["arm"] != by_id[run_id].arm
+                    or row["seed"] != by_id[run_id].seed
+                    or row["dataset_sha256"] != manifest.dataset_sha256
+                    or row["source_commit"] != manifest.source_commit
+                )
+            )
         ):
             raise MsctlError(
                 "CHECKPOINT_PROVENANCE_MISMATCH",
@@ -962,9 +1300,16 @@ def verify_checkpoint_receipt(
             Checkpoint(
                 run_id=run_id,
                 arm=by_id[run_id].arm,
+                seed=by_id[run_id].seed,
                 path=checkpoint,
                 sha256=expected_hash,
                 config_sha256=str(row["config_sha256"]),
+                dataset_sha256=manifest.dataset_sha256,
+                source_commit=(
+                    str(row["source_commit"])
+                    if schema_version == 2
+                    else manifest.source_commit
+                ),
                 step=int(row["step"]),
                 world_size=int(row["world_size"]),
             )
@@ -974,7 +1319,13 @@ def verify_checkpoint_receipt(
             "CHECKPOINT_PROVENANCE_MISMATCH",
             "checkpoint receipt is missing a paired run",
         )
+    if len({checkpoint.step for checkpoint in checkpoints}) != 1:
+        raise MsctlError(
+            "CHECKPOINT_PROVENANCE_MISMATCH",
+            "paired checkpoints must record the same optimizer step",
+        )
     return CheckpointReceipt(
+        schema_version=schema_version,
         sha256=canonical_sha256(value),
         checkpoints=tuple(
             sorted(checkpoints, key=lambda item: item.run_id)

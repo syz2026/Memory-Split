@@ -47,6 +47,43 @@ RUN_STATE_KEYS = {
     "created_at",
     "updated_at",
 }
+AWS_RUN_STATE_KEYS = {
+    "schema_version",
+    "run_id",
+    "arm",
+    "seed",
+    "provider",
+    "release_sha256",
+    "run_manifest_sha256",
+    "config_sha256",
+    "dataset_sha256",
+    "dataset_pointer_sha256",
+    "dataset_verification_sha256",
+    "environment_receipt_sha256",
+    "cohort_assignment_sha256",
+    "study_lock_sha256",
+    "source_commit",
+    "profile_sha256",
+    "runtime_sha256",
+    "ami_id",
+    "container_digest",
+    "instance_id",
+    "terminate_at",
+    "operation_id",
+    "intent_sha256",
+    "intent_uri",
+    "command_id",
+    "operation",
+    "status",
+    "attempt",
+    "send_attempted",
+    "created_at",
+    "updated_at",
+}
+AWS_RESUME_STATE_KEYS = AWS_RUN_STATE_KEYS | {
+    "checkpoint_receipt_sha256",
+    "prior_command_ids",
+}
 RESUME_STATE_KEYS = RUN_STATE_KEYS | {
     "checkpoint_receipt_sha256",
     "prior_job_ids",
@@ -66,6 +103,39 @@ EVALUATION_STATE_KEYS = {
     "status",
     "created_at",
     "updated_at",
+}
+AWS_EVALUATION_STATE_KEYS = {
+    "schema_version",
+    "provider",
+    "seed",
+    "release_sha256",
+    "run_manifest_sha256",
+    "dataset_sha256",
+    "dataset_pointer_sha256",
+    "dataset_verification_sha256",
+    "environment_receipt_sha256",
+    "profile_sha256",
+    "runtime_sha256",
+    "ami_id",
+    "container_digest",
+    "instance_id",
+    "terminate_at",
+    "operation_id",
+    "intent_sha256",
+    "intent_uri",
+    "command_id",
+    "operation",
+    "status",
+    "send_attempted",
+    "created_at",
+    "updated_at",
+}
+AWS_PAIR_INTENT_KEYS = {
+    "schema_version",
+    "provider",
+    "run_manifest_sha256",
+    "operation_id",
+    "states",
 }
 INTENT_KEYS = {
     "schema_version",
@@ -97,6 +167,26 @@ RESOURCE_KEYS = {
     "script",
 }
 STATUS_RE = re.compile(r"^[A-Z][A-Z0-9_]*$")
+_AWS_PROVIDER = "aws-p5.48xlarge"
+_AWS_INSTANCE_RE = re.compile(r"^i-[0-9a-f]{8,17}$")
+_AWS_COMMAND_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9-]{7,127}$")
+_AWS_AMI_RE = re.compile(r"^ami-[0-9a-f]{8,17}$")
+_AWS_DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
+_COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
+_AWS_STATUSES = {
+    "INTENT_PUBLISHED",
+    "SENDING",
+    "Pending",
+    "InProgress",
+    "Delayed",
+    "Success",
+    "Failed",
+    "Cancelled",
+    "TimedOut",
+    "Cancelling",
+    "Terminating",
+    "Submitting",
+}
 
 
 def _require_string(value: object, *, label: str) -> str:
@@ -180,6 +270,9 @@ def _validate_common(value: dict[str, object], *, operation: str) -> None:
 
 
 def _validate_run_state(value: dict[str, object], run_id: str) -> None:
+    if value.get("provider") == _AWS_PROVIDER:
+        _validate_aws_run_state(value, run_id)
+        return
     operation = value.get("operation")
     keys = RESUME_STATE_KEYS if operation == "resume" else RUN_STATE_KEYS
     require_exact_keys(value, keys, label="run state")
@@ -213,10 +306,159 @@ def _validate_run_state(value: dict[str, object], run_id: str) -> None:
             )
 
 
+def _validate_aws_run_state(value: dict[str, object], run_id: str) -> None:
+    operation = value.get("operation")
+    keys = AWS_RESUME_STATE_KEYS if operation == "resume" else AWS_RUN_STATE_KEYS
+    require_exact_keys(value, keys, label="AWS run state")
+    require_schema_version(
+        value["schema_version"],
+        label="AWS run state.schema_version",
+    )
+    if (
+        operation not in {"submit", "resume"}
+        or value["run_id"] != run_id
+        or RUN_ID_RE.fullmatch(run_id) is None
+        or value["arm"] not in {"dense", "split90"}
+        or isinstance(value["seed"], bool)
+        or value["seed"] not in {1, 2, 3, 4}
+    ):
+        raise MsctlError("STATE_CORRUPT", "AWS run identity is invalid")
+    for field in (
+        "release_sha256",
+        "run_manifest_sha256",
+        "config_sha256",
+        "dataset_sha256",
+        "dataset_pointer_sha256",
+        "dataset_verification_sha256",
+        "environment_receipt_sha256",
+        "cohort_assignment_sha256",
+        "study_lock_sha256",
+        "profile_sha256",
+        "runtime_sha256",
+        "operation_id",
+        "intent_sha256",
+    ):
+        require_sha256(value[field], label=f"AWS run state {field}")
+    if (
+        not isinstance(value["source_commit"], str)
+        or _COMMIT_RE.fullmatch(value["source_commit"]) is None
+        or not isinstance(value["ami_id"], str)
+        or _AWS_AMI_RE.fullmatch(value["ami_id"]) is None
+        or not isinstance(value["container_digest"], str)
+        or _AWS_DIGEST_RE.fullmatch(value["container_digest"]) is None
+        or not isinstance(value["instance_id"], str)
+        or _AWS_INSTANCE_RE.fullmatch(value["instance_id"]) is None
+        or not isinstance(value["terminate_at"], str)
+        or not value["terminate_at"].endswith("Z")
+        or not isinstance(value["intent_uri"], str)
+        or not value["intent_uri"].startswith("s3://")
+    ):
+        raise MsctlError("STATE_CORRUPT", "AWS execution binding is invalid")
+    command_id = value["command_id"]
+    if command_id is not None and (
+        not isinstance(command_id, str)
+        or _AWS_COMMAND_RE.fullmatch(command_id) is None
+    ):
+        raise MsctlError("STATE_CORRUPT", "AWS command ID is invalid")
+    if value["status"] not in _AWS_STATUSES:
+        raise MsctlError("STATE_CORRUPT", "AWS run status is invalid")
+    attempt = require_nonnegative_int(
+        value["attempt"],
+        label="AWS run attempt",
+    )
+    if attempt < 1 or not isinstance(value["send_attempted"], bool):
+        raise MsctlError("STATE_CORRUPT", "AWS send attempt is invalid")
+    for field in ("created_at", "updated_at"):
+        _require_string(value[field], label=f"AWS run state {field}")
+    if operation == "resume":
+        require_sha256(
+            value["checkpoint_receipt_sha256"],
+            label="AWS checkpoint receipt SHA-256",
+        )
+        prior = value["prior_command_ids"]
+        if (
+            not isinstance(prior, list)
+            or not prior
+            or any(
+                not isinstance(item, str)
+                or _AWS_COMMAND_RE.fullmatch(item) is None
+                for item in prior
+            )
+            or len(prior) != len(set(prior))
+        ):
+            raise MsctlError(
+                "STATE_CORRUPT",
+                "AWS prior command IDs are invalid",
+            )
+
+
 def _validate_evaluation_state(
     value: dict[str, object],
     manifest_sha256: str,
 ) -> None:
+    if value.get("provider") == _AWS_PROVIDER:
+        require_exact_keys(
+            value,
+            AWS_EVALUATION_STATE_KEYS,
+            label="AWS evaluation state",
+        )
+        require_schema_version(
+            value["schema_version"],
+            label="AWS evaluation state.schema_version",
+        )
+        for field in (
+            "release_sha256",
+            "run_manifest_sha256",
+            "dataset_sha256",
+            "dataset_pointer_sha256",
+            "dataset_verification_sha256",
+            "environment_receipt_sha256",
+            "profile_sha256",
+            "runtime_sha256",
+            "operation_id",
+            "intent_sha256",
+        ):
+            require_sha256(
+                value[field],
+                label=f"AWS evaluation state {field}",
+            )
+        if (
+            value["run_manifest_sha256"] != manifest_sha256
+            or isinstance(value["seed"], bool)
+            or value["seed"] not in {1, 2, 3, 4}
+            or not isinstance(value["ami_id"], str)
+            or _AWS_AMI_RE.fullmatch(value["ami_id"]) is None
+            or not isinstance(value["container_digest"], str)
+            or _AWS_DIGEST_RE.fullmatch(value["container_digest"]) is None
+            or not isinstance(value["instance_id"], str)
+            or _AWS_INSTANCE_RE.fullmatch(value["instance_id"]) is None
+            or not isinstance(value["terminate_at"], str)
+            or not value["terminate_at"].endswith("Z")
+            or not isinstance(value["intent_uri"], str)
+            or not value["intent_uri"].startswith("s3://")
+            or value["operation"] != "evaluate"
+            or not isinstance(value["send_attempted"], bool)
+            or value["status"] not in _AWS_STATUSES
+        ):
+            raise MsctlError(
+                "STATE_CORRUPT",
+                "AWS evaluation identity is invalid",
+            )
+        command_id = value["command_id"]
+        if command_id is not None and (
+            not isinstance(command_id, str)
+            or _AWS_COMMAND_RE.fullmatch(command_id) is None
+        ):
+            raise MsctlError(
+                "STATE_CORRUPT",
+                "AWS evaluation command ID is invalid",
+            )
+        for field in ("created_at", "updated_at"):
+            _require_string(
+                value[field],
+                label=f"AWS evaluation state {field}",
+            )
+        return
     require_exact_keys(value, EVALUATION_STATE_KEYS, label="evaluation state")
     _validate_common(value, operation="evaluate")
     if value["run_manifest_sha256"] != manifest_sha256:
@@ -570,4 +812,87 @@ class StateStore:
             self._intent_name(submission_key),
             value,
             label="pair intent",
+        )
+
+    def _aws_pair_name(self, manifest_sha256: str) -> str:
+        try:
+            require_sha256(manifest_sha256, label="AWS pair manifest")
+        except MsctlError as error:
+            raise MsctlError(
+                "UNSAFE_STATE",
+                "invalid AWS pair manifest identity",
+            ) from error
+        return f"aws-{manifest_sha256}.json"
+
+    def _validate_aws_pair(
+        self,
+        value: dict[str, object],
+        manifest_sha256: str,
+    ) -> None:
+        require_exact_keys(value, AWS_PAIR_INTENT_KEYS, label="AWS pair intent")
+        require_schema_version(
+            value["schema_version"],
+            label="AWS pair intent.schema_version",
+        )
+        if (
+            value["provider"] != _AWS_PROVIDER
+            or value["run_manifest_sha256"] != manifest_sha256
+        ):
+            raise MsctlError("STATE_CORRUPT", "AWS pair intent identity is invalid")
+        require_sha256(value["operation_id"], label="AWS pair operation")
+        states = value["states"]
+        if not isinstance(states, list) or len(states) != 2:
+            raise MsctlError("STATE_CORRUPT", "AWS pair intent is incomplete")
+        run_ids: set[str] = set()
+        for raw in states:
+            state = require_object(raw, label="AWS pair state")
+            run_id = state.get("run_id")
+            if not isinstance(run_id, str):
+                raise MsctlError("STATE_CORRUPT", "AWS pair run ID is invalid")
+            _validate_aws_run_state(state, run_id)
+            if (
+                state["run_manifest_sha256"] != manifest_sha256
+                or state["operation_id"] != value["operation_id"]
+                or run_id in run_ids
+            ):
+                raise MsctlError(
+                    "STATE_CORRUPT",
+                    "AWS pair state does not match its durable intent",
+                )
+            run_ids.add(run_id)
+
+    def read_aws_pair(
+        self,
+        manifest_sha256: str,
+    ) -> dict[str, object] | None:
+        _, _, _, intents_fd = self._require_locked()
+        try:
+            raw = load_json_at(
+                intents_fd,
+                self._aws_pair_name(manifest_sha256),
+                label="AWS pair intent",
+            )
+        except MsctlError as error:
+            if error.code == "FILE_NOT_FOUND":
+                return None
+            raise MsctlError(
+                "STATE_CORRUPT",
+                "AWS pair intent is unreadable",
+            ) from error
+        value = require_object(raw, label="AWS pair intent")
+        self._validate_aws_pair(value, manifest_sha256)
+        return value
+
+    def write_aws_pair(
+        self,
+        manifest_sha256: str,
+        value: dict[str, object],
+    ) -> None:
+        _, _, _, intents_fd = self._require_locked()
+        self._validate_aws_pair(value, manifest_sha256)
+        atomic_write_json_at(
+            intents_fd,
+            self._aws_pair_name(manifest_sha256),
+            value,
+            label="AWS pair intent",
         )

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import importlib
 import json
 import os
 from dataclasses import dataclass
@@ -12,6 +13,7 @@ from .errors import MsctlError
 from .fsutil import open_directory, open_regular_at, read_fd
 from .jsonutil import (
     canonical_sha256,
+    load_json,
     require_exact_keys,
     require_object,
     require_positive_int,
@@ -20,6 +22,13 @@ from .jsonutil import (
 
 
 SUPPORTED_PROFILE = "illumina-usfc-prd"
+AWS_P5_PROFILE = "aws-p5.48xlarge"
+_LEGACY_RESUME_ENV = (
+    "MS_DENSE_RESUME_PATH",
+    "MS_DENSE_RESUME_SHA256",
+    "MS_SPLIT_RESUME_PATH",
+    "MS_SPLIT_RESUME_SHA256",
+)
 
 
 @dataclass(frozen=True)
@@ -64,7 +73,7 @@ def _optional_slug(value: object, *, label: str) -> str | None:
     return value
 
 
-def load_profile(path: Path | str) -> IlluminaProfile:
+def _load_illumina_profile(path: Path | str) -> IlluminaProfile:
     candidate = Path(path)
     directory_fd = open_directory(
         candidate.parent,
@@ -110,21 +119,25 @@ def load_profile(path: Path | str) -> IlluminaProfile:
             "profile must contain valid UTF-8 JSON",
         ) from error
     value = require_object(decoded, label="profile")
+    legacy_profile = "environment" not in value
+    root_fields = {
+        "schema_version",
+        "profile_id",
+        "provider",
+        "cluster",
+        "login",
+        "cpu",
+        "gpu",
+        "storage",
+        "slurm",
+        "job_env_allowlist",
+        "environment",
+    }
+    if legacy_profile:
+        root_fields.remove("environment")
     require_exact_keys(
         value,
-        {
-            "schema_version",
-            "profile_id",
-            "provider",
-            "cluster",
-            "login",
-            "cpu",
-            "gpu",
-            "storage",
-            "slurm",
-            "job_env_allowlist",
-            "environment",
-        },
+        root_fields,
         label="profile",
     )
     try:
@@ -246,7 +259,19 @@ def load_profile(path: Path | str) -> IlluminaProfile:
     )
 
     environment = require_object(
-        value["environment"],
+        value.get(
+            "environment",
+            {
+                "status": "operator_input_required",
+                "lock_path": "requirements-illumina.lock",
+                "contract": {
+                    "python_implementation": "CPython",
+                    "python_version": None,
+                    "platform": "linux_x86_64",
+                    "cuda_version": None,
+                },
+            },
+        ),
         label="profile.environment",
     )
     require_exact_keys(
@@ -305,7 +330,12 @@ def load_profile(path: Path | str) -> IlluminaProfile:
             "environment contract must explicitly identify missing site pins",
         )
 
-    allowlist = value["job_env_allowlist"]
+    raw_allowlist = value["job_env_allowlist"]
+    allowlist = (
+        [*raw_allowlist, *_LEGACY_RESUME_ENV]
+        if legacy_profile and isinstance(raw_allowlist, list)
+        else raw_allowlist
+    )
     if (
         not isinstance(allowlist, list)
         or not allowlist
@@ -357,4 +387,70 @@ def load_profile(path: Path | str) -> IlluminaProfile:
         environment_status=str(environment["status"]),
         sha256=canonical_sha256(value),
         source_sha256=hashlib.sha256(data).hexdigest(),
+    )
+
+
+def _profile_provider(path: Path | str) -> str:
+    value = require_object(load_json(path, label="profile"), label="profile")
+    provider = value.get("provider")
+    profile_id = value.get("profile_id")
+    if (
+        not isinstance(provider, str)
+        or not isinstance(profile_id, str)
+        or provider != profile_id
+    ):
+        raise MsctlError(
+            "PROFILE_INVALID",
+            "profile_id and provider must be the same explicit string",
+        )
+    return provider
+
+
+def _load_aws_p5_profile(path: Path | str) -> object:
+    module_name = "cluster.aws.p5.profile"
+    try:
+        module = importlib.import_module(module_name)
+    except (ImportError, ModuleNotFoundError) as error:
+        raise MsctlError(
+            "PROVIDER_ADAPTER_UNAVAILABLE",
+            "the AWS P5 profile adapter is not installed",
+            details={"adapter": module_name},
+        ) from error
+    loader = getattr(module, "load_aws_p5_profile", None)
+    if not callable(loader):
+        raise MsctlError(
+            "PROVIDER_ADAPTER_UNAVAILABLE",
+            "the AWS P5 profile adapter has no supported loader",
+            details={"adapter": module_name},
+        )
+    try:
+        profile = loader(path)
+    except MsctlError:
+        raise
+    except (OSError, TypeError, ValueError) as error:
+        raise MsctlError(
+            "PROFILE_INVALID",
+            "AWS P5 profile validation failed",
+        ) from error
+    if (
+        getattr(profile, "provider", None) != AWS_P5_PROFILE
+        or getattr(profile, "profile_id", None) != AWS_P5_PROFILE
+    ):
+        raise MsctlError(
+            "PROFILE_INVALID",
+            "AWS P5 adapter returned the wrong provider",
+        )
+    return profile
+
+
+def load_profile(path: Path | str) -> IlluminaProfile | object:
+    provider = _profile_provider(path)
+    if provider == SUPPORTED_PROFILE:
+        return _load_illumina_profile(path)
+    if provider == AWS_P5_PROFILE:
+        return _load_aws_p5_profile(path)
+    raise MsctlError(
+        "PROVIDER_UNSUPPORTED",
+        "profile provider is not supported",
+        details={"provider": provider},
     )

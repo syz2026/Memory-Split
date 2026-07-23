@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import ast
 import os
+import secrets
+import stat
+from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -21,7 +24,15 @@ from .contracts import (
 from .dataset import load_dataset_verification, verify_dataset
 from .environment import verify_environment_receipt
 from .errors import MsctlError
-from .profile import IlluminaProfile
+from .fsutil import open_directory, rename_noreplace_at
+from .jsonutil import (
+    canonical_json,
+    canonical_sha256,
+    load_json,
+    require_object,
+    sha256_file,
+)
+from .profile import AWS_P5_PROFILE, SUPPORTED_PROFILE, IlluminaProfile
 from .slurm import (
     ACTIVE_STATES,
     BOOTSTRAP_SHA256,
@@ -48,6 +59,322 @@ def _timestamp() -> str:
     return datetime.now(UTC).isoformat().replace("+00:00", "Z")
 
 
+def _load_cohort_adapter(path: Path | str):
+    try:
+        from .cohort import load_cohort_assignment
+    except (ImportError, ModuleNotFoundError) as error:
+        raise MsctlError(
+            "COHORT_ADAPTER_UNAVAILABLE",
+            "the strict cohort assignment adapter is not installed",
+            details={"adapter": "msctl.cohort"},
+        ) from error
+    return load_cohort_assignment(path)
+
+
+def _load_task4_dataset_verifier(
+    receipt_path: Path | str,
+    *,
+    expected_sha256: str,
+    expected_ordered_sha256: str,
+):
+    try:
+        from cluster.aws.p5.corpus_contract import verify_canonical_corpus
+    except (ImportError, ModuleNotFoundError) as error:
+        raise MsctlError(
+            "DATASET_ADAPTER_UNAVAILABLE",
+            "the canonical Task 4 dataset verifier is not installed",
+            details={"adapter": "cluster.aws.p5.corpus_contract"},
+        ) from error
+    return verify_canonical_corpus(
+        Path(receipt_path),
+        expected_sha256=expected_sha256,
+        expected_ordered_sha256=expected_ordered_sha256,
+    )
+
+
+def _dataset_file_identities(evidence: object) -> list[dict[str, object]]:
+    files = getattr(evidence, "files", None)
+    if not isinstance(files, tuple) or not files:
+        raise MsctlError(
+            "DATASET_RECEIPT_INVALID",
+            "dataset verifier returned no pinned files",
+        )
+    receipt = Path(files[0].path)
+    root = receipt.parent.resolve(strict=True)
+    identities: list[dict[str, object]] = []
+    for pinned in files:
+        path = Path(getattr(pinned, "path", ""))
+        expected = getattr(pinned, "sha256", None)
+        try:
+            relative = path.resolve(strict=True).relative_to(root).as_posix()
+            before = path.stat(follow_symlinks=False)
+            digest = sha256_file(path)
+            after = path.stat(follow_symlinks=False)
+        except (OSError, ValueError) as error:
+            raise MsctlError(
+                "DATASET_RECEIPT_INVALID",
+                "verified dataset file is missing or outside its publication",
+            ) from error
+        identity = (before.st_dev, before.st_ino, before.st_size)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or before.st_nlink != 1
+            or identity != (after.st_dev, after.st_ino, after.st_size)
+            or digest != expected
+        ):
+            raise MsctlError(
+                "DATASET_RECEIPT_INVALID",
+                "verified dataset file identity or content changed",
+                details={"path": relative},
+            )
+        identities.append(
+            {
+                "path": relative,
+                "sha256": digest,
+                "bytes": before.st_size,
+                "device": before.st_dev,
+                "inode": before.st_ino,
+            }
+        )
+    return identities
+
+
+def _publish_manifest_no_replace(path: Path | str, value: object) -> None:
+    destination = Path(path)
+    directory_fd = open_directory(
+        destination.parent,
+        label="run manifest output",
+        create=True,
+    )
+    temporary = f".{destination.name}.{secrets.token_hex(12)}.tmp"
+    descriptor: int | None = None
+    try:
+        flags = (
+            os.O_WRONLY
+            | os.O_CREAT
+            | os.O_EXCL
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_CLOEXEC", 0)
+        )
+        descriptor = os.open(temporary, flags, 0o600, dir_fd=directory_fd)
+        data = canonical_json(value) + b"\n"
+        view = memoryview(data)
+        while view:
+            written = os.write(descriptor, view)
+            view = view[written:]
+        os.fsync(descriptor)
+        os.close(descriptor)
+        descriptor = None
+        try:
+            rename_noreplace_at(
+                directory_fd,
+                temporary,
+                directory_fd,
+                destination.name,
+            )
+        except FileExistsError as error:
+            raise MsctlError(
+                "RUN_MANIFEST_EXISTS",
+                "refusing to replace an existing run manifest",
+                details={"path": str(destination)},
+            ) from error
+        os.fsync(directory_fd)
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+        try:
+            os.unlink(temporary, dir_fd=directory_fd)
+        except FileNotFoundError:
+            pass
+        os.close(directory_fd)
+
+
+def instantiate_run_manifest(
+    *,
+    profile: object,
+    release_path: Path | str,
+    dataset_receipt: Path | str,
+    seed: int,
+    out: Path | str,
+    repo_root: Path | str,
+    apply: bool,
+    cohort_loader: Callable[[Path | str], object] | None = None,
+    dataset_verifier: Callable[..., object] | None = None,
+) -> dict[str, object]:
+    provider = getattr(profile, "provider", None)
+    owned_seeds = {
+        SUPPORTED_PROFILE: (0,),
+        AWS_P5_PROFILE: (1, 2, 3, 4),
+    }.get(provider)
+    if (
+        owned_seeds is None
+        or isinstance(seed, bool)
+        or not isinstance(seed, int)
+        or seed not in owned_seeds
+    ):
+        raise MsctlError(
+            "SEED_OWNERSHIP_VIOLATION",
+            "seed is not owned by the selected provider",
+            details={"provider": provider, "seed": seed},
+        )
+    release = load_release(release_path)
+    if release.provider != provider:
+        raise MsctlError(
+            "RELEASE_PROVIDER_MISMATCH",
+            "release and profile providers differ",
+        )
+    profile_sha256 = getattr(
+        profile,
+        "source_sha256" if provider == SUPPORTED_PROFILE else "sha256",
+        None,
+    )
+    if (
+        not isinstance(profile_sha256, str)
+        or release.metadata.get("profile_sha256") != profile_sha256
+    ):
+        raise MsctlError(
+            "PROFILE_RELEASE_MISMATCH",
+            "selected provider profile differs from the verified release",
+        )
+
+    root = Path(repo_root)
+    assignment_path = root / "configs" / "cohort-assignment-v2.json"
+    study_lock_path = root / "configs" / "preregistration-v2.yaml"
+    loader = cohort_loader or _load_cohort_adapter
+    cohort = loader(assignment_path)
+    assignment_sha256 = getattr(cohort, "assignment_sha256", None)
+    if not isinstance(assignment_sha256, str):
+        raise MsctlError(
+            "COHORT_INVALID",
+            "cohort adapter did not return an assignment hash",
+        )
+    verified_assignment_sha256 = verify_release_member(
+        release,
+        member_path="configs/cohort-assignment-v2.json",
+        local_path=assignment_path,
+        label="cohort assignment",
+    )
+    study_lock_sha256 = verify_release_member(
+        release,
+        member_path="configs/preregistration-v2.yaml",
+        local_path=study_lock_path,
+        label="study lock",
+    )
+    if (
+        assignment_sha256 != verified_assignment_sha256
+        or getattr(cohort, "preregistration_sha256", None)
+        != study_lock_sha256
+    ):
+        raise MsctlError(
+            "RELEASE_COHORT_MISMATCH",
+            "cohort adapter hashes differ from verified release members",
+        )
+    assignment = release.metadata.get("seed_assignment")
+    if not isinstance(assignment, dict) or (
+        assignment.get("cohort_id") != getattr(cohort, "cohort_id", None)
+        or assignment.get("provider") != provider
+        or seed not in assignment.get("seeds", [])
+        or assignment.get("arms") != ["dense", "split90"]
+    ):
+        raise MsctlError(
+            "RELEASE_COHORT_MISMATCH",
+            "release does not bind the requested cohort seed pair",
+        )
+
+    provider_configs = cohort.configs_for_provider(provider)
+    selected = tuple(config for config in provider_configs if config.seed == seed)
+    if (
+        len(selected) != 2
+        or {config.condition for config in selected} != {"dense", "split90"}
+    ):
+        raise MsctlError(
+            "RUN_MANIFEST_INVALID",
+            "requested seed must resolve to one Dense/Split90 pair",
+        )
+    run_rows = []
+    for config in sorted(selected, key=lambda item: item.condition):
+        digest = verify_release_member(
+            release,
+            member_path=config.path,
+            local_path=root / config.path,
+            label="run config",
+        )
+        if digest != config.sha256:
+            raise MsctlError(
+                "RELEASE_COHORT_MISMATCH",
+                "release config differs from the cohort assignment",
+                details={"config": config.path},
+            )
+        run_rows.append(
+            {
+                "run_id": config.run_id,
+                "arm": config.condition,
+                "seed": seed,
+                "config": config.path,
+                "config_sha256": digest,
+            }
+        )
+
+    receipt_value = require_object(
+        load_json(dataset_receipt, label="dataset receipt"),
+        label="dataset receipt",
+    )
+    dataset_sha256 = sha256_file(dataset_receipt)
+    dataset_verification = None
+    if provider == AWS_P5_PROFILE:
+        ordered_sha256 = receipt_value.get("ordered_stream_sha256")
+        verifier = dataset_verifier or _load_task4_dataset_verifier
+        try:
+            evidence = verifier(
+                Path(dataset_receipt),
+                expected_sha256=dataset_sha256,
+                expected_ordered_sha256=ordered_sha256,
+            )
+            identities = _dataset_file_identities(evidence)
+        except MsctlError:
+            raise
+        except Exception as error:
+            raise MsctlError(
+                "DATASET_RECEIPT_INVALID",
+                "dataset receipt is not a verified canonical Task 4 publication",
+            ) from error
+        dataset_verification = {
+            "receipt_sha256": dataset_sha256,
+            "ordered_stream_sha256": ordered_sha256,
+            "file_identities": identities,
+        }
+    else:
+        receipt_schema = receipt_value.get("schema_version")
+        if isinstance(receipt_schema, bool) or not isinstance(receipt_schema, int):
+            raise MsctlError(
+                "DATASET_RECEIPT_INVALID",
+                "dataset receipt schema version must be an integer",
+            )
+    manifest = {
+        "schema_version": 2,
+        "provider": provider,
+        "seed": seed,
+        "release_sha256": release.archive_sha256,
+        "dataset_sha256": dataset_sha256,
+        "cohort_assignment_sha256": assignment_sha256,
+        "study_lock_sha256": study_lock_sha256,
+        "source_commit": release.source_commit,
+        "runs": run_rows,
+    }
+    result = {
+        "manifest": manifest,
+        "manifest_sha256": canonical_sha256(manifest),
+        "out": str(Path(out)),
+        "published": False,
+    }
+    if dataset_verification is not None:
+        result["dataset_verification"] = dataset_verification
+    if apply:
+        _publish_manifest_no_replace(out, manifest)
+        result["published"] = True
+    return result
+
+
 def load_bound_inputs(
     *,
     profile: IlluminaProfile,
@@ -59,6 +386,11 @@ def load_bound_inputs(
     release_root = verify_release_extraction(release, repo_root)
     manifest = load_run_manifest(manifest_path, repo_root=release_root)
     bind_release(release, manifest)
+    if manifest.provider != profile.provider or manifest.seed != 0:
+        raise MsctlError(
+            "SEED_OWNERSHIP_VIOLATION",
+            "Illumina lifecycle accepts only its owned seed 0 pair",
+        )
     if release.metadata.get("profile_sha256") != profile.source_sha256:
         raise MsctlError(
             "PROFILE_RELEASE_MISMATCH",

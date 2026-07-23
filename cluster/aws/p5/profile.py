@@ -104,6 +104,7 @@ class AwsP5Runtime:
     region: str
     s3_root: str
     ami_id: str
+    container_image: str
     container_digest: str
     uid: int
     gid: int
@@ -431,6 +432,22 @@ def validate_runtime_environment(
         raise ValueError(
             "MS_CONTAINER_DIGEST must be sha256 followed by 64 lowercase hex"
         )
+    container_image = _required_environment(
+        environment, "MS_CONTAINER_IMAGE"
+    )
+    image_name, separator, image_digest = container_image.partition("@")
+    if (
+        separator != "@"
+        or image_digest != container_digest
+        or container_image.count("@") != 1
+        or "/" not in image_name
+        or "." not in image_name.partition("/")[0]
+        or any(character.isspace() for character in container_image)
+    ):
+        raise ValueError(
+            "MS_CONTAINER_IMAGE must be an exact registry reference pinned "
+            "to MS_CONTAINER_DIGEST"
+        )
     uid = _nonroot_id(
         _required_environment(environment, profile.runtime_uid_env),
         label="MS_RUNTIME_UID",
@@ -443,6 +460,7 @@ def validate_runtime_environment(
         region=region,
         s3_root=s3_root,
         ami_id=ami_id,
+        container_image=container_image,
         container_digest=container_digest,
         uid=uid,
         gid=gid,

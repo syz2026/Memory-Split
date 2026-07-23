@@ -8,7 +8,7 @@ import stat
 from pathlib import Path
 
 from .approval import verify_scope_approval
-from .contracts import load_release
+from .contracts import bind_release, load_release, load_run_manifest
 from .errors import MsctlError
 from .fsutil import (
     hash_fd,
@@ -153,6 +153,8 @@ def apply_cleanup(
     profile: IlluminaProfile,
     plan_path: Path | str,
     release_path: Path | str,
+    manifest_path: Path | str,
+    repo_root: Path | str,
     approval_path: Path | str | None,
     apply: bool,
     environ: dict[str, str] | None = None,
@@ -164,7 +166,23 @@ def apply_cleanup(
         )
     plan = _load_plan(plan_path)
     release = load_release(release_path)
-    scope_hash = canonical_sha256(plan)
+    manifest = load_run_manifest(manifest_path, repo_root=repo_root)
+    bind_release(release, manifest)
+    if (
+        manifest.provider != profile.provider
+        or manifest.seed != 0
+        or len(manifest.runs) != 2
+    ):
+        raise MsctlError(
+            "CLEANUP_MANIFEST_INVALID",
+            "Illumina cleanup requires the exact provider-owned seed-0 manifest",
+        )
+    scope_hash = canonical_sha256(
+        {
+            "plan_sha256": canonical_sha256(plan),
+            "run_manifest_sha256": manifest.sha256,
+        }
+    )
     files = plan["files"]
     assert isinstance(files, list)
     verify_scope_approval(
@@ -321,6 +339,7 @@ def apply_cleanup(
         os.close(root_fd)
     return {
         "plan_sha256": scope_hash,
+        "run_manifest_sha256": manifest.sha256,
         "deleted_files": len(checked),
         "deleted_bytes": sum(int(row["bytes"]) for row in files),
     }

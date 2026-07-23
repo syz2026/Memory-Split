@@ -149,6 +149,10 @@ def test_runtime_environment_requires_immutable_aws_identity():
             "MS_S3_ROOT": "s3://memorysplit-prod/cohort-v2",
             "MS_AWS_AMI_ID": "ami-0123456789abcdef0",
             "MS_CONTAINER_DIGEST": "sha256:" + "a" * 64,
+            "MS_CONTAINER_IMAGE": (
+                "123456789012.dkr.ecr.us-east-1.amazonaws.com/memorysplit"
+                "@sha256:" + "a" * 64
+            ),
             "MS_RUNTIME_UID": "1000",
             "MS_RUNTIME_GID": "1000",
         },
@@ -158,6 +162,9 @@ def test_runtime_environment_requires_immutable_aws_identity():
     assert runtime.s3_root == "s3://memorysplit-prod/cohort-v2"
     assert runtime.ami_id == "ami-0123456789abcdef0"
     assert runtime.container_digest == "sha256:" + "a" * 64
+    assert runtime.container_image.endswith(
+        "@sha256:" + "a" * 64
+    )
     assert runtime.uid == 1000
     assert runtime.gid == 1000
 
@@ -172,6 +179,11 @@ def test_runtime_environment_requires_immutable_aws_identity():
         ("MS_AWS_AMI_ID", "ami-latest"),
         ("MS_CONTAINER_DIGEST", "memorysplit:latest"),
         ("MS_CONTAINER_DIGEST", "sha256:" + "A" * 64),
+        ("MS_CONTAINER_IMAGE", "memorysplit@sha256:" + "a" * 64),
+        (
+            "MS_CONTAINER_IMAGE",
+            "registry.example/memorysplit@sha256:" + "b" * 64,
+        ),
         ("MS_RUNTIME_UID", "0"),
         ("MS_RUNTIME_UID", "-1"),
         ("MS_RUNTIME_UID", "01000"),
@@ -185,6 +197,10 @@ def test_runtime_environment_rejects_mutable_or_unsafe_values(name, value):
         "MS_S3_ROOT": "s3://memorysplit-prod/cohort-v2",
         "MS_AWS_AMI_ID": "ami-0123456789abcdef0",
         "MS_CONTAINER_DIGEST": "sha256:" + "a" * 64,
+        "MS_CONTAINER_IMAGE": (
+            "123456789012.dkr.ecr.us-east-1.amazonaws.com/memorysplit"
+            "@sha256:" + "a" * 64
+        ),
         "MS_RUNTIME_UID": "1000",
         "MS_RUNTIME_GID": "1000",
     }
@@ -212,6 +228,10 @@ def test_runtime_environment_rejects_inherited_secrets(secret_name):
         "MS_S3_ROOT": "s3://memorysplit-prod/cohort-v2",
         "MS_AWS_AMI_ID": "ami-0123456789abcdef0",
         "MS_CONTAINER_DIGEST": "sha256:" + "a" * 64,
+        "MS_CONTAINER_IMAGE": (
+            "123456789012.dkr.ecr.us-east-1.amazonaws.com/memorysplit"
+            "@sha256:" + "a" * 64
+        ),
         "MS_RUNTIME_UID": "1000",
         "MS_RUNTIME_GID": "1000",
         secret_name: "must-not-be-inherited",
@@ -242,6 +262,10 @@ def test_runtime_environment_rejects_non_instance_role_sources(source_name):
         "MS_S3_ROOT": "s3://memorysplit-prod/cohort-v2",
         "MS_AWS_AMI_ID": "ami-0123456789abcdef0",
         "MS_CONTAINER_DIGEST": "sha256:" + "a" * 64,
+        "MS_CONTAINER_IMAGE": (
+            "123456789012.dkr.ecr.us-east-1.amazonaws.com/memorysplit"
+            "@sha256:" + "a" * 64
+        ),
         "MS_RUNTIME_UID": "1000",
         "MS_RUNTIME_GID": "1000",
         source_name: "configured",

@@ -208,19 +208,44 @@ def verify_scope_approval(
         receipt["resources"],
         label="approval receipt.resources",
     )
+    base_resource_fields = {
+        "schema_version",
+        "operation",
+        "jobs",
+        "allocated_gpus",
+        "wall_minutes",
+        "gpu_hours",
+        "gres",
+        "script",
+    }
+    expected_resource_fields = set(resources)
+    extended_aws_operation = (
+        profile.provider == "aws-p5.48xlarge"
+        and operation in {"submit", "resume", "evaluate", "cleanup"}
+    )
+    if extended_aws_operation:
+        expected_resource_fields = base_resource_fields | {
+            "ami_id",
+            "container_digest",
+            "instance_id",
+            "profile_sha256",
+            "release_sha256",
+            "run_manifest_sha256",
+            "runtime_sha256",
+            "seed",
+            "terminate_at",
+        }
+        if operation == "resume":
+            expected_resource_fields.add("checkpoint_receipt_sha256")
     require_exact_keys(
         receipt_resources,
-        {
-            "schema_version",
-            "operation",
-            "jobs",
-            "allocated_gpus",
-            "wall_minutes",
-            "gpu_hours",
-            "gres",
-            "script",
-        },
+        expected_resource_fields,
         label="approval receipt.resources",
+    )
+    require_exact_keys(
+        resources,
+        expected_resource_fields,
+        label="resource request",
     )
     try:
         require_schema_version(
@@ -235,6 +260,26 @@ def verify_scope_approval(
             resources.get("gpu_hours"),
             label="resource request.gpu_hours",
         )
+        if extended_aws_operation:
+            for field in (
+                "profile_sha256",
+                "release_sha256",
+                "run_manifest_sha256",
+                "runtime_sha256",
+            ):
+                require_sha256(
+                    resources.get(field),
+                    label=f"resource request.{field}",
+                )
+            if operation == "resume":
+                require_sha256(
+                    resources.get("checkpoint_receipt_sha256"),
+                    label="resource request.checkpoint_receipt_sha256",
+                )
+            require_nonnegative_int(
+                resources.get("seed"),
+                label="resource request.seed",
+            )
     except MsctlError as error:
         raise MsctlError(
             "APPROVAL_INVALID",

@@ -6,8 +6,10 @@ import argparse
 import json
 import os
 import sys
+from collections.abc import Callable
 from pathlib import Path
 
+from .aws_p5 import build_aws_backend
 from .cleanup import apply_cleanup, make_cleanup_plan
 from .collect import collect_evidence
 from .contracts import load_release
@@ -23,13 +25,14 @@ from .operations import (
     cancel_runs,
     check_capacity,
     evaluate_runs,
+    instantiate_run_manifest,
     load_bound_inputs,
     render_runs,
     resume_runs,
     status_runs,
     submit_runs,
 )
-from .profile import load_profile
+from .profile import AWS_P5_PROFILE, SUPPORTED_PROFILE, load_profile
 
 
 SCHEMA_VERSION = 1
@@ -89,7 +92,7 @@ def build_parser() -> JsonArgumentParser:
     env_sub = env.add_subparsers(dest="action", required=True)
     ensure_env = _leaf(env_sub, "ensure", help_text="plan or build environment")
     ensure_env.add_argument("--root")
-    ensure_env.add_argument("--lock", default="requirements-illumina.lock")
+    ensure_env.add_argument("--lock")
     ensure_env.add_argument("--release")
     ensure_env.add_argument("--apply", action="store_true")
 
@@ -99,26 +102,38 @@ def build_parser() -> JsonArgumentParser:
         dataset_sub, "ensure", help_text="plan or stage immutable dataset"
     )
     ensure_dataset.add_argument("--pointer", default="DATASET-POINTER.json")
+    ensure_dataset.add_argument("--receipt")
     ensure_dataset.add_argument("--apply", action="store_true")
     verify_dataset = _leaf(
         dataset_sub, "verify", help_text="verify immutable dataset receipt"
     )
     verify_dataset.add_argument("--pointer", default="DATASET-POINTER.json")
-    verify_dataset.add_argument("--dataset-root", required=True)
-    verify_dataset.add_argument("--shared-root", required=True)
-    verify_dataset.add_argument("--release", required=True)
-    verify_dataset.add_argument("--manifest", required=True)
+    verify_dataset.add_argument("--receipt")
+    verify_dataset.add_argument("--dataset-root")
+    verify_dataset.add_argument("--shared-root")
+    verify_dataset.add_argument("--release")
+    verify_dataset.add_argument("--manifest")
     verify_dataset.add_argument("--verification-out")
     verify_dataset.add_argument("--apply", action="store_true")
 
     runs = _leaf(commands, "runs", help_text="run plan lifecycle")
     runs_sub = runs.add_subparsers(dest="action", required=True)
+    instantiate = _leaf(
+        runs_sub,
+        "instantiate",
+        help_text="bind one provider-owned seed pair after release",
+    )
+    instantiate.add_argument("--release", required=True)
+    instantiate.add_argument("--dataset-receipt", required=True)
+    instantiate.add_argument("--seed", required=True, type=int)
+    instantiate.add_argument("--out", required=True)
+    instantiate.add_argument("--apply", action="store_true")
     render = _leaf(runs_sub, "render", help_text="render deterministic Slurm argv")
     render.add_argument("--release", required=True)
     render.add_argument("--manifest", required=True)
-    render.add_argument("--dataset-pointer", required=True)
-    render.add_argument("--shared-root", required=True)
-    render_dataset = render.add_mutually_exclusive_group(required=True)
+    render.add_argument("--dataset-pointer")
+    render_dataset = render.add_mutually_exclusive_group()
+    render.add_argument("--shared-root")
     render_dataset.add_argument("--dataset-root")
     render_dataset.add_argument("--dataset-verification")
     render.add_argument("--environment-receipt")
@@ -128,13 +143,16 @@ def build_parser() -> JsonArgumentParser:
         leaf.add_argument("--release", required=True)
         leaf.add_argument("--manifest", required=True)
         if name in {"submit", "resume", "evaluate"}:
-            leaf.add_argument("--dataset-pointer", required=True)
-            leaf.add_argument("--shared-root", required=True)
-            dataset_binding = leaf.add_mutually_exclusive_group(required=True)
+            leaf.add_argument("--dataset-pointer")
+            dataset_binding = leaf.add_mutually_exclusive_group()
+            leaf.add_argument("--shared-root")
             dataset_binding.add_argument("--dataset-root")
             dataset_binding.add_argument("--dataset-verification")
             leaf.add_argument("--environment-receipt")
         leaf.add_argument("--approval")
+        if name == "submit":
+            leaf.add_argument("--instance-id")
+            leaf.add_argument("--terminate-at")
         if name == "resume":
             leaf.add_argument("--checkpoint-receipt", required=True)
         leaf.add_argument("--apply", action="store_true")
@@ -152,10 +170,13 @@ def build_parser() -> JsonArgumentParser:
     cleanup = _leaf(commands, "cleanup", help_text="safe cleanup lifecycle")
     cleanup_sub = cleanup.add_subparsers(dest="action", required=True)
     cleanup_plan = _leaf(cleanup_sub, "plan", help_text="render cleanup plan")
-    cleanup_plan.add_argument("--root", required=True)
+    cleanup_plan.add_argument("--root")
+    cleanup_plan.add_argument("--release")
+    cleanup_plan.add_argument("--manifest")
     cleanup_apply = _leaf(cleanup_sub, "apply", help_text="apply frozen cleanup")
-    cleanup_apply.add_argument("--plan", required=True)
+    cleanup_apply.add_argument("--plan")
     cleanup_apply.add_argument("--release", required=True)
+    cleanup_apply.add_argument("--manifest")
     cleanup_apply.add_argument("--approval")
     cleanup_apply.add_argument("--apply", action="store_true", required=True)
     return parser
@@ -172,6 +193,20 @@ def _unsupported(command: str) -> None:
         "this external operation has no safe local implementation",
         details={"operation": command},
     )
+
+
+def _require_cli_values(args: argparse.Namespace, *names: str) -> None:
+    missing = [name for name in names if getattr(args, name, None) is None]
+    if missing:
+        raise MsctlError(
+            "CLI_USAGE",
+            "missing provider-specific arguments",
+            details={
+                "missing": [
+                    f"--{name.replace('_', '-')}" for name in missing
+                ]
+            },
+        )
 
 
 def _auth_check(profile) -> dict[str, object]:
@@ -202,13 +237,94 @@ def _auth_check(profile) -> dict[str, object]:
     }
 
 
-def dispatch(args: argparse.Namespace) -> tuple[bool, dict[str, object]]:
-    profile = load_profile(args.profile)
+def dispatch(
+    args: argparse.Namespace,
+    *,
+    profile_loader: Callable[[Path | str], object] | None = None,
+    cohort_loader: Callable[[Path | str], object] | None = None,
+    aws_backend_factory: Callable[..., object] = build_aws_backend,
+    environ: dict[str, str] | None = None,
+) -> tuple[bool, dict[str, object]]:
+    profile = (profile_loader or load_profile)(args.profile)
     command = _command_name(args)
+    environment = dict(os.environ if environ is None else environ)
+    provider = getattr(profile, "provider", None)
+    if provider not in {SUPPORTED_PROFILE, AWS_P5_PROFILE}:
+        raise MsctlError(
+            "PROVIDER_UNSUPPORTED",
+            "profile provider is not supported",
+            details={"provider": provider},
+        )
+    if command == "runs instantiate":
+        return not args.apply, instantiate_run_manifest(
+            profile=profile,
+            release_path=args.release,
+            dataset_receipt=args.dataset_receipt,
+            seed=args.seed,
+            out=args.out,
+            repo_root=args.repo_root,
+            apply=args.apply,
+            cohort_loader=cohort_loader,
+        )
+    if provider == AWS_P5_PROFILE:
+        if command == "submit":
+            _require_cli_values(args, "instance_id", "terminate_at")
+        if command in {"runs render", "submit", "resume", "evaluate"}:
+            _require_cli_values(
+                args,
+                "dataset_pointer",
+                "environment_receipt",
+            )
+            if (args.dataset_root is None) == (
+                args.dataset_verification is None
+            ):
+                raise MsctlError(
+                    "CLI_USAGE",
+                    "AWS requires exactly one dataset source",
+                    details={
+                        "required_one_of": [
+                            "--dataset-root",
+                            "--dataset-verification",
+                        ]
+                    },
+                )
+        if command in {"dataset ensure", "dataset verify"}:
+            _require_cli_values(args, "receipt")
+        backend = aws_backend_factory(
+            profile=profile,
+            state_root=args.state_root,
+            environ=environment,
+        )
+        return backend.dispatch(command, args)
+    if command in {"runs render", "submit", "resume", "evaluate"}:
+        _require_cli_values(args, "dataset_pointer", "shared_root")
+        if (args.dataset_root is None) == (args.dataset_verification is None):
+            raise MsctlError(
+                "CLI_USAGE",
+                "Illumina requires exactly one dataset source",
+                details={
+                    "required_one_of": [
+                        "--dataset-root",
+                        "--dataset-verification",
+                    ]
+                },
+            )
+    if command == "dataset verify":
+        _require_cli_values(
+            args,
+            "dataset_root",
+            "shared_root",
+            "release",
+            "manifest",
+        )
+    if command == "cleanup plan":
+        _require_cli_values(args, "root")
+    if command == "cleanup apply":
+        _require_cli_values(args, "plan", "manifest")
     if command == "auth check":
         return False, _auth_check(profile)
     if command == "capacity check":
-        return False, check_capacity(profile, environ=dict(os.environ))
+        return False, check_capacity(profile, environ=environment)
     if command == "runs render":
         return True, render_runs(
             profile=profile,
@@ -235,7 +351,7 @@ def dispatch(args: argparse.Namespace) -> tuple[bool, dict[str, object]]:
             state_root=args.state_root,
             approval_path=args.approval,
             apply=args.apply,
-            environ=dict(os.environ),
+            environ=environment,
         )
     if command == "env ensure":
         release = load_release(args.release) if args.release else None
@@ -243,7 +359,7 @@ def dispatch(args: argparse.Namespace) -> tuple[bool, dict[str, object]]:
             profile=profile,
             release=release,
             root=args.root,
-            lock=args.lock,
+            lock=args.lock or profile.environment_lock,
             apply=args.apply,
             environ=dict(os.environ),
         )
@@ -253,7 +369,7 @@ def dispatch(args: argparse.Namespace) -> tuple[bool, dict[str, object]]:
             pointer_path=args.pointer,
             repo_root=args.repo_root,
             apply=args.apply,
-            environ=dict(os.environ),
+            environ=environment,
         )
     if command == "dataset verify":
         release, manifest, _ = load_bound_inputs(
@@ -282,7 +398,7 @@ def dispatch(args: argparse.Namespace) -> tuple[bool, dict[str, object]]:
             repo_root=args.repo_root,
             state_root=args.state_root,
             cached=args.cached,
-            environ=dict(os.environ),
+            environ=environment,
         )
     if command == "resume":
         return not args.apply, resume_runs(
@@ -299,7 +415,7 @@ def dispatch(args: argparse.Namespace) -> tuple[bool, dict[str, object]]:
             state_root=args.state_root,
             approval_path=args.approval,
             apply=args.apply,
-            environ=dict(os.environ),
+            environ=environment,
         )
     if command == "cancel":
         return not args.apply, cancel_runs(
@@ -310,7 +426,7 @@ def dispatch(args: argparse.Namespace) -> tuple[bool, dict[str, object]]:
             state_root=args.state_root,
             approval_path=args.approval,
             apply=args.apply,
-            environ=dict(os.environ),
+            environ=environment,
         )
     if command == "evaluate":
         return not args.apply, evaluate_runs(
@@ -326,7 +442,7 @@ def dispatch(args: argparse.Namespace) -> tuple[bool, dict[str, object]]:
             state_root=args.state_root,
             approval_path=args.approval,
             apply=args.apply,
-            environ=dict(os.environ),
+            environ=environment,
         )
     if command == "collect":
         return not args.apply, collect_evidence(
@@ -346,9 +462,11 @@ def dispatch(args: argparse.Namespace) -> tuple[bool, dict[str, object]]:
             profile=profile,
             plan_path=args.plan,
             release_path=args.release,
+            manifest_path=args.manifest,
+            repo_root=args.repo_root,
             approval_path=args.approval,
             apply=args.apply,
-            environ=dict(os.environ),
+            environ=environment,
         )
     _unsupported(command)
     raise AssertionError("unreachable")

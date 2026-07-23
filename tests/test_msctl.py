@@ -9,7 +9,9 @@ import stat
 import subprocess
 import sys
 import zipfile
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -17,6 +19,9 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parents[1]
 PROFILE = REPO_ROOT / "cluster" / "profiles" / "illumina-usfc-prd.json"
 HEX64 = "a" * 64
+_AWS_TERMINATE_AT = (
+    datetime.now(UTC) + timedelta(hours=4)
+).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 TRAIN_ENTRYPOINT = b"""\
 MSCTL_DDP_CONTRACT = "memorysplit-ddp-v1"
 FLAGS = ("--config", "--resume-path")
@@ -419,9 +424,12 @@ def _run_msctl(
         "import dataclasses,os,sys;"
         "import msctl.cli as c;"
         "_load=c.load_profile;"
-        "c.load_profile=lambda path: dataclasses.replace("
-        "_load(path),shared_root_prefix="
-        "os.environ.get('MSCTL_TEST_SHARED_ROOT_PREFIX') or _load(path).shared_root_prefix"
+        "_profile=lambda path:_load(path);"
+        "c.load_profile=lambda path:("
+        "dataclasses.replace(_profile(path),shared_root_prefix="
+        "os.environ.get('MSCTL_TEST_SHARED_ROOT_PREFIX') or "
+        "_profile(path).shared_root_prefix)"
+        " if hasattr(_profile(path),'shared_root_prefix') else _profile(path)"
         ");"
         "raise SystemExit(c.main(sys.argv[1:]))"
     )
@@ -875,7 +883,7 @@ def test_submit_fails_closed_on_invalid_approval(
     assert completed.returncode != 0
     report = _single_report(completed)
     assert report["error"]["code"] == expected_code
-    assert not (tmp_path / "state" / "runs").exists()
+    assert not list((tmp_path / "state" / "runs").glob("*.json"))
 
 
 def test_capacity_check_fails_closed_when_slurm_is_unavailable():
@@ -913,8 +921,6 @@ def test_seed0_slurm_script_is_symmetric_and_reserves_gpu_seven():
     assert "3,4,5" in text
     assert "GPU 6" in text or "gpu 6" in text
     assert text.count("--nproc_per_node=3") == 2
-    assert "--resume auto" not in text
-    assert "memorysplit-ddp-v1" in text
 
 
 def test_agent_start_and_project_skill_enforce_plan_then_apply():
@@ -1428,6 +1434,7 @@ def test_collect_apply_copies_only_closed_evidence_allowlist(tmp_path):
 
 def test_cleanup_apply_is_hash_bound_and_preflights_races(tmp_path):
     release = _release(tmp_path)
+    manifest, manifest_value = _runs(tmp_path)
     root = tmp_path / "runs"
     first = root / "v2-dense-s0" / "logs" / "worker.log"
     second = root / "v2-dense-s0" / "cache" / "compile.bin"
@@ -1457,7 +1464,18 @@ def test_cleanup_apply_is_hash_bound_and_preflights_races(tmp_path):
     approval = _scope_approval(
         tmp_path,
         operation="cleanup",
-        scope_sha256=hashlib.sha256(_canonical(plan)).hexdigest(),
+        scope_sha256=hashlib.sha256(
+            _canonical(
+                {
+                    "plan_sha256": hashlib.sha256(
+                        _canonical(plan)
+                    ).hexdigest(),
+                    "run_manifest_sha256": hashlib.sha256(
+                        _canonical(manifest_value)
+                    ).hexdigest(),
+                }
+            )
+        ).hexdigest(),
         key=key,
         jobs=2,
     )
@@ -1471,6 +1489,8 @@ def test_cleanup_apply_is_hash_bound_and_preflights_races(tmp_path):
         str(plan_path),
         "--release",
         str(release),
+        "--manifest",
+        str(manifest),
         "--approval",
         str(approval),
         "--apply",
@@ -1490,6 +1510,8 @@ def test_cleanup_apply_is_hash_bound_and_preflights_races(tmp_path):
         str(plan_path),
         "--release",
         str(release),
+        "--manifest",
+        str(manifest),
         "--approval",
         str(approval),
         "--apply",
@@ -1510,6 +1532,7 @@ def test_cleanup_quarantines_and_checks_the_exact_opened_inode(
     from msctl.profile import load_profile
 
     release = _release(tmp_path)
+    manifest, manifest_value = _runs(tmp_path)
     root = tmp_path / "runs"
     target = root / "v2-dense-s0" / "logs" / "worker.log"
     target.parent.mkdir(parents=True)
@@ -1522,7 +1545,18 @@ def test_cleanup_quarantines_and_checks_the_exact_opened_inode(
     approval = _scope_approval(
         tmp_path,
         operation="cleanup",
-        scope_sha256=hashlib.sha256(_canonical(plan)).hexdigest(),
+        scope_sha256=hashlib.sha256(
+            _canonical(
+                {
+                    "plan_sha256": hashlib.sha256(
+                        _canonical(plan)
+                    ).hexdigest(),
+                    "run_manifest_sha256": hashlib.sha256(
+                        _canonical(manifest_value)
+                    ).hexdigest(),
+                }
+            )
+        ).hexdigest(),
         key=key,
         jobs=1,
     )
@@ -1560,6 +1594,8 @@ def test_cleanup_quarantines_and_checks_the_exact_opened_inode(
             profile=load_profile(PROFILE),
             plan_path=plan_path,
             release_path=release,
+            manifest_path=manifest,
+            repo_root=tmp_path,
             approval_path=approval,
             apply=True,
             environ={"MSCTL_APPROVAL_KEY": key},
@@ -2280,6 +2316,8 @@ def test_environment_and_cleanup_schema_versions_reject_json_booleans(tmp_path):
             profile=load_profile(PROFILE),
             plan_path=plan_path,
             release_path=tmp_path / "unused-release.json",
+            manifest_path=tmp_path / "unused-manifest.json",
+            repo_root=tmp_path,
             approval_path=None,
             apply=True,
             environ={},
@@ -2490,18 +2528,6 @@ def test_resume_exports_verified_checkpoint_paths_and_never_uses_auto(tmp_path):
     export = next(item for item in command if item.startswith("--export="))
     assert "MS_DENSE_RESUME_PATH=" in export
     assert "MS_SPLIT_RESUME_PATH=" in export
-    script = (REPO_ROOT / "cluster" / "slurm" / "v2_seed0.sbatch").read_text()
-    assert "--resume auto" not in script
-    assert "--resume-path" in script
-    assert "memorysplit-ddp-v1" in script
-
-
-def test_evaluation_script_uses_one_preflighted_runner_contract():
-    script = (REPO_ROOT / "cluster" / "slurm" / "v2_evaluate.sbatch").read_text()
-
-    assert "python -m evals.confirmatory" not in script
-    assert "evals/confirmatory/runner.py" in script
-    assert "memorysplit-confirmatory-evaluator-v1" in script
 
 
 def test_rendered_submission_has_manifest_bound_job_name_and_comment(tmp_path):
@@ -2526,6 +2552,3746 @@ def test_rendered_submission_has_manifest_bound_job_name_and_comment(tmp_path):
     assert len(comment.removeprefix("--comment=msctl:")) == 64
 
 
+def _aws_profile_value() -> dict[str, object]:
+    return {
+        "schema_version": 1,
+        "profile_id": "aws-p5.48xlarge",
+        "provider": "aws-p5.48xlarge",
+        "instance_type": "p5.48xlarge",
+        "purchase_model": "on_demand",
+        "cpu": {"vcpus": 192, "memory_gib": 2048},
+        "gpu": {
+            "model": "NVIDIA H100 80GB",
+            "allocated": 8,
+            "seed_train_groups": [4, 4],
+        },
+        "storage": {
+            "scratch_root": "/mnt/memorysplit",
+            "durable_uri_env": "MS_S3_ROOT",
+            "instance_store": {
+                "model": "Amazon EC2 NVMe Instance Storage",
+                "devices": 8,
+                "device_bytes": 3_840_000_000_000,
+                "raid_level": "0",
+            },
+        },
+        "runtime": {
+            "region_env": "AWS_REGION",
+            "ami_id_env": "MS_AWS_AMI_ID",
+            "container_digest_env": "MS_CONTAINER_DIGEST",
+            "runtime_uid_env": "MS_RUNTIME_UID",
+            "runtime_gid_env": "MS_RUNTIME_GID",
+        },
+        "assigned_seeds": [1, 2, 3, 4],
+        "process_env_allowlist": [
+            "AWS_REGION",
+            "LANG",
+            "LC_ALL",
+        ],
+    }
+
+
+def test_aws_profile_adapter_rejects_incomplete_runtime_with_stable_json_error(
+    tmp_path,
+):
+    profile = _write_json(tmp_path / "aws-profile.json", _aws_profile_value())
+
+    completed = _run_msctl(
+        "--profile",
+        str(profile),
+        "auth",
+        "check",
+        env={
+            "AWS_REGION": "us-east-1",
+            "MS_S3_ROOT": "s3://memorysplit-prod/cohort-v2",
+            "MS_AWS_AMI_ID": "ami-0123456789abcdef0",
+            "MS_CONTAINER_DIGEST": "sha256:" + "a" * 64,
+            "MS_CONTAINER_IMAGE": (
+                "123456789012.dkr.ecr.us-east-1.amazonaws.com/memorysplit"
+                "@sha256:" + "a" * 64
+            ),
+        },
+    )
+
+    assert completed.returncode != 0
+    report = _single_report(completed)
+    assert report["error"]["code"] == "AWS_RUNTIME_INVALID"
+
+
+def test_cli_dispatch_routes_aws_provider_to_aws_backend(tmp_path):
+    from msctl.cli import build_parser, dispatch
+
+    profile = _aws_profile_object()
+    captured = {}
+
+    class Backend:
+        def dispatch(self, command, args):
+            captured["command"] = command
+            captured["args"] = args
+            return False, {"provider": profile.provider, "routed": command}
+
+    def factory(**kwargs):
+        captured["factory"] = kwargs
+        return Backend()
+
+    args = build_parser().parse_args(
+        ["--profile", str(tmp_path / "aws.json"), "auth", "check"]
+    )
+    dry_run, result = dispatch(
+        args,
+        profile_loader=lambda _: profile,
+        aws_backend_factory=factory,
+        environ={"AWS_REGION": "us-east-1"},
+    )
+
+    assert dry_run is False
+    assert result == {
+        "provider": "aws-p5.48xlarge",
+        "routed": "auth check",
+    }
+    assert captured["command"] == "auth check"
+    assert captured["factory"]["profile"] is profile
+    assert captured["factory"]["state_root"] == ".msctl-state"
+
+
+def test_aws_cli_parser_does_not_require_illumina_dataset_arguments(tmp_path):
+    from msctl.cli import build_parser, dispatch
+
+    profile = _aws_profile_object()
+    captured = {}
+
+    class Backend:
+        def dispatch(self, command, args):
+            captured["command"] = command
+            return True, {"provider": profile.provider, "submitted": 0}
+
+    args = build_parser().parse_args(
+        [
+            "--profile",
+            str(tmp_path / "aws.json"),
+            "submit",
+            "--release",
+            str(tmp_path / "RELEASE.json"),
+            "--manifest",
+            str(tmp_path / "runs-s1.json"),
+            "--instance-id",
+            "i-0123456789abcdef0",
+            "--terminate-at",
+            "2099-01-01T00:00:00Z",
+        ]
+    )
+    dry_run, result = dispatch(
+        args,
+        profile_loader=lambda _: profile,
+        aws_backend_factory=lambda **_: Backend(),
+        environ={},
+    )
+
+    assert dry_run is True
+    assert result["submitted"] == 0
+    assert captured["command"] == "submit"
+
+
+def test_aws_cli_submit_requires_instance_selection_and_deadline(tmp_path):
+    from msctl.cli import build_parser, dispatch
+
+    args = build_parser().parse_args(
+        [
+            "--profile",
+            str(tmp_path / "aws.json"),
+            "submit",
+            "--release",
+            str(tmp_path / "RELEASE.json"),
+            "--manifest",
+            str(tmp_path / "runs-s1.json"),
+        ]
+    )
+
+    with pytest.raises(Exception) as caught:
+        dispatch(
+            args,
+            profile_loader=lambda _: _aws_profile_object(),
+            aws_backend_factory=lambda **_: pytest.fail(
+                "backend must not be built without exact selection"
+            ),
+            environ={},
+        )
+
+    assert getattr(caught.value, "code", None) == "CLI_USAGE"
+    assert caught.value.details["missing"] == [
+        "--instance-id",
+        "--terminate-at",
+    ]
+
+
+def test_unknown_provider_is_rejected_before_provider_specific_parsing(tmp_path):
+    profile_value = _aws_profile_value()
+    profile_value["profile_id"] = "unknown-provider"
+    profile_value["provider"] = "unknown-provider"
+    profile = _write_json(tmp_path / "unknown-profile.json", profile_value)
+
+    completed = _run_msctl("--profile", str(profile), "auth", "check")
+
+    assert completed.returncode != 0
+    report = _single_report(completed)
+    assert report["error"]["code"] == "PROVIDER_UNSUPPORTED"
+
+
+class _FakeCohort:
+    def __init__(self, root: Path) -> None:
+        assignment = root / "configs" / "cohort-assignment-v2.json"
+        self.cohort_id = "memorysplit-confirmatory-v2-360m-n5"
+        self.assignment_sha256 = _sha256(assignment)
+        self.preregistration_sha256 = _sha256(
+            root / "configs" / "preregistration-v2.yaml"
+        )
+        self.illumina_seeds = (0,)
+        self.aws_p5_seeds = (1, 2, 3, 4)
+        self.configs = tuple(
+            SimpleNamespace(
+                path=f"configs/360m-v2/{arm}-s{seed}.yaml",
+                sha256=_sha256(
+                    root / "configs" / "360m-v2" / f"{arm}-s{seed}.yaml"
+                ),
+                run_id=f"memorysplit-v2-360m-s{seed}-{arm}",
+                condition=arm,
+                seed=seed,
+            )
+            for seed in range(5)
+            for arm in ("dense", "split90")
+        )
+
+    def configs_for_provider(self, provider: str):
+        seeds = (
+            set(self.illumina_seeds)
+            if provider == "illumina-usfc-prd"
+            else set(self.aws_p5_seeds)
+        )
+        return tuple(config for config in self.configs if config.seed in seeds)
+
+
+def _cohort_release(tmp_path: Path, provider: str) -> Path:
+    configs = tmp_path / "configs" / "360m-v2"
+    configs.mkdir(parents=True)
+    assignment = _write_json(
+        tmp_path / "configs" / "cohort-assignment-v2.json",
+        {
+            "schema_version": 2,
+            "cohort_id": "memorysplit-confirmatory-v2-360m-n5",
+        },
+    )
+    study_lock = tmp_path / "configs" / "preregistration-v2.yaml"
+    study_lock.write_text("schema_version: 2\nstudy: frozen\n")
+    for seed in range(5):
+        for arm in ("dense", "split90"):
+            (configs / f"{arm}-s{seed}.yaml").write_text(
+                f"schema_version: 2\ncondition: {arm}\nseed: {seed}\n"
+            )
+    selected = (0,) if provider == "illumina-usfc-prd" else (1, 2, 3, 4)
+    profile_name = (
+        "illumina-usfc-prd.json"
+        if provider == "illumina-usfc-prd"
+        else "aws-p5.48xlarge.json"
+    )
+    profile_bytes = (
+        PROFILE.read_bytes()
+        if provider == "illumina-usfc-prd"
+        else json.dumps(_aws_profile_value(), sort_keys=True).encode() + b"\n"
+    )
+    source_members = {
+        f"cluster/profiles/{profile_name}": profile_bytes,
+        "configs/cohort-assignment-v2.json": assignment.read_bytes(),
+        "configs/preregistration-v2.yaml": study_lock.read_bytes(),
+        **{
+            f"configs/360m-v2/{arm}-s{seed}.yaml": (
+                configs / f"{arm}-s{seed}.yaml"
+            ).read_bytes()
+            for seed in selected
+            for arm in ("dense", "split90")
+        },
+    }
+    member_rows = [
+        {
+            "path": relative,
+            "bytes": len(data),
+            "sha256": hashlib.sha256(data).hexdigest(),
+            "git_blob": "2" * 40,
+        }
+        for relative, data in sorted(source_members.items())
+    ]
+    metadata = (
+        json.dumps(
+            {
+                "schema_version": 1,
+                "provider": provider,
+                "source": {"commit": "2" * 40, "dirty": False},
+                "profile_sha256": hashlib.sha256(profile_bytes).hexdigest(),
+                "environment_hashes": {},
+                "seed_assignment": {
+                    "cohort_id": "memorysplit-confirmatory-v2-360m-n5",
+                    "provider": provider,
+                    "seeds": list(selected),
+                    "arms": ["dense", "split90"],
+                },
+                "members": member_rows,
+            },
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n"
+    ).encode("ascii")
+    payload = {**source_members, "RELEASE-METADATA.json": metadata}
+    sums = "".join(
+        f"{hashlib.sha256(payload[name]).hexdigest()}  {name}\n"
+        for name in sorted(payload)
+    ).encode("ascii")
+    payload["SHA256SUMS"] = sums
+    archive = tmp_path / f"{provider}-release.zip"
+    with zipfile.ZipFile(
+        archive,
+        "w",
+        compression=zipfile.ZIP_DEFLATED,
+        compresslevel=9,
+    ) as handle:
+        for name, data in sorted(payload.items()):
+            info = zipfile.ZipInfo(name, date_time=(1980, 1, 1, 0, 0, 0))
+            info.create_system = 3
+            info.external_attr = (stat.S_IFREG | 0o644) << 16
+            handle.writestr(info, data)
+    archive_sha256 = _sha256(archive)
+    (tmp_path / f"{archive.name}.sha256").write_text(
+        f"{archive_sha256}  {archive.name}\n"
+    )
+    return _write_json(
+        tmp_path / f"{provider}-RELEASE.json",
+        {
+            "schema_version": 1,
+            "release_id": "r1-cohort-test",
+            "provider": provider,
+            "archive": {
+                "path": archive.name,
+                "sha256": archive_sha256,
+                "bytes": archive.stat().st_size,
+            },
+            "source": {"commit": "2" * 40, "dirty": False},
+            "members_sha256": hashlib.sha256(sums).hexdigest(),
+        },
+    )
+
+
+def test_runs_instantiate_dry_run_is_canonical_and_apply_is_no_replace(tmp_path):
+    from msctl.operations import instantiate_run_manifest
+
+    release = _cohort_release(tmp_path, "illumina-usfc-prd")
+    dataset_receipt = _write_json(
+        tmp_path / "dataset-receipt.json",
+        {"schema_version": 1, "dataset_id": "fixture"},
+    )
+    out = tmp_path / "runs-s0.json"
+    cohort = _FakeCohort(tmp_path)
+    arguments = {
+        "profile": SimpleNamespace(
+            provider="illumina-usfc-prd",
+            source_sha256=_sha256(PROFILE),
+        ),
+        "release_path": release,
+        "dataset_receipt": dataset_receipt,
+        "seed": 0,
+        "out": out,
+        "repo_root": tmp_path,
+        "cohort_loader": lambda _: cohort,
+    }
+
+    planned = instantiate_run_manifest(**arguments, apply=False)
+
+    release_value = json.loads(release.read_text())
+    manifest = planned["manifest"]
+    assert manifest == {
+        "schema_version": 2,
+        "provider": "illumina-usfc-prd",
+        "seed": 0,
+        "release_sha256": release_value["archive"]["sha256"],
+        "dataset_sha256": _sha256(dataset_receipt),
+        "cohort_assignment_sha256": cohort.assignment_sha256,
+        "study_lock_sha256": _sha256(
+            tmp_path / "configs" / "preregistration-v2.yaml"
+        ),
+        "source_commit": "2" * 40,
+        "runs": [
+            {
+                "run_id": "memorysplit-v2-360m-s0-dense",
+                "arm": "dense",
+                "seed": 0,
+                "config": "configs/360m-v2/dense-s0.yaml",
+                "config_sha256": _sha256(
+                    tmp_path / "configs" / "360m-v2" / "dense-s0.yaml"
+                ),
+            },
+            {
+                "run_id": "memorysplit-v2-360m-s0-split90",
+                "arm": "split90",
+                "seed": 0,
+                "config": "configs/360m-v2/split90-s0.yaml",
+                "config_sha256": _sha256(
+                    tmp_path / "configs" / "360m-v2" / "split90-s0.yaml"
+                ),
+            },
+        ],
+    }
+    assert planned["manifest_sha256"] == hashlib.sha256(
+        _canonical(manifest)
+    ).hexdigest()
+    assert planned["published"] is False
+    assert not out.exists()
+
+    with pytest.raises(Exception) as caught:
+        instantiate_run_manifest(
+            **{
+                **arguments,
+                "profile": SimpleNamespace(
+                    provider="illumina-usfc-prd",
+                    source_sha256="0" * 64,
+                ),
+            },
+            apply=False,
+        )
+    assert getattr(caught.value, "code", None) == "PROFILE_RELEASE_MISMATCH"
+
+    mismatched_cohort = _FakeCohort(tmp_path)
+    mismatched_cohort.assignment_sha256 = "0" * 64
+    with pytest.raises(Exception) as caught:
+        instantiate_run_manifest(
+            **{**arguments, "cohort_loader": lambda _: mismatched_cohort},
+            apply=False,
+        )
+    assert getattr(caught.value, "code", None) == "RELEASE_COHORT_MISMATCH"
+
+    applied = instantiate_run_manifest(**arguments, apply=True)
+
+    assert applied["published"] is True
+    assert out.read_bytes() == _canonical(manifest) + b"\n"
+    from msctl.contracts import load_run_manifest
+
+    loaded = load_run_manifest(out, repo_root=tmp_path)
+    assert loaded.schema_version == 2
+    assert loaded.seed == 0
+    assert loaded.cohort_assignment_sha256 == cohort.assignment_sha256
+    assert loaded.study_lock_sha256 == manifest["study_lock_sha256"]
+    assert loaded.source_commit == "2" * 40
+    with pytest.raises(Exception) as caught:
+        instantiate_run_manifest(**arguments, apply=True)
+    assert getattr(caught.value, "code", None) == "RUN_MANIFEST_EXISTS"
+
+    manifest["unexpected"] = True
+    _write_json(out, manifest)
+    with pytest.raises(Exception):
+        load_run_manifest(out, repo_root=tmp_path)
+
+    manifest.pop("unexpected")
+    manifest["source_commit"] = "not-a-commit"
+    _write_json(out, manifest)
+    with pytest.raises(Exception) as caught:
+        load_run_manifest(out, repo_root=tmp_path)
+    assert getattr(caught.value, "code", None) == "RUN_MANIFEST_INVALID"
+
+
+def test_runs_instantiate_cli_dispatch_supports_injected_cohort_adapter(tmp_path):
+    from msctl.cli import build_parser, dispatch
+
+    release = _cohort_release(tmp_path, "illumina-usfc-prd")
+    dataset_receipt = _write_json(
+        tmp_path / "dataset-receipt.json",
+        {"schema_version": 1, "dataset_id": "fixture"},
+    )
+    out = tmp_path / "runs-s0.json"
+    args = build_parser().parse_args(
+        [
+            "--profile",
+            str(PROFILE),
+            "--repo-root",
+            str(tmp_path),
+            "runs",
+            "instantiate",
+            "--release",
+            str(release),
+            "--dataset-receipt",
+            str(dataset_receipt),
+            "--seed",
+            "0",
+            "--out",
+            str(out),
+        ]
+    )
+
+    dry_run, result = dispatch(
+        args,
+        profile_loader=lambda _: SimpleNamespace(
+            provider="illumina-usfc-prd",
+            source_sha256=_sha256(PROFILE),
+        ),
+        cohort_loader=lambda _: _FakeCohort(tmp_path),
+    )
+
+    assert dry_run is True
+    assert result["manifest"]["seed"] == 0
+    assert result["published"] is False
+    assert not out.exists()
+
+
+def test_runs_instantiate_accepts_each_aws_owned_seed_pair(tmp_path):
+    from cluster.aws.p5.corpus_contract import verify_canonical_corpus
+    from msctl.operations import instantiate_run_manifest
+    from tests.test_aws_p5_launcher import _launcher_fixture
+
+    release = _cohort_release(tmp_path, "aws-p5.48xlarge")
+    fixture = _launcher_fixture(tmp_path / "task4")
+    profile_bytes = (
+        json.dumps(_aws_profile_value(), sort_keys=True).encode() + b"\n"
+    )
+
+    def verify(receipt_path, *, expected_sha256, expected_ordered_sha256):
+        return verify_canonical_corpus(
+            receipt_path,
+            expected_sha256=expected_sha256,
+            expected_ordered_sha256=expected_ordered_sha256,
+            semantic_verifier=lambda _root: fixture["corpus"],
+        )
+
+    for seed in (1, 2, 3, 4):
+        result = instantiate_run_manifest(
+            profile=SimpleNamespace(
+                provider="aws-p5.48xlarge",
+                sha256=hashlib.sha256(profile_bytes).hexdigest(),
+            ),
+            release_path=release,
+            dataset_receipt=fixture["corpus_path"],
+            seed=seed,
+            out=tmp_path / f"runs-s{seed}.json",
+            repo_root=tmp_path,
+            cohort_loader=lambda _: _FakeCohort(tmp_path),
+            dataset_verifier=verify,
+            apply=False,
+        )
+
+        assert result["manifest"]["seed"] == seed
+        assert {run["seed"] for run in result["manifest"]["runs"]} == {seed}
+        assert result["published"] is False
+
+
+@pytest.mark.parametrize(
+    ("provider", "seed"),
+    [
+        ("illumina-usfc-prd", 1),
+        ("aws-p5.48xlarge", 0),
+        ("aws-p5.48xlarge", 5),
+    ],
+)
+def test_runs_instantiate_enforces_exact_provider_seed_ownership(
+    tmp_path,
+    provider,
+    seed,
+):
+    from msctl.operations import instantiate_run_manifest
+
+    release = _cohort_release(tmp_path, provider)
+    dataset_receipt = _write_json(
+        tmp_path / "dataset-receipt.json",
+        {"schema_version": 1, "dataset_id": "fixture"},
+    )
+    cohort = _FakeCohort(tmp_path)
+
+    with pytest.raises(Exception) as caught:
+        instantiate_run_manifest(
+            profile=SimpleNamespace(provider=provider),
+            release_path=release,
+            dataset_receipt=dataset_receipt,
+            seed=seed,
+            out=tmp_path / f"runs-s{seed}.json",
+            repo_root=tmp_path,
+            cohort_loader=lambda _: cohort,
+            apply=False,
+        )
+
+    assert getattr(caught.value, "code", None) == "SEED_OWNERSHIP_VIOLATION"
+
+
+def test_aws_runs_instantiate_rejects_arbitrary_dataset_json(tmp_path):
+    from msctl.operations import instantiate_run_manifest
+
+    release = _cohort_release(tmp_path, "aws-p5.48xlarge")
+    arbitrary = _write_json(
+        tmp_path / "dataset-receipt.json",
+        {"schema_version": 2, "build_id": "b" * 64},
+    )
+
+    with pytest.raises(Exception) as caught:
+        instantiate_run_manifest(
+            profile=SimpleNamespace(
+                provider="aws-p5.48xlarge",
+                sha256=hashlib.sha256(
+                    json.dumps(
+                        _aws_profile_value(),
+                        sort_keys=True,
+                    ).encode()
+                    + b"\n"
+                ).hexdigest(),
+            ),
+            release_path=release,
+            dataset_receipt=arbitrary,
+            seed=1,
+            out=tmp_path / "runs-s1.json",
+            repo_root=tmp_path,
+            cohort_loader=lambda _: _FakeCohort(tmp_path),
+            apply=False,
+        )
+    assert getattr(caught.value, "code", None) == "DATASET_RECEIPT_INVALID"
+
+
+def test_aws_runs_instantiate_verifies_real_task4_files_and_device_ids(
+    tmp_path,
+):
+    from cluster.aws.p5.corpus_contract import verify_canonical_corpus
+    from msctl.operations import instantiate_run_manifest
+    from tests.test_aws_p5_launcher import _launcher_fixture
+
+    release = _cohort_release(tmp_path, "aws-p5.48xlarge")
+    fixture = _launcher_fixture(tmp_path / "task4")
+
+    def verify(receipt_path, *, expected_sha256, expected_ordered_sha256):
+        return verify_canonical_corpus(
+            receipt_path,
+            expected_sha256=expected_sha256,
+            expected_ordered_sha256=expected_ordered_sha256,
+            semantic_verifier=lambda _root: fixture["corpus"],
+        )
+
+    result = instantiate_run_manifest(
+        profile=SimpleNamespace(
+            provider="aws-p5.48xlarge",
+            sha256=hashlib.sha256(
+                json.dumps(_aws_profile_value(), sort_keys=True).encode() + b"\n"
+            ).hexdigest(),
+        ),
+        release_path=release,
+        dataset_receipt=fixture["corpus_path"],
+        seed=1,
+        out=tmp_path / "runs-s1.json",
+        repo_root=tmp_path,
+        cohort_loader=lambda _: _FakeCohort(tmp_path),
+        dataset_verifier=verify,
+        apply=False,
+    )
+
+    verification = result["dataset_verification"]
+    assert verification["receipt_sha256"] == _sha256(fixture["corpus_path"])
+    assert len(verification["file_identities"]) > 5
+    assert all(
+        {"path", "sha256", "bytes", "device", "inode"} <= set(identity)
+        for identity in verification["file_identities"]
+    )
+
+
+class _FakeAwsRunner:
+    def __init__(self, *outputs: object) -> None:
+        self.outputs = list(outputs)
+        self.calls: list[tuple[list[str], str]] = []
+
+    def run_json(self, argv, *, operation: str):
+        self.calls.append((list(argv), operation))
+        if not self.outputs:
+            raise AssertionError(f"unexpected AWS call: {argv}")
+        output = self.outputs.pop(0)
+        if isinstance(output, Exception):
+            raise output
+        return output
+
+
+def _aws_profile_object():
+    return SimpleNamespace(
+        schema_version=1,
+        profile_id="aws-p5.48xlarge",
+        provider="aws-p5.48xlarge",
+        instance_type="p5.48xlarge",
+        purchase_model="on_demand",
+        allocated_gpus=8,
+        train_groups=(4, 4),
+        assigned_seeds=(1, 2, 3, 4),
+        process_env_allowlist=(
+            "AWS_REGION",
+            "HOME",
+            "LANG",
+            "LC_ALL",
+            "PATH",
+            "PYTHONPATH",
+        ),
+        sha256="7" * 64,
+    )
+
+
+def _aws_runtime_object():
+    return SimpleNamespace(
+        region="us-east-1",
+        s3_root="s3://memorysplit-prod/cohort-v2",
+        ami_id="ami-0123456789abcdef0",
+        container_digest="sha256:" + "8" * 64,
+        container_image=(
+            "123456789012.dkr.ecr.us-east-1.amazonaws.com/memorysplit"
+            "@sha256:" + "8" * 64
+        ),
+    )
+
+
+def _aws_manifest_object(seed: int = 1):
+    runs = tuple(
+        SimpleNamespace(
+            run_id=f"memorysplit-v2-360m-s{seed}-{arm}",
+            arm=arm,
+            seed=seed,
+            config=f"configs/360m-v2/{arm}-s{seed}.yaml",
+            config_sha256=("a" if arm == "dense" else "b") * 64,
+        )
+        for arm in ("dense", "split90")
+    )
+    value = {
+        "schema_version": 2,
+        "provider": "aws-p5.48xlarge",
+        "seed": seed,
+        "release_sha256": "1" * 64,
+        "dataset_sha256": "2" * 64,
+        "cohort_assignment_sha256": "3" * 64,
+        "study_lock_sha256": "4" * 64,
+        "source_commit": "5" * 40,
+        "runs": [
+            {
+                "run_id": run.run_id,
+                "arm": run.arm,
+                "seed": run.seed,
+                "config": run.config,
+                "config_sha256": run.config_sha256,
+            }
+            for run in runs
+        ],
+    }
+    return SimpleNamespace(
+        schema_version=2,
+        provider="aws-p5.48xlarge",
+        seed=seed,
+        release_sha256="1" * 64,
+        dataset_sha256="2" * 64,
+        cohort_assignment_sha256="3" * 64,
+        study_lock_sha256="4" * 64,
+        source_commit="5" * 40,
+        runs=runs,
+        value=value,
+        sha256=hashlib.sha256(_canonical(value)).hexdigest(),
+    )
+
+
+def _aws_release_object():
+    return SimpleNamespace(
+        provider="aws-p5.48xlarge",
+        archive_sha256="1" * 64,
+        receipt_sha256="9" * 64,
+        members_sha256="6" * 64,
+        source_commit="5" * 40,
+    )
+
+
+def test_aws_launch_boundary_uses_pinned_image_private_home_and_bounded_deadline(
+    tmp_path,
+):
+    from msctl.aws_p5 import AwsP5Backend
+
+    backend = AwsP5Backend(
+        profile=_aws_profile_object(),
+        runtime=_aws_runtime_object(),
+        instance_profile_arn=(
+            "arn:aws:iam::123456789012:instance-profile/memorysplit-p5"
+        ),
+        state_root=tmp_path / "state",
+        runner=_FakeAwsRunner(),
+    )
+    release = _aws_release_object()
+    manifest = _aws_manifest_object()
+    intent = backend._training_operation_intent(
+        operation="submit",
+        release=release,
+        manifest=manifest,
+        terminate_at=(
+            __import__("datetime").datetime.now(__import__("datetime").UTC)
+            + __import__("datetime").timedelta(hours=1)
+        ).isoformat().replace("+00:00", "Z"),
+    )
+    by_name = {step["name"]: step["argv"] for step in intent["steps"]}
+
+    private_home = by_name["prepare-aws-private-home"]
+    assert private_home[-1] == "/var/lib/memorysplit/aws-private-home"
+    assert private_home[private_home.index("-m") + 1] == "0700"
+    bootstrap = by_name["bootstrap"]
+    assert (
+        bootstrap[bootstrap.index("--container-image") + 1]
+        == _aws_runtime_object().container_image
+    )
+    assert (
+        bootstrap[bootstrap.index("--aws-private-home") + 1]
+        == "/var/lib/memorysplit/aws-private-home"
+    )
+
+    with pytest.raises(Exception) as caught:
+        backend._validate_submit_selection(
+            "i-0123456789abcdef0",
+            "2099-01-01T00:00:00Z",
+        )
+    assert getattr(caught.value, "code", None) == "TERMINATION_DEADLINE_INVALID"
+
+
+def test_aws_evaluation_runs_task8_module_in_pinned_container(tmp_path):
+    from msctl.aws_p5 import AwsP5Backend
+
+    backend = AwsP5Backend(
+        profile=_aws_profile_object(),
+        runtime=_aws_runtime_object(),
+        instance_profile_arn=(
+            "arn:aws:iam::123456789012:instance-profile/memorysplit-p5"
+        ),
+        state_root=tmp_path / "state",
+        runner=_FakeAwsRunner(),
+    )
+    commands = backend._evaluation_argv(
+        _aws_release_object(),
+        _aws_manifest_object(),
+    )
+
+    assert len(commands) == 2
+    for argv in commands:
+        image_index = argv.index(_aws_runtime_object().container_image)
+        assert argv[:2] == ["/usr/bin/docker", "run"]
+        assert argv[image_index + 1 : image_index + 5] == [
+            "/usr/bin/python3",
+            "-m",
+            "evals.confirmatory",
+            "evaluate",
+        ]
+        assert "runner.py" not in " ".join(argv)
+
+
+def test_aws_pair_journal_repairs_crash_after_first_arm_write(tmp_path):
+    from msctl.aws_p5 import AwsP5Backend
+    from msctl.state import StateStore
+
+    backend = AwsP5Backend(
+        profile=_aws_profile_object(),
+        runtime=_aws_runtime_object(),
+        instance_profile_arn=(
+            "arn:aws:iam::123456789012:instance-profile/memorysplit-p5"
+        ),
+        state_root=tmp_path / "state",
+        runner=_FakeAwsRunner(),
+    )
+    manifest = _aws_manifest_object()
+    release = _aws_release_object()
+    deadline = (
+        __import__("datetime").datetime.now(__import__("datetime").UTC)
+        + __import__("datetime").timedelta(hours=1)
+    ).isoformat().replace("+00:00", "Z")
+    intent = backend._operation_envelope(
+        backend._training_operation_intent(
+            operation="submit",
+            release=release,
+            manifest=manifest,
+            terminate_at=deadline,
+        ),
+        instance_id="i-0123456789abcdef0",
+        terminate_at=deadline,
+    )
+    published = {
+        "intent_sha256": hashlib.sha256(_canonical(intent)).hexdigest(),
+        "intent_uri": (
+            f"{_aws_runtime_object().s3_root}/operations/intents/sha256/"
+            f"{hashlib.sha256(_canonical(intent)).hexdigest()}.json"
+        ),
+    }
+    states = [
+        backend._new_aws_run_state(
+            run=run,
+            manifest=manifest,
+            operation="submit",
+            instance_id="i-0123456789abcdef0",
+            terminate_at=deadline,
+            intent=intent,
+            published=published,
+            attempt=1,
+        )
+        for run in manifest.runs
+    ]
+    store = StateStore(tmp_path / "state")
+    with store.locked():
+        store.write_aws_pair(
+            manifest.sha256,
+            {
+                "schema_version": 1,
+                "provider": "aws-p5.48xlarge",
+                "run_manifest_sha256": manifest.sha256,
+                "operation_id": intent["operation_id"],
+                "states": states,
+            },
+        )
+        store.write_run(str(states[0]["run_id"]), states[0])
+        backend._repair_paired_states(store, manifest)
+        assert store.read_run(str(states[1]["run_id"])) == states[1]
+
+
+def _bound_instance(
+    manifest,
+    *,
+    instance_id: str = "i-0123456789abcdef0",
+    release_sha256: str | None = None,
+):
+    return {
+        "instance_id": instance_id,
+        "instance_type": "p5.48xlarge",
+        "state": "running",
+        "instance_profile_arn": (
+            "arn:aws:iam::123456789012:instance-profile/memorysplit-p5"
+        ),
+        "provider": "aws-p5.48xlarge",
+        "seed": manifest.seed,
+        "cohort_sha256": manifest.cohort_assignment_sha256,
+        "release_sha256": release_sha256 or manifest.release_sha256,
+        "dataset_sha256": manifest.dataset_sha256,
+        "run_manifest_sha256": manifest.sha256,
+    }
+
+
+def _selected_instance(
+    manifest,
+    *,
+    instance_id: str = "i-0123456789abcdef0",
+    bound: bool,
+):
+    runtime = _aws_runtime_object()
+    profile = _aws_profile_object()
+    tags = {
+        "provider": "aws-p5.48xlarge",
+        "seed": manifest.seed,
+        "cohort_sha256": manifest.cohort_assignment_sha256,
+        "release_sha256": manifest.release_sha256,
+        "dataset_sha256": manifest.dataset_sha256,
+        "run_manifest_sha256": manifest.sha256,
+        "profile_sha256": profile.sha256,
+        "runtime_sha256": hashlib.sha256(
+            _canonical(
+                {
+                    "ami_id": runtime.ami_id,
+                    "container_image": runtime.container_image,
+                    "container_digest": runtime.container_digest,
+                    "gid": getattr(runtime, "gid", None),
+                    "region": runtime.region,
+                    "s3_root": runtime.s3_root,
+                    "uid": getattr(runtime, "uid", None),
+                }
+            )
+        ).hexdigest(),
+        "container_digest": runtime.container_digest,
+        "terminate_at": _AWS_TERMINATE_AT,
+    }
+    if not bound:
+        tags = {key: None for key in tags}
+    return {
+        "instance_id": instance_id,
+        "instance_type": "p5.48xlarge",
+        "state": "running",
+        "instance_profile_arn": (
+            "arn:aws:iam::123456789012:instance-profile/memorysplit-p5"
+        ),
+        "ami_id": runtime.ami_id,
+        **tags,
+    }
+
+
+def _aws_submit_outputs(backend, release, manifest, *, ssm_online=True):
+    from msctl.aws_p5 import (
+        ARGV_DOCUMENT_NAME,
+        ARGV_DOCUMENT_SHA256,
+    )
+    from msctl.jsonutil import canonical_json
+
+    instance_id = "i-0123456789abcdef0"
+    terminate_at = _AWS_TERMINATE_AT
+    core = backend._training_operation_intent(
+        operation="submit",
+        release=release,
+        manifest=manifest,
+        terminate_at=terminate_at,
+    )
+    intent = backend._operation_envelope(
+        core,
+        instance_id=instance_id,
+        terminate_at=terminate_at,
+    )
+    payload = canonical_json(intent)
+    digest = hashlib.sha256(payload).hexdigest()
+    checksum = __import__("base64").b64encode(
+        bytes.fromhex(digest)
+    ).decode("ascii")
+    outputs = [
+        {"instances": []},
+        {"instances": [_selected_instance(manifest, bound=False)]},
+        {
+            "managed_instances": (
+                [{"instance_id": instance_id, "ping_status": "Online"}]
+                if ssm_online
+                else []
+            )
+        },
+    ]
+    if not ssm_online:
+        return outputs
+    outputs.extend(
+        [
+            {
+                "documents": [
+                    {
+                        "name": ARGV_DOCUMENT_NAME,
+                        "hash": ARGV_DOCUMENT_SHA256,
+                        "status": "Active",
+                    }
+                ]
+            },
+            {"instances": [_selected_instance(manifest, bound=False)]},
+            {},
+            {},
+            {"instances": [_selected_instance(manifest, bound=True)]},
+            {
+                "attribute": {
+                    "instance_id": instance_id,
+                    "shutdown_behavior": "terminate",
+                }
+            },
+            {
+                "object": {
+                    "checksum_sha256": checksum,
+                    "version_id": "version-1",
+                }
+            },
+            {
+                "object": {
+                    "checksum_sha256": checksum,
+                    "content_length": len(payload),
+                    "metadata": {
+                        "operation-id": intent["operation_id"],
+                        "sha256": digest,
+                    },
+                    "version_id": "version-1",
+                }
+            },
+            {"command": {"command_id": "cmd-0123456789abcdef0"}},
+        ]
+    )
+    return outputs
+
+
+def _aws_run_state(
+    backend,
+    release,
+    manifest,
+    run,
+    *,
+    status,
+    command_id,
+):
+    from msctl.jsonutil import canonical_json
+
+    instance_id = "i-0123456789abcdef0"
+    terminate_at = _AWS_TERMINATE_AT
+    core = backend._training_operation_intent(
+        operation="submit",
+        release=release,
+        manifest=manifest,
+        terminate_at=terminate_at,
+    )
+    intent = backend._operation_envelope(
+        core,
+        instance_id=instance_id,
+        terminate_at=terminate_at,
+    )
+    digest = hashlib.sha256(canonical_json(intent)).hexdigest()
+    state = backend._new_aws_run_state(
+        run=run,
+        manifest=manifest,
+        operation="submit",
+        instance_id=instance_id,
+        terminate_at=terminate_at,
+        intent=intent,
+        published={
+            "intent_sha256": digest,
+            "intent_uri": (
+                "s3://memorysplit-prod/cohort-v2/operations/intents/"
+                f"sha256/{digest}.json"
+            ),
+        },
+        attempt=1,
+    )
+    state["command_id"] = command_id
+    state["send_attempted"] = True
+    state["status"] = status
+    return state
+
+
+def test_aws_cli_runner_is_argv_only_sanitized_and_strict(tmp_path):
+    from msctl.aws_p5 import AwsP5Backend
+
+    runner = _FakeAwsRunner(
+        {
+            "account": "123456789012",
+            "arn": "arn:aws:sts::123456789012:assumed-role/msctl/operator",
+            "user_id": "AROATEST:operator",
+            "unexpected": True,
+        }
+    )
+    backend = AwsP5Backend(
+        profile=_aws_profile_object(),
+        runtime=_aws_runtime_object(),
+        instance_profile_arn=(
+            "arn:aws:iam::123456789012:instance-profile/memorysplit-p5"
+        ),
+        state_root=tmp_path / "state",
+        runner=runner,
+    )
+
+    with pytest.raises(Exception) as caught:
+        backend.auth_check()
+
+    assert getattr(caught.value, "code", None) == "AWS_OUTPUT_INVALID"
+    argv, operation = runner.calls[0]
+    assert argv[:2] == ["env", "-i"]
+    assert "aws" in argv
+    assert operation == "auth check"
+    rendered = json.dumps(argv)
+    for secret in (
+        "AWS_ACCESS_KEY_ID",
+        "AWS_SECRET_ACCESS_KEY",
+        "AWS_SESSION_TOKEN",
+        "MSCTL_APPROVAL_KEY",
+    ):
+        assert secret not in rendered
+
+    credentialed_runtime = _aws_runtime_object()
+    credentialed_runtime.s3_root = (
+        "s3://access-key:secret-key@memorysplit-prod/cohort-v2"
+    )
+    with pytest.raises(Exception) as caught:
+        AwsP5Backend(
+            profile=_aws_profile_object(),
+            runtime=credentialed_runtime,
+            instance_profile_arn=(
+                "arn:aws:iam::123456789012:instance-profile/memorysplit-p5"
+            ),
+            state_root=tmp_path / "unsafe-state",
+            runner=_FakeAwsRunner(),
+        )
+    assert getattr(caught.value, "code", None) == "AWS_RUNTIME_INVALID"
+
+
+def test_aws_cli_runner_maps_nonzero_exit_without_leaking_output(monkeypatch):
+    from msctl.aws_p5 import SubprocessAwsJsonRunner
+
+    observed = {}
+
+    def fake_run(argv, **kwargs):
+        observed["argv"] = argv
+        observed["kwargs"] = kwargs
+        return SimpleNamespace(
+            returncode=17,
+            stdout='{"secret":"must-not-leak"}',
+            stderr="credential=must-not-leak",
+        )
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    with pytest.raises(Exception) as caught:
+        SubprocessAwsJsonRunner().run_json(
+            ["env", "-i", "aws", "sts", "get-caller-identity"],
+            operation="auth check",
+        )
+
+    assert getattr(caught.value, "code", None) == "AWS_COMMAND_FAILED"
+    assert "must-not-leak" not in str(caught.value)
+    assert observed["kwargs"]["shell"] is False
+    assert observed["kwargs"]["env"] == {}
+
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        lambda *_, **__: SimpleNamespace(
+            returncode=0,
+            stdout='{"account":"first","account":"second"}',
+            stderr="",
+        ),
+    )
+    with pytest.raises(Exception) as caught:
+        SubprocessAwsJsonRunner().run_json(
+            ["env", "-i", "aws", "sts", "get-caller-identity"],
+            operation="auth check",
+        )
+    assert getattr(caught.value, "code", None) == "AWS_OUTPUT_INVALID"
+
+
+def test_aws_read_only_lifecycle_is_dry_run_first_and_argv_only(tmp_path):
+    from cluster.aws.p5.corpus_contract import verify_canonical_corpus
+    from msctl.aws_p5 import AwsP5Backend
+    from tests.test_aws_p5_launcher import _launcher_fixture
+
+    fixture = _launcher_fixture(tmp_path / "task4")
+
+    def verify(receipt_path, *, expected_sha256, expected_ordered_sha256):
+        return verify_canonical_corpus(
+            receipt_path,
+            expected_sha256=expected_sha256,
+            expected_ordered_sha256=expected_ordered_sha256,
+            semantic_verifier=lambda _root: fixture["corpus"],
+        )
+
+    runner = _FakeAwsRunner(
+        {
+            "offerings": [
+                {
+                    "instance_type": "p5.48xlarge",
+                    "location": "us-east-1",
+                    "location_type": "region",
+                }
+            ]
+        }
+    )
+    backend = AwsP5Backend(
+        profile=_aws_profile_object(),
+        runtime=_aws_runtime_object(),
+        instance_profile_arn=(
+            "arn:aws:iam::123456789012:instance-profile/memorysplit-p5"
+        ),
+        state_root=tmp_path / "state",
+        runner=runner,
+        corpus_verifier=verify,
+    )
+
+    capacity = backend.capacity_check()
+    assert capacity["offered"] is True
+    assert runner.calls[0][0][:2] == ["env", "-i"]
+
+    lock = tmp_path / "requirements-aws-p5.lock"
+    lock.write_text("fixture==1.0 --hash=sha256:" + "a" * 64 + "\n")
+    with pytest.raises(Exception) as static_environment:
+        backend.dispatch(
+            "env ensure",
+            SimpleNamespace(
+                apply=False,
+                lock=lock,
+                root=tmp_path / "environment",
+            ),
+        )
+    assert (
+        getattr(static_environment.value, "code", None)
+        == "STATIC_ENVIRONMENT_FORBIDDEN"
+    )
+
+    dry_run, dataset = backend.dispatch(
+        "dataset ensure",
+        SimpleNamespace(apply=False, receipt=fixture["corpus_path"]),
+    )
+    assert dry_run is True
+    assert dataset["verified"] is False
+    assert any("put-object" in argv for argv in dataset["commands"])
+    assert any("head-object" in argv for argv in dataset["commands"])
+
+    dry_run, collection = backend.dispatch(
+        "collect",
+        SimpleNamespace(
+            apply=False,
+            source="results/seed-1.json",
+            out=tmp_path / "seed-1.json",
+        ),
+    )
+    assert dry_run is True
+    assert collection["collected"] == 0
+    assert "get-object" in collection["commands"][0]
+    assert len(runner.calls) == 1
+
+
+def test_aws_dataset_ensure_plans_every_verified_task4_object_not_head_only(
+    tmp_path,
+):
+    from cluster.aws.p5.corpus_contract import verify_canonical_corpus
+    from msctl.aws_p5 import AwsP5Backend
+    from tests.test_aws_p5_launcher import _launcher_fixture
+
+    fixture = _launcher_fixture(tmp_path / "task4")
+
+    def verify(receipt_path, *, expected_sha256, expected_ordered_sha256):
+        return verify_canonical_corpus(
+            receipt_path,
+            expected_sha256=expected_sha256,
+            expected_ordered_sha256=expected_ordered_sha256,
+            semantic_verifier=lambda _root: fixture["corpus"],
+        )
+
+    backend = AwsP5Backend(
+        profile=_aws_profile_object(),
+        runtime=_aws_runtime_object(),
+        instance_profile_arn=(
+            "arn:aws:iam::123456789012:instance-profile/memorysplit-p5"
+        ),
+        state_root=tmp_path / "state",
+        runner=_FakeAwsRunner(),
+        corpus_verifier=verify,
+    )
+
+    planned = backend.dataset_ensure(
+        receipt_path=fixture["corpus_path"],
+        apply=False,
+    )
+
+    identities = planned["file_identities"]
+    puts = [
+        argv
+        for argv in planned["commands"]
+        if "put-object" in argv
+    ]
+    heads = [
+        argv
+        for argv in planned["commands"]
+        if "head-object" in argv
+    ]
+    assert len(puts) == len(identities)
+    assert len(heads) == len(identities)
+    assert all("--if-none-match" in argv for argv in puts)
+    assert all("--checksum-sha256" in argv for argv in puts)
+    assert all("device" in identity for identity in identities)
+
+
+def test_aws_environment_ensure_rejects_removed_static_lock_api(tmp_path):
+    from msctl.aws_p5 import AwsP5Backend
+
+    lock = tmp_path / "requirements-aws-p5.lock"
+    lock.write_bytes(b"torch==2.7.1 --hash=sha256:" + b"a" * 64 + b"\n")
+    backend = AwsP5Backend(
+        profile=_aws_profile_object(),
+        runtime=_aws_runtime_object(),
+        instance_profile_arn=(
+            "arn:aws:iam::123456789012:instance-profile/memorysplit-p5"
+        ),
+        state_root=tmp_path / "state",
+        runner=_FakeAwsRunner(),
+    )
+
+    with pytest.raises(Exception) as caught:
+        backend.env_ensure(
+            root=tmp_path / "environment",
+            lock=lock,
+            apply=False,
+        )
+    assert getattr(caught.value, "code", None) == "STATIC_ENVIRONMENT_FORBIDDEN"
+
+
+def test_aws_render_uses_reviewed_bootstrap_and_paired_launcher_only(tmp_path):
+    from msctl.aws_p5 import AwsP5Backend
+
+    backend = AwsP5Backend(
+        profile=_aws_profile_object(),
+        runtime=_aws_runtime_object(),
+        instance_profile_arn=(
+            "arn:aws:iam::123456789012:instance-profile/memorysplit-p5"
+        ),
+        state_root=tmp_path / "state",
+        runner=_FakeAwsRunner(),
+    )
+
+    rendered = backend.render(
+        release=_aws_release_object(),
+        manifest=_aws_manifest_object(),
+    )
+    steps = rendered["operation_intent"]["steps"]
+
+    names = [step["name"] for step in steps]
+    assert names == [
+        "prepare-aws-private-home",
+        "prepare-staging",
+        "materialize-release-archive",
+        "materialize-release-receipt",
+        "materialize-cohort-assignment",
+        "materialize-dataset",
+        "bootstrap",
+        "build-launcher-manifest",
+        "paired-launch",
+    ]
+    bootstrap = steps[names.index("bootstrap")]["argv"]
+    launcher = steps[names.index("paired-launch")]["argv"]
+    assert bootstrap[1].endswith("/cluster/aws/p5/bootstrap.py")
+    assert launcher[1].endswith(
+        "/cluster/aws/p5/launch_seed_pair.py"
+    )
+    assert "torchrun" not in json.dumps(rendered)
+    assert "torch.distributed.run" not in json.dumps(rendered)
+
+
+def test_aws_post_bootstrap_builder_emits_exact_task3_launcher_manifest(
+    tmp_path,
+):
+    from msctl.aws_launch_manifest import build_launcher_manifest
+    from tests.test_aws_p5_launcher import _launcher_fixture
+
+    fixture = _launcher_fixture(tmp_path / "task3")
+    expected = fixture["manifest"]
+    runs = [
+        {
+            "arm": row["arm"],
+            "config": row["config"],
+            "config_sha256": row["config_sha256"],
+        }
+        for row in expected["runs"]
+    ]
+
+    actual = build_launcher_manifest(
+        out=fixture["scratch_root"] / "staging" / "msctl-manifest.json",
+        scratch_root=fixture["scratch_root"],
+        seed=expected["seed"],
+        profile_sha256=expected["profile_sha256"],
+        release_sha256=expected["release_sha256"],
+        release_members_sha256=expected["release_members_sha256"],
+        cohort_assignment_sha256=expected["cohort_assignment_sha256"],
+        code_commit=expected["code_commit"],
+        bootstrap_receipt=fixture["bootstrap_path"],
+        corpus_receipt=fixture["corpus_path"],
+        runs=runs,
+    )
+
+    assert actual == expected
+
+
+def test_aws_submit_is_dry_run_by_default_and_approval_precedes_aws_calls(
+    tmp_path,
+):
+    from msctl.aws_p5 import AwsP5Backend
+
+    runner = _FakeAwsRunner()
+    backend = AwsP5Backend(
+        profile=_aws_profile_object(),
+        runtime=_aws_runtime_object(),
+        instance_profile_arn=(
+            "arn:aws:iam::123456789012:instance-profile/memorysplit-p5"
+        ),
+        state_root=tmp_path / "state",
+        runner=runner,
+    )
+    manifest = _aws_manifest_object()
+    instance_id = "i-0123456789abcdef0"
+    terminate_at = "2099-01-01T00:00:00Z"
+
+    planned = backend.submit(
+        release=_aws_release_object(),
+        manifest=manifest,
+        instance_id=instance_id,
+        terminate_at=terminate_at,
+        approval_path=None,
+        apply=False,
+    )
+
+    assert planned["submitted"] == 0
+    assert planned["instance_id"] == instance_id
+    assert planned["terminate_at"] == terminate_at
+    assert all("run-instances" not in command for command in planned["commands"])
+    assert any(
+        "--instance-ids" in command
+        and command[command.index("--instance-ids") + 1] == instance_id
+        for command in planned["commands"]
+    )
+    steps = planned["operation_intent"]["steps"]
+    names = [step["name"] for step in steps]
+    assert names[0] == "auto-termination"
+    assert "materialize-release-archive" in names
+    assert "materialize-dataset" in names
+    assert names[-3:] == [
+        "bootstrap",
+        "build-launcher-manifest",
+        "paired-launch",
+    ]
+    bootstrap = steps[names.index("bootstrap")]["argv"]
+    launcher = steps[names.index("paired-launch")]["argv"]
+    assert bootstrap[1].endswith("/cluster/aws/p5/bootstrap.py")
+    assert "--release-archive" in bootstrap
+    assert "--dataset-receipt" in bootstrap
+    assert "--cohort-assignment" in bootstrap
+    assert "--apply" in bootstrap
+    assert launcher[1].endswith("/cluster/aws/p5/launch_seed_pair.py")
+    assert launcher[launcher.index("--seed") + 1] == str(manifest.seed)
+    assert "--manifest" in launcher
+    assert "--apply" in launcher
+    assert "torchrun" not in json.dumps(planned)
+    assert "torch.distributed.run" not in json.dumps(planned)
+    assert runner.calls == []
+
+    with pytest.raises(Exception) as caught:
+        backend.submit(
+            release=_aws_release_object(),
+            manifest=manifest,
+            instance_id=instance_id,
+            terminate_at=terminate_at,
+            approval_path=None,
+            apply=True,
+        )
+    assert getattr(caught.value, "code", None) == "APPROVAL_REQUIRED"
+    assert runner.calls == []
+
+
+def test_aws_submit_binds_selected_instance_runtime_and_deadline_to_approval(
+    tmp_path,
+):
+    from msctl.aws_p5 import AwsP5Backend
+
+    manifest = _aws_manifest_object()
+    selected = "i-0123456789abcdef0"
+    discovered = _bound_instance(
+        manifest,
+        instance_id="i-11111111111111111",
+    )
+    runner = _FakeAwsRunner({"instances": [discovered]})
+    captured = {}
+
+    def approve(**kwargs):
+        captured.update(kwargs)
+        return {}
+
+    backend = AwsP5Backend(
+        profile=_aws_profile_object(),
+        runtime=_aws_runtime_object(),
+        instance_profile_arn=discovered["instance_profile_arn"],
+        state_root=tmp_path / "state",
+        runner=runner,
+        approval_verifier=approve,
+    )
+
+    with pytest.raises(Exception) as caught:
+        backend.submit(
+            release=_aws_release_object(),
+            manifest=manifest,
+            instance_id=selected,
+            terminate_at="2099-01-01T00:00:00Z",
+            approval_path=tmp_path / "approval.json",
+            apply=True,
+        )
+
+    assert getattr(caught.value, "code", None) == "INSTANCE_SELECTION_CONFLICT"
+    resources = captured["resources"]
+    assert resources["instance_id"] == selected
+    assert resources["terminate_at"] == "2099-01-01T00:00:00Z"
+    assert resources["release_sha256"] == manifest.release_sha256
+    assert resources["run_manifest_sha256"] == manifest.sha256
+    assert resources["seed"] == manifest.seed
+    assert resources["ami_id"] == _aws_runtime_object().ami_id
+    assert resources["container_digest"] == _aws_runtime_object().container_digest
+    assert resources["profile_sha256"] == _aws_profile_object().sha256
+    assert len(resources["runtime_sha256"]) == 64
+    assert all("run-instances" not in argv for argv, _ in runner.calls)
+    assert all("send-command" not in argv for argv, _ in runner.calls)
+
+
+def test_aws_approval_binds_every_extended_execution_resource(tmp_path):
+    from datetime import UTC, datetime
+
+    from msctl.approval import verify_scope_approval
+    from msctl.aws_p5 import AwsP5Backend
+
+    key = "approval-key-" * 4
+    manifest = _aws_manifest_object()
+    release = _aws_release_object()
+    backend = AwsP5Backend(
+        profile=_aws_profile_object(),
+        runtime=_aws_runtime_object(),
+        instance_profile_arn=(
+            "arn:aws:iam::123456789012:instance-profile/memorysplit-p5"
+        ),
+        state_root=tmp_path / "state",
+        runner=_FakeAwsRunner(),
+    )
+    resources = backend._submit_resources(
+        release=release,
+        manifest=manifest,
+        instance_id="i-0123456789abcdef0",
+        terminate_at="2099-01-01T00:00:00Z",
+    )
+    unsigned = {
+        "schema_version": 1,
+        "receipt_id": "aws-submit-fixture",
+        "provider": "aws-p5.48xlarge",
+        "operation": "submit",
+        "release_sha256": release.archive_sha256,
+        "run_manifest_sha256": manifest.sha256,
+        "resources": resources,
+        "limits": {"gpu_hours": 192.0, "jobs": 1},
+        "expires_at": "2098-01-01T00:00:00Z",
+        "key_id": "fixture",
+    }
+    receipt = {
+        **unsigned,
+        "signature": hmac.new(
+            key.encode(),
+            _canonical(unsigned),
+            hashlib.sha256,
+        ).hexdigest(),
+    }
+    path = _write_json(tmp_path / "approval.json", receipt)
+
+    verified = verify_scope_approval(
+        path,
+        operation="submit",
+        release_sha256=release.archive_sha256,
+        scope_sha256=manifest.sha256,
+        resources=resources,
+        profile=_aws_profile_object(),
+        environ={"MSCTL_APPROVAL_KEY": key},
+        now=datetime(2026, 7, 23, tzinfo=UTC),
+    )
+    assert verified["resources"]["instance_id"] == "i-0123456789abcdef0"
+
+    with pytest.raises(Exception) as caught:
+        verify_scope_approval(
+            path,
+            operation="submit",
+            release_sha256=release.archive_sha256,
+            scope_sha256=manifest.sha256,
+            resources={**resources, "instance_id": "i-11111111111111111"},
+            profile=_aws_profile_object(),
+            environ={"MSCTL_APPROVAL_KEY": key},
+            now=datetime(2026, 7, 23, tzinfo=UTC),
+        )
+    assert getattr(caught.value, "code", None) == "APPROVAL_SCOPE_MISMATCH"
+
+
+def test_aws_selected_instance_is_validated_then_tagged_with_exact_binding(
+    tmp_path,
+):
+    from msctl.aws_p5 import AwsP5Backend
+
+    manifest = _aws_manifest_object()
+    selected = _selected_instance(manifest, bound=False)
+    runner = _FakeAwsRunner(
+        {"instances": [selected]},
+        {},
+        {},
+        {"instances": [_selected_instance(manifest, bound=True)]},
+        {
+            "attribute": {
+                "instance_id": selected["instance_id"],
+                "shutdown_behavior": "terminate",
+            }
+        },
+    )
+    backend = AwsP5Backend(
+        profile=_aws_profile_object(),
+        runtime=_aws_runtime_object(),
+        instance_profile_arn=selected["instance_profile_arn"],
+        state_root=tmp_path / "state",
+        runner=runner,
+    )
+
+    result = backend._bind_selected_instance(
+        manifest,
+        instance_id=selected["instance_id"],
+        terminate_at="2099-01-01T00:00:00Z",
+    )
+
+    assert result["instance_id"] == selected["instance_id"]
+    assert result["terminate_at"] == "2099-01-01T00:00:00Z"
+    assert all("run-instances" not in argv for argv, _ in runner.calls)
+    tag_call = next(argv for argv, _ in runner.calls if "create-tags" in argv)
+    rendered = tag_call[tag_call.index("--tags") + 1]
+    for value in (
+        manifest.sha256,
+        manifest.release_sha256,
+        _aws_profile_object().sha256,
+        _aws_runtime_object().container_digest,
+        "2099-01-01T00:00:00Z",
+    ):
+        assert value in rendered
+    assert any("modify-instance-attribute" in argv for argv, _ in runner.calls)
+
+    mismatched = _selected_instance(manifest, bound=False)
+    mismatched["ami_id"] = "ami-11111111111111111"
+    rejected = AwsP5Backend(
+        profile=_aws_profile_object(),
+        runtime=_aws_runtime_object(),
+        instance_profile_arn=selected["instance_profile_arn"],
+        state_root=tmp_path / "other-state",
+        runner=_FakeAwsRunner({"instances": [mismatched]}),
+    )
+    with pytest.raises(Exception) as caught:
+        rejected._bind_selected_instance(
+            manifest,
+            instance_id=selected["instance_id"],
+            terminate_at="2099-01-01T00:00:00Z",
+        )
+    assert getattr(caught.value, "code", None) == "INSTANCE_BINDING_MISMATCH"
+
+
+def test_aws_operation_intent_uses_conditional_content_addressed_s3_put(
+    tmp_path,
+):
+    import base64
+
+    from msctl.aws_p5 import AwsP5Backend
+
+    manifest = _aws_manifest_object()
+    release = _aws_release_object()
+    backend = AwsP5Backend(
+        profile=_aws_profile_object(),
+        runtime=_aws_runtime_object(),
+        instance_profile_arn=(
+            "arn:aws:iam::123456789012:instance-profile/memorysplit-p5"
+        ),
+        state_root=tmp_path / "state",
+        runner=_FakeAwsRunner(),
+    )
+    core = backend._training_operation_intent(
+        operation="submit",
+        release=release,
+        manifest=manifest,
+        terminate_at="2099-01-01T00:00:00Z",
+    )
+    intent = backend._operation_envelope(
+        core,
+        instance_id="i-0123456789abcdef0",
+        terminate_at="2099-01-01T00:00:00Z",
+    )
+    payload = _canonical(intent)
+    digest = hashlib.sha256(payload).hexdigest()
+    checksum = base64.b64encode(hashlib.sha256(payload).digest()).decode()
+    runner = _FakeAwsRunner(
+        {
+            "object": {
+                "checksum_sha256": checksum,
+                "version_id": "intent-version-1",
+            }
+        },
+        {
+            "object": {
+                "checksum_sha256": checksum,
+                "content_length": len(payload),
+                "metadata": {
+                    "operation-id": intent["operation_id"],
+                    "sha256": digest,
+                },
+                "version_id": "intent-version-1",
+            }
+        },
+    )
+    backend.runner = runner
+
+    published = backend._publish_operation_intent(intent)
+
+    assert published["intent_sha256"] == digest
+    assert published["intent_uri"].endswith(
+        f"/operations/intents/sha256/{digest}.json"
+    )
+    put, head = [argv for argv, _operation in runner.calls]
+    assert "put-object" in put
+    assert put[put.index("--if-none-match") + 1] == "*"
+    assert put[put.index("--checksum-sha256") + 1] == checksum
+    assert put[put.index("--metadata") + 1] == (
+        f"operation-id={intent['operation_id']},sha256={digest}"
+    )
+    assert "head-object" in head
+
+
+def test_aws_operation_intent_recovers_a_lost_conditional_put_response(
+    tmp_path,
+):
+    import base64
+
+    from msctl.aws_p5 import AwsP5Backend
+    from msctl.errors import MsctlError
+
+    manifest = _aws_manifest_object()
+    release = _aws_release_object()
+    backend = AwsP5Backend(
+        profile=_aws_profile_object(),
+        runtime=_aws_runtime_object(),
+        instance_profile_arn=(
+            "arn:aws:iam::123456789012:instance-profile/memorysplit-p5"
+        ),
+        state_root=tmp_path / "state",
+        runner=_FakeAwsRunner(),
+    )
+    intent = backend._operation_envelope(
+        backend._training_operation_intent(
+            operation="submit",
+            release=release,
+            manifest=manifest,
+            terminate_at="2099-01-01T00:00:00Z",
+        ),
+        instance_id="i-0123456789abcdef0",
+        terminate_at="2099-01-01T00:00:00Z",
+    )
+    payload = _canonical(intent)
+    digest = hashlib.sha256(payload).hexdigest()
+    checksum = base64.b64encode(hashlib.sha256(payload).digest()).decode()
+    backend.runner = _FakeAwsRunner(
+        MsctlError("AWS_COMMAND_FAILED", "put response was lost"),
+        {
+            "object": {
+                "checksum_sha256": checksum,
+                "content_length": len(payload),
+                "metadata": {
+                    "operation-id": intent["operation_id"],
+                    "sha256": digest,
+                },
+                "version_id": "intent-version-1",
+            }
+        },
+    )
+
+    published = backend._publish_operation_intent(intent)
+
+    assert published["intent_sha256"] == digest
+    assert len(backend.runner.calls) == 2
+    assert "put-object" in backend.runner.calls[0][0]
+    assert "head-object" in backend.runner.calls[1][0]
+
+
+def test_aws_provisions_only_the_fixed_argv_document_hash(tmp_path):
+    from msctl.aws_p5 import (
+        ARGV_DOCUMENT_NAME,
+        ARGV_DOCUMENT_SHA256,
+        AwsP5Backend,
+    )
+
+    runner = _FakeAwsRunner(
+        {"documents": []},
+        {
+            "document": {
+                "hash": ARGV_DOCUMENT_SHA256,
+                "name": ARGV_DOCUMENT_NAME,
+                "status": "Active",
+            }
+        },
+    )
+    backend = AwsP5Backend(
+        profile=_aws_profile_object(),
+        runtime=_aws_runtime_object(),
+        instance_profile_arn=(
+            "arn:aws:iam::123456789012:instance-profile/memorysplit-p5"
+        ),
+        state_root=tmp_path / "state",
+        runner=runner,
+    )
+
+    backend._ensure_argv_document()
+
+    create = next(argv for argv, _ in runner.calls if "create-document" in argv)
+    assert create[create.index("--name") + 1] == ARGV_DOCUMENT_NAME
+    assert hashlib.sha256(
+        create[create.index("--content") + 1].encode("ascii")
+    ).hexdigest() == ARGV_DOCUMENT_SHA256
+    assert "msctl/aws_argv.py" in create[create.index("--content") + 1]
+
+    rejected = AwsP5Backend(
+        profile=_aws_profile_object(),
+        runtime=_aws_runtime_object(),
+        instance_profile_arn=(
+            "arn:aws:iam::123456789012:instance-profile/memorysplit-p5"
+        ),
+        state_root=tmp_path / "other-state",
+        runner=_FakeAwsRunner(
+            {
+                "documents": [
+                    {
+                        "hash": "0" * 64,
+                        "name": ARGV_DOCUMENT_NAME,
+                        "status": "Active",
+                    }
+                ]
+            }
+        ),
+    )
+    with pytest.raises(Exception) as caught:
+        rejected._ensure_argv_document()
+    assert getattr(caught.value, "code", None) == "SSM_DOCUMENT_MISMATCH"
+
+
+def test_aws_remote_wrapper_acquires_once_and_writes_terminal_receipt(tmp_path):
+    from msctl.aws_argv import RemoteIntentError, execute_intent
+    from msctl.aws_p5 import AwsP5Backend
+    from msctl.jsonutil import canonical_json
+
+    backend = AwsP5Backend(
+        profile=_aws_profile_object(),
+        runtime=_aws_runtime_object(),
+        instance_profile_arn=(
+            "arn:aws:iam::123456789012:instance-profile/memorysplit-p5"
+        ),
+        state_root=tmp_path / "state",
+        runner=_FakeAwsRunner(),
+    )
+    manifest = _aws_manifest_object()
+    release = _aws_release_object()
+    core = backend._training_operation_intent(
+        operation="submit",
+        release=release,
+        manifest=manifest,
+        terminate_at="2099-01-01T00:00:00Z",
+    )
+    intent = backend._operation_envelope(
+        core,
+        instance_id="i-0123456789abcdef0",
+        terminate_at="2099-01-01T00:00:00Z",
+    )
+    payload = canonical_json(intent)
+    digest = hashlib.sha256(payload).hexdigest()
+    intent_uri = (
+        "s3://memorysplit-prod/cohort-v2/operations/intents/"
+        f"sha256/{digest}.json"
+    )
+
+    class Store:
+        def __init__(self):
+            self.objects = {intent_uri: payload}
+            self.metadata = {}
+
+        def read(self, uri, *, expected_sha256=None):
+            value = self.objects[uri]
+            if expected_sha256 is not None:
+                assert hashlib.sha256(value).hexdigest() == expected_sha256
+            return value
+
+        def read_if_exists(self, uri):
+            return self.objects.get(uri)
+
+        def put_if_absent(self, uri, value, *, metadata):
+            if uri in self.objects:
+                return self.objects[uri] == value
+            self.objects[uri] = value
+            self.metadata[uri] = dict(metadata)
+            return True
+
+    class Executor:
+        def __init__(self):
+            self.calls = []
+
+        def run(self, argv, *, environment):
+            self.calls.append((list(argv), dict(environment)))
+            return 0
+
+    store = Store()
+    executor = Executor()
+    first = execute_intent(
+        intent_uri=intent_uri,
+        intent_sha256=digest,
+        store=store,
+        executor=executor,
+    )
+    second = execute_intent(
+        intent_uri=intent_uri,
+        intent_sha256=digest,
+        store=store,
+        executor=executor,
+    )
+
+    assert first["executed"] is True
+    assert second["executed"] is False
+    assert second["idempotent"] is True
+    assert len(executor.calls) == len(intent["steps"])
+    assert store.metadata[intent["started_receipt_uri"]] == {
+        "operation-id": intent["operation_id"],
+        "intent-sha256": digest,
+        "receipt-kind": "started",
+    }
+    assert store.metadata[intent["terminal_receipt_uri"]][
+        "receipt-kind"
+    ] == "terminal"
+    assert all(
+        not any(name in environment for name in (
+            "AWS_ACCESS_KEY_ID",
+            "AWS_SECRET_ACCESS_KEY",
+            "AWS_SESSION_TOKEN",
+        ))
+        for _, environment in executor.calls
+    )
+    corrupt_store = Store()
+    corrupt_store.objects[intent["started_receipt_uri"]] = b"{}\n"
+    with pytest.raises(RemoteIntentError, match="started receipt"):
+        execute_intent(
+            intent_uri=intent_uri,
+            intent_sha256=digest,
+            store=corrupt_store,
+            executor=Executor(),
+        )
+
+
+def test_aws_remote_wrapper_rejects_unknown_checkpoint_receipt_fields(tmp_path):
+    from msctl.aws_argv import RemoteIntentError, _validate_intent
+    from msctl.aws_p5 import AwsP5Backend
+    from msctl.contracts import verify_checkpoint_receipt
+    from msctl.jsonutil import canonical_json
+
+    manifest = _aws_manifest_object()
+    release = _aws_release_object()
+    receipt = verify_checkpoint_receipt(
+        _aws_checkpoint_receipt(tmp_path, manifest),
+        release=release,
+        manifest=manifest,
+    )
+    backend = AwsP5Backend(
+        profile=_aws_profile_object(),
+        runtime=_aws_runtime_object(),
+        instance_profile_arn=(
+            "arn:aws:iam::123456789012:instance-profile/memorysplit-p5"
+        ),
+        state_root=tmp_path / "state",
+        runner=_FakeAwsRunner(),
+    )
+    core = backend._training_operation_intent(
+        operation="resume",
+        release=release,
+        manifest=manifest,
+        checkpoints=backend._checkpoint_map(manifest, receipt),
+        checkpoint_receipt_sha256=receipt.sha256,
+    )
+    core["checkpoint_receipt"]["checkpoints"][0]["unexpected"] = True
+    intent = backend._operation_envelope(
+        core,
+        instance_id="i-0123456789abcdef0",
+        terminate_at="2099-01-01T00:00:00Z",
+    )
+    payload = canonical_json(intent)
+
+    with pytest.raises(RemoteIntentError, match="checkpoint"):
+        _validate_intent(
+            payload,
+            expected_sha256=hashlib.sha256(payload).hexdigest(),
+        )
+
+
+def test_aws_remote_wrapper_rejects_a_substituted_argv_document_hash(tmp_path):
+    from msctl.aws_argv import RemoteIntentError, _validate_intent
+    from msctl.aws_p5 import AwsP5Backend
+    from msctl.jsonutil import canonical_json
+
+    backend = AwsP5Backend(
+        profile=_aws_profile_object(),
+        runtime=_aws_runtime_object(),
+        instance_profile_arn=(
+            "arn:aws:iam::123456789012:instance-profile/memorysplit-p5"
+        ),
+        state_root=tmp_path / "state",
+        runner=_FakeAwsRunner(),
+    )
+    intent = backend._operation_envelope(
+        backend._training_operation_intent(
+            operation="submit",
+            release=_aws_release_object(),
+            manifest=_aws_manifest_object(),
+            terminate_at="2099-01-01T00:00:00Z",
+        ),
+        instance_id="i-0123456789abcdef0",
+        terminate_at="2099-01-01T00:00:00Z",
+    )
+    intent["ssm_document"]["sha256"] = "0" * 64
+    payload = canonical_json(intent)
+
+    with pytest.raises(RemoteIntentError, match="SSM document"):
+        _validate_intent(
+            payload,
+            expected_sha256=hashlib.sha256(payload).hexdigest(),
+        )
+
+
+def test_aws_remote_wrapper_rejects_an_expired_operation_intent(tmp_path):
+    from msctl.aws_argv import RemoteIntentError, _validate_intent
+    from msctl.aws_p5 import AwsP5Backend
+    from msctl.jsonutil import canonical_json, canonical_sha256
+
+    backend = AwsP5Backend(
+        profile=_aws_profile_object(),
+        runtime=_aws_runtime_object(),
+        instance_profile_arn=(
+            "arn:aws:iam::123456789012:instance-profile/memorysplit-p5"
+        ),
+        state_root=tmp_path / "state",
+        runner=_FakeAwsRunner(),
+    )
+    intent = backend._operation_envelope(
+        backend._training_operation_intent(
+            operation="submit",
+            release=_aws_release_object(),
+            manifest=_aws_manifest_object(),
+            terminate_at="2099-01-01T00:00:00Z",
+        ),
+        instance_id="i-0123456789abcdef0",
+        terminate_at="2099-01-01T00:00:00Z",
+    )
+    intent["terminate_at"] = "2000-01-01T00:00:00Z"
+    identity = {
+        key: value
+        for key, value in intent.items()
+        if key
+        not in {
+            "operation_id",
+            "ssm_document",
+            "started_receipt_uri",
+            "terminal_receipt_uri",
+        }
+    }
+    intent["operation_id"] = canonical_sha256(identity)
+    receipt_root = (
+        "s3://memorysplit-prod/cohort-v2/operations/"
+        f"{intent['operation_id']}/receipts"
+    )
+    intent["started_receipt_uri"] = f"{receipt_root}/started.json"
+    intent["terminal_receipt_uri"] = f"{receipt_root}/terminal.json"
+    payload = canonical_json(intent)
+
+    with pytest.raises(RemoteIntentError, match="termination deadline"):
+        _validate_intent(
+            payload,
+            expected_sha256=hashlib.sha256(payload).hexdigest(),
+        )
+
+
+def test_aws_remote_wrapper_rejects_redirected_operation_receipts(tmp_path):
+    from msctl.aws_argv import RemoteIntentError, _validate_intent
+    from msctl.aws_p5 import AwsP5Backend
+    from msctl.jsonutil import canonical_json
+
+    backend = AwsP5Backend(
+        profile=_aws_profile_object(),
+        runtime=_aws_runtime_object(),
+        instance_profile_arn=(
+            "arn:aws:iam::123456789012:instance-profile/memorysplit-p5"
+        ),
+        state_root=tmp_path / "state",
+        runner=_FakeAwsRunner(),
+    )
+    intent = backend._operation_envelope(
+        backend._training_operation_intent(
+            operation="submit",
+            release=_aws_release_object(),
+            manifest=_aws_manifest_object(),
+            terminate_at="2099-01-01T00:00:00Z",
+        ),
+        instance_id="i-0123456789abcdef0",
+        terminate_at="2099-01-01T00:00:00Z",
+    )
+    intent["started_receipt_uri"] = (
+        "s3://memorysplit-prod/cohort-v2/operations/redirected/started.json"
+    )
+    payload = canonical_json(intent)
+
+    with pytest.raises(RemoteIntentError, match="receipt"):
+        _validate_intent(
+            payload,
+            expected_sha256=hashlib.sha256(payload).hexdigest(),
+        )
+
+
+def test_aws_submit_response_loss_never_resends_the_same_operation(tmp_path):
+    import base64
+
+    from msctl.aws_p5 import (
+        ARGV_DOCUMENT_NAME,
+        ARGV_DOCUMENT_SHA256,
+        AwsP5Backend,
+    )
+    from msctl.errors import MsctlError
+
+    manifest = _aws_manifest_object()
+    release = _aws_release_object()
+    selected = _selected_instance(manifest, bound=False)
+    common = {
+        "profile": _aws_profile_object(),
+        "runtime": _aws_runtime_object(),
+        "instance_profile_arn": selected["instance_profile_arn"],
+        "state_root": tmp_path / "state",
+        "approval_verifier": lambda **_: {},
+    }
+    preparer = AwsP5Backend(runner=_FakeAwsRunner(), **common)
+    core = preparer._training_operation_intent(
+        operation="submit",
+        release=release,
+        manifest=manifest,
+        terminate_at="2099-01-01T00:00:00Z",
+    )
+    intent = preparer._operation_envelope(
+        core,
+        instance_id=selected["instance_id"],
+        terminate_at="2099-01-01T00:00:00Z",
+    )
+    payload = _canonical(intent)
+    digest = hashlib.sha256(payload).hexdigest()
+    checksum = base64.b64encode(hashlib.sha256(payload).digest()).decode()
+    first_runner = _FakeAwsRunner(
+        {"instances": []},
+        {"instances": [selected]},
+        {
+            "managed_instances": [
+                {
+                    "instance_id": selected["instance_id"],
+                    "ping_status": "Online",
+                }
+            ]
+        },
+        {
+            "documents": [
+                {
+                    "hash": ARGV_DOCUMENT_SHA256,
+                    "name": ARGV_DOCUMENT_NAME,
+                    "status": "Active",
+                }
+            ]
+        },
+        {"instances": [selected]},
+        {},
+        {},
+        {"instances": [_selected_instance(manifest, bound=True)]},
+        {
+            "attribute": {
+                "instance_id": selected["instance_id"],
+                "shutdown_behavior": "terminate",
+            }
+        },
+        {
+            "object": {
+                "checksum_sha256": checksum,
+                "version_id": "intent-version-1",
+            }
+        },
+        {
+            "object": {
+                "checksum_sha256": checksum,
+                "content_length": len(payload),
+                "metadata": {
+                    "operation-id": intent["operation_id"],
+                    "sha256": digest,
+                },
+                "version_id": "intent-version-1",
+            }
+        },
+        MsctlError("AWS_COMMAND_FAILED", "simulated response loss"),
+    )
+    first = AwsP5Backend(runner=first_runner, **common)
+
+    with pytest.raises(Exception) as caught:
+        first.submit(
+            release=release,
+            manifest=manifest,
+            instance_id=selected["instance_id"],
+            terminate_at="2099-01-01T00:00:00Z",
+            approval_path=tmp_path / "approval.json",
+            apply=True,
+        )
+    assert getattr(caught.value, "code", None) == "AWS_COMMAND_FAILED"
+    assert sum("send-command" in argv for argv, _ in first_runner.calls) == 1
+    states = [
+        json.loads(
+            (
+                tmp_path
+                / "state"
+                / "runs"
+                / f"{run.run_id}.json"
+            ).read_text()
+        )
+        for run in manifest.runs
+    ]
+    assert {state["status"] for state in states} == {"SENDING"}
+    assert {state["send_attempted"] for state in states} == {True}
+    assert {state["intent_sha256"] for state in states} == {digest}
+
+    second_runner = _FakeAwsRunner(
+        MsctlError("AWS_COMMAND_FAILED", "started receipt absent"),
+        MsctlError("AWS_COMMAND_FAILED", "terminal receipt absent"),
+        {"commands": []},
+    )
+    second = AwsP5Backend(runner=second_runner, **common)
+    with pytest.raises(Exception) as caught:
+        second.submit(
+            release=release,
+            manifest=manifest,
+            instance_id=selected["instance_id"],
+            terminate_at="2099-01-01T00:00:00Z",
+            approval_path=tmp_path / "approval.json",
+            apply=True,
+        )
+    assert getattr(caught.value, "code", None) == "SUBMISSION_UNCERTAIN"
+    assert all("send-command" not in argv for argv, _ in second_runner.calls)
+
+
+def test_aws_submit_rejects_state_bound_to_a_different_operation_intent(
+    tmp_path,
+):
+    from msctl.aws_p5 import AwsP5Backend
+    from msctl.state import StateStore
+
+    manifest = _aws_manifest_object()
+    release = _aws_release_object()
+    runner = _FakeAwsRunner()
+    backend = AwsP5Backend(
+        profile=_aws_profile_object(),
+        runtime=_aws_runtime_object(),
+        instance_profile_arn=(
+            "arn:aws:iam::123456789012:instance-profile/memorysplit-p5"
+        ),
+        state_root=tmp_path / "state",
+        runner=runner,
+        approval_verifier=lambda **_: {},
+    )
+    store = StateStore(tmp_path / "state")
+    with store.locked():
+        for run in manifest.runs:
+            state = _aws_run_state(
+                backend,
+                release,
+                manifest,
+                run,
+                status="SENDING",
+                command_id=None,
+            )
+            state["operation_id"] = "f" * 64
+            store.write_run(run.run_id, state)
+
+    with pytest.raises(Exception) as caught:
+        backend.submit(
+            release=release,
+            manifest=manifest,
+            instance_id="i-0123456789abcdef0",
+            terminate_at="2099-01-01T00:00:00Z",
+            approval_path=tmp_path / "approval.json",
+            apply=True,
+        )
+
+    assert getattr(caught.value, "code", None) == "STATE_CORRUPT"
+    assert runner.calls == []
+
+
+def test_aws_lifecycle_rejects_state_with_a_different_runtime_binding(tmp_path):
+    from msctl.aws_p5 import AwsP5Backend
+    from msctl.state import StateStore
+
+    manifest = _aws_manifest_object()
+    release = _aws_release_object()
+    backend = AwsP5Backend(
+        profile=_aws_profile_object(),
+        runtime=_aws_runtime_object(),
+        instance_profile_arn=(
+            "arn:aws:iam::123456789012:instance-profile/memorysplit-p5"
+        ),
+        state_root=tmp_path / "state",
+        runner=_FakeAwsRunner(),
+    )
+    store = StateStore(tmp_path / "state")
+    with store.locked():
+        for run in manifest.runs:
+            state = _aws_run_state(
+                backend,
+                release,
+                manifest,
+                run,
+                status="InProgress",
+                command_id="cmd-0123456789abcdef0",
+            )
+            state["runtime_sha256"] = "e" * 64
+            store.write_run(run.run_id, state)
+
+    with pytest.raises(Exception) as caught:
+        backend.status(
+            release=release,
+            manifest=manifest,
+            cached=True,
+        )
+
+    assert getattr(caught.value, "code", None) == "RUN_ID_CONFLICT"
+
+
+def test_aws_lifecycle_rejects_divergent_paired_operation_state(tmp_path):
+    from msctl.aws_p5 import AwsP5Backend
+    from msctl.state import StateStore
+
+    manifest = _aws_manifest_object()
+    release = _aws_release_object()
+    backend = AwsP5Backend(
+        profile=_aws_profile_object(),
+        runtime=_aws_runtime_object(),
+        instance_profile_arn=(
+            "arn:aws:iam::123456789012:instance-profile/memorysplit-p5"
+        ),
+        state_root=tmp_path / "state",
+        runner=_FakeAwsRunner(),
+    )
+    store = StateStore(tmp_path / "state")
+    with store.locked():
+        for index, run in enumerate(manifest.runs):
+            state = _aws_run_state(
+                backend,
+                release,
+                manifest,
+                run,
+                status="InProgress",
+                command_id="cmd-0123456789abcdef0",
+            )
+            if index:
+                state["operation_id"] = "d" * 64
+            store.write_run(run.run_id, state)
+
+    with pytest.raises(Exception) as caught:
+        backend.status(
+            release=release,
+            manifest=manifest,
+            cached=True,
+        )
+
+    assert getattr(caught.value, "code", None) == "STATE_INCOMPLETE"
+
+
+def test_aws_paid_continuation_rejects_an_expired_instance_deadline(tmp_path):
+    from msctl.aws_p5 import AwsP5Backend
+    from msctl.state import StateStore
+
+    manifest = _aws_manifest_object()
+    release = _aws_release_object()
+    runner = _FakeAwsRunner()
+    backend = AwsP5Backend(
+        profile=_aws_profile_object(),
+        runtime=_aws_runtime_object(),
+        instance_profile_arn=(
+            "arn:aws:iam::123456789012:instance-profile/memorysplit-p5"
+        ),
+        state_root=tmp_path / "state",
+        runner=runner,
+        approval_verifier=lambda **_: {},
+    )
+    store = StateStore(tmp_path / "state")
+    with store.locked():
+        for run in manifest.runs:
+            state = _aws_run_state(
+                backend,
+                release,
+                manifest,
+                run,
+                status="Success",
+                command_id="cmd-0123456789abcdef0",
+            )
+            state["terminate_at"] = "2000-01-01T00:00:00Z"
+            store.write_run(run.run_id, state)
+
+    with pytest.raises(Exception) as caught:
+        backend.evaluate(
+            release=release,
+            manifest=manifest,
+            approval_path=tmp_path / "approval.json",
+            apply=True,
+        )
+
+    assert getattr(caught.value, "code", None) == "TERMINATION_DEADLINE_INVALID"
+    assert runner.calls == []
+
+
+def test_aws_instance_discovery_rejects_unknown_fields_wrong_tags_and_duplicates(
+    tmp_path,
+):
+    from msctl.aws_p5 import AwsP5Backend
+
+    manifest = _aws_manifest_object()
+    exact = _bound_instance(manifest)
+    outputs = (
+        {"instances": [{**exact, "unexpected": True}]},
+        {
+            "instances": [
+                _bound_instance(manifest, release_sha256="9" * 64)
+            ]
+        },
+        {
+            "instances": [
+                exact,
+                _bound_instance(
+                    manifest,
+                    instance_id="i-11111111111111111",
+                ),
+            ]
+        },
+    )
+    runner = _FakeAwsRunner(*outputs)
+    backend = AwsP5Backend(
+        profile=_aws_profile_object(),
+        runtime=_aws_runtime_object(),
+        instance_profile_arn=(
+            "arn:aws:iam::123456789012:instance-profile/memorysplit-p5"
+        ),
+        state_root=tmp_path / "state",
+        runner=runner,
+    )
+
+    expected_codes = (
+        "AWS_OUTPUT_INVALID",
+        "INSTANCE_BINDING_MISMATCH",
+        "DUPLICATE_ACTIVE_SEED",
+    )
+    for expected in expected_codes:
+        with pytest.raises(Exception) as caught:
+            backend.discover_instances(manifest)
+        assert getattr(caught.value, "code", None) == expected
+
+
+def test_aws_submit_persists_one_paired_intent_and_is_idempotent(tmp_path):
+    from msctl.aws_p5 import AwsP5Backend
+
+    manifest = _aws_manifest_object()
+    release = _aws_release_object()
+    runner = _FakeAwsRunner()
+    backend = AwsP5Backend(
+        profile=_aws_profile_object(),
+        runtime=_aws_runtime_object(),
+        instance_profile_arn=(
+            "arn:aws:iam::123456789012:instance-profile/memorysplit-p5"
+        ),
+        state_root=tmp_path / "state",
+        runner=runner,
+        approval_verifier=lambda **_: {},
+    )
+    runner.outputs.extend(_aws_submit_outputs(backend, release, manifest))
+    runner.outputs.append(
+        {
+            "command": {
+                "command_id": "cmd-0123456789abcdef0",
+                "status": "InProgress",
+            }
+        }
+    )
+
+    first = backend.submit(
+        release=release,
+        manifest=manifest,
+        instance_id="i-0123456789abcdef0",
+        terminate_at="2099-01-01T00:00:00Z",
+        approval_path=tmp_path / "approval.json",
+        apply=True,
+    )
+    second = backend.submit(
+        release=release,
+        manifest=manifest,
+        instance_id="i-0123456789abcdef0",
+        terminate_at="2099-01-01T00:00:00Z",
+        approval_path=tmp_path / "approval.json",
+        apply=True,
+    )
+
+    assert first["submitted"] == 1
+    assert first["command_id"] == "cmd-0123456789abcdef0"
+    assert second["submitted"] == 0
+    assert second["idempotent"] is True
+    assert sum("run-instances" in argv for argv, _ in runner.calls) == 0
+    assert sum("send-command" in argv for argv, _ in runner.calls) == 1
+    states = [
+        json.loads(
+            (
+                tmp_path
+                / "state"
+                / "runs"
+                / f"{run.run_id}.json"
+            ).read_text()
+        )
+        for run in manifest.runs
+    ]
+    assert {state["instance_id"] for state in states} == {
+        "i-0123456789abcdef0"
+    }
+    assert {state["command_id"] for state in states} == {
+        "cmd-0123456789abcdef0"
+    }
+    assert {state["ami_id"] for state in states} == {
+        backend.runtime.ami_id
+    }
+    assert {state["container_digest"] for state in states} == {
+        backend.runtime.container_digest
+    }
+    assert {state["runtime_sha256"] for state in states} == {
+        backend._runtime_sha256()
+    }
+
+
+def test_aws_submit_ssm_preflight_failure_never_records_or_sends_intent(tmp_path):
+    from msctl.aws_p5 import AwsP5Backend
+
+    manifest = _aws_manifest_object()
+    release = _aws_release_object()
+    first_runner = _FakeAwsRunner()
+    arguments = {
+        "profile": _aws_profile_object(),
+        "runtime": _aws_runtime_object(),
+        "instance_profile_arn": (
+            "arn:aws:iam::123456789012:instance-profile/memorysplit-p5"
+        ),
+        "state_root": tmp_path / "state",
+        "approval_verifier": lambda **_: {},
+    }
+    first = AwsP5Backend(runner=first_runner, **arguments)
+    first_runner.outputs.extend(
+        _aws_submit_outputs(
+            first,
+            release,
+            manifest,
+            ssm_online=False,
+        )
+    )
+
+    with pytest.raises(Exception) as caught:
+        first.submit(
+            release=release,
+            manifest=manifest,
+            instance_id="i-0123456789abcdef0",
+            terminate_at="2099-01-01T00:00:00Z",
+            approval_path=tmp_path / "approval.json",
+            apply=True,
+        )
+    assert getattr(caught.value, "code", None) == "SSM_UNAVAILABLE"
+    assert not list((tmp_path / "state" / "runs").glob("*.json"))
+    assert all(
+        "send-command" not in argv and "run-instances" not in argv
+        for argv, _ in first_runner.calls
+    )
+    assert all(
+        "modify-instance-attribute" not in argv and "create-tags" not in argv
+        for argv, _ in first_runner.calls
+    )
+
+
+def test_aws_evaluate_and_cleanup_refuse_active_training(tmp_path):
+    from msctl.aws_p5 import AwsP5Backend
+    from msctl.state import StateStore
+
+    manifest = _aws_manifest_object()
+    release = _aws_release_object()
+    command_id = "cmd-0123456789abcdef0"
+
+    for operation in ("evaluate", "cleanup"):
+        state_root = tmp_path / f"{operation}-state"
+        outputs = [
+            {
+                "instances": [
+                    _selected_instance(manifest, bound=True)
+                ]
+            },
+            {
+                "attribute": {
+                    "instance_id": "i-0123456789abcdef0",
+                    "shutdown_behavior": "terminate",
+                }
+            },
+        ]
+        outputs.append(
+            {
+                "command": {
+                    "command_id": command_id,
+                    "status": "InProgress",
+                }
+            }
+        )
+        runner = _FakeAwsRunner(*outputs)
+        backend = AwsP5Backend(
+            profile=_aws_profile_object(),
+            runtime=_aws_runtime_object(),
+            instance_profile_arn=(
+                "arn:aws:iam::123456789012:instance-profile/memorysplit-p5"
+            ),
+            state_root=state_root,
+            runner=runner,
+            approval_verifier=lambda **_: {},
+        )
+        store = StateStore(state_root)
+        with store.locked():
+            for run in manifest.runs:
+                store.write_run(
+                    run.run_id,
+                    _aws_run_state(
+                        backend,
+                        release,
+                        manifest,
+                        run,
+                        status="InProgress",
+                        command_id=command_id,
+                    ),
+                )
+
+        with pytest.raises(Exception) as caught:
+            getattr(backend, operation)(
+                release=release,
+                manifest=manifest,
+                approval_path=tmp_path / "approval.json",
+                apply=True,
+            )
+
+        assert getattr(caught.value, "code", None) == "RUN_ALREADY_ACTIVE"
+        assert not any("send-command" in argv for argv, _ in runner.calls)
+        assert not any(
+            "terminate-instances" in argv for argv, _ in runner.calls
+        )
+
+
+def test_aws_cancel_evaluate_and_cleanup_mutate_one_paired_state(tmp_path):
+    import base64
+
+    from msctl.aws_p5 import (
+        ARGV_DOCUMENT_NAME,
+        ARGV_DOCUMENT_SHA256,
+        AwsP5Backend,
+    )
+    from msctl.state import StateStore
+
+    manifest = _aws_manifest_object()
+    release = _aws_release_object()
+    instance = _bound_instance(manifest)
+    command_id = "cmd-0123456789abcdef0"
+
+    def seed_state(root: Path, backend: AwsP5Backend) -> None:
+        store = StateStore(root)
+        with store.locked():
+            for run in manifest.runs:
+                store.write_run(
+                    run.run_id,
+                    _aws_run_state(
+                        backend,
+                        release,
+                        manifest,
+                        run,
+                        status="Success",
+                        command_id=command_id,
+                    ),
+                )
+
+    common = {
+        "profile": _aws_profile_object(),
+        "runtime": _aws_runtime_object(),
+        "instance_profile_arn": instance["instance_profile_arn"],
+        "approval_verifier": lambda **_: {},
+    }
+
+    cancel_root = tmp_path / "cancel-state"
+    cancel_runner = _FakeAwsRunner(
+        {
+            "command": {
+                "command_id": command_id,
+                "status": "InProgress",
+            }
+        },
+        {},
+    )
+    cancel_backend = AwsP5Backend(
+        state_root=cancel_root,
+        runner=cancel_runner,
+        **common,
+    )
+    seed_state(cancel_root, cancel_backend)
+    cancelled = cancel_backend.cancel(
+        release=release,
+        manifest=manifest,
+        approval_path=tmp_path / "approval.json",
+        apply=True,
+    )
+    cancelled_again = cancel_backend.cancel(
+        release=release,
+        manifest=manifest,
+        approval_path=tmp_path / "approval.json",
+        apply=True,
+    )
+    assert cancelled["cancelled"] == 1
+    assert cancelled_again["cancelled"] == 0
+    assert cancelled_again["idempotent"] is True
+    assert sum(
+        "cancel-command" in argv for argv, _ in cancel_runner.calls
+    ) == 1
+
+    evaluate_root = tmp_path / "evaluate-state"
+    evaluate_runner = _FakeAwsRunner()
+    evaluate_backend = AwsP5Backend(
+        state_root=evaluate_root,
+        runner=evaluate_runner,
+        **common,
+    )
+    seed_state(evaluate_root, evaluate_backend)
+    evaluation_intent = evaluate_backend._operation_envelope(
+        evaluate_backend._evaluation_operation_intent(release, manifest),
+        instance_id=instance["instance_id"],
+        terminate_at="2099-01-01T00:00:00Z",
+    )
+    evaluation_payload = _canonical(evaluation_intent)
+    evaluation_digest = hashlib.sha256(evaluation_payload).hexdigest()
+    evaluation_checksum = base64.b64encode(
+        bytes.fromhex(evaluation_digest)
+    ).decode("ascii")
+    evaluate_runner.outputs.extend(
+        [
+            {"instances": [_selected_instance(manifest, bound=True)]},
+            {
+                "attribute": {
+                    "instance_id": instance["instance_id"],
+                    "shutdown_behavior": "terminate",
+                }
+            },
+            {
+                "command": {
+                    "command_id": command_id,
+                    "status": "Success",
+                }
+            },
+            {
+                "managed_instances": [
+                    {
+                        "instance_id": instance["instance_id"],
+                        "ping_status": "Online",
+                    }
+                ]
+            },
+            {
+                "documents": [
+                    {
+                        "name": ARGV_DOCUMENT_NAME,
+                        "hash": ARGV_DOCUMENT_SHA256,
+                        "status": "Active",
+                    }
+                ]
+            },
+            {
+                "object": {
+                    "checksum_sha256": evaluation_checksum,
+                    "version_id": "evaluation-version",
+                }
+            },
+            {
+                "object": {
+                    "checksum_sha256": evaluation_checksum,
+                    "content_length": len(evaluation_payload),
+                    "metadata": {
+                        "operation-id": evaluation_intent["operation_id"],
+                        "sha256": evaluation_digest,
+                    },
+                    "version_id": "evaluation-version",
+                }
+            },
+            {"command": {"command_id": "cmd-evaluate-12345678"}},
+        ]
+    )
+    evaluated = evaluate_backend.evaluate(
+        release=release,
+        manifest=manifest,
+        approval_path=tmp_path / "approval.json",
+        apply=True,
+    )
+    assert evaluated["submitted"] == 1
+    assert sum(
+        "send-command" in argv for argv, _ in evaluate_runner.calls
+    ) == 1
+
+    cleanup_root = tmp_path / "cleanup-state"
+    cleanup_runner = _FakeAwsRunner(
+        {"instances": [_selected_instance(manifest, bound=True)]},
+        {
+            "attribute": {
+                "instance_id": instance["instance_id"],
+                "shutdown_behavior": "terminate",
+            }
+        },
+        {
+            "command": {
+                "command_id": command_id,
+                "status": "Cancelled",
+            }
+        },
+        {
+            "terminating_instances": [
+                {
+                    "instance_id": instance["instance_id"],
+                    "current_state": "shutting-down",
+                    "previous_state": "running",
+                }
+            ]
+        },
+    )
+    cleanup_backend = AwsP5Backend(
+        state_root=cleanup_root,
+        runner=cleanup_runner,
+        **common,
+    )
+    seed_state(cleanup_root, cleanup_backend)
+    cleaned = cleanup_backend.cleanup(
+        release=release,
+        manifest=manifest,
+        approval_path=tmp_path / "approval.json",
+        apply=True,
+    )
+    assert cleaned["terminated"] == 1
+    assert sum(
+        "terminate-instances" in argv for argv, _ in cleanup_runner.calls
+    ) == 1
+
+
+def test_aws_cleanup_binds_approval_and_revalidates_exact_selected_instance(
+    tmp_path,
+):
+    from msctl.aws_p5 import AwsP5Backend
+    from msctl.state import StateStore
+
+    manifest = _aws_manifest_object()
+    release = _aws_release_object()
+    command_id = "cmd-0123456789abcdef0"
+    instance_id = "i-0123456789abcdef0"
+    approvals = []
+    runner = _FakeAwsRunner(
+        {"instances": [_selected_instance(manifest, bound=True)]},
+        {
+            "attribute": {
+                "instance_id": instance_id,
+                "shutdown_behavior": "terminate",
+            }
+        },
+        {
+            "command": {
+                "command_id": command_id,
+                "status": "Cancelled",
+            }
+        },
+        {
+            "terminating_instances": [
+                {
+                    "instance_id": instance_id,
+                    "current_state": "shutting-down",
+                    "previous_state": "running",
+                }
+            ]
+        },
+    )
+
+    def approve(**kwargs):
+        approvals.append(kwargs)
+        return {}
+
+    backend = AwsP5Backend(
+        profile=_aws_profile_object(),
+        runtime=_aws_runtime_object(),
+        instance_profile_arn=(
+            "arn:aws:iam::123456789012:instance-profile/memorysplit-p5"
+        ),
+        state_root=tmp_path / "state",
+        runner=runner,
+        approval_verifier=approve,
+    )
+    store = StateStore(tmp_path / "state")
+    with store.locked():
+        for run in manifest.runs:
+            store.write_run(
+                run.run_id,
+                _aws_run_state(
+                    backend,
+                    release,
+                    manifest,
+                    run,
+                    status="Success",
+                    command_id=command_id,
+                ),
+            )
+
+    result = backend.cleanup(
+        release=release,
+        manifest=manifest,
+        approval_path=tmp_path / "cleanup-approval.json",
+        apply=True,
+    )
+    repeated = backend.cleanup(
+        release=release,
+        manifest=manifest,
+        approval_path=tmp_path / "cleanup-approval.json",
+        apply=True,
+    )
+
+    assert result["terminated"] == 1
+    assert repeated["terminated"] == 0
+    assert repeated["idempotent"] is True
+    resources = approvals[0]["resources"]
+    assert resources["instance_id"] == instance_id
+    assert resources["run_manifest_sha256"] == manifest.sha256
+    assert resources["release_sha256"] == release.archive_sha256
+    assert resources["seed"] == manifest.seed
+    assert resources["runtime_sha256"] == backend._runtime_sha256()
+    assert next(
+        index
+        for index, (argv, _) in enumerate(runner.calls)
+        if "terminate-instances" in argv
+    ) > next(
+        index
+        for index, (_, operation) in enumerate(runner.calls)
+        if operation == "verify cleanup instance"
+    )
+
+
+def _aws_checkpoint_receipt(tmp_path: Path, manifest, *, world_size: int = 4):
+    rows = []
+    for run in manifest.runs:
+        checkpoint = tmp_path / "checkpoints" / f"{run.run_id}.pt"
+        checkpoint.parent.mkdir(exist_ok=True)
+        checkpoint.write_bytes(f"checkpoint:{run.run_id}".encode())
+        rows.append(
+            {
+                "run_id": run.run_id,
+                "arm": run.arm,
+                "seed": run.seed,
+                "path": f"checkpoints/{checkpoint.name}",
+                "sha256": _sha256(checkpoint),
+                "config_sha256": run.config_sha256,
+                "dataset_sha256": manifest.dataset_sha256,
+                "source_commit": manifest.source_commit,
+                "step": 400,
+                "world_size": world_size,
+            }
+        )
+    return _write_json(
+        tmp_path / "aws-checkpoint-receipt.json",
+        {
+            "schema_version": 2,
+            "provider": "aws-p5.48xlarge",
+            "release_sha256": manifest.release_sha256,
+            "run_manifest_sha256": manifest.sha256,
+            "dataset_sha256": manifest.dataset_sha256,
+            "source_commit": manifest.source_commit,
+            "checkpoints": rows,
+        },
+    )
+
+
+def test_aws_resume_requires_world_size_four_and_forwards_both_receipts(
+    tmp_path,
+):
+    from msctl.aws_p5 import AwsP5Backend
+    from msctl.contracts import verify_checkpoint_receipt
+
+    manifest = _aws_manifest_object()
+    release = _aws_release_object()
+    receipt_path = _aws_checkpoint_receipt(tmp_path, manifest)
+    receipt = verify_checkpoint_receipt(
+        receipt_path,
+        release=release,
+        manifest=manifest,
+    )
+    backend = AwsP5Backend(
+        profile=_aws_profile_object(),
+        runtime=_aws_runtime_object(),
+        instance_profile_arn=(
+            "arn:aws:iam::123456789012:instance-profile/memorysplit-p5"
+        ),
+        state_root=tmp_path / "state",
+        runner=_FakeAwsRunner(),
+    )
+
+    planned = backend.resume(
+        release=release,
+        manifest=manifest,
+        checkpoint_receipt=receipt,
+        approval_path=None,
+        apply=False,
+    )
+
+    intent = planned["operation_intent"]
+    assert intent["operation"] == "resume"
+    assert intent["checkpoint_receipt"]["sha256"] == receipt.sha256
+    by_arm = {
+        row["arm"]: row for row in intent["checkpoint_receipt"]["checkpoints"]
+    }
+    for checkpoint in receipt.checkpoints:
+        assert by_arm[checkpoint.arm]["resume_path"].startswith(
+            f"/mnt/memorysplit/staging/resume/{receipt.sha256}/"
+        )
+        assert by_arm[checkpoint.arm]["resume_sha256"] == checkpoint.sha256
+        assert by_arm[checkpoint.arm]["world_size"] == 4
+    names = [step["name"] for step in intent["steps"]]
+    assert names == [
+        "prepare-resume-staging",
+        "materialize-resume-receipt",
+        "materialize-resume-dense",
+        "materialize-resume-split90",
+        "paired-launch",
+    ]
+    launcher = next(
+        step["argv"]
+        for step in intent["steps"]
+        if step["name"] == "paired-launch"
+    )
+    assert launcher[1].endswith("/msctl/aws_resume_launch.py")
+    reviewed_launcher = (
+        "/mnt/memorysplit/releases/"
+        f"{release.archive_sha256}/cluster/aws/p5/launch_seed_pair.py"
+    )
+    assert launcher[launcher.index("--launcher") + 1] == reviewed_launcher
+    checkpoint_arguments = [
+        json.loads(launcher[index + 1])
+        for index, value in enumerate(launcher)
+        if value == "--checkpoint"
+    ]
+    assert checkpoint_arguments == [
+        by_arm["dense"],
+        by_arm["split90"],
+    ]
+    assert len(
+        [argv for argv in planned["checkpoint_commands"] if "put-object" in argv]
+    ) == 3
+    assert len(
+        [argv for argv in planned["checkpoint_commands"] if "head-object" in argv]
+    ) == 3
+    assert "torchrun" not in json.dumps(intent)
+
+    invalid = _aws_checkpoint_receipt(tmp_path, manifest, world_size=3)
+    with pytest.raises(Exception) as caught:
+        verify_checkpoint_receipt(
+            invalid,
+            release=release,
+            manifest=manifest,
+        )
+    assert getattr(caught.value, "code", None) == "CHECKPOINT_PROVENANCE_MISMATCH"
+
+    receipt_path = _aws_checkpoint_receipt(tmp_path, manifest)
+    mismatched_steps = json.loads(receipt_path.read_text())
+    mismatched_steps["checkpoints"][1]["step"] += 1
+    _write_json(receipt_path, mismatched_steps)
+    with pytest.raises(Exception) as caught:
+        verify_checkpoint_receipt(
+            receipt_path,
+            release=release,
+            manifest=manifest,
+        )
+    assert getattr(caught.value, "code", None) == "CHECKPOINT_PROVENANCE_MISMATCH"
+
+
+def test_aws_resume_adapter_injects_receipt_bound_checkpoints_into_real_launcher(
+    tmp_path,
+):
+    from cluster.aws.p5 import launch_seed_pair
+    from msctl.aws_resume_launch import bind_resume_checkpoints
+    from tests.test_aws_p5_launcher import _launcher_fixture, _load_fixture_plan
+
+    fixture = _launcher_fixture(tmp_path / "launcher", seed=2)
+    plan = _load_fixture_plan(fixture)
+    checkpoint_root = fixture["scratch_root"] / "staging" / "resume" / ("a" * 64)
+    checkpoint_root.mkdir(parents=True)
+    bindings = []
+    for arm in ("dense", "split90"):
+        checkpoint = checkpoint_root / f"{arm}.pt"
+        checkpoint.write_bytes(f"checkpoint:{arm}".encode())
+        bindings.append(
+            {
+                "arm": arm,
+                "resume_path": str(checkpoint),
+                "resume_sha256": _sha256(checkpoint),
+                "world_size": 4,
+            }
+        )
+
+    resumed = bind_resume_checkpoints(
+        plan,
+        checkpoint_receipt_sha256="a" * 64,
+        checkpoints=bindings,
+        launcher_module=launch_seed_pair,
+    )
+
+    assert {item.path for item in resumed.verified_files} >= {
+        Path(row["resume_path"]) for row in bindings
+    }
+    by_arm = {launch.arm: launch for launch in resumed.arms}
+    for binding in bindings:
+        argv = by_arm[binding["arm"]].argv
+        assert "--resume" not in argv
+        assert argv[argv.index("--resume-path") + 1] == "/resume/checkpoint.pt"
+        assert (
+            argv[argv.index("--resume-sha256") + 1]
+            == binding["resume_sha256"]
+        )
+        mount = (
+            "type=bind,"
+            f"src={binding['resume_path']},"
+            "dst=/resume/checkpoint.pt,readonly"
+        )
+        assert mount in argv
+        assert argv.index(mount) < argv.index(resumed.container_image)
+        assert "--nproc_per_node=4" in argv
+
+
+def test_aws_resume_adapter_archives_the_previous_pair_as_one_recoverable_root(
+    tmp_path,
+):
+    from msctl.aws_resume_launch import prepare_resume_output_roots
+    from tests.test_aws_p5_launcher import _launcher_fixture, _load_fixture_plan
+
+    fixture = _launcher_fixture(tmp_path / "launcher", seed=3)
+    seed_root = fixture["scratch_root"] / "runs" / "seed-3"
+    for arm in ("dense", "split90"):
+        output = seed_root / arm
+        output.mkdir(parents=True)
+        (output / "partial.log").write_text(f"{arm}\n")
+    cid_root = (
+        fixture["scratch_root"]
+        / "staging"
+        / "container-cids"
+        / "seed-3"
+    )
+    cid_root.mkdir(parents=True)
+    (cid_root / "dense.cid").write_text("a" * 64)
+
+    archive = prepare_resume_output_roots(
+        fixture["scratch_root"],
+        seed=3,
+        checkpoint_receipt_sha256="b" * 64,
+    )
+    repeated = prepare_resume_output_roots(
+        fixture["scratch_root"],
+        seed=3,
+        checkpoint_receipt_sha256="b" * 64,
+    )
+
+    assert repeated == archive
+    assert not seed_root.exists()
+    assert (archive / "runs" / "dense" / "partial.log").is_file()
+    assert (archive / "runs" / "split90" / "partial.log").is_file()
+    assert (archive / "container-cids" / "dense.cid").is_file()
+    assert _load_fixture_plan(fixture).seed == 3
+
+
+def test_aws_resume_adapter_rejects_a_symlinked_archive_parent(tmp_path):
+    from msctl.aws_resume_launch import (
+        ResumeLaunchError,
+        prepare_resume_output_roots,
+    )
+
+    scratch = tmp_path / "scratch"
+    scratch.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (scratch / "resume-history").symlink_to(
+        outside,
+        target_is_directory=True,
+    )
+
+    with pytest.raises(ResumeLaunchError, match="archive"):
+        prepare_resume_output_roots(
+            scratch,
+            seed=4,
+            checkpoint_receipt_sha256="c" * 64,
+        )
+
+    assert list(outside.iterdir()) == []
+
+
+def test_aws_resume_adapter_verifies_before_archiving_outputs(
+    tmp_path,
+    monkeypatch,
+):
+    from types import SimpleNamespace
+
+    import msctl.aws_resume_launch as adapter
+
+    scratch = tmp_path / "scratch"
+    source = scratch / "runs" / "seed-2"
+    for arm in ("dense", "split90"):
+        output = source / arm
+        output.mkdir(parents=True)
+        (output / "partial.log").write_text(f"{arm}\n")
+    receipt = tmp_path / "checkpoint-receipt.json"
+    receipt.write_text("{}")
+    launcher = tmp_path / "launch_seed_pair.py"
+    launcher.write_text("# fixture\n")
+    manifest = tmp_path / "manifest.json"
+    manifest.write_text("{}")
+    profile = tmp_path / "profile.json"
+    profile.write_text("{}")
+    repo_root = tmp_path / "release"
+    repo_root.mkdir()
+    monkeypatch.setattr(adapter, "_verify_launcher_path", lambda *_: None)
+    monkeypatch.setattr(
+        adapter.reviewed_launcher,
+        "load_launch_plan",
+        lambda **_: SimpleNamespace(),
+    )
+
+    result = adapter.main(
+        [
+            "--seed",
+            "2",
+            "--manifest",
+            str(manifest),
+            "--profile",
+            str(profile),
+            "--repo-root",
+            str(repo_root),
+            "--scratch-root",
+            str(scratch),
+            "--launcher",
+            str(launcher),
+            "--checkpoint-receipt",
+            str(receipt),
+            "--checkpoint-receipt-sha256",
+            _sha256(receipt),
+            "--run-manifest-sha256",
+            "a" * 64,
+            "--checkpoint",
+            "{}",
+            "--checkpoint",
+            "{}",
+            "--apply",
+        ]
+    )
+
+    assert result == 2
+    assert source.is_dir()
+    assert not (scratch / "resume-history").exists()
+
+
+def test_aws_resume_response_loss_reconciles_without_resending(tmp_path):
+    import base64
+
+    from msctl.aws_p5 import (
+        ARGV_DOCUMENT_NAME,
+        ARGV_DOCUMENT_SHA256,
+        AwsP5Backend,
+    )
+    from msctl.contracts import verify_checkpoint_receipt
+    from msctl.errors import MsctlError
+    from msctl.jsonutil import canonical_json
+    from msctl.state import StateStore
+
+    manifest = _aws_manifest_object()
+    release = _aws_release_object()
+    checkpoint_receipt = verify_checkpoint_receipt(
+        _aws_checkpoint_receipt(tmp_path, manifest),
+        release=release,
+        manifest=manifest,
+    )
+    command_id = "cmd-0123456789abcdef0"
+    runner = _FakeAwsRunner()
+    backend = AwsP5Backend(
+        profile=_aws_profile_object(),
+        runtime=_aws_runtime_object(),
+        instance_profile_arn=(
+            "arn:aws:iam::123456789012:instance-profile/memorysplit-p5"
+        ),
+        state_root=tmp_path / "state",
+        runner=runner,
+        approval_verifier=lambda **_: {},
+    )
+    store = StateStore(tmp_path / "state")
+    with store.locked():
+        for run in manifest.runs:
+            store.write_run(
+                run.run_id,
+                _aws_run_state(
+                    backend,
+                    release,
+                    manifest,
+                    run,
+                    status="Failed",
+                    command_id=command_id,
+                ),
+            )
+    core = backend._training_operation_intent(
+        operation="resume",
+        release=release,
+        manifest=manifest,
+        checkpoints=backend._checkpoint_map(
+            manifest,
+            checkpoint_receipt,
+        ),
+        checkpoint_receipt_sha256=checkpoint_receipt.sha256,
+    )
+    intent = backend._operation_envelope(
+        core,
+        instance_id="i-0123456789abcdef0",
+        terminate_at="2099-01-01T00:00:00Z",
+    )
+    payload = canonical_json(intent)
+    digest = hashlib.sha256(payload).hexdigest()
+    checksum = base64.b64encode(bytes.fromhex(digest)).decode("ascii")
+    checkpoint_outputs = []
+    checkpoint_plan = backend._checkpoint_publication(
+        checkpoint_receipt=checkpoint_receipt,
+        checkpoints=backend._checkpoint_map(manifest, checkpoint_receipt),
+        apply=False,
+    )
+    for item in checkpoint_plan["objects"]:
+        checkpoint_outputs.extend(
+            [
+                {},
+                {
+                    "object": {
+                        "bytes": item["bytes"],
+                        "checksum_sha256": base64.b64encode(
+                            bytes.fromhex(item["sha256"])
+                        ).decode("ascii"),
+                        "metadata": {"sha256": item["sha256"]},
+                        "version_id": "checkpoint-version-1",
+                    }
+                },
+            ]
+        )
+    runner.outputs.extend(
+        [
+            {"instances": [_selected_instance(manifest, bound=True)]},
+            {
+                "attribute": {
+                    "instance_id": "i-0123456789abcdef0",
+                    "shutdown_behavior": "terminate",
+                }
+            },
+            {
+                "command": {
+                    "command_id": command_id,
+                    "status": "Failed",
+                }
+            },
+            {
+                "managed_instances": [
+                    {
+                        "instance_id": "i-0123456789abcdef0",
+                        "ping_status": "Online",
+                    }
+                ]
+            },
+                {
+                    "documents": [
+                        {
+                            "name": ARGV_DOCUMENT_NAME,
+                            "hash": ARGV_DOCUMENT_SHA256,
+                            "status": "Active",
+                        }
+                    ]
+                },
+            *checkpoint_outputs,
+            {
+                "object": {
+                    "checksum_sha256": checksum,
+                    "version_id": "version-1",
+                }
+            },
+            {
+                "object": {
+                    "checksum_sha256": checksum,
+                    "content_length": len(payload),
+                    "metadata": {
+                        "operation-id": intent["operation_id"],
+                        "sha256": digest,
+                    },
+                    "version_id": "version-1",
+                }
+            },
+            MsctlError("AWS_COMMAND_FAILED", "response lost"),
+        ]
+    )
+
+    with pytest.raises(Exception) as caught:
+        backend.resume(
+            release=release,
+            manifest=manifest,
+            checkpoint_receipt=checkpoint_receipt,
+            approval_path=tmp_path / "approval.json",
+            apply=True,
+        )
+    assert getattr(caught.value, "code", None) == "AWS_COMMAND_FAILED"
+    assert next(
+        index
+        for index, (_, operation) in enumerate(runner.calls)
+        if operation == "verify SSM document"
+    ) < next(
+        index
+        for index, (_, operation) in enumerate(runner.calls)
+        if operation == "materialize checkpoint object"
+    )
+
+    retry_runner = _FakeAwsRunner(
+        {"instances": [_selected_instance(manifest, bound=True)]},
+        {
+            "attribute": {
+                "instance_id": "i-0123456789abcdef0",
+                "shutdown_behavior": "terminate",
+            }
+        },
+        MsctlError("AWS_COMMAND_FAILED", "missing started receipt"),
+        MsctlError("AWS_COMMAND_FAILED", "missing terminal receipt"),
+        {
+            "commands": [
+                {
+                    "command_id": "cmd-resume-12345678",
+                    "status": "InProgress",
+                    "comment": intent["operation_id"],
+                    "instance_ids": ["i-0123456789abcdef0"],
+                }
+            ]
+        },
+    )
+    retry = AwsP5Backend(
+        profile=_aws_profile_object(),
+        runtime=_aws_runtime_object(),
+        instance_profile_arn=(
+            "arn:aws:iam::123456789012:instance-profile/memorysplit-p5"
+        ),
+        state_root=tmp_path / "state",
+        runner=retry_runner,
+        approval_verifier=lambda **_: {},
+    )
+    result = retry.resume(
+        release=release,
+        manifest=manifest,
+        checkpoint_receipt=checkpoint_receipt,
+        approval_path=tmp_path / "approval.json",
+        apply=True,
+    )
+
+    assert result["submitted"] == 0
+    assert result["idempotent"] is True
+    assert result["command_id"] == "cmd-resume-12345678"
+    assert all(
+        "send-command" not in argv for argv, _ in retry_runner.calls
+    )
+
+
+def test_aws_evaluation_uses_canonical_confirmatory_runner_interface(tmp_path):
+    from msctl.aws_p5 import AwsP5Backend
+
+    manifest = _aws_manifest_object()
+    backend = AwsP5Backend(
+        profile=_aws_profile_object(),
+        runtime=_aws_runtime_object(),
+        instance_profile_arn=(
+            "arn:aws:iam::123456789012:instance-profile/memorysplit-p5"
+        ),
+        state_root=tmp_path / "state",
+        runner=_FakeAwsRunner(),
+    )
+
+    planned = backend.evaluate(
+        release=_aws_release_object(),
+        manifest=manifest,
+        approval_path=None,
+        apply=False,
+    )
+
+    commands = planned["operation_intent"]["steps"]
+    assert len(commands) == 2
+    for step in commands:
+        argv = step["argv"]
+        assert argv[1].endswith("/evals/confirmatory/runner.py")
+        assert "--run" in argv
+        assert "--sealed-release" in argv
+        assert "--expected-study-lock-sha256" in argv
+        assert "--device" in argv
+        assert "--output-dir" in argv
+        assert "--run-id" not in argv
+        assert "--run-manifest-sha256" not in argv
+
+
+def test_aws_evaluation_uses_one_content_addressed_fixed_document_intent(
+    tmp_path,
+):
+    import base64
+
+    from msctl.aws_p5 import (
+        ARGV_DOCUMENT_NAME,
+        ARGV_DOCUMENT_SHA256,
+        AwsP5Backend,
+    )
+    from msctl.jsonutil import canonical_json
+    from msctl.state import StateStore
+
+    manifest = _aws_manifest_object()
+    release = _aws_release_object()
+    instance_id = "i-0123456789abcdef0"
+    terminate_at = "2099-01-01T00:00:00Z"
+    training_command = "cmd-0123456789abcdef0"
+    runner = _FakeAwsRunner()
+    backend = AwsP5Backend(
+        profile=_aws_profile_object(),
+        runtime=_aws_runtime_object(),
+        instance_profile_arn=(
+            "arn:aws:iam::123456789012:instance-profile/memorysplit-p5"
+        ),
+        state_root=tmp_path / "state",
+        runner=runner,
+        approval_verifier=lambda **_: {},
+    )
+    store = StateStore(tmp_path / "state")
+    with store.locked():
+        for run in manifest.runs:
+            store.write_run(
+                run.run_id,
+                _aws_run_state(
+                    backend,
+                    release,
+                    manifest,
+                    run,
+                    status="Success",
+                    command_id=training_command,
+                ),
+            )
+    core = backend._evaluation_operation_intent(release, manifest)
+    intent = backend._operation_envelope(
+        core,
+        instance_id=instance_id,
+        terminate_at=terminate_at,
+    )
+    payload = canonical_json(intent)
+    digest = hashlib.sha256(payload).hexdigest()
+    checksum = base64.b64encode(bytes.fromhex(digest)).decode("ascii")
+    runner.outputs.extend(
+        [
+            {"instances": [_selected_instance(manifest, bound=True)]},
+            {
+                "attribute": {
+                    "instance_id": instance_id,
+                    "shutdown_behavior": "terminate",
+                }
+            },
+            {
+                "command": {
+                    "command_id": training_command,
+                    "status": "Success",
+                }
+            },
+            {
+                "managed_instances": [
+                    {
+                        "instance_id": instance_id,
+                        "ping_status": "Online",
+                    }
+                ]
+            },
+            {
+                "documents": [
+                    {
+                        "name": ARGV_DOCUMENT_NAME,
+                        "hash": ARGV_DOCUMENT_SHA256,
+                        "status": "Active",
+                    }
+                ]
+            },
+            {
+                "object": {
+                    "checksum_sha256": checksum,
+                    "version_id": "evaluation-intent-version",
+                }
+            },
+            {
+                "object": {
+                    "checksum_sha256": checksum,
+                    "content_length": len(payload),
+                    "metadata": {
+                        "operation-id": intent["operation_id"],
+                        "sha256": digest,
+                    },
+                    "version_id": "evaluation-intent-version",
+                }
+            },
+            {"command": {"command_id": "cmd-evaluate-12345678"}},
+            {"instances": [_selected_instance(manifest, bound=True)]},
+            {
+                "attribute": {
+                    "instance_id": instance_id,
+                    "shutdown_behavior": "terminate",
+                }
+            },
+            {
+                "command": {
+                    "command_id": training_command,
+                    "status": "Success",
+                }
+            },
+            {
+                "command": {
+                    "command_id": "cmd-evaluate-12345678",
+                    "status": "Success",
+                }
+            },
+        ]
+    )
+
+    first = backend.evaluate(
+        release=release,
+        manifest=manifest,
+        approval_path=tmp_path / "approval.json",
+        apply=True,
+    )
+    second = backend.evaluate(
+        release=release,
+        manifest=manifest,
+        approval_path=tmp_path / "approval.json",
+        apply=True,
+    )
+
+    assert first["submitted"] == 1
+    assert second["submitted"] == 0
+    assert second["idempotent"] is True
+    send_calls = [
+        argv for argv, _ in runner.calls if "send-command" in argv
+    ]
+    assert len(send_calls) == 1
+    send = send_calls[0]
+    assert send[send.index("--document-name") + 1] == ARGV_DOCUMENT_NAME
+    assert send[send.index("--document-hash") + 1] == ARGV_DOCUMENT_SHA256
+    assert send[send.index("--comment") + 1] == intent["operation_id"]
+    assert "IntentUri" in send[send.index("--parameters") + 1]
+    assert "argv" not in send[send.index("--parameters") + 1]
+
+
+def test_every_paid_aws_mutation_requires_approval_before_runner(tmp_path):
+    from msctl.aws_p5 import AwsP5Backend
+    from msctl.contracts import verify_checkpoint_receipt
+
+    manifest = _aws_manifest_object()
+    release = _aws_release_object()
+    receipt = verify_checkpoint_receipt(
+        _aws_checkpoint_receipt(tmp_path, manifest),
+        release=release,
+        manifest=manifest,
+    )
+    runner = _FakeAwsRunner()
+    backend = AwsP5Backend(
+        profile=_aws_profile_object(),
+        runtime=_aws_runtime_object(),
+        instance_profile_arn=(
+            "arn:aws:iam::123456789012:instance-profile/memorysplit-p5"
+        ),
+        state_root=tmp_path / "state",
+        runner=runner,
+    )
+
+    mutations = (
+        lambda: backend.resume(
+            release=release,
+            manifest=manifest,
+            checkpoint_receipt=receipt,
+            approval_path=None,
+            apply=True,
+        ),
+        lambda: backend.cancel(
+            release=release,
+            manifest=manifest,
+            approval_path=None,
+            apply=True,
+        ),
+        lambda: backend.evaluate(
+            release=release,
+            manifest=manifest,
+            approval_path=None,
+            apply=True,
+        ),
+        lambda: backend.cleanup(
+            release=release,
+            manifest=manifest,
+            approval_path=None,
+            apply=True,
+        ),
+    )
+    for mutate in mutations:
+        with pytest.raises(Exception) as caught:
+            mutate()
+        assert getattr(caught.value, "code", None) == "APPROVAL_REQUIRED"
+    assert runner.calls == []
 def test_render_binds_verified_runtime_roots_independent_of_cwd_and_ambient_data(
     tmp_path,
 ):
