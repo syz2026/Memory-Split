@@ -123,6 +123,7 @@ _FORBIDDEN_COMPONENT_PATTERNS = tuple(
         r"pass(?:word|phrase)(?:v[0-9]+)?",
         r"privatekeys?(?:v[0-9]+)?",
         r"corpus(?:es)?(?:v[0-9]+)?",
+        r"results?(?:v[0-9]+)?",
     )
 )
 _SHARED_SUFFIXES: dict[str, set[str]] = {
@@ -227,6 +228,11 @@ _SENSITIVE_FIELD_AFFIXES = (
     "privatekey",
     "secretkey",
     "sessiontoken",
+)
+_SENSITIVE_FIELD_VALUE_FORMS = (
+    "apitokenvalue",
+    "secretvalue",
+    "tokenvalue",
 )
 _TEXT_SUFFIXES = {".json", ".lock", ".md", ".py", ".sh", ".txt", ".yaml", ".yml"}
 _OBJECT_ID_PATTERN = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})")
@@ -894,6 +900,8 @@ def _is_sensitive_field_name(value: str) -> bool:
     if canonical in _SENSITIVE_FIELD_EXACT:
         return True
     if canonical.endswith(("secret", "token")):
+        return True
+    if any(form in canonical for form in _SENSITIVE_FIELD_VALUE_FORMS):
         return True
     return any(
         concept in canonical for concept in _SENSITIVE_FIELD_AFFIXES

@@ -713,6 +713,12 @@ def test_packager_rejects_static_credential_fields_in_profile(tmp_path):
         "scripts/private/lo-gs/worker.py",
         "tests/private/check_points/state.py",
         "msctl/private/creden-tials/key.py",
+        "evals/private/result/answers.py",
+        "evals/private/results/answers.py",
+        "evals/private/RESULTS/answers.py",
+        "evals/private/re-sults/answers.py",
+        "evals/private/re_sult/answers.py",
+        "evals/private/Re-SuLtS_v2/answers.py",
     ],
 )
 def test_packager_rejects_forbidden_content_nested_in_allowed_trees(
@@ -811,6 +817,12 @@ def test_packager_recursively_rejects_secret_keys_without_echoing_values(
         ("configs/preregistration-v2.yaml", "passphrase"),
         ("configs/current-dataset-lock.json", "token"),
         ("configs/preregistration-v2.yaml", "credentials"),
+        ("configs/current-dataset-lock.json", "secretValue"),
+        ("configs/preregistration-v2.yaml", "secret_value"),
+        ("configs/current-dataset-lock.json", "tokenValue"),
+        ("configs/preregistration-v2.yaml", "token_value"),
+        ("configs/current-dataset-lock.json", "apiToken"),
+        ("configs/preregistration-v2.yaml", "api_token_value"),
     ],
 )
 def test_structured_credential_key_variants_are_rejected_without_values(
@@ -855,6 +867,10 @@ def test_structured_scanner_allows_benign_token_measurement_keys(tmp_path):
         "schema_version": 1,
         "token_count": 1024,
         "tokenizer_name": "fixture-tokenizer",
+        "tokenization_method": "fixture",
+        "token_type_count": 2,
+        "api_token_count": 0,
+        "secretary_name": "fixture-role",
         "tokens_per_step": 524_288,
         "raw_target_tokens": 7_120_879_616,
     }
