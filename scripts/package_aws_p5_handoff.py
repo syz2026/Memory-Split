@@ -65,6 +65,7 @@ REQUIRED_MEMBERS = EXPECTED_CONFIGS | {
     "scripts/run_train.py",
     "tests/test_package_aws_p5_handoff.py",
     "train/__init__.py",
+    "train/data.py",
 }
 _ROOT_INCLUDED = {
     "AWS-P5-START.md",
@@ -922,7 +923,7 @@ def _classification(path: str) -> str:
     parts = PurePosixPath(path).parts
     if not parts:
         return "unknown"
-    if path == "msctl/dataset.py":
+    if path in {"msctl/dataset.py", "train/data.py"}:
         return "included"
     if path == STATIC_ENVIRONMENT_LOCK_PATH:
         return "forbidden"
