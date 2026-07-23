@@ -1,0 +1,1551 @@
+#!/usr/bin/env python3
+"""Build a deterministic, fail-closed AWS P5 MemorySplit handoff."""
+
+from __future__ import annotations
+
+import argparse
+import ctypes
+import errno
+import fcntl
+import hashlib
+import json
+import os
+import re
+import secrets
+import stat
+import subprocess
+import sys
+import tempfile
+import zipfile
+from dataclasses import dataclass
+from pathlib import Path, PurePosixPath
+from typing import Iterator
+
+import yaml
+
+
+PROVIDER = "aws-p5.48xlarge"
+COHORT_ID = "memorysplit-confirmatory-v2-360m-n5"
+AWS_SEEDS = (1, 2, 3, 4)
+ARMS = ("dense", "split90")
+PACKAGE_FORMAT_VERSION = 1
+NORMALIZED_TIME = (1980, 1, 1, 0, 0, 0)
+COHORT_PATH = "configs/cohort-assignment-v2.json"
+PROFILE_PATH = "cluster/profiles/aws-p5.48xlarge.json"
+ENVIRONMENT_PATH = "requirements-aws-p5.lock"
+DATASET_POINTER_PATH = "DATASET-POINTER-AWS.json"
+RELEASE_RECEIPT_NAME = "RELEASE-AWS-P5.json"
+EXPECTED_CONFIGS = {
+    f"configs/360m-v2/{arm}-s{seed}.yaml"
+    for seed in AWS_SEEDS
+    for arm in ARMS
+}
+SEED_ZERO_CONFIGS = {
+    f"configs/360m-v2/{arm}-s0.yaml" for arm in ARMS
+}
+REQUIRED_MEMBERS = EXPECTED_CONFIGS | {
+    "AWS-P5-START.md",
+    DATASET_POINTER_PATH,
+    ENVIRONMENT_PATH,
+    COHORT_PATH,
+    "configs/preregistration-v2.yaml",
+    PROFILE_PATH,
+    "cluster/aws/p5/bootstrap.sh",
+    "cluster/aws/p5/interruption_checkpoint.py",
+    "cluster/aws/p5/launch_seed_pair.py",
+    "corpusgen/parallel/__init__.py",
+    "evals/confirmatory/__init__.py",
+    "msctl/__init__.py",
+    "msctl/__main__.py",
+    "msctl/aws_p5.py",
+    "scripts/build_parallel_corpus.py",
+    "scripts/package_aws_p5_handoff.py",
+    "scripts/run_train.py",
+    "tests/test_package_aws_p5_handoff.py",
+    "train/__init__.py",
+}
+_ROOT_INCLUDED = {
+    "AWS-P5-START.md",
+    DATASET_POINTER_PATH,
+    ENVIRONMENT_PATH,
+    "LICENSE",
+    "LICENSE.txt",
+    "pyproject.toml",
+    "pytest.ini",
+    "requirements.txt",
+}
+_ROOT_EXCLUDED = {
+    ".gitignore",
+    "AGENT-START.md",
+    "DATASET-POINTER.json",
+    "HANDOFF-AGENT.md",
+    "Memory-split-design.md",
+    "README.md",
+    "requirements-illumina.lock",
+}
+_EXCLUDED_TOP_LEVEL = {
+    ".cursor",
+    ".github",
+    ".superpowers",
+    "artifacts",
+    "checkpoints",
+    "data",
+    "dist",
+    "docs",
+    "fixtures",
+    "logs",
+    "outputs",
+    "paper",
+    "schemas",
+    "sealed",
+    "wandb",
+}
+_DISPOSABLE_COMPONENTS = {
+    ".cache",
+    ".mypy_cache",
+    ".pytest_cache",
+    ".ruff_cache",
+    ".tiktoken_cache",
+    "__pycache__",
+    "cache",
+    "caches",
+    "checkpoints",
+    "logs",
+    "snapshots",
+}
+_SHARED_SUFFIXES: dict[str, set[str] | None] = {
+    "corpusgen": {".py"},
+    "evals": {".py"},
+    "msctl": {".py"},
+    "organizer": {".py"},
+    "scripts": {".py"},
+    "sources": {".json", ".txt"},
+    "tests": {".py"},
+    "train": {".py"},
+    "vendor": None,
+}
+_SHARED_CONFIGS = {
+    "configs/current-dataset-lock.json",
+    "configs/preregistration-v2.yaml",
+    "configs/reasoning-dataset-v2.json",
+    "configs/route-policy.json",
+}
+_SHARED_TEST_FIXTURES = {
+    "tests/fixtures/current_sources/README.md",
+    "tests/fixtures/relational-smoke-route-policy.json",
+}
+_LEGACY_CONFIG_PREFIXES = (
+    "configs/29m/",
+    "configs/160m/",
+    "configs/360m/",
+)
+_LEGACY_CONFIG_FILES = {
+    "configs/29m.tsv",
+    "configs/160m.tsv",
+    "configs/360m.tsv",
+}
+_PROVIDER_EXCLUDED = {
+    "cluster/profiles/illumina-usfc-prd.json",
+    "scripts/package_illumina_handoff.py",
+    "tests/test_package_illumina_handoff.py",
+}
+_PRIVATE_KEY_PATTERN = re.compile(
+    rb"-----BEGIN (?:RSA |EC |DSA |OPENSSH |PGP )?PRIVATE KEY"
+    rb"(?: BLOCK)?-----"
+)
+_AWS_ACCESS_KEY_PATTERN = re.compile(rb"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b")
+_SERVICE_TOKEN_PATTERN = re.compile(
+    rb"\b(?:hf_[A-Za-z0-9]{16,}|gh[pousr]_[A-Za-z0-9]{16,}|"
+    rb"github_pat_[A-Za-z0-9_]{16,}|glpat-[A-Za-z0-9_-]{16,}|"
+    rb"npm_[A-Za-z0-9]{16,}|sk-(?:proj-)?[A-Za-z0-9_-]{20,}|"
+    rb"sk-ant-[A-Za-z0-9_-]{20,})\b"
+)
+_ASSIGNMENT_NAME_PATTERN = (
+    rb"(?:AWS_(?:ACCESS_KEY_ID|SECRET_ACCESS_KEY|SESSION_TOKEN)|"
+    rb"(?:HF|HUGGINGFACE|GITHUB|GH)_(?:TOKEN|API_KEY|API_TOKEN|PAT)|"
+    rb"(?:OPENAI|ANTHROPIC|WANDB)_(?:API_KEY|TOKEN)|"
+    rb"SLACK_(?:TOKEN|BOT_TOKEN)|"
+    rb"(?:API|ACCESS|AUTH)_(?:KEY|TOKEN|SECRET)|"
+    rb"CLIENT_SECRET|PRIVATE_KEY|PASSWORD)"
+)
+_SECRET_ASSIGNMENT_PATTERN = re.compile(
+    rb"(?i)\b"
+    + _ASSIGNMENT_NAME_PATTERN
+    + rb"\s*=\s*(?:[\"'][^\"'\r\n]{8,}[\"']|[^\s#;\"']{8,})"
+)
+_GENERIC_SECRET_ASSIGNMENT_PATTERN = re.compile(
+    rb"\b(?:TOKEN|SECRET|PASSWORD|"
+    rb"[A-Z][A-Z0-9_]*(?:TOKEN|SECRET|PASSWORD|API_KEY|PRIVATE_KEY))\s*=\s*"
+    rb"(?:[\"'][^\"'\r\n]{8,}[\"']|[^\s#;\"']{8,})"
+)
+_BEARER_TOKEN_PATTERN = re.compile(
+    rb"(?i)\bauthorization\s*:\s*bearer\s+[A-Za-z0-9._~+/-]{16,}"
+)
+_SECRET_PATTERNS = (
+    _PRIVATE_KEY_PATTERN,
+    _AWS_ACCESS_KEY_PATTERN,
+    _SERVICE_TOKEN_PATTERN,
+    _SECRET_ASSIGNMENT_PATTERN,
+    _GENERIC_SECRET_ASSIGNMENT_PATTERN,
+    _BEARER_TOKEN_PATTERN,
+)
+_SENSITIVE_FIELD_PATTERN = re.compile(
+    r"(?:^|_)(?:access_key|api_key|auth_token|client_secret|credential|"
+    r"password|private_key|secret|session_token|token)(?:$|_)",
+    re.IGNORECASE,
+)
+_OBJECT_ID_PATTERN = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})")
+_CONFIG_KEYS = {
+    "schema_version",
+    "cohort_id",
+    "run_id",
+    "condition",
+    "seed",
+    "model",
+    "ctx",
+    "train_corpus",
+    "sidecar_name",
+    "out_dir",
+    "micro_batch_size",
+    "tokens_per_step",
+    "max_steps",
+    "total_tokens",
+    "lr",
+    "warmup_steps",
+    "weight_decay",
+    "compile",
+    "device",
+    "log_every",
+    "eval_every",
+    "snap_frac",
+    "ckpt_minutes",
+}
+
+
+class PackageError(ValueError):
+    """A fail-closed release validation error."""
+
+    def __init__(self, message: str, *, code: str = "PACKAGE_REJECTED") -> None:
+        super().__init__(message)
+        self.code = code
+
+
+class _HelpRequested(Exception):
+    def __init__(self, text: str) -> None:
+        super().__init__(text)
+        self.text = text
+
+
+class _JsonArgumentParser(argparse.ArgumentParser):
+    def error(self, message: str) -> None:
+        raise PackageError(message, code="CLI_USAGE")
+
+    def print_help(self, file=None) -> None:
+        raise _HelpRequested(self.format_help())
+
+    def exit(self, status: int = 0, message: str | None = None) -> None:
+        if status == 0:
+            raise _HelpRequested(message or self.format_help())
+        raise PackageError(
+            (message or "invalid arguments").strip(),
+            code="CLI_USAGE",
+        )
+
+
+@dataclass(frozen=True)
+class ReleaseArtifacts:
+    release_dir: Path
+    archive: Path
+    sha256_file: Path
+    release: Path
+    release_id: str
+    sha256: str
+    published: bool
+
+
+@dataclass(frozen=True)
+class _Tracked:
+    path: str
+    mode: str
+    object_id: str
+
+
+@dataclass(frozen=True)
+class _Collected:
+    payload: dict[str, bytes]
+    modes: dict[str, str]
+    members_sha256: str
+    cohort_sha256: str
+    profile_sha256: str
+    environment_sha256: str
+    dataset_pointer_sha256: str
+    config_sha256: dict[str, str]
+    seed_assignment: dict[str, object]
+
+
+@dataclass(frozen=True)
+class _Staged:
+    archive_fd: int
+    archive_sha256: str
+    archive_bytes: int
+
+
+class _UniqueSafeLoader(yaml.SafeLoader):
+    pass
+
+
+def _construct_unique_mapping(
+    loader: _UniqueSafeLoader,
+    node: yaml.nodes.MappingNode,
+    deep: bool = False,
+) -> dict[object, object]:
+    loader.flatten_mapping(node)
+    result: dict[object, object] = {}
+    for key_node, value_node in node.value:
+        key = loader.construct_object(key_node, deep=deep)
+        try:
+            duplicate = key in result
+        except TypeError as error:
+            raise PackageError("YAML mapping contains an invalid key") from error
+        if duplicate:
+            raise PackageError(f"YAML mapping contains duplicate key: {key}")
+        result[key] = loader.construct_object(value_node, deep=deep)
+    return result
+
+
+_UniqueSafeLoader.add_constructor(
+    yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG,
+    _construct_unique_mapping,
+)
+
+
+def _directory_flags() -> int:
+    return (
+        os.O_RDONLY
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+
+
+def _open_source_root(path: Path) -> int:
+    try:
+        descriptor = os.open(path, _directory_flags())
+    except OSError as error:
+        raise PackageError(
+            "source root must be a non-symlink directory"
+        ) from error
+    try:
+        if not stat.S_ISDIR(os.fstat(descriptor).st_mode):
+            raise PackageError("source root must be a directory")
+        return descriptor
+    except Exception:
+        os.close(descriptor)
+        raise
+
+
+def _descriptor_path(descriptor: int) -> str:
+    if sys.platform == "darwin":
+        try:
+            encoded = fcntl.fcntl(descriptor, 50, b"\0" * 1024)
+            path = encoded.split(b"\0", 1)[0]
+            if path:
+                return os.fsdecode(path)
+        except OSError as error:
+            raise PackageError(
+                "platform cannot resolve the pinned source descriptor"
+            ) from error
+    for prefix in ("/proc/self/fd", "/dev/fd"):
+        candidate = f"{prefix}/{descriptor}"
+        try:
+            return os.readlink(candidate)
+        except OSError:
+            continue
+    raise PackageError("platform cannot expose the pinned source descriptor")
+
+
+def _assert_directory_descriptor_path(descriptor: int, path: str) -> None:
+    pinned = os.fstat(descriptor)
+    try:
+        current = os.stat(path, follow_symlinks=False)
+    except OSError as error:
+        raise PackageError("pinned source directory path changed") from error
+    if (
+        not stat.S_ISDIR(current.st_mode)
+        or current.st_dev != pinned.st_dev
+        or current.st_ino != pinned.st_ino
+    ):
+        raise PackageError("pinned source directory path was replaced")
+
+
+def _run_git(repository_fd: int, *arguments: str) -> bytes:
+    environment = dict(os.environ)
+    environment.update(
+        {
+            "GIT_OPTIONAL_LOCKS": "0",
+            "GIT_PAGER": "cat",
+            "LC_ALL": "C",
+        }
+    )
+    repository_path = _descriptor_path(repository_fd)
+    _assert_directory_descriptor_path(repository_fd, repository_path)
+    try:
+        completed = subprocess.run(
+            [
+                "git",
+                "-C",
+                repository_path,
+                *arguments,
+            ],
+            capture_output=True,
+            check=False,
+            env=environment,
+            pass_fds=(repository_fd,),
+        )
+    except OSError as error:
+        raise PackageError("git repository verification failed") from error
+    _assert_directory_descriptor_path(repository_fd, repository_path)
+    if completed.returncode != 0:
+        raise PackageError("git repository verification failed")
+    return completed.stdout
+
+
+def _clean_revision(repository_fd: int) -> str:
+    status = _run_git(
+        repository_fd,
+        "status",
+        "--porcelain=v1",
+        "-z",
+        "--untracked-files=all",
+    )
+    if status:
+        raise PackageError("dirty Git trees cannot produce a release")
+    revision = (
+        _run_git(repository_fd, "rev-parse", "--verify", "HEAD")
+        .decode("ascii", errors="strict")
+        .strip()
+    )
+    if _OBJECT_ID_PATTERN.fullmatch(revision) is None:
+        raise PackageError("Git HEAD is not a full commit ID")
+    return revision
+
+
+def _assert_repository_unchanged(repository_fd: int, revision: str) -> None:
+    current = (
+        _run_git(repository_fd, "rev-parse", "--verify", "HEAD")
+        .decode("ascii", errors="strict")
+        .strip()
+    )
+    status = _run_git(
+        repository_fd,
+        "status",
+        "--porcelain=v1",
+        "-z",
+        "--untracked-files=all",
+    )
+    if current != revision or status:
+        raise PackageError("source Git tree changed during packaging")
+
+
+def _tracked_files(repository_fd: int, revision: str) -> list[_Tracked]:
+    output = _run_git(
+        repository_fd,
+        "ls-tree",
+        "-r",
+        "-z",
+        "--full-tree",
+        revision,
+    )
+    result: list[_Tracked] = []
+    seen: set[str] = set()
+    for raw in output.split(b"\0"):
+        if not raw:
+            continue
+        try:
+            metadata, encoded_path = raw.split(b"\t", 1)
+            mode, object_type, object_id = metadata.decode("ascii").split()
+            path = encoded_path.decode("ascii")
+        except (UnicodeDecodeError, ValueError) as error:
+            raise PackageError("Git tree contains an unsupported path") from error
+        portable = PurePosixPath(path)
+        if (
+            portable.is_absolute()
+            or "\\" in path
+            or any(part in {"", ".", ".."} for part in path.split("/"))
+        ):
+            raise PackageError("Git tree contains an unsafe path")
+        if path in seen:
+            raise PackageError("Git tree contains a duplicate path")
+        seen.add(path)
+        if mode == "120000":
+            raise PackageError(f"tracked symlink is forbidden: {path}")
+        if object_type != "blob":
+            raise PackageError(f"unsupported tracked Git object: {path}")
+        if mode not in {"100644", "100755"}:
+            raise PackageError(f"unsupported tracked file mode: {path}")
+        if _OBJECT_ID_PATTERN.fullmatch(object_id) is None:
+            raise PackageError("Git tree contains an invalid blob ID")
+        result.append(_Tracked(path=path, mode=mode, object_id=object_id))
+    return sorted(result, key=lambda item: item.path)
+
+
+def _classification(path: str) -> str:
+    parts = PurePosixPath(path).parts
+    if not parts:
+        return "unknown"
+    if set(parts) & _DISPOSABLE_COMPONENTS:
+        return "excluded"
+    if path in _ROOT_INCLUDED:
+        return "included"
+    if path in _ROOT_EXCLUDED or path in _PROVIDER_EXCLUDED:
+        return "excluded"
+    if parts[0] in _EXCLUDED_TOP_LEVEL:
+        return "excluded"
+    if path == COHORT_PATH or path in EXPECTED_CONFIGS or path in _SHARED_CONFIGS:
+        return "included"
+    if path in SEED_ZERO_CONFIGS:
+        return "excluded"
+    if path in _LEGACY_CONFIG_FILES or path.startswith(_LEGACY_CONFIG_PREFIXES):
+        return "excluded"
+    if path.startswith("configs/"):
+        return "unknown"
+    if path == PROFILE_PATH:
+        return "included"
+    if parts[0] == "cluster":
+        if (
+            len(parts) >= 4
+            and parts[0:3] == ("cluster", "aws", "p5")
+            and PurePosixPath(path).suffix.lower() in {".py", ".sh"}
+        ):
+            return "included"
+        return "excluded"
+    if path in _SHARED_TEST_FIXTURES:
+        return "included"
+    suffixes = _SHARED_SUFFIXES.get(parts[0])
+    if parts[0] in _SHARED_SUFFIXES:
+        if suffixes is None or PurePosixPath(path).suffix.lower() in suffixes:
+            return "included"
+        return "unknown"
+    return "unknown"
+
+
+def _read_blob(repository_fd: int, object_id: str) -> bytes:
+    if _OBJECT_ID_PATTERN.fullmatch(object_id) is None:
+        raise PackageError("Git tree contains an invalid blob ID")
+    return _run_git(repository_fd, "cat-file", "blob", object_id)
+
+
+def _scan_secret(path: str, data: bytes) -> None:
+    lower_name = PurePosixPath(path).name.lower()
+    if (
+        lower_name == ".env"
+        or lower_name.startswith("id_rsa")
+        or lower_name.endswith((".key", ".pem", ".p12"))
+        or "credential" in lower_name
+    ):
+        raise PackageError(f"secret-like file is forbidden: {path}")
+    if any(pattern.search(data) for pattern in _SECRET_PATTERNS):
+        raise PackageError(f"secret material detected in: {path}")
+
+
+def _sha256(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def _canonical_pretty(value: object) -> bytes:
+    return (
+        json.dumps(
+            value,
+            indent=2,
+            sort_keys=True,
+            ensure_ascii=True,
+            allow_nan=False,
+        )
+        + "\n"
+    ).encode("ascii")
+
+
+def _unique_json_pairs(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise PackageError(f"JSON object contains duplicate key: {key}")
+        result[key] = value
+    return result
+
+
+def _reject_json_constant(value: str) -> object:
+    raise PackageError(f"JSON contains a non-finite number: {value}")
+
+
+def _load_json_object(data: bytes, *, label: str) -> dict[str, object]:
+    try:
+        text = data.decode("utf-8", errors="strict")
+        value = json.loads(
+            text,
+            object_pairs_hook=_unique_json_pairs,
+            parse_constant=_reject_json_constant,
+        )
+    except PackageError:
+        raise
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise PackageError(f"{label} is not canonical JSON data") from error
+    if not isinstance(value, dict):
+        raise PackageError(f"{label} must be a JSON object")
+    return value
+
+
+def _load_yaml_object(data: bytes, *, path: str) -> dict[str, object]:
+    try:
+        text = data.decode("utf-8", errors="strict")
+        value = yaml.load(text, Loader=_UniqueSafeLoader)
+    except PackageError:
+        raise
+    except (UnicodeDecodeError, yaml.YAMLError) as error:
+        raise PackageError(f"run config is not valid YAML: {path}") from error
+    if not isinstance(value, dict) or not all(
+        isinstance(key, str) for key in value
+    ):
+        raise PackageError(f"run config must be a string-keyed mapping: {path}")
+    return value
+
+
+def _same_typed_value(actual: object, expected: object) -> bool:
+    if type(actual) is not type(expected):
+        return False
+    if isinstance(expected, dict):
+        return (
+            actual.keys() == expected.keys()
+            and all(
+                _same_typed_value(actual[key], expected[key])
+                for key in expected
+            )
+        )
+    if isinstance(expected, list):
+        return len(actual) == len(expected) and all(
+            _same_typed_value(left, right)
+            for left, right in zip(actual, expected)
+        )
+    return actual == expected
+
+
+def _expected_assignment() -> dict[str, object]:
+    return {
+        "cohort_id": COHORT_ID,
+        "model_parameters": 356_033_536,
+        "optimizer_steps": 13_582,
+        "provider_seeds": {
+            PROVIDER: [1, 2, 3, 4],
+            "illumina-usfc-prd": [0],
+        },
+        "raw_target_tokens": 7_120_879_616,
+        "schema_version": 2,
+        "targets_per_update": 524_288,
+    }
+
+
+def _validate_assignment(data: bytes) -> dict[str, object]:
+    assignment = _load_json_object(data, label="cohort assignment")
+    if not _same_typed_value(assignment, _expected_assignment()):
+        raise PackageError(
+            "cohort assignment must assign seed 0 to Illumina and "
+            "exactly seeds 1-4 to AWS P5"
+        )
+    if (
+        assignment["optimizer_steps"] * assignment["targets_per_update"]
+        != assignment["raw_target_tokens"]
+    ):
+        raise PackageError("cohort assignment token math is inconsistent")
+    return assignment
+
+
+def _expected_config(seed: int, arm: str) -> dict[str, object]:
+    return {
+        "schema_version": 2,
+        "cohort_id": COHORT_ID,
+        "run_id": f"memorysplit-v2-360m-s{seed}-{arm}",
+        "condition": arm,
+        "seed": seed,
+        "model": "d360m",
+        "ctx": 1024,
+        "train_corpus": "dataset/corpus-receipt.json",
+        "sidecar_name": (
+            "dense_target_weights"
+            if arm == "dense"
+            else "split90_target_weights"
+        ),
+        "out_dir": f"runs/seed-{seed}/{arm}",
+        "micro_batch_size": 8,
+        "tokens_per_step": 524_288,
+        "max_steps": 13_582,
+        "total_tokens": 7_120_879_616,
+        "lr": 0.001,
+        "warmup_steps": 300,
+        "weight_decay": 0.1,
+        "compile": True,
+        "device": "cuda",
+        "log_every": 20,
+        "eval_every": 250,
+        "snap_frac": 0.1,
+        "ckpt_minutes": 30,
+    }
+
+
+def _validate_config(path: str, data: bytes, *, seed: int, arm: str) -> None:
+    config = _load_yaml_object(data, path=path)
+    if set(config) != _CONFIG_KEYS:
+        missing = sorted(_CONFIG_KEYS - set(config))
+        extra = sorted(set(config) - _CONFIG_KEYS)
+        detail = missing[0] if missing else extra[0]
+        raise PackageError(f"run config has invalid field {detail}: {path}")
+    expected = _expected_config(seed, arm)
+    for field, expected_value in expected.items():
+        if not _same_typed_value(config[field], expected_value):
+            raise PackageError(
+                f"run config {field} does not match the frozen contract: {path}"
+            )
+    if config["max_steps"] * config["tokens_per_step"] != config["total_tokens"]:
+        raise PackageError(f"run config token math is inconsistent: {path}")
+
+
+def _nested_value(
+    value: dict[str, object],
+    path: tuple[str, ...],
+    *,
+    label: str,
+) -> object:
+    current: object = value
+    for component in path:
+        if not isinstance(current, dict) or component not in current:
+            raise PackageError(
+                f"{label} is missing required field {'.'.join(path)}"
+            )
+        current = current[component]
+    return current
+
+
+def _reject_sensitive_fields(value: object, *, label: str) -> None:
+    if isinstance(value, dict):
+        for key, child in value.items():
+            if not isinstance(key, str):
+                raise PackageError(f"{label} contains a non-string field")
+            if _SENSITIVE_FIELD_PATTERN.search(key):
+                raise PackageError(
+                    f"{label} contains a static credential or secret field"
+                )
+            _reject_sensitive_fields(child, label=label)
+    elif isinstance(value, list):
+        for child in value:
+            _reject_sensitive_fields(child, label=label)
+
+
+def _validate_profile(data: bytes) -> None:
+    profile = _load_json_object(data, label="AWS P5 profile")
+    _reject_sensitive_fields(profile, label="AWS P5 profile")
+    expected_values = {
+        ("provider",): PROVIDER,
+        ("instance_type",): "p5.48xlarge",
+        ("purchase_model",): "on_demand",
+        ("assigned_seeds",): [1, 2, 3, 4],
+        ("gpu", "model"): "NVIDIA H100 80GB",
+        ("gpu", "allocated"): 8,
+        ("gpu", "seed_train_groups"): [4, 4],
+        ("cpu", "vcpus"): 192,
+        ("storage", "instance_store_devices"): 8,
+        ("storage", "instance_store_device_bytes"): 3_840_000_000_000,
+        ("storage", "scratch_root"): "/mnt/memorysplit",
+        ("storage", "durable_uri_env"): "MS_S3_ROOT",
+        ("runtime", "ami_id_env"): "MS_AWS_AMI_ID",
+        ("runtime", "container_digest_env"): "MS_CONTAINER_DIGEST",
+    }
+    for path, expected in expected_values.items():
+        actual = _nested_value(profile, path, label="AWS P5 profile")
+        if not _same_typed_value(actual, expected):
+            raise PackageError(
+                "AWS P5 profile field "
+                f"{'.'.join(path)} does not match the frozen contract"
+            )
+
+
+def _validate_dataset_pointer(data: bytes) -> None:
+    pointer = _load_json_object(data, label="AWS dataset pointer")
+    _reject_sensitive_fields(pointer, label="AWS dataset pointer")
+    expected = {
+        "provider": PROVIDER,
+        "durable_uri_env": "MS_S3_ROOT",
+        "full_corpus_in_release": False,
+    }
+    for field, expected_value in expected.items():
+        if field not in pointer or not _same_typed_value(
+            pointer[field], expected_value
+        ):
+            raise PackageError(
+                f"AWS dataset pointer field {field} is invalid"
+            )
+
+
+def _collect_payload(
+    repository_fd: int,
+    tracked: list[_Tracked],
+    revision: str,
+) -> _Collected:
+    included: list[_Tracked] = []
+    unknown: list[str] = []
+    for item in tracked:
+        classification = _classification(item.path)
+        if classification == "included":
+            included.append(item)
+        elif classification == "unknown":
+            unknown.append(item.path)
+    if unknown:
+        raise PackageError(
+            f"unknown tracked path is not allowlisted: {unknown[0]}"
+        )
+    included_paths = {item.path for item in included}
+    missing = sorted(REQUIRED_MEMBERS - included_paths)
+    if missing:
+        raise PackageError(f"required release member is not tracked: {missing[0]}")
+
+    payload: dict[str, bytes] = {}
+    modes: dict[str, str] = {}
+    member_rows: list[dict[str, object]] = []
+    for item in included:
+        data = _read_blob(repository_fd, item.object_id)
+        _scan_secret(item.path, data)
+        payload[item.path] = data
+        modes[item.path] = item.mode
+        member_rows.append(
+            {
+                "path": item.path,
+                "bytes": len(data),
+                "sha256": _sha256(data),
+                "git_blob": item.object_id,
+                "git_mode": item.mode,
+            }
+        )
+
+    assignment = _validate_assignment(payload[COHORT_PATH])
+    for seed in AWS_SEEDS:
+        for arm in ARMS:
+            path = f"configs/360m-v2/{arm}-s{seed}.yaml"
+            _validate_config(path, payload[path], seed=seed, arm=arm)
+    _validate_profile(payload[PROFILE_PATH])
+    _validate_dataset_pointer(payload[DATASET_POINTER_PATH])
+    if not payload[ENVIRONMENT_PATH].strip():
+        raise PackageError("AWS environment lock must not be empty")
+
+    config_sha256 = {
+        path: _sha256(payload[path]) for path in sorted(EXPECTED_CONFIGS)
+    }
+    cohort_sha256 = _sha256(payload[COHORT_PATH])
+    profile_sha256 = _sha256(payload[PROFILE_PATH])
+    environment_sha256 = _sha256(payload[ENVIRONMENT_PATH])
+    dataset_pointer_sha256 = _sha256(payload[DATASET_POINTER_PATH])
+    seed_assignment: dict[str, object] = {
+        "cohort_id": assignment["cohort_id"],
+        "provider": PROVIDER,
+        "seeds": list(AWS_SEEDS),
+        "arms": list(ARMS),
+    }
+    payload["RELEASE-METADATA.json"] = _canonical_pretty(
+        {
+            "schema_version": 1,
+            "package_format_version": PACKAGE_FORMAT_VERSION,
+            "provider": PROVIDER,
+            "source": {"commit": revision, "dirty": False},
+            "seed_assignment": seed_assignment,
+            "cohort_assignment": {
+                "path": COHORT_PATH,
+                "sha256": cohort_sha256,
+            },
+            "profile": {
+                "path": PROFILE_PATH,
+                "sha256": profile_sha256,
+            },
+            "environment": {
+                "path": ENVIRONMENT_PATH,
+                "sha256": environment_sha256,
+            },
+            "dataset_pointer": {
+                "path": DATASET_POINTER_PATH,
+                "sha256": dataset_pointer_sha256,
+            },
+            "config_sha256": config_sha256,
+            "members": member_rows,
+        }
+    )
+    modes["RELEASE-METADATA.json"] = "100644"
+    sums = "".join(
+        f"{_sha256(payload[name])}  {name}\n" for name in sorted(payload)
+    ).encode("ascii")
+    payload["SHA256SUMS"] = sums
+    modes["SHA256SUMS"] = "100644"
+    return _Collected(
+        payload=payload,
+        modes=modes,
+        members_sha256=_sha256(sums),
+        cohort_sha256=cohort_sha256,
+        profile_sha256=profile_sha256,
+        environment_sha256=environment_sha256,
+        dataset_pointer_sha256=dataset_pointer_sha256,
+        config_sha256=config_sha256,
+        seed_assignment=seed_assignment,
+    )
+
+
+def _planned_directories(paths: Iterator[str]) -> set[str]:
+    directories: set[str] = set()
+    for path in paths:
+        parts = PurePosixPath(path).parts
+        for end in range(1, len(parts)):
+            directories.add("/".join(parts[:end]) + "/")
+    return directories
+
+
+def _zip_info(name: str, *, mode: int, directory: bool) -> zipfile.ZipInfo:
+    info = zipfile.ZipInfo(name, date_time=NORMALIZED_TIME)
+    info.create_system = 3
+    info.create_version = 20
+    info.extract_version = 20
+    info.compress_type = (
+        zipfile.ZIP_STORED if directory else zipfile.ZIP_DEFLATED
+    )
+    info.flag_bits = 0
+    info.extra = b""
+    info.comment = b""
+    info.internal_attr = 0
+    file_type = stat.S_IFDIR if directory else stat.S_IFREG
+    info.external_attr = (file_type | mode) << 16
+    if directory:
+        info.external_attr |= 0x10
+    return info
+
+
+def _write_all(descriptor: int, data: bytes) -> None:
+    view = memoryview(data)
+    written = 0
+    while written < len(view):
+        count = os.write(descriptor, view[written:])
+        if count <= 0:
+            raise PackageError("short write while staging release")
+        written += count
+
+
+def _write_zip_at(
+    directory_fd: int,
+    name: str,
+    *,
+    payload: dict[str, bytes],
+    modes: dict[str, str],
+) -> None:
+    flags = (
+        os.O_RDWR
+        | os.O_CREAT
+        | os.O_EXCL
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    try:
+        descriptor = os.open(name, flags, 0o600, dir_fd=directory_fd)
+    except OSError as error:
+        raise PackageError("cannot create private staged archive") from error
+    try:
+        with os.fdopen(os.dup(descriptor), "w+b") as handle:
+            with zipfile.ZipFile(
+                handle,
+                mode="w",
+                compression=zipfile.ZIP_DEFLATED,
+                compresslevel=9,
+                strict_timestamps=True,
+            ) as archive:
+                archive.comment = b""
+                entries: list[tuple[str, bool]] = [
+                    (directory, True)
+                    for directory in _planned_directories(iter(payload))
+                ]
+                entries.extend((path, False) for path in payload)
+                for path, is_directory in sorted(entries):
+                    if is_directory:
+                        info = _zip_info(path, mode=0o755, directory=True)
+                        archive.writestr(info, b"", compress_type=zipfile.ZIP_STORED)
+                    else:
+                        mode = 0o755 if modes[path] == "100755" else 0o644
+                        info = _zip_info(path, mode=mode, directory=False)
+                        archive.writestr(
+                            info,
+                            payload[path],
+                            compress_type=zipfile.ZIP_DEFLATED,
+                            compresslevel=9,
+                        )
+            handle.flush()
+        os.fchmod(descriptor, 0o644)
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _write_new_at(
+    directory_fd: int,
+    name: str,
+    data: bytes,
+    *,
+    mode: int = 0o644,
+) -> None:
+    flags = (
+        os.O_WRONLY
+        | os.O_CREAT
+        | os.O_EXCL
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    try:
+        descriptor = os.open(name, flags, 0o600, dir_fd=directory_fd)
+    except OSError as error:
+        raise PackageError("cannot create private release receipt") from error
+    try:
+        _write_all(descriptor, data)
+        os.fchmod(descriptor, mode)
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _open_pinned_regular_at(directory_fd: int, name: str) -> int:
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    try:
+        descriptor = os.open(name, flags, dir_fd=directory_fd)
+    except OSError as error:
+        raise PackageError("staged release member cannot be opened safely") from error
+    try:
+        details = os.fstat(descriptor)
+        if not stat.S_ISREG(details.st_mode) or details.st_nlink != 1:
+            raise PackageError(
+                "staged release member is not a singly-linked regular file"
+            )
+        return descriptor
+    except Exception:
+        os.close(descriptor)
+        raise
+
+
+def _assert_descriptor_names_entry(
+    directory_fd: int,
+    name: str,
+    descriptor: int,
+) -> None:
+    pinned = os.fstat(descriptor)
+    try:
+        current = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+    except OSError as error:
+        raise PackageError(
+            "staged release path changed after descriptor pinning"
+        ) from error
+    if (
+        not stat.S_ISREG(current.st_mode)
+        or current.st_dev != pinned.st_dev
+        or current.st_ino != pinned.st_ino
+        or current.st_size != pinned.st_size
+        or current.st_nlink != 1
+    ):
+        raise PackageError(
+            "staged release path was replaced after descriptor pinning"
+        )
+
+
+def _read_descriptor(descriptor: int) -> bytes:
+    os.lseek(descriptor, 0, os.SEEK_SET)
+    chunks: list[bytes] = []
+    while True:
+        chunk = os.read(descriptor, 1024 * 1024)
+        if not chunk:
+            break
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
+def _hash_descriptor(descriptor: int) -> tuple[str, int]:
+    os.lseek(descriptor, 0, os.SEEK_SET)
+    digest = hashlib.sha256()
+    total = 0
+    while True:
+        chunk = os.read(descriptor, 1024 * 1024)
+        if not chunk:
+            break
+        digest.update(chunk)
+        total += len(chunk)
+    if total != os.fstat(descriptor).st_size:
+        raise PackageError("archive size changed while hashing descriptor")
+    return digest.hexdigest(), total
+
+
+def _verify_zip_descriptor(
+    descriptor: int,
+    *,
+    payload: dict[str, bytes],
+    modes: dict[str, str],
+) -> None:
+    expected_directories = _planned_directories(iter(payload))
+    expected_names = expected_directories | set(payload)
+    try:
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        with os.fdopen(os.dup(descriptor), "rb") as handle:
+            with zipfile.ZipFile(handle) as archive:
+                infos = archive.infolist()
+                names = [info.filename for info in infos]
+                if len(names) != len(set(names)) or set(names) != expected_names:
+                    raise PackageError(
+                        "staged archive has duplicate or unexpected members"
+                    )
+                for info in infos:
+                    if info.date_time != NORMALIZED_TIME or info.create_system != 3:
+                        raise PackageError(
+                            "staged archive metadata is not normalized"
+                        )
+                    raw_mode = info.external_attr >> 16
+                    expected_mode = (
+                        0o755
+                        if info.is_dir()
+                        else (0o755 if modes[info.filename] == "100755" else 0o644)
+                    )
+                    if stat.S_IMODE(raw_mode) != expected_mode:
+                        raise PackageError("staged archive mode is not normalized")
+                    if not info.is_dir():
+                        if archive.read(info.filename) != payload[info.filename]:
+                            raise PackageError(
+                                "staged archive member checksum verification failed"
+                            )
+                expected_sums = "".join(
+                    f"{_sha256(payload[name])}  {name}\n"
+                    for name in sorted(payload)
+                    if name != "SHA256SUMS"
+                ).encode("ascii")
+                if archive.read("SHA256SUMS") != expected_sums:
+                    raise PackageError(
+                        "staged archive internal checksums are invalid"
+                    )
+    except PackageError:
+        raise
+    except (OSError, zipfile.BadZipFile, KeyError, RuntimeError) as error:
+        raise PackageError("staged archive verification failed") from error
+
+
+def _verify_new_file_at(
+    directory_fd: int,
+    name: str,
+    expected: bytes,
+) -> None:
+    descriptor = _open_pinned_regular_at(directory_fd, name)
+    try:
+        _assert_descriptor_names_entry(directory_fd, name, descriptor)
+        if _read_descriptor(descriptor) != expected:
+            raise PackageError("staged release receipt verification failed")
+        _assert_descriptor_names_entry(directory_fd, name, descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _build_staging(
+    staging_fd: int,
+    *,
+    collected: _Collected,
+    revision: str,
+    release_id: str,
+    archive_name: str,
+) -> _Staged:
+    _write_zip_at(
+        staging_fd,
+        archive_name,
+        payload=collected.payload,
+        modes=collected.modes,
+    )
+    archive_fd = _open_pinned_regular_at(staging_fd, archive_name)
+    try:
+        _assert_descriptor_names_entry(staging_fd, archive_name, archive_fd)
+        archive_hash, archive_bytes = _hash_descriptor(archive_fd)
+        _verify_zip_descriptor(
+            archive_fd,
+            payload=collected.payload,
+            modes=collected.modes,
+        )
+        _assert_descriptor_names_entry(staging_fd, archive_name, archive_fd)
+
+        checksum_name = f"{archive_name}.sha256"
+        checksum_bytes = f"{archive_hash}  {archive_name}\n".encode("ascii")
+        release_value = {
+            "schema_version": 1,
+            "package_format_version": PACKAGE_FORMAT_VERSION,
+            "release_id": release_id,
+            "provider": PROVIDER,
+            "archive": {
+                "path": archive_name,
+                "sha256": archive_hash,
+                "bytes": archive_bytes,
+            },
+            "source": {"commit": revision, "dirty": False},
+            "seed_assignment": collected.seed_assignment,
+            "cohort_assignment_sha256": collected.cohort_sha256,
+            "profile_sha256": collected.profile_sha256,
+            "environment_sha256": collected.environment_sha256,
+            "dataset_pointer_sha256": collected.dataset_pointer_sha256,
+            "config_sha256": collected.config_sha256,
+            "members_sha256": collected.members_sha256,
+        }
+        release_bytes = _canonical_pretty(release_value)
+        _write_new_at(staging_fd, checksum_name, checksum_bytes)
+        _write_new_at(staging_fd, RELEASE_RECEIPT_NAME, release_bytes)
+        _verify_new_file_at(staging_fd, checksum_name, checksum_bytes)
+        _verify_new_file_at(staging_fd, RELEASE_RECEIPT_NAME, release_bytes)
+        expected_entries = {
+            archive_name,
+            checksum_name,
+            RELEASE_RECEIPT_NAME,
+        }
+        if set(os.listdir(staging_fd)) != expected_entries:
+            raise PackageError("private release staging has unexpected entries")
+        _assert_descriptor_names_entry(staging_fd, archive_name, archive_fd)
+        os.fsync(staging_fd)
+        return _Staged(
+            archive_fd=archive_fd,
+            archive_sha256=archive_hash,
+            archive_bytes=archive_bytes,
+        )
+    except Exception:
+        os.close(archive_fd)
+        raise
+
+
+def _open_or_create_output(path: Path) -> tuple[Path, int]:
+    absolute = Path(os.path.abspath(os.fspath(path)))
+    if absolute == Path("/"):
+        raise PackageError("release output cannot be the filesystem root")
+    current_fd = os.open("/", _directory_flags())
+    try:
+        for component in absolute.parts[1:]:
+            try:
+                child_fd = os.open(
+                    component,
+                    _directory_flags(),
+                    dir_fd=current_fd,
+                )
+            except FileNotFoundError:
+                try:
+                    os.mkdir(component, 0o700, dir_fd=current_fd)
+                    child_fd = os.open(
+                        component,
+                        _directory_flags(),
+                        dir_fd=current_fd,
+                    )
+                except OSError as error:
+                    raise PackageError(
+                        "release output cannot be created safely"
+                    ) from error
+            except OSError as error:
+                raise PackageError(
+                    "release output path contains a symlink or non-directory"
+                ) from error
+            os.close(current_fd)
+            current_fd = child_fd
+        return absolute, current_fd
+    except Exception:
+        os.close(current_fd)
+        raise
+
+
+def _make_staging_at(output_fd: int, release_id: str) -> tuple[str, int]:
+    for _ in range(128):
+        name = f".{release_id}.{secrets.token_hex(8)}.staging"
+        try:
+            os.mkdir(name, 0o700, dir_fd=output_fd)
+        except FileExistsError:
+            continue
+        except OSError as error:
+            raise PackageError("cannot create private release staging") from error
+        try:
+            descriptor = os.open(name, _directory_flags(), dir_fd=output_fd)
+        except Exception:
+            os.rmdir(name, dir_fd=output_fd)
+            raise
+        return name, descriptor
+    raise PackageError("cannot allocate a unique private release staging name")
+
+
+def _remove_staging_at(
+    output_fd: int,
+    staging_name: str,
+    staging_fd: int,
+) -> None:
+    try:
+        for name in os.listdir(staging_fd):
+            try:
+                details = os.stat(
+                    name,
+                    dir_fd=staging_fd,
+                    follow_symlinks=False,
+                )
+                if stat.S_ISDIR(details.st_mode):
+                    raise PackageError(
+                        "private release staging contains an unsafe directory"
+                    )
+                os.unlink(name, dir_fd=staging_fd)
+            except FileNotFoundError:
+                continue
+        os.rmdir(staging_name, dir_fd=output_fd)
+    except FileNotFoundError:
+        return
+
+
+def _rename_noreplace_at(
+    directory_fd: int,
+    source_name: str,
+    destination_name: str,
+) -> None:
+    libc = ctypes.CDLL(None, use_errno=True)
+    encoded_source = os.fsencode(source_name)
+    encoded_destination = os.fsencode(destination_name)
+    ctypes.set_errno(0)
+    if sys.platform == "darwin" and hasattr(libc, "renameatx_np"):
+        rename = libc.renameatx_np
+        rename.argtypes = [
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_uint,
+        ]
+        rename.restype = ctypes.c_int
+        result = rename(
+            directory_fd,
+            encoded_source,
+            directory_fd,
+            encoded_destination,
+            0x00000004,
+        )
+    elif sys.platform.startswith("linux") and hasattr(libc, "renameat2"):
+        rename = libc.renameat2
+        rename.argtypes = [
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_uint,
+        ]
+        rename.restype = ctypes.c_int
+        result = rename(
+            directory_fd,
+            encoded_source,
+            directory_fd,
+            encoded_destination,
+            0x00000001,
+        )
+    else:
+        raise PackageError(
+            "platform lacks atomic no-replace directory publication"
+        )
+    if result == 0:
+        return
+    error_number = ctypes.get_errno()
+    if error_number in {errno.EEXIST, errno.ENOTEMPTY}:
+        raise PackageError(
+            "release directory already exists",
+            code="RELEASE_EXISTS",
+        )
+    raise PackageError("atomic no-replace release publication failed")
+
+
+def build_handoff(
+    *,
+    source_root: Path | str,
+    out_dir: Path | str,
+    apply: bool = False,
+) -> ReleaseArtifacts:
+    """Validate a clean Git snapshot and optionally publish one release set."""
+
+    source = Path(os.path.abspath(os.fspath(source_root)))
+    repository_fd = _open_source_root(source)
+    try:
+        revision = _clean_revision(repository_fd)
+        tracked = _tracked_files(repository_fd, revision)
+        collected = _collect_payload(repository_fd, tracked, revision)
+        _assert_repository_unchanged(repository_fd, revision)
+        release_suffix = collected.members_sha256[:16]
+        release_id = f"aws-p5-r1-{release_suffix}"
+        archive_name = f"ms-aws-p5-r1-{release_suffix}.zip"
+        output_requested = Path(out_dir)
+        release_dir = Path(os.path.abspath(os.fspath(output_requested))) / release_id
+
+        if not apply:
+            with tempfile.TemporaryDirectory(
+                prefix=f".{release_id}.dry-run-"
+            ) as temporary:
+                staging_fd = os.open(temporary, _directory_flags())
+                staged: _Staged | None = None
+                try:
+                    staged = _build_staging(
+                        staging_fd,
+                        collected=collected,
+                        revision=revision,
+                        release_id=release_id,
+                        archive_name=archive_name,
+                    )
+                    _assert_repository_unchanged(repository_fd, revision)
+                    _assert_descriptor_names_entry(
+                        staging_fd,
+                        archive_name,
+                        staged.archive_fd,
+                    )
+                    archive_hash = staged.archive_sha256
+                finally:
+                    if staged is not None:
+                        os.close(staged.archive_fd)
+                    os.close(staging_fd)
+            return ReleaseArtifacts(
+                release_dir=release_dir,
+                archive=release_dir / archive_name,
+                sha256_file=release_dir / f"{archive_name}.sha256",
+                release=release_dir / RELEASE_RECEIPT_NAME,
+                release_id=release_id,
+                sha256=archive_hash,
+                published=False,
+            )
+
+        output, output_fd = _open_or_create_output(output_requested)
+        staging_name: str | None = None
+        staging_fd: int | None = None
+        staged = None
+        published = False
+        try:
+            staging_name, staging_fd = _make_staging_at(output_fd, release_id)
+            staged = _build_staging(
+                staging_fd,
+                collected=collected,
+                revision=revision,
+                release_id=release_id,
+                archive_name=archive_name,
+            )
+            _assert_repository_unchanged(repository_fd, revision)
+            _assert_descriptor_names_entry(
+                staging_fd,
+                archive_name,
+                staged.archive_fd,
+            )
+            _rename_noreplace_at(output_fd, staging_name, release_id)
+            published = True
+            os.fsync(output_fd)
+            release_dir = output / release_id
+            return ReleaseArtifacts(
+                release_dir=release_dir,
+                archive=release_dir / archive_name,
+                sha256_file=release_dir / f"{archive_name}.sha256",
+                release=release_dir / RELEASE_RECEIPT_NAME,
+                release_id=release_id,
+                sha256=staged.archive_sha256,
+                published=True,
+            )
+        finally:
+            if staged is not None:
+                os.close(staged.archive_fd)
+            if (
+                not published
+                and staging_name is not None
+                and staging_fd is not None
+            ):
+                _remove_staging_at(output_fd, staging_name, staging_fd)
+            if staging_fd is not None:
+                os.close(staging_fd)
+            os.close(output_fd)
+    finally:
+        os.close(repository_fd)
+
+
+def _emit(value: dict[str, object]) -> None:
+    sys.stdout.write(
+        json.dumps(
+            value,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+            allow_nan=False,
+        )
+        + "\n"
+    )
+
+
+def main(argv: list[str] | None = None) -> int:
+    apply = False
+    try:
+        parser = _JsonArgumentParser(
+            description="Build a deterministic AWS P5 MemorySplit handoff."
+        )
+        parser.add_argument(
+            "--source-root",
+            default=str(Path(__file__).resolve().parents[1]),
+        )
+        parser.add_argument("--out-dir", default="dist/aws-p5")
+        parser.add_argument("--apply", action="store_true")
+        args = parser.parse_args(argv)
+        apply = bool(args.apply)
+        artifacts = build_handoff(
+            source_root=args.source_root,
+            out_dir=args.out_dir,
+            apply=apply,
+        )
+        report = {
+            "schema_version": 1,
+            "ok": True,
+            "provider": PROVIDER,
+            "dry_run": not apply,
+            "published": artifacts.published,
+            "release_id": artifacts.release_id,
+            "release_dir": str(artifacts.release_dir),
+            "archive": str(artifacts.archive),
+            "sha256_file": str(artifacts.sha256_file),
+            "release": str(artifacts.release),
+            "sha256": artifacts.sha256,
+        }
+        code = 0
+    except _HelpRequested as help_request:
+        report = {
+            "schema_version": 1,
+            "ok": True,
+            "provider": PROVIDER,
+            "dry_run": True,
+            "published": False,
+            "help": help_request.text,
+        }
+        code = 0
+    except PackageError as error:
+        report = {
+            "schema_version": 1,
+            "ok": False,
+            "provider": PROVIDER,
+            "dry_run": not apply,
+            "published": False,
+            "error": {
+                "code": error.code,
+                "message": str(error),
+            },
+        }
+        code = 2
+    except Exception:
+        report = {
+            "schema_version": 1,
+            "ok": False,
+            "provider": PROVIDER,
+            "dry_run": not apply,
+            "published": False,
+            "error": {
+                "code": "PACKAGE_INTERNAL_ERROR",
+                "message": "unexpected local packaging failure",
+            },
+        }
+        code = 70
+    _emit(report)
+    return code
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
