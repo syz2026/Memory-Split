@@ -4,12 +4,21 @@ from dataclasses import replace
 
 import pytest
 
+import evals.confirmatory as confirmatory
 from evals.confirmatory import contracts as contracts_module
-from evals.confirmatory.contracts import Arm, Control, MemoryMode, Stratum, Twin
+from evals.confirmatory.contracts import (
+    Arm,
+    Control,
+    MemoryMode,
+    Stratum,
+    Twin,
+    store_content_sha256,
+)
 from evals.confirmatory.metrics import (
     ItemOutcome,
     _ScoredItemOutcome,
-    balanced_counterfactual_pair_metric,
+    _aggregate_scored_pair_metric,
+    _score_item_outcome,
 )
 from evals.confirmatory import metrics as metrics_module
 from evals.confirmatory import status as status_module
@@ -22,7 +31,7 @@ def _pair(
     *,
     original: bool = True,
     counterfactual: bool = True,
-) -> list[_ScoredItemOutcome]:
+) -> list[ItemOutcome]:
     common = {
         "pair_id": f"{family}-{stratum}-pair-{index}",
         "family": family,
@@ -37,36 +46,55 @@ def _pair(
     }
     proof = [
         {
+            "source_slot": 0,
+            "relation_id": "P1",
+            "direction": "out",
+            "op": "read",
+        },
+        {
             "source_slot": None,
             "relation_id": None,
             "direction": None,
-            "op": "noop",
-        }
-        for _ in range(12)
+            "op": "halt",
+        },
+        *[
+            {
+                "source_slot": None,
+                "relation_id": None,
+                "direction": None,
+                "op": "noop",
+            }
+            for _ in range(10)
+        ],
     ]
     return [
-        _ScoredItemOutcome(
-            submission=ItemOutcome(
-                item_id=f"{common['pair_id']}-original",
-                twin=Twin.ORIGINAL,
-                submitted_answer="fixture",
-                submitted_proof=proof,
-                **common,
-            ),
-            proof_valid=original,
-            answer_valid=original,
+        ItemOutcome(
+            item_id=f"{common['pair_id']}-original",
+            twin=Twin.ORIGINAL,
+            submitted_answer="done" if original else "wrong",
+            submitted_proof=proof,
+            **common,
         ),
-        _ScoredItemOutcome(
-            submission=ItemOutcome(
-                item_id=f"{common['pair_id']}-counterfactual",
-                twin=Twin.COUNTERFACTUAL,
-                submitted_answer="fixture",
-                submitted_proof=proof,
-                **common,
-            ),
-            proof_valid=counterfactual,
-            answer_valid=counterfactual,
+        ItemOutcome(
+            item_id=f"{common['pair_id']}-counterfactual",
+            twin=Twin.COUNTERFACTUAL,
+            submitted_answer="done" if counterfactual else "wrong",
+            submitted_proof=proof,
+            **common,
         ),
+    ]
+
+
+def _store_rows() -> list[dict]:
+    return [
+        {
+            "source_id": "Q1",
+            "relation_id": "P1",
+            "direction": "out",
+            "target_kind": "literal",
+            "target": "done",
+            "qualifiers": {},
+        }
     ]
 
 
@@ -79,9 +107,11 @@ def _records(rows):
     }
     items = {}
     checkpoints = {}
+    gold_records = {}
+    stores = {}
     for row in rows:
         path_length, composition_split = stratum_shape[row.stratum.value]
-        items[row.item_id] = contracts_module.ItemRecord.from_dict(
+        item = contracts_module.ItemRecord.from_dict(
             {
                 "record_type": contracts_module.ITEM_SCHEMA,
                 "schema_version": contracts_module.CONTRACT_VERSION,
@@ -102,6 +132,40 @@ def _records(rows):
                 "control": row.control.value,
             }
         )
+        items[row.item_id] = item
+        store_rows = _store_rows()
+        store_sha256 = store_content_sha256(
+            item.store_id,
+            item.world_id,
+            store_rows,
+        )
+        stores[item.store_id] = contracts_module.StoreRecord.from_dict(
+            {
+                "record_type": contracts_module.STORE_SCHEMA,
+                "schema_version": contracts_module.CONTRACT_VERSION,
+                "store_id": item.store_id,
+                "world_id": item.world_id,
+                "rows": store_rows,
+                "content_sha256": store_sha256,
+            }
+        )
+        gold_records[row.item_id] = (
+            contracts_module.SealedGoldRecord.from_dict(
+                {
+                    "record_type": contracts_module.SEALED_GOLD_SCHEMA,
+                    "schema_version": contracts_module.CONTRACT_VERSION,
+                    "item_id": row.item_id,
+                    "pair_id": row.pair_id,
+                    "twin": row.twin.value,
+                    "answer": "done",
+                    "proof": [
+                        action.to_dict() for action in row.submitted_proof
+                    ],
+                    "solver_id": "lookup-chain-v1",
+                    "store_sha256": store_sha256,
+                }
+            )
+        )
         checkpoints[row.checkpoint_sha256] = (
             contracts_module.CheckpointRecord.from_dict(
                 {
@@ -120,13 +184,23 @@ def _records(rows):
                 }
             )
         )
-    return items, checkpoints
+    return items, checkpoints, gold_records, stores
 
 
 def _metric(rows):
-    items, checkpoints = _records(rows)
-    return balanced_counterfactual_pair_metric(
-        rows,
+    items, checkpoints, gold_records, stores = _records(rows)
+    scored = [
+        _score_item_outcome(
+            outcome=row,
+            item=items[row.item_id],
+            checkpoint=checkpoints[row.checkpoint_sha256],
+            gold=gold_records[row.item_id],
+            store=stores[items[row.item_id].store_id],
+        )
+        for row in rows
+    ]
+    return _aggregate_scored_pair_metric(
+        scored,
         items=items,
         checkpoints=checkpoints,
     )
@@ -176,6 +250,40 @@ def test_primary_metric_equal_weights_only_four_family_ood_cells():
     assert result.control is Control.CORRECT
 
 
+def test_caller_cannot_forge_a_correct_score_for_a_wrong_submission():
+    wrong_submission = replace(
+        _pair("graph", "composition_ood", 0)[0],
+        submitted_answer="wrong",
+    )
+
+    with pytest.raises(TypeError, match="internal|solver"):
+        _ScoredItemOutcome(
+            submission=wrong_submission,
+            proof_valid=True,
+            answer_valid=True,
+        )
+    assert not hasattr(confirmatory, "balanced_counterfactual_pair_metric")
+    assert not hasattr(confirmatory, "counterfactual_pair_metric")
+    assert not hasattr(confirmatory, "score_item_outcome")
+    assert not hasattr(metrics_module, "balanced_counterfactual_pair_metric")
+    assert not hasattr(metrics_module, "counterfactual_pair_metric")
+    assert not hasattr(metrics_module, "score_item_outcome")
+
+    wrong_rows = [
+        row
+        for family in ("graph", "non_path")
+        for stratum in ("composition_ood", "joint_ood")
+        for row in _pair(
+            family,
+            stratum,
+            0,
+            original=False,
+            counterfactual=False,
+        )
+    ]
+    assert _metric(wrong_rows).primary_accuracy == 0.0
+
+
 def test_pair_metric_rejects_missing_duplicate_crossed_or_unscored_twins():
     complete = [
         row
@@ -190,16 +298,13 @@ def test_pair_metric_rejects_missing_duplicate_crossed_or_unscored_twins():
         _metric([*complete, complete[0]])
 
     crossed = list(complete)
-    crossed[1] = replace(
-        crossed[1],
-        submission=replace(crossed[1].submission, family="non_path"),
-    )
+    crossed[1] = replace(crossed[1], family="non_path")
     with pytest.raises(ValueError, match="metadata"):
         _metric(crossed)
 
     with pytest.raises(TypeError, match="solver-scored"):
-        balanced_counterfactual_pair_metric(
-            [row.submission for row in complete],
+        _aggregate_scored_pair_metric(
+            complete,
             items=_records(complete)[0],
             checkpoints=_records(complete)[1],
         )
@@ -230,20 +335,14 @@ def test_pair_metric_requires_four_primary_cells_but_not_iid_or_length():
     with pytest.raises(ValueError, match="primary"):
         _metric(missing)
 
-    rows[-1] = replace(
-        rows[-1],
-        submission=replace(
-            rows[-1].submission,
-            memory_mode=MemoryMode.MEMORY_OFF,
-        ),
-    )
+    rows[-1] = replace(rows[-1], memory_mode=MemoryMode.MEMORY_OFF)
     with pytest.raises(ValueError, match="cell"):
         _metric(rows)
 
 
 def test_outcome_binding_authenticates_item_and_checkpoint_identity():
-    outcome = _pair("graph", "composition_ood", 0)[0].submission
-    items, checkpoints = _records([outcome])
+    outcome = _pair("graph", "composition_ood", 0)[0]
+    items, checkpoints, _, _ = _records([outcome])
     item = items[outcome.item_id]
     checkpoint = checkpoints[outcome.checkpoint_sha256]
 
@@ -293,22 +392,21 @@ def test_metric_validation_rejects_cross_checkpoint_attribution():
         for stratum in ("composition_ood", "joint_ood")
         for row in _pair(family, stratum, 0)
     ]
-    items, checkpoints = _records(rows)
+    items, checkpoints, gold_records, stores = _records(rows)
     rows[0] = replace(
         rows[0],
-        submission=replace(
-            rows[0].submission,
-            seed=1002,
-            arm=Arm.DENSE,
-            condition_id="dense",
-        ),
+        seed=1002,
+        arm=Arm.DENSE,
+        condition_id="dense",
     )
 
     with pytest.raises(ValueError, match="checkpoint binding"):
-        balanced_counterfactual_pair_metric(
-            rows,
-            items=items,
-            checkpoints=checkpoints,
+        _score_item_outcome(
+            outcome=rows[0],
+            item=items[rows[0].item_id],
+            checkpoint=checkpoints[rows[0].checkpoint_sha256],
+            gold=gold_records[rows[0].item_id],
+            store=stores[items[rows[0].item_id].store_id],
         )
 
 

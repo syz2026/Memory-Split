@@ -26,6 +26,7 @@ from evals.confirmatory.contracts import (
 )
 from evals.confirmatory.actions import ActionSlot, validate_action_slots
 from evals.confirmatory.solver import (
+    ProofAnswerVerification,
     registered_solver,
     verify_proof_and_answer,
 )
@@ -208,20 +209,33 @@ class ItemOutcome:
         }
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, init=False)
 class _ScoredItemOutcome:
     submission: ItemOutcome
     proof_valid: bool
     answer_valid: bool
 
-    def __post_init__(self) -> None:
-        if not isinstance(self.submission, ItemOutcome):
-            raise TypeError("scored outcome requires an ItemOutcome submission")
-        if not isinstance(self.proof_valid, bool) or not isinstance(
-            self.answer_valid,
-            bool,
+    def __init__(self, *args, **kwargs) -> None:
+        raise TypeError(
+            "scored outcomes are internal solver-replay results"
+        )
+
+    @classmethod
+    def _from_solver_replay(
+        cls,
+        submission: ItemOutcome,
+        verification: ProofAnswerVerification,
+    ) -> "_ScoredItemOutcome":
+        if not isinstance(submission, ItemOutcome) or not isinstance(
+            verification,
+            ProofAnswerVerification,
         ):
-            raise ValueError("derived outcome scores must be Boolean")
+            raise TypeError("solver replay produced an invalid scored outcome")
+        result = object.__new__(cls)
+        object.__setattr__(result, "submission", submission)
+        object.__setattr__(result, "proof_valid", verification.proof_valid)
+        object.__setattr__(result, "answer_valid", verification.answer_valid)
+        return result
 
     def __getattr__(self, name: str):
         return getattr(self.submission, name)
@@ -231,7 +245,7 @@ class _ScoredItemOutcome:
         return self.proof_valid and self.answer_valid
 
 
-def score_item_outcome(
+def _score_item_outcome(
     *,
     outcome: ItemOutcome,
     item: ItemRecord,
@@ -252,10 +266,9 @@ def score_item_outcome(
         answer=outcome.submitted_answer,
         solver=registered_solver(gold.solver_id),
     )
-    return _ScoredItemOutcome(
-        submission=outcome,
-        proof_valid=verification.proof_valid,
-        answer_valid=verification.answer_valid,
+    return _ScoredItemOutcome._from_solver_replay(
+        outcome,
+        verification,
     )
 
 
@@ -536,7 +549,7 @@ _PAIR_METADATA = (
 )
 
 
-def balanced_counterfactual_pair_metric(
+def _aggregate_scored_pair_metric(
     outcomes: Iterable[_ScoredItemOutcome],
     *,
     items: Mapping[str, ItemRecord],
@@ -680,6 +693,3 @@ def balanced_counterfactual_pair_metric(
         memory_mode=memory_mode,
         control=control,
     )
-
-
-counterfactual_pair_metric = balanced_counterfactual_pair_metric

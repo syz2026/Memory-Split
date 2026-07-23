@@ -18,6 +18,11 @@ from evals.confirmatory.reporting import (
     publish_artifact_report,
     validate_artifact_report,
 )
+from evals.confirmatory.study_lock import (
+    StudyLock,
+    ValidityEvidence,
+    evaluate_readiness,
+)
 
 
 def _trusted_report(fixture):
@@ -68,6 +73,19 @@ def test_publication_also_requires_external_study_lock(tmp_path):
             report,
             fixture.artifacts,
         )
+
+
+def test_exported_readiness_rejects_evidence_bound_to_another_lock():
+    fixture = positive_fixture()
+    other = fixtures_module.shrunken_fixture()
+    lock = StudyLock.from_dict(json.loads(fixture.artifacts["study-lock.json"]))
+    evidence = ValidityEvidence.from_dict(
+        json.loads(other.artifacts["validity.json"])
+    )
+
+    assert evidence.study_lock_sha256 != fixture.expected_study_lock_sha256
+    with pytest.raises(ValueError, match="study.lock"):
+        evaluate_readiness(lock, evidence)
 
 
 def test_shrunken_self_consistent_release_cannot_replace_frozen_commitment():

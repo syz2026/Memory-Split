@@ -33,8 +33,8 @@ from evals.confirmatory.metrics import (
     ItemOutcome,
     PairMetricSummary,
     _ScoredItemOutcome,
-    balanced_counterfactual_pair_metric,
-    score_item_outcome,
+    _aggregate_scored_pair_metric,
+    _score_item_outcome,
     validate_item_outcome_binding,
 )
 from evals.confirmatory.solver import registered_solver, verify_sealed_gold
@@ -583,7 +583,7 @@ def _recomputed_metrics(
         if {row.item_id for row in rows} != expected_items:
             continue
         summaries.append(
-            balanced_counterfactual_pair_metric(
+            _aggregate_scored_pair_metric(
                 rows,
                 items={item_id: items[item_id] for item_id in expected_items},
                 checkpoints={
@@ -839,7 +839,7 @@ def _replay_artifacts(
         observed_keys.add(key)
         gold = gold_map[item.item_id]
         scored_outcomes.append(
-            score_item_outcome(
+            _score_item_outcome(
                 outcome=outcome,
                 item=item,
                 checkpoint=checkpoint,

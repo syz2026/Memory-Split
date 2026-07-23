@@ -45,8 +45,6 @@ def test_confirmatory_package_exports_the_supported_core_api():
     assert confirmatory.FROZEN_PREREGISTRATION_SHA256 == (
         "fee38e363298d3def46b741320c9d7df4523d0ff3cd249187cf52d54046cbbf0"
     )
-    assert callable(confirmatory.score_item_outcome)
-    assert callable(confirmatory.balanced_counterfactual_pair_metric)
     assert callable(confirmatory.hierarchical_paired_bootstrap)
     assert callable(confirmatory.verify_proof_and_answer)
     assert callable(confirmatory.build_artifact_report)

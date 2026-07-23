@@ -251,9 +251,9 @@ def test_outcome_submission_is_solver_replayed_not_caller_scored():
     )
 
     assert "solver" not in inspect.signature(
-        metrics_module.score_item_outcome
+        metrics_module._score_item_outcome
     ).parameters
-    scored = metrics_module.score_item_outcome(
+    scored = metrics_module._score_item_outcome(
         outcome=submission,
         item=item,
         checkpoint=checkpoint,

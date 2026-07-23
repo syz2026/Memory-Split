@@ -33,8 +33,8 @@ from evals.confirmatory.inference import exact_sign_flip_test
 from evals.confirmatory.metrics import (
     ItemOutcome,
     _ScoredItemOutcome,
-    balanced_counterfactual_pair_metric,
-    score_item_outcome,
+    _aggregate_scored_pair_metric,
+    _score_item_outcome,
 )
 from evals.confirmatory.reporting import (
     INFERENCE_EVIDENCE_SCHEMA,
@@ -360,7 +360,7 @@ def _artifact_bundle(
         ]
         outcomes.extend(submissions)
         scored = [
-            score_item_outcome(
+            _score_item_outcome(
                 outcome=submission,
                 item=item_map[submission.item_id],
                 checkpoint=checkpoint,
@@ -378,7 +378,7 @@ def _artifact_bundle(
         for rows in grouped.values():
             row_items = {row.item_id: item_map[row.item_id] for row in rows}
             summaries.append(
-                balanced_counterfactual_pair_metric(
+                _aggregate_scored_pair_metric(
                     rows,
                     items=row_items,
                     checkpoints={

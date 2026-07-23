@@ -617,6 +617,8 @@ def evaluate_readiness(
     lock: StudyLock,
     evidence: ValidityEvidence,
 ) -> ReadinessResult:
+    if evidence.study_lock_sha256 != canonical_sha256(lock.to_dict()):
+        raise ValueError("validity evidence study-lock commitment mismatch")
     if evidence.preregistration_sha256 != lock.preregistration_sha256:
         raise ValueError("validity preregistration commitment mismatch")
     commitments = {
