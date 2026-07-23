@@ -324,6 +324,13 @@ def _validate_release_root(
     cohort_sha256: str,
     code_commit: str,
 ) -> tuple[VerifiedFile, ...]:
+    from msctl.contracts import (
+        same_typed_value,
+        validate_aws_dataset_pointer_contract,
+        validate_runtime_attested_contract,
+    )
+    from msctl.errors import MsctlError
+
     expected_root = scratch / "releases" / release_sha256
     if repo != expected_root.resolve(strict=True):
         raise LaunchError(
@@ -435,13 +442,15 @@ def _validate_release_root(
         or source["dirty"] is not False
         or not isinstance(source["tree"], str)
         or _COMMIT_RE.fullmatch(source["tree"]) is None
-        or metadata.get("seed_assignment")
-        != {
-            "arms": list(ARMS),
-            "cohort_id": COHORT_ID,
-            "provider": PROVIDER,
-            "seeds": list(SEEDS),
-        }
+        or not same_typed_value(
+            metadata.get("seed_assignment"),
+            {
+                "arms": list(ARMS),
+                "cohort_id": COHORT_ID,
+                "provider": PROVIDER,
+                "seeds": list(SEEDS),
+            },
+        )
     ):
         raise LaunchError("release metadata identity does not match")
     rows = metadata.get("members")
@@ -542,9 +551,6 @@ def _validate_release_root(
             raise LaunchError(
                 f"release config member binding does not match: {relative}"
             )
-    from msctl.contracts import validate_runtime_attested_contract
-    from msctl.errors import MsctlError
-
     try:
         validate_runtime_attested_contract(
             metadata["environment"],
@@ -607,11 +613,14 @@ def _validate_release_root(
         ),
         label="dataset pointer",
     )
+    try:
+        validate_aws_dataset_pointer_contract(pointer)
+    except MsctlError as error:
+        raise LaunchError(
+            "release dataset pointer contract is invalid"
+        ) from error
     if (
-        pointer.get("provider") != PROVIDER
-        or pointer.get("required_receipt") != DATASET_RECEIPT_PATH
-        or pointer.get("full_corpus_in_release") is not False
-        or _hash_regular(
+        _hash_regular(
             repo / DATASET_POINTER_PATH,
             label="dataset pointer",
         )
@@ -825,6 +834,8 @@ def _validate_bootstrap_receipt(
     observed_instance_id: str,
     observed_boot_id: str,
 ) -> tuple[VerifiedFile, Mapping[str, object]]:
+    from msctl.contracts import same_typed_value
+
     digest = _hash_regular(path, label="bootstrap receipt")
     if digest != expected_sha256:
         raise LaunchError("bootstrap receipt SHA-256 mismatch")
@@ -855,7 +866,7 @@ def _validate_bootstrap_receipt(
         "durable_upload_verified": True,
     }
     for key, expected_value in expected.items():
-        if receipt.get(key) != expected_value:
+        if not same_typed_value(receipt.get(key), expected_value):
             if key == "release_members_sha256":
                 raise LaunchError(
                     "bootstrap receipt release member SHA-256 does not match"
@@ -878,12 +889,15 @@ def _validate_bootstrap_receipt(
     ):
         raise LaunchError("bootstrap receipt boot ID is invalid")
     store = receipt["instance_store"]
-    if store != {
-        "device_bytes": profile.instance_store_device_bytes,
-        "devices": profile.instance_store_devices,
-        "model": profile.instance_store_model,
-        "raid_level": profile.raid_level,
-    }:
+    if not same_typed_value(
+        store,
+        {
+            "device_bytes": profile.instance_store_device_bytes,
+            "devices": profile.instance_store_devices,
+            "model": profile.instance_store_model,
+            "raid_level": profile.raid_level,
+        },
+    ):
         raise LaunchError("bootstrap receipt instance-store contract does not match")
     container_image = receipt["container_image"]
     if (

@@ -742,7 +742,11 @@ def _verify_release_archive(
         raise BootstrapError(
             "release source commit and tree must be 40-character Git IDs"
         )
-    from msctl.contracts import validate_runtime_attested_contract
+    from msctl.contracts import (
+        same_typed_value,
+        validate_aws_dataset_pointer_contract,
+        validate_runtime_attested_contract,
+    )
     from msctl.errors import MsctlError
 
     try:
@@ -876,13 +880,15 @@ def _verify_release_archive(
             or metadata_source["tree"] != code_tree
             or not isinstance(metadata_source["tree"], str)
             or _COMMIT_RE.fullmatch(metadata_source["tree"]) is None
-            or metadata.get("seed_assignment")
-            != {
-                "arms": list(ARMS),
-                "cohort_id": COHORT_ID,
-                "provider": PROVIDER,
-                "seeds": list(SEEDS),
-            }
+            or not same_typed_value(
+                metadata.get("seed_assignment"),
+                {
+                    "arms": list(ARMS),
+                    "cohort_id": COHORT_ID,
+                    "provider": PROVIDER,
+                    "seeds": list(SEEDS),
+                },
+            )
         ):
             raise BootstrapError("release metadata identity does not match")
         rows = metadata.get("members")
@@ -1023,7 +1029,8 @@ def _verify_release_archive(
             label="v3 profile",
         )
         if (
-            profile.get("schema_version") != 1
+            type(profile.get("schema_version")) is not int
+            or profile.get("schema_version") != 1
             or profile.get("profile_id") != "aws-p5.48xlarge-v3"
             or profile.get("provider") != PROVIDER
             or profile.get("assigned_seeds") != list(SEEDS)
@@ -1037,12 +1044,12 @@ def _verify_release_archive(
             regular[DATASET_POINTER_PATH][1],
             label="dataset pointer",
         )
-        if (
-            pointer.get("provider") != PROVIDER
-            or pointer.get("required_receipt") != "dataset/receipt.json"
-            or pointer.get("full_corpus_in_release") is not False
-        ):
-            raise BootstrapError("release dataset pointer identity is invalid")
+        try:
+            validate_aws_dataset_pointer_contract(pointer)
+        except MsctlError as error:
+            raise BootstrapError(
+                "release dataset pointer contract is invalid"
+            ) from error
 
         if release_value is not None:
             for field in (
@@ -1055,7 +1062,10 @@ def _verify_release_archive(
                 "source",
                 "package_format_version",
             ):
-                if release_value.get(field) != metadata[field]:
+                if not same_typed_value(
+                    release_value.get(field),
+                    metadata[field],
+                ):
                     raise BootstrapError(
                         f"release receipt does not bind metadata field {field}"
                     )
@@ -1097,6 +1107,12 @@ def verify_bootstrap_artifacts(
     code_commit: str,
 ) -> BootstrapArtifacts:
     """Hash ZIP, release, dataset, and cohort bytes and cross-check bindings."""
+
+    from msctl.contracts import (
+        same_typed_value,
+        validate_runtime_attested_contract,
+    )
+    from msctl.errors import MsctlError
 
     release_digest = _regular_digest(
         release_archive,
@@ -1221,12 +1237,15 @@ def verify_bootstrap_artifacts(
         {"cohort_id", "provider", "seeds", "arms"},
         label="release seed assignment",
     )
-    if seed_assignment != {
-        "arms": list(ARMS),
-        "cohort_id": COHORT_ID,
-        "provider": PROVIDER,
-        "seeds": list(SEEDS),
-    } or any(type(seed) is not int for seed in seed_assignment["seeds"]):
+    if not same_typed_value(
+        seed_assignment,
+        {
+            "arms": list(ARMS),
+            "cohort_id": COHORT_ID,
+            "provider": PROVIDER,
+            "seeds": list(SEEDS),
+        },
+    ):
         raise BootstrapError(
             "release seed assignment must contain AWS-only seeds 0 through 9"
         )
@@ -1258,9 +1277,6 @@ def verify_bootstrap_artifacts(
         raise BootstrapError("release receipt config namespace is not exact v3")
     for path, digest in config_sha256.items():
         _required_sha256(digest, label=f"release receipt config {path}")
-    from msctl.contracts import validate_runtime_attested_contract
-    from msctl.errors import MsctlError
-
     try:
         validate_runtime_attested_contract(
             release_value["environment"],

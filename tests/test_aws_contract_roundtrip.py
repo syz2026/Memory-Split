@@ -3,6 +3,8 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import zipfile
+from copy import deepcopy
 from pathlib import Path
 
 import pytest
@@ -23,6 +25,7 @@ from cluster.aws.p5.profile import (
 from msctl.aws_contracts import (
     COHORT_ASSIGNMENT_PATH,
     CONFIG_ROOT,
+    DATASET_POINTER_PATH,
     PROFILE_PATH,
 )
 from msctl.aws_launch_manifest import build_launcher_manifest
@@ -59,6 +62,109 @@ def _build_real_package(tmp_path: Path):
     source = _minimal_repo(tmp_path)
     packaged = _build(_load_module(), source, tmp_path / "published")
     return source, packaged
+
+
+def _canonical_pretty_json(value: object) -> bytes:
+    return (
+        json.dumps(
+            value,
+            indent=2,
+            sort_keys=True,
+            ensure_ascii=True,
+            allow_nan=False,
+        )
+        + "\n"
+    ).encode("ascii")
+
+
+def _rewrite_real_package(
+    packaged,
+    *,
+    member_values: dict[str, object] | None = None,
+    mutate_metadata=None,
+) -> None:
+    member_values = member_values or {}
+    with zipfile.ZipFile(packaged.archive, "r") as source:
+        infos = source.infolist()
+        payloads = {
+            info.filename: source.read(info)
+            for info in infos
+            if not info.is_dir()
+        }
+
+    metadata = json.loads(payloads["RELEASE-METADATA.json"])
+    binding_names = {
+        COHORT_ASSIGNMENT_PATH: "cohort_assignment",
+        DATASET_POINTER_PATH: "dataset_pointer",
+        PROFILE_PATH: "profile",
+    }
+    changed_bindings = set()
+    for relative, value in member_values.items():
+        payload = _canonical_pretty_json(value)
+        payloads[relative] = payload
+        row = next(
+            item for item in metadata["members"] if item["path"] == relative
+        )
+        row["bytes"] = len(payload)
+        row["sha256"] = hashlib.sha256(payload).hexdigest()
+        binding_name = binding_names.get(relative)
+        if binding_name is not None:
+            metadata[binding_name]["sha256"] = row["sha256"]
+            changed_bindings.add(binding_name)
+    if mutate_metadata is not None:
+        mutate_metadata(metadata)
+    payloads["RELEASE-METADATA.json"] = _canonical_pretty_json(metadata)
+    checksum_paths = sorted(set(payloads) - {"SHA256SUMS"})
+    payloads["SHA256SUMS"] = "".join(
+        f"{hashlib.sha256(payloads[path]).hexdigest()}  {path}\n"
+        for path in checksum_paths
+    ).encode("ascii")
+
+    rewritten = packaged.archive.with_name("rewritten.zip")
+    with zipfile.ZipFile(rewritten, "w") as destination:
+        for info in infos:
+            destination.writestr(
+                info,
+                b"" if info.is_dir() else payloads[info.filename],
+            )
+    os.replace(rewritten, packaged.archive)
+
+    release = json.loads(packaged.release.read_text())
+    release["archive"]["bytes"] = packaged.archive.stat().st_size
+    release["archive"]["sha256"] = _sha256(packaged.archive)
+    release["members_sha256"] = hashlib.sha256(
+        payloads["SHA256SUMS"]
+    ).hexdigest()
+    for binding_name in changed_bindings:
+        release[binding_name] = deepcopy(metadata[binding_name])
+        release[f"{binding_name}_sha256"] = metadata[binding_name]["sha256"]
+    _write_canonical_json(packaged.release, release)
+    packaged.archive.with_name(packaged.archive.name + ".sha256").write_text(
+        f"{_sha256(packaged.archive)}  {packaged.archive.name}\n",
+        encoding="ascii",
+    )
+
+
+def _pointer_mutation(value: dict[str, object], mutation: str) -> None:
+    if mutation == "missing":
+        del value["dataset_id"]
+    elif mutation == "extra":
+        value["unexpected"] = "forbidden"
+    elif mutation == "schema-float":
+        value["schema_version"] = 1.0
+    else:
+        value[mutation] = "d" * 64
+
+
+_POINTER_MUTATIONS = (
+    "missing",
+    "extra",
+    "schema-float",
+    "dataset_receipt_sha256",
+    "dataset_build_id",
+    "build_id",
+    "ordered_stream_sha256",
+)
 
 
 def test_real_v3_package_round_trips_to_exact_seed_zero_pair(tmp_path):
@@ -318,3 +424,130 @@ def test_real_v3_bootstrap_rejects_assignment_and_dataset_mutations(tmp_path):
                     "dataset_receipt_sha256": _sha256(dataset_receipt),
                 }
             )
+
+
+@pytest.mark.parametrize("mutation", _POINTER_MUTATIONS)
+def test_real_v3_loader_rejects_noncanonical_dataset_pointer(
+    tmp_path,
+    mutation,
+):
+    source, packaged = _build_real_package(tmp_path)
+    pointer = json.loads((source / DATASET_POINTER_PATH).read_text())
+    _pointer_mutation(pointer, mutation)
+    _rewrite_real_package(
+        packaged,
+        member_values={DATASET_POINTER_PATH: pointer},
+    )
+
+    with pytest.raises(MsctlError, match="dataset|pointer|contract"):
+        load_release(packaged.release)
+
+
+@pytest.mark.parametrize("mutation", _POINTER_MUTATIONS)
+def test_real_v3_bootstrap_rejects_noncanonical_dataset_pointer(
+    tmp_path,
+    mutation,
+):
+    source, packaged = _build_real_package(tmp_path)
+    pointer = json.loads((source / DATASET_POINTER_PATH).read_text())
+    _pointer_mutation(pointer, mutation)
+    _rewrite_real_package(
+        packaged,
+        member_values={DATASET_POINTER_PATH: pointer},
+    )
+    dataset_receipt = _write_canonical_json(
+        tmp_path / "dataset" / "receipt.json",
+        {
+            "build_id": "b" * 64,
+            "ordered_stream_sha256": "c" * 64,
+        },
+    )
+    cohort_assignment = source / COHORT_ASSIGNMENT_PATH
+    release = json.loads(packaged.release.read_text())
+
+    with pytest.raises(BootstrapError, match="dataset|pointer|contract"):
+        verify_bootstrap_artifacts(
+            release_archive=packaged.archive,
+            release_sha256=_sha256(packaged.archive),
+            release_receipt=packaged.release,
+            release_receipt_sha256=_sha256(packaged.release),
+            dataset_receipt=dataset_receipt,
+            dataset_receipt_sha256=_sha256(dataset_receipt),
+            cohort_assignment=cohort_assignment,
+            cohort_assignment_sha256=_sha256(cohort_assignment),
+            code_commit=release["source"]["commit"],
+        )
+
+
+@pytest.mark.parametrize("numeric_alias", [False, 0.0])
+def test_real_v3_loader_rejects_outer_seed_numeric_alias(
+    tmp_path,
+    numeric_alias,
+):
+    _source, packaged = _build_real_package(tmp_path)
+    release = json.loads(packaged.release.read_text())
+    release["seed_assignment"]["seeds"][0] = numeric_alias
+    _write_canonical_json(packaged.release, release)
+
+    with pytest.raises(MsctlError, match="seed|metadata|bind"):
+        load_release(packaged.release)
+
+
+@pytest.mark.parametrize("numeric_alias", [False, 0.0])
+def test_real_v3_bootstrap_rejects_internal_seed_numeric_alias(
+    tmp_path,
+    numeric_alias,
+):
+    source, packaged = _build_real_package(tmp_path)
+
+    def mutate(metadata):
+        metadata["seed_assignment"]["seeds"][0] = numeric_alias
+
+    _rewrite_real_package(packaged, mutate_metadata=mutate)
+    dataset_receipt = _write_canonical_json(
+        tmp_path / "dataset" / "receipt.json",
+        {
+            "build_id": "b" * 64,
+            "ordered_stream_sha256": "c" * 64,
+        },
+    )
+    cohort_assignment = source / COHORT_ASSIGNMENT_PATH
+    release = json.loads(packaged.release.read_text())
+
+    with pytest.raises(BootstrapError, match="seed|metadata|identity"):
+        verify_bootstrap_artifacts(
+            release_archive=packaged.archive,
+            release_sha256=_sha256(packaged.archive),
+            release_receipt=packaged.release,
+            release_receipt_sha256=_sha256(packaged.release),
+            dataset_receipt=dataset_receipt,
+            dataset_receipt_sha256=_sha256(dataset_receipt),
+            cohort_assignment=cohort_assignment,
+            cohort_assignment_sha256=_sha256(cohort_assignment),
+            code_commit=release["source"]["commit"],
+        )
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "model_parameters",
+        "optimizer_steps",
+        "raw_target_tokens",
+        "targets_per_update",
+    ],
+)
+def test_real_v3_loader_rejects_integer_valued_assignment_float(
+    tmp_path,
+    field,
+):
+    source, packaged = _build_real_package(tmp_path)
+    assignment = json.loads((source / COHORT_ASSIGNMENT_PATH).read_text())
+    assignment[field] = float(assignment[field])
+    _rewrite_real_package(
+        packaged,
+        member_values={COHORT_ASSIGNMENT_PATH: assignment},
+    )
+
+    with pytest.raises(MsctlError, match="assignment|identity"):
+        load_release(packaged.release)

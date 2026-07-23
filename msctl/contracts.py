@@ -17,6 +17,7 @@ from .aws_contracts import (
     COHORT_ASSIGNMENT_PATH as AWS_COHORT_ASSIGNMENT_PATH,
     COHORT_ID as AWS_COHORT_ID,
     DATASET_POINTER_PATH as AWS_DATASET_POINTER_PATH,
+    DATASET_RECEIPT_PATH as AWS_DATASET_RECEIPT_PATH,
     EXPECTED_CONFIG_PATHS as AWS_EXPECTED_CONFIG_PATHS,
     PACKAGE_FORMAT_VERSION as AWS_PACKAGE_FORMAT_VERSION,
     PROFILE_PATH as AWS_PROFILE_PATH,
@@ -120,6 +121,57 @@ _RUNTIME_RECEIPT_FIELDS = [
     "aws_instance_identity_document",
     "aws_instance_identity_pkcs7",
 ]
+
+
+def same_typed_value(actual: object, expected: object) -> bool:
+    """Compare nested JSON-like values without Python numeric aliases."""
+
+    if type(actual) is not type(expected):
+        return False
+    if isinstance(expected, dict):
+        return (
+            actual.keys() == expected.keys()
+            and all(
+                same_typed_value(actual[key], expected[key])
+                for key in expected
+            )
+        )
+    if isinstance(expected, list):
+        return len(actual) == len(expected) and all(
+            same_typed_value(left, right)
+            for left, right in zip(actual, expected)
+        )
+    return actual == expected
+
+
+def validate_aws_dataset_pointer_contract(
+    value: object,
+) -> dict[str, object]:
+    """Return the exact Task 2A pointer or reject any semantic drift."""
+
+    pointer = require_object(value, label="AWS dataset pointer")
+    expected = {
+        "dataset_id": "memorysplit-v2-20x-reasoning-max-cohort",
+        "durable_uri_env": "MS_S3_ROOT",
+        "full_corpus_in_release": False,
+        "materialization": "s3",
+        "provider": AWS_P5_PROFILE,
+        "relative_path": "dataset",
+        "required_receipt": AWS_DATASET_RECEIPT_PATH,
+        "required_sidecars": [
+            "dense_target_weights",
+            "split90_target_weights",
+        ],
+        "schema_version": 1,
+        "scratch_root": "/mnt/memorysplit",
+        "source_lock_manifest": "configs/reasoning-dataset-v2.json",
+    }
+    if not same_typed_value(pointer, expected):
+        raise MsctlError(
+            "RELEASE_INTERNAL_INVALID",
+            "AWS dataset pointer does not match the exact Task 2A contract",
+        )
+    return pointer
 
 
 def validate_runtime_attested_contract(
@@ -720,9 +772,13 @@ def _verify_release_internals(
                 type(assignment_value["schema_version"]) is not int
                 or assignment_value["schema_version"] != 3
                 or assignment_value["cohort_id"] != AWS_COHORT_ID
+                or type(assignment_value["model_parameters"]) is not int
                 or assignment_value["model_parameters"] != 356_033_536
+                or type(assignment_value["optimizer_steps"]) is not int
                 or assignment_value["optimizer_steps"] != 13_582
+                or type(assignment_value["raw_target_tokens"]) is not int
                 or assignment_value["raw_target_tokens"] != 7_120_879_616
+                or type(assignment_value["targets_per_update"]) is not int
                 or assignment_value["targets_per_update"] != 524_288
                 or set(provider_seeds) != {AWS_P5_PROFILE}
                 or provider_seeds[AWS_P5_PROFILE] != list(AWS_SEEDS)
@@ -739,15 +795,7 @@ def _verify_release_internals(
                 payload[AWS_DATASET_POINTER_PATH],
                 label=AWS_DATASET_POINTER_PATH,
             )
-            if (
-                pointer.get("provider") != AWS_P5_PROFILE
-                or pointer.get("required_receipt") != "dataset/receipt.json"
-                or pointer.get("full_corpus_in_release") is not False
-            ):
-                raise _release_error(
-                    "RELEASE_INTERNAL_INVALID",
-                    "AWS v3 dataset pointer identity is invalid",
-                )
+            validate_aws_dataset_pointer_contract(pointer)
     else:
         environment_hashes = require_object(
             metadata["environment_hashes"],
@@ -787,7 +835,6 @@ def _verify_release_internals(
             {"cohort_id", "provider", "seeds", "arms"},
             label="RELEASE-METADATA.json.seed_assignment",
         )
-        seeds = assignment["seeds"]
         expected_seeds = (
             [0]
             if release_value["provider"] == SUPPORTED_PROFILE
@@ -802,14 +849,13 @@ def _verify_release_internals(
             if aws_package_version == AWS_PACKAGE_FORMAT_VERSION
             else "memorysplit-confirmatory-v2-360m-n5"
         )
-        if (
-            assignment["cohort_id"] != expected_cohort_id
-            or assignment["provider"] != release_value["provider"]
-            or not isinstance(seeds, list)
-            or any(isinstance(seed, bool) or not isinstance(seed, int) for seed in seeds)
-            or seeds != expected_seeds
-            or assignment["arms"] != ["dense", "split90"]
-        ):
+        expected_assignment = {
+            "cohort_id": expected_cohort_id,
+            "provider": release_value["provider"],
+            "seeds": expected_seeds,
+            "arms": ["dense", "split90"],
+        }
+        if not same_typed_value(assignment, expected_assignment):
             raise _release_error(
                 "RELEASE_INTERNAL_INVALID",
                 "release seed assignment is invalid",
@@ -973,12 +1019,27 @@ def load_release(path: Path | str) -> Release:
             label="release.profile_sha256",
         )
         if (
-            value["profile"] != metadata["profile"]
-            or value["environment"] != metadata["environment"]
-            or value["dataset_pointer"] != metadata["dataset_pointer"]
-            or value["cohort_assignment"] != metadata["cohort_assignment"]
-            or value["seed_assignment"] != metadata["seed_assignment"]
-            or value["config_sha256"] != metadata["config_sha256"]
+            not same_typed_value(value["profile"], metadata["profile"])
+            or not same_typed_value(
+                value["environment"],
+                metadata["environment"],
+            )
+            or not same_typed_value(
+                value["dataset_pointer"],
+                metadata["dataset_pointer"],
+            )
+            or not same_typed_value(
+                value["cohort_assignment"],
+                metadata["cohort_assignment"],
+            )
+            or not same_typed_value(
+                value["seed_assignment"],
+                metadata["seed_assignment"],
+            )
+            or not same_typed_value(
+                value["config_sha256"],
+                metadata["config_sha256"],
+            )
             or value["cohort_assignment_sha256"]
             != metadata["cohort_assignment"]["sha256"]
             or profile_hash != metadata["profile"]["sha256"]

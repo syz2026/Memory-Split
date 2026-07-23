@@ -552,6 +552,93 @@ def _refresh_corpus_bindings(fixture: dict) -> None:
     _write_json(fixture["manifest_path"], fixture["manifest"])
 
 
+def _rewrite_release_fixture(
+    fixture: dict,
+    *,
+    member_values: dict[str, object] | None = None,
+    mutate_metadata=None,
+) -> None:
+    repo_root = fixture["repo_root"]
+    for path in [repo_root, *repo_root.rglob("*")]:
+        path.chmod(0o755 if path.is_dir() else 0o644)
+
+    metadata = json.loads(fixture["metadata_path"].read_text())
+    binding_names = {
+        COHORT_ASSIGNMENT_PATH: "cohort_assignment",
+        DATASET_POINTER_PATH: "dataset_pointer",
+        PROFILE_MEMBER_PATH: "profile",
+    }
+    for relative, value in (member_values or {}).items():
+        path = repo_root / relative
+        path.write_text(
+            json.dumps(value, indent=2, sort_keys=True) + "\n",
+            encoding="ascii",
+        )
+        row = next(
+            item for item in metadata["members"] if item["path"] == relative
+        )
+        row["bytes"] = path.stat().st_size
+        row["sha256"] = _sha256(path)
+        binding_name = binding_names.get(relative)
+        if binding_name is not None:
+            metadata[binding_name]["sha256"] = row["sha256"]
+    if mutate_metadata is not None:
+        mutate_metadata(metadata)
+    fixture["metadata_path"].write_text(
+        json.dumps(metadata, indent=2, sort_keys=True) + "\n",
+        encoding="ascii",
+    )
+    checksum_paths = sorted(
+        path.relative_to(repo_root).as_posix()
+        for path in repo_root.rglob("*")
+        if path.is_file()
+        and path.relative_to(repo_root).as_posix() != "SHA256SUMS"
+    )
+    fixture["sums_path"].write_text(
+        "".join(
+            f"{_sha256(repo_root / relative)}  {relative}\n"
+            for relative in checksum_paths
+        ),
+        encoding="ascii",
+    )
+    release_members_sha256 = _sha256(fixture["sums_path"])
+    fixture["release_members_sha256"] = release_members_sha256
+    bootstrap = json.loads(fixture["bootstrap_path"].read_text())
+    bootstrap["release_members_sha256"] = release_members_sha256
+    _write_json(fixture["bootstrap_path"], bootstrap)
+    fixture["manifest"]["release_members_sha256"] = release_members_sha256
+    fixture["manifest"]["bootstrap_receipt"]["sha256"] = _sha256(
+        fixture["bootstrap_path"]
+    )
+    _write_json(fixture["manifest_path"], fixture["manifest"])
+
+    for path in repo_root.rglob("*"):
+        path.chmod(0o555 if path.is_dir() else 0o444)
+    repo_root.chmod(0o555)
+
+
+def _mutate_dataset_pointer(value: dict[str, object], mutation: str) -> None:
+    if mutation == "missing":
+        del value["dataset_id"]
+    elif mutation == "extra":
+        value["unexpected"] = "forbidden"
+    elif mutation == "schema-float":
+        value["schema_version"] = 1.0
+    else:
+        value[mutation] = "d" * 64
+
+
+_NONCANONICAL_POINTER_MUTATIONS = (
+    "missing",
+    "extra",
+    "schema-float",
+    "dataset_receipt_sha256",
+    "dataset_build_id",
+    "build_id",
+    "ordered_stream_sha256",
+)
+
+
 @pytest.mark.parametrize("seed", list(SEEDS))
 def test_dry_run_renders_exact_symmetric_four_plus_four_commands(tmp_path, seed):
     fixture = _launcher_fixture(tmp_path, seed)
@@ -826,6 +913,70 @@ def test_launcher_rejects_wrong_corpus_identity(
     manifest = deepcopy(fixture["manifest"])
     manifest["corpus_receipt"][field] = "0" * 64
     _write_json(fixture["manifest_path"], manifest)
+
+    with pytest.raises(LaunchError, match=message):
+        _load_fixture_plan(fixture)
+
+
+@pytest.mark.parametrize("mutation", _NONCANONICAL_POINTER_MUTATIONS)
+def test_launcher_rejects_noncanonical_dataset_pointer(
+    tmp_path,
+    mutation,
+):
+    fixture = _launcher_fixture(tmp_path)
+    pointer = json.loads((ROOT / DATASET_POINTER_PATH).read_text())
+    _mutate_dataset_pointer(pointer, mutation)
+    _rewrite_release_fixture(
+        fixture,
+        member_values={DATASET_POINTER_PATH: pointer},
+    )
+
+    with pytest.raises(LaunchError, match="dataset|pointer|contract"):
+        _load_fixture_plan(fixture)
+
+
+@pytest.mark.parametrize("numeric_alias", [False, 0.0])
+def test_launcher_rejects_internal_seed_numeric_alias(
+    tmp_path,
+    numeric_alias,
+):
+    fixture = _launcher_fixture(tmp_path)
+
+    def mutate(metadata):
+        metadata["seed_assignment"]["seeds"][0] = numeric_alias
+
+    _rewrite_release_fixture(fixture, mutate_metadata=mutate)
+
+    with pytest.raises(LaunchError, match="seed|metadata|identity"):
+        _load_fixture_plan(fixture)
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    [
+        ("schema-float", "schema_version"),
+        ("durable-int", "durable_upload_verified"),
+        ("store-float", "instance-store|instance_store"),
+    ],
+)
+def test_launcher_rejects_bootstrap_receipt_numeric_alias(
+    tmp_path,
+    mutation,
+    message,
+):
+    fixture = _launcher_fixture(tmp_path)
+    receipt = json.loads(fixture["bootstrap_path"].read_text())
+    if mutation == "schema-float":
+        receipt["schema_version"] = 2.0
+    elif mutation == "durable-int":
+        receipt["durable_upload_verified"] = 1
+    else:
+        receipt["instance_store"]["devices"] = 8.0
+    _write_json(fixture["bootstrap_path"], receipt)
+    fixture["manifest"]["bootstrap_receipt"]["sha256"] = _sha256(
+        fixture["bootstrap_path"]
+    )
+    _write_json(fixture["manifest_path"], fixture["manifest"])
 
     with pytest.raises(LaunchError, match=message):
         _load_fixture_plan(fixture)
