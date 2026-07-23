@@ -25,7 +25,7 @@ RUNBOOK = REPO_ROOT / "docs" / "AWS-P5-360M-RUNBOOK.md"
 
 # Final interface refs. Update only after the owning task publishes a commit.
 COHORT_AULC_REF = "70c1951fedce3a61e24b7d761fa330749b71618c"
-AWS_PACKAGE_REF = "e01cee358288684c801c2bfff277ee0700e6034b"
+AWS_PACKAGE_REF = "4502db6607b673ead8613e68e8c8db49dd254b65"
 AWS_PACKAGE_LINEAGE_REF = "81543c216d1a8dcdb6a5ed92fd7c34681ab4894b"
 CONFIRMATORY_RUNNER_REF = "ac4b5a0033817fe1fcd4e0c9514c13252e7d560f"
 TASK_6_REF = "a2361588286f0050a0151ffdff88343e5eec4836"
@@ -101,6 +101,7 @@ def _git_bytes(revision: str, path: str) -> bytes:
 def _aws_profile() -> dict[str, object]:
     return {
         "schema_version": 1,
+        "profile_id": AWS,
         "provider": AWS,
         "instance_type": "p5.48xlarge",
         "purchase_model": "on_demand",
@@ -109,18 +110,25 @@ def _aws_profile() -> dict[str, object]:
             "allocated": 8,
             "seed_train_groups": [4, 4],
         },
-        "cpu": {"vcpus": 192},
-        "memory_bytes": 2_199_023_255_552,
+        "cpu": {"vcpus": 192, "memory_gib": 2048},
         "storage": {
-            "instance_store_devices": 8,
-            "instance_store_device_bytes": 3_840_000_000_000,
+            "instance_store": {
+                "devices": 8,
+                "device_bytes": 3_840_000_000_000,
+                "model": "Amazon EC2 NVMe Instance Storage",
+                "raid_level": "0",
+            },
             "scratch_root": "/mnt/memorysplit",
             "durable_uri_env": "MS_S3_ROOT",
         },
         "runtime": {
             "ami_id_env": "MS_AWS_AMI_ID",
             "container_digest_env": "MS_CONTAINER_DIGEST",
+            "region_env": "AWS_REGION",
+            "runtime_gid_env": "MS_RUNTIME_GID",
+            "runtime_uid_env": "MS_RUNTIME_UID",
         },
+        "process_env_allowlist": ["AWS_REGION", "LANG", "LC_ALL"],
         "assigned_seeds": [1, 2, 3, 4],
     }
 
@@ -272,9 +280,17 @@ def _build_release(
         {
             "schema_version": 1,
             "provider": AWS,
-            "dataset_id": "memorysplit-parallel-corpus-v2",
+            "dataset_id": "memorysplit-v2-20x-reasoning-max-cohort",
             "durable_uri_env": "MS_S3_ROOT",
-            "receipt_relative_path": "dataset/corpus-receipt.json",
+            "materialization": "s3",
+            "relative_path": "dataset",
+            "required_receipt": "dataset/receipt.json",
+            "required_sidecars": [
+                "dense_target_weights",
+                "split90_target_weights",
+            ],
+            "scratch_root": "/mnt/memorysplit",
+            "source_lock_manifest": "configs/reasoning-dataset-v2.json",
             "full_corpus_in_release": False,
         }
     )
@@ -1247,9 +1263,17 @@ def test_rejects_semantically_wrong_dataset_pointer_when_fully_rehashed(
             {
                 "schema_version": 1,
                 "provider": AWS,
-                "dataset_id": "memorysplit-parallel-corpus-v2",
+                "dataset_id": "memorysplit-v2-20x-reasoning-max-cohort",
                 "durable_uri_env": "MS_S3_ROOT",
-                "receipt_relative_path": "dataset/corpus-receipt.json",
+                "materialization": "s3",
+                "relative_path": "dataset",
+                "required_receipt": "dataset/receipt.json",
+                "required_sidecars": [
+                    "dense_target_weights",
+                    "split90_target_weights",
+                ],
+                "scratch_root": "/mnt/memorysplit",
+                "source_lock_manifest": "configs/reasoning-dataset-v2.json",
                 "full_corpus_in_release": True,
             }
         ),

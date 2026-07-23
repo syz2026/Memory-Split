@@ -41,6 +41,7 @@ _OBJECT_ID = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})")
 _MAX_CONTROL_FILE_BYTES = 16 * 1024 * 1024
 _AWS_PROFILE_CONTRACT = {
     "schema_version": 1,
+    "profile_id": AWS_PROVIDER,
     "provider": AWS_PROVIDER,
     "instance_type": "p5.48xlarge",
     "purchase_model": "on_demand",
@@ -49,18 +50,25 @@ _AWS_PROFILE_CONTRACT = {
         "allocated": 8,
         "seed_train_groups": [4, 4],
     },
-    "cpu": {"vcpus": 192},
-    "memory_bytes": 2_199_023_255_552,
+    "cpu": {"vcpus": 192, "memory_gib": 2048},
     "storage": {
-        "instance_store_devices": 8,
-        "instance_store_device_bytes": 3_840_000_000_000,
+        "instance_store": {
+            "devices": 8,
+            "device_bytes": 3_840_000_000_000,
+            "model": "Amazon EC2 NVMe Instance Storage",
+            "raid_level": "0",
+        },
         "scratch_root": "/mnt/memorysplit",
         "durable_uri_env": "MS_S3_ROOT",
     },
     "runtime": {
         "ami_id_env": "MS_AWS_AMI_ID",
         "container_digest_env": "MS_CONTAINER_DIGEST",
+        "region_env": "AWS_REGION",
+        "runtime_gid_env": "MS_RUNTIME_GID",
+        "runtime_uid_env": "MS_RUNTIME_UID",
     },
+    "process_env_allowlist": ["AWS_REGION", "LANG", "LC_ALL"],
     "assigned_seeds": [1, 2, 3, 4],
 }
 
@@ -838,7 +846,12 @@ def _dataset_pointer(content: bytes) -> None:
                 "provider",
                 "dataset_id",
                 "durable_uri_env",
-                "receipt_relative_path",
+                "materialization",
+                "relative_path",
+                "required_receipt",
+                "required_sidecars",
+                "scratch_root",
+                "source_lock_manifest",
                 "full_corpus_in_release",
             }
         ),
@@ -847,9 +860,17 @@ def _dataset_pointer(content: bytes) -> None:
     expected = {
         "schema_version": 1,
         "provider": AWS_PROVIDER,
-        "dataset_id": "memorysplit-parallel-corpus-v2",
+        "dataset_id": "memorysplit-v2-20x-reasoning-max-cohort",
         "durable_uri_env": "MS_S3_ROOT",
-        "receipt_relative_path": "dataset/corpus-receipt.json",
+        "materialization": "s3",
+        "relative_path": "dataset",
+        "required_receipt": "dataset/receipt.json",
+        "required_sidecars": [
+            "dense_target_weights",
+            "split90_target_weights",
+        ],
+        "scratch_root": "/mnt/memorysplit",
+        "source_lock_manifest": "configs/reasoning-dataset-v2.json",
         "full_corpus_in_release": False,
     }
     for field, expected_value in expected.items():

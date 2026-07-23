@@ -192,9 +192,17 @@ def _dataset_pointer() -> dict[str, object]:
     return {
         "schema_version": 1,
         "provider": PROVIDER,
-        "dataset_id": "memorysplit-parallel-corpus-v2",
+        "dataset_id": "memorysplit-v2-20x-reasoning-max-cohort",
         "durable_uri_env": "MS_S3_ROOT",
-        "receipt_relative_path": "dataset/corpus-receipt.json",
+        "materialization": "s3",
+        "relative_path": "dataset",
+        "required_receipt": "dataset/receipt.json",
+        "required_sidecars": [
+            "dense_target_weights",
+            "split90_target_weights",
+        ],
+        "scratch_root": "/mnt/memorysplit",
+        "source_lock_manifest": "configs/reasoning-dataset-v2.json",
         "full_corpus_in_release": False,
     }
 
