@@ -1,0 +1,19 @@
+{
+  "cohort_id": "memorysplit-confirmatory-v2-360m-n5",
+  "model_parameters": 356033536,
+  "optimizer_steps": 13582,
+  "provider_seeds": {
+    "aws-p5.48xlarge": [
+      1,
+      2,
+      3,
+      4
+    ],
+    "illumina-usfc-prd": [
+      0
+    ]
+  },
+  "raw_target_tokens": 7120879616,
+  "schema_version": 2,
+  "targets_per_update": 524288
+}
