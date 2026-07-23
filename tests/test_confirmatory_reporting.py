@@ -39,9 +39,30 @@ def _artifacts(name: str = "positive") -> dict[str, bytes]:
     return dict(fixtures[name]().artifacts)
 
 
+def _expected_lock(artifacts) -> str:
+    import hashlib
+
+    return hashlib.sha256(artifacts["study-lock.json"]).hexdigest()
+
+
+def _build(artifacts):
+    return build_artifact_report(
+        artifacts=artifacts,
+        expected_study_lock_sha256=_expected_lock(artifacts),
+    )
+
+
+def _validate(report, artifacts):
+    return validate_artifact_report(
+        report,
+        artifacts,
+        expected_study_lock_sha256=_expected_lock(artifacts),
+    )
+
+
 def test_artifact_report_round_trips_and_authenticates_every_required_file():
     artifacts = _artifacts()
-    report = build_artifact_report(artifacts=artifacts)
+    report = _build(artifacts)
 
     assert report.record_type == ARTIFACT_REPORT_SCHEMA
     assert report.schema_version == CONTRACT_VERSION
@@ -50,7 +71,7 @@ def test_artifact_report_round_trips_and_authenticates_every_required_file():
     assert report.final_inference_conclusion == "supports_effect"
     assert set(report.artifacts) == set(REQUIRED_ARTIFACTS)
     assert ArtifactReport.from_dict(report.to_dict()) == report
-    assert validate_artifact_report(report, artifacts) == report
+    assert _validate(report, artifacts) == report
     assert json.loads(canonical_json_bytes(report)) == report.to_dict()
 
 
@@ -59,7 +80,7 @@ def test_artifact_report_fails_closed_on_missing_extra_or_tampered_files(
     mutation,
 ):
     artifacts = _artifacts()
-    report = build_artifact_report(artifacts=artifacts)
+    report = _build(artifacts)
     changed = dict(artifacts)
     if mutation == "missing":
         changed.pop(next(iter(changed)))
@@ -70,12 +91,12 @@ def test_artifact_report_fails_closed_on_missing_extra_or_tampered_files(
         changed[name] += b"tamper"
 
     with pytest.raises(ValueError, match="artifact"):
-        validate_artifact_report(report, changed)
+        _validate(report, changed)
 
 
 def test_artifact_report_rejects_dishonest_status_counts_and_schema_drift():
     artifacts = _artifacts()
-    report = build_artifact_report(artifacts=artifacts)
+    report = _build(artifacts)
     drifted = report.to_dict()
     drifted["unexpected"] = True
     with pytest.raises(ValueError, match="fields"):
@@ -95,13 +116,13 @@ def test_artifact_report_rejects_dishonest_status_counts_and_schema_drift():
     dishonest["report_sha256"] = canonical_sha256(payload)
     typed = ArtifactReport.from_dict(dishonest)
     with pytest.raises(ValueError, match="counts|status"):
-        validate_artifact_report(typed, artifacts)
+        _validate(typed, artifacts)
 
 
 @pytest.mark.parametrize("schema_version", [True, 2.0])
 def test_report_schema_version_is_an_exact_integer(schema_version):
     artifacts = _artifacts()
-    report = build_artifact_report(artifacts=artifacts)
+    report = _build(artifacts)
     raw_report = report.to_dict()
     raw_report["schema_version"] = schema_version
     with pytest.raises(ValueError, match="schema"):
@@ -118,12 +139,12 @@ def test_inference_evidence_schema_version_is_an_exact_integer(
     raw_evidence["schema_version"] = schema_version
     changed_artifacts["inference.json"] = canonical_json_bytes(raw_evidence)
     with pytest.raises(ValueError, match="schema"):
-        build_artifact_report(artifacts=changed_artifacts)
+        _build(changed_artifacts)
 
 
 def test_measured_invalidity_overrides_missing_cells_and_rejects_strong_claims():
     invalid_artifacts = _artifacts("invalid")
-    report = build_artifact_report(artifacts=invalid_artifacts)
+    report = _build(invalid_artifacts)
 
     assert report.scientific_status == "invalid"
     assert report.interim_evidence_label == "none"
@@ -134,12 +155,12 @@ def test_measured_invalidity_overrides_missing_cells_and_rejects_strong_claims()
     raw["supports_effect"] = True
     claiming_effect["inference.json"] = canonical_json_bytes(raw)
     with pytest.raises(ValueError, match="fields"):
-        build_artifact_report(artifacts=claiming_effect)
+        _build(claiming_effect)
 
 
 def test_report_axes_are_derived_from_strict_hash_bound_inference_evidence():
     artifacts = _artifacts()
-    report = build_artifact_report(artifacts=artifacts)
+    report = _build(artifacts)
     dishonest = report.to_dict()
     dishonest.update(
         scientific_status="invalid",
@@ -153,14 +174,14 @@ def test_report_axes_are_derived_from_strict_hash_bound_inference_evidence():
     dishonest["report_sha256"] = canonical_sha256(payload)
 
     with pytest.raises(ValueError, match="evidence|status"):
-        validate_artifact_report(dishonest, artifacts)
+        _validate(dishonest, artifacts)
 
     drifted = dict(artifacts)
     raw = json.loads(drifted["inference.json"])
     raw["unregistered_claim"] = True
     drifted["inference.json"] = canonical_json_bytes(raw)
     with pytest.raises(ValueError, match="fields"):
-        build_artifact_report(artifacts=drifted)
+        _build(drifted)
 
     assert (
         reporting_module.INFERENCE_EVIDENCE_SCHEMA
@@ -172,13 +193,26 @@ def test_artifact_report_publication_is_canonical_atomic_and_nonoverwriting(
     tmp_path,
 ):
     artifacts = _artifacts("null")
-    report = build_artifact_report(artifacts=artifacts)
+    report = _build(artifacts)
     output = tmp_path / "confirmatory-report.json"
 
-    assert publish_artifact_report(output, report, artifacts) == output
+    assert (
+        publish_artifact_report(
+            output,
+            report,
+            artifacts,
+            expected_study_lock_sha256=_expected_lock(artifacts),
+        )
+        == output
+    )
     assert output.read_bytes() == canonical_json_bytes(report)
     with pytest.raises(FileExistsError):
-        publish_artifact_report(output, report, artifacts)
+        publish_artifact_report(
+            output,
+            report,
+            artifacts,
+            expected_study_lock_sha256=_expected_lock(artifacts),
+        )
 
 
 def test_publication_pins_parent_across_directory_swap(
@@ -186,7 +220,7 @@ def test_publication_pins_parent_across_directory_swap(
     monkeypatch,
 ):
     artifacts = _artifacts()
-    report = build_artifact_report(artifacts=artifacts)
+    report = _build(artifacts)
     parent = tmp_path / "validated-parent"
     moved_parent = tmp_path / "pinned-parent"
     attacker = tmp_path / "attacker"
@@ -210,7 +244,15 @@ def test_publication_pins_parent_across_directory_swap(
         swap_parent_then_link,
     )
 
-    assert publish_artifact_report(output, report, artifacts) == output
+    assert (
+        publish_artifact_report(
+            output,
+            report,
+            artifacts,
+            expected_study_lock_sha256=_expected_lock(artifacts),
+        )
+        == output
+    )
     assert (
         moved_parent.joinpath(output.name).read_bytes()
         == canonical_json_bytes(report)
@@ -223,7 +265,7 @@ def test_publication_rejects_symlink_components_and_unsupported_platforms(
     monkeypatch,
 ):
     artifacts = _artifacts()
-    report = build_artifact_report(artifacts=artifacts)
+    report = _build(artifacts)
     real_parent = tmp_path / "real"
     real_parent.mkdir()
     alias = tmp_path / "alias"
@@ -234,6 +276,7 @@ def test_publication_rejects_symlink_components_and_unsupported_platforms(
             alias / "report.json",
             report,
             artifacts,
+            expected_study_lock_sha256=_expected_lock(artifacts),
         )
     assert not real_parent.joinpath("report.json").exists()
 
@@ -243,6 +286,7 @@ def test_publication_rejects_symlink_components_and_unsupported_platforms(
             real_parent / "report.json",
             report,
             artifacts,
+            expected_study_lock_sha256=_expected_lock(artifacts),
         )
 
 
@@ -260,7 +304,10 @@ def test_positive_null_and_invalid_fixtures_are_deterministic_and_decisive():
 
     for fixture in (positive, practical_null, invalid):
         assert len({row.seed for row in fixture.observations}) == 5
-        report = build_artifact_report(artifacts=fixture.artifacts)
+        report = build_artifact_report(
+            artifacts=fixture.artifacts,
+            expected_study_lock_sha256=fixture.expected_study_lock_sha256,
+        )
         assert (
             report.scientific_status,
             report.interim_evidence_label,

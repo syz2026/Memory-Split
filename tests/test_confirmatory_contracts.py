@@ -28,6 +28,9 @@ def test_confirmatory_package_exports_the_supported_core_api():
     assert confirmatory.ItemRecord is ItemRecord
     assert confirmatory.StoreRecord is StoreRecord
     assert confirmatory.CheckpointRecord is CheckpointRecord
+    assert {
+        condition.value for condition in confirmatory.ConditionId
+    } == {"dense", "split90", "random"}
     assert confirmatory.ReasoningFamily is contracts_module.ReasoningFamily
     assert (
         confirmatory.OUTCOME_SCHEMA
@@ -38,6 +41,11 @@ def test_confirmatory_package_exports_the_supported_core_api():
         == "memorysplit.confirmatory.metrics.v2"
     )
     assert "RNG seed" in confirmatory.PRACTICAL_NULL_REPLAY_GAP
+    assert confirmatory.STUDY_LOCK_SCHEMA.endswith("study-lock.v2")
+    assert confirmatory.FROZEN_PREREGISTRATION_SHA256 == (
+        "fee38e363298d3def46b741320c9d7df4523d0ff3cd249187cf52d54046cbbf0"
+    )
+    assert callable(confirmatory.score_item_outcome)
     assert callable(confirmatory.balanced_counterfactual_pair_metric)
     assert callable(confirmatory.hierarchical_paired_bootstrap)
     assert callable(confirmatory.verify_proof_and_answer)
@@ -155,9 +163,11 @@ def _checkpoint(**changes) -> dict:
         "checkpoint_sha256": "a" * 64,
         "model_id": "memorysplit-160m",
         "arm": "split",
+        "condition_id": "split90",
         "seed": 1001,
         "raw_token_count": 3_244_818_432,
         "configuration_sha256": "b" * 64,
+        "route_dose_sha256": "e" * 64,
         "corpus_sha256": "c" * 64,
         "code_sha256": "d" * 64,
     }
@@ -242,6 +252,30 @@ def test_contract_schema_versions_are_exact_integers(
 ):
     with pytest.raises(ValueError, match="schema_version"):
         factory({**record, "schema_version": schema_version})
+
+
+def test_checkpoint_requires_explicit_condition_and_route_dose_identity():
+    checkpoint = CheckpointRecord.from_dict(_checkpoint())
+
+    assert checkpoint.condition_id.value == "split90"
+    assert checkpoint.route_dose_sha256 == "e" * 64
+
+    generic_split = _checkpoint(condition_id="split")
+    with pytest.raises(ValueError, match="condition"):
+        CheckpointRecord.from_dict(generic_split)
+    missing_condition = _checkpoint()
+    missing_condition.pop("condition_id")
+    with pytest.raises(ValueError, match="condition"):
+        CheckpointRecord.from_dict(missing_condition)
+    with pytest.raises(ValueError, match="condition|arm"):
+        CheckpointRecord.from_dict(
+            _checkpoint(arm="dense", condition_id="split90")
+        )
+
+    random_checkpoint = CheckpointRecord.from_dict(
+        _checkpoint(arm="random", condition_id="random")
+    )
+    assert random_checkpoint.arm.value == "random"
 
 
 @pytest.mark.parametrize(

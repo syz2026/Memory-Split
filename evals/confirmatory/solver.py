@@ -91,6 +91,18 @@ class LookupChainSolver:
         return returned[-1]
 
 
+_REGISTERED_SOLVERS: Mapping[str, ProofSolver] = {
+    LookupChainSolver.solver_id: LookupChainSolver(),
+}
+
+
+def registered_solver(solver_id: str) -> ProofSolver:
+    try:
+        return _REGISTERED_SOLVERS[solver_id]
+    except (KeyError, TypeError) as exc:
+        raise ValueError(f"sealed gold names an unregistered solver: {solver_id!r}") from exc
+
+
 def _binding_error(
     item: ItemRecord,
     store: StoreRecord,

@@ -26,9 +26,11 @@ class FinalInferenceConclusion(StrEnum):
 
 
 def _enum(value: object, enum_type: type[StrEnum], name: str) -> StrEnum:
+    if not isinstance(value, str):
+        raise ValueError(f"{name} is not an approved value")
     try:
         return enum_type(value)
-    except (TypeError, ValueError) as exc:
+    except ValueError as exc:
         raise ValueError(f"{name} is not an approved value") from exc
 
 

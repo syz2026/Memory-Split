@@ -83,6 +83,12 @@ class Arm(StrEnum):
     RANDOM_MASK = "random"
 
 
+class ConditionId(StrEnum):
+    DENSE = "dense"
+    SPLIT90 = "split90"
+    RANDOM = "random"
+
+
 def _strict_fields(
     raw: object,
     expected: frozenset[str],
@@ -134,9 +140,11 @@ def _sha256(value: object, name: str) -> str:
 
 
 def _enum(value: object, cls: type[StrEnum], name: str):
+    if not isinstance(value, str):
+        raise ValueError(f"{name} is not an approved value")
     try:
         return cls(value)
-    except (TypeError, ValueError) as exc:
+    except ValueError as exc:
         raise ValueError(f"{name} is not an approved value") from exc
 
 
@@ -556,9 +564,11 @@ class CheckpointRecord:
     checkpoint_sha256: str
     model_id: str
     arm: Arm
+    condition_id: ConditionId
     seed: int
     raw_token_count: int
     configuration_sha256: str
+    route_dose_sha256: str
     corpus_sha256: str
     code_sha256: str
 
@@ -569,9 +579,11 @@ class CheckpointRecord:
             "checkpoint_sha256",
             "model_id",
             "arm",
+            "condition_id",
             "seed",
             "raw_token_count",
             "configuration_sha256",
+            "route_dose_sha256",
             "corpus_sha256",
             "code_sha256",
         }
@@ -590,6 +602,18 @@ class CheckpointRecord:
         )
         object.__setattr__(self, "model_id", _string(self.model_id, "model_id"))
         object.__setattr__(self, "arm", _enum(self.arm, Arm, "arm"))
+        object.__setattr__(
+            self,
+            "condition_id",
+            _enum(self.condition_id, ConditionId, "condition_id"),
+        )
+        expected_arm = {
+            ConditionId.DENSE: Arm.DENSE,
+            ConditionId.SPLIT90: Arm.SPLIT,
+            ConditionId.RANDOM: Arm.RANDOM,
+        }[self.condition_id]
+        if self.arm is not expected_arm:
+            raise ValueError("checkpoint condition_id disagrees with arm")
         object.__setattr__(self, "seed", _integer(self.seed, "seed"))
         object.__setattr__(
             self,
@@ -598,6 +622,7 @@ class CheckpointRecord:
         )
         for field in (
             "configuration_sha256",
+            "route_dose_sha256",
             "corpus_sha256",
             "code_sha256",
         ):
@@ -619,9 +644,11 @@ class CheckpointRecord:
             "checkpoint_sha256": self.checkpoint_sha256,
             "model_id": self.model_id,
             "arm": self.arm.value,
+            "condition_id": self.condition_id.value,
             "seed": self.seed,
             "raw_token_count": self.raw_token_count,
             "configuration_sha256": self.configuration_sha256,
+            "route_dose_sha256": self.route_dose_sha256,
             "corpus_sha256": self.corpus_sha256,
             "code_sha256": self.code_sha256,
         }

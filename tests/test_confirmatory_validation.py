@@ -28,6 +28,8 @@ from evals.confirmatory.solver import (
     verify_proof_and_answer,
     verify_sealed_gold,
 )
+from evals.confirmatory.metrics import ItemOutcome
+from evals.confirmatory import metrics as metrics_module
 
 
 def _read(relation: str, slot: int = 0) -> dict:
@@ -128,9 +130,11 @@ def _records():
             "checkpoint_sha256": "a" * 64,
             "model_id": "memorysplit-160m",
             "arm": "split",
+            "condition_id": "split90",
             "seed": 1001,
             "raw_token_count": 1,
             "configuration_sha256": "b" * 64,
+            "route_dose_sha256": "e" * 64,
             "corpus_sha256": "c" * 64,
             "code_sha256": "d" * 64,
         }
@@ -225,6 +229,47 @@ def test_lookup_solver_verifies_both_proof_and_answer():
     assert result.derived_answer == "done"
     assert result.reason is None
     assert verify_sealed_gold(item, store, gold, solver).valid
+
+
+def test_outcome_submission_is_solver_replayed_not_caller_scored():
+    item, store, gold, checkpoint = _records()
+    submission = ItemOutcome(
+        item_id=item.item_id,
+        pair_id=item.pair_id,
+        twin=item.twin,
+        stratum=item.stratum,
+        family=item.family,
+        seed=checkpoint.seed,
+        world_id=item.world_id,
+        checkpoint_sha256=checkpoint.checkpoint_sha256,
+        arm=checkpoint.arm,
+        condition_id=checkpoint.condition_id,
+        memory_mode=item.memory_mode,
+        control=item.control,
+        submitted_answer="forged-correct",
+        submitted_proof=_proof("P1", "P2"),
+    )
+
+    assert "solver" not in inspect.signature(
+        metrics_module.score_item_outcome
+    ).parameters
+    scored = metrics_module.score_item_outcome(
+        outcome=submission,
+        item=item,
+        checkpoint=checkpoint,
+        gold=gold,
+        store=store,
+    )
+    assert scored.proof_valid
+    assert not scored.answer_valid
+    assert not scored.verified_correct
+
+    dishonest = submission.to_dict()
+    dishonest["proof_valid"] = True
+    dishonest["answer_valid"] = True
+    dishonest["valid"] = True
+    with pytest.raises(ValueError, match="fields"):
+        ItemOutcome.from_dict(dishonest)
 
 
 def test_sealed_gold_rejects_action_budget_violations():

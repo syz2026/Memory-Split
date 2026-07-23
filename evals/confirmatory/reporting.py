@@ -16,21 +16,37 @@ from types import MappingProxyType
 from typing import Any
 
 from evals.confirmatory.contracts import (
-    Arm,
     CheckpointRecord,
+    ConditionId,
     CONTRACT_VERSION,
     Control,
     ItemRecord,
     MemoryMode,
+    SealedGoldRecord,
+    StoreRecord,
     canonical_json_bytes,
     canonical_sha256,
+    validate_contract_bundle,
 )
 from evals.confirmatory.inference import ExactTestResult, exact_sign_flip_test
 from evals.confirmatory.metrics import (
     ItemOutcome,
     PairMetricSummary,
+    _ScoredItemOutcome,
     balanced_counterfactual_pair_metric,
+    score_item_outcome,
     validate_item_outcome_binding,
+)
+from evals.confirmatory.solver import registered_solver, verify_sealed_gold
+from evals.confirmatory.study_lock import (
+    FROZEN_PREREGISTRATION_SHA256,
+    REQUIRED_CONTROL_IDS,
+    REQUIRED_FAMILIES,
+    REQUIRED_MEMORY_MODES,
+    REQUIRED_STRATA,
+    StudyLock,
+    ValidityEvidence,
+    evaluate_readiness,
 )
 from evals.confirmatory.status import (
     FinalInferenceConclusion,
@@ -55,8 +71,12 @@ PRACTICAL_NULL_REPLAY_GAP = (
     "draws, but preregistration-v2 does not freeze an RNG seed; "
     "supports_practical_null cannot be replayed before amendment."
 )
+RELEASE_SEALING_LAUNCH_GAP = (
+    "No production release study-lock commitment is frozen; protected launch "
+    "must supply the independently sealed expected_study_lock_sha256."
+)
 _FROZEN_SEEDS = tuple(range(5))
-_FROZEN_ARMS = (Arm.DENSE, Arm.SPLIT)
+_FROZEN_CONDITIONS = (ConditionId.DENSE, ConditionId.SPLIT90)
 REQUIRED_ARTIFACTS = (
     "checkpoints.jsonl",
     "inference.json",
@@ -64,7 +84,9 @@ REQUIRED_ARTIFACTS = (
     "metrics.json",
     "outcomes.jsonl",
     "sealed-gold.jsonl",
+    "study-lock.json",
     "stores.jsonl",
+    "validity.json",
 )
 _REPORT_FIELDS = frozenset(
     {
@@ -74,6 +96,8 @@ _REPORT_FIELDS = frozenset(
         "interim_evidence_label",
         "final_inference_conclusion",
         "practical_null_replay_status",
+        "study_lock_sha256",
+        "preregistration_sha256",
         "paired_seed_bundle_deltas",
         "expected_cells",
         "observed_cells",
@@ -86,7 +110,6 @@ _INFERENCE_FIELDS = frozenset(
     {
         "record_type",
         "schema_version",
-        "measured_validity_failure",
         "primary_test",
         "paired_seed_bundle_deltas",
         "exact_test_result",
@@ -270,7 +293,6 @@ class PersistedExactTestResult:
 class InferenceEvidence:
     record_type: str
     schema_version: int
-    measured_validity_failure: bool
     primary_test: PrimaryTestIdentity
     paired_seed_bundle_deltas: tuple[float, ...]
     exact_test_result: PersistedExactTestResult | None
@@ -279,10 +301,6 @@ class InferenceEvidence:
         if self.record_type != INFERENCE_EVIDENCE_SCHEMA:
             raise ValueError("inference evidence schema identity is invalid")
         _schema_version(self.schema_version, "inference evidence")
-        _boolean(
-            self.measured_validity_failure,
-            "measured_validity_failure",
-        )
         if not isinstance(self.primary_test, PrimaryTestIdentity):
             raise ValueError("inference evidence primary_test is invalid")
         if not isinstance(self.paired_seed_bundle_deltas, (list, tuple)):
@@ -314,7 +332,6 @@ class InferenceEvidence:
         return cls(
             record_type=value["record_type"],
             schema_version=value["schema_version"],
-            measured_validity_failure=value["measured_validity_failure"],
             primary_test=PrimaryTestIdentity.from_dict(value["primary_test"]),
             paired_seed_bundle_deltas=value["paired_seed_bundle_deltas"],
             exact_test_result=(
@@ -328,7 +345,6 @@ class InferenceEvidence:
         return {
             "record_type": self.record_type,
             "schema_version": self.schema_version,
-            "measured_validity_failure": self.measured_validity_failure,
             "primary_test": self.primary_test.to_dict(),
             "paired_seed_bundle_deltas": list(
                 self.paired_seed_bundle_deltas
@@ -393,6 +409,70 @@ def _parse_items(content: bytes) -> tuple[ItemRecord, ...]:
     return records
 
 
+def _parse_gold(content: bytes) -> tuple[SealedGoldRecord, ...]:
+    records = _canonical_jsonl(
+        content,
+        name="sealed-gold.jsonl",
+        parser=SealedGoldRecord.from_dict,
+    )
+    identities = tuple(record.item_id for record in records)
+    if len(set(identities)) != len(identities):
+        raise ValueError("sealed-gold.jsonl contains a duplicate item_id")
+    if identities != tuple(sorted(identities)):
+        raise ValueError("sealed-gold.jsonl is not ordered by item_id")
+    return records
+
+
+def _parse_stores(content: bytes) -> tuple[StoreRecord, ...]:
+    records = _canonical_jsonl(
+        content,
+        name="stores.jsonl",
+        parser=StoreRecord.from_dict,
+    )
+    identities = tuple(record.store_id for record in records)
+    if len(set(identities)) != len(identities):
+        raise ValueError("stores.jsonl contains a duplicate store_id")
+    if identities != tuple(sorted(identities)):
+        raise ValueError("stores.jsonl is not ordered by store_id")
+    return records
+
+
+def _parse_canonical_object(
+    content: bytes,
+    *,
+    name: str,
+) -> Mapping[str, Any]:
+    try:
+        raw = json.loads(content)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError(f"{name} must be canonical UTF-8 JSON") from exc
+    if not isinstance(raw, Mapping) or canonical_json_bytes(raw) != content:
+        raise ValueError(f"{name} must be a canonical JSON object")
+    return raw
+
+
+def _parse_study_lock(
+    content: bytes,
+    expected_study_lock_sha256: str,
+) -> StudyLock:
+    expected = _hash(
+        expected_study_lock_sha256,
+        "expected_study_lock_sha256",
+    )
+    actual = hashlib.sha256(content).hexdigest()
+    if actual != expected:
+        raise ValueError("study lock disagrees with external commitment")
+    return StudyLock.from_dict(
+        _parse_canonical_object(content, name="study-lock.json")
+    )
+
+
+def _parse_validity(content: bytes) -> ValidityEvidence:
+    return ValidityEvidence.from_dict(
+        _parse_canonical_object(content, name="validity.json")
+    )
+
+
 def _parse_checkpoints(content: bytes) -> tuple[CheckpointRecord, ...]:
     records = _canonical_jsonl(
         content,
@@ -402,16 +482,16 @@ def _parse_checkpoints(content: bytes) -> tuple[CheckpointRecord, ...]:
     identities = tuple(record.checkpoint_sha256 for record in records)
     if len(set(identities)) != len(identities):
         raise ValueError("checkpoints.jsonl contains a duplicate hash")
-    slots = tuple((record.seed, record.arm) for record in records)
+    slots = tuple((record.seed, record.condition_id) for record in records)
     allowed = {
-        (seed, arm)
+        (seed, condition)
         for seed in _FROZEN_SEEDS
-        for arm in _FROZEN_ARMS
+        for condition in (*_FROZEN_CONDITIONS, ConditionId.RANDOM)
     }
     if len(set(slots)) != len(slots) or not set(slots) <= allowed:
         raise ValueError("checkpoints.jsonl has an invalid frozen seed/arm slot")
     if slots != tuple(sorted(slots, key=lambda slot: (slot[0], slot[1].value))):
-        raise ValueError("checkpoints.jsonl is not ordered by seed and arm")
+        raise ValueError("checkpoints.jsonl is not ordered by seed and condition")
     return records
 
 
@@ -422,11 +502,13 @@ def _parse_outcomes(content: bytes) -> tuple[ItemOutcome, ...]:
         parser=ItemOutcome.from_dict,
     )
     order = tuple(
-        (record.seed, record.arm.value, record.item_id)
+        (record.seed, record.condition_id.value, record.item_id)
         for record in records
     )
     if order != tuple(sorted(order)):
-        raise ValueError("outcomes.jsonl is not ordered by seed, arm, and item")
+        raise ValueError(
+            "outcomes.jsonl is not ordered by seed, condition, and item"
+        )
     return records
 
 
@@ -456,6 +538,8 @@ class ArtifactReplay:
     observed_cells: int
     seed_deltas: tuple[float, ...]
     exact_test_result: ExactTestResult | None
+    study_lock_sha256: str
+    preregistration_sha256: str
 
 
 def _metric_sort_key(
@@ -465,7 +549,7 @@ def _metric_sort_key(
     checkpoint = checkpoints[summary.checkpoint_sha256]
     return (
         checkpoint.seed,
-        checkpoint.arm.value,
+        checkpoint.condition_id.value,
         summary.memory_mode.value,
         summary.control.value,
     )
@@ -475,14 +559,14 @@ def _recomputed_metrics(
     *,
     items: Mapping[str, ItemRecord],
     checkpoints: Mapping[str, CheckpointRecord],
-    outcomes: Sequence[ItemOutcome],
+    outcomes: Sequence[_ScoredItemOutcome],
 ) -> tuple[PairMetricSummary, ...]:
     item_cells: dict[tuple[MemoryMode, Control], set[str]] = defaultdict(set)
     for item in items.values():
         item_cells[(item.memory_mode, item.control)].add(item.item_id)
     grouped: dict[
         tuple[str, MemoryMode, Control],
-        list[ItemOutcome],
+        list[_ScoredItemOutcome],
     ] = defaultdict(list)
     for outcome in outcomes:
         grouped[
@@ -496,10 +580,7 @@ def _recomputed_metrics(
     summaries = []
     for (checkpoint_hash, memory_mode, control), rows in grouped.items():
         expected_items = item_cells[(memory_mode, control)]
-        if (
-            {row.item_id for row in rows} != expected_items
-            or any(not row.complete or not row.valid for row in rows)
-        ):
+        if {row.item_id for row in rows} != expected_items:
             continue
         summaries.append(
             balanced_counterfactual_pair_metric(
@@ -532,7 +613,7 @@ def _seed_deltas(
     summaries: Sequence[PairMetricSummary],
     checkpoints: Mapping[str, CheckpointRecord],
 ) -> tuple[float, ...]:
-    by_slot: dict[tuple[int, Arm], float] = {}
+    by_slot: dict[tuple[int, ConditionId], float] = {}
     for summary in summaries:
         if (
             summary.memory_mode is not MemoryMode.MEMORY_ON
@@ -540,14 +621,16 @@ def _seed_deltas(
         ):
             continue
         checkpoint = checkpoints[summary.checkpoint_sha256]
-        slot = checkpoint.seed, checkpoint.arm
+        slot = checkpoint.seed, checkpoint.condition_id
         if slot in by_slot:
             raise ValueError("metrics contain a duplicate primary seed/arm cell")
         by_slot[slot] = summary.primary_accuracy
     return tuple(
-        by_slot[(seed, Arm.SPLIT)] - by_slot[(seed, Arm.DENSE)]
+        by_slot[(seed, ConditionId.SPLIT90)]
+        - by_slot[(seed, ConditionId.DENSE)]
         for seed in _FROZEN_SEEDS
-        if (seed, Arm.SPLIT) in by_slot and (seed, Arm.DENSE) in by_slot
+        if (seed, ConditionId.SPLIT90) in by_slot
+        and (seed, ConditionId.DENSE) in by_slot
     )
 
 
@@ -573,21 +656,170 @@ def _validate_exact_result(
     return decision
 
 
+def _control_id(item: ItemRecord) -> str:
+    if (
+        item.memory_mode is MemoryMode.MEMORY_OFF
+        and item.control is Control.CORRECT
+    ):
+        return "memory_off"
+    if item.memory_mode is not MemoryMode.MEMORY_ON:
+        raise ValueError("non-correct controls require memory_on")
+    mapping = {
+        Control.CORRECT: "correct_memory",
+        Control.SHUFFLED_RETURNS: "shuffled_returns",
+        Control.RELEVANT_EDGE: "relevant_edge_swap",
+        Control.IRRELEVANT_EDGE: "irrelevant_edge_swap",
+        Control.GOLD_PATH: "gold_path_replay",
+        Control.NO_QUERY: "no_query",
+        Control.ENTITY_RENAME: "entity_rename",
+        Control.GRAPH_ISOMORPHISM: "graph_isomorphism",
+        Control.PAGE_ORDER_PERMUTATION: "page_order_permutation",
+    }
+    try:
+        return mapping[item.control]
+    except KeyError as exc:
+        raise ValueError(
+            f"item uses an unregistered protected control: {item.control.value}"
+        ) from exc
+
+
+def _validate_release(
+    *,
+    content: Mapping[str, bytes],
+    lock: StudyLock,
+    items: Sequence[ItemRecord],
+    gold_records: Sequence[SealedGoldRecord],
+    stores: Sequence[StoreRecord],
+    checkpoints: Sequence[CheckpointRecord],
+) -> tuple[
+    Mapping[str, ItemRecord],
+    Mapping[str, SealedGoldRecord],
+    Mapping[str, StoreRecord],
+    Mapping[str, CheckpointRecord],
+]:
+    release = lock.release
+    for name, expected in (
+        ("items.jsonl", release.items_sha256),
+        ("sealed-gold.jsonl", release.sealed_gold_sha256),
+        ("stores.jsonl", release.stores_sha256),
+        ("checkpoints.jsonl", release.checkpoints_sha256),
+    ):
+        if hashlib.sha256(content[name]).hexdigest() != expected:
+            raise ValueError(f"{name} disagrees with sealed release commitment")
+    item_map = {item.item_id: item for item in items}
+    gold_map = {gold.item_id: gold for gold in gold_records}
+    store_map = {store.store_id: store for store in stores}
+    checkpoint_map = {
+        checkpoint.checkpoint_sha256: checkpoint
+        for checkpoint in checkpoints
+    }
+    if tuple(item_map) != release.item_ids or set(gold_map) != set(item_map):
+        raise ValueError("sealed item/gold registry disagrees with study lock")
+    if tuple(sorted({item.pair_id for item in items})) != release.pair_ids:
+        raise ValueError("sealed pair registry disagrees with study lock")
+    if tuple(sorted({item.world_id for item in items})) != release.world_ids:
+        raise ValueError("sealed world registry disagrees with study lock")
+    if set(store_map) != {item.store_id for item in items}:
+        raise ValueError("sealed store registry is not exactly item-bound")
+    if {item.family.value for item in items} != set(REQUIRED_FAMILIES):
+        raise ValueError("release omits a required reasoning family")
+    if {item.stratum.value for item in items} != set(REQUIRED_STRATA):
+        raise ValueError("release omits a required stratum")
+    if {item.memory_mode.value for item in items} != set(
+        REQUIRED_MEMORY_MODES
+    ):
+        raise ValueError("release omits a required memory mode")
+    if {_control_id(item) for item in items} != set(REQUIRED_CONTROL_IDS):
+        raise ValueError("release omits a preregistered control")
+    if not checkpoints:
+        raise ValueError("study lock requires checkpoint records")
+    for item in items:
+        gold = gold_map[item.item_id]
+        store = store_map[item.store_id]
+        validate_contract_bundle(item, gold, store, checkpoints[0])
+        solver = registered_solver(gold.solver_id)
+        if not verify_sealed_gold(item, store, gold, solver).valid:
+            raise ValueError(f"sealed gold is not solver-verifiable: {item.item_id}")
+
+    approvals = {
+        approval.checkpoint_sha256: approval
+        for approval in lock.checkpoints
+    }
+    if set(approvals) != set(checkpoint_map):
+        raise ValueError("checkpoint registry disagrees with study lock")
+    for checkpoint_hash, checkpoint in checkpoint_map.items():
+        approval = approvals[checkpoint_hash]
+        if (
+            checkpoint.seed != approval.seed
+            or checkpoint.condition_id is not approval.condition_id
+            or checkpoint.configuration_sha256
+            != approval.configuration_sha256
+            or checkpoint.route_dose_sha256 != approval.route_dose_sha256
+        ):
+            raise ValueError(
+                "checkpoint configuration or route-dose disagrees with study lock"
+            )
+    expected_cells = tuple(
+        sorted(
+            (
+                item.item_id,
+                checkpoint.checkpoint_sha256,
+                checkpoint.seed,
+                checkpoint.condition_id.value,
+            )
+            for item in items
+            for checkpoint in checkpoints
+            if checkpoint.condition_id in _FROZEN_CONDITIONS
+        )
+    )
+    locked_cells = tuple(
+        sorted(
+            (
+                cell.item_id,
+                cell.checkpoint_sha256,
+                cell.seed,
+                cell.condition_id.value,
+            )
+            for cell in release.evaluation_cells
+        )
+    )
+    if locked_cells != expected_cells:
+        raise ValueError("evaluation-cell registry disagrees with sealed release")
+    return item_map, gold_map, store_map, checkpoint_map
+
+
 def _replay_artifacts(
     content: Mapping[str, bytes],
+    *,
+    expected_study_lock_sha256: str,
 ) -> ArtifactReplay:
+    lock = _parse_study_lock(
+        content["study-lock.json"],
+        expected_study_lock_sha256,
+    )
+    lock_sha256 = hashlib.sha256(content["study-lock.json"]).hexdigest()
+    validity = _parse_validity(content["validity.json"])
+    if validity.study_lock_sha256 != lock_sha256:
+        raise ValueError("validity evidence is unbound from study lock")
+    readiness = evaluate_readiness(lock, validity)
     items = _parse_items(content["items.jsonl"])
+    gold_records = _parse_gold(content["sealed-gold.jsonl"])
+    stores = _parse_stores(content["stores.jsonl"])
     checkpoints = _parse_checkpoints(content["checkpoints.jsonl"])
     outcomes = _parse_outcomes(content["outcomes.jsonl"])
     persisted_metrics = _parse_metrics(content["metrics.json"])
     evidence = _inference_evidence(content["inference.json"])
 
-    item_map = {item.item_id: item for item in items}
-    checkpoint_map = {
-        checkpoint.checkpoint_sha256: checkpoint
-        for checkpoint in checkpoints
-    }
-    observed_keys: set[tuple[str, int, Arm]] = set()
+    item_map, gold_map, store_map, checkpoint_map = _validate_release(
+        content=content,
+        lock=lock,
+        items=items,
+        gold_records=gold_records,
+        stores=stores,
+        checkpoints=checkpoints,
+    )
+    observed_keys: set[tuple[str, str]] = set()
+    scored_outcomes = []
     for outcome in outcomes:
         try:
             item = item_map[outcome.item_id]
@@ -599,16 +831,26 @@ def _replay_artifacts(
             item=item,
             checkpoint=checkpoint,
         )
-        key = outcome.item_id, outcome.seed, outcome.arm
+        if checkpoint.condition_id not in _FROZEN_CONDITIONS:
+            raise ValueError("random checkpoint outcomes cannot enter primary replay")
+        key = outcome.item_id, outcome.checkpoint_sha256
         if key in observed_keys:
             raise ValueError("outcomes.jsonl contains a duplicate evaluation cell")
         observed_keys.add(key)
+        gold = gold_map[item.item_id]
+        scored_outcomes.append(
+            score_item_outcome(
+                outcome=outcome,
+                item=item,
+                checkpoint=checkpoint,
+                gold=gold,
+                store=store_map[item.store_id],
+            )
+        )
 
     expected_keys = {
-        (item.item_id, seed, arm)
-        for item in items
-        for seed in _FROZEN_SEEDS
-        for arm in _FROZEN_ARMS
+        (cell.item_id, cell.checkpoint_sha256)
+        for cell in lock.release.evaluation_cells
     }
     if not observed_keys <= expected_keys:
         raise ValueError("outcomes contain a cell outside the frozen registry")
@@ -616,7 +858,7 @@ def _replay_artifacts(
     recomputed_metrics = _recomputed_metrics(
         items=item_map,
         checkpoints=checkpoint_map,
-        outcomes=outcomes,
+        outcomes=scored_outcomes,
     )
     if _metrics_bytes(persisted_metrics) != content["metrics.json"]:
         raise ValueError("metrics artifact is not canonical")
@@ -635,17 +877,17 @@ def _replay_artifacts(
 
     complete = (
         observed_keys == expected_keys
-        and set((checkpoint.seed, checkpoint.arm) for checkpoint in checkpoints)
+        and set(
+            (checkpoint.seed, checkpoint.condition_id)
+            for checkpoint in checkpoints
+            if checkpoint.condition_id in _FROZEN_CONDITIONS
+        )
         == {
-            (seed, arm)
+            (seed, condition)
             for seed in _FROZEN_SEEDS
-            for arm in _FROZEN_ARMS
+            for condition in _FROZEN_CONDITIONS
         }
-        and all(outcome.complete for outcome in outcomes)
-    )
-    measured_failure = (
-        evidence.measured_validity_failure
-        or any(not outcome.valid for outcome in outcomes)
+        and readiness.complete
     )
     same_sign = bool(deltas) and (
         all(delta > 0.0 for delta in deltas)
@@ -653,7 +895,7 @@ def _replay_artifacts(
     )
     axes = classify_status(
         complete=complete,
-        valid=not measured_failure,
+        valid=readiness.valid,
         observed_seeds=len(deltas),
         required_seeds=5,
         sign_consistent=same_sign,
@@ -666,6 +908,8 @@ def _replay_artifacts(
         observed_cells=len(observed_keys),
         seed_deltas=deltas,
         exact_test_result=replayed_test,
+        study_lock_sha256=lock_sha256,
+        preregistration_sha256=lock.preregistration_sha256,
     )
 
 
@@ -674,7 +918,7 @@ def _artifact_bindings(
 ) -> dict[str, dict[str, str | int]]:
     if not isinstance(value, Mapping) or set(value) != set(REQUIRED_ARTIFACTS):
         raise ValueError("artifact set is not exact")
-    bindings = {}
+    bindings: dict[str, dict[str, str | int]] = {}
     for name in REQUIRED_ARTIFACTS:
         raw = _strict_fields(
             value[name],
@@ -695,6 +939,8 @@ def _artifact_bindings(
 def _report_payload(
     *,
     axes: StatusAxes,
+    study_lock_sha256: str,
+    preregistration_sha256: str,
     seed_deltas: Sequence[float],
     expected_cells: int,
     observed_cells: int,
@@ -705,6 +951,8 @@ def _report_payload(
         "schema_version": CONTRACT_VERSION,
         **axes.to_dict(),
         "practical_null_replay_status": PRACTICAL_NULL_REPLAY_STATUS,
+        "study_lock_sha256": study_lock_sha256,
+        "preregistration_sha256": preregistration_sha256,
         "paired_seed_bundle_deltas": list(seed_deltas),
         "expected_cells": expected_cells,
         "observed_cells": observed_cells,
@@ -722,6 +970,8 @@ class ArtifactReport:
     interim_evidence_label: InterimEvidenceLabel
     final_inference_conclusion: FinalInferenceConclusion
     practical_null_replay_status: str
+    study_lock_sha256: str
+    preregistration_sha256: str
     paired_seed_bundle_deltas: tuple[float, ...]
     expected_cells: int
     observed_cells: int
@@ -739,6 +989,16 @@ class ArtifactReport:
         )
         if self.practical_null_replay_status != PRACTICAL_NULL_REPLAY_STATUS:
             raise ValueError("practical-null replay status is invalid")
+        study_lock_sha256 = _hash(
+            self.study_lock_sha256,
+            "study_lock_sha256",
+        )
+        preregistration_sha256 = _hash(
+            self.preregistration_sha256,
+            "preregistration_sha256",
+        )
+        if preregistration_sha256 != FROZEN_PREREGISTRATION_SHA256:
+            raise ValueError("report preregistration commitment is invalid")
         if not isinstance(self.paired_seed_bundle_deltas, (list, tuple)):
             raise ValueError("report seed-bundle deltas must be ordered")
         seed_deltas = tuple(
@@ -759,6 +1019,8 @@ class ArtifactReport:
         bindings = _artifact_bindings(self.artifacts)
         payload = _report_payload(
             axes=axes,
+            study_lock_sha256=study_lock_sha256,
+            preregistration_sha256=preregistration_sha256,
             seed_deltas=seed_deltas,
             expected_cells=expected,
             observed_cells=observed,
@@ -811,6 +1073,8 @@ class ArtifactReport:
                     self.interim_evidence_label,
                     self.final_inference_conclusion,
                 ),
+                study_lock_sha256=self.study_lock_sha256,
+                preregistration_sha256=self.preregistration_sha256,
                 seed_deltas=self.paired_seed_bundle_deltas,
                 expected_cells=self.expected_cells,
                 observed_cells=self.observed_cells,
@@ -839,10 +1103,14 @@ def _artifact_bytes(
 def build_artifact_report(
     *,
     artifacts: Mapping[str, bytes],
+    expected_study_lock_sha256: str,
 ) -> ArtifactReport:
     content = _artifact_bytes(artifacts)
-    replay = _replay_artifacts(content)
-    bindings = {
+    replay = _replay_artifacts(
+        content,
+        expected_study_lock_sha256=expected_study_lock_sha256,
+    )
+    bindings: dict[str, dict[str, str | int]] = {
         name: {
             "sha256": hashlib.sha256(content[name]).hexdigest(),
             "size_bytes": len(content[name]),
@@ -851,6 +1119,8 @@ def build_artifact_report(
     }
     payload = _report_payload(
         axes=replay.axes,
+        study_lock_sha256=replay.study_lock_sha256,
+        preregistration_sha256=replay.preregistration_sha256,
         seed_deltas=replay.seed_deltas,
         expected_cells=replay.expected_cells,
         observed_cells=replay.observed_cells,
@@ -867,6 +1137,8 @@ def build_artifact_report(
 def validate_artifact_report(
     report: ArtifactReport | Mapping[str, Any],
     artifacts: Mapping[str, bytes],
+    *,
+    expected_study_lock_sha256: str,
 ) -> ArtifactReport:
     typed = (
         ArtifactReport.from_dict(report.to_dict())
@@ -880,7 +1152,10 @@ def validate_artifact_report(
             raise ValueError(f"artifact {name} size mismatch")
         if hashlib.sha256(content[name]).hexdigest() != binding["sha256"]:
             raise ValueError(f"artifact {name} hash mismatch")
-    replay = _replay_artifacts(content)
+    replay = _replay_artifacts(
+        content,
+        expected_study_lock_sha256=expected_study_lock_sha256,
+    )
     reported_axes = StatusAxes(
         typed.scientific_status,
         typed.interim_evidence_label,
@@ -895,6 +1170,11 @@ def validate_artifact_report(
         raise ValueError("artifact report counts disagree with bound evidence")
     if typed.paired_seed_bundle_deltas != replay.seed_deltas:
         raise ValueError("artifact report seed effects disagree with bound evidence")
+    if (
+        typed.study_lock_sha256 != replay.study_lock_sha256
+        or typed.preregistration_sha256 != replay.preregistration_sha256
+    ):
+        raise ValueError("artifact report trust commitments disagree")
     return typed
 
 
@@ -1001,10 +1281,16 @@ def publish_artifact_report(
     path: str | Path,
     report: ArtifactReport | Mapping[str, Any],
     artifacts: Mapping[str, bytes],
+    *,
+    expected_study_lock_sha256: str,
 ) -> Path:
     """Atomically publish a canonical report without replacing existing data."""
 
-    typed = validate_artifact_report(report, artifacts)
+    typed = validate_artifact_report(
+        report,
+        artifacts,
+        expected_study_lock_sha256=expected_study_lock_sha256,
+    )
     output = Path(path)
     directory_fd = _open_parent_directory(output)
     temporary_name: str | None = None

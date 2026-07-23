@@ -13,13 +13,21 @@ from typing import Any, ClassVar
 from evals.confirmatory.contracts import (
     Arm,
     CheckpointRecord,
+    ConditionId,
     CONTRACT_VERSION,
     Control,
     ItemRecord,
     MemoryMode,
     ReasoningFamily,
+    SealedGoldRecord,
+    StoreRecord,
     Stratum,
     Twin,
+)
+from evals.confirmatory.actions import ActionSlot, validate_action_slots
+from evals.confirmatory.solver import (
+    registered_solver,
+    verify_proof_and_answer,
 )
 
 
@@ -87,12 +95,11 @@ class ItemOutcome:
     world_id: str
     checkpoint_sha256: str
     arm: Arm
+    condition_id: ConditionId
     memory_mode: MemoryMode
     control: Control
-    proof_valid: bool
-    answer_valid: bool
-    complete: bool
-    valid: bool
+    submitted_answer: str
+    submitted_proof: tuple[ActionSlot, ...]
 
     FIELDS: ClassVar[frozenset[str]] = frozenset(
         {
@@ -107,12 +114,11 @@ class ItemOutcome:
             "world_id",
             "checkpoint_sha256",
             "arm",
+            "condition_id",
             "memory_mode",
             "control",
-            "proof_valid",
-            "answer_valid",
-            "complete",
-            "valid",
+            "submitted_answer",
+            "submitted_proof",
         }
     )
 
@@ -137,6 +143,11 @@ class ItemOutcome:
         object.__setattr__(self, "arm", _enum(self.arm, Arm, "arm"))
         object.__setattr__(
             self,
+            "condition_id",
+            _enum(self.condition_id, ConditionId, "condition_id"),
+        )
+        object.__setattr__(
+            self,
             "memory_mode",
             _enum(self.memory_mode, MemoryMode, "memory_mode"),
         )
@@ -152,9 +163,13 @@ class ItemOutcome:
             or _SHA256_RE.fullmatch(self.checkpoint_sha256) is None
         ):
             raise ValueError("checkpoint_sha256 must be a lowercase SHA-256")
-        for field in ("proof_valid", "answer_valid", "complete", "valid"):
-            if not isinstance(getattr(self, field), bool):
-                raise ValueError(f"{field} must be Boolean")
+        if not isinstance(self.submitted_answer, str):
+            raise ValueError("submitted_answer must be a string")
+        object.__setattr__(
+            self,
+            "submitted_proof",
+            validate_action_slots(self.submitted_proof),
+        )
 
     @classmethod
     def from_dict(cls, raw: Mapping[str, Any]) -> "ItemOutcome":
@@ -183,22 +198,65 @@ class ItemOutcome:
             "world_id": self.world_id,
             "checkpoint_sha256": self.checkpoint_sha256,
             "arm": self.arm.value,
+            "condition_id": self.condition_id.value,
             "memory_mode": self.memory_mode.value,
             "control": self.control.value,
-            "proof_valid": self.proof_valid,
-            "answer_valid": self.answer_valid,
-            "complete": self.complete,
-            "valid": self.valid,
+            "submitted_answer": self.submitted_answer,
+            "submitted_proof": [
+                action.to_dict() for action in self.submitted_proof
+            ],
         }
+
+
+@dataclass(frozen=True)
+class _ScoredItemOutcome:
+    submission: ItemOutcome
+    proof_valid: bool
+    answer_valid: bool
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.submission, ItemOutcome):
+            raise TypeError("scored outcome requires an ItemOutcome submission")
+        if not isinstance(self.proof_valid, bool) or not isinstance(
+            self.answer_valid,
+            bool,
+        ):
+            raise ValueError("derived outcome scores must be Boolean")
+
+    def __getattr__(self, name: str):
+        return getattr(self.submission, name)
 
     @property
     def verified_correct(self) -> bool:
-        return (
-            self.complete
-            and self.valid
-            and self.proof_valid
-            and self.answer_valid
-        )
+        return self.proof_valid and self.answer_valid
+
+
+def score_item_outcome(
+    *,
+    outcome: ItemOutcome,
+    item: ItemRecord,
+    checkpoint: CheckpointRecord,
+    gold: SealedGoldRecord,
+    store: StoreRecord,
+) -> _ScoredItemOutcome:
+    validate_item_outcome_binding(
+        outcome=outcome,
+        item=item,
+        checkpoint=checkpoint,
+    )
+    verification = verify_proof_and_answer(
+        item=item,
+        store=store,
+        gold=gold,
+        proof=outcome.submitted_proof,
+        answer=outcome.submitted_answer,
+        solver=registered_solver(gold.solver_id),
+    )
+    return _ScoredItemOutcome(
+        submission=outcome,
+        proof_valid=verification.proof_valid,
+        answer_valid=verification.answer_valid,
+    )
 
 
 def validate_item_outcome_binding(
@@ -228,7 +286,7 @@ def validate_item_outcome_binding(
     ):
         if getattr(outcome, field) != getattr(item, field):
             raise ValueError(f"outcome item binding mismatch: {field}")
-    for field in ("checkpoint_sha256", "seed", "arm"):
+    for field in ("checkpoint_sha256", "seed", "arm", "condition_id"):
         if getattr(outcome, field) != getattr(checkpoint, field):
             raise ValueError(f"outcome checkpoint binding mismatch: {field}")
     return outcome
@@ -284,6 +342,7 @@ class PairMetricSummary:
     by_family: Mapping[ReasoningFamily, Rate]
     checkpoint_sha256: str
     arm: Arm
+    condition_id: ConditionId
     memory_mode: MemoryMode
     control: Control
 
@@ -296,6 +355,7 @@ class PairMetricSummary:
             "by_family",
             "checkpoint_sha256",
             "arm",
+            "condition_id",
             "memory_mode",
             "control",
         }
@@ -314,6 +374,11 @@ class PairMetricSummary:
         ):
             raise ValueError("checkpoint_sha256 must be a lowercase SHA-256")
         object.__setattr__(self, "arm", _enum(self.arm, Arm, "arm"))
+        object.__setattr__(
+            self,
+            "condition_id",
+            _enum(self.condition_id, ConditionId, "condition_id"),
+        )
         object.__setattr__(
             self,
             "memory_mode",
@@ -427,6 +492,7 @@ class PairMetricSummary:
             by_family=by_family,
             checkpoint_sha256=value["checkpoint_sha256"],
             arm=value["arm"],
+            condition_id=value["condition_id"],
             memory_mode=value["memory_mode"],
             control=value["control"],
         )
@@ -450,6 +516,7 @@ class PairMetricSummary:
             },
             "checkpoint_sha256": self.checkpoint_sha256,
             "arm": self.arm.value,
+            "condition_id": self.condition_id.value,
             "memory_mode": self.memory_mode.value,
             "control": self.control.value,
         }
@@ -463,13 +530,14 @@ _PAIR_METADATA = (
     "world_id",
     "checkpoint_sha256",
     "arm",
+    "condition_id",
     "memory_mode",
     "control",
 )
 
 
 def balanced_counterfactual_pair_metric(
-    outcomes: Iterable[ItemOutcome],
+    outcomes: Iterable[_ScoredItemOutcome],
     *,
     items: Mapping[str, ItemRecord],
     checkpoints: Mapping[str, CheckpointRecord],
@@ -479,8 +547,8 @@ def balanced_counterfactual_pair_metric(
     rows = tuple(outcomes)
     if not rows:
         raise ValueError("counterfactual pair metric requires outcomes")
-    if any(not isinstance(row, ItemOutcome) for row in rows):
-        raise TypeError("pair metric outcomes must be ItemOutcome values")
+    if any(not isinstance(row, _ScoredItemOutcome) for row in rows):
+        raise TypeError("pair metric outcomes must be solver-scored values")
     if not isinstance(items, Mapping) or any(
         not isinstance(key, str)
         or not isinstance(value, ItemRecord)
@@ -505,19 +573,16 @@ def balanced_counterfactual_pair_metric(
         raise ValueError("metric checkpoint bindings are not exact")
     for row in rows:
         validate_item_outcome_binding(
-            outcome=row,
+            outcome=row.submission,
             item=items[row.item_id],
             checkpoint=checkpoints[row.checkpoint_sha256],
         )
-    if any(not row.complete for row in rows):
-        raise ValueError("pair metric cannot consume incomplete outcomes")
-    if any(not row.valid for row in rows):
-        raise ValueError("pair metric cannot consume invalid outcomes")
 
     cell_values = {
         (
             row.checkpoint_sha256,
             row.arm,
+            row.condition_id,
             row.memory_mode,
             row.control,
         )
@@ -525,12 +590,14 @@ def balanced_counterfactual_pair_metric(
     }
     if len(cell_values) != 1:
         raise ValueError("pair metric requires one explicit evaluation cell")
-    checkpoint, arm, memory_mode, control = next(iter(cell_values))
+    checkpoint, arm, condition_id, memory_mode, control = next(
+        iter(cell_values)
+    )
 
     seen_items: set[str] = set()
     grouped: dict[
         tuple[int, str, str],
-        dict[Twin, ItemOutcome],
+        dict[Twin, _ScoredItemOutcome],
     ] = defaultdict(dict)
     for row in rows:
         if row.item_id in seen_items:
@@ -609,6 +676,7 @@ def balanced_counterfactual_pair_metric(
         by_family=family_rates,
         checkpoint_sha256=checkpoint,
         arm=arm,
+        condition_id=condition_id,
         memory_mode=memory_mode,
         control=control,
     )

@@ -8,6 +8,7 @@ from evals.confirmatory import contracts as contracts_module
 from evals.confirmatory.contracts import Arm, Control, MemoryMode, Stratum, Twin
 from evals.confirmatory.metrics import (
     ItemOutcome,
+    _ScoredItemOutcome,
     balanced_counterfactual_pair_metric,
 )
 from evals.confirmatory import metrics as metrics_module
@@ -21,7 +22,7 @@ def _pair(
     *,
     original: bool = True,
     counterfactual: bool = True,
-) -> list[ItemOutcome]:
+) -> list[_ScoredItemOutcome]:
     common = {
         "pair_id": f"{family}-{stratum}-pair-{index}",
         "family": family,
@@ -30,25 +31,41 @@ def _pair(
         "world_id": f"{family}-{stratum}-world-{index // 2}",
         "checkpoint_sha256": "a" * 64,
         "arm": Arm.SPLIT,
+        "condition_id": "split90",
         "memory_mode": MemoryMode.MEMORY_ON,
         "control": Control.CORRECT,
-        "complete": True,
-        "valid": True,
     }
+    proof = [
+        {
+            "source_slot": None,
+            "relation_id": None,
+            "direction": None,
+            "op": "noop",
+        }
+        for _ in range(12)
+    ]
     return [
-        ItemOutcome(
-            item_id=f"{common['pair_id']}-original",
-            twin=Twin.ORIGINAL,
+        _ScoredItemOutcome(
+            submission=ItemOutcome(
+                item_id=f"{common['pair_id']}-original",
+                twin=Twin.ORIGINAL,
+                submitted_answer="fixture",
+                submitted_proof=proof,
+                **common,
+            ),
             proof_valid=original,
             answer_valid=original,
-            **common,
         ),
-        ItemOutcome(
-            item_id=f"{common['pair_id']}-counterfactual",
-            twin=Twin.COUNTERFACTUAL,
+        _ScoredItemOutcome(
+            submission=ItemOutcome(
+                item_id=f"{common['pair_id']}-counterfactual",
+                twin=Twin.COUNTERFACTUAL,
+                submitted_answer="fixture",
+                submitted_proof=proof,
+                **common,
+            ),
             proof_valid=counterfactual,
             answer_valid=counterfactual,
-            **common,
         ),
     ]
 
@@ -93,9 +110,11 @@ def _records(rows):
                     "checkpoint_sha256": row.checkpoint_sha256,
                     "model_id": "fixture-model",
                     "arm": row.arm.value,
+                    "condition_id": row.condition_id.value,
                     "seed": row.seed,
                     "raw_token_count": 1,
                     "configuration_sha256": "b" * 64,
+                    "route_dose_sha256": "e" * 64,
                     "corpus_sha256": "c" * 64,
                     "code_sha256": "d" * 64,
                 }
@@ -157,7 +176,7 @@ def test_primary_metric_equal_weights_only_four_family_ood_cells():
     assert result.control is Control.CORRECT
 
 
-def test_pair_metric_rejects_missing_duplicate_crossed_or_incomplete_twins():
+def test_pair_metric_rejects_missing_duplicate_crossed_or_unscored_twins():
     complete = [
         row
         for family in ("graph", "non_path")
@@ -171,14 +190,19 @@ def test_pair_metric_rejects_missing_duplicate_crossed_or_incomplete_twins():
         _metric([*complete, complete[0]])
 
     crossed = list(complete)
-    crossed[1] = replace(crossed[1], family="non_path")
+    crossed[1] = replace(
+        crossed[1],
+        submission=replace(crossed[1].submission, family="non_path"),
+    )
     with pytest.raises(ValueError, match="metadata"):
         _metric(crossed)
 
-    incomplete = list(complete)
-    incomplete[0] = replace(incomplete[0], complete=False)
-    with pytest.raises(ValueError, match="incomplete"):
-        _metric(incomplete)
+    with pytest.raises(TypeError, match="solver-scored"):
+        balanced_counterfactual_pair_metric(
+            [row.submission for row in complete],
+            items=_records(complete)[0],
+            checkpoints=_records(complete)[1],
+        )
 
 
 def test_pair_metric_requires_four_primary_cells_but_not_iid_or_length():
@@ -206,13 +230,19 @@ def test_pair_metric_requires_four_primary_cells_but_not_iid_or_length():
     with pytest.raises(ValueError, match="primary"):
         _metric(missing)
 
-    rows[-1] = replace(rows[-1], memory_mode=MemoryMode.MEMORY_OFF)
+    rows[-1] = replace(
+        rows[-1],
+        submission=replace(
+            rows[-1].submission,
+            memory_mode=MemoryMode.MEMORY_OFF,
+        ),
+    )
     with pytest.raises(ValueError, match="cell"):
         _metric(rows)
 
 
 def test_outcome_binding_authenticates_item_and_checkpoint_identity():
-    outcome = _pair("graph", "composition_ood", 0)[0]
+    outcome = _pair("graph", "composition_ood", 0)[0].submission
     items, checkpoints = _records([outcome])
     item = items[outcome.item_id]
     checkpoint = checkpoints[outcome.checkpoint_sha256]
@@ -242,7 +272,12 @@ def test_outcome_binding_authenticates_item_and_checkpoint_identity():
                 checkpoint=checkpoint,
             )
 
-    seed_two_dense = replace(outcome, seed=1002, arm=Arm.DENSE)
+    seed_two_dense = replace(
+        outcome,
+        seed=1002,
+        arm=Arm.DENSE,
+        condition_id="dense",
+    )
     with pytest.raises(ValueError, match="checkpoint binding"):
         metrics_module.validate_item_outcome_binding(
             outcome=seed_two_dense,
@@ -259,7 +294,15 @@ def test_metric_validation_rejects_cross_checkpoint_attribution():
         for row in _pair(family, stratum, 0)
     ]
     items, checkpoints = _records(rows)
-    rows[0] = replace(rows[0], seed=1002, arm=Arm.DENSE)
+    rows[0] = replace(
+        rows[0],
+        submission=replace(
+            rows[0].submission,
+            seed=1002,
+            arm=Arm.DENSE,
+            condition_id="dense",
+        ),
+    )
 
     with pytest.raises(ValueError, match="checkpoint binding"):
         balanced_counterfactual_pair_metric(
