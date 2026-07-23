@@ -96,6 +96,23 @@ def test_target_weights_shape_must_match_targets():
         model(x, targets, target_weights=torch.ones(8))
 
 
+@pytest.mark.parametrize("weighted", [False, True])
+@pytest.mark.parametrize("reduction", ["none", "invalid", "", None])
+def test_loss_reduction_rejects_values_other_than_mean_or_sum(weighted, reduction):
+    model = tiny()
+    x = torch.randint(0, 100, (1, 8))
+    targets = torch.randint(0, 100, (1, 8))
+    weights = torch.ones_like(targets, dtype=torch.float32) if weighted else None
+
+    with pytest.raises(ValueError, match="loss_reduction"):
+        model(
+            x,
+            targets,
+            target_weights=weights,
+            loss_reduction=reduction,
+        )
+
+
 def test_kv_cache_matches_full_forward():
     torch.manual_seed(1)
     m = tiny().eval()

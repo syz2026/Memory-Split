@@ -1,7 +1,8 @@
 """Minimal decoder-only GPT: RMSNorm pre-norm, RoPE, SwiGLU, untied embeddings.
 
 Two entry points (contract shared with evals/):
-    forward(idx, targets=None, target_weights=None) -> (logits, loss | None)
+    forward(idx, targets=None, target_weights=None, loss_reduction="mean")
+                                                    -> (logits, loss | None)
     forward_step(idx, cache)                       -> (logits, cache)
 """
 
@@ -173,6 +174,7 @@ class GPT(nn.Module):
         idx: torch.Tensor,
         targets: torch.Tensor | None = None,
         target_weights: torch.Tensor | None = None,
+        loss_reduction: str = "mean",
     ):
         B, T = idx.shape
         assert T <= self.cfg.ctx, f"sequence length {T} > ctx {self.cfg.ctx}"
@@ -184,11 +186,14 @@ class GPT(nn.Module):
         logits = self.lm_head(x)
         loss = None
         if targets is not None:
+            if loss_reduction not in {"mean", "sum"}:
+                raise ValueError("loss_reduction must be 'mean' or 'sum'")
             if target_weights is None:
                 loss = F.cross_entropy(
                     logits.float().view(-1, logits.size(-1)),
                     targets.view(-1),
                     ignore_index=-100,
+                    reduction=loss_reduction,
                 )
             else:
                 if target_weights.shape != targets.shape:
@@ -204,7 +209,9 @@ class GPT(nn.Module):
                     target_weights,
                     torch.zeros_like(target_weights),
                 )
-                loss = (per_token * valid_weights).sum() / targets.numel()
+                loss = (per_token * valid_weights).sum()
+                if loss_reduction == "mean":
+                    loss = loss / targets.numel()
         return logits, loss
 
     @torch.no_grad()

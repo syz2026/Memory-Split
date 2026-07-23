@@ -1,6 +1,11 @@
+import hashlib
+import os
+
 import numpy as np
+import pytest
 import torch
 
+import train.data as data_module
 from train.data import PackedShards
 
 
@@ -33,6 +38,162 @@ def test_batch_alignment_and_mask(tmp_path):
                 assert y[row, t] == x[row, t + 1]
     # first row starts at token 0, so y[0,0] is token 1
     assert y[0, 0] == 1
+
+
+def test_batches_cover_each_global_causal_target_once_in_order(tmp_path):
+    bp, _ = make_shards(tmp_path, n=100, masked_span=(100, 100))
+    ds = PackedShards(bp, None, ctx=4, batch_size=2, device="cpu")
+
+    first_targets = ds.next_batch()[1].flatten()
+    second_targets = ds.next_batch()[1].flatten()
+
+    assert torch.equal(first_targets, torch.arange(1, 9))
+    assert torch.equal(second_targets, torch.arange(9, 17))
+
+
+def test_corpus_exactly_one_batch_window_is_accepted(tmp_path):
+    bp, _ = make_shards(tmp_path, n=9, masked_span=(9, 9))
+    shard = PackedShards(bp, None, ctx=4, batch_size=2)
+
+    _, targets = shard.next_batch()
+
+    assert torch.equal(targets.flatten(), torch.arange(1, 9))
+
+
+def test_unbound_multiple_files_are_rejected(tmp_path):
+    token_paths = []
+    weight_paths = []
+    for shard_index, (start, stop) in enumerate(((0, 9), (9, 18))):
+        token_path = tmp_path / f"tokens-{shard_index}.bin"
+        weight_path = tmp_path / f"weights-{shard_index}.bin"
+        np.arange(start, stop, dtype=np.uint16).tofile(token_path)
+        np.arange(start, stop, dtype=np.uint8).tofile(weight_path)
+        token_paths.append(token_path)
+        weight_paths.append(weight_path)
+
+    with pytest.raises(ValueError, match="verified parallel corpus"):
+        PackedShards(
+            token_paths,
+            None,
+            ctx=4,
+            batch_size=2,
+            weights_path=weight_paths,
+        )
+
+
+def test_wrap_continues_through_final_target_without_skip_or_duplicate(tmp_path):
+    bp, _ = make_shards(tmp_path, n=17, masked_span=(17, 17))
+    ds = PackedShards(bp, None, ctx=4, batch_size=2, device="cpu")
+
+    observed = [ds.next_batch()[1].flatten() for _ in range(3)]
+
+    assert torch.equal(observed[0], torch.arange(1, 9))
+    assert torch.equal(observed[1], torch.arange(9, 17))
+    assert torch.equal(observed[2], torch.arange(0, 8))
+    assert ds.epoch == 1
+    assert ds.cursor == 7
+
+
+def test_validated_update_cursor_advances_only_by_exact_global_quota(tmp_path):
+    bp, _ = make_shards(tmp_path, n=64, masked_span=(64, 64))
+    ds = PackedShards(bp, None, ctx=4, batch_size=2)
+    ds.validate_update_alignment(8)
+
+    with pytest.raises(ValueError, match="exactly"):
+        ds.advance(4)
+
+    ds.advance(8)
+    assert ds.global_cursor == 8
+
+
+def test_cursor_state_rejects_different_shard_provenance(tmp_path):
+    first_path = tmp_path / "first.bin"
+    second_path = tmp_path / "second.bin"
+    np.arange(100, dtype=np.uint16).tofile(first_path)
+    np.arange(99, -1, -1, dtype=np.uint16).tofile(second_path)
+    first = PackedShards(first_path, None, ctx=4, batch_size=2)
+    first.next_batch()
+
+    second = PackedShards(second_path, None, ctx=4, batch_size=2)
+    with pytest.raises(ValueError, match="provenance"):
+        second.load_state_dict(first.state_dict())
+
+
+def test_cursor_state_rejects_same_path_rewritten_in_place(tmp_path):
+    token_path = tmp_path / "tokens.bin"
+    np.arange(100, dtype=np.uint16).tofile(token_path)
+    original = PackedShards(token_path, None, ctx=4, batch_size=2)
+    state = original.state_dict()
+
+    np.arange(99, -1, -1, dtype=np.uint16).tofile(token_path)
+    rewritten = PackedShards(token_path, None, ctx=4, batch_size=2)
+
+    with pytest.raises(ValueError, match="provenance"):
+        rewritten.load_state_dict(state)
+
+
+def test_legacy_loader_hashes_and_maps_the_same_pinned_descriptor(
+    tmp_path,
+    monkeypatch,
+):
+    token_path = tmp_path / "tokens.bin"
+    replacement = tmp_path / "replacement.bin"
+    original = np.arange(64, dtype=np.uint16)
+    malicious = np.arange(63, -1, -1, dtype=np.uint16)
+    original.tofile(token_path)
+    malicious.tofile(replacement)
+    original_hash = hashlib.sha256(original.tobytes()).hexdigest()
+    real_hash = data_module._sha256_fd
+    swapped = False
+
+    def replace_during_hash(fd):
+        nonlocal swapped
+        if not swapped:
+            os.replace(replacement, token_path)
+            swapped = True
+        return real_hash(fd)
+
+    monkeypatch.setattr(data_module, "_sha256_fd", replace_during_hash)
+    shard = PackedShards(token_path, None, ctx=4, batch_size=2)
+    _, targets = shard.next_batch()
+
+    assert shard.provenance["tokens"]["sha256"] == original_hash
+    assert torch.equal(targets.flatten(), torch.arange(1, 9))
+    assert shard._open_files
+    assert all(not pinned.handle.closed for pinned in shard._open_files)
+
+
+def test_legacy_loader_rejects_symlinked_parent_component(tmp_path):
+    real = tmp_path / "real"
+    real.mkdir()
+    token_path = real / "tokens.bin"
+    np.arange(64, dtype=np.uint16).tofile(token_path)
+    linked_parent = tmp_path / "linked"
+    linked_parent.symlink_to(real, target_is_directory=True)
+
+    with pytest.raises(ValueError, match="symlink|unsafe"):
+        PackedShards(linked_parent / "tokens.bin", None, ctx=4, batch_size=2)
+
+
+def test_cursor_state_rejects_incompatible_state_version(tmp_path):
+    bp, _ = make_shards(tmp_path)
+    shard = PackedShards(bp, None, ctx=4, batch_size=2)
+    state = shard.state_dict()
+    state["format_version"] = 999
+
+    with pytest.raises(ValueError, match="version"):
+        shard.load_state_dict(state)
+
+
+def test_unverified_multiple_shards_fail_closed(tmp_path):
+    token_paths = []
+    for index, length in enumerate((9, 16)):
+        path = tmp_path / f"tokens-{index}.bin"
+        np.arange(length, dtype=np.uint16).tofile(path)
+        token_paths.append(path)
+
+    with pytest.raises(ValueError, match="verified parallel corpus"):
+        PackedShards(token_paths, None, ctx=4, batch_size=2)
 
 
 def test_masked_positions_become_ignore_index(tmp_path):
@@ -68,7 +229,7 @@ def test_weighted_batch_aligns_weights_to_next_token(tmp_path):
     )
     _, _, weights = ds.next_weighted_batch()
     expected = torch.from_numpy(
-        raw_weights[:10].reshape(2, 5)[:, 1:].astype(np.float32)
+        raw_weights[1:9].reshape(2, 4).astype(np.float32)
     )
     assert weights.dtype == torch.float32
     assert torch.equal(weights, expected)
@@ -91,14 +252,14 @@ def test_nonzero_cursor_sidecar_alignment_uses_the_same_token_window(tmp_path):
     x, _, weights = ds.next_weighted_batch()
 
     token_window = np.memmap(bp, dtype=np.uint16, mode="r")[
-        start_cursor : start_cursor + 10
-    ].reshape(2, 5)
+        start_cursor : start_cursor + 9
+    ]
     expected_x = torch.from_numpy(
-        np.asarray(token_window[:, :-1], dtype=np.int64).copy()
+        np.asarray(token_window[:-1].reshape(2, 4), dtype=np.int64).copy()
     )
     expected_weights = torch.from_numpy(
-        raw_weights[start_cursor : start_cursor + 10]
-        .reshape(2, 5)[:, 1:]
+        raw_weights[start_cursor + 1 : start_cursor + 9]
+        .reshape(2, 4)
         .astype(np.float32)
     )
     assert torch.equal(x, expected_x)
@@ -155,7 +316,9 @@ def test_weighted_batch_wraps_sidecar_with_token_cursor(tmp_path):
     )
     _, _, weights = ds.next_weighted_batch()
     expected = torch.from_numpy(
-        raw_weights[:18].reshape(2, 9)[:, 1:].astype(np.float32)
+        np.concatenate((raw_weights[41:], raw_weights[:7]))
+        .reshape(2, 8)
+        .astype(np.float32)
     )
     assert ds.epoch == 1
     assert torch.equal(weights, expected)
