@@ -1,6 +1,7 @@
 import json
 
 import numpy as np
+import torch
 
 from train.trainer import Trainer, cosine_lr
 
@@ -69,6 +70,36 @@ def test_checkpoint_resume_exact_batches(tmp_path):
     xb, _ = b.data.next_batch()
     xa, _ = a.data.next_batch()
     assert (xa == xb).all()
+
+
+def test_receipt_v2_training_uses_direct_weights_over_raw_targets(tmp_path):
+    bp, mp = write_corpus(tmp_path, mask_frac=0.4)
+    cfg = base_cfg(tmp_path, bp, mp)
+    cfg["max_steps"] = 1
+    cfg["tokens_per_step"] = 2 * cfg["micro_batch_size"] * cfg["model"]["ctx"]
+    cfg["log_every"] = 1
+    cfg["dataset"] = {"contract_id": "memorysplit-parallel-corpus-v2"}
+    trainer = Trainer(cfg)
+    assert trainer.direct_target_weights is True
+
+    state = trainer.data.state_dict()
+    numerator = 0.0
+    with torch.no_grad():
+        for _ in range(trainer.accum):
+            x, y, weights = trainer.data.next_weighted_batch()
+            _, loss_sum = trainer.model(
+                x,
+                y,
+                target_weights=weights,
+                loss_reduction="sum",
+            )
+            numerator += loss_sum.item()
+    expected = numerator / cfg["tokens_per_step"]
+    trainer.data.load_state_dict(state)
+
+    trainer.train_steps()
+    row = json.loads(trainer.log_path.read_text().splitlines()[0])
+    assert row["loss"] == round(expected, 4)
 
 
 def test_cosine_schedule():

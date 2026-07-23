@@ -1,5 +1,7 @@
-"""Training loop: AdamW + cosine, bf16 autocast (CUDA), grad accumulation,
-atomic checkpoint/resume (model+opt+data cursor+RNG), model-only snapshots,
+"""Training loop with exact cyclic targets and receipt-v2 direct weights.
+
+Uses AdamW + cosine, bf16 autocast (CUDA), gradient accumulation, atomic
+checkpoint/resume (model+optimizer+data cursor+RNG), model-only snapshots, and
 JSONL logging including the split-arm mechanism metric `loss_masked_values`.
 """
 
@@ -15,6 +17,9 @@ import torch
 
 from train.data import PackedShards
 from train.model import GPT, GPTConfig, PRESETS
+
+
+PARALLEL_CORPUS_V2 = "memorysplit-parallel-corpus-v2"
 
 
 def pick_device(requested: str = "auto") -> str:
@@ -58,7 +63,22 @@ class Trainer:
             self.model = torch.compile(self.model)
 
         self.micro_bs = cfg["micro_batch_size"]
-        self.accum = max(1, cfg["tokens_per_step"] // (self.micro_bs * model_cfg.ctx))
+        micro_targets = self.micro_bs * model_cfg.ctx
+        self.accum = max(1, cfg["tokens_per_step"] // micro_targets)
+        dataset = cfg.get("dataset")
+        self.direct_target_weights = (
+            isinstance(dataset, dict)
+            and dataset.get("contract_id") == PARALLEL_CORPUS_V2
+        )
+        if self.direct_target_weights and (
+            cfg.get("train_mask") is None
+            or cfg["tokens_per_step"] % micro_targets
+            or self.accum * micro_targets != cfg["tokens_per_step"]
+        ):
+            raise ValueError(
+                "receipt-v2 training requires target weights and an integral "
+                "microbatch partition"
+            )
         self.data = PackedShards(
             cfg["train_bin"],
             cfg.get("train_mask"),
@@ -206,17 +226,33 @@ class Trainer:
                 group["lr"] = lr
             self.opt.zero_grad(set_to_none=True)
             micro_losses = []
-            for _ in range(self.accum):
-                x, y = self.data.next_batch()
-                with self._autocast():
-                    _, loss = self.model(x, y)
-                (loss / self.accum).backward()
-                micro_losses.append(loss.item())
-                tokens_seen += x.numel()
+            if self.direct_target_weights:
+                denominator = self.accum * self.micro_bs * self.data.ctx
+                for _ in range(self.accum):
+                    x, y, weights = self.data.next_weighted_batch()
+                    with self._autocast():
+                        _, loss_sum = self.model(
+                            x,
+                            y,
+                            target_weights=weights,
+                            loss_reduction="sum",
+                        )
+                    (loss_sum / denominator).backward()
+                    micro_losses.append(loss_sum.item())
+                    tokens_seen += x.numel()
+                step_loss = sum(micro_losses) / denominator
+            else:
+                for _ in range(self.accum):
+                    x, y = self.data.next_batch()
+                    with self._autocast():
+                        _, loss = self.model(x, y)
+                    (loss / self.accum).backward()
+                    micro_losses.append(loss.item())
+                    tokens_seen += x.numel()
+                step_loss = sum(micro_losses) / len(micro_losses)
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
             self.opt.step()
             self.step += 1
-            step_loss = sum(micro_losses) / len(micro_losses)
             running = step_loss if running is None else 0.95 * running + 0.05 * step_loss
 
             if self.step % self.log_every == 0 or self.step == target:

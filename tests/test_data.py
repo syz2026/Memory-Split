@@ -1,4 +1,5 @@
 import numpy as np
+import pytest
 import torch
 
 from train.data import PackedShards
@@ -26,6 +27,9 @@ def test_batch_alignment_and_mask(tmp_path):
                 assert y[row, t] == x[row, t + 1]
     # first row starts at token 0, so y[0,0] is token 1
     assert y[0, 0] == 1
+    # Adjacent rows share exactly one boundary token; no causal target is skipped.
+    assert x[1, 0] == 32
+    assert y[0, -1] == x[1, 0]
 
 
 def test_masked_positions_become_ignore_index(tmp_path):
@@ -33,6 +37,19 @@ def test_masked_positions_become_ignore_index(tmp_path):
     ds = PackedShards(bp, mp, ctx=64, batch_size=1, device="cpu")
     _, y = ds.next_batch()
     assert (y == -100).sum() > 0
+
+
+def test_weighted_batch_keeps_targets_and_aligns_direct_weights(tmp_path):
+    bp, mp = make_shards(tmp_path, n=128, masked_span=(10, 20))
+    ds = PackedShards(bp, mp, ctx=16, batch_size=2, device="cpu")
+    x, y, weights = ds.next_weighted_batch()
+
+    assert x.shape == y.shape == weights.shape == (2, 16)
+    assert (y == -100).sum() == 0
+    assert torch.equal(y.flatten(), torch.arange(1, 33))
+    assert torch.equal(weights.flatten(), torch.tensor(
+        [0.0 if 10 <= index < 20 else 1.0 for index in range(1, 33)]
+    ))
 
 
 def test_cursor_resume_exact(tmp_path):
@@ -54,6 +71,42 @@ def test_wraparound_epoch(tmp_path):
     for _ in range(20):
         ds.next_batch()
     assert ds.epoch >= 1
+
+
+def test_one_epoch_consumes_every_cyclic_target_once_in_order(tmp_path):
+    bp, mp = make_shards(tmp_path, n=192, masked_span=(0, 0))
+    ds = PackedShards(bp, mp, ctx=16, batch_size=3, device="cpu")
+    targets = []
+    for _ in range(4):
+        _, y = ds.next_batch()
+        targets.extend(y.flatten().tolist())
+
+    assert targets == [*range(1, 192), 0]
+    assert ds.state_dict() == {"cursor": 192, "epoch": 1}
+
+
+def test_sidecar_alignment_wraps_with_the_final_causal_target(tmp_path):
+    bp, mp = make_shards(tmp_path, n=64, masked_span=(0, 1))
+    ds = PackedShards(bp, mp, ctx=16, batch_size=2, device="cpu")
+    first_targets = []
+    for _ in range(2):
+        _, y = ds.next_batch()
+        first_targets.extend(y.flatten().tolist())
+
+    assert first_targets[:-1] == list(range(1, 64))
+    assert first_targets[-1] == -100
+
+
+def test_explicit_missing_or_symlinked_sidecar_is_rejected(tmp_path):
+    bp, mp = make_shards(tmp_path)
+    missing = tmp_path / "missing.bin"
+    with pytest.raises(ValueError, match="target-weight"):
+        PackedShards(bp, missing, ctx=16, batch_size=2)
+
+    link = tmp_path / "weights-link.bin"
+    link.symlink_to(mp)
+    with pytest.raises(ValueError, match="target-weight"):
+        PackedShards(bp, link, ctx=16, batch_size=2)
 
 
 def test_masked_value_probe(tmp_path):

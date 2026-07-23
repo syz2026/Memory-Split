@@ -38,6 +38,9 @@ COMMON_FILES = frozenset(
     {
         "DATASET-POINTER-SLURM-135M.json",
         "cluster/__init__.py",
+        "cluster/aws/__init__.py",
+        "cluster/aws/p5/__init__.py",
+        "cluster/aws/p5/corpus_contract.py",
         "cluster/corpus_contract.py",
         "cluster/mit/__init__.py",
         "cluster/mit/probe_cluster.py",
@@ -51,6 +54,7 @@ COMMON_FILES = frozenset(
         "configs/reasoning-dataset-v2.json",
         "docs/SLURM-135M-RUNBOOK.md",
         "requirements.txt",
+        "scripts/bridge_135m_dataset.py",
         "scripts/build_135m_preflight.py",
         "scripts/check_135m_pair_resume.py",
         "scripts/evaluate_135m_pair.py",

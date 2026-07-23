@@ -1,12 +1,13 @@
-"""Packed-sequence dataloader over uint16 token shards + uint8 loss-mask shards.
+"""Packed-sequence dataloader over uint16 tokens and uint8 target weights.
 
 The corpus builder writes, per arm, a flat stream of token ids (uint16) and
-a parallel loss mask (uint8, 1 = loss ON). Batches are contiguous windows;
-the target at position t is token t+1, and its label is -100 wherever the
-NEXT token's mask is 0 (fact values in the split arm).
+a parallel binary sidecar. Legacy callers receive ``-100`` labels at zero
+weights; receipt-v2 callers consume the same bytes as direct target weights.
+Batches read ``batch_size * ctx + 1`` cyclic tokens and overlap adjacent rows
+at one boundary token, so every causal target occurs once and in order.
 
-The cursor is a single integer (token offset), saved into checkpoints so a
-resumed run continues on the exact next batch.
+The cursor is a monotonic target offset saved into checkpoints, so a resumed
+run continues on the exact next batch.
 """
 
 from __future__ import annotations
@@ -28,39 +29,76 @@ class PackedShards:
         start_cursor: int = 0,
         seed: int = 0,
     ):
-        self.tokens = np.memmap(bin_path, dtype=np.uint16, mode="r")
-        if mask_path is not None and Path(mask_path).exists():
-            self.mask = np.memmap(mask_path, dtype=np.uint8, mode="r")
-            assert len(self.mask) == len(self.tokens), "mask/token length mismatch"
+        del seed
+        token_path = Path(bin_path)
+        if not token_path.is_file() or token_path.is_symlink():
+            raise ValueError("token stream is missing, symlinked, or unsafe")
+        self.tokens = np.memmap(token_path, dtype=np.uint16, mode="r")
+        if mask_path is not None:
+            target_mask_path = Path(mask_path)
+            if not target_mask_path.is_file() or target_mask_path.is_symlink():
+                raise ValueError("target-weight stream is missing, symlinked, or unsafe")
+            self.mask = np.memmap(target_mask_path, dtype=np.uint8, mode="r")
+            if len(self.mask) != len(self.tokens):
+                raise ValueError("mask/token length mismatch")
         else:
             self.mask = None
+        if (
+            isinstance(ctx, bool)
+            or not isinstance(ctx, int)
+            or ctx <= 0
+            or isinstance(batch_size, bool)
+            or not isinstance(batch_size, int)
+            or batch_size <= 0
+        ):
+            raise ValueError("ctx and batch_size must be positive integers")
+        if (
+            isinstance(start_cursor, bool)
+            or not isinstance(start_cursor, int)
+            or start_cursor < 0
+        ):
+            raise ValueError("start_cursor must be a non-negative integer")
         self.ctx = ctx
         self.batch_size = batch_size
         self.device = device
         self.cursor = start_cursor
         self.n_tokens = len(self.tokens)
-        self.epoch = 0
-        span = self.batch_size * (self.ctx + 1)
-        assert self.n_tokens > span, "corpus smaller than one batch"
+        self.epoch = start_cursor // self.n_tokens if self.n_tokens else 0
+        target_count = self.batch_size * self.ctx
+        if self.n_tokens < target_count:
+            raise ValueError("corpus smaller than one batch")
 
     def _window(self, start: int, length: int) -> tuple[np.ndarray, np.ndarray | None]:
-        toks = np.asarray(self.tokens[start : start + length])
-        msk = np.asarray(self.mask[start : start + length]) if self.mask is not None else None
-        return toks, msk
+        def read(stream: np.memmap) -> np.ndarray:
+            result = np.empty(length, dtype=stream.dtype)
+            position = start % self.n_tokens
+            written = 0
+            while written < length:
+                take = min(length - written, self.n_tokens - position)
+                result[written : written + take] = stream[position : position + take]
+                written += take
+                position = (position + take) % self.n_tokens
+            return result
+
+        return read(self.tokens), read(self.mask) if self.mask is not None else None
+
+    def _next_arrays(self) -> tuple[np.ndarray, np.ndarray, np.ndarray | None]:
+        target_count = self.batch_size * self.ctx
+        toks, msk = self._window(self.cursor, target_count + 1)
+        self.cursor += target_count
+        self.epoch = self.cursor // self.n_tokens
+        shape = (self.batch_size, self.ctx)
+        x = toks[:-1].astype(np.int64).reshape(shape)
+        y = toks[1:].astype(np.int64).reshape(shape)
+        weights = msk[1:].reshape(shape) if msk is not None else None
+        return x, y, weights
 
     def next_batch(self) -> tuple[torch.Tensor, torch.Tensor]:
-        span = self.batch_size * (self.ctx + 1)
-        if self.cursor + span >= self.n_tokens:
-            self.cursor = 0
-            self.epoch += 1
-        toks, msk = self._window(self.cursor, span)
-        self.cursor += self.batch_size * self.ctx  # overlap of 1 keeps every target trained
-        toks = toks.astype(np.int64).reshape(self.batch_size, self.ctx + 1)
-        x = torch.from_numpy(toks[:, :-1].copy())
-        y = torch.from_numpy(toks[:, 1:].copy())
-        if msk is not None:
-            m = msk.reshape(self.batch_size, self.ctx + 1)[:, 1:]
-            y[torch.from_numpy((m == 0).copy())] = -100
+        x_values, y_values, weights = self._next_arrays()
+        x = torch.from_numpy(x_values.copy())
+        y = torch.from_numpy(y_values.copy())
+        if weights is not None:
+            y[torch.from_numpy((weights == 0).copy())] = -100
         if self.device == "cuda":
             x = x.pin_memory().to(self.device, non_blocking=True)
             y = y.pin_memory().to(self.device, non_blocking=True)
@@ -68,6 +106,35 @@ class PackedShards:
             x = x.to(self.device)
             y = y.to(self.device)
         return x, y
+
+    def next_weighted_batch(
+        self,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Return causal targets plus direct per-target objective weights."""
+
+        x_values, y_values, weights = self._next_arrays()
+        x = torch.from_numpy(x_values.copy())
+        y = torch.from_numpy(y_values.copy())
+        if weights is not None and np.any((weights != 0) & (weights != 1)):
+            raise ValueError("target-weight stream contains non-binary values")
+        weight_values = (
+            np.ones_like(y_values, dtype=np.float32)
+            if weights is None
+            else weights.astype(np.float32)
+        )
+        target_weights = torch.from_numpy(weight_values.copy())
+        if self.device == "cuda":
+            x = x.pin_memory().to(self.device, non_blocking=True)
+            y = y.pin_memory().to(self.device, non_blocking=True)
+            target_weights = target_weights.pin_memory().to(
+                self.device,
+                non_blocking=True,
+            )
+        elif self.device != "cpu":
+            x = x.to(self.device)
+            y = y.to(self.device)
+            target_weights = target_weights.to(self.device)
+        return x, y, target_weights
 
     def masked_value_batch(self, max_batches: int = 8) -> tuple[torch.Tensor, torch.Tensor] | None:
         """Fixed probe batches over MASKED positions only (loss_masked_values metric).
@@ -78,16 +145,14 @@ class PackedShards:
         """
         if self.mask is None:
             return None
-        span = self.batch_size * (self.ctx + 1)
-        toks, msk = self._window(0, span * max_batches)
+        target_count = self.batch_size * self.ctx * max_batches
+        toks, msk = self._window(0, target_count + 1)
+        assert msk is not None
         if (msk == 0).sum() == 0:
             return None
-        usable = (len(toks) // (self.ctx + 1)) * (self.ctx + 1)
-        toks = toks[:usable].astype(np.int64).reshape(-1, self.ctx + 1)
-        msk = msk[:usable].reshape(-1, self.ctx + 1)
-        x = torch.from_numpy(toks[:, :-1].copy())
-        y = torch.from_numpy(toks[:, 1:].copy())
-        keep = torch.from_numpy((msk[:, 1:] == 0).copy())
+        x = torch.from_numpy(toks[:-1].astype(np.int64).reshape(-1, self.ctx))
+        y = torch.from_numpy(toks[1:].astype(np.int64).reshape(-1, self.ctx))
+        keep = torch.from_numpy((msk[1:].reshape(-1, self.ctx) == 0).copy())
         y[~keep] = -100
         rows = keep.any(dim=1)
         if not rows.any():
@@ -98,5 +163,20 @@ class PackedShards:
         return {"cursor": self.cursor, "epoch": self.epoch}
 
     def load_state_dict(self, state: dict) -> None:
-        self.cursor = state["cursor"]
-        self.epoch = state.get("epoch", 0)
+        cursor = state["cursor"]
+        epoch = state.get("epoch", 0)
+        if (
+            isinstance(cursor, bool)
+            or not isinstance(cursor, int)
+            or cursor < 0
+            or isinstance(epoch, bool)
+            or not isinstance(epoch, int)
+            or epoch < 0
+        ):
+            raise ValueError("checkpoint data cursor is invalid")
+        if epoch and cursor < self.n_tokens:
+            cursor += epoch * self.n_tokens
+        if epoch != cursor // self.n_tokens:
+            raise ValueError("checkpoint data epoch is inconsistent with its cursor")
+        self.cursor = cursor
+        self.epoch = epoch

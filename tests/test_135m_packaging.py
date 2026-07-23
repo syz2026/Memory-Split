@@ -3,6 +3,8 @@ from __future__ import annotations
 import hashlib
 import json
 import stat
+import subprocess
+import sys
 import zipfile
 from pathlib import Path
 
@@ -78,6 +80,37 @@ def test_each_archive_contains_only_its_four_configs_and_no_corpus(tmp_path):
                 or name.startswith(("data/", "dataset/", "outputs/"))
                 for name in names
             )
+
+
+def test_role_archive_contains_an_importable_task4_bridge(tmp_path):
+    _, archives = _build(tmp_path, "releases")
+    archive = next(iter(archives.values()))
+    extracted = tmp_path / "extracted"
+    with zipfile.ZipFile(archive) as release:
+        release.extractall(extracted)
+        names = set(release.namelist())
+    assert {
+        "cluster/aws/__init__.py",
+        "cluster/aws/p5/__init__.py",
+        "cluster/aws/p5/corpus_contract.py",
+        "cluster/corpus_contract.py",
+        "scripts/bridge_135m_dataset.py",
+    } <= names
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "from cluster.corpus_contract import "
+                "materialize_135m_layout, freeze_dataset_pointer"
+            ),
+        ],
+        cwd=extracted,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
 
 
 def test_aws_bundle_contains_five_role_archives_and_run_instructions(tmp_path):

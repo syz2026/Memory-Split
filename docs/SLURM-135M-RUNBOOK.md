@@ -37,14 +37,45 @@ the extracted source tree.
 ## 2. Bind a complete dataset mirror
 
 The checked-in dataset pointer is intentionally unfrozen until the production
-receipt is supplied. The coordinator must distribute a bound copy whose
-receipt and ordered-stream SHA-256 values match the production receipt.
+Task-4 receipt is supplied. Do not copy hashes out of an untrusted mirror and
+treat them as approval: compare the verifier output with the independently
+delivered Task-4 receipt identity.
 
-Each site may use a different filesystem path, but both mirrors must produce
-the same receipt, packed-target, Dense-sidecar, Split90-sidecar, semantic
-evidence, lane, source-lock, and ordered-stream identities.
+Verify the sharded Task-4 publication:
 
-Verify an existing mirror:
+```bash
+python scripts/bridge_135m_dataset.py verify-source \
+  /trusted/task4-publication \
+  --expected-source-receipt-sha256 TASK4_RECEIPT_SHA256 \
+  --expected-ordered-sha256 TASK4_ORDERED_STREAM_SHA256
+```
+
+Convert its verified, ordered shards into the flat layout consumed by the 135M
+configs. Publication is atomic and refuses an existing destination:
+
+```bash
+python scripts/bridge_135m_dataset.py materialize \
+  /trusted/task4-publication /site/scratch/memorysplit-v2 \
+  --expected-source-receipt-sha256 TASK4_RECEIPT_SHA256 \
+  --expected-ordered-sha256 TASK4_ORDERED_STREAM_SHA256
+```
+
+Freeze a new pointer only after both the source publication and converted
+bytes verify. The checked-in template is never replaced:
+
+```bash
+python scripts/bridge_135m_dataset.py freeze-pointer \
+  /trusted/task4-publication /site/scratch/memorysplit-v2 \
+  /site/path/DATASET-POINTER-SLURM-135M.bound.json \
+  --expected-source-receipt-sha256 TASK4_RECEIPT_SHA256 \
+  --expected-ordered-sha256 TASK4_ORDERED_STREAM_SHA256
+```
+
+Each site may use a different filesystem path, but all bound pointers and
+mirrors must produce the same source receipt, bridge receipt, ordered stream,
+packed targets, Dense sidecar, Split90 sidecar, lanes, and recipe identity.
+
+Verify an existing flat mirror:
 
 ```bash
 python scripts/stage_135m_dataset.py /site/path/memorysplit-v2 \
@@ -59,8 +90,8 @@ python scripts/stage_135m_dataset.py /trusted/source/memorysplit-v2 \
   --pointer /site/path/DATASET-POINTER-SLURM-135M.bound.json
 ```
 
-Any receipt mismatch, missing lane, incomplete-once Wikidata evidence,
-misaligned sidecar, fixture flag, symlink, or existing destination aborts.
+Any receipt mismatch, wrong lane quota, misaligned sidecar, noncanonical
+Task-4 publication, symlink, extra file, or existing destination aborts.
 
 ## 3. Bind the Slurm profile
 

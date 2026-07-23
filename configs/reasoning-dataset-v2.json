@@ -1,59 +1,362 @@
 {
-  "contract_id": "memorysplit-reasoning-dataset-v2",
   "schema_version": 2,
+  "contract_id": "memorysplit-reasoning-dataset-v2",
+  "status": {
+    "scientific_status": "incomplete",
+    "interim_evidence_label": "none",
+    "protected_launch_allowed": false,
+    "reason": "No valid claim-bearing MemorySplit v2 experiment has finished."
+  },
+  "canonical_hypothesis": "At matched parameters, initialization, raw tokens, token order, optimizer schedule and inference budget, removing direct next-token loss from selected factual payloads improves OOD relational reasoning.",
   "sprint_recipe": {
-    "all_lanes_required": true,
     "label": "20tpp_reasoning_maximized_sprint",
+    "reasoning_optimal_claim": false,
+    "model_parameters": 356033536,
+    "nominal_tokens_per_parameter": 20,
+    "targets_per_update": 524288,
+    "optimizer_steps": 13582,
+    "raw_target_tokens": 7120879616,
+    "mixture_unit": "raw_causal_target_tokens_before_condition_weights",
+    "share_semantics": "target_percentages",
     "lanes": [
       {
         "id": "fineweb_edu",
         "share_percent": 25.0,
-        "source_lock_sha256": "18d665853778f2d9ead41347ffc9ae4607e7a883692423611c38e890a3b8be51"
+        "human_language": true,
+        "broad_general_language": true,
+        "verification": "source_locked_and_cross_deduplicated",
+        "role": "broad_language"
       },
       {
         "id": "finemath",
         "share_percent": 15.0,
-        "source_lock_sha256": "8881c572af9fdf826b041bc7756455185bf103a7a40adc1b7f24003c9b7cd369"
+        "human_language": true,
+        "broad_general_language": false,
+        "verification": "source_locked_and_cross_deduplicated",
+        "role": "mathematical_language"
       },
       {
-        "complete_once": true,
         "id": "wikidata_graph",
         "share_percent": 20.0,
-        "source_lock_sha256": "fe4528d8057038f804396b9913fde09a2f389c5558275e166144853f77bdfbe1"
+        "human_language": false,
+        "broad_general_language": false,
+        "verification": "source_locked_complete_once",
+        "role": "real_graph_exposure"
       },
       {
-        "id": "srgm_worlds",
+        "id": "synthetic_graph",
         "share_percent": 10.0,
-        "source_lock_sha256": "22567f14a1eeb8616cb0e79e9a1682a601924652ba1f5e3d0e6ca6f77fd2b92b"
+        "human_language": false,
+        "broad_general_language": false,
+        "verification": "deterministic_generator_and_fact_ledger",
+        "role": "controlled_graph_exposure"
       },
       {
-        "id": "proof_composition",
-        "share_percent": 10.0,
-        "source_lock_sha256": "eb6c1e41885649be108f5d1e7e5319c385839a0926f16d1e65fa5132190933c9"
+        "id": "verified_synthetic_multihop",
+        "share_percent": 15.0,
+        "human_language": false,
+        "broad_general_language": false,
+        "verification": "solver_required",
+        "role": "fresh_multihop_reasoning"
       },
       {
-        "id": "graph_non_path",
-        "share_percent": 8.0,
-        "source_lock_sha256": "ce507454bccdb8ba0e418797ed3eaa9329f54f8c7d18f16a03339472f29a2eb0"
+        "id": "wikidata_path_reasoning",
+        "share_percent": 7.5,
+        "human_language": false,
+        "broad_general_language": false,
+        "verification": "solver_required",
+        "role": "source_backed_path_reasoning"
       },
       {
-        "id": "counterfactual_pairs",
-        "share_percent": 7.0,
-        "source_lock_sha256": "52e0c77adccda1fc4cc527b2b33f48a1cab8387abd4366e13fe3466d449d0ff4"
+        "id": "relational_refinement",
+        "share_percent": 2.5,
+        "human_language": false,
+        "broad_general_language": false,
+        "verification": "solver_required",
+        "role": "candidate_state_refinement"
       },
       {
-        "id": "general_reasoning",
+        "id": "objective_auxiliary",
         "share_percent": 5.0,
-        "source_lock_sha256": "dda329890af124425306ac341971ca35f3238a40235392b7a95570d75e9522e9"
+        "human_language": false,
+        "broad_general_language": false,
+        "verification": "objective_answer_or_solver_required",
+        "role": "diverse_objective_reasoning"
       }
     ],
-    "model_parameters": 356033536,
-    "nominal_tokens_per_parameter": 20,
-    "raw_target_tokens": 7120879616,
-    "sidecars": [
-      "dense_target_weights",
-      "split90_target_weights"
+    "realized_token_allocation": {
+      "method": "hamilton_largest_remainder",
+      "procedure": "floor_each_ideal_then_award_remaining_tokens_by_descending_fractional_remainder",
+      "tie_break": "stable_lane_order",
+      "lane_order": [
+        "fineweb_edu",
+        "finemath",
+        "wikidata_graph",
+        "synthetic_graph",
+        "verified_synthetic_multihop",
+        "wikidata_path_reasoning",
+        "relational_refinement",
+        "objective_auxiliary"
+      ],
+      "total_tokens": 7120879616,
+      "token_quotas": {
+        "fineweb_edu": 1780219904,
+        "finemath": 1068131943,
+        "wikidata_graph": 1424175923,
+        "synthetic_graph": 712087962,
+        "verified_synthetic_multihop": 1068131942,
+        "wikidata_path_reasoning": 534065971,
+        "relational_refinement": 178021990,
+        "objective_auxiliary": 356043981
+      }
+    },
+    "language_floors_percent": {
+      "human_language": 40.0,
+      "broad_general_language": 25.0
+    },
+    "source_policy": {
+      "fineweb_source_lock": "configs/current-dataset-lock.json",
+      "wikidata_source_lock": "sources/wikidata5m.lock.json",
+      "finemath_repository": "HuggingFaceTB/finemath",
+      "finemath_subsets_in_order": [
+        "finemath-4plus",
+        "finemath-3plus-cross-deduplicated-remainder"
+      ],
+      "cross_deduplicate_finemath_against_fineweb": true,
+      "objective_auxiliary_sources": [
+        "deepmind_mathematics_generator",
+        "clrs_text",
+        "ruletaker",
+        "prontoqa",
+        "reasoning_gym_exact_answer",
+        "arc_agi_training",
+        "conceptarc_training"
+      ],
+      "arc_conceptarc_total_max_percent": 0.25,
+      "teacher_generated_cot_total_max_percent": 0.5,
+      "teacher_generated_cot_requires": [
+        "independent_answer_validation",
+        "trace_validation",
+        "contamination_review"
+      ],
+      "excluded_from_claim_bearing_core": [
+        "proof_pile_variants",
+        "ambiguous_license_sources",
+        "benchmark_evaluation_answers"
+      ]
+    },
+    "publication_requirements": {
+      "complete_once_wikidata_training_graph": true,
+      "stable_fact_universe_and_exposure_burden": true,
+      "solver_verification_rate": 1.0,
+      "structural_train_evaluation_overlap_max": 0.0,
+      "deterministic_rebuild_required": true,
+      "reasoning_lane_cycle_fill_forbidden": true
+    }
+  },
+  "intervention": {
+    "primary_arms": [
+      "dense",
+      "split90"
     ],
-    "wikidata_coverage": "complete_once"
+    "published_views": [
+      "dense",
+      "split50",
+      "split90",
+      "random_fact_90",
+      "matched_nonfactual_mask"
+    ],
+    "split90_minimum_percent": {
+      "distinct_offloadable_atomic_facts": 90.0,
+      "train_only_information_weighted_burden": 90.0
+    },
+    "always_internal": [
+      "rules",
+      "operators",
+      "schemas",
+      "proof_procedures"
+    ],
+    "matched_pair_invariants": [
+      "model_architecture",
+      "parameters",
+      "initialization",
+      "data_seed",
+      "raw_target_tokens",
+      "token_bytes",
+      "token_order",
+      "packing_boundaries",
+      "optimizer",
+      "optimizer_schedule",
+      "targets_per_update",
+      "training_steps",
+      "inference_budget",
+      "evaluation_items",
+      "exact_graph_memory"
+    ],
+    "only_claim_bearing_difference": "direct_target_weights_on_routed_factual_payloads",
+    "semantic_mask_closure_required": true,
+    "candidate_and_final_state_fact_surfaces_forbidden": true,
+    "memory": {
+      "kind": "exact_non_trainable_graph",
+      "identical_between_arms": true,
+      "byte_identity_required": true,
+      "may_return": [
+        "exact_row",
+        "MISS"
+      ],
+      "may_not": [
+        "rank_candidates",
+        "infer_paths",
+        "generate_proofs",
+        "generate_answers"
+      ]
+    }
+  },
+  "evaluation": {
+    "release_contract": {
+      "model_visible_separate_from_sealed_gold": true,
+      "model_visible_contains_answers_or_proofs": false,
+      "sealed_gold_evaluation_only": true,
+      "frozen_before_protected_checkpoint_inspection": true
+    },
+    "primary_endpoint": {
+      "id": "counterfactual_pair_and_proof_accuracy",
+      "contrast_id": "primary_omnibus_pair_and_proof__graph_non_path__composition_joint_ood__split90_minus_dense",
+      "verifier_required": true,
+      "pair_credit": "one_iff_both_twins_have_correct_answers_and_verifier_accepted_proofs",
+      "weighting": "equal_across_four_primary_cells",
+      "reasoning_families": [
+        "graph",
+        "non_path"
+      ],
+      "primary_ood_strata": [
+        "composition_ood",
+        "joint_ood"
+      ],
+      "primary_cell_ids": [
+        "graph__composition_ood",
+        "graph__joint_ood",
+        "non_path__composition_ood",
+        "non_path__joint_ood"
+      ]
+    },
+    "stratum_classification": {
+      "primary_ood_strata": [
+        "composition_ood",
+        "joint_ood"
+      ],
+      "secondary_strata": [
+        "length_ood"
+      ],
+      "guardrail_strata": [
+        "iid"
+      ]
+    },
+    "sealed_strata": [
+      {
+        "id": "iid",
+        "sealed": true,
+        "training_overlap_allowed": false,
+        "role": "guardrail"
+      },
+      {
+        "id": "composition_ood",
+        "sealed": true,
+        "training_overlap_allowed": false,
+        "role": "primary_ood"
+      },
+      {
+        "id": "length_ood",
+        "sealed": true,
+        "training_overlap_allowed": false,
+        "role": "secondary"
+      },
+      {
+        "id": "joint_ood",
+        "sealed": true,
+        "training_overlap_allowed": false,
+        "role": "primary_ood"
+      }
+    ],
+    "controls": [
+      {
+        "id": "correct_memory",
+        "role": "claim_bearing_reference"
+      },
+      {
+        "id": "memory_off",
+        "role": "memory_sensitivity"
+      },
+      {
+        "id": "shuffled_returns",
+        "role": "causal_negative_control"
+      },
+      {
+        "id": "relevant_edge_swap",
+        "role": "causal_positive_control"
+      },
+      {
+        "id": "irrelevant_edge_swap",
+        "role": "causal_specificity_control"
+      },
+      {
+        "id": "gold_path_replay",
+        "role": "execution_ceiling"
+      },
+      {
+        "id": "no_query",
+        "role": "query_dependence"
+      },
+      {
+        "id": "entity_rename",
+        "role": "surface_invariance"
+      },
+      {
+        "id": "graph_isomorphism",
+        "role": "structural_invariance"
+      },
+      {
+        "id": "page_order_permutation",
+        "role": "set_order_invariance"
+      }
+    ]
+  },
+  "artifact_bindings": {
+    "expanded_fineweb_snapshot": {
+      "state": "unfrozen",
+      "sha256": null
+    },
+    "finemath_snapshot": {
+      "state": "unfrozen",
+      "sha256": null
+    },
+    "reasoning_corpus": {
+      "state": "unfrozen",
+      "sha256": null
+    },
+    "route_manifest": {
+      "state": "unfrozen",
+      "sha256": null
+    },
+    "exact_graph_memory": {
+      "state": "unfrozen",
+      "sha256": null
+    },
+    "model_visible_evaluation": {
+      "state": "unfrozen",
+      "sha256": null
+    },
+    "sealed_gold_evaluation": {
+      "state": "unfrozen",
+      "sha256": null
+    },
+    "environment_lock": {
+      "state": "unfrozen",
+      "sha256": null
+    },
+    "run_manifest": {
+      "state": "unfrozen",
+      "sha256": null
+    }
   }
 }
