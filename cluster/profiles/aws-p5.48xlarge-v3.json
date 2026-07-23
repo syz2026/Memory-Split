@@ -1,0 +1,53 @@
+{
+  "assigned_seeds": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9
+  ],
+  "cpu": {
+    "memory_gib": 2048,
+    "vcpus": 192
+  },
+  "gpu": {
+    "allocated": 8,
+    "model": "NVIDIA H100 80GB",
+    "seed_train_groups": [
+      4,
+      4
+    ]
+  },
+  "instance_type": "p5.48xlarge",
+  "process_env_allowlist": [
+    "AWS_REGION",
+    "LANG",
+    "LC_ALL"
+  ],
+  "profile_id": "aws-p5.48xlarge-v3",
+  "provider": "aws-p5.48xlarge",
+  "purchase_model": "on_demand",
+  "runtime": {
+    "ami_id_env": "MS_AWS_AMI_ID",
+    "container_digest_env": "MS_CONTAINER_DIGEST",
+    "region_env": "AWS_REGION",
+    "runtime_gid_env": "MS_RUNTIME_GID",
+    "runtime_uid_env": "MS_RUNTIME_UID"
+  },
+  "schema_version": 1,
+  "storage": {
+    "durable_uri_env": "MS_S3_ROOT",
+    "instance_store": {
+      "device_bytes": 3840000000000,
+      "devices": 8,
+      "model": "Amazon EC2 NVMe Instance Storage",
+      "raid_level": "0"
+    },
+    "scratch_root": "/mnt/memorysplit"
+  }
+}

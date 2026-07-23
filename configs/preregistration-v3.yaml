@@ -1,0 +1,425 @@
+schema_version: 3
+preregistration_id: memorysplit-confirmatory-v3
+frozen: true
+current_scientific_status: incomplete
+current_interim_evidence_label: none
+protected_launch_allowed: false
+canonical_hypothesis: >-
+  At matched parameters, initialization, raw tokens, token order, optimizer
+  schedule and inference budget, removing direct next-token loss from selected
+  factual payloads improves OOD relational reasoning.
+
+prospective_amendment:
+  supersedes: split_provider_n5_execution_plan
+  execution_plan: one_aws_p5.48xlarge_n10_cohort
+  outcome_inspection_before_amendment:
+    seed_level_confirmatory_result_inspected: false
+    arm_level_confirmatory_result_inspected: false
+  continuation:
+    all_ten_pairs_required: true
+    effect_direction_may_not_change_continuation: true
+    stop_only_for:
+      - measured_preregistered_validity_failure
+      - infrastructure_failure
+  trained_control_arms_added: false
+  claim_bearing_condition_pair:
+    - dense
+    - split90
+  unchanged:
+    - model_architecture
+    - corpus_bytes
+    - corpus_order
+    - target_budget
+    - optimizer_schedule
+    - primary_endpoint
+    - one_sided_direction
+    - alpha
+    - inclusive_tail_rule
+    - validity_gates
+
+status_policy:
+  scientific_status:
+    values:
+      - incomplete
+      - invalid
+      - complete
+    rules:
+      incomplete: missing_required_runs_evaluations_instruments_or_replication
+      invalid: measured_protocol_provenance_endpoint_or_instrument_failure
+      complete: terminal_evidence_complete_and_no_measured_validity_failure
+    resolution: measured_failure_invalid_else_missing_terminal_evidence_incomplete_else_complete
+  interim_evidence_label:
+    values:
+      - none
+      - directional_only
+      - sign_consistent_only
+    rules:
+      none: no_valid_interim_seed_bundle_evidence
+      directional_only: exactly_one_valid_360m_pair
+      sign_consistent_only: three_same_sign_pairs_without_completed_confirmatory_test
+  final_inference_conclusion:
+    values:
+      - not_evaluated
+      - inconclusive
+      - supports_effect
+      - supports_practical_null
+    rules:
+      not_evaluated: scientific_status_not_complete
+      inconclusive: complete_valid_primary_procedure_crosses_neither_effect_nor_equivalence
+      supports_effect: primary_omnibus_passes_and_all_validity_guardrail_gates_pass
+      supports_practical_null: primary_omnibus_meets_frozen_equivalence_rule
+  forbidden_labels:
+    - failed_to_reject
+    - statistically_significant_single_seed
+    - reasoning_optimal_sprint
+
+protected_cohort:
+  condition_pair:
+    - dense
+    - split90
+  model_parameters: 356033536
+  terminal_n_pairs: 10
+  seeds:
+    - 0
+    - 1
+    - 2
+    - 3
+    - 4
+    - 5
+    - 6
+    - 7
+    - 8
+    - 9
+  provider_assignment:
+    aws-p5.48xlarge:
+      - 0
+      - 1
+      - 2
+      - 3
+      - 4
+      - 5
+      - 6
+      - 7
+      - 8
+      - 9
+  precommit_before_any_outcome_inspection: true
+  continue_all_pairs_regardless_of_effect: true
+  continuation_may_stop_only_for:
+    - measured_preregistered_validity_failure
+    - infrastructure_failure
+  training:
+    nominal_tokens_per_parameter: 20
+    targets_per_update: 524288
+    optimizer_steps: 13582
+    raw_target_tokens: 7120879616
+  matched_pair_invariants:
+    - model_architecture
+    - parameters
+    - initialization
+    - data_seed
+    - raw_target_tokens
+    - token_bytes
+    - token_order
+    - packing_boundaries
+    - optimizer
+    - optimizer_schedule
+    - targets_per_update
+    - training_steps
+    - inference_budget
+    - evaluation_items
+    - exact_graph_memory
+  claim_bearing_difference: direct_target_weights_on_routed_factual_payloads
+  memory:
+    kind: exact_non_trainable_graph
+    identical_between_arms: true
+    byte_identity_required: true
+    answer_or_proof_generation_forbidden: true
+  aws_topology:
+    instance_type: p5.48xlarge
+    instances: 1
+    accelerator: NVIDIA H100 80GB
+    total_gpus: 8
+    dense_training_gpus:
+      - 0
+      - 1
+      - 2
+      - 3
+    split90_training_gpus:
+      - 4
+      - 5
+      - 6
+      - 7
+    train_groups:
+      - 4
+      - 4
+    symmetric_training: true
+    purchase_model: on_demand
+  extra_trained_control_arms: []
+  terminal_evidence:
+    paired_bundles_required: 10
+    all_validity_and_evaluation_evidence_required: true
+
+development_diagnostics_29m:
+  required: true
+  run_count: 6
+  model_parameters: 28969216
+  targets_per_update: 524288
+  optimizer_steps: 1106
+  raw_target_tokens: 579862528
+  protected_launch_requires_all_pass: true
+  selection_use_forbidden: true
+  effect_direction_as_pass_criterion_forbidden: true
+  runs:
+    - id: full_corpus_dense
+      pair_id: full_corpus
+      arm: dense
+      token_matched_replacement: none
+      state: pending
+    - id: full_corpus_split90
+      pair_id: full_corpus
+      arm: split90
+      token_matched_replacement: none
+      state: pending
+    - id: no_arc_conceptarc_dense
+      pair_id: no_arc_conceptarc
+      arm: dense
+      token_matched_replacement: fineweb_edu
+      state: pending
+    - id: no_arc_conceptarc_split90
+      pair_id: no_arc_conceptarc
+      arm: split90
+      token_matched_replacement: fineweb_edu
+      state: pending
+    - id: no_refinement_dense
+      pair_id: no_refinement
+      arm: dense
+      token_matched_replacement: verified_standard_relational_records
+      state: pending
+    - id: no_refinement_split90
+      pair_id: no_refinement
+      arm: split90
+      token_matched_replacement: verified_standard_relational_records
+      state: pending
+
+intervention_gates:
+  minimum_offload_percent:
+    distinct_offloadable_atomic_facts: 90.0
+    train_only_information_weighted_burden: 90.0
+  semantic_mask_closure_required: true
+  rules_operators_schemas_and_proof_procedures_internal: true
+  random_fact_and_matched_nonfactual_controls_required: true
+
+evaluation:
+  primary_endpoint: counterfactual_pair_and_proof_accuracy
+  primary_contrast_id: primary_omnibus_pair_and_proof__graph_non_path__composition_joint_ood__split90_minus_dense
+  verifier_required: true
+  pair_credit: one_iff_both_twins_have_correct_answers_and_verifier_accepted_proofs
+  reasoning_families:
+    - graph
+    - non_path
+  model_visible_and_sealed_gold_separate: true
+  stratum_classification:
+    primary_ood_strata:
+      - composition_ood
+      - joint_ood
+    secondary_strata:
+      - length_ood
+    guardrail_strata:
+      - iid
+  primary_cell_ids:
+    - graph__composition_ood
+    - graph__joint_ood
+    - non_path__composition_ood
+    - non_path__joint_ood
+  primary_weighting:
+    method: equal_across_four_primary_cells
+    cell_weight: 0.25
+    cell_ids:
+      - graph__composition_ood
+      - graph__joint_ood
+      - non_path__composition_ood
+      - non_path__joint_ood
+  sealed_strata:
+    - iid
+    - composition_ood
+    - length_ood
+    - joint_ood
+  required_controls:
+    - correct_memory
+    - memory_off
+    - shuffled_returns
+    - relevant_edge_swap
+    - irrelevant_edge_swap
+    - gold_path_replay
+    - no_query
+    - entity_rename
+    - graph_isomorphism
+    - page_order_permutation
+  syntax_only_action_validation: true
+  allowed_actions_may_not_be_derived_from_gold_or_store_topology: true
+  fixed_action_slots: 12
+
+analysis:
+  independent_unit: paired_training_bundle
+  single_primary_hypothesis: true
+  primary_hypothesis:
+    contrast_id: primary_omnibus_pair_and_proof__graph_non_path__composition_joint_ood__split90_minus_dense
+    endpoint: counterfactual_pair_and_proof_accuracy
+    estimand: split90_minus_dense
+    timepoint: final_optimizer_step
+    optimizer_step: 13582
+    reasoning_families:
+      - graph
+      - non_path
+    primary_ood_strata:
+      - composition_ood
+      - joint_ood
+    cell_ids:
+      - graph__composition_ood
+      - graph__joint_ood
+      - non_path__composition_ood
+      - non_path__joint_ood
+    cell_weight: 0.25
+    paired_seed_bundle_delta: split90_equal_weight_omnibus_minus_dense_equal_weight_omnibus
+    test:
+      method: exact_one_sided_exhaustive_sign_flip
+      alpha: 0.05
+      statistic: arithmetic_mean_of_paired_seed_bundle_deltas
+      sign_assignments: 1024
+      tail_count_rule: permuted_statistic_greater_than_or_equal_to_observed
+      equality_counted: true
+      zero_deltas: retained
+      n_pairs: 10
+      minimum_attainable_p: 0.0009765625
+      confirmatory_scope: primary_omnibus_only
+  hierarchical_bootstrap:
+    bit_generator: PCG64
+    rng_seed: 0
+    draws: 20000
+    confidence_interval_percent: 90
+    resampling_levels:
+      - seed
+      - world
+      - counterfactual_pair
+  secondary_family_contrasts:
+    contrast_ids:
+      - secondary_graph_pair_and_proof__composition_joint_ood__split90_minus_dense
+      - secondary_non_path_pair_and_proof__composition_joint_ood__split90_minus_dense
+    holm:
+      method: holm
+      family_size: 2
+      tie_break: stable_lexicographic_contrast_id_order
+    required_for_primary_status: false
+  practical_equivalence:
+    contrast_id: primary_omnibus_pair_and_proof__graph_non_path__composition_joint_ood__split90_minus_dense
+    margin_absolute_pair_accuracy: 0.01
+    method: two_one_sided_90_percent_confidence_bounds
+    bound_estimator: hierarchical_bootstrap_seed_world_pair
+    lower_rule: strictly_greater_than_negative_margin
+    upper_rule: strictly_less_than_positive_margin
+    boundary_equality: does_not_support_equivalence
+  fixed_checkpoint_aulc:
+    enabled: true
+    role: required_secondary_trajectory_evidence
+    second_primary: false
+    optimizer_steps:
+      - 1358
+      - 3396
+      - 6791
+      - 10187
+      - 13582
+    all_steps_required_for_every_arm_and_seed: true
+    interpolation: none
+    integral: right_step
+  terminal_status_requires:
+    paired_bundles: 10
+    all_validity_and_evaluation_evidence: true
+  conclusion_scope:
+    supports_effect_at_n10: primary_omnibus_only
+    requires_all_validity_and_guardrail_gates: true
+    family_specific_secondary_contrasts_are_not_primary: true
+  effect_direction_may_not_change_continuation: true
+
+protected_run_gates:
+  all_required: true
+  required_order:
+    - scientific_contract
+    - route_dose
+    - semantic_closure
+    - proof_verification
+    - ood_seal
+    - corpus_identity
+    - paired_training
+    - checkpoint_resume
+    - evaluation_validity
+    - six_29m_diagnostics
+  gates:
+    - id: scientific_contract
+      state: pending
+      evidence_state: unfrozen
+      evidence_sha256: null
+    - id: route_dose
+      state: pending
+      evidence_state: unfrozen
+      evidence_sha256: null
+    - id: semantic_closure
+      state: pending
+      evidence_state: unfrozen
+      evidence_sha256: null
+    - id: proof_verification
+      state: pending
+      evidence_state: unfrozen
+      evidence_sha256: null
+    - id: ood_seal
+      state: pending
+      evidence_state: unfrozen
+      evidence_sha256: null
+    - id: corpus_identity
+      state: pending
+      evidence_state: unfrozen
+      evidence_sha256: null
+    - id: paired_training
+      state: pending
+      evidence_state: unfrozen
+      evidence_sha256: null
+    - id: checkpoint_resume
+      state: pending
+      evidence_state: unfrozen
+      evidence_sha256: null
+    - id: evaluation_validity
+      state: pending
+      evidence_state: unfrozen
+      evidence_sha256: null
+    - id: six_29m_diagnostics
+      state: pending
+      evidence_state: unfrozen
+      evidence_sha256: null
+
+artifact_bindings:
+  expanded_fineweb_snapshot:
+    state: unfrozen
+    sha256: null
+  finemath_snapshot:
+    state: unfrozen
+    sha256: null
+  reasoning_corpus:
+    state: unfrozen
+    sha256: null
+  route_manifest:
+    state: unfrozen
+    sha256: null
+  exact_graph_memory:
+    state: unfrozen
+    sha256: null
+  model_visible_evaluation:
+    state: unfrozen
+    sha256: null
+  sealed_gold_evaluation:
+    state: unfrozen
+    sha256: null
+  environment_lock:
+    state: unfrozen
+    sha256: null
+  run_manifest:
+    state: unfrozen
+    sha256: null

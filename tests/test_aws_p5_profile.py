@@ -16,6 +16,7 @@ from cluster.aws.p5.profile import (
 
 ROOT = Path(__file__).resolve().parents[1]
 PROFILE_PATH = ROOT / "cluster" / "profiles" / "aws-p5.48xlarge.json"
+PROFILE_V3_PATH = ROOT / "cluster" / "profiles" / "aws-p5.48xlarge-v3.json"
 POINTER_PATH = ROOT / "DATASET-POINTER-AWS.json"
 
 
@@ -29,8 +30,18 @@ def _production_profile() -> dict:
     return json.loads(PROFILE_PATH.read_text(encoding="utf-8"))
 
 
+def _production_v3_profile() -> dict:
+    return json.loads(PROFILE_V3_PATH.read_text(encoding="utf-8"))
+
+
 def _mutated_profile(tmp_path: Path, mutate) -> Path:
     value = deepcopy(_production_profile())
+    mutate(value)
+    return _write_profile(tmp_path, value)
+
+
+def _mutated_v3_profile(tmp_path: Path, mutate) -> Path:
+    value = deepcopy(_production_v3_profile())
     mutate(value)
     return _write_profile(tmp_path, value)
 
@@ -64,6 +75,79 @@ def test_production_profile_freezes_exact_p5_hardware_and_seed_assignment():
         "LC_ALL",
     )
     assert re.fullmatch(r"[0-9a-f]{64}", profile.sha256)
+
+
+def test_v3_profile_preserves_p5_contract_and_assigns_all_ten_seeds():
+    profile = load_aws_p5_profile(PROFILE_V3_PATH)
+
+    assert isinstance(profile, AwsP5Profile)
+    assert profile.schema_version == 1
+    assert profile.profile_id == "aws-p5.48xlarge-v3"
+    assert profile.provider == "aws-p5.48xlarge"
+    assert profile.instance_type == "p5.48xlarge"
+    assert profile.purchase_model == "on_demand"
+    assert profile.vcpus == 192
+    assert profile.memory_gib == 2048
+    assert profile.gpu_model == "NVIDIA H100 80GB"
+    assert profile.allocated_gpus == 8
+    assert profile.train_groups == (4, 4)
+    assert profile.instance_store_model == "Amazon EC2 NVMe Instance Storage"
+    assert profile.instance_store_devices == 8
+    assert profile.instance_store_device_bytes == 3_840_000_000_000
+    assert profile.raid_level == "0"
+    assert profile.scratch_root == "/mnt/memorysplit"
+    assert profile.durable_uri_env == "MS_S3_ROOT"
+    assert profile.region_env == "AWS_REGION"
+    assert profile.ami_id_env == "MS_AWS_AMI_ID"
+    assert profile.container_digest_env == "MS_CONTAINER_DIGEST"
+    assert profile.runtime_uid_env == "MS_RUNTIME_UID"
+    assert profile.runtime_gid_env == "MS_RUNTIME_GID"
+    assert profile.assigned_seeds == tuple(range(10))
+    assert profile.process_env_allowlist == (
+        "AWS_REGION",
+        "LANG",
+        "LC_ALL",
+    )
+    assert re.fullmatch(r"[0-9a-f]{64}", profile.sha256)
+
+
+@pytest.mark.parametrize(
+    "assigned_seeds",
+    [
+        list(range(9)),
+        [*range(9), 8],
+        [1, 0, *range(2, 10)],
+        [-1, *range(1, 10)],
+        [*range(9), 10],
+    ],
+    ids=["missing", "duplicate", "reordered", "negative", "seed-10"],
+)
+def test_v3_profile_rejects_noncanonical_seed_assignments(
+    tmp_path,
+    assigned_seeds,
+):
+    path = _mutated_v3_profile(
+        tmp_path,
+        lambda value: value.update(assigned_seeds=assigned_seeds),
+    )
+
+    with pytest.raises(ValueError, match="assigned_seeds"):
+        load_aws_p5_profile(path)
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda value: value.update(schema_version=2),
+        lambda value: value.update(profile_id="aws-p5.48xlarge"),
+    ],
+    ids=["wrong-schema", "v1-profile-id"],
+)
+def test_v3_profile_rejects_cross_version_identity(tmp_path, mutate):
+    path = _mutated_v3_profile(tmp_path, mutate)
+
+    with pytest.raises(ValueError, match="identity|schema|profile_id"):
+        load_aws_p5_profile(path)
 
 
 @pytest.mark.parametrize(

@@ -12,6 +12,7 @@ from urllib.parse import urlsplit
 
 
 PROFILE_ID = "aws-p5.48xlarge"
+PROFILE_ID_V3 = "aws-p5.48xlarge-v3"
 _MAX_PROFILE_BYTES = 65_536
 _AMI_RE = re.compile(r"^ami-[0-9a-f]{8,17}$")
 _CONTAINER_DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
@@ -64,6 +65,29 @@ _PROCESS_ENV_ALLOWLIST = (
     "AWS_REGION",
     "LANG",
     "LC_ALL",
+)
+
+
+@dataclass(frozen=True)
+class _ProfileContract:
+    """Closed schema/profile identity and its exact seed assignment."""
+
+    schema_version: int
+    profile_id: str
+    assigned_seeds: tuple[int, ...]
+
+
+_PROFILE_CONTRACTS = (
+    _ProfileContract(
+        schema_version=1,
+        profile_id=PROFILE_ID,
+        assigned_seeds=(1, 2, 3, 4),
+    ),
+    _ProfileContract(
+        schema_version=1,
+        profile_id=PROFILE_ID_V3,
+        assigned_seeds=tuple(range(10)),
+    ),
 )
 
 
@@ -151,9 +175,26 @@ def _exact_string(value: object, expected: str, *, label: str) -> str:
 
 def _parse_profile(raw: object, *, sha256: str) -> AwsP5Profile:
     value = _object(raw, fields=_ROOT_FIELDS, label="profile")
-    _exact_int(value["schema_version"], 1, label="profile.schema_version")
+    contract = next(
+        (
+            candidate
+            for candidate in _PROFILE_CONTRACTS
+            if value["schema_version"] == candidate.schema_version
+            and value["profile_id"] == candidate.profile_id
+        ),
+        None,
+    )
+    if contract is None:
+        raise ValueError(
+            "profile schema/profile_id identity is not a frozen P5 contract"
+        )
+    schema_version = _exact_int(
+        value["schema_version"],
+        contract.schema_version,
+        label="profile.schema_version",
+    )
     profile_id = _exact_string(
-        value["profile_id"], PROFILE_ID, label="profile.profile_id"
+        value["profile_id"], contract.profile_id, label="profile.profile_id"
     )
     provider = _exact_string(
         value["provider"], PROFILE_ID, label="profile.provider"
@@ -279,9 +320,11 @@ def _parse_profile(raw: object, *, sha256: str) -> AwsP5Profile:
     if (
         not isinstance(seeds, list)
         or any(type(seed) is not int for seed in seeds)
-        or seeds != [1, 2, 3, 4]
+        or seeds != list(contract.assigned_seeds)
     ):
-        raise ValueError("profile.assigned_seeds must be exactly [1, 2, 3, 4]")
+        raise ValueError(
+            "profile.assigned_seeds must exactly match its profile identity"
+        )
 
     allowlist = value["process_env_allowlist"]
     if (
@@ -294,7 +337,7 @@ def _parse_profile(raw: object, *, sha256: str) -> AwsP5Profile:
         )
 
     return AwsP5Profile(
-        schema_version=1,
+        schema_version=schema_version,
         profile_id=profile_id,
         provider=provider,
         instance_type=instance_type,
@@ -315,14 +358,14 @@ def _parse_profile(raw: object, *, sha256: str) -> AwsP5Profile:
         container_digest_env=container_digest_env,
         runtime_uid_env=runtime_uid_env,
         runtime_gid_env=runtime_gid_env,
-        assigned_seeds=(1, 2, 3, 4),
+        assigned_seeds=contract.assigned_seeds,
         process_env_allowlist=_PROCESS_ENV_ALLOWLIST,
         sha256=sha256,
     )
 
 
 def load_aws_p5_profile(path: Path | str) -> AwsP5Profile:
-    """Load one regular JSON file under the closed P5 v1 schema."""
+    """Load one regular JSON file under a closed P5 profile identity."""
 
     profile_path = Path(path)
     if profile_path.is_symlink():
