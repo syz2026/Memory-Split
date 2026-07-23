@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
@@ -22,6 +23,11 @@ OPTIMIZER_STEPS = 13_582
 RAW_TARGET_TOKENS = 7_120_879_616
 SEEDS = tuple(range(5))
 ARMS = ("dense", "split90")
+_RUN_CONFIG_PATHS = frozenset(
+    f"configs/360m-v2/{arm}-s{seed}.yaml"
+    for seed in SEEDS
+    for arm in ARMS
+)
 _ASSIGNMENT_FIELDS = {
     "schema_version",
     "cohort_id",
@@ -255,8 +261,7 @@ def _portable_logical_path(value: object, *, label: str) -> str:
     return path.as_posix()
 
 
-def _validate_preregistration(path: Path) -> str:
-    data = _read_regular(path, label="preregistration")
+def _validate_preregistration(data: bytes) -> str:
     value = _yaml_object(data, label="preregistration")
     protected = value.get("protected_cohort")
     if not isinstance(protected, dict):
@@ -373,13 +378,12 @@ def _expected_config(seed: int, arm: str) -> dict[str, object]:
 
 
 def _load_run_config(
-    path: Path,
+    data: bytes,
     *,
     relative: str,
     seed: int,
     arm: str,
 ) -> CohortRunConfig:
-    data = _read_regular(path, label=f"run config {relative}")
     value = _yaml_object(data, label=f"run config {relative}")
     _require_exact_fields(value, _CONFIG_FIELDS, label=f"run config {relative}")
     for field in _INTEGER_CONFIG_FIELDS:
@@ -405,14 +409,65 @@ def _load_run_config(
     )
 
 
+def load_cohort_assignment_bytes(
+    *,
+    assignment_data: bytes,
+    preregistration_data: bytes,
+    config_data: Mapping[str, bytes],
+) -> CohortAssignment:
+    """Validate one immutable byte snapshot of the complete cohort."""
+
+    if type(assignment_data) is not bytes:
+        _fail("cohort assignment snapshot must be immutable bytes")
+    if type(preregistration_data) is not bytes:
+        _fail("preregistration snapshot must be immutable bytes")
+    configs = dict(config_data)
+    if set(configs) != _RUN_CONFIG_PATHS or not all(
+        isinstance(path, str) and type(data) is bytes
+        for path, data in configs.items()
+    ):
+        _fail(
+            "cohort config snapshot must contain exactly ten immutable cells",
+            details={
+                "missing": sorted(_RUN_CONFIG_PATHS - set(configs)),
+                "unknown": sorted(set(configs) - _RUN_CONFIG_PATHS),
+            },
+        )
+    value = _json_object(assignment_data, label="cohort assignment")
+    illumina, aws = _validate_assignment(value)
+    preregistration_sha256 = _validate_preregistration(preregistration_data)
+
+    parsed_configs = []
+    for seed in SEEDS:
+        for arm in ARMS:
+            relative = f"configs/360m-v2/{arm}-s{seed}.yaml"
+            parsed_configs.append(
+                _load_run_config(
+                    configs[relative],
+                    relative=relative,
+                    seed=seed,
+                    arm=arm,
+                )
+            )
+
+    return CohortAssignment(
+        cohort_id=COHORT_ID,
+        model_parameters=MODEL_PARAMETERS,
+        targets_per_update=TARGETS_PER_UPDATE,
+        optimizer_steps=OPTIMIZER_STEPS,
+        raw_target_tokens=RAW_TARGET_TOKENS,
+        illumina_seeds=illumina,
+        aws_p5_seeds=aws,
+        configs=tuple(parsed_configs),
+        assignment_sha256=hashlib.sha256(assignment_data).hexdigest(),
+        preregistration_sha256=preregistration_sha256,
+    )
+
+
 def load_cohort_assignment(path: Path | str) -> CohortAssignment:
     """Load and cross-check the canonical assignment, preregistration, and runs."""
 
     assignment_path = Path(path)
-    assignment_data = _read_regular(
-        assignment_path,
-        label="cohort assignment",
-    )
     if assignment_path.parent.name != "configs":
         _fail("cohort assignment must live directly under configs")
     configs_root = assignment_path.parent
@@ -420,15 +475,7 @@ def load_cohort_assignment(path: Path | str) -> CohortAssignment:
     if run_root.is_symlink() or not run_root.is_dir():
         _fail("cohort run-config directory must be a regular directory")
 
-    value = _json_object(assignment_data, label="cohort assignment")
-    illumina, aws = _validate_assignment(value)
-    preregistration_sha256 = _validate_preregistration(
-        configs_root / "preregistration-v2.yaml"
-    )
-
-    expected_names = {
-        f"{arm}-s{seed}.yaml" for seed in SEEDS for arm in ARMS
-    }
+    expected_names = {PurePosixPath(path).name for path in _RUN_CONFIG_PATHS}
     try:
         actual_names = {entry.name for entry in run_root.iterdir()}
     except OSError as error:
@@ -446,37 +493,29 @@ def load_cohort_assignment(path: Path | str) -> CohortAssignment:
         )
 
     repo_root = configs_root.parent
-    configs = []
-    for seed in SEEDS:
-        for arm in ARMS:
-            filename = f"{arm}-s{seed}.yaml"
-            relative = f"configs/360m-v2/{filename}"
-            candidate = run_root / filename
-            try:
-                candidate.resolve(strict=True).relative_to(repo_root.resolve())
-            except (FileNotFoundError, ValueError) as error:
-                raise MsctlError(
-                    "COHORT_INVALID",
-                    "cohort run config escapes the repository root",
-                ) from error
-            configs.append(
-                _load_run_config(
-                    candidate,
-                    relative=relative,
-                    seed=seed,
-                    arm=arm,
-                )
-            )
+    config_data = {}
+    for relative in sorted(_RUN_CONFIG_PATHS):
+        candidate = repo_root / relative
+        try:
+            candidate.resolve(strict=True).relative_to(repo_root.resolve())
+        except (FileNotFoundError, ValueError) as error:
+            raise MsctlError(
+                "COHORT_INVALID",
+                "cohort run config escapes the repository root",
+            ) from error
+        config_data[relative] = _read_regular(
+            candidate,
+            label=f"run config {relative}",
+        )
 
-    return CohortAssignment(
-        cohort_id=COHORT_ID,
-        model_parameters=MODEL_PARAMETERS,
-        targets_per_update=TARGETS_PER_UPDATE,
-        optimizer_steps=OPTIMIZER_STEPS,
-        raw_target_tokens=RAW_TARGET_TOKENS,
-        illumina_seeds=illumina,
-        aws_p5_seeds=aws,
-        configs=tuple(configs),
-        assignment_sha256=hashlib.sha256(assignment_data).hexdigest(),
-        preregistration_sha256=preregistration_sha256,
+    return load_cohort_assignment_bytes(
+        assignment_data=_read_regular(
+            assignment_path,
+            label="cohort assignment",
+        ),
+        preregistration_data=_read_regular(
+            configs_root / "preregistration-v2.yaml",
+            label="preregistration",
+        ),
+        config_data=config_data,
     )

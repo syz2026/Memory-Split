@@ -152,6 +152,29 @@ def _commit_mutation(root: Path, message: str) -> None:
     _git(root, "commit", "-qm", message)
 
 
+def _replace_after_tracked_snapshot(
+    package_module,
+    monkeypatch,
+    *,
+    path: Path,
+    replacement: bytes,
+) -> dict[str, str]:
+    original_tracked_files = package_module._tracked_files
+    captured: dict[str, str] = {}
+
+    def tracked_then_replace(root, *arguments):
+        tracked = original_tracked_files(root, *arguments)
+        relative = path.relative_to(root).as_posix()
+        captured["git_blob"] = next(
+            item.object_id for item in tracked if item.path == relative
+        )
+        path.write_bytes(replacement)
+        return tracked
+
+    monkeypatch.setattr(package_module, "_tracked_files", tracked_then_replace)
+    return captured
+
+
 def test_production_dataset_pointer_is_nonmaterialized_and_illumina_only():
     pointer = json.loads((REPO_ROOT / "DATASET-POINTER.json").read_text())
 
@@ -325,59 +348,86 @@ def test_packager_rejects_tracked_root_seed_config_without_output(
     assert not out.exists()
 
 
-def test_packager_rejects_assignment_config_hash_mismatch(
+def test_packager_uses_git_config_bytes_after_tracked_snapshot_race(
     tmp_path,
     package_module,
     monkeypatch,
 ):
     source = _minimal_repo(tmp_path)
-    original = package_module._read_member
+    config_path = source / "configs" / "360m-v2" / "dense-s0.yaml"
+    original = config_path.read_bytes()
+    replacement = original + b"# semantically equivalent race replacement\n"
+    captured = _replace_after_tracked_snapshot(
+        package_module,
+        monkeypatch,
+        path=config_path,
+        replacement=replacement,
+    )
 
-    def raced_read(root, relative):
-        data = original(root, relative)
-        if relative == "configs/360m-v2/dense-s0.yaml":
-            return data + b"# raced after cohort validation\n"
-        return data
+    release = package_module.build_handoff(
+        source_root=source,
+        out_dir=tmp_path / "out",
+    )
 
-    monkeypatch.setattr(package_module, "_read_member", raced_read)
+    with zipfile.ZipFile(release.archive) as archive:
+        packaged = archive.read("configs/360m-v2/dense-s0.yaml")
+        metadata = json.loads(archive.read("RELEASE-METADATA.json"))
+    member = next(
+        row
+        for row in metadata["members"]
+        if row["path"] == "configs/360m-v2/dense-s0.yaml"
+    )
+    assert config_path.read_bytes() == replacement
+    assert packaged == original
+    assert member == {
+        "path": "configs/360m-v2/dense-s0.yaml",
+        "bytes": len(original),
+        "sha256": hashlib.sha256(original).hexdigest(),
+        "git_blob": captured["git_blob"],
+    }
 
-    with pytest.raises(package_module.PackageError, match="hash"):
-        package_module.build_handoff(
-            source_root=source,
-            out_dir=tmp_path / "out",
-        )
 
-
-def test_packager_rejects_preregistration_replacement_after_snapshot(
+def test_packager_uses_git_preregistration_bytes_after_tracked_snapshot_race(
     tmp_path,
     package_module,
     monkeypatch,
 ):
     source = _minimal_repo(tmp_path)
-    original = package_module._read_member
+    preregistration_path = source / "configs" / "preregistration-v2.yaml"
+    original = preregistration_path.read_bytes()
+    replacement = (
+        original + b"# semantically equivalent race replacement\n"
+    )
+    captured = _replace_after_tracked_snapshot(
+        package_module,
+        monkeypatch,
+        path=preregistration_path,
+        replacement=replacement,
+    )
 
-    def raced_read(root, relative):
-        data = original(root, relative)
-        if relative == "configs/preregistration-v2.yaml":
-            replaced = data.replace(
-                b"model_parameters: 356033536",
-                b"model_parameters: 356033535",
-                1,
-            )
-            assert replaced != data
-            return replaced
-        return data
+    release = package_module.build_handoff(
+        source_root=source,
+        out_dir=tmp_path / "out",
+    )
 
-    monkeypatch.setattr(package_module, "_read_member", raced_read)
-    out = tmp_path / "out"
-
-    with pytest.raises(
-        package_module.PackageError,
-        match="preregistration hash mismatch",
-    ):
-        package_module.build_handoff(source_root=source, out_dir=out)
-
-    assert not out.exists()
+    with zipfile.ZipFile(release.archive) as archive:
+        packaged = archive.read("configs/preregistration-v2.yaml")
+        metadata = json.loads(archive.read("RELEASE-METADATA.json"))
+    digest = hashlib.sha256(original).hexdigest()
+    member = next(
+        row
+        for row in metadata["members"]
+        if row["path"] == "configs/preregistration-v2.yaml"
+    )
+    assert preregistration_path.read_bytes() == replacement
+    assert packaged == original
+    assert metadata["preregistration_sha256"] == digest
+    assert member == {
+        "path": "configs/preregistration-v2.yaml",
+        "bytes": len(original),
+        "sha256": digest,
+        "git_blob": captured["git_blob"],
+    }
 
 
 def test_packager_refuses_to_replace_existing_release_set(

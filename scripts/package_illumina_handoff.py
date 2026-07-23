@@ -20,7 +20,7 @@ _SOURCE_ROOT = str(Path(__file__).resolve().parents[1])
 if _SOURCE_ROOT not in sys.path:
     sys.path.insert(0, _SOURCE_ROOT)
 
-from msctl.cohort import load_cohort_assignment
+from msctl.cohort import load_cohort_assignment_bytes
 from msctl.errors import MsctlError
 
 
@@ -44,6 +44,11 @@ ILLUMINA_RUN_CONFIGS = frozenset(
         "configs/360m-v2/dense-s0.yaml",
         "configs/360m-v2/split90-s0.yaml",
     }
+)
+COHORT_RUN_CONFIGS = frozenset(
+    f"configs/360m-v2/{arm}-s{seed}.yaml"
+    for seed in range(5)
+    for arm in ("dense", "split90")
 )
 NORMALIZED_TIME = (1980, 1, 1, 0, 0, 0)
 PLANNED_DIRECTORIES = (
@@ -189,27 +194,30 @@ def _clean_revision(root: Path) -> str:
     return revision
 
 
-def _tracked_files(root: Path) -> list[_Tracked]:
-    output = _run_git(root, "ls-files", "-s", "-z")
+def _tracked_files(root: Path, revision: str) -> list[_Tracked]:
+    output = _run_git(root, "ls-tree", "-r", "-z", revision)
     result = []
     for raw in output.split(b"\0"):
         if not raw:
             continue
         try:
             metadata, encoded_path = raw.split(b"\t", 1)
-            mode, object_id, stage = metadata.decode("ascii").split()
+            mode, object_type, object_id = metadata.decode("ascii").split()
             path = encoded_path.decode("utf-8")
         except (UnicodeDecodeError, ValueError) as error:
-            raise PackageError("Git index contains an unsupported path") from error
-        if stage != "0":
-            raise PackageError("Git index contains an unresolved stage")
+            raise PackageError("Git commit contains an unsupported path") from error
+        if (
+            object_type != "blob"
+            or re.fullmatch(r"[0-9a-f]{40,64}", object_id) is None
+        ):
+            raise PackageError("Git commit contains a non-blob entry")
         portable = PurePosixPath(path)
         if (
             portable.is_absolute()
             or "\\" in path
             or any(part in {"", ".", ".."} for part in path.split("/"))
         ):
-            raise PackageError("Git index contains an unsafe path")
+            raise PackageError("Git commit contains an unsafe path")
         if mode == "120000":
             raise PackageError(f"tracked symlink is forbidden: {path}")
         if mode not in {"100644", "100755"}:
@@ -282,37 +290,47 @@ def _classification(path: str) -> str:
     return "unknown"
 
 
-def _read_member(root: Path, relative: str) -> bytes:
-    root_resolved = root.resolve()
-    candidate = root
-    for part in PurePosixPath(relative).parts:
-        candidate = candidate / part
-        if candidate.is_symlink():
-            raise PackageError(f"symlink traversal is forbidden: {relative}")
+def _read_git_blobs(
+    root: Path,
+    tracked: list[_Tracked],
+) -> dict[str, bytes]:
+    queries = b"".join(
+        item.object_id.encode("ascii") + b"\n" for item in tracked
+    )
+    completed = subprocess.run(
+        ["git", "-C", str(root), "cat-file", "--batch"],
+        input=queries,
+        capture_output=True,
+        check=False,
+    )
+    if completed.returncode != 0:
+        raise PackageError("Git blob snapshot cannot be read")
+
+    output = completed.stdout
+    cursor = 0
+    blobs: dict[str, bytes] = {}
     try:
-        resolved = candidate.resolve(strict=True)
-        resolved.relative_to(root_resolved)
-    except (FileNotFoundError, ValueError) as error:
-        raise PackageError(f"tracked member is missing or unsafe: {relative}") from error
-    if not resolved.is_file():
-        raise PackageError(f"tracked member is not a regular file: {relative}")
-    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
-    descriptor: int | None = None
-    try:
-        descriptor = os.open(candidate, flags)
-        metadata = os.fstat(descriptor)
-        if not stat.S_ISREG(metadata.st_mode):
-            raise PackageError(
-                f"tracked member is not a regular file: {relative}"
-            )
-        with os.fdopen(descriptor, "rb") as handle:
-            descriptor = None
-            return handle.read()
-    except OSError as error:
-        raise PackageError(f"tracked member cannot be read safely: {relative}") from error
-    finally:
-        if descriptor is not None:
-            os.close(descriptor)
+        for item in tracked:
+            header_end = output.index(b"\n", cursor)
+            header = output[cursor:header_end].decode("ascii").split()
+            if (
+                len(header) != 3
+                or header[0] != item.object_id
+                or header[1] != "blob"
+            ):
+                raise ValueError
+            size = int(header[2])
+            data_start = header_end + 1
+            data_end = data_start + size
+            if size < 0 or output[data_end : data_end + 1] != b"\n":
+                raise ValueError
+            blobs[item.path] = output[data_start:data_end]
+            cursor = data_end + 1
+    except (UnicodeDecodeError, ValueError) as error:
+        raise PackageError("Git blob snapshot response is malformed") from error
+    if cursor != len(output) or len(blobs) != len(tracked):
+        raise PackageError("Git blob snapshot response is incomplete")
+    return blobs
 
 
 def _scan_secret(path: str, data: bytes) -> None:
@@ -471,8 +489,50 @@ def _collect_payload(
     tracked: list[_Tracked],
     revision: str,
 ) -> tuple[dict[str, bytes], str]:
+    included: list[_Tracked] = []
+    unknown = []
+    for item in tracked:
+        classification = _classification(item.path)
+        if classification == "included":
+            included.append(item)
+        elif classification == "unknown":
+            unknown.append(item.path)
+    if unknown:
+        raise PackageError(f"unknown tracked path is not allowlisted: {unknown[0]}")
+    paths = {item.path for item in included}
+    missing = sorted(REQUIRED_MEMBERS - paths)
+    if missing:
+        raise PackageError(f"required release member is not tracked: {missing[0]}")
+    tracked_by_path = {item.path: item for item in tracked}
+    tracked_run_configs = {
+        path
+        for path in tracked_by_path
+        if path.startswith("configs/360m-v2/")
+    }
+    if tracked_run_configs != COHORT_RUN_CONFIGS:
+        raise PackageError(
+            "cohort run configs must contain exactly ten tracked cells"
+        )
+    snapshot_paths = paths | COHORT_RUN_CONFIGS
+    missing_snapshot = sorted(snapshot_paths - set(tracked_by_path))
+    if missing_snapshot:
+        raise PackageError(
+            f"required Git snapshot member is missing: {missing_snapshot[0]}"
+        )
+    snapshot_items = sorted(
+        (tracked_by_path[path] for path in snapshot_paths),
+        key=lambda item: item.path,
+    )
+    snapshot = _read_git_blobs(source, snapshot_items)
+
     try:
-        cohort = load_cohort_assignment(source / COHORT_ASSIGNMENT)
+        cohort = load_cohort_assignment_bytes(
+            assignment_data=snapshot[COHORT_ASSIGNMENT],
+            preregistration_data=snapshot[PREREGISTRATION],
+            config_data={
+                path: snapshot[path] for path in COHORT_RUN_CONFIGS
+            },
+        )
         provider_configs = cohort.configs_for_provider(PROVIDER)
     except MsctlError as error:
         raise PackageError(f"invalid cohort assignment: {error.message}") from error
@@ -489,26 +549,11 @@ def _collect_payload(
         config.path: config.sha256 for config in provider_configs
     }
 
-    included: list[_Tracked] = []
-    unknown = []
-    for item in tracked:
-        classification = _classification(item.path)
-        if classification == "included":
-            included.append(item)
-        elif classification == "unknown":
-            unknown.append(item.path)
-    if unknown:
-        raise PackageError(f"unknown tracked path is not allowlisted: {unknown[0]}")
-    paths = {item.path for item in included}
-    missing = sorted(REQUIRED_MEMBERS - paths)
-    if missing:
-        raise PackageError(f"required release member is not tracked: {missing[0]}")
-
     payload: dict[str, bytes] = {}
     member_rows = []
     environment_hashes: dict[str, str] = {}
     for item in included:
-        data = _read_member(source, item.path)
+        data = snapshot[item.path]
         _scan_secret(item.path, data)
         digest = _sha256(data)
         if (
@@ -573,7 +618,7 @@ def build_handoff(
     if source.is_symlink() or not source.is_dir():
         raise PackageError("source root must be a regular directory")
     revision = _clean_revision(source)
-    tracked = _tracked_files(source)
+    tracked = _tracked_files(source, revision)
     payload, members_sha256 = _collect_payload(source, tracked, revision)
     release_suffix = members_sha256[:16]
     release_id = f"r1-{release_suffix}"
