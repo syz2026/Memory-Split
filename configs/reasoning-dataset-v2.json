@@ -1,0 +1,59 @@
+{
+  "contract_id": "memorysplit-reasoning-dataset-v2",
+  "schema_version": 2,
+  "sprint_recipe": {
+    "all_lanes_required": true,
+    "label": "20tpp_reasoning_maximized_sprint",
+    "lanes": [
+      {
+        "id": "fineweb_edu",
+        "share_percent": 25.0,
+        "source_lock_sha256": "18d665853778f2d9ead41347ffc9ae4607e7a883692423611c38e890a3b8be51"
+      },
+      {
+        "id": "finemath",
+        "share_percent": 15.0,
+        "source_lock_sha256": "8881c572af9fdf826b041bc7756455185bf103a7a40adc1b7f24003c9b7cd369"
+      },
+      {
+        "complete_once": true,
+        "id": "wikidata_graph",
+        "share_percent": 20.0,
+        "source_lock_sha256": "fe4528d8057038f804396b9913fde09a2f389c5558275e166144853f77bdfbe1"
+      },
+      {
+        "id": "srgm_worlds",
+        "share_percent": 10.0,
+        "source_lock_sha256": "22567f14a1eeb8616cb0e79e9a1682a601924652ba1f5e3d0e6ca6f77fd2b92b"
+      },
+      {
+        "id": "proof_composition",
+        "share_percent": 10.0,
+        "source_lock_sha256": "eb6c1e41885649be108f5d1e7e5319c385839a0926f16d1e65fa5132190933c9"
+      },
+      {
+        "id": "graph_non_path",
+        "share_percent": 8.0,
+        "source_lock_sha256": "ce507454bccdb8ba0e418797ed3eaa9329f54f8c7d18f16a03339472f29a2eb0"
+      },
+      {
+        "id": "counterfactual_pairs",
+        "share_percent": 7.0,
+        "source_lock_sha256": "52e0c77adccda1fc4cc527b2b33f48a1cab8387abd4366e13fe3466d449d0ff4"
+      },
+      {
+        "id": "general_reasoning",
+        "share_percent": 5.0,
+        "source_lock_sha256": "dda329890af124425306ac341971ca35f3238a40235392b7a95570d75e9522e9"
+      }
+    ],
+    "model_parameters": 356033536,
+    "nominal_tokens_per_parameter": 20,
+    "raw_target_tokens": 7120879616,
+    "sidecars": [
+      "dense_target_weights",
+      "split90_target_weights"
+    ],
+    "wikidata_coverage": "complete_once"
+  }
+}

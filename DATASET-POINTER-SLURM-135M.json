@@ -1,0 +1,20 @@
+{
+  "contract_id": "memorysplit-parallel-corpus-v2",
+  "dataset_id": "memorysplit-v2-20x-reasoning-max-cohort",
+  "expected_ordered_token_stream_sha256": null,
+  "expected_receipt_sha256": null,
+  "launch_gate_status": "unfrozen",
+  "materialization": "filesystem-mirror",
+  "mirror_root_environment": {
+    "farmshare": "MS135_FARMSHARE_DATASET_ROOT",
+    "mit": "MS135_MIT_DATASET_ROOT"
+  },
+  "receipt_relative_path": "receipt.json",
+  "relative_path": "dataset",
+  "required_sidecars": [
+    "dense_target_weights",
+    "split90_target_weights"
+  ],
+  "schema_version": 1,
+  "source_lock_manifest": "configs/reasoning-dataset-v2.json"
+}
