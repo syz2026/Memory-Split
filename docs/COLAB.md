@@ -26,6 +26,10 @@ first cell. The selected checkpoint must contain its training `step`
 metadata. The two source configs must agree on architecture, seed, schedule,
 optimizer settings, microbatching, precision, and selected completion step:
 
+For the current `compose_*_s0` runs, dense's latest snapshot is step 1900 and
+split's is 1520. The notebook therefore selects `step0001520.pt` for both;
+using their unequal latest steps would confound the arm comparison.
+
 ```text
 MyDrive/memorysplit/compose_dense_s0/
 ├── config.yaml
