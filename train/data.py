@@ -597,7 +597,7 @@ class PackedShards:
         supplied = Path(root)
         receipt_path = _resolve_parallel_receipt_path(supplied)
         publication = receipt_path.parent
-        receipt = verify_parallel_corpus(receipt_path)
+        receipt = dict(verify_parallel_corpus(receipt_path))
         _validate_parallel_receipt_scalars(receipt)
         publication_format = receipt["format"]
         sidecar_set = None
