@@ -547,8 +547,8 @@ git commit -m "feat: launch matched P5 seed pairs"
 
 **Interfaces:**
 - Commands: `auth check`, `capacity check`, `env ensure`, `dataset ensure`,
-  `dataset verify`, `runs render`, `submit`, `status`, `resume`, `cancel`,
-  `evaluate`, `collect`, `cleanup`
+  `dataset verify`, `runs instantiate`, `runs render`, `submit`, `status`,
+  `resume`, `cancel`, `evaluate`, `collect`, `cleanup`
 - AWS backend: S3 + SSM + EC2 APIs through AWS CLI JSON output
 
 - [ ] **Step 1: Add provider dispatch tests**
@@ -562,7 +562,24 @@ unknown AWS output fields, wrong instance tags, and duplicate active seed IDs.
 Every mutating AWS operation must reject seed 0. Every Illumina mutating
 operation must reject seeds 1–4.
 
-- [ ] **Step 3: Implement AWS backend**
+- [ ] **Step 3: Instantiate run manifests after release publication**
+
+Add:
+
+```text
+msctl runs instantiate --release RELEASE.json \
+  --dataset-receipt dataset-receipt.json --seed N --out runs-sN.json --apply
+```
+
+This is the only run-manifest creation path. It resolves the provider-owned
+seed's two checked-in configs, verifies their hashes and Dense/Split90
+invariants, then binds the now-known release, dataset, cohort-assignment,
+study-lock, and config SHA-256 values. Illumina accepts only `N=0`; AWS accepts
+only `N` in `1..4`. Dry-run returns the exact canonical manifest and hash
+without writing. Apply uses atomic no-replace publication. No manifest may
+bind more than one seed pair.
+
+- [ ] **Step 4: Implement AWS backend**
 
 Use argument arrays with `env -i`; never invoke a shell. Require:
 
@@ -574,19 +591,19 @@ Use argument arrays with `env -i`; never invoke a shell. Require:
 - S3 durable prefix;
 - explicit approval for paid launch, resume, cancel, evaluate, and cleanup.
 
-- [ ] **Step 4: Implement paired checkpoint resume**
+- [ ] **Step 5: Implement paired checkpoint resume**
 
 Pass `--resume-path` and `--resume-sha256` to `scripts/run_train.py` for each
 arm. Require world size 4, matching seed/arm/config/corpus/code, and both
 checkpoint hashes before mutation.
 
-- [ ] **Step 5: Verify**
+- [ ] **Step 6: Verify**
 
 ```bash
 pytest -q tests/test_msctl.py tests/test_aws_p5_launcher.py
 ```
 
-- [ ] **Step 6: Commit**
+- [ ] **Step 7: Commit**
 
 ```bash
 git add msctl tests/test_msctl.py
