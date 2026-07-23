@@ -104,6 +104,7 @@ def _minimal_repo(tmp_path: Path) -> Path:
             / "memorysplit-cluster"
             / "SKILL.md"
         ).read_bytes(),
+        "Memory-split-design.md": "known excluded design documentation\n",
         "README.md": "known excluded documentation\n",
         "docs/history.md": "known excluded documentation\n",
         "data/full-corpus.bin": b"excluded corpus",

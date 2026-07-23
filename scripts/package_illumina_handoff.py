@@ -70,6 +70,7 @@ _INCLUDED_SUFFIXES = {
 _KNOWN_EXCLUDED_ROOT_FILES = {
     ".gitignore",
     "HANDOFF-AGENT.md",
+    "Memory-split-design.md",
     "README.md",
 }
 _KNOWN_EXCLUDED_TOP_LEVEL = {
