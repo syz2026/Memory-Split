@@ -20,6 +20,7 @@ from evals.confirmatory.contracts import (
     SEALED_GOLD_SCHEMA,
     STORE_SCHEMA,
     ItemRecord,
+    StoreRecord,
     canonical_json_bytes,
     store_content_sha256,
 )
@@ -67,7 +68,11 @@ class _Fixture:
     submissions: dict[str, object]
 
 
-def _sealed_fixture(tmp_path: Path) -> _Fixture:
+def _sealed_fixture(
+    tmp_path: Path,
+    *,
+    candidate_text: str = " candidate=done",
+) -> _Fixture:
     runner = _runner()
     tmp_path.mkdir(parents=True, exist_ok=True)
     run = tmp_path / "run"
@@ -75,10 +80,21 @@ def _sealed_fixture(tmp_path: Path) -> _Fixture:
     run.mkdir()
     release.mkdir()
 
+    tok = get_tok()
+    response_ids = tuple(tok.encode(candidate_text))
+    assert response_ids
+    transitions: dict[int, int] = {}
+    for source_id, target_id in zip(
+        (tok.ANSWER_STATE, *response_ids),
+        (*response_ids, tok.GRAPH_START),
+        strict=True,
+    ):
+        previous = transitions.setdefault(source_id, target_id)
+        assert previous == target_id
     model_config = {
         "n_layer": 0,
         "n_head": 1,
-        "d_model": 2,
+        "d_model": len(transitions),
         "vocab_size": 50304,
         "ctx": 512,
     }
@@ -90,19 +106,14 @@ def _sealed_fixture(tmp_path: Path) -> _Fixture:
     config_path = run / "config.json"
     config_path.write_bytes(canonical_json_bytes(run_config))
     configuration_sha256 = hashlib.sha256(config_path.read_bytes()).hexdigest()
-    tok = get_tok()
-    answer_ids = tok.encode("done")
-    assert len(answer_ids) == 1
-    answer_id = answer_ids[0]
     model = GPT(GPTConfig(**model_config))
     with torch.no_grad():
         for parameter in model.parameters():
             parameter.zero_()
         model.ln_f.weight.fill_(1.0)
-        model.wte.weight[tok.ANSWER_STATE] = torch.tensor([1.0, 0.0])
-        model.lm_head.weight[answer_id] = torch.tensor([1.0, 0.0])
-        model.wte.weight[answer_id] = torch.tensor([0.0, 1.0])
-        model.lm_head.weight[tok.GRAPH_START] = torch.tensor([0.0, 1.0])
+        for dimension, (source_id, target_id) in enumerate(transitions.items()):
+            model.wte.weight[source_id, dimension] = 1.0
+            model.lm_head.weight[target_id, dimension] = 1.0
     checkpoint_path = run / "ckpt.pt"
     torch.save(
         {
@@ -411,13 +422,40 @@ def _sealed_fixture(tmp_path: Path) -> _Fixture:
     )
 
 
+def _model_visible_pair(
+    fixture: _Fixture,
+    *,
+    memory_mode: str = "memory_on",
+) -> tuple[ItemRecord, StoreRecord]:
+    items = [
+        ItemRecord.from_dict(json.loads(line))
+        for line in fixture.release.joinpath("items.jsonl").read_bytes().splitlines()
+    ]
+    stores = {
+        store.store_id: store
+        for store in (
+            StoreRecord.from_dict(json.loads(line))
+            for line in fixture.release.joinpath("stores.jsonl")
+            .read_bytes()
+            .splitlines()
+        )
+    }
+    item = next(row for row in items if row.memory_mode.value == memory_mode)
+    return item, stores[item.store_id]
+
+
 def _reseal_study_lock(fixture: _Fixture, **release_changes) -> str:
     path = fixture.release / "study-lock.json"
     lock = json.loads(path.read_bytes())
     lock["release"].update(release_changes)
     content = canonical_json_bytes(lock)
     path.write_bytes(content)
-    return hashlib.sha256(content).hexdigest()
+    expected = hashlib.sha256(content).hexdigest()
+    validity_path = fixture.release / "validity.json"
+    validity = json.loads(validity_path.read_bytes())
+    validity["study_lock_sha256"] = expected
+    validity_path.write_bytes(canonical_json_bytes(validity))
+    return expected
 
 
 def _mutate_study_lock(fixture: _Fixture, mutation) -> str:
@@ -470,7 +508,7 @@ def test_repository_adapter_rejects_checkpoint_hash_architecture_and_state_drift
     checkpoint_path = architecture_fixture.run / "ckpt.pt"
     state = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
     state["cfg"] = copy.deepcopy(state["cfg"])
-    state["cfg"]["model"]["d_model"] = 4
+    state["cfg"]["model"]["d_model"] += 1
     torch.save(state, checkpoint_path)
     binding = replace(
         binding,
@@ -499,6 +537,98 @@ def test_repository_adapter_rejects_checkpoint_hash_architecture_and_state_drift
             binding,
             "cpu",
         )
+
+
+@pytest.mark.parametrize(
+    "candidate_text",
+    [
+        "done",
+        " candidate:done",
+        " candidate=done suffix",
+    ],
+)
+def test_repository_adapter_rejects_malformed_candidate_framing(
+    tmp_path,
+    candidate_text,
+):
+    runner = _runner()
+    fixture = _sealed_fixture(tmp_path, candidate_text=candidate_text)
+    binding = runner._load_run_binding(fixture.run)
+    adapter = runner.RepositoryGPTAdapter.from_bound_run(
+        fixture.run,
+        binding,
+        "cpu",
+    )
+    item, store = _model_visible_pair(fixture)
+
+    with pytest.raises(ValueError, match="candidate.*framing"):
+        adapter.generate(item, store)
+
+
+def test_candidate_parser_accepts_only_matching_trained_final_frame():
+    runner = _runner()
+
+    assert (
+        runner._parse_candidate_response(
+            " candidate=done final=done",
+            final=True,
+        )
+        == "done"
+    )
+    with pytest.raises(ValueError, match="final value"):
+        runner._parse_candidate_response(
+            " candidate=done final=other",
+            final=True,
+        )
+    with pytest.raises(ValueError, match="framing"):
+        runner._parse_candidate_response(
+            " candidate=done final=done suffix",
+            final=True,
+        )
+
+
+def test_repository_adapter_never_teacher_forces_store_target_as_candidate(tmp_path):
+    runner = _runner()
+    fixture = _sealed_fixture(tmp_path)
+    binding = runner._load_run_binding(fixture.run)
+    adapter = runner.RepositoryGPTAdapter.from_bound_run(
+        fixture.run,
+        binding,
+        "cpu",
+    )
+    item, store = _model_visible_pair(fixture)
+    raw_store = store.to_dict()
+    raw_store["rows"][0]["target"] = "leak-sentinel"
+    raw_store["content_sha256"] = store_content_sha256(
+        raw_store["store_id"],
+        raw_store["world_id"],
+        raw_store["rows"],
+    )
+    changed_store = StoreRecord.from_dict(raw_store)
+    observed_token_ids: list[int] = []
+    repository_model = adapter.model
+
+    class RecordingModel:
+        cfg = repository_model.cfg
+
+        def forward_step(self, token_ids, cache):
+            observed_token_ids.extend(int(value) for value in token_ids.flatten())
+            return repository_model.forward_step(token_ids, cache)
+
+    adapter.model = RecordingModel()
+    submission = adapter.generate(item, changed_store)
+
+    tok = get_tok()
+    expected_candidate = tuple(tok.encode(" candidate=done"))
+    observed_candidates = []
+    for position, token_id in enumerate(observed_token_ids):
+        if token_id != tok.ANSWER_STATE:
+            continue
+        terminator = observed_token_ids.index(tok.GRAPH_START, position + 1)
+        observed_candidates.append(tuple(observed_token_ids[position + 1 : terminator]))
+    assert submission.answer == "done"
+    assert observed_candidates == [expected_candidate] * 12
+    assert tuple(tok.encode(" candidate=leak-sentinel")) not in observed_candidates
 
 
 def test_submission_requires_exactly_twelve_valid_action_slots():
@@ -661,6 +791,65 @@ def test_runner_rejects_drifted_frozen_graph_protocol(tmp_path, monkeypatch):
             sealed_release=fixture.release,
             expected_study_lock_sha256=fixture.expected_study_lock_sha256,
         )
+
+
+def test_incomplete_readiness_prevents_inference_gold_open_and_scoring(
+    tmp_path,
+    monkeypatch,
+):
+    runner = _runner()
+    fixture = _sealed_fixture(tmp_path)
+    validity_path = fixture.release / "validity.json"
+    validity = json.loads(validity_path.read_bytes())
+    validity["receipts"] = validity["receipts"][1:]
+    validity_path.write_bytes(canonical_json_bytes(validity))
+    adapter_calls = 0
+    gold_reads = 0
+    score_calls = 0
+    delegate = runner.DeterministicFixtureAdapter(fixture.submissions)
+
+    class CountingAdapter:
+        def generate(self, item, store):
+            nonlocal adapter_calls
+            adapter_calls += 1
+            return delegate.generate(item, store)
+
+    read_regular_file = runner._read_regular_file
+
+    def record_reads(path, name):
+        nonlocal gold_reads
+        if name == "sealed-gold.jsonl":
+            gold_reads += 1
+        return read_regular_file(path, name)
+
+    score_and_summarize = runner._score_and_summarize
+
+    def record_scoring(**kwargs):
+        nonlocal score_calls
+        score_calls += 1
+        return score_and_summarize(**kwargs)
+
+    monkeypatch.setattr(runner, "_read_regular_file", record_reads)
+    monkeypatch.setattr(runner, "_score_and_summarize", record_scoring)
+    error = None
+    try:
+        runner.evaluate(
+            run=fixture.run,
+            sealed_release=fixture.release,
+            expected_study_lock_sha256=fixture.expected_study_lock_sha256,
+            model_adapter=CountingAdapter(),
+            output_dir=fixture.output,
+        )
+    except ValueError as exc:
+        error = exc
+
+    assert adapter_calls == 0
+    assert gold_reads == 0
+    assert score_calls == 0
+    assert error is not None
+    assert "readiness" in str(error)
+    assert "complete" in str(error)
+    assert not fixture.output.exists()
 
 
 def test_runner_keeps_gold_sealed_replays_solver_and_publishes_canonical_evidence(

@@ -55,6 +55,12 @@ PRIMARY_CONTRAST_ID = (
 )
 PRIMARY_TEST_METHOD = "exact_one_sided_exhaustive_sign_flip"
 _SHA256_RE = re.compile(r"[0-9a-f]{64}")
+_CANONICAL_CANDIDATE_VALUE = r"(?:[A-Za-z0-9][A-Za-z0-9_.:/-]{0,255}|<\|slot_[0-3]\|>)"
+_CANDIDATE_RESPONSE_RE = re.compile(rf" candidate=({_CANONICAL_CANDIDATE_VALUE})")
+_FINAL_RESPONSE_RE = re.compile(
+    rf" candidate=({_CANONICAL_CANDIDATE_VALUE})"
+    rf" final=({_CANONICAL_CANDIDATE_VALUE})"
+)
 _RUN_FIELDS = frozenset(
     {
         "record_type",
@@ -217,6 +223,7 @@ class _PreparedEvaluation:
     run: Path
     release: Path
     lock: _StudyLockView
+    validity_content: bytes
     binding: RunBinding
     checkpoint: _CheckpointView
     selected_ids: tuple[str, ...]
@@ -632,9 +639,10 @@ class RepositoryGPTAdapter:
                     raise ValueError(
                         "model ended before completing twelve action slots"
                     )
-                answer = tok.decode(answer_tokens).strip()
-                if not answer:
-                    raise ValueError("model answer decodes to empty text")
+                answer = _parse_candidate_response(
+                    tok.decode(answer_tokens),
+                    final=final,
+                )
                 return answer, logits, cache, token_id == tok.GRAPH_START
             answer_tokens.append(token_id)
         raise ValueError("model answer exceeded the frozen token budget")
@@ -728,11 +736,23 @@ class RepositoryGPTAdapter:
                 answers.append(answer)
         if reads > 10:
             raise AssertionError("repository adapter exceeded read cap")
-        # Slot 11 is the last clean provisional answer before the final record
-        # tail. A solver-valid trace cannot READ after it because slot 12 must
-        # HALT (or is post-HALT padding), so this answer contains every return
-        # without accidentally concatenating the duplicated final-answer tail.
-        return Submission(item.item_id, answers[-2], tuple(actions))
+        return Submission(item.item_id, answers[-1], tuple(actions))
+
+
+def _parse_candidate_response(value: str, *, final: bool) -> str:
+    if final:
+        final_match = _FINAL_RESPONSE_RE.fullmatch(value)
+        if final_match is not None:
+            candidate, final_answer = final_match.groups()
+            if candidate != final_answer:
+                raise ValueError(
+                    "model candidate response final value disagrees with candidate"
+                )
+            return candidate
+    match = _CANDIDATE_RESPONSE_RE.fullmatch(value)
+    if match is None:
+        raise ValueError("model candidate response has invalid framing")
+    return match.group(1)
 
 
 def _strict_mapping(
@@ -896,6 +916,7 @@ def _hardened_study_lock_api():
     required = (
         "StudyLock",
         "ValidityEvidence",
+        "ReadinessResult",
         "evaluate_readiness",
         "VALIDITY_EVIDENCE_SCHEMA",
         "FROZEN_PREREGISTRATION_SHA256",
@@ -962,6 +983,30 @@ def _load_study_lock(
         content=content,
         sha256=actual,
     )
+
+
+def _load_complete_readiness(release: Path, lock: _StudyLockView) -> bytes:
+    content = _read_regular_file(
+        release / "validity.json",
+        "validity.json",
+    )
+    raw = _canonical_object(content, "validity.json")
+    api = _hardened_study_lock_api()
+    typed = api.ValidityEvidence.from_dict(raw)
+    readiness = api.evaluate_readiness(lock.typed, typed)
+    if (
+        not isinstance(readiness, api.ReadinessResult)
+        or type(readiness.complete) is not bool
+        or type(readiness.valid) is not bool
+    ):
+        raise ValidationInterfaceUnavailable(
+            "hardened study-lock readiness result contract is unavailable"
+        )
+    if not readiness.complete or not readiness.valid:
+        raise ValueError(
+            "study-lock readiness must be complete and valid before evaluation"
+        )
+    return content
 
 
 def _read_bound_artifact(
@@ -1475,6 +1520,7 @@ def _prepare_evaluation(
     release = _directory(sealed_release, "sealed release")
     run_root = _directory(run, "run")
     lock = _load_study_lock(release, expected_study_lock_sha256)
+    validity_content = _load_complete_readiness(release, lock)
     binding = _load_run_binding(run_root)
     _validate_run_files(run_root, binding)
     checkpoint = _load_checkpoints(release, lock, binding)
@@ -1510,6 +1556,7 @@ def _prepare_evaluation(
         run=run_root,
         release=release,
         lock=lock,
+        validity_content=validity_content,
         binding=binding,
         checkpoint=checkpoint,
         selected_ids=selected_ids,
@@ -1570,6 +1617,7 @@ def evaluate(
     items = prepared.items
     stores_content = prepared.stores_content
     stores = prepared.stores
+    validity_content = prepared.validity_content
     if model_adapter is None:
         model_adapter = RepositoryGPTAdapter.from_bound_run(
             prepared.run,
@@ -1621,18 +1669,6 @@ def evaluate(
         binding=binding,
         submissions=submissions,
     )
-    validity_content = _read_regular_file(
-        release / "validity.json",
-        "validity.json",
-    )
-    validity = _canonical_object(validity_content, "validity.json")
-    if validity.get("record_type") != VALIDITY_EVIDENCE_SCHEMA:
-        raise ValueError("validity.json record_type is invalid")
-    if validity.get("study_lock_sha256") != lock.sha256:
-        raise ValueError("validity evidence is unbound from study lock")
-    readiness_api = _hardened_study_lock_api()
-    typed_validity = readiness_api.ValidityEvidence.from_dict(validity)
-    readiness_api.evaluate_readiness(lock.typed, typed_validity)
     artifacts = MappingProxyType(
         {
             "checkpoints.jsonl": checkpoint.content,

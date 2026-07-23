@@ -3,42 +3,46 @@
 Date: 2026-07-23
 Branch: `feat/memorysplit-v2-confirmatory-runner`
 Base: `c190429b1542`
-Validated hardening revision: `f9341246012e83c3647069840218261e860466f6`
+Merged hardening parent: `f9341246012e83c3647069840218261e860466f6`
 
 ## Outcome
 
-The review findings are fixed in the requested isolated worktree. The CLI now
-constructs a real checkpoint-backed `RepositoryGPTAdapter` whenever
-`--output-dir` is supplied, while tests may still inject the strict
-`ModelAdapter` or `DeterministicFixtureAdapter`.
+Candidate A now contains the hardened confirmatory APIs from `f934124` and runs
+the full suite directly from an exact checkout. The runner keeps its packaged
+checkpoint-backed `RepositoryGPTAdapter`, injected test adapter boundary,
+transactional evidence publication, and canonical CLI.
 
-Scoped files:
-
-- `evals/confirmatory/runner.py`
-- `evals/confirmatory/__main__.py`
-- `tests/test_confirmatory_runner.py`
-- `.superpowers/sdd/task-8-report.md`
-
-No reporting, contracts, metrics, solver, or unrelated subsystem file was
-modified.
+The merge takes the confirmatory core and its tests exactly from `f934124`,
+including `study_lock.py`, sealed replay/reporting, and metrics with no exported
+caller-boolean scoring functions. Runner-specific changes remain confined to
+`runner.py`, `__main__.py`, `test_confirmatory_runner.py`, and this report. No
+provider or launcher was modified.
 
 ## Trust, model, and replay behavior
 
-- Requires and authenticates an external lowercase study-lock SHA-256 before
-  opening model-visible items. The permissive local validator is gone; the
-  externally rooted `f934124` study-lock/readiness API is mandatory.
-- Rejects malformed frozen preregistration, control registries, receipt
-  commitments, and drift in the repository graph-token protocol or `r0`-`r15`
-  relation vocabulary.
+- Requires and authenticates the external study-lock SHA-256, parses
+  `validity.json`, verifies every committed gate/control/guardrail receipt, and
+  requires readiness to be both complete and valid during preflight. This
+  occurs before model construction/inference, sealed-gold access, or scoring.
+- Uses the exact externally rooted `f934124` study-lock/readiness types and
+  rejects malformed preregistration, registries, receipts, and graph protocol.
 - Loads hash-bound config/checkpoint bytes with safe PyTorch loading, checks
   seed, explicit `dense`/`split90` identity, architecture metadata, strict
   state-dict shape/keys, and selected device availability.
 - Gives the model only a validated `ItemRecord` and its validated `StoreRecord`;
-  `memory_off` receives no store. Sealed gold is not opened until every
-  submission has been generated.
+  `memory_off` receives no store. Store data reaches the model only in the
+  serialized return produced by its selected read action.
 - Executes the frozen read/return protocol for exactly 12 slots, caps reads at
-  10, and pads every post-HALT slot with canonical NOOP. Store targets and
-  addresses never become action candidate lists.
+  10, and pads post-HALT slots with canonical NOOP.
+- Decodes the trained ` candidate=VALUE` response from model logits, requires
+  exact leading-space/prefix framing, a canonical value, and a strict
+  terminator. It strips the field framing before constructing `Submission`.
+  The trained final frame is accepted only when `candidate` and `final` agree;
+  malformed prefixes, whitespace suffixes, and mismatched finals fail closed.
+- Never derives candidates from sealed gold or store rows and never
+  teacher-forces `row.target` as candidate tokens. The anti-leak regression
+  changes the returned target to `leak-sentinel` while the real checkpoint
+  still emits exactly ` candidate=done` and submits only `done`.
 - Replays submitted answers/proofs through the trusted solver. Persisted
   outcomes remain submission-only and contain no asserted correctness flags.
 - Requires the hardened reporting API and publishes all evidence in an owned
@@ -53,19 +57,29 @@ modified.
 
 ## TDD and verification evidence
 
-RED was observed before each implementation slice: missing production adapter
-and contract symbols, permissive validation, non-transactional publication,
-and the graph-protocol drift regression all failed first. The final protocol
-RED was `DID NOT RAISE`; its focused GREEN result was `1 passed`.
-
-The final cross-worktree run loaded this runner with the committed confirmatory
-modules from `f934124` and ran the runner plus every `test_confirmatory*.py`:
+After merging the exact hardening parent, the unchanged baseline was:
 
 ```text
-136 passed in 41.07s
+136 passed in 55.60s
 ```
 
-This comprises 34 runner tests and 102 hardening tests, including real hardened
+The new focused RED run had six expected failures: the real checkpoint
+submitted `candidate=done`; three malformed/missing frames were accepted; the
+anti-leak test saw the unparsed field; and incomplete readiness made 160 model
+calls. The focused GREEN run was `6 passed in 9.75s`. A separate trained-final
+frame regression failed first on invalid framing and then passed.
+
+Final exact-checkout command:
+
+```text
+python -m pytest -q tests/test_confirmatory*.py
+```
+
+```text
+142 passed in 77.96s
+```
+
+This comprises 40 runner tests and 102 hardening tests, including real hardened
 report construction/publication, replay, trust, metrics, validation, contracts,
 and inference fixtures. The real tiny GPT/checkpoint CLI test evaluates 160
 items across both memory boundaries without mocking reporting.
@@ -73,20 +87,20 @@ items across both memory boundaries without mocking reporting.
 Additional gates:
 
 ```text
-module CLI help: evaluate help 1 True
-direct CLI help: evaluate help 1 True
 ruff check: All checks passed
-ruff format --check: 3 files already formatted
+runner scope format check: 3 files already formatted
 py_compile: passed
+contract marker and hidden metric exports: passed
+module and direct CLI smoke tests: passed
 git diff --check: passed
 ```
 
 ## Concerns and limits
 
-- The branch base intentionally predates the hardened modules. Evaluation and
-  publication therefore fail closed until `f934124` (or its exact compatible
-  API) is integrated.
 - CPU production construction and inference are exercised with a tiny real
   checkpoint. CUDA and MPS availability paths were not executable on this host.
+- The frozen candidate grammar accepts canonical ASCII identifiers and the four
+  slot markers used by the trained corpus. Expanding answer syntax requires a
+  versioned protocol change and new checkpoint/evaluator tests.
 - Atomic no-replace directory publication supports Darwin and Linux and fails
   closed on unsupported platforms.
