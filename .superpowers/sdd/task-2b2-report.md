@@ -541,3 +541,115 @@ No known Task 2B2 review finding remains. The existing Task 3 gates still
 apply: the v3 manifest intentionally has no legacy `dataset_sha256` property,
 non-instantiation v3 AWS CLI paths remain unavailable, and sealed-evaluation
 artifact verification remains outside Task 2B2.
+
+## Acceptance follow-up: unmodified default semantic verifier
+
+One acceptance gap remained in the earlier verifier coverage. The real-verifier
+tests injected a dataset verifier that called
+`cluster.aws.p5.corpus_contract.verify_canonical_corpus()` with a test semantic
+verifier. They therefore did not prove that an ordinary
+`instantiate_run_manifest()` call resolves
+`msctl.operations._load_task4_dataset_verifier` and reaches the canonical
+verifier's default `corpusgen.parallel.verify_parallel_corpus` semantics.
+
+The correction is committed in:
+
+- `7afe7b7fd257ae8bc7fda19522eeff9854c1c4cf`
+  (`test: cover default Task 4 verifier path`)
+- This follow-up report is committed separately in the commit containing this
+  appended section.
+
+### Acceptance RED
+
+The integration test was first added with no `dataset_verifier` argument,
+against the existing hand-authored publication fixture:
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 python -m pytest -q -p no:cacheprovider \
+  --basetemp=/tmp/memorysplit-v3-task2b2-default-verifier-red \
+  tests/test_run_manifest_v3.py::\
+test_v3_instantiates_through_unmodified_default_corpus_verifier
+```
+
+```text
+F                                                                        [100%]
+1 failed in 0.91s
+```
+
+The traceback showed the expected fixture gap:
+`corpusgen.parallel.verify_parallel_corpus()` rejected the synthetic
+`catalog.jsonl` because `{"fixture":"catalog"}` did not match the canonical
+catalog-record contract. `instantiate_run_manifest()` closed that rejection as
+`DATASET_RECEIPT_INVALID`. No production verification was changed.
+
+### Acceptance correction
+
+The new test-only `_build_default_verified_corpus()` helper constructs a
+legitimate `memorysplit-parallel-corpus-v2` publication with the production
+Task 4 builder:
+
+- a canonical `fixture_catalog()` and `FixtureRenderer`;
+- a real `ParallelBuildConfig`;
+- exact `dense_target_weights` and `split90_target_weights` source streams;
+- `build_parallel_corpus()`, which emits the canonical receipt, catalog,
+  metadata, schedule, assignments, packed shards, and sidecar shards.
+
+The integration test then calls `instantiate_run_manifest()` directly without
+the `dataset_verifier` keyword. It does not pass a semantic-verifier lambda.
+Consequently the exercised path is:
+
+```text
+instantiate_run_manifest
+  -> msctl.operations._load_task4_dataset_verifier
+  -> cluster.aws.p5.corpus_contract.verify_canonical_corpus
+  -> corpusgen.parallel.verify_parallel_corpus
+```
+
+The test asserts that the resulting manifest and verification evidence carry
+the actual builder-produced receipt and build identities. No `msctl/`,
+`cluster/`, or `corpusgen/` production file changed.
+
+### Acceptance GREEN
+
+The focused integration test then passed:
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 python -m pytest -q -p no:cacheprovider \
+  --basetemp=/tmp/memorysplit-v3-task2b2-default-verifier-green \
+  tests/test_run_manifest_v3.py::\
+test_v3_instantiates_through_unmodified_default_corpus_verifier
+```
+
+```text
+.                                                                        [100%]
+1 passed in 0.83s
+```
+
+The complete v3 manifest test file also passed:
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 python -m pytest -q -p no:cacheprovider \
+  --basetemp=/tmp/memorysplit-v3-task2b2-default-verifier-file \
+  tests/test_run_manifest_v3.py
+```
+
+```text
+........................................................................ [100%]
+72 passed in 44.47s
+```
+
+The five-file suite was conditional on production changes or changes to
+fixture helpers shared by other cases. This correction changes neither: its
+only code change is a new test and a construction helper used only by that
+test. The required-suite result above (`368 passed`) therefore remains the
+latest full cross-file evidence, while all 72 current v3 manifest tests were
+rerun.
+
+The final `git diff --check` produced no output and exited `0`.
+
+### Acceptance concerns
+
+No known Task 2B2 acceptance gap remains. The integration publication is small
+and synthetic, but it is produced and accepted by the unmodified production
+builder/verifier pair; it does not substitute a test semantic verifier or
+weaken any verification boundary.
