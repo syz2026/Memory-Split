@@ -55,9 +55,10 @@ CONFIG_KEYS = {
     "device",
     "log_every",
     "eval_every",
-    "snap_frac",
+    "snapshot_steps",
     "ckpt_minutes",
 }
+SNAPSHOT_STEPS = [1_358, 3_396, 6_791, 10_187, 13_582]
 
 
 def _load_module():
@@ -147,7 +148,7 @@ def _config(seed: int, arm: str) -> dict[str, object]:
         "device": "cuda",
         "log_every": 20,
         "eval_every": 250,
-        "snap_frac": 0.1,
+        "snapshot_steps": list(SNAPSHOT_STEPS),
         "ckpt_minutes": 30,
     }
 
@@ -961,6 +962,70 @@ def test_packager_rejects_semantically_invalid_provider_config(
     config[field] = value
     path.write_text(yaml.safe_dump(config, sort_keys=False))
     _commit(source, f"break {field}")
+
+    with pytest.raises(module.PackageError, match=message):
+        module.build_handoff(
+            source_root=source,
+            out_dir=tmp_path / "out",
+            apply=True,
+        )
+
+
+@pytest.mark.parametrize(
+    ("case", "message"),
+    [
+        ("bool", "snapshot_steps"),
+        ("float", "snapshot_steps"),
+        ("missing-field", "snapshot_steps"),
+        ("missing-element", "snapshot_steps"),
+        ("extra-element", "snapshot_steps"),
+        ("reordered", "snapshot_steps"),
+        ("duplicate", "snapshot_steps"),
+        ("drift", "snapshot_steps"),
+        ("final-drift", "snapshot_steps"),
+        ("snap-frac", "snap_frac"),
+    ],
+)
+def test_packager_rejects_invalid_snapshot_schedule(
+    tmp_path,
+    case,
+    message,
+):
+    module = _load_module()
+    source = _minimal_repo(tmp_path)
+    path = source / "configs/360m-v2/dense-s1.yaml"
+    config = yaml.safe_load(path.read_text())
+    if case == "bool":
+        config["snapshot_steps"][2] = True
+    elif case == "float":
+        config["snapshot_steps"][2] = 6_791.0
+    elif case == "missing-field":
+        del config["snapshot_steps"]
+    elif case == "missing-element":
+        config["snapshot_steps"] = [1_358, 3_396, 6_791, 13_582]
+    elif case == "extra-element":
+        config["snapshot_steps"] = [
+            1_358,
+            3_396,
+            6_791,
+            9_000,
+            10_187,
+            13_582,
+        ]
+    elif case == "reordered":
+        config["snapshot_steps"] = [3_396, 1_358, 6_791, 10_187, 13_582]
+    elif case == "duplicate":
+        config["snapshot_steps"] = [1_358, 3_396, 6_791, 6_791, 13_582]
+    elif case == "drift":
+        config["snapshot_steps"][3] = 10_188
+    elif case == "final-drift":
+        config["snapshot_steps"][-1] = 13_581
+    elif case == "snap-frac":
+        config["snap_frac"] = 0.1
+    else:
+        raise AssertionError(f"unknown test case: {case}")
+    path.write_text(yaml.safe_dump(config, sort_keys=False))
+    _commit(source, f"break snapshot schedule: {case}")
 
     with pytest.raises(module.PackageError, match=message):
         module.build_handoff(

@@ -28,6 +28,7 @@ PROVIDER = "aws-p5.48xlarge"
 COHORT_ID = "memorysplit-confirmatory-v2-360m-n5"
 AWS_SEEDS = (1, 2, 3, 4)
 ARMS = ("dense", "split90")
+SNAPSHOT_STEPS = (1_358, 3_396, 6_791, 10_187, 13_582)
 PACKAGE_FORMAT_VERSION = 1
 NORMALIZED_TIME = (1980, 1, 1, 0, 0, 0)
 COHORT_PATH = "configs/cohort-assignment-v2.json"
@@ -258,7 +259,7 @@ _CONFIG_KEYS = {
     "device",
     "log_every",
     "eval_every",
-    "snap_frac",
+    "snapshot_steps",
     "ckpt_minutes",
 }
 
@@ -1177,7 +1178,7 @@ def _expected_config(seed: int, arm: str) -> dict[str, object]:
         "device": "cuda",
         "log_every": 20,
         "eval_every": 250,
-        "snap_frac": 0.1,
+        "snapshot_steps": list(SNAPSHOT_STEPS),
         "ckpt_minutes": 30,
     }
 
@@ -1189,6 +1190,21 @@ def _validate_config(path: str, data: bytes, *, seed: int, arm: str) -> None:
         extra = sorted(set(config) - _CONFIG_KEYS)
         detail = missing[0] if missing else extra[0]
         raise PackageError(f"run config has invalid field {detail}: {path}")
+    snapshot_steps = config["snapshot_steps"]
+    if not isinstance(snapshot_steps, list) or any(
+        type(step) is not int for step in snapshot_steps
+    ):
+        raise PackageError(
+            f"run config snapshot_steps must be an integer list: {path}"
+        )
+    if not snapshot_steps or snapshot_steps[-1] != config["max_steps"]:
+        raise PackageError(
+            f"run config snapshot_steps must end at max_steps: {path}"
+        )
+    if snapshot_steps != list(SNAPSHOT_STEPS):
+        raise PackageError(
+            f"run config snapshot_steps does not match the frozen schedule: {path}"
+        )
     expected = _expected_config(seed, arm)
     for field, expected_value in expected.items():
         if not _same_typed_value(config[field], expected_value):
