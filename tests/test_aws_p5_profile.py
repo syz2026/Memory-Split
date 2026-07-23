@@ -162,9 +162,7 @@ def test_runtime_environment_requires_immutable_aws_identity():
     assert runtime.s3_root == "s3://memorysplit-prod/cohort-v2"
     assert runtime.ami_id == "ami-0123456789abcdef0"
     assert runtime.container_digest == "sha256:" + "a" * 64
-    assert runtime.container_image.endswith(
-        "@sha256:" + "a" * 64
-    )
+    assert runtime.container_image.endswith("@sha256:" + "a" * 64)
     assert runtime.uid == 1000
     assert runtime.gid == 1000
 

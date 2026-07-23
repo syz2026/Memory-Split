@@ -432,9 +432,7 @@ def validate_runtime_environment(
         raise ValueError(
             "MS_CONTAINER_DIGEST must be sha256 followed by 64 lowercase hex"
         )
-    container_image = _required_environment(
-        environment, "MS_CONTAINER_IMAGE"
-    )
+    container_image = _required_environment(environment, "MS_CONTAINER_IMAGE")
     image_name, separator, image_digest = container_image.partition("@")
     if (
         separator != "@"
