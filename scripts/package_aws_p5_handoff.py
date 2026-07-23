@@ -35,6 +35,7 @@ COHORT_PATH = "configs/cohort-assignment-v2.json"
 PROFILE_PATH = "cluster/profiles/aws-p5.48xlarge.json"
 STATIC_ENVIRONMENT_LOCK_PATH = "requirements-aws-p5.lock"
 DATASET_POINTER_PATH = "DATASET-POINTER-AWS.json"
+RUNBOOK_PATH = "docs/AWS-P5-360M-RUNBOOK.md"
 RELEASE_RECEIPT_NAME = "RELEASE-AWS-P5.json"
 CONTAINER_IMAGE_DIGEST_PATTERN = "^sha256:[0-9a-f]{64}$"
 EXPECTED_CONFIGS = {
@@ -51,6 +52,7 @@ REQUIRED_MEMBERS = EXPECTED_CONFIGS | {
     COHORT_PATH,
     "configs/preregistration-v2.yaml",
     PROFILE_PATH,
+    RUNBOOK_PATH,
     "cluster/aws/p5/bootstrap.sh",
     "cluster/aws/p5/interruption_checkpoint.py",
     "cluster/aws/p5/launch_seed_pair.py",
@@ -923,6 +925,8 @@ def _classification(path: str) -> str:
     parts = PurePosixPath(path).parts
     if not parts:
         return "unknown"
+    if path == RUNBOOK_PATH:
+        return "included"
     if path in {"msctl/dataset.py", "train/data.py"}:
         return "included"
     if path == STATIC_ENVIRONMENT_LOCK_PATH:

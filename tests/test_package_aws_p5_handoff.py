@@ -234,6 +234,7 @@ def _minimal_repo(tmp_path: Path, *, name: str = "source") -> Path:
         "AWS-P5-START.md": (
             "# Fixture P5 start\nSeeds 1-4 only; seed 0 is forbidden.\n"
         ),
+        "docs/AWS-P5-360M-RUNBOOK.md": "# Fixture AWS P5 runbook\n",
         "DATASET-POINTER-AWS.json": _canonical_json(_dataset_pointer()),
         "requirements.txt": "PyYAML>=6.0\npytest>=8.0\n",
         "pytest.ini": "[pytest]\n",
@@ -576,7 +577,6 @@ def test_archive_excludes_materialized_provider_and_sealed_content(tmp_path):
         "artifacts",
         "checkpoints",
         "data",
-        "docs",
         "fixtures",
         "logs",
         "outputs",
@@ -587,6 +587,9 @@ def test_archive_excludes_materialized_provider_and_sealed_content(tmp_path):
         and PurePosixPath(name).parts[0] in forbidden_roots
         for name in names
     )
+    assert {
+        name for name in names if PurePosixPath(name).parts[:1] == ("docs",)
+    } == {"docs/", "docs/AWS-P5-360M-RUNBOOK.md"}
     assert "AGENT-START.md" not in names
     assert "DATASET-POINTER.json" not in names
     assert "cluster/profiles/illumina-usfc-prd.json" not in names
