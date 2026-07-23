@@ -1,0 +1,60 @@
+{
+  "cluster": "usfc-prd",
+  "cpu": {
+    "cpus_per_node": 56,
+    "local_ssd_required": true,
+    "nodes": 35
+  },
+  "gpu": {
+    "allocated": 7,
+    "evaluation_gpus": 1,
+    "generic_resource": "gpu:a100",
+    "model": "NVIDIA A100 80GB",
+    "seed0_train_groups": [
+      3,
+      3
+    ]
+  },
+  "job_env_allowlist": [
+    "MS_PROVIDER",
+    "MS_PROFILE_SHA256",
+    "MS_RELEASE_ID",
+    "MS_RELEASE_SHA256",
+    "MS_RUN_MANIFEST_SHA256",
+    "MS_DATASET_SHA256",
+    "MS_DENSE_RUN_ID",
+    "MS_DENSE_CONFIG",
+    "MS_DENSE_CONFIG_SHA256",
+    "MS_SPLIT_RUN_ID",
+    "MS_SPLIT_CONFIG",
+    "MS_SPLIT_CONFIG_SHA256",
+    "MS_RUN_IDS",
+    "MS_WORLD_SIZE",
+    "MS_EVAL_GPU",
+    "MS_RESUME",
+    "MS_SHARED_ROOT",
+    "MS_ENV_ROOT",
+    "MS_DATA_ROOT",
+    "MS_OUT_ROOT",
+    "MS_SEALED_ROOT"
+  ],
+  "login": {
+    "heavy_compute_allowed": false,
+    "max_vcpus": 4
+  },
+  "profile_id": "illumina-usfc-prd",
+  "provider": "illumina-usfc-prd",
+  "schema_version": 1,
+  "slurm": {
+    "account": null,
+    "evaluation_wall_minutes": 360,
+    "partition": null,
+    "qos": null,
+    "seed0_wall_minutes": 2160
+  },
+  "storage": {
+    "gpu_local_ssd_bytes": 10000000000000,
+    "shared_root_env": "MS_SHARED_ROOT",
+    "shared_root_prefix": "/illumina"
+  }
+}
