@@ -29,6 +29,7 @@ _WRITE_FLAGS = (
 _SAFE_TOKEN = re.compile(r"[A-Za-z0-9._-]+\Z")
 _RENAME_NOREPLACE = 1
 _RENAME_EXCL = 0x00000004
+_TOMBSTONE_DIRECTORY_PREFIX = ".memorysplit-v2-retained-tombstones-"
 
 if not getattr(os, "O_DIRECTORY", 0) or not getattr(os, "O_NOFOLLOW", 0):
     raise RuntimeError("secure corpus publication requires O_DIRECTORY and O_NOFOLLOW")
@@ -225,6 +226,35 @@ def open_directory_path(
         raise
 
 
+def open_tombstone_directory(parent_fd: int) -> int:
+    """Open a pinned sibling namespace for retained, never-path-deleted objects."""
+
+    for _attempt in range(16):
+        name = f"{_TOMBSTONE_DIRECTORY_PREFIX}{secrets.token_hex(16)}"
+        try:
+            os.mkdir(name, mode=0o700, dir_fd=parent_fd)
+        except FileExistsError:
+            continue
+        fsync_directory(parent_fd)
+        descriptor, _created = open_directory_at(parent_fd, name)
+        try:
+            metadata = os.fstat(descriptor)
+            named_metadata = entry_lstat(parent_fd, name)
+        except BaseException:
+            os.close(descriptor)
+            raise
+        if (
+            not stat.S_ISDIR(named_metadata.st_mode)
+            or (metadata.st_dev, metadata.st_ino)
+            != (named_metadata.st_dev, named_metadata.st_ino)
+            or metadata.st_uid != os.geteuid()
+        ):
+            os.close(descriptor)
+            raise ValueError("retained tombstone directory identity changed")
+        return descriptor
+    raise FileExistsError("could not allocate a retained tombstone directory")
+
+
 def open_parent_directory(
     path: Path | str,
     *,
@@ -349,33 +379,44 @@ def is_owned_temporary(name: str, final_names: set[str], owner: str) -> bool:
 
 
 def _restore_quarantined_entry(
-    directory_fd: int,
-    quarantine_name: str,
+    source_directory_fd: int,
     original_name: str,
+    tombstone_fd: int,
+    tombstone_name: str,
 ) -> bool:
     try:
         atomic_rename_noreplace(
-            directory_fd,
-            quarantine_name,
-            directory_fd,
+            tombstone_fd,
+            tombstone_name,
+            source_directory_fd,
             original_name,
         )
     except FileExistsError:
-        fsync_directory(directory_fd)
+        fsync_directory(source_directory_fd)
+        fsync_directory(tombstone_fd)
         return False
-    fsync_directory(directory_fd)
+    fsync_directory(source_directory_fd)
+    fsync_directory(tombstone_fd)
     return True
 
 
-def _quarantine_and_unlink_regular(
+def _retain_regular_tombstone(
     directory_fd: int,
     name: str,
     *,
+    tombstone_fd: int,
     expected_identity: tuple[int, int] | None = None,
     expected_payload: bytes | None = None,
     missing_ok: bool,
 ) -> None:
     name = _entry_name(name)
+    source_directory = os.fstat(directory_fd)
+    tombstone_directory = os.fstat(tombstone_fd)
+    if (source_directory.st_dev, source_directory.st_ino) == (
+        tombstone_directory.st_dev,
+        tombstone_directory.st_ino,
+    ):
+        raise ValueError("retained tombstones require a distinct directory")
     try:
         source_fd, source_metadata = open_regular_file_at(directory_fd, name)
     except FileNotFoundError:
@@ -392,30 +433,32 @@ def _quarantine_and_unlink_regular(
         ):
             raise ValueError(f"owned file content drift: {name}")
 
-        quarantine_name = ""
+        tombstone_name = ""
+        name_digest = hashlib.sha256(os.fsencode(name)).hexdigest()[:16]
         for _attempt in range(16):
-            candidate = f".{name}.quarantine-{secrets.token_hex(16)}"
+            candidate = f"file-{name_digest}-{secrets.token_hex(16)}"
             try:
                 atomic_rename_noreplace(
                     directory_fd,
                     name,
-                    directory_fd,
+                    tombstone_fd,
                     candidate,
                 )
             except FileExistsError:
                 continue
-            quarantine_name = candidate
+            tombstone_name = candidate
             break
-        if not quarantine_name:
+        if not tombstone_name:
             raise FileExistsError(
-                "could not allocate a unique quarantine entry"
+                "could not allocate a unique retained tombstone"
             )
         fsync_directory(directory_fd)
+        fsync_directory(tombstone_fd)
 
         try:
             quarantined_fd, quarantined_metadata = open_regular_file_at(
-                directory_fd,
-                quarantine_name,
+                tombstone_fd,
+                tombstone_name,
             )
             try:
                 quarantined_payload = (
@@ -428,8 +471,9 @@ def _quarantine_and_unlink_regular(
         except BaseException:
             _restore_quarantined_entry(
                 directory_fd,
-                quarantine_name,
                 name,
+                tombstone_fd,
+                tombstone_name,
             )
             raise
 
@@ -446,39 +490,42 @@ def _quarantine_and_unlink_regular(
         ):
             _restore_quarantined_entry(
                 directory_fd,
-                quarantine_name,
                 name,
+                tombstone_fd,
+                tombstone_name,
             )
             raise ValueError(
                 f"owned file identity changed during quarantine: {name}"
             )
-        current = entry_lstat(directory_fd, quarantine_name)
+        current = entry_lstat(tombstone_fd, tombstone_name)
         if (
             not stat.S_ISREG(current.st_mode)
             or (current.st_dev, current.st_ino) != source_identity
         ):
             _restore_quarantined_entry(
                 directory_fd,
-                quarantine_name,
                 name,
+                tombstone_fd,
+                tombstone_name,
             )
             raise ValueError(
                 f"owned file identity changed during quarantine: {name}"
             )
-        os.unlink(quarantine_name, dir_fd=directory_fd)
-        fsync_directory(directory_fd)
     finally:
         os.close(source_fd)
 
 
-def _unlink_same_regular(
+def _retain_same_regular_tombstone(
     directory_fd: int,
     name: str,
     identity: tuple[int, int],
+    *,
+    tombstone_fd: int,
 ) -> None:
-    _quarantine_and_unlink_regular(
+    _retain_regular_tombstone(
         directory_fd,
         name,
+        tombstone_fd=tombstone_fd,
         expected_identity=identity,
         missing_ok=True,
     )
@@ -489,6 +536,7 @@ def clean_owned_temporaries(
     *,
     final_names: set[str],
     owner: str,
+    tombstone_fd: int,
 ) -> tuple[str, ...]:
     """Remove only regular stale files carrying the exact ownership token."""
 
@@ -500,7 +548,12 @@ def clean_owned_temporaries(
         if not stat.S_ISREG(metadata.st_mode):
             raise ValueError(f"owned temporary entry is unsafe: {name}")
         identity = (metadata.st_dev, metadata.st_ino)
-        _unlink_same_regular(directory_fd, name, identity)
+        _retain_same_regular_tombstone(
+            directory_fd,
+            name,
+            identity,
+            tombstone_fd=tombstone_fd,
+        )
         removed.append(name)
     return tuple(removed)
 
@@ -509,12 +562,15 @@ def unlink_regular_if_matches(
     directory_fd: int,
     name: str,
     expected_payload: bytes,
+    *,
+    tombstone_fd: int,
 ) -> None:
-    """Quarantine then unlink only the opened inode with the expected bytes."""
+    """Remove a verified name only by atomically retaining its opened inode."""
 
-    _quarantine_and_unlink_regular(
+    _retain_regular_tombstone(
         directory_fd,
         name,
+        tombstone_fd=tombstone_fd,
         expected_payload=expected_payload,
         missing_ok=False,
     )
@@ -529,13 +585,16 @@ class AtomicFileWriter:
         final_name: str,
         *,
         owner: str,
+        tombstone_fd: int,
         mode: int = 0o600,
     ) -> None:
         self.directory_fd = os.dup(directory_fd)
+        self.tombstone_fd = -1
         self.temporary_name = ""
         self.descriptor = -1
         self._closed = True
         try:
+            self.tombstone_fd = os.dup(tombstone_fd)
             self.final_name = _entry_name(final_name)
             prefix = _temporary_prefix(self.final_name, owner)
             for _attempt in range(16):
@@ -571,14 +630,17 @@ class AtomicFileWriter:
                 self.descriptor = -1
             if self.temporary_name and identity is not None:
                 try:
-                    _unlink_same_regular(
+                    _retain_same_regular_tombstone(
                         self.directory_fd,
                         self.temporary_name,
                         identity,
+                        tombstone_fd=self.tombstone_fd,
                     )
                 except (OSError, ValueError):
                     pass
             os.close(self.directory_fd)
+            if self.tombstone_fd >= 0:
+                os.close(self.tombstone_fd)
             raise
 
     def write(self, payload: bytes) -> None:
@@ -613,15 +675,17 @@ class AtomicFileWriter:
             ):
                 self.abort()
                 raise ValueError(f"existing artifact drift: {self.final_name}")
-            _unlink_same_regular(
+            _retain_same_regular_tombstone(
                 self.directory_fd,
                 self.temporary_name,
                 self._identity,
+                tombstone_fd=self.tombstone_fd,
             )
         else:
             fsync_directory(self.directory_fd)
         self._closed = True
         os.close(self.directory_fd)
+        os.close(self.tombstone_fd)
 
     def abort(self) -> None:
         if self._closed:
@@ -630,14 +694,16 @@ class AtomicFileWriter:
             os.close(self.descriptor)
             self.descriptor = -1
         try:
-            _unlink_same_regular(
+            _retain_same_regular_tombstone(
                 self.directory_fd,
                 self.temporary_name,
                 self._identity,
+                tombstone_fd=self.tombstone_fd,
             )
         finally:
             self._closed = True
             os.close(self.directory_fd)
+            os.close(self.tombstone_fd)
 
 
 def atomic_write_or_match(
@@ -646,6 +712,7 @@ def atomic_write_or_match(
     payload: bytes,
     *,
     owner: str,
+    tombstone_fd: int,
 ) -> None:
     """Install bytes no-replace, accepting only an exact existing regular file."""
 
@@ -659,7 +726,12 @@ def atomic_write_or_match(
         if existing != payload:
             raise ValueError(f"existing artifact drift: {name}")
         return
-    writer = AtomicFileWriter(directory_fd, name, owner=owner)
+    writer = AtomicFileWriter(
+        directory_fd,
+        name,
+        owner=owner,
+        tombstone_fd=tombstone_fd,
+    )
     try:
         writer.write(payload)
         writer.finish(

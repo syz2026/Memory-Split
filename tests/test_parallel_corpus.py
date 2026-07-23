@@ -379,14 +379,14 @@ def test_task_workspace_cleanup_never_removes_swapped_directory(
         nonlocal swapped
         if (
             source_name == workspace.name
-            and ".cleanup-" in destination_name
+            and "cleanup-" in destination_name
             and not swapped
         ):
             swapped = True
             real_rename(
                 source_fd,
                 source_name,
-                destination_fd,
+                source_fd,
                 held_name,
             )
             os.mkdir(source_name, dir_fd=source_fd)
@@ -414,6 +414,48 @@ def test_task_workspace_cleanup_never_removes_swapped_directory(
 
     assert workspace.is_dir()
     assert workspace.with_name(held_name).is_dir()
+
+
+def test_task_workspace_cleanup_never_uses_path_rmdir(tmp_path, monkeypatch):
+    catalog, renderer, config = _fixture_build(record_count=6)
+    result = parallel.render_task_result(
+        catalog,
+        renderer,
+        config,
+        task_index=0,
+        task_count=1,
+    )
+    shared_root = tmp_path / "shared"
+    parallel.publish_task_result(
+        shared_root,
+        result,
+        scheduler_id="job-42",
+        nonce="nonce-a",
+    )
+    workspace = parallel.task_workspace_path(
+        shared_root,
+        result.build_id,
+        scheduler_id="job-42",
+        nonce="nonce-a",
+    )
+
+    def reject_path_rmdir(*args, **kwargs):
+        raise AssertionError("path rmdir can delete a replacement")
+
+    monkeypatch.setattr(workspace_module.os, "rmdir", reject_path_rmdir)
+
+    parallel.cleanup_task_workspace(
+        workspace,
+        build_id=result.build_id,
+        scheduler_id="job-42",
+        nonce="nonce-a",
+    )
+
+    assert not workspace.exists()
+    assert any(
+        path.is_dir() and "cleanup-" in path.name
+        for path in shared_root.rglob("*")
+    )
 
 
 def test_task_workspace_loader_requires_exact_complete_foreign_free_results(tmp_path):
@@ -496,12 +538,20 @@ def test_task_result_is_validated_node_locally_before_shared_publication(
     shared_root.mkdir()
     real_atomic_write = workspace_module.atomic_write_or_match
 
-    def corrupt_local_result(directory_fd, name, payload, *, owner):
+    def corrupt_local_result(
+        directory_fd,
+        name,
+        payload,
+        *,
+        owner,
+        tombstone_fd,
+    ):
         real_atomic_write(
             directory_fd,
             name,
             payload,
             owner=owner,
+            tombstone_fd=tombstone_fd,
         )
         if name == parallel.task_result_filename(result):
             descriptor = os.open(
@@ -871,6 +921,12 @@ def test_atomic_file_writer_closes_duplicated_directory_fd_on_open_error(
         tmp_path,
         os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
     )
+    tombstones = tmp_path / "tombstones"
+    tombstones.mkdir()
+    tombstone_fd = os.open(
+        tombstones,
+        os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+    )
     real_dup = os.dup
     duplicated_fds = []
 
@@ -890,19 +946,60 @@ def test_atomic_file_writer_closes_duplicated_directory_fd_on_open_error(
                 directory_fd,
                 "artifact.bin",
                 owner="owner",
+                tombstone_fd=tombstone_fd,
             )
     finally:
+        os.close(tombstone_fd)
         os.close(directory_fd)
 
-    assert len(duplicated_fds) == 1
+    assert len(duplicated_fds) == 2
+    for duplicate in duplicated_fds:
+        try:
+            os.fstat(duplicate)
+        except OSError:
+            duplicate_was_closed = True
+        else:
+            duplicate_was_closed = False
+            os.close(duplicate)
+        assert duplicate_was_closed
+
+
+def test_regular_cleanup_moves_to_retained_tombstone_without_path_unlink(
+    tmp_path,
+    monkeypatch,
+):
+    owned = tmp_path / "owned"
+    owned.write_bytes(b"expected")
+    tombstones = tmp_path / "tombstones"
+    tombstones.mkdir()
+    directory_fd = os.open(
+        tmp_path,
+        os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+    )
+    tombstone_fd = os.open(
+        tombstones,
+        os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+    )
+
+    def reject_path_unlink(*args, **kwargs):
+        raise AssertionError("path unlink can delete a replacement")
+
+    monkeypatch.setattr(safeio_module.os, "unlink", reject_path_unlink)
     try:
-        os.fstat(duplicated_fds[0])
-    except OSError:
-        duplicate_was_closed = True
-    else:
-        duplicate_was_closed = False
-        os.close(duplicated_fds[0])
-    assert duplicate_was_closed
+        safeio_module.unlink_regular_if_matches(
+            directory_fd,
+            owned.name,
+            b"expected",
+            tombstone_fd=tombstone_fd,
+        )
+    finally:
+        os.close(tombstone_fd)
+        os.close(directory_fd)
+
+    assert not owned.exists()
+    retained = list(tombstones.iterdir())
+    assert len(retained) == 1
+    assert retained[0].read_bytes() == b"expected"
 
 
 def test_unlink_regular_if_matches_never_deletes_swapped_replacement(
@@ -912,8 +1009,14 @@ def test_unlink_regular_if_matches_never_deletes_swapped_replacement(
     owned = tmp_path / "owned"
     owned.write_bytes(b"expected")
     held = tmp_path / "held-original"
+    tombstones = tmp_path / "tombstones"
+    tombstones.mkdir()
     directory_fd = os.open(
         tmp_path,
+        os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+    )
+    tombstone_fd = os.open(
+        tombstones,
         os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
     )
     real_rename = safeio_module.atomic_rename_noreplace
@@ -931,7 +1034,7 @@ def test_unlink_regular_if_matches_never_deletes_swapped_replacement(
             real_rename(
                 source_fd,
                 source_name,
-                destination_fd,
+                source_fd,
                 held.name,
             )
             replacement_fd = os.open(
@@ -962,13 +1065,15 @@ def test_unlink_regular_if_matches_never_deletes_swapped_replacement(
                 directory_fd,
                 owned.name,
                 b"expected",
+                tombstone_fd=tombstone_fd,
             )
     finally:
+        os.close(tombstone_fd)
         os.close(directory_fd)
 
     assert held.read_bytes() == b"expected"
     assert owned.read_bytes() == b"replacement"
-    assert not any(".quarantine-" in path.name for path in tmp_path.iterdir())
+    assert list(tombstones.iterdir()) == []
 
 
 def test_staging_shards_symlink_receives_no_temporary_bytes(tmp_path):
@@ -1302,6 +1407,120 @@ def test_verifier_rejects_receipted_symlink_and_fifo_components(tmp_path):
     finally:
         shard.unlink()
         held_shard.rename(shard)
+
+
+def test_verifier_rejects_shard_appended_after_initial_fstat(
+    tmp_path,
+    monkeypatch,
+):
+    catalog, renderer, config = _fixture_build()
+    destination = tmp_path / "corpus"
+    build_parallel_corpus(catalog, renderer, config, destination)
+    shard = sorted((destination / "shards").glob("*.bin"))[-1]
+    real_init = publication_module._PinnedPackedReader.__init__
+
+    def append_after_initial_stats(reader, entries):
+        real_init(reader, entries)
+        with shard.open("ab") as handle:
+            handle.write(b"\x00\x00")
+            handle.flush()
+            os.fsync(handle.fileno())
+
+    monkeypatch.setattr(
+        publication_module._PinnedPackedReader,
+        "__init__",
+        append_after_initial_stats,
+    )
+
+    with pytest.raises(ValueError, match="EOF|size|identity|digest drift"):
+        verify_parallel_corpus(destination)
+
+
+def test_verifier_rejects_shard_replaced_after_initial_fstat(
+    tmp_path,
+    monkeypatch,
+):
+    catalog, renderer, config = _fixture_build()
+    destination = tmp_path / "corpus"
+    build_parallel_corpus(catalog, renderer, config, destination)
+    shard = sorted((destination / "shards").glob("*.bin"))[-1]
+    replacement = tmp_path / "replacement.bin"
+    replacement.write_bytes(shard.read_bytes())
+    held = tmp_path / "held-original.bin"
+    real_init = publication_module._PinnedPackedReader.__init__
+
+    def replace_after_initial_stats(reader, entries):
+        real_init(reader, entries)
+        shard.rename(held)
+        os.replace(replacement, shard)
+
+    monkeypatch.setattr(
+        publication_module._PinnedPackedReader,
+        "__init__",
+        replace_after_initial_stats,
+    )
+
+    with pytest.raises(ValueError, match="identity drift"):
+        verify_parallel_corpus(destination)
+
+
+def test_malformed_later_shard_closes_every_popped_descriptor(
+    tmp_path,
+    monkeypatch,
+):
+    catalog, renderer, config = _fixture_build()
+    destination = tmp_path / "corpus"
+    build_parallel_corpus(catalog, renderer, config, destination)
+    receipt_path = destination / "receipt.json"
+    receipt = json.loads(receipt_path.read_bytes())
+    shard_artifacts = [
+        artifact
+        for artifact in receipt["artifacts"]
+        if artifact["path"].startswith("shards/")
+    ]
+    shard_artifacts[-1]["bytes"] += 2
+    receipt_path.write_bytes(canonical_json_bytes(receipt))
+    real_open = publication_module.open_regular_file_at
+    real_dup = publication_module.os.dup
+    shard_descriptors = []
+    binding_descriptors = []
+
+    def record_shard_descriptor(directory_fd, name):
+        descriptor, metadata = real_open(directory_fd, name)
+        if name.endswith(".bin"):
+            shard_descriptors.append(descriptor)
+        return descriptor, metadata
+
+    def record_binding_descriptor(descriptor):
+        duplicate = real_dup(descriptor)
+        binding_descriptors.append(duplicate)
+        return duplicate
+
+    monkeypatch.setattr(
+        publication_module,
+        "open_regular_file_at",
+        record_shard_descriptor,
+    )
+    monkeypatch.setattr(
+        publication_module.os,
+        "dup",
+        record_binding_descriptor,
+    )
+
+    with pytest.raises(ValueError, match="shard size drift"):
+        verify_parallel_corpus(destination)
+
+    open_descriptors = []
+    for descriptor in [*shard_descriptors, *binding_descriptors]:
+        try:
+            os.fstat(descriptor)
+        except OSError:
+            continue
+        open_descriptors.append(descriptor)
+        os.close(descriptor)
+    assert shard_descriptors
+    assert binding_descriptors
+    assert open_descriptors == []
 
 
 def test_verifier_uses_pinned_root_when_path_component_is_replaced(

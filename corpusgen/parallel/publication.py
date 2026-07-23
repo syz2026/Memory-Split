@@ -47,6 +47,7 @@ from .safeio import (
     open_directory_path,
     open_parent_directory,
     open_regular_file_at,
+    open_tombstone_directory,
     read_file_descriptor,
     read_regular_file,
     regular_file_digest,
@@ -202,6 +203,7 @@ class _ShardSink:
         assignment: ShardAssignment,
         *,
         owner: str,
+        tombstone_fd: int,
     ) -> None:
         self.assignment = assignment
         self.final_name = f"{assignment.shard_id}.bin"
@@ -209,6 +211,7 @@ class _ShardSink:
             shards_fd,
             self.final_name,
             owner=owner,
+            tombstone_fd=tombstone_fd,
         )
         self.digest = hashlib.sha256()
         self.byte_count = 0
@@ -249,6 +252,7 @@ def _rerender_and_pack_pinned(
     shards_fd: int,
     *,
     owner: str,
+    tombstone_fd: int,
     cached_payloads: dict[str, bytes] | None = None,
 ) -> dict[str, object]:
     reduced = reduce_metadata(
@@ -276,6 +280,7 @@ def _rerender_and_pack_pinned(
         shards_fd,
         assignments[assignment_index],
         owner=owner,
+        tombstone_fd=tombstone_fd,
     )
     token_position = 0
 
@@ -295,6 +300,7 @@ def _rerender_and_pack_pinned(
                     shards_fd,
                     assignments[assignment_index],
                     owner=owner,
+                    tombstone_fd=tombstone_fd,
                 )
                 continue
             take = min(available, token_count)
@@ -358,8 +364,12 @@ def rerender_and_pack(
 ) -> dict[str, object]:
     """Rerender records and install shards through pinned no-follow fds."""
 
-    root_fd = open_directory_path(root)
+    parent_fd, root_name = open_parent_directory(root)
+    root_fd = -1
+    tombstone_fd = -1
     try:
+        root_fd, _created = open_directory_at(parent_fd, root_name)
+        tombstone_fd = open_tombstone_directory(parent_fd)
         shards_fd, _created = open_directory_at(root_fd, "shards", create=True)
         try:
             return _rerender_and_pack_pinned(
@@ -370,11 +380,16 @@ def rerender_and_pack(
                 renderer,
                 shards_fd,
                 owner="direct-pack",
+                tombstone_fd=tombstone_fd,
             )
         finally:
             os.close(shards_fd)
     finally:
-        os.close(root_fd)
+        if tombstone_fd >= 0:
+            os.close(tombstone_fd)
+        if root_fd >= 0:
+            os.close(root_fd)
+        os.close(parent_fd)
 
 
 def _stage_owner_bytes(build_id: str) -> bytes:
@@ -437,6 +452,7 @@ def _prepare_staging(
     created: bool,
     build_id: str,
     shard_names: set[str],
+    tombstone_fd: int,
 ) -> int:
     owner_payload = _stage_owner_bytes(build_id)
     if created:
@@ -447,6 +463,7 @@ def _prepare_staging(
             _STAGE_OWNER_NAME,
             owner_payload,
             owner=build_id,
+            tombstone_fd=tombstone_fd,
         )
     else:
         try:
@@ -460,6 +477,7 @@ def _prepare_staging(
         stage_fd,
         final_names={*_FOUNDATION_NAMES, "receipt.json"},
         owner=build_id,
+        tombstone_fd=tombstone_fd,
     )
     shards_fd, _created = open_directory_at(stage_fd, "shards", create=True)
     try:
@@ -468,6 +486,7 @@ def _prepare_staging(
             shards_fd,
             final_names=shard_names,
             owner=build_id,
+            tombstone_fd=tombstone_fd,
         )
     except BaseException:
         os.close(shards_fd)
@@ -514,6 +533,7 @@ def _publish_staging(
     stage_name: str,
     output_name: str,
     build_id: str,
+    tombstone_fd: int,
 ) -> dict[str, Any]:
     stage_metadata = os.fstat(stage_fd)
     named_metadata = entry_lstat(parent_fd, stage_name)
@@ -536,6 +556,7 @@ def _publish_staging(
             _STAGE_OWNER_NAME,
             _stage_owner_bytes(build_id),
             owner=build_id,
+            tombstone_fd=tombstone_fd,
         )
         fsync_directory(stage_fd)
         try:
@@ -648,7 +669,7 @@ def _open_artifact_namespace(
     receipt_metadata: os.stat_result,
     *,
     allow_stage_owner: bool,
-) -> tuple[dict[str, tuple[int, os.stat_result]], bytes | None]:
+) -> tuple[dict[str, tuple[int, os.stat_result, int, str]], bytes | None]:
     file_parts = {
         tuple(PurePosixPath(path).parts): path for path in artifact_by_path
     }
@@ -667,7 +688,7 @@ def _open_artifact_namespace(
         expected_children[parts[:-1]][parts[-1]] = path
 
     directory_fds = {(): root_fd}
-    opened_files: dict[str, tuple[int, os.stat_result]] = {}
+    opened_files: dict[str, tuple[int, os.stat_result, int, str]] = {}
     owner_bytes = None
     try:
         for directory in sorted(directory_parts, key=lambda parts: (len(parts), parts)):
@@ -706,11 +727,22 @@ def _open_artifact_namespace(
                     finally:
                         os.close(descriptor)
                 else:
-                    opened_files[kind] = (descriptor, metadata)
+                    try:
+                        binding_fd = os.dup(directory_fd)
+                    except BaseException:
+                        os.close(descriptor)
+                        raise
+                    opened_files[kind] = (
+                        descriptor,
+                        metadata,
+                        binding_fd,
+                        name,
+                    )
         return opened_files, owner_bytes
     except BaseException:
-        for descriptor, _metadata in opened_files.values():
+        for descriptor, _metadata, binding_fd, _name in opened_files.values():
             os.close(descriptor)
+            os.close(binding_fd)
         raise
     finally:
         for directory, descriptor in directory_fds.items():
@@ -719,20 +751,46 @@ def _open_artifact_namespace(
 
 
 def _read_opened_artifact(
-    opened_files: dict[str, tuple[int, os.stat_result]],
+    opened_files: dict[str, tuple[int, os.stat_result, int, str]],
     artifact_by_path: dict[str, dict[str, Any]],
     relative: str,
 ) -> bytes:
-    descriptor, metadata = opened_files.pop(relative)
+    descriptor, metadata, binding_fd, name = opened_files.pop(relative)
     artifact = artifact_by_path[relative]
     try:
         payload = read_file_descriptor(descriptor)
+        final_metadata = os.fstat(descriptor)
+        named_metadata = entry_lstat(binding_fd, name)
     finally:
         os.close(descriptor)
+        os.close(binding_fd)
     if (
         metadata.st_size != artifact["bytes"]
         or len(payload) != artifact["bytes"]
         or sha256_hex(payload) != artifact["sha256"]
+        or not stat.S_ISREG(named_metadata.st_mode)
+        or (
+            named_metadata.st_dev,
+            named_metadata.st_ino,
+            named_metadata.st_size,
+        )
+        != (
+            metadata.st_dev,
+            metadata.st_ino,
+            metadata.st_size,
+        )
+        or (
+            final_metadata.st_dev,
+            final_metadata.st_ino,
+            final_metadata.st_size,
+            final_metadata.st_nlink,
+        )
+        != (
+            metadata.st_dev,
+            metadata.st_ino,
+            metadata.st_size,
+            metadata.st_nlink,
+        )
     ):
         raise ValueError(f"publication artifact digest drift: {relative}")
     return payload
@@ -742,7 +800,7 @@ class _PinnedPackedReader:
     def __init__(
         self,
         entries: list[
-            tuple[str, int, os.stat_result, dict[str, Any]]
+            tuple[str, int, os.stat_result, int, str, dict[str, Any]]
         ],
     ) -> None:
         self.entries = entries
@@ -760,7 +818,14 @@ class _PinnedPackedReader:
         if self.index >= len(self.entries):
             self.remaining = 0
             return
-        relative, _descriptor, metadata, artifact = self.entries[self.index]
+        (
+            relative,
+            _descriptor,
+            metadata,
+            _binding_fd,
+            _name,
+            artifact,
+        ) = self.entries[self.index]
         if metadata.st_size != artifact["bytes"]:
             raise ValueError(f"publication artifact digest drift: {relative}")
         self.remaining = metadata.st_size
@@ -768,9 +833,49 @@ class _PinnedPackedReader:
 
     def _finish_empty_entries(self) -> None:
         while self.index < len(self.entries) and self.remaining == 0:
-            relative, descriptor, _metadata, artifact = self.entries[self.index]
+            (
+                relative,
+                descriptor,
+                metadata,
+                binding_fd,
+                name,
+                artifact,
+            ) = self.entries[self.index]
             actual_digest = self.local_digest.hexdigest()
+            trailing = os.read(descriptor, 1)
+            final_metadata = os.fstat(descriptor)
+            named_metadata = entry_lstat(binding_fd, name)
+            if (
+                trailing
+                or not stat.S_ISREG(named_metadata.st_mode)
+                or (
+                    named_metadata.st_dev,
+                    named_metadata.st_ino,
+                    named_metadata.st_size,
+                )
+                != (
+                    metadata.st_dev,
+                    metadata.st_ino,
+                    metadata.st_size,
+                )
+                or (
+                    final_metadata.st_dev,
+                    final_metadata.st_ino,
+                    final_metadata.st_size,
+                    final_metadata.st_nlink,
+                )
+                != (
+                    metadata.st_dev,
+                    metadata.st_ino,
+                    metadata.st_size,
+                    metadata.st_nlink,
+                )
+            ):
+                raise ValueError(
+                    f"publication artifact EOF or identity drift: {relative}"
+                )
             os.close(descriptor)
+            os.close(binding_fd)
             self.index += 1
             self._begin_entry()
             if actual_digest != artifact["sha256"]:
@@ -790,7 +895,14 @@ class _PinnedPackedReader:
                 raise ValueError(
                     "packed shards end before their declared token stream"
                 )
-            _relative, descriptor, _metadata, _artifact = self.entries[self.index]
+            (
+                _relative,
+                descriptor,
+                _metadata,
+                _binding_fd,
+                _name,
+                _artifact,
+            ) = self.entries[self.index]
             chunk = os.read(descriptor, min(1 << 20, remaining, self.remaining))
             if not chunk:
                 raise ValueError("packed shard ends before its declared size")
@@ -812,8 +924,13 @@ class _PinnedPackedReader:
     def close(self) -> None:
         for index in range(self.index, len(self.entries)):
             descriptor = self.entries[index][1]
+            binding_fd = self.entries[index][3]
             try:
                 os.close(descriptor)
+            except OSError:
+                pass
+            try:
+                os.close(binding_fd)
             except OSError:
                 pass
         self.index = len(self.entries)
@@ -955,7 +1072,6 @@ def _verify_parallel_corpus_fd(
             raise ValueError(
                 "parallel corpus shard namespace does not match assignments"
             )
-        entries = []
         for assignment, relative in zip(
             assignments,
             shard_paths,
@@ -966,15 +1082,19 @@ def _verify_parallel_corpus_fd(
             ) * 2
             if artifact_by_path[relative]["bytes"] != expected_bytes:
                 raise ValueError(f"parallel corpus shard size drift: {relative}")
-            descriptor, metadata_stat = opened_files.pop(relative)
-            entries.append(
-                (
-                    relative,
-                    descriptor,
-                    metadata_stat,
-                    artifact_by_path[relative],
-                )
+        entries = [
+            (
+                relative,
+                opened_files[relative][0],
+                opened_files[relative][1],
+                opened_files[relative][2],
+                opened_files[relative][3],
+                artifact_by_path[relative],
             )
+            for relative in shard_paths
+        ]
+        for relative in shard_paths:
+            del opened_files[relative]
         reader = _PinnedPackedReader(entries)
         try:
             metadata_by_id = {record.record_id: record for record in metadata}
@@ -1002,8 +1122,9 @@ def _verify_parallel_corpus_fd(
             raise ValueError("packed stream digest drift")
         return receipt
     finally:
-        for descriptor, _metadata in opened_files.values():
+        for descriptor, _metadata, binding_fd, _name in opened_files.values():
             os.close(descriptor)
+            os.close(binding_fd)
 
 
 def verify_parallel_corpus(
@@ -1062,6 +1183,7 @@ def build_parallel_corpus(
     stage_path = publication_staging_path(output, build_id)
     stage_name = stage_path.name
     owner_payload = _stage_owner_bytes(build_id)
+    tombstone_fd = -1
     try:
         if entry_exists(parent_fd, output_name):
             try:
@@ -1115,6 +1237,7 @@ def build_parallel_corpus(
                 raise ValueError(
                     f"conflicting parallel corpus output: {output}"
                 ) from error
+        tombstone_fd = open_tombstone_directory(parent_fd)
         if entry_exists(parent_fd, stage_name):
             stage_metadata = entry_lstat(parent_fd, stage_name)
             if not stat.S_ISDIR(stage_metadata.st_mode):
@@ -1146,6 +1269,7 @@ def build_parallel_corpus(
                             existing_stage_fd,
                             _STAGE_OWNER_NAME,
                             owner_payload,
+                            tombstone_fd=tombstone_fd,
                         )
                     return _publish_staging(
                         parent_fd=parent_fd,
@@ -1153,6 +1277,7 @@ def build_parallel_corpus(
                         stage_name=stage_name,
                         output_name=output_name,
                         build_id=build_id,
+                        tombstone_fd=tombstone_fd,
                     )
                 if not entry_exists(existing_stage_fd, _STAGE_OWNER_NAME):
                     raise ValueError(
@@ -1180,30 +1305,35 @@ def build_parallel_corpus(
                 created=created,
                 build_id=build_id,
                 shard_names=shard_names,
+                tombstone_fd=tombstone_fd,
             )
             atomic_write_or_match(
                 stage_fd,
                 "catalog.jsonl",
                 catalog_bytes,
                 owner=build_id,
+                tombstone_fd=tombstone_fd,
             )
             atomic_write_or_match(
                 stage_fd,
                 "metadata.jsonl",
                 metadata_bytes,
                 owner=build_id,
+                tombstone_fd=tombstone_fd,
             )
             atomic_write_or_match(
                 stage_fd,
                 "schedule.jsonl",
                 schedule_bytes,
                 owner=build_id,
+                tombstone_fd=tombstone_fd,
             )
             atomic_write_or_match(
                 stage_fd,
                 "assignments.jsonl",
                 assignment_bytes,
                 owner=build_id,
+                tombstone_fd=tombstone_fd,
             )
             packed = _rerender_and_pack_pinned(
                 catalog,
@@ -1213,6 +1343,7 @@ def build_parallel_corpus(
                 renderer,
                 shards_fd,
                 owner=build_id,
+                tombstone_fd=tombstone_fd,
                 cached_payloads=_cached_payloads,
             )
             _assert_complete_stage(stage_fd, shards_fd, shard_names)
@@ -1262,6 +1393,7 @@ def build_parallel_corpus(
                 "receipt.json",
                 canonical_json_bytes(receipt),
                 owner=build_id,
+                tombstone_fd=tombstone_fd,
             )
             fsync_directory(shards_fd)
             fsync_directory(stage_fd)
@@ -1274,6 +1406,7 @@ def build_parallel_corpus(
                 stage_fd,
                 _STAGE_OWNER_NAME,
                 owner_payload,
+                tombstone_fd=tombstone_fd,
             )
             _verify_parallel_corpus_fd(
                 stage_fd,
@@ -1285,12 +1418,15 @@ def build_parallel_corpus(
                 stage_name=stage_name,
                 output_name=output_name,
                 build_id=build_id,
+                tombstone_fd=tombstone_fd,
             )
         finally:
             if shards_fd >= 0:
                 os.close(shards_fd)
             os.close(stage_fd)
     finally:
+        if tombstone_fd >= 0:
+            os.close(tombstone_fd)
         os.close(parent_fd)
 
 
@@ -1349,13 +1485,18 @@ def publish_verification_receipt(
     )
     receipt_bytes = canonical_json_bytes(receipt)
     parent_fd, name = open_parent_directory(destination, create=True)
+    tombstone_fd = -1
     try:
+        tombstone_fd = open_tombstone_directory(parent_fd)
         atomic_write_or_match(
             parent_fd,
             name,
             receipt_bytes,
             owner=expected_build_id,
+            tombstone_fd=tombstone_fd,
         )
     finally:
+        if tombstone_fd >= 0:
+            os.close(tombstone_fd)
         os.close(parent_fd)
     return receipt
