@@ -394,9 +394,9 @@ def rerender_and_pack(
     tombstone_fd = None
     try:
         root_fd, _created = open_directory_at(parent_fd, root_name)
+        tombstone_fd = open_tombstone_directory(parent_fd)
         shards_fd, _created = open_directory_at(root_fd, "shards", create=True)
         try:
-            tombstone_fd = open_tombstone_directory(parent_fd)
             return _rerender_and_pack_pinned(
                 catalog,
                 metadata,

@@ -195,9 +195,10 @@ def _open_workspace(
     root_fd = open_directory_path(shared_root, create=create)
     namespace_fd = -1
     build_fd = -1
-    tombstone_parent_fd = -1
     tombstone_fd = None
     try:
+        if create:
+            tombstone_fd = open_tombstone_directory(root_fd)
         namespace_fd, _created = open_directory_at(
             root_fd,
             _WORKSPACE_ROOT,
@@ -213,11 +214,9 @@ def _open_workspace(
             workspace.name,
             create=create,
         )
-        if create:
-            tombstone_parent_fd = os.dup(root_fd)
     except BaseException:
-        if tombstone_parent_fd >= 0:
-            os.close(tombstone_parent_fd)
+        if tombstone_fd is not None:
+            tombstone_fd.close()
         raise
     finally:
         if build_fd >= 0:
@@ -236,7 +235,8 @@ def _open_workspace(
         if created:
             if list_entries(workspace_fd):
                 raise ValueError("new task workspace is not empty")
-            tombstone_fd = open_tombstone_directory(tombstone_parent_fd)
+            if tombstone_fd is None:
+                raise RuntimeError("task workspace creation requires retained objects")
             atomic_write_or_match(
                 workspace_fd,
                 _OWNER_NAME,
@@ -251,17 +251,11 @@ def _open_workspace(
                 raise ValueError("task workspace ownership marker is missing") from error
             if actual_owner != owner_payload:
                 raise ValueError("task workspace ownership marker mismatch")
-            if create:
-                tombstone_fd = open_tombstone_directory(tombstone_parent_fd)
     except BaseException:
         os.close(workspace_fd)
         if tombstone_fd is not None:
             tombstone_fd.close()
-        if tombstone_parent_fd >= 0:
-            os.close(tombstone_parent_fd)
         raise
-    if tombstone_parent_fd >= 0:
-        os.close(tombstone_parent_fd)
     return workspace_fd, tombstone_fd, workspace, owner_payload, owner_token
 
 
@@ -373,6 +367,7 @@ def _open_local_task_workspace(
     workspace_fd = -1
     tombstone_fd = None
     try:
+        tombstone_fd = open_tombstone_directory(root_fd)
         namespace_fd, _created = open_directory_at(
             root_fd,
             _LOCAL_WORKSPACE_ROOT,
@@ -388,7 +383,6 @@ def _open_local_task_workspace(
             workspace.name,
             create=True,
         )
-        tombstone_fd = open_tombstone_directory(root_fd)
     except BaseException:
         if workspace_fd >= 0:
             os.close(workspace_fd)
@@ -498,7 +492,7 @@ def _restore_quarantined_directory(
     original_name: str,
     tombstone_fd: int,
     tombstone_name: str,
-) -> None:
+) -> bool:
     try:
         atomic_rename_noreplace(
             tombstone_fd,
@@ -507,9 +501,12 @@ def _restore_quarantined_directory(
             original_name,
         )
     except FileExistsError:
-        pass
+        fsync_directory(source_parent_fd)
+        fsync_directory(tombstone_fd)
+        return False
     fsync_directory(source_parent_fd)
     fsync_directory(tombstone_fd)
+    return True
 
 
 def _remove_owned_empty_directory(
@@ -534,7 +531,7 @@ def _remove_owned_empty_directory(
     quarantined_fd = -1
     tombstone_name = ""
     try:
-        tombstone_fd.enforce_capacity(
+        tombstone_fd.require_admission(
             additional_count=1,
             additional_bytes=0,
         )
@@ -573,12 +570,14 @@ def _remove_owned_empty_directory(
         ):
             os.close(quarantined_fd)
             quarantined_fd = -1
-            _restore_quarantined_directory(
+            restored = _restore_quarantined_directory(
                 parent_fd,
                 name,
                 tombstone_fd.directory_fd,
                 tombstone_name,
             )
+            if not restored:
+                tombstone_fd.raise_identity_error(name)
             raise ValueError(
                 f"owned cleanup directory identity changed: {name}"
             )
@@ -590,12 +589,14 @@ def _remove_owned_empty_directory(
             tombstone_fd.directory_fd,
             tombstone_name,
         ):
-            _restore_quarantined_directory(
+            restored = _restore_quarantined_directory(
                 parent_fd,
                 name,
                 tombstone_fd.directory_fd,
                 tombstone_name,
             )
+            if not restored:
+                tombstone_fd.raise_identity_error(name)
         raise
     finally:
         if quarantined_fd >= 0:

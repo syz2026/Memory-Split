@@ -44,8 +44,8 @@ _TOMBSTONE_LOCK_FLAGS = (
     | getattr(os, "O_CLOEXEC", 0)
     | getattr(os, "O_NOFOLLOW", 0)
 )
-RETAINED_TOMBSTONE_MAX_COUNT = 4096
-RETAINED_TOMBSTONE_MAX_BYTES = 64 * 1024**3
+RETAINED_TOMBSTONE_ADMISSION_COUNT_THRESHOLD = 4096
+RETAINED_TOMBSTONE_ADMISSION_BYTE_THRESHOLD = 64 * 1024**3
 
 if not getattr(os, "O_DIRECTORY", 0) or not getattr(os, "O_NOFOLLOW", 0):
     raise RuntimeError("secure corpus publication requires O_DIRECTORY and O_NOFOLLOW")
@@ -53,6 +53,10 @@ if not getattr(os, "O_DIRECTORY", 0) or not getattr(os, "O_NOFOLLOW", 0):
 
 def retained_tombstone_maintenance_contract() -> dict[str, object]:
     return {
+        "coordination_scope": "conforming-builders",
+        "hostile_same_uid_mutation_in_scope": False,
+        "hard_storage_boundary": "filesystem-or-project-quota",
+        "reclamation": "quiescent-operator-maintenance",
         "requires_no_active_build_or_finalizer": True,
         "library_path_deletion": False,
         "procedure": (
@@ -60,6 +64,11 @@ def retained_tombstone_maintenance_contract() -> dict[str, object]:
             "or finalizer is active; snapshot the reported inventory; then "
             "remove only the reported entries and their containing tombstone "
             "roots in an operator-controlled maintenance window."
+        ),
+        "trust_boundary": (
+            "Advisory locks and admission thresholds coordinate conforming "
+            "builders only. Hostile same-UID mutation is out of scope; "
+            "filesystem or project quotas are the hard storage boundary."
         ),
     }
 
@@ -86,30 +95,47 @@ class RetainedTombstoneInventory:
         }
 
 
-class RetainedTombstoneLimitError(ValueError):
+class RetainedTombstoneAdmissionError(ValueError):
     def __init__(
         self,
         inventory: RetainedTombstoneInventory,
         *,
-        max_count: int,
-        max_bytes: int,
+        count_threshold: int,
+        byte_threshold: int,
         additional_count: int,
         additional_bytes: int,
     ) -> None:
         self.inventory = inventory
         self.report = {
             "inventory": inventory.summary_dict(),
-            "limits": {
-                "bytes": max_bytes,
-                "count": max_count,
+            "cooperative_thresholds": {
+                "bytes": byte_threshold,
+                "count": count_threshold,
             },
-            "projected": {
-                "bytes": inventory.byte_count + additional_bytes,
-                "count": inventory.count + additional_count,
+            "requested_admission": {
+                "bytes": additional_bytes,
+                "count": additional_count,
             },
         }
         super().__init__(
-            "retained tombstone limit exceeded: "
+            "retained tombstone cooperative admission threshold exceeded: "
+            + json.dumps(self.report, sort_keys=True, separators=(",", ":"))
+        )
+
+
+class RetainedTombstoneIdentityError(ValueError):
+    def __init__(
+        self,
+        name: str,
+        inventory: RetainedTombstoneInventory,
+    ) -> None:
+        self.inventory = inventory
+        self.report = {
+            "inventory": inventory.summary_dict(),
+            "reason": "uncertain-identity-retained",
+        }
+        super().__init__(
+            f"retained object identity is uncertain after quarantine: {name}; "
             + json.dumps(self.report, sort_keys=True, separators=(",", ":"))
         )
 
@@ -119,10 +145,11 @@ class RetainedTombstoneStore:
     parent_fd: int
     directory_fd: int
     lock_fd: int
-    max_count: int
-    max_bytes: int
+    admission_count_threshold: int
+    admission_byte_threshold: int
 
     def duplicate(self) -> "RetainedTombstoneStore":
+        self.require_admission(additional_count=0, additional_bytes=0)
         parent_fd = os.dup(self.parent_fd)
         directory_fd = -1
         lock_fd = -1
@@ -133,8 +160,8 @@ class RetainedTombstoneStore:
                 parent_fd=parent_fd,
                 directory_fd=directory_fd,
                 lock_fd=lock_fd,
-                max_count=self.max_count,
-                max_bytes=self.max_bytes,
+                admission_count_threshold=self.admission_count_threshold,
+                admission_byte_threshold=self.admission_byte_threshold,
             )
         except BaseException:
             if lock_fd >= 0:
@@ -154,25 +181,41 @@ class RetainedTombstoneStore:
     def inventory(self) -> RetainedTombstoneInventory:
         return retained_tombstone_inventory_fd(self.parent_fd)
 
-    def enforce_capacity(
+    def require_admission(
         self,
         *,
         additional_count: int,
         additional_bytes: int,
     ) -> RetainedTombstoneInventory:
+        """Coordinate cleanup admission among conforming builders.
+
+        This is not a filesystem quota. Same-UID processes that ignore the
+        lock can change retained storage; deployments needing a hard storage
+        bound must enforce a filesystem or project quota.
+        """
+
         inventory = self.inventory()
         if (
-            inventory.count + additional_count > self.max_count
-            or inventory.byte_count + additional_bytes > self.max_bytes
+            inventory.count + additional_count
+            > self.admission_count_threshold
+            or inventory.byte_count + additional_bytes
+            > self.admission_byte_threshold
         ):
-            raise RetainedTombstoneLimitError(
+            raise RetainedTombstoneAdmissionError(
                 inventory,
-                max_count=self.max_count,
-                max_bytes=self.max_bytes,
+                count_threshold=self.admission_count_threshold,
+                byte_threshold=self.admission_byte_threshold,
                 additional_count=additional_count,
                 additional_bytes=additional_bytes,
             )
         return inventory
+
+    def raise_identity_error(self, name: str) -> None:
+        inventory = self.require_admission(
+            additional_count=0,
+            additional_bytes=0,
+        )
+        raise RetainedTombstoneIdentityError(name, inventory)
 
 
 def _entry_name(name: str) -> str:
@@ -559,16 +602,20 @@ def retained_tombstone_inventory(
 def open_tombstone_directory(
     parent_fd: int,
     *,
-    max_count: int | None = None,
-    max_bytes: int | None = None,
+    admission_count_threshold: int | None = None,
+    admission_byte_threshold: int | None = None,
 ) -> RetainedTombstoneStore:
-    """Open the bounded pinned store used instead of path-based deletion."""
+    """Open the pinned retained-object store used instead of path deletion."""
 
     resolved_count = (
-        RETAINED_TOMBSTONE_MAX_COUNT if max_count is None else max_count
+        RETAINED_TOMBSTONE_ADMISSION_COUNT_THRESHOLD
+        if admission_count_threshold is None
+        else admission_count_threshold
     )
     resolved_bytes = (
-        RETAINED_TOMBSTONE_MAX_BYTES if max_bytes is None else max_bytes
+        RETAINED_TOMBSTONE_ADMISSION_BYTE_THRESHOLD
+        if admission_byte_threshold is None
+        else admission_byte_threshold
     )
     if (
         isinstance(resolved_count, bool)
@@ -578,7 +625,9 @@ def open_tombstone_directory(
         or not isinstance(resolved_bytes, int)
         or resolved_bytes < 0
     ):
-        raise ValueError("retained tombstone ceilings must be non-negative integers")
+        raise ValueError(
+            "retained tombstone admission thresholds must be non-negative integers"
+        )
     created = False
     try:
         os.mkdir(_TOMBSTONE_DIRECTORY_NAME, mode=0o700, dir_fd=parent_fd)
@@ -608,13 +657,22 @@ def open_tombstone_directory(
             _validate_tombstone_root(directory_fd)
             lock_fd = _open_tombstone_lock(directory_fd)
         retained_parent_fd = os.dup(parent_fd)
-        return RetainedTombstoneStore(
+        store = RetainedTombstoneStore(
             parent_fd=retained_parent_fd,
             directory_fd=directory_fd,
             lock_fd=lock_fd,
-            max_count=resolved_count,
-            max_bytes=resolved_bytes,
+            admission_count_threshold=resolved_count,
+            admission_byte_threshold=resolved_bytes,
         )
+        fcntl.flock(store.lock_fd, fcntl.LOCK_EX)
+        try:
+            store.require_admission(
+                additional_count=0,
+                additional_bytes=0,
+            )
+        finally:
+            fcntl.flock(store.lock_fd, fcntl.LOCK_UN)
+        return store
     except BaseException:
         if retained_parent_fd >= 0:
             os.close(retained_parent_fd)
@@ -805,7 +863,7 @@ def _retain_regular_tombstone(
 
         fcntl.flock(tombstone_fd.lock_fd, fcntl.LOCK_EX)
         locked = True
-        tombstone_fd.enforce_capacity(
+        tombstone_fd.require_admission(
             additional_count=1,
             additional_bytes=source_metadata.st_size,
         )
@@ -845,12 +903,14 @@ def _retain_regular_tombstone(
             finally:
                 os.close(quarantined_fd)
         except BaseException:
-            _restore_quarantined_entry(
+            restored = _restore_quarantined_entry(
                 directory_fd,
                 name,
                 tombstone_fd.directory_fd,
                 tombstone_name,
             )
+            if not restored:
+                tombstone_fd.raise_identity_error(name)
             raise
 
         quarantined_identity = (
@@ -865,12 +925,14 @@ def _retain_regular_tombstone(
                 and quarantined_payload != expected_payload
             )
         ):
-            _restore_quarantined_entry(
+            restored = _restore_quarantined_entry(
                 directory_fd,
                 name,
                 tombstone_fd.directory_fd,
                 tombstone_name,
             )
+            if not restored:
+                tombstone_fd.raise_identity_error(name)
             raise ValueError(
                 f"owned file identity changed during quarantine: {name}"
             )
@@ -880,12 +942,14 @@ def _retain_regular_tombstone(
             or (current.st_dev, current.st_ino) != source_identity
             or current.st_size != source_metadata.st_size
         ):
-            _restore_quarantined_entry(
+            restored = _restore_quarantined_entry(
                 directory_fd,
                 name,
                 tombstone_fd.directory_fd,
                 tombstone_name,
             )
+            if not restored:
+                tombstone_fd.raise_identity_error(name)
             raise ValueError(
                 f"owned file identity changed during quarantine: {name}"
             )
@@ -1001,7 +1065,7 @@ class AtomicFileWriter:
             self._closed = False
         except BaseException as construction_error:
             identity = None
-            limit_error = None
+            admission_error = None
             if self.descriptor >= 0:
                 try:
                     metadata = os.fstat(self.descriptor)
@@ -1018,15 +1082,15 @@ class AtomicFileWriter:
                         identity,
                         tombstone_fd=self.tombstone_store,
                     )
-                except RetainedTombstoneLimitError as error:
-                    limit_error = error
+                except RetainedTombstoneAdmissionError as error:
+                    admission_error = error
                 except (OSError, ValueError):
                     pass
             os.close(self.directory_fd)
             if self.tombstone_store is not None:
                 self.tombstone_store.close()
-            if limit_error is not None:
-                raise limit_error from construction_error
+            if admission_error is not None:
+                raise admission_error from construction_error
             raise
 
     def write(self, payload: bytes) -> None:

@@ -1036,7 +1036,7 @@ def test_regular_cleanup_moves_to_retained_tombstone_without_path_unlink(
     assert (tmp_path / inventory.paths[0]).read_bytes() == b"expected"
 
 
-def test_retained_tombstone_cap_reports_existing_inventory_before_move(tmp_path):
+def test_retained_tombstone_threshold_reports_inventory_before_admission(tmp_path):
     first = tmp_path / "first"
     second = tmp_path / "second"
     first.write_bytes(b"four")
@@ -1047,8 +1047,8 @@ def test_retained_tombstone_cap_reports_existing_inventory_before_move(tmp_path)
     )
     store = safeio_module.open_tombstone_directory(
         directory_fd,
-        max_count=1,
-        max_bytes=1024,
+        admission_count_threshold=1,
+        admission_byte_threshold=1024,
     )
     try:
         first_inventory = safeio_module.unlink_regular_if_matches(
@@ -1058,7 +1058,7 @@ def test_retained_tombstone_cap_reports_existing_inventory_before_move(tmp_path)
             tombstone_fd=store,
         )
         with pytest.raises(
-            safeio_module.RetainedTombstoneLimitError
+            safeio_module.RetainedTombstoneAdmissionError
         ) as captured:
             safeio_module.unlink_regular_if_matches(
                 directory_fd,
@@ -1077,11 +1077,257 @@ def test_retained_tombstone_cap_reports_existing_inventory_before_move(tmp_path)
         "count": 1,
         "paths": list(first_inventory.paths),
     }
-    assert captured.value.report["projected"] == {
-        "bytes": 9,
-        "count": 2,
+    assert captured.value.report["cooperative_thresholds"] == {
+        "bytes": 1024,
+        "count": 1,
+    }
+    assert captured.value.report["requested_admission"] == {
+        "bytes": 5,
+        "count": 1,
     }
     assert second.read_bytes() == b"five!"
+
+
+def test_retention_contract_uses_cooperative_threshold_trust_boundary():
+    contract = safeio_module.retained_tombstone_maintenance_contract()
+
+    assert hasattr(
+        safeio_module,
+        "RETAINED_TOMBSTONE_ADMISSION_COUNT_THRESHOLD",
+    )
+    assert hasattr(
+        safeio_module,
+        "RETAINED_TOMBSTONE_ADMISSION_BYTE_THRESHOLD",
+    )
+    assert hasattr(safeio_module, "RetainedTombstoneAdmissionError")
+    assert not hasattr(safeio_module, "RETAINED_TOMBSTONE_MAX_COUNT")
+    assert not hasattr(safeio_module, "RETAINED_TOMBSTONE_MAX_BYTES")
+    assert not hasattr(safeio_module, "RetainedTombstoneLimitError")
+    assert contract["coordination_scope"] == "conforming-builders"
+    assert contract["hostile_same_uid_mutation_in_scope"] is False
+    assert contract["hard_storage_boundary"] == "filesystem-or-project-quota"
+    assert contract["reclamation"] == "quiescent-operator-maintenance"
+
+
+def test_larger_replacement_is_reported_and_stops_subsequent_admission(
+    tmp_path,
+    monkeypatch,
+):
+    owned = tmp_path / "owned"
+    owned.write_bytes(b"tiny")
+    held = tmp_path / "held-original"
+    second = tmp_path / "second"
+    second.write_bytes(b"next")
+    directory_fd = os.open(
+        tmp_path,
+        os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+    )
+    store = safeio_module.open_tombstone_directory(
+        directory_fd,
+        admission_count_threshold=10,
+        admission_byte_threshold=8,
+    )
+    real_rename = safeio_module.atomic_rename_noreplace
+    swapped = False
+    blocked = False
+    second_mutated = False
+
+    def swap_larger_then_block_restore(
+        source_fd,
+        source_name,
+        destination_fd,
+        destination_name,
+    ):
+        nonlocal swapped, blocked, second_mutated
+        if source_name == owned.name and not swapped:
+            swapped = True
+            real_rename(
+                source_fd,
+                source_name,
+                source_fd,
+                held.name,
+            )
+            replacement = os.open(
+                source_name,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                0o600,
+                dir_fd=source_fd,
+            )
+            try:
+                os.write(replacement, b"x" * 64)
+            finally:
+                os.close(replacement)
+        elif (
+            source_fd == store.directory_fd
+            and destination_name == owned.name
+            and not blocked
+        ):
+            blocked = True
+            blocker = os.open(
+                destination_name,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                0o600,
+                dir_fd=destination_fd,
+            )
+            try:
+                os.write(blocker, b"block")
+            finally:
+                os.close(blocker)
+        elif source_name == second.name:
+            second_mutated = True
+        return real_rename(
+            source_fd,
+            source_name,
+            destination_fd,
+            destination_name,
+        )
+
+    monkeypatch.setattr(
+        safeio_module,
+        "atomic_rename_noreplace",
+        swap_larger_then_block_restore,
+    )
+    try:
+        with pytest.raises(
+            safeio_module.RetainedTombstoneAdmissionError,
+            match="cooperative admission threshold",
+        ) as captured:
+            safeio_module.unlink_regular_if_matches(
+                directory_fd,
+                owned.name,
+                b"tiny",
+                tombstone_fd=store,
+            )
+        inventory = store.inventory()
+        assert getattr(captured.value, "report", None) == {
+            "inventory": inventory.summary_dict(),
+            "cooperative_thresholds": {"bytes": 8, "count": 10},
+            "requested_admission": {"bytes": 0, "count": 0},
+        }
+        with pytest.raises(ValueError, match="admission threshold"):
+            safeio_module.unlink_regular_if_matches(
+                directory_fd,
+                second.name,
+                b"next",
+                tombstone_fd=store,
+            )
+    finally:
+        store.close()
+        os.close(directory_fd)
+
+    assert swapped and blocked
+    assert inventory.count == 1
+    assert inventory.byte_count == 64
+    assert (tmp_path / inventory.paths[0]).read_bytes() == b"x" * 64
+    assert held.read_bytes() == b"tiny"
+    assert owned.read_bytes() == b"block"
+    assert second.read_bytes() == b"next"
+    assert second_mutated is False
+
+
+def test_crossed_retention_threshold_stops_task_workspace_creation(
+    tmp_path,
+    monkeypatch,
+):
+    shared_root = tmp_path / "shared"
+    shared_root.mkdir()
+    seed = shared_root / "seed"
+    seed.write_bytes(b"retained")
+    root_fd = os.open(
+        shared_root,
+        os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+    )
+    store = safeio_module.open_tombstone_directory(root_fd)
+    try:
+        safeio_module.unlink_regular_if_matches(
+            root_fd,
+            seed.name,
+            b"retained",
+            tombstone_fd=store,
+        )
+    finally:
+        store.close()
+        os.close(root_fd)
+    monkeypatch.setattr(
+        safeio_module,
+        "RETAINED_TOMBSTONE_ADMISSION_COUNT_THRESHOLD",
+        0,
+    )
+    catalog, renderer, config = _fixture_build(record_count=6)
+    result = parallel.render_task_result(
+        catalog,
+        renderer,
+        config,
+        task_index=0,
+        task_count=1,
+    )
+
+    with pytest.raises(
+        safeio_module.RetainedTombstoneAdmissionError,
+        match="cooperative admission threshold",
+    ):
+        parallel.publish_task_result(
+            shared_root,
+            result,
+            scheduler_id="job-42",
+            nonce="nonce-a",
+        )
+
+    assert not (shared_root / ".memorysplit-v2-builds").exists()
+
+
+def test_crossed_retention_threshold_stops_local_cache_creation(
+    tmp_path,
+    monkeypatch,
+):
+    local_root = tmp_path / "local"
+    local_root.mkdir()
+    seed = local_root / "seed"
+    seed.write_bytes(b"retained")
+    root_fd = os.open(
+        local_root,
+        os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+    )
+    store = safeio_module.open_tombstone_directory(root_fd)
+    try:
+        safeio_module.unlink_regular_if_matches(
+            root_fd,
+            seed.name,
+            b"retained",
+            tombstone_fd=store,
+        )
+    finally:
+        store.close()
+        os.close(root_fd)
+    monkeypatch.setattr(
+        safeio_module,
+        "RETAINED_TOMBSTONE_ADMISSION_COUNT_THRESHOLD",
+        0,
+    )
+    catalog, renderer, config = _fixture_build(record_count=6)
+    result = parallel.render_task_result(
+        catalog,
+        renderer,
+        config,
+        task_index=0,
+        task_count=1,
+    )
+
+    with pytest.raises(
+        safeio_module.RetainedTombstoneAdmissionError,
+        match="cooperative admission threshold",
+    ):
+        parallel.publish_task_result_via_local_cache(
+            local_root,
+            tmp_path / "shared",
+            result,
+            scheduler_id="job-42",
+            job_id="job-42",
+            nonce="nonce-a",
+        )
+
+    assert not (local_root / ".memorysplit-v2-local-tasks").exists()
+    assert not (tmp_path / "shared").exists()
 
 
 def test_unlink_regular_if_matches_never_deletes_swapped_replacement(
@@ -1790,25 +2036,25 @@ def test_read_only_verification_and_task_loading_create_no_tombstones(tmp_path):
 
 
 @pytest.mark.parametrize(
-    ("max_count", "max_bytes"),
+    ("count_threshold", "byte_threshold"),
     [(0, 1 << 30), (100, 0)],
 )
-def test_retained_tombstone_caps_fail_before_quarantine(
+def test_retained_tombstone_thresholds_stop_build_admission(
     tmp_path,
     monkeypatch,
-    max_count,
-    max_bytes,
+    count_threshold,
+    byte_threshold,
 ):
     monkeypatch.setattr(
         safeio_module,
-        "RETAINED_TOMBSTONE_MAX_COUNT",
-        max_count,
+        "RETAINED_TOMBSTONE_ADMISSION_COUNT_THRESHOLD",
+        count_threshold,
         raising=False,
     )
     monkeypatch.setattr(
         safeio_module,
-        "RETAINED_TOMBSTONE_MAX_BYTES",
-        max_bytes,
+        "RETAINED_TOMBSTONE_ADMISSION_BYTE_THRESHOLD",
+        byte_threshold,
         raising=False,
     )
     catalog, renderer, config = _fixture_build()
@@ -1816,7 +2062,10 @@ def test_retained_tombstone_caps_fail_before_quarantine(
     build_id = parallel_build_id(catalog, renderer.renderer_id, config)
     stage = publication_staging_path(destination, build_id)
 
-    with pytest.raises(ValueError, match="retained tombstone limit") as captured:
+    with pytest.raises(
+        ValueError,
+        match="retained tombstone cooperative admission threshold",
+    ) as captured:
         build_parallel_corpus(catalog, renderer, config, destination)
 
     report = captured.value.report
@@ -1825,12 +2074,12 @@ def test_retained_tombstone_caps_fail_before_quarantine(
         "count": 0,
         "paths": [],
     }
-    assert report["limits"] == {
-        "bytes": max_bytes,
-        "count": max_count,
+    assert report["cooperative_thresholds"] == {
+        "bytes": byte_threshold,
+        "count": count_threshold,
     }
-    assert report["projected"]["count"] == 1
-    assert report["projected"]["bytes"] > 0
+    assert report["requested_admission"]["count"] == 1
+    assert report["requested_admission"]["bytes"] > 0
     assert not destination.exists()
     assert (stage / ".parallel-owner.json").is_file()
 
