@@ -109,20 +109,45 @@ _DISPOSABLE_COMPONENTS = {
     "__pycache__",
     "cache",
     "caches",
-    "checkpoints",
-    "logs",
     "snapshots",
 }
-_SHARED_SUFFIXES: dict[str, set[str] | None] = {
+_FORBIDDEN_DIRECTORY_COMPONENTS = {
+    "checkpoint",
+    "checkpoints",
+    "credential",
+    "credentials",
+    "data",
+    "gold",
+    "log",
+    "logs",
+    "output",
+    "outputs",
+    "sealed",
+    "sealed-gold",
+    "sealed_gold",
+}
+_FORBIDDEN_FILE_STEMS = _FORBIDDEN_DIRECTORY_COMPONENTS | {
+    "password",
+    "private-key",
+    "private_key",
+}
+_SHARED_SUFFIXES: dict[str, set[str]] = {
     "corpusgen": {".py"},
     "evals": {".py"},
     "msctl": {".py"},
     "organizer": {".py"},
     "scripts": {".py"},
-    "sources": {".json", ".txt"},
     "tests": {".py"},
     "train": {".py"},
-    "vendor": None,
+}
+_APPROVED_SOURCES = {
+    "sources/Wikidata-CC0-1.0.txt",
+    "sources/current-dataset-licenses.json",
+    "sources/wikidata5m.lock.json",
+}
+_APPROVED_VENDOR = {
+    "vendor/tiktoken/6c7ea1a7e38e3a7f062df639a5b80947f075ffe6",
+    "vendor/tiktoken/6d1cbeee0f20b3d9449abfede4726ed8212e3aee",
 }
 _SHARED_CONFIGS = {
     "configs/current-dataset-lock.json",
@@ -194,6 +219,7 @@ _SENSITIVE_FIELD_PATTERN = re.compile(
     r"password|private_key|secret|session_token|token)(?:$|_)",
     re.IGNORECASE,
 )
+_TEXT_SUFFIXES = {".json", ".lock", ".md", ".py", ".sh", ".txt", ".yaml", ".yml"}
 _OBJECT_ID_PATTERN = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})")
 _CONFIG_KEYS = {
     "schema_version",
@@ -264,6 +290,33 @@ class ReleaseArtifacts:
 
 
 @dataclass(frozen=True)
+class _PinnedEntry:
+    parent_fd: int
+    name: str
+    descriptor: int
+    kind: str
+    sha256: str | None = None
+
+
+@dataclass(frozen=True)
+class _Repository:
+    source_fd: int
+    source_path: str
+    git_dir_fd: int
+    git_dir_path: str
+    pinned_entries: tuple[_PinnedEntry, ...]
+    directory_paths: tuple[tuple[int, str], ...]
+    owned_descriptors: tuple[int, ...]
+
+    def close(self) -> None:
+        for descriptor in reversed(self.owned_descriptors):
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+
+
+@dataclass(frozen=True)
 class _Tracked:
     path: str
     mode: str
@@ -328,22 +381,6 @@ def _directory_flags() -> int:
     )
 
 
-def _open_source_root(path: Path) -> int:
-    try:
-        descriptor = os.open(path, _directory_flags())
-    except OSError as error:
-        raise PackageError(
-            "source root must be a non-symlink directory"
-        ) from error
-    try:
-        if not stat.S_ISDIR(os.fstat(descriptor).st_mode):
-            raise PackageError("source root must be a directory")
-        return descriptor
-    except Exception:
-        os.close(descriptor)
-        raise
-
-
 def _descriptor_path(descriptor: int) -> str:
     if sys.platform == "darwin":
         try:
@@ -364,64 +401,363 @@ def _descriptor_path(descriptor: int) -> str:
     raise PackageError("platform cannot expose the pinned source descriptor")
 
 
-def _assert_directory_descriptor_path(descriptor: int, path: str) -> None:
+def _assert_directory_descriptor_path(
+    descriptor: int,
+    path: str,
+    *,
+    label: str = "directory",
+) -> None:
     pinned = os.fstat(descriptor)
     try:
         current = os.stat(path, follow_symlinks=False)
     except OSError as error:
-        raise PackageError("pinned source directory path changed") from error
+        raise PackageError(f"pinned {label} path changed") from error
     if (
         not stat.S_ISDIR(current.st_mode)
         or current.st_dev != pinned.st_dev
         or current.st_ino != pinned.st_ino
     ):
-        raise PackageError("pinned source directory path was replaced")
+        raise PackageError(f"pinned {label} path was replaced")
 
 
-def _run_git(repository_fd: int, *arguments: str) -> bytes:
-    environment = dict(os.environ)
+def _open_existing_directory(path: Path, *, label: str) -> tuple[Path, int]:
+    absolute = Path(os.path.abspath(os.fspath(path)))
+    current_fd = os.open("/", _directory_flags())
+    try:
+        for component in absolute.parts[1:]:
+            try:
+                child_fd = os.open(
+                    component,
+                    _directory_flags(),
+                    dir_fd=current_fd,
+                )
+            except OSError as error:
+                raise PackageError(
+                    f"{label} must contain no symlink or non-directory component"
+                ) from error
+            os.close(current_fd)
+            current_fd = child_fd
+        _assert_directory_descriptor_path(
+            current_fd,
+            str(absolute),
+            label=label,
+        )
+        return absolute, current_fd
+    except Exception:
+        os.close(current_fd)
+        raise
+
+
+def _read_pinned_bytes(
+    descriptor: int,
+    *,
+    label: str,
+    maximum_bytes: int = 512 * 1024 * 1024,
+) -> bytes:
+    details = os.fstat(descriptor)
+    if not stat.S_ISREG(details.st_mode) or details.st_nlink != 1:
+        raise PackageError(f"{label} must be a singly-linked regular file")
+    if details.st_size < 0 or details.st_size > maximum_bytes:
+        raise PackageError(f"{label} has an unsupported size")
+    try:
+        data = os.pread(descriptor, details.st_size, 0)
+    except OSError as error:
+        raise PackageError(f"{label} cannot be read safely") from error
+    if len(data) != details.st_size:
+        raise PackageError(f"{label} changed while being read")
+    return data
+
+
+def _open_entry_at(parent_fd: int, name: str, *, label: str) -> int:
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    try:
+        return os.open(name, flags, dir_fd=parent_fd)
+    except OSError as error:
+        raise PackageError(f"{label} cannot be opened safely") from error
+
+
+def _pin_entry(
+    parent_fd: int,
+    name: str,
+    *,
+    label: str,
+    expected_kind: str,
+) -> _PinnedEntry:
+    descriptor = _open_entry_at(parent_fd, name, label=label)
+    try:
+        details = os.fstat(descriptor)
+        if expected_kind == "directory":
+            if not stat.S_ISDIR(details.st_mode):
+                raise PackageError(f"{label} must be a directory")
+            digest = None
+        elif expected_kind == "file":
+            data = _read_pinned_bytes(descriptor, label=label)
+            digest = _sha256(data)
+        else:
+            raise AssertionError(f"unsupported pinned entry kind: {expected_kind}")
+        return _PinnedEntry(
+            parent_fd=parent_fd,
+            name=name,
+            descriptor=descriptor,
+            kind=expected_kind,
+            sha256=digest,
+        )
+    except Exception:
+        os.close(descriptor)
+        raise
+
+
+def _parse_gitdir_file(data: bytes, source_path: Path) -> Path:
+    try:
+        text = data.decode("utf-8", errors="strict")
+    except UnicodeDecodeError as error:
+        raise PackageError("worktree .git file is not UTF-8") from error
+    lines = text.splitlines()
+    if len(lines) != 1 or not lines[0].startswith("gitdir: "):
+        raise PackageError("worktree .git file has an invalid format")
+    raw_path = lines[0][len("gitdir: ") :]
+    if not raw_path or "\x00" in raw_path:
+        raise PackageError("worktree .git file has an invalid path")
+    candidate = Path(raw_path)
+    if not candidate.is_absolute():
+        candidate = source_path / candidate
+    return Path(os.path.abspath(os.fspath(candidate)))
+
+
+def _open_repository(path: Path) -> _Repository:
+    source_path, source_fd = _open_existing_directory(path, label="source root")
+    owned: list[int] = [source_fd]
+    pinned_entries: list[_PinnedEntry] = []
+    directory_paths: list[tuple[int, str]] = [
+        (source_fd, str(source_path)),
+    ]
+    try:
+        dot_git_fd = _open_entry_at(source_fd, ".git", label="source .git")
+        owned.append(dot_git_fd)
+        dot_git_details = os.fstat(dot_git_fd)
+        if stat.S_ISDIR(dot_git_details.st_mode):
+            dot_git = _PinnedEntry(
+                parent_fd=source_fd,
+                name=".git",
+                descriptor=dot_git_fd,
+                kind="directory",
+            )
+            git_dir_fd = os.dup(dot_git_fd)
+            owned.append(git_dir_fd)
+            git_dir_path = Path(_descriptor_path(git_dir_fd))
+        elif stat.S_ISREG(dot_git_details.st_mode):
+            dot_git_data = _read_pinned_bytes(
+                dot_git_fd,
+                label="source .git file",
+                maximum_bytes=16 * 1024,
+            )
+            dot_git = _PinnedEntry(
+                parent_fd=source_fd,
+                name=".git",
+                descriptor=dot_git_fd,
+                kind="file",
+                sha256=_sha256(dot_git_data),
+            )
+            requested_git_dir = _parse_gitdir_file(dot_git_data, source_path)
+            git_dir_path, git_dir_fd = _open_existing_directory(
+                requested_git_dir,
+                label="worktree Git directory",
+            )
+            owned.append(git_dir_fd)
+        else:
+            raise PackageError("source .git must be a file or directory")
+        pinned_entries.append(dot_git)
+        directory_paths.append((git_dir_fd, str(git_dir_path)))
+
+        try:
+            common_link = _pin_entry(
+                git_dir_fd,
+                "commondir",
+                label="Git commondir file",
+                expected_kind="file",
+            )
+        except PackageError as error:
+            try:
+                os.stat("commondir", dir_fd=git_dir_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                common_link = None
+            else:
+                raise error
+        if common_link is None:
+            common_dir_fd = os.dup(git_dir_fd)
+            owned.append(common_dir_fd)
+            common_dir_path = git_dir_path
+        else:
+            owned.append(common_link.descriptor)
+            pinned_entries.append(common_link)
+            try:
+                common_text = _read_pinned_bytes(
+                    common_link.descriptor,
+                    label="Git commondir file",
+                    maximum_bytes=16 * 1024,
+                ).decode("utf-8", errors="strict").strip()
+            except UnicodeDecodeError as error:
+                raise PackageError("Git commondir file is not UTF-8") from error
+            if not common_text or "\x00" in common_text:
+                raise PackageError("Git commondir file has an invalid path")
+            common_candidate = Path(common_text)
+            if not common_candidate.is_absolute():
+                common_candidate = git_dir_path / common_candidate
+            common_dir_path, common_dir_fd = _open_existing_directory(
+                Path(os.path.abspath(os.fspath(common_candidate))),
+                label="Git common directory",
+            )
+            owned.append(common_dir_fd)
+        directory_paths.append((common_dir_fd, str(common_dir_path)))
+
+        for name, label in (
+            ("HEAD", "Git HEAD"),
+            ("index", "Git index"),
+        ):
+            entry = _pin_entry(
+                git_dir_fd,
+                name,
+                label=label,
+                expected_kind="file",
+            )
+            owned.append(entry.descriptor)
+            pinned_entries.append(entry)
+        config_entry = _pin_entry(
+            common_dir_fd,
+            "config",
+            label="Git repository config",
+            expected_kind="file",
+        )
+        owned.append(config_entry.descriptor)
+        pinned_entries.append(config_entry)
+        objects_entry = _pin_entry(
+            common_dir_fd,
+            "objects",
+            label="Git object directory",
+            expected_kind="directory",
+        )
+        owned.append(objects_entry.descriptor)
+        pinned_entries.append(objects_entry)
+        objects_path = _descriptor_path(objects_entry.descriptor)
+        directory_paths.append((objects_entry.descriptor, objects_path))
+
+        repository = _Repository(
+            source_fd=source_fd,
+            source_path=str(source_path),
+            git_dir_fd=git_dir_fd,
+            git_dir_path=str(git_dir_path),
+            pinned_entries=tuple(pinned_entries),
+            directory_paths=tuple(directory_paths),
+            owned_descriptors=tuple(owned),
+        )
+        _assert_repository_bindings(repository)
+        return repository
+    except Exception:
+        for descriptor in reversed(owned):
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+        raise
+
+
+def _assert_pinned_entry(entry: _PinnedEntry) -> None:
+    pinned = os.fstat(entry.descriptor)
+    try:
+        current = os.stat(
+            entry.name,
+            dir_fd=entry.parent_fd,
+            follow_symlinks=False,
+        )
+    except OSError as error:
+        raise PackageError(f"pinned Git entry changed: {entry.name}") from error
+    expected_type = stat.S_IFDIR if entry.kind == "directory" else stat.S_IFREG
+    if (
+        stat.S_IFMT(current.st_mode) != expected_type
+        or current.st_dev != pinned.st_dev
+        or current.st_ino != pinned.st_ino
+    ):
+        raise PackageError(f"pinned Git entry was replaced: {entry.name}")
+    if entry.kind == "file":
+        if current.st_nlink != 1:
+            raise PackageError(f"pinned Git file is multiply linked: {entry.name}")
+        data = _read_pinned_bytes(
+            entry.descriptor,
+            label=f"pinned Git file {entry.name}",
+        )
+        if _sha256(data) != entry.sha256:
+            raise PackageError(f"pinned Git file changed: {entry.name}")
+
+
+def _assert_repository_bindings(repository: _Repository) -> None:
+    for descriptor, path in repository.directory_paths:
+        _assert_directory_descriptor_path(
+            descriptor,
+            path,
+            label="Git repository directory",
+        )
+    for entry in repository.pinned_entries:
+        _assert_pinned_entry(entry)
+
+
+def _sanitized_git_environment() -> dict[str, str]:
+    environment = {
+        key: value
+        for key, value in os.environ.items()
+        if not key.upper().startswith("GIT_")
+    }
     environment.update(
         {
+            "GIT_CONFIG_GLOBAL": os.devnull,
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_CONFIG_SYSTEM": os.devnull,
+            "GIT_NO_REPLACE_OBJECTS": "1",
             "GIT_OPTIONAL_LOCKS": "0",
             "GIT_PAGER": "cat",
+            "GIT_TERMINAL_PROMPT": "0",
             "LC_ALL": "C",
         }
     )
-    repository_path = _descriptor_path(repository_fd)
-    _assert_directory_descriptor_path(repository_fd, repository_path)
+    return environment
+
+
+def _run_git(repository: _Repository, *arguments: str) -> bytes:
+    _assert_repository_bindings(repository)
     try:
         completed = subprocess.run(
             [
                 "git",
-                "-C",
-                repository_path,
+                "--no-pager",
+                "--no-replace-objects",
+                f"--git-dir={repository.git_dir_path}",
+                f"--work-tree={repository.source_path}",
+                "-c",
+                "core.fsmonitor=false",
+                "-c",
+                "core.untrackedCache=false",
                 *arguments,
             ],
             capture_output=True,
             check=False,
-            env=environment,
-            pass_fds=(repository_fd,),
+            cwd="/",
+            env=_sanitized_git_environment(),
+            pass_fds=repository.owned_descriptors,
         )
     except OSError as error:
         raise PackageError("git repository verification failed") from error
-    _assert_directory_descriptor_path(repository_fd, repository_path)
+    _assert_repository_bindings(repository)
     if completed.returncode != 0:
         raise PackageError("git repository verification failed")
     return completed.stdout
 
 
-def _clean_revision(repository_fd: int) -> str:
-    status = _run_git(
-        repository_fd,
-        "status",
-        "--porcelain=v1",
-        "-z",
-        "--untracked-files=all",
-    )
-    if status:
-        raise PackageError("dirty Git trees cannot produce a release")
+def _head_revision(repository: _Repository) -> str:
     revision = (
-        _run_git(repository_fd, "rev-parse", "--verify", "HEAD")
+        _run_git(repository, "rev-parse", "--verify", "HEAD")
         .decode("ascii", errors="strict")
         .strip()
     )
@@ -430,26 +766,43 @@ def _clean_revision(repository_fd: int) -> str:
     return revision
 
 
-def _assert_repository_unchanged(repository_fd: int, revision: str) -> None:
-    current = (
-        _run_git(repository_fd, "rev-parse", "--verify", "HEAD")
-        .decode("ascii", errors="strict")
-        .strip()
-    )
+def _clean_revision(repository: _Repository) -> str:
+    before = _head_revision(repository)
     status = _run_git(
-        repository_fd,
+        repository,
         "status",
         "--porcelain=v1",
         "-z",
         "--untracked-files=all",
     )
-    if current != revision or status:
+    if status:
+        raise PackageError("dirty Git trees cannot produce a release")
+    after = _head_revision(repository)
+    if before != after:
+        raise PackageError("Git HEAD changed during clean-tree verification")
+    return before
+
+
+def _assert_repository_unchanged(
+    repository: _Repository,
+    revision: str,
+) -> None:
+    before = _head_revision(repository)
+    status = _run_git(
+        repository,
+        "status",
+        "--porcelain=v1",
+        "-z",
+        "--untracked-files=all",
+    )
+    after = _head_revision(repository)
+    if before != revision or after != revision or status:
         raise PackageError("source Git tree changed during packaging")
 
 
-def _tracked_files(repository_fd: int, revision: str) -> list[_Tracked]:
+def _tracked_files(repository: _Repository, revision: str) -> list[_Tracked]:
     output = _run_git(
-        repository_fd,
+        repository,
         "ls-tree",
         "-r",
         "-z",
@@ -489,18 +842,36 @@ def _tracked_files(repository_fd: int, revision: str) -> list[_Tracked]:
     return sorted(result, key=lambda item: item.path)
 
 
+def _path_contains_forbidden_content(path: str) -> bool:
+    parts = tuple(part.lower() for part in PurePosixPath(path).parts)
+    if not parts:
+        return False
+    if any(part in _FORBIDDEN_DIRECTORY_COMPONENTS for part in parts[:-1]):
+        return True
+    filename = parts[-1]
+    stem = PurePosixPath(filename).stem
+    return (
+        stem in _FORBIDDEN_FILE_STEMS
+        or "credential" in stem
+        or "sealed-gold" in stem
+        or "sealed_gold" in stem
+    )
+
+
 def _classification(path: str) -> str:
     parts = PurePosixPath(path).parts
     if not parts:
         return "unknown"
-    if set(parts) & _DISPOSABLE_COMPONENTS:
-        return "excluded"
-    if path in _ROOT_INCLUDED:
-        return "included"
     if path in _ROOT_EXCLUDED or path in _PROVIDER_EXCLUDED:
         return "excluded"
     if parts[0] in _EXCLUDED_TOP_LEVEL:
         return "excluded"
+    if _path_contains_forbidden_content(path):
+        return "forbidden"
+    if set(parts) & _DISPOSABLE_COMPONENTS:
+        return "excluded"
+    if path in _ROOT_INCLUDED:
+        return "included"
     if path == COHORT_PATH or path in EXPECTED_CONFIGS or path in _SHARED_CONFIGS:
         return "included"
     if path in SEED_ZERO_CONFIGS:
@@ -521,18 +892,22 @@ def _classification(path: str) -> str:
         return "excluded"
     if path in _SHARED_TEST_FIXTURES:
         return "included"
+    if path in _APPROVED_SOURCES or path in _APPROVED_VENDOR:
+        return "included"
+    if parts[0] in {"sources", "vendor"}:
+        return "unknown"
     suffixes = _SHARED_SUFFIXES.get(parts[0])
     if parts[0] in _SHARED_SUFFIXES:
-        if suffixes is None or PurePosixPath(path).suffix.lower() in suffixes:
+        if PurePosixPath(path).suffix.lower() in suffixes:
             return "included"
         return "unknown"
     return "unknown"
 
 
-def _read_blob(repository_fd: int, object_id: str) -> bytes:
+def _read_blob(repository: _Repository, object_id: str) -> bytes:
     if _OBJECT_ID_PATTERN.fullmatch(object_id) is None:
         raise PackageError("Git tree contains an invalid blob ID")
-    return _run_git(repository_fd, "cat-file", "blob", object_id)
+    return _run_git(repository, "cat-file", "blob", object_id)
 
 
 def _scan_secret(path: str, data: bytes) -> None:
@@ -546,6 +921,20 @@ def _scan_secret(path: str, data: bytes) -> None:
         raise PackageError(f"secret-like file is forbidden: {path}")
     if any(pattern.search(data) for pattern in _SECRET_PATTERNS):
         raise PackageError(f"secret material detected in: {path}")
+    suffix = PurePosixPath(path).suffix.lower()
+    if suffix in _TEXT_SUFFIXES:
+        try:
+            text = data.decode("utf-8", errors="strict")
+        except UnicodeDecodeError as error:
+            raise PackageError(f"text release member is not UTF-8: {path}") from error
+        if "\x00" in text:
+            raise PackageError(f"text release member contains a NUL byte: {path}")
+    if suffix == ".json":
+        value = _load_json_value(data, label=path)
+        _reject_sensitive_fields(value, label=path)
+    elif suffix in {".yaml", ".yml"}:
+        value = _load_yaml_value(data, path=path)
+        _reject_sensitive_fields(value, label=path)
 
 
 def _sha256(data: bytes) -> str:
@@ -578,7 +967,7 @@ def _reject_json_constant(value: str) -> object:
     raise PackageError(f"JSON contains a non-finite number: {value}")
 
 
-def _load_json_object(data: bytes, *, label: str) -> dict[str, object]:
+def _load_json_value(data: bytes, *, label: str) -> object:
     try:
         text = data.decode("utf-8", errors="strict")
         value = json.loads(
@@ -590,19 +979,29 @@ def _load_json_object(data: bytes, *, label: str) -> dict[str, object]:
         raise
     except (UnicodeDecodeError, json.JSONDecodeError) as error:
         raise PackageError(f"{label} is not canonical JSON data") from error
+    return value
+
+
+def _load_json_object(data: bytes, *, label: str) -> dict[str, object]:
+    value = _load_json_value(data, label=label)
     if not isinstance(value, dict):
         raise PackageError(f"{label} must be a JSON object")
     return value
 
 
-def _load_yaml_object(data: bytes, *, path: str) -> dict[str, object]:
+def _load_yaml_value(data: bytes, *, path: str) -> object:
     try:
         text = data.decode("utf-8", errors="strict")
         value = yaml.load(text, Loader=_UniqueSafeLoader)
     except PackageError:
         raise
     except (UnicodeDecodeError, yaml.YAMLError) as error:
-        raise PackageError(f"run config is not valid YAML: {path}") from error
+        raise PackageError(f"release member is not valid YAML: {path}") from error
+    return value
+
+
+def _load_yaml_object(data: bytes, *, path: str) -> dict[str, object]:
+    value = _load_yaml_value(data, path=path)
     if not isinstance(value, dict) or not all(
         isinstance(key, str) for key in value
     ):
@@ -785,18 +1184,25 @@ def _validate_dataset_pointer(data: bytes) -> None:
 
 
 def _collect_payload(
-    repository_fd: int,
+    repository: _Repository,
     tracked: list[_Tracked],
     revision: str,
 ) -> _Collected:
     included: list[_Tracked] = []
     unknown: list[str] = []
+    forbidden: list[str] = []
     for item in tracked:
         classification = _classification(item.path)
         if classification == "included":
             included.append(item)
         elif classification == "unknown":
             unknown.append(item.path)
+        elif classification == "forbidden":
+            forbidden.append(item.path)
+    if forbidden:
+        raise PackageError(
+            f"forbidden tracked path cannot be released: {forbidden[0]}"
+        )
     if unknown:
         raise PackageError(
             f"unknown tracked path is not allowlisted: {unknown[0]}"
@@ -810,7 +1216,7 @@ def _collect_payload(
     modes: dict[str, str] = {}
     member_rows: list[dict[str, object]] = []
     for item in included:
-        data = _read_blob(repository_fd, item.object_id)
+        data = _read_blob(repository, item.object_id)
         _scan_secret(item.path, data)
         payload[item.path] = data
         modes[item.path] = item.mode
@@ -1187,6 +1593,22 @@ def _build_staging(
             },
             "source": {"commit": revision, "dirty": False},
             "seed_assignment": collected.seed_assignment,
+            "cohort_assignment": {
+                "path": COHORT_PATH,
+                "sha256": collected.cohort_sha256,
+            },
+            "profile": {
+                "path": PROFILE_PATH,
+                "sha256": collected.profile_sha256,
+            },
+            "environment": {
+                "path": ENVIRONMENT_PATH,
+                "sha256": collected.environment_sha256,
+            },
+            "dataset_pointer": {
+                "path": DATASET_POINTER_PATH,
+                "sha256": collected.dataset_pointer_sha256,
+            },
             "cohort_assignment_sha256": collected.cohort_sha256,
             "profile_sha256": collected.profile_sha256,
             "environment_sha256": collected.environment_sha256,
@@ -1249,10 +1671,32 @@ def _open_or_create_output(path: Path) -> tuple[Path, int]:
                 ) from error
             os.close(current_fd)
             current_fd = child_fd
+        _assert_output_control(current_fd)
         return absolute, current_fd
     except Exception:
         os.close(current_fd)
         raise
+
+
+def _assert_output_control(output_fd: int) -> None:
+    details = os.fstat(output_fd)
+    if not stat.S_ISDIR(details.st_mode):
+        raise PackageError("release output must be a directory")
+    if details.st_uid != os.geteuid():
+        raise PackageError("release output must be controlled by the current owner")
+    if stat.S_IMODE(details.st_mode) & 0o022:
+        raise PackageError(
+            "release output must not be group- or world-writable"
+        )
+
+
+def _lock_output(output_fd: int) -> None:
+    _assert_output_control(output_fd)
+    try:
+        fcntl.flock(output_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError as error:
+        raise PackageError("release output is locked by another publisher") from error
+    _assert_output_control(output_fd)
 
 
 def _make_staging_at(output_fd: int, release_id: str) -> tuple[str, int]:
@@ -1269,8 +1713,37 @@ def _make_staging_at(output_fd: int, release_id: str) -> tuple[str, int]:
         except Exception:
             os.rmdir(name, dir_fd=output_fd)
             raise
+        _assert_staging_path(output_fd, name, descriptor)
         return name, descriptor
     raise PackageError("cannot allocate a unique private release staging name")
+
+
+def _assert_staging_path(
+    output_fd: int,
+    staging_name: str,
+    staging_fd: int,
+) -> None:
+    _assert_output_control(output_fd)
+    pinned = os.fstat(staging_fd)
+    try:
+        current = os.stat(
+            staging_name,
+            dir_fd=output_fd,
+            follow_symlinks=False,
+        )
+    except OSError as error:
+        raise PackageError("private staging pathname changed") from error
+    if (
+        not stat.S_ISDIR(pinned.st_mode)
+        or not stat.S_ISDIR(current.st_mode)
+        or current.st_dev != pinned.st_dev
+        or current.st_ino != pinned.st_ino
+        or current.st_uid != os.geteuid()
+        or stat.S_IMODE(current.st_mode) & 0o077
+    ):
+        raise PackageError(
+            "private staging pathname was replaced or is not owner-only"
+        )
 
 
 def _remove_staging_at(
@@ -1278,6 +1751,7 @@ def _remove_staging_at(
     staging_name: str,
     staging_fd: int,
 ) -> None:
+    pinned = os.fstat(staging_fd)
     try:
         for name in os.listdir(staging_fd):
             try:
@@ -1293,8 +1767,36 @@ def _remove_staging_at(
                 os.unlink(name, dir_fd=staging_fd)
             except FileNotFoundError:
                 continue
-        os.rmdir(staging_name, dir_fd=output_fd)
-    except FileNotFoundError:
+        matching_name = None
+        for candidate in os.listdir(output_fd):
+            try:
+                details = os.stat(
+                    candidate,
+                    dir_fd=output_fd,
+                    follow_symlinks=False,
+                )
+            except FileNotFoundError:
+                continue
+            if (
+                stat.S_ISDIR(details.st_mode)
+                and details.st_dev == pinned.st_dev
+                and details.st_ino == pinned.st_ino
+            ):
+                matching_name = candidate
+                break
+        if matching_name is not None:
+            os.rmdir(matching_name, dir_fd=output_fd)
+        try:
+            replacement = os.stat(
+                staging_name,
+                dir_fd=output_fd,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            return
+        if stat.S_ISLNK(replacement.st_mode):
+            os.unlink(staging_name, dir_fd=output_fd)
+    except (FileNotFoundError, OSError):
         return
 
 
@@ -1356,6 +1858,36 @@ def _rename_noreplace_at(
     raise PackageError("atomic no-replace release publication failed")
 
 
+def _publish_staging_at(
+    output_fd: int,
+    staging_name: str,
+    staging_fd: int,
+    release_id: str,
+) -> None:
+    _assert_output_control(output_fd)
+    _assert_staging_path(output_fd, staging_name, staging_fd)
+    _rename_noreplace_at(output_fd, staging_name, release_id)
+
+
+def _assert_external_output(
+    repository: _Repository,
+    output_path: Path,
+) -> Path:
+    absolute = Path(os.path.abspath(os.fspath(output_path)))
+    source = Path(repository.source_path)
+    try:
+        within_source = os.path.commonpath((str(source), str(absolute))) == str(
+            source
+        )
+    except ValueError:
+        within_source = False
+    if within_source:
+        raise PackageError(
+            "apply output must be outside the source worktree"
+        )
+    return absolute
+
+
 def build_handoff(
     *,
     source_root: Path | str,
@@ -1365,16 +1897,18 @@ def build_handoff(
     """Validate a clean Git snapshot and optionally publish one release set."""
 
     source = Path(os.path.abspath(os.fspath(source_root)))
-    repository_fd = _open_source_root(source)
+    repository = _open_repository(source)
     try:
-        revision = _clean_revision(repository_fd)
-        tracked = _tracked_files(repository_fd, revision)
-        collected = _collect_payload(repository_fd, tracked, revision)
-        _assert_repository_unchanged(repository_fd, revision)
+        output_requested = Path(out_dir)
+        if apply:
+            _assert_external_output(repository, output_requested)
+        revision = _clean_revision(repository)
+        tracked = _tracked_files(repository, revision)
+        collected = _collect_payload(repository, tracked, revision)
+        _assert_repository_unchanged(repository, revision)
         release_suffix = collected.members_sha256[:16]
         release_id = f"aws-p5-r1-{release_suffix}"
         archive_name = f"ms-aws-p5-r1-{release_suffix}.zip"
-        output_requested = Path(out_dir)
         release_dir = Path(os.path.abspath(os.fspath(output_requested))) / release_id
 
         if not apply:
@@ -1391,7 +1925,7 @@ def build_handoff(
                         release_id=release_id,
                         archive_name=archive_name,
                     )
-                    _assert_repository_unchanged(repository_fd, revision)
+                    _assert_repository_unchanged(repository, revision)
                     _assert_descriptor_names_entry(
                         staging_fd,
                         archive_name,
@@ -1418,6 +1952,7 @@ def build_handoff(
         staged = None
         published = False
         try:
+            _lock_output(output_fd)
             staging_name, staging_fd = _make_staging_at(output_fd, release_id)
             staged = _build_staging(
                 staging_fd,
@@ -1426,13 +1961,19 @@ def build_handoff(
                 release_id=release_id,
                 archive_name=archive_name,
             )
-            _assert_repository_unchanged(repository_fd, revision)
+            _assert_repository_unchanged(repository, revision)
             _assert_descriptor_names_entry(
                 staging_fd,
                 archive_name,
                 staged.archive_fd,
             )
-            _rename_noreplace_at(output_fd, staging_name, release_id)
+            _assert_staging_path(output_fd, staging_name, staging_fd)
+            _publish_staging_at(
+                output_fd,
+                staging_name,
+                staging_fd,
+                release_id,
+            )
             published = True
             os.fsync(output_fd)
             release_dir = output / release_id
@@ -1458,7 +1999,7 @@ def build_handoff(
                 os.close(staging_fd)
             os.close(output_fd)
     finally:
-        os.close(repository_fd)
+        repository.close()
 
 
 def _emit(value: dict[str, object]) -> None:
@@ -1484,13 +2025,26 @@ def main(argv: list[str] | None = None) -> int:
             "--source-root",
             default=str(Path(__file__).resolve().parents[1]),
         )
-        parser.add_argument("--out-dir", default="dist/aws-p5")
+        parser.add_argument(
+            "--out-dir",
+            default=None,
+            help=(
+                "external release root; defaults to "
+                "../memorysplit-releases/aws-p5 relative to the source"
+            ),
+        )
         parser.add_argument("--apply", action="store_true")
         args = parser.parse_args(argv)
         apply = bool(args.apply)
+        source_root = Path(os.path.abspath(os.fspath(args.source_root)))
+        out_dir = (
+            Path(args.out_dir)
+            if args.out_dir is not None
+            else source_root.parent / "memorysplit-releases" / "aws-p5"
+        )
         artifacts = build_handoff(
-            source_root=args.source_root,
-            out_dir=args.out_dir,
+            source_root=source_root,
+            out_dir=out_dir,
             apply=apply,
         )
         report = {

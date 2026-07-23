@@ -252,7 +252,9 @@ def _minimal_repo(tmp_path: Path, *, name: str = "source") -> Path:
         ),
         "sources/current-dataset-licenses.json": '{"license":"fixture"}\n',
         "sources/wikidata5m.lock.json": '{"sha256":"' + "b" * 64 + '"}\n',
-        "vendor/tiktoken/fixture-asset": b"tokenizer fixture",
+        "vendor/tiktoken/6c7ea1a7e38e3a7f062df639a5b80947f075ffe6": (
+            b"tokenizer fixture"
+        ),
         # Provider-specific and materialized paths are deliberately tracked
         # so the fixture proves they are excluded rather than merely absent.
         "AGENT-START.md": "# Illumina guide\n",
@@ -447,6 +449,7 @@ def test_archive_contains_only_semantic_seed_pairs_and_hash_bound_metadata(
             assert digest == _sha256_bytes(archive.read(relative))
             checksum_paths.add(relative)
         assert checksum_paths == regular_names - {"SHA256SUMS"}
+        members_sha256 = _sha256_bytes(archive.read("SHA256SUMS"))
 
     receipt = json.loads(artifacts.release.read_text())
     assert receipt["cohort_assignment_sha256"] == metadata[
@@ -454,6 +457,15 @@ def test_archive_contains_only_semantic_seed_pairs_and_hash_bound_metadata(
     ]["sha256"]
     assert receipt["profile_sha256"] == metadata["profile"]["sha256"]
     assert receipt["environment_sha256"] == metadata["environment"]["sha256"]
+    assert receipt["dataset_pointer_sha256"] == metadata["dataset_pointer"][
+        "sha256"
+    ]
+    assert receipt["config_sha256"] == metadata["config_sha256"]
+    assert receipt["members_sha256"] == members_sha256
+    assert receipt["cohort_assignment"] == metadata["cohort_assignment"]
+    assert receipt["profile"] == metadata["profile"]
+    assert receipt["environment"] == metadata["environment"]
+    assert receipt["dataset_pointer"] == metadata["dataset_pointer"]
 
 
 def test_archive_excludes_materialized_provider_and_sealed_content(tmp_path):
@@ -532,6 +544,33 @@ def test_packager_rejects_dirty_tree_before_writing(tmp_path):
     assert not out.exists()
 
 
+def test_inherited_git_controls_cannot_redirect_a_dirty_source(
+    tmp_path,
+    monkeypatch,
+):
+    module = _load_module()
+    source = _minimal_repo(tmp_path, name="dirty-source")
+    alternate = _minimal_repo(tmp_path, name="alternate-clean-source")
+    (source / "untracked.txt").write_text("dirty source must remain authoritative\n")
+    out = tmp_path / "out"
+    injected = {
+        "GIT_DIR": str(alternate / ".git"),
+        "GIT_WORK_TREE": str(alternate),
+        "GIT_INDEX_FILE": str(alternate / ".git" / "index"),
+        "GIT_OBJECT_DIRECTORY": str(alternate / ".git" / "objects"),
+        "GIT_CONFIG_COUNT": "1",
+        "GIT_CONFIG_KEY_0": "core.worktree",
+        "GIT_CONFIG_VALUE_0": str(alternate),
+    }
+    for key, value in injected.items():
+        monkeypatch.setenv(key, value)
+
+    with pytest.raises(module.PackageError, match="dirty"):
+        module.build_handoff(source_root=source, out_dir=out, apply=True)
+
+    assert not out.exists()
+
+
 def test_packager_rejects_any_tracked_symlink(tmp_path):
     module = _load_module()
     source = _minimal_repo(tmp_path)
@@ -583,6 +622,100 @@ def test_packager_rejects_static_credential_fields_in_profile(tmp_path):
             out_dir=tmp_path / "out",
             apply=True,
         )
+
+
+@pytest.mark.parametrize(
+    "relative",
+    [
+        "vendor/tiktoken/data/payload.bin",
+        "sources/archive/outputs/result.json",
+        "tests/helpers/checkpoints/state.py",
+        "msctl/runtime/logs/helper.py",
+        "evals/confirmatory/sealed/gold.py",
+        "train/private/credentials/key.py",
+    ],
+)
+def test_packager_rejects_forbidden_content_nested_in_allowed_trees(
+    tmp_path,
+    relative,
+):
+    module = _load_module()
+    source = _minimal_repo(tmp_path)
+    _write(source / relative, b"forbidden nested content\n")
+    _commit(source, "add nested forbidden content")
+
+    with pytest.raises(module.PackageError, match="forbidden"):
+        module.build_handoff(
+            source_root=source,
+            out_dir=tmp_path / "out",
+            apply=True,
+        )
+
+
+@pytest.mark.parametrize(
+    "relative",
+    [
+        "vendor/tiktoken/unapproved-asset",
+        "sources/unapproved-source.json",
+    ],
+)
+def test_packager_rejects_unenumerated_vendor_and_source_paths(
+    tmp_path,
+    relative,
+):
+    module = _load_module()
+    source = _minimal_repo(tmp_path)
+    _write(source / relative, b'{"fixture":true}\n')
+    _commit(source, "add unapproved source path")
+
+    with pytest.raises(module.PackageError, match="unknown|allowlist"):
+        module.build_handoff(
+            source_root=source,
+            out_dir=tmp_path / "out",
+            apply=True,
+        )
+
+
+@pytest.mark.parametrize(
+    "relative",
+    [
+        "configs/current-dataset-lock.json",
+        "configs/preregistration-v2.yaml",
+    ],
+)
+def test_packager_recursively_rejects_secret_keys_without_echoing_values(
+    tmp_path,
+    relative,
+):
+    module = _load_module()
+    source = _minimal_repo(tmp_path)
+    secret_key = "pass" + "word"
+    secret_value = "nested-json-or-yaml-secret-must-not-echo"
+    if relative.endswith(".json"):
+        content = _canonical_json(
+            {
+                "schema_version": 1,
+                "nested": {secret_key: secret_value},
+            }
+        )
+    else:
+        content = (
+            "schema_version: 2\n"
+            "nested:\n"
+            f"  {secret_key}: {secret_value}\n"
+        )
+    (source / relative).write_text(content)
+    _commit(source, "add nested structured secret")
+
+    with pytest.raises(module.PackageError) as caught:
+        module.build_handoff(
+            source_root=source,
+            out_dir=tmp_path / "out",
+            apply=True,
+        )
+
+    assert "secret" in str(caught.value).lower()
+    assert secret_value not in str(caught.value)
 
 
 def test_packager_rejects_unknown_tracked_path(tmp_path):
@@ -774,6 +907,64 @@ def test_descriptor_pinning_detects_archive_path_replacement(
     assert not out.exists() or list(out.iterdir()) == []
 
 
+@pytest.mark.parametrize("replacement_kind", ["directory", "symlink"])
+def test_staging_path_replacement_cannot_publish_a_release(
+    tmp_path,
+    monkeypatch,
+    replacement_kind,
+):
+    module = _load_module()
+    source = _minimal_repo(tmp_path)
+    out = tmp_path / "out"
+    original_make = module._make_staging_at
+    raced = False
+
+    def racing_make(output_fd, release_id):
+        nonlocal raced
+        name, descriptor = original_make(output_fd, release_id)
+        moved = f"{name}.moved"
+        os.rename(
+            name,
+            moved,
+            src_dir_fd=output_fd,
+            dst_dir_fd=output_fd,
+        )
+        if replacement_kind == "directory":
+            os.mkdir(name, 0o700, dir_fd=output_fd)
+        else:
+            os.symlink(moved, name, dir_fd=output_fd)
+        raced = True
+        return name, descriptor
+
+    monkeypatch.setattr(module, "_make_staging_at", racing_make)
+
+    with pytest.raises(
+        module.PackageError,
+        match="staging|symlink|replaced|descriptor",
+    ):
+        module.build_handoff(source_root=source, out_dir=out, apply=True)
+
+    assert raced is True
+    if out.exists():
+        assert not any(
+            not path.name.startswith(".") or path.name == "RELEASE-AWS-P5.json"
+            for path in out.iterdir()
+        )
+
+
+def test_apply_rejects_group_or_world_writable_output_parent(tmp_path):
+    module = _load_module()
+    source = _minimal_repo(tmp_path)
+    out = tmp_path / "shared-output"
+    out.mkdir(mode=0o700)
+    out.chmod(0o777)
+
+    with pytest.raises(module.PackageError, match="owner|writable|permission"):
+        module.build_handoff(source_root=source, out_dir=out, apply=True)
+
+    assert list(out.iterdir()) == []
+
+
 def test_packager_rejects_symlink_output_directory(tmp_path):
     module = _load_module()
     source = _minimal_repo(tmp_path)
@@ -822,6 +1013,57 @@ def test_cli_defaults_to_dry_run_and_emits_one_json_object(tmp_path):
     assert not out.exists()
 
 
+def test_apply_requires_output_outside_source_worktree(tmp_path):
+    module = _load_module()
+    source = _minimal_repo(tmp_path)
+    internal_out = source / "dist" / "aws-p5"
+
+    with pytest.raises(module.PackageError, match="outside|external"):
+        module.build_handoff(
+            source_root=source,
+            out_dir=internal_out,
+            apply=True,
+        )
+
+    assert not internal_out.exists()
+    assert _git(source, "status", "--porcelain") == ""
+
+
+def test_cli_apply_uses_documented_external_output_by_default(tmp_path):
+    _load_module()
+    source = _minimal_repo(tmp_path)
+    expected_output = tmp_path / "memorysplit-releases" / "aws-p5"
+    command = [
+        sys.executable,
+        str(source / "scripts" / "package_aws_p5_handoff.py"),
+        "--source-root",
+        ".",
+        "--apply",
+    ]
+
+    completed = subprocess.run(
+        command,
+        cwd=source,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert completed.returncode == 0
+    assert completed.stderr == ""
+    assert len(completed.stdout.splitlines()) == 1
+    report = json.loads(completed.stdout)
+    assert report["ok"] is True
+    assert report["dry_run"] is False
+    assert report["published"] is True
+    release_dir = Path(report["release_dir"])
+    assert release_dir.parent == expected_output
+    assert Path(report["archive"]).is_file()
+    assert Path(report["sha256_file"]).is_file()
+    assert Path(report["release"]).name == "RELEASE-AWS-P5.json"
+    assert _git(source, "status", "--porcelain") == ""
+
+
 def test_operator_start_guide_states_fail_closed_seed_and_storage_contract():
     assert START_GUIDE.is_file(), "AWS P5 operator guide has not been implemented"
     text = START_GUIDE.read_text().lower()
@@ -835,3 +1077,4 @@ def test_operator_start_guide_states_fail_closed_seed_and_storage_contract():
     assert "release-aws-p5.json" in text
     assert "sha-256" in text or "sha256" in text
     assert "sealed gold" in text and "outside" in text
+    assert "../memorysplit-releases/aws-p5" in text

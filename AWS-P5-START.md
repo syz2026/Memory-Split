@@ -47,7 +47,7 @@ Build the handoff without publishing:
 ```bash
 python scripts/package_aws_p5_handoff.py \
   --source-root . \
-  --out-dir dist/aws-p5
+  --out-dir ../memorysplit-releases/aws-p5
 ```
 
 Publish one atomic, no-replace release set only after reviewing the JSON:
@@ -55,9 +55,13 @@ Publish one atomic, no-replace release set only after reviewing the JSON:
 ```bash
 python scripts/package_aws_p5_handoff.py \
   --source-root . \
-  --out-dir dist/aws-p5 \
+  --out-dir ../memorysplit-releases/aws-p5 \
   --apply
 ```
+
+If `--out-dir` is omitted, that same external sibling path is used. Apply
+rejects any output beneath the source worktree so staging cannot dirty the
+commit being packaged.
 
 On the P5 host, run the profile/readiness checks, a two-GPU functional canary,
 and the measured 100-update `4+4` throughput canary before a full seed. Launch
