@@ -226,6 +226,7 @@ def verify_scope_approval(
     if extended_aws_operation:
         expected_resource_fields = base_resource_fields | {
             "ami_id",
+            "container_image",
             "container_digest",
             "instance_id",
             "profile_sha256",

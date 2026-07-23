@@ -2654,7 +2654,7 @@ def test_cli_dispatch_routes_aws_provider_to_aws_backend(tmp_path):
     assert captured["factory"]["state_root"] == ".msctl-state"
 
 
-def test_aws_cli_parser_does_not_require_illumina_dataset_arguments(tmp_path):
+def test_aws_cli_parser_requires_aws_lifecycle_evidence(tmp_path):
     from msctl.cli import build_parser, dispatch
 
     profile = _aws_profile_object()
@@ -2677,7 +2677,13 @@ def test_aws_cli_parser_does_not_require_illumina_dataset_arguments(tmp_path):
             "--instance-id",
             "i-0123456789abcdef0",
             "--terminate-at",
-            "2099-01-01T00:00:00Z",
+            _AWS_TERMINATE_AT,
+            "--dataset-pointer",
+            str(tmp_path / "DATASET-POINTER.json"),
+            "--dataset-verification",
+            str(tmp_path / "dataset-verification.json"),
+            "--environment-receipt",
+            str(tmp_path / "AWS-ENVIRONMENT.json"),
         ]
     )
     dry_run, result = dispatch(
@@ -3984,7 +3990,7 @@ def test_aws_submit_is_dry_run_by_default_and_approval_precedes_aws_calls(
     )
     manifest = _aws_manifest_object()
     instance_id = "i-0123456789abcdef0"
-    terminate_at = "2099-01-01T00:00:00Z"
+    terminate_at = _AWS_TERMINATE_AT
 
     planned = backend.submit(
         release=_aws_release_object(),
@@ -4074,7 +4080,7 @@ def test_aws_submit_binds_selected_instance_runtime_and_deadline_to_approval(
             release=_aws_release_object(),
             manifest=manifest,
             instance_id=selected,
-            terminate_at="2099-01-01T00:00:00Z",
+            terminate_at=_AWS_TERMINATE_AT,
             approval_path=tmp_path / "approval.json",
             apply=True,
         )
@@ -4082,7 +4088,7 @@ def test_aws_submit_binds_selected_instance_runtime_and_deadline_to_approval(
     assert getattr(caught.value, "code", None) == "INSTANCE_SELECTION_CONFLICT"
     resources = captured["resources"]
     assert resources["instance_id"] == selected
-    assert resources["terminate_at"] == "2099-01-01T00:00:00Z"
+    assert resources["terminate_at"] == _AWS_TERMINATE_AT
     assert resources["release_sha256"] == manifest.release_sha256
     assert resources["run_manifest_sha256"] == manifest.sha256
     assert resources["seed"] == manifest.seed
@@ -4116,7 +4122,7 @@ def test_aws_approval_binds_every_extended_execution_resource(tmp_path):
         release=release,
         manifest=manifest,
         instance_id="i-0123456789abcdef0",
-        terminate_at="2099-01-01T00:00:00Z",
+        terminate_at=_AWS_TERMINATE_AT,
     )
     unsigned = {
         "schema_version": 1,
@@ -4196,11 +4202,11 @@ def test_aws_selected_instance_is_validated_then_tagged_with_exact_binding(
     result = backend._bind_selected_instance(
         manifest,
         instance_id=selected["instance_id"],
-        terminate_at="2099-01-01T00:00:00Z",
+        terminate_at=_AWS_TERMINATE_AT,
     )
 
     assert result["instance_id"] == selected["instance_id"]
-    assert result["terminate_at"] == "2099-01-01T00:00:00Z"
+    assert result["terminate_at"] == _AWS_TERMINATE_AT
     assert all("run-instances" not in argv for argv, _ in runner.calls)
     tag_call = next(argv for argv, _ in runner.calls if "create-tags" in argv)
     rendered = tag_call[tag_call.index("--tags") + 1]
@@ -4209,7 +4215,7 @@ def test_aws_selected_instance_is_validated_then_tagged_with_exact_binding(
         manifest.release_sha256,
         _aws_profile_object().sha256,
         _aws_runtime_object().container_digest,
-        "2099-01-01T00:00:00Z",
+        _AWS_TERMINATE_AT,
     ):
         assert value in rendered
     assert any("modify-instance-attribute" in argv for argv, _ in runner.calls)
@@ -4227,7 +4233,7 @@ def test_aws_selected_instance_is_validated_then_tagged_with_exact_binding(
         rejected._bind_selected_instance(
             manifest,
             instance_id=selected["instance_id"],
-            terminate_at="2099-01-01T00:00:00Z",
+            terminate_at=_AWS_TERMINATE_AT,
         )
     assert getattr(caught.value, "code", None) == "INSTANCE_BINDING_MISMATCH"
 
@@ -4254,12 +4260,12 @@ def test_aws_operation_intent_uses_conditional_content_addressed_s3_put(
         operation="submit",
         release=release,
         manifest=manifest,
-        terminate_at="2099-01-01T00:00:00Z",
+        terminate_at=_AWS_TERMINATE_AT,
     )
     intent = backend._operation_envelope(
         core,
         instance_id="i-0123456789abcdef0",
-        terminate_at="2099-01-01T00:00:00Z",
+        terminate_at=_AWS_TERMINATE_AT,
     )
     payload = _canonical(intent)
     digest = hashlib.sha256(payload).hexdigest()
@@ -4325,10 +4331,10 @@ def test_aws_operation_intent_recovers_a_lost_conditional_put_response(
             operation="submit",
             release=release,
             manifest=manifest,
-            terminate_at="2099-01-01T00:00:00Z",
+            terminate_at=_AWS_TERMINATE_AT,
         ),
         instance_id="i-0123456789abcdef0",
-        terminate_at="2099-01-01T00:00:00Z",
+        terminate_at=_AWS_TERMINATE_AT,
     )
     payload = _canonical(intent)
     digest = hashlib.sha256(payload).hexdigest()
@@ -4436,12 +4442,12 @@ def test_aws_remote_wrapper_acquires_once_and_writes_terminal_receipt(tmp_path):
         operation="submit",
         release=release,
         manifest=manifest,
-        terminate_at="2099-01-01T00:00:00Z",
+        terminate_at=_AWS_TERMINATE_AT,
     )
     intent = backend._operation_envelope(
         core,
         instance_id="i-0123456789abcdef0",
-        terminate_at="2099-01-01T00:00:00Z",
+        terminate_at=_AWS_TERMINATE_AT,
     )
     payload = canonical_json(intent)
     digest = hashlib.sha256(payload).hexdigest()
@@ -4558,7 +4564,7 @@ def test_aws_remote_wrapper_rejects_unknown_checkpoint_receipt_fields(tmp_path):
     intent = backend._operation_envelope(
         core,
         instance_id="i-0123456789abcdef0",
-        terminate_at="2099-01-01T00:00:00Z",
+        terminate_at=_AWS_TERMINATE_AT,
     )
     payload = canonical_json(intent)
 
@@ -4588,10 +4594,10 @@ def test_aws_remote_wrapper_rejects_a_substituted_argv_document_hash(tmp_path):
             operation="submit",
             release=_aws_release_object(),
             manifest=_aws_manifest_object(),
-            terminate_at="2099-01-01T00:00:00Z",
+            terminate_at=_AWS_TERMINATE_AT,
         ),
         instance_id="i-0123456789abcdef0",
-        terminate_at="2099-01-01T00:00:00Z",
+        terminate_at=_AWS_TERMINATE_AT,
     )
     intent["ssm_document"]["sha256"] = "0" * 64
     payload = canonical_json(intent)
@@ -4622,10 +4628,10 @@ def test_aws_remote_wrapper_rejects_an_expired_operation_intent(tmp_path):
             operation="submit",
             release=_aws_release_object(),
             manifest=_aws_manifest_object(),
-            terminate_at="2099-01-01T00:00:00Z",
+            terminate_at=_AWS_TERMINATE_AT,
         ),
         instance_id="i-0123456789abcdef0",
-        terminate_at="2099-01-01T00:00:00Z",
+        terminate_at=_AWS_TERMINATE_AT,
     )
     intent["terminate_at"] = "2000-01-01T00:00:00Z"
     identity = {
@@ -4674,10 +4680,10 @@ def test_aws_remote_wrapper_rejects_redirected_operation_receipts(tmp_path):
             operation="submit",
             release=_aws_release_object(),
             manifest=_aws_manifest_object(),
-            terminate_at="2099-01-01T00:00:00Z",
+            terminate_at=_AWS_TERMINATE_AT,
         ),
         instance_id="i-0123456789abcdef0",
-        terminate_at="2099-01-01T00:00:00Z",
+        terminate_at=_AWS_TERMINATE_AT,
     )
     intent["started_receipt_uri"] = (
         "s3://memorysplit-prod/cohort-v2/operations/redirected/started.json"
@@ -4716,12 +4722,12 @@ def test_aws_submit_response_loss_never_resends_the_same_operation(tmp_path):
         operation="submit",
         release=release,
         manifest=manifest,
-        terminate_at="2099-01-01T00:00:00Z",
+        terminate_at=_AWS_TERMINATE_AT,
     )
     intent = preparer._operation_envelope(
         core,
         instance_id=selected["instance_id"],
-        terminate_at="2099-01-01T00:00:00Z",
+        terminate_at=_AWS_TERMINATE_AT,
     )
     payload = _canonical(intent)
     digest = hashlib.sha256(payload).hexdigest()
@@ -4782,7 +4788,7 @@ def test_aws_submit_response_loss_never_resends_the_same_operation(tmp_path):
             release=release,
             manifest=manifest,
             instance_id=selected["instance_id"],
-            terminate_at="2099-01-01T00:00:00Z",
+            terminate_at=_AWS_TERMINATE_AT,
             approval_path=tmp_path / "approval.json",
             apply=True,
         )
@@ -4814,7 +4820,7 @@ def test_aws_submit_response_loss_never_resends_the_same_operation(tmp_path):
             release=release,
             manifest=manifest,
             instance_id=selected["instance_id"],
-            terminate_at="2099-01-01T00:00:00Z",
+            terminate_at=_AWS_TERMINATE_AT,
             approval_path=tmp_path / "approval.json",
             apply=True,
         )
@@ -4860,7 +4866,7 @@ def test_aws_submit_rejects_state_bound_to_a_different_operation_intent(
             release=release,
             manifest=manifest,
             instance_id="i-0123456789abcdef0",
-            terminate_at="2099-01-01T00:00:00Z",
+            terminate_at=_AWS_TERMINATE_AT,
             approval_path=tmp_path / "approval.json",
             apply=True,
         )
@@ -5067,7 +5073,7 @@ def test_aws_submit_persists_one_paired_intent_and_is_idempotent(tmp_path):
         release=release,
         manifest=manifest,
         instance_id="i-0123456789abcdef0",
-        terminate_at="2099-01-01T00:00:00Z",
+        terminate_at=_AWS_TERMINATE_AT,
         approval_path=tmp_path / "approval.json",
         apply=True,
     )
@@ -5075,7 +5081,7 @@ def test_aws_submit_persists_one_paired_intent_and_is_idempotent(tmp_path):
         release=release,
         manifest=manifest,
         instance_id="i-0123456789abcdef0",
-        terminate_at="2099-01-01T00:00:00Z",
+        terminate_at=_AWS_TERMINATE_AT,
         approval_path=tmp_path / "approval.json",
         apply=True,
     )
@@ -5144,7 +5150,7 @@ def test_aws_submit_ssm_preflight_failure_never_records_or_sends_intent(tmp_path
             release=release,
             manifest=manifest,
             instance_id="i-0123456789abcdef0",
-            terminate_at="2099-01-01T00:00:00Z",
+            terminate_at=_AWS_TERMINATE_AT,
             approval_path=tmp_path / "approval.json",
             apply=True,
         )
@@ -5316,7 +5322,7 @@ def test_aws_cancel_evaluate_and_cleanup_mutate_one_paired_state(tmp_path):
     evaluation_intent = evaluate_backend._operation_envelope(
         evaluate_backend._evaluation_operation_intent(release, manifest),
         instance_id=instance["instance_id"],
-        terminate_at="2099-01-01T00:00:00Z",
+        terminate_at=_AWS_TERMINATE_AT,
     )
     evaluation_payload = _canonical(evaluation_intent)
     evaluation_digest = hashlib.sha256(evaluation_payload).hexdigest()
@@ -5904,7 +5910,7 @@ def test_aws_resume_response_loss_reconciles_without_resending(tmp_path):
     intent = backend._operation_envelope(
         core,
         instance_id="i-0123456789abcdef0",
-        terminate_at="2099-01-01T00:00:00Z",
+        terminate_at=_AWS_TERMINATE_AT,
     )
     payload = canonical_json(intent)
     digest = hashlib.sha256(payload).hexdigest()
@@ -6076,7 +6082,14 @@ def test_aws_evaluation_uses_canonical_confirmatory_runner_interface(tmp_path):
     assert len(commands) == 2
     for step in commands:
         argv = step["argv"]
-        assert argv[1].endswith("/evals/confirmatory/runner.py")
+        image_index = argv.index(_aws_runtime_object().container_image)
+        assert argv[:2] == ["/usr/bin/docker", "run"]
+        assert argv[image_index + 1 : image_index + 5] == [
+            "/usr/bin/python3",
+            "-m",
+            "evals.confirmatory",
+            "evaluate",
+        ]
         assert "--run" in argv
         assert "--sealed-release" in argv
         assert "--expected-study-lock-sha256" in argv
@@ -6102,7 +6115,7 @@ def test_aws_evaluation_uses_one_content_addressed_fixed_document_intent(
     manifest = _aws_manifest_object()
     release = _aws_release_object()
     instance_id = "i-0123456789abcdef0"
-    terminate_at = "2099-01-01T00:00:00Z"
+    terminate_at = _AWS_TERMINATE_AT
     training_command = "cmd-0123456789abcdef0"
     runner = _FakeAwsRunner()
     backend = AwsP5Backend(
