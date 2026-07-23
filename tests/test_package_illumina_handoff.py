@@ -118,6 +118,16 @@ def _minimal_repo(tmp_path: Path) -> Path:
         "outputs/run/logs/worker.log": b"excluded log",
         ".cache/compiler.bin": b"excluded cache",
     }
+    for relative in (
+        "configs/cohort-assignment-v2.json",
+        "configs/preregistration-v2.yaml",
+        *(
+            f"configs/360m-v2/{arm}-s{seed}.yaml"
+            for seed in range(5)
+            for arm in ("dense", "split90")
+        ),
+    ):
+        files[relative] = (REPO_ROOT / relative).read_bytes()
     for relative, data in files.items():
         _write(
             root / relative,

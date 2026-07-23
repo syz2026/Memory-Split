@@ -422,8 +422,9 @@ def _verify_release_internals(
             "environment_hashes",
             "members",
         }
-        if "seed_assignment" in metadata:
-            metadata_fields.add("seed_assignment")
+        for optional_field in ("preregistration_sha256", "seed_assignment"):
+            if optional_field in metadata:
+                metadata_fields.add(optional_field)
     require_exact_keys(
         metadata,
         metadata_fields,
@@ -608,6 +609,20 @@ def _verify_release_internals(
                 raise _release_error(
                     "RELEASE_INTERNAL_INVALID",
                     "environment hash does not bind a release member",
+                )
+        if "preregistration_sha256" in metadata:
+            preregistration_hash = require_sha256(
+                metadata["preregistration_sha256"],
+                label="RELEASE-METADATA.json.preregistration_sha256",
+            )
+            preregistration_member = members.get("configs/preregistration-v2.yaml")
+            if (
+                preregistration_member is None
+                or preregistration_member["sha256"] != preregistration_hash
+            ):
+                raise _release_error(
+                    "RELEASE_INTERNAL_INVALID",
+                    "preregistration hash does not bind its release member",
                 )
     if "seed_assignment" in metadata:
         assignment = require_object(
