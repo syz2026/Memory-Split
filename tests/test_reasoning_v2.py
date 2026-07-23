@@ -37,6 +37,65 @@ def _routing_fact(index: int) -> FactMetadata:
     )
 
 
+def _fact_with(**overrides) -> FactMetadata:
+    values = {
+        "fact_id": "fact",
+        "source": "fixture",
+        "record_type": "graph",
+        "payload_entropy_bits": 10,
+        "scheduled_exposures": 1,
+        "expected_reads": 0,
+        "expected_hops": 0,
+        "surfaces": ("value",),
+    }
+    values.update(overrides)
+    return FactMetadata(**values)
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"fact_id": 7},
+        {"source": 7},
+        {"record_type": 7},
+        {"surfaces": ["value"]},
+        {"surfaces": {"value"}},
+    ],
+)
+def test_fact_metadata_rejects_nonstring_ids_and_unordered_surfaces(overrides):
+    with pytest.raises(TypeError):
+        _fact_with(**overrides)
+
+
+@pytest.mark.parametrize(
+    "factory",
+    [
+        lambda: SemanticFact(7, ("value",)),
+        lambda: SemanticFact("fact", ["value"]),
+        lambda: SemanticFact("fact", {"value"}),
+        lambda: SupervisedField(7, "text"),
+        lambda: SupervisedField("field", 7),
+        lambda: SupervisedField("field", "text", supervised=1),
+    ],
+)
+def test_semantic_records_require_string_fields_and_ordered_tuple_inputs(factory):
+    with pytest.raises(TypeError):
+        factory()
+
+
+@pytest.mark.parametrize(
+    "factory",
+    [
+        lambda: CompositionPremise(7, hop=0, compose_code=1),
+        lambda: EqualityPremise(7, slot=0, value="value"),
+        lambda: EqualityPremise("fact", slot=0, value=7),
+    ],
+)
+def test_proof_premises_require_string_ids_and_values(factory):
+    with pytest.raises(TypeError):
+        factory()
+
+
 def test_route_score_uses_only_frozen_training_metadata():
     fact = FactMetadata(
         fact_id="fact-a",
@@ -151,6 +210,43 @@ def test_split90_rounds_up_to_preserve_its_minimum_fact_dose():
     assert manifest.information_burden_quota_met is True
 
 
+def test_large_burden_repair_is_deterministic_with_bounded_fact_accesses():
+    class AccessBoundFact(FactMetadata):
+        burden_accesses = 0
+        burden_access_limit = 100_000
+
+        @property
+        def information_burden_bits(self):
+            type(self).burden_accesses += 1
+            if type(self).burden_accesses > type(self).burden_access_limit:
+                raise AssertionError("routing materialized a pair-list explosion")
+            return super().information_burden_bits
+
+    facts = tuple(
+        AccessBoundFact(
+            fact_id=f"fact-{index:05d}",
+            source="large-fixture",
+            record_type="graph",
+            payload_entropy_bits=10 if index < 1_800 else 9,
+            scheduled_exposures=1 if index < 1_800 else 100,
+            expected_reads=0,
+            expected_hops=0,
+            surfaces=(f"value-{index:05d}",),
+        )
+        for index in range(2_000)
+    )
+
+    forward = build_route_manifest(facts, "Split90")
+    AccessBoundFact.burden_accesses = 0
+    reverse = build_route_manifest(reversed(facts), "Split90")
+
+    assert forward.to_bytes() == reverse.to_bytes()
+    assert forward.external_count == 1_800
+    assert forward.information_burden_quota_met is True
+    heavy_ids = {fact.fact_id for fact in facts[1_800:]}
+    assert len(heavy_ids.intersection(forward.external_fact_ids)) == 180
+
+
 def test_occurrence_closure_masks_every_supervised_declared_surface():
     facts = (SemanticFact("mars", ("Mars", "Red Planet")),)
     fields = (
@@ -205,6 +301,33 @@ def test_occurrence_closure_fails_closed_on_missing_routed_fact_metadata():
     assert caught.value.report.metadata_errors == (
         "routed fact lacks semantic metadata: unknown",
     )
+
+
+@pytest.mark.parametrize(
+    ("facts", "text"),
+    [
+        (
+            (
+                SemanticFact("planet", ("Mars",)),
+                SemanticFact("deity", ("Mars",)),
+            ),
+            "Mars",
+        ),
+        (
+            (
+                SemanticFact("short", ("Mars",)),
+                SemanticFact("long", ("Mars City",)),
+            ),
+            "Mars City",
+        ),
+    ],
+)
+def test_occurrence_closure_rejects_cross_fact_overlapping_surfaces(facts, text):
+    with pytest.raises(ValueError, match="cross-fact overlapping"):
+        plan_occurrence_closure(
+            facts,
+            (SupervisedField("payload", text),),
+        )
 
 
 def test_pointer_answer_state_is_canonical_and_cannot_repeat_surface_values():

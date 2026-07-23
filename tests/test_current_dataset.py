@@ -46,6 +46,33 @@ def _tree_bytes(root: Path) -> dict[str, bytes]:
     }
 
 
+def _refresh_manifest_artifact(root: Path, relative: str) -> None:
+    manifest_path = root / "manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    artifact = next(
+        item for item in manifest["artifacts"] if item["path"] == relative
+    )
+    path = root / relative
+    artifact["bytes"] = path.stat().st_size
+    artifact["sha256"] = _sha256(path)
+    manifest_path.write_text(
+        json.dumps(manifest, sort_keys=True, separators=(",", ":")) + "\n"
+    )
+
+
+def _read_jsonl(path: Path) -> list[dict]:
+    return [json.loads(line) for line in path.read_text().splitlines()]
+
+
+def _write_jsonl(path: Path, rows: list[dict]) -> None:
+    path.write_text(
+        "".join(
+            json.dumps(row, sort_keys=True, separators=(",", ":")) + "\n"
+            for row in rows
+        )
+    )
+
+
 def test_smoke_build_has_current_lanes_and_aligned_sidecars(tmp_path):
     report = build_fixture_current_dataset(tmp_path, total_tokens=131_072)
 
@@ -332,3 +359,92 @@ def test_v2_smoke_proves_route_dose_and_zero_supervised_semantic_copies(
         )
         assert len(weights) == token_count
         assert int((weights == 0).sum()) > 0
+
+
+def test_v2_verifier_rejects_rehashed_overmasked_sidecar(tmp_path):
+    build_reasoning_v2_smoke_fixture(tmp_path)
+    sidecar = tmp_path / "split50.weights.bin"
+    sidecar.write_bytes(bytes(sidecar.stat().st_size))
+    _refresh_manifest_artifact(tmp_path, sidecar.name)
+
+    with pytest.raises(ValueError, match="Split50 sidecar"):
+        verify_reasoning_v2_smoke_fixture(tmp_path)
+
+
+def test_v2_verifier_rejects_rehashed_false_route_claims(tmp_path):
+    build_reasoning_v2_smoke_fixture(tmp_path)
+    route_path = tmp_path / "split90-route-manifest.json"
+    route = json.loads(route_path.read_text())
+    route["total_facts"] = 999
+    route["total_information_burden_bits"] = {
+        "numerator": 0,
+        "denominator": 1,
+    }
+    route["external_information_burden_bits"] = {
+        "numerator": 0,
+        "denominator": 1,
+    }
+    route["information_burden_fraction"] = {
+        "numerator": 0,
+        "denominator": 1,
+    }
+    route_path.write_text(
+        json.dumps(route, sort_keys=True, separators=(",", ":")) + "\n"
+    )
+    _refresh_manifest_artifact(tmp_path, route_path.name)
+
+    with pytest.raises(ValueError, match="Split90 route"):
+        verify_reasoning_v2_smoke_fixture(tmp_path)
+
+
+def test_v2_smoke_persists_typed_proof_and_answer_state_inputs(tmp_path):
+    build_reasoning_v2_smoke_fixture(tmp_path)
+
+    proofs = _read_jsonl(tmp_path / "proofs.jsonl")
+    states = _read_jsonl(tmp_path / "answer-states.jsonl")
+
+    assert all(set(bundle) == {"family", "premises", "proof"} for bundle in proofs)
+    assert {bundle["family"] for bundle in proofs} == {
+        "graph_composition_mod4",
+        "slot_equality",
+    }
+    assert all(
+        set(row) == {"phase", "pointer", "state"}
+        and set(row["pointer"]) == {"member_index", "read_index", "slot"}
+        for row in states
+    )
+
+
+def test_v2_verifier_rejects_rehashed_proof_change(tmp_path):
+    build_reasoning_v2_smoke_fixture(tmp_path)
+    proof_path = tmp_path / "proofs.jsonl"
+    bundles = _read_jsonl(proof_path)
+    published_proof = bundles[0].get("proof", bundles[0])
+    published_proof["conclusion"]["relation"] = "r0"
+    _write_jsonl(proof_path, bundles)
+    _refresh_manifest_artifact(tmp_path, proof_path.name)
+
+    with pytest.raises(ValueError, match="proof bundle"):
+        verify_reasoning_v2_smoke_fixture(tmp_path)
+
+
+def test_v2_verifier_rejects_rehashed_answer_state_change(tmp_path):
+    build_reasoning_v2_smoke_fixture(tmp_path)
+    state_path = tmp_path / "answer-states.jsonl"
+    states = _read_jsonl(state_path)
+    states[0]["state"] += " value-00-cerulean"
+    _write_jsonl(state_path, states)
+    _refresh_manifest_artifact(tmp_path, state_path.name)
+
+    with pytest.raises(ValueError, match="answer-state"):
+        verify_reasoning_v2_smoke_fixture(tmp_path)
+
+
+def test_v2_verifier_rejects_broken_symlink_anywhere_in_artifact_tree(
+    tmp_path,
+):
+    build_reasoning_v2_smoke_fixture(tmp_path)
+    (tmp_path / "broken-link").symlink_to("missing-target")
+
+    with pytest.raises(ValueError, match="non-regular"):
+        verify_reasoning_v2_smoke_fixture(tmp_path)

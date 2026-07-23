@@ -7,6 +7,7 @@ import json
 import os
 import shutil
 from dataclasses import dataclass
+from fractions import Fraction
 from pathlib import Path
 from typing import Any
 
@@ -29,6 +30,7 @@ from corpusgen.reasoning.proofs import (
 from corpusgen.reasoning.routing import (
     FactMetadata,
     RouteManifest,
+    build_route_manifest,
     build_route_manifests,
 )
 from corpusgen.reasoning.state import AnswerPointer, serialize_answer_state
@@ -97,50 +99,114 @@ def _semantic_facts(
     return tuple(SemanticFact(fact.fact_id, fact.surfaces) for fact in facts)
 
 
-def _fixture_states() -> tuple[str, ...]:
+def _fixture_state_inputs() -> tuple[tuple[AnswerPointer, str], ...]:
     return tuple(
-        serialize_answer_state(
+        (
             AnswerPointer(
                 slot=index % 4,
                 read_index=index % 12,
                 member_index=0,
             ),
-            phase=phase,
+            phase,
         )
         for index in range(len(_VALUES))
         for phase in ("candidate", "final")
     )
 
 
-def _fixture_fields(states: tuple[str, ...]) -> tuple[SupervisedField, ...]:
+def _state_bundle(pointer: AnswerPointer, phase: str) -> dict:
+    return {
+        "phase": phase,
+        "pointer": {
+            "slot": pointer.slot,
+            "read_index": pointer.read_index,
+            "member_index": pointer.member_index,
+        },
+        "state": serialize_answer_state(pointer, phase=phase),
+    }
+
+
+def _fixture_state_bundles() -> tuple[dict, ...]:
+    return tuple(
+        _state_bundle(pointer, phase)
+        for pointer, phase in _fixture_state_inputs()
+    )
+
+
+def _fixture_fields(states: tuple[dict, ...]) -> tuple[SupervisedField, ...]:
     return tuple(
         SupervisedField(
             field_id=f"record-{index:02d}",
             text=(
                 f"Declaration {index}: target={value}; alias={alias}. "
                 f"Memory return target={value}; alias={alias}. "
-                f"{states[2 * index]} {states[2 * index + 1]}"
+                f"{states[2 * index]['state']} {states[2 * index + 1]['state']}"
             ),
         )
         for index, (value, alias) in enumerate(_VALUES)
     )
 
 
-def _fixture_proofs() -> tuple[ProofObject, ...]:
-    composition = solve_graph_composition(
+def _fixture_proof_inputs() -> tuple[tuple[str, tuple], ...]:
+    return (
         (
-            CompositionPremise("fact-00", hop=0, compose_code=2),
-            CompositionPremise("fact-01", hop=1, compose_code=3),
-            CompositionPremise("fact-02", hop=2, compose_code=1),
-        )
-    )
-    equality = solve_slot_equality(
+            "graph_composition_mod4",
+            (
+                CompositionPremise("fact-00", hop=0, compose_code=2),
+                CompositionPremise("fact-01", hop=1, compose_code=3),
+                CompositionPremise("fact-02", hop=2, compose_code=1),
+            ),
+        ),
         (
-            EqualityPremise("fact-08", slot=0, value=_VALUES[8][0]),
-            EqualityPremise("fact-09", slot=1, value=_VALUES[9][0]),
-        )
+            "slot_equality",
+            (
+                EqualityPremise("fact-08", slot=0, value=_VALUES[8][0]),
+                EqualityPremise("fact-09", slot=1, value=_VALUES[9][0]),
+            ),
+        ),
     )
-    return composition, equality
+
+
+def _solve_proof(family: str, premises: tuple) -> ProofObject:
+    if family == "graph_composition_mod4":
+        return solve_graph_composition(premises)
+    if family == "slot_equality":
+        return solve_slot_equality(premises)
+    raise ValueError(f"unknown proof family: {family}")
+
+
+def _premise_json(premise: object) -> dict:
+    if isinstance(premise, CompositionPremise):
+        return {
+            "type": "composition",
+            "fact_id": premise.fact_id,
+            "hop": premise.hop,
+            "compose_code": premise.compose_code,
+        }
+    if isinstance(premise, EqualityPremise):
+        return {
+            "type": "equality",
+            "fact_id": premise.fact_id,
+            "slot": premise.slot,
+            "value": premise.value,
+        }
+    raise TypeError("unsupported proof premise")
+
+
+def _proof_bundle(family: str, premises: tuple) -> dict:
+    proof = _solve_proof(family, premises)
+    return {
+        "family": family,
+        "premises": [_premise_json(premise) for premise in premises],
+        "proof": proof.as_dict(),
+    }
+
+
+def _fixture_proof_bundles() -> tuple[dict, ...]:
+    return tuple(
+        _proof_bundle(family, premises)
+        for family, premises in _fixture_proof_inputs()
+    )
 
 
 @dataclass(frozen=True)
@@ -199,6 +265,26 @@ def _mask_for_manifest(
     return bytes(mask)
 
 
+def _route_dose(manifest: RouteManifest) -> dict:
+    return {
+        "target_fraction": (
+            f"{manifest.target_fraction.numerator}/"
+            f"{manifest.target_fraction.denominator}"
+        ),
+        "total_facts": manifest.total_facts,
+        "quota_facts": manifest.quota_count,
+        "external_facts": manifest.external_count,
+        "minimally_rounded": True,
+        "information_burden_fraction": (
+            f"{manifest.information_burden_fraction.numerator}/"
+            f"{manifest.information_burden_fraction.denominator}"
+        ),
+        "information_burden_quota_met": (
+            manifest.information_burden_quota_met
+        ),
+    }
+
+
 def _token_leaks(
     facts: tuple[SemanticFact, ...],
     fields: tuple[SupervisedField, ...],
@@ -235,26 +321,14 @@ def _write_jsonl(path: Path, rows) -> None:
 def _build_private(root: Path) -> dict:
     facts = _fixture_facts()
     semantic_facts = _semantic_facts(facts)
-    states = _fixture_states()
+    states = _fixture_state_bundles()
     fields = _fixture_fields(states)
-    proofs = _fixture_proofs()
-    if not all(verify_proof(proof, premises) for proof, premises in (
-        (
-            proofs[0],
-            (
-                CompositionPremise("fact-00", 0, 2),
-                CompositionPremise("fact-01", 1, 3),
-                CompositionPremise("fact-02", 2, 1),
-            ),
-        ),
-        (
-            proofs[1],
-            (
-                EqualityPremise("fact-08", 0, _VALUES[8][0]),
-                EqualityPremise("fact-09", 1, _VALUES[9][0]),
-            ),
-        ),
-    )):
+    proof_inputs = _fixture_proof_inputs()
+    proof_bundles = _fixture_proof_bundles()
+    if not all(
+        verify_proof(_solve_proof(family, premises), premises)
+        for family, premises in proof_inputs
+    ):
         raise AssertionError("fixture proof verification failed")
 
     manifests = build_route_manifests(facts)
@@ -275,11 +349,9 @@ def _build_private(root: Path) -> dict:
     )
     _write_jsonl(
         root / "answer-states.jsonl",
-        ({"state": state} for state in states),
+        states,
     )
-    with (root / "proofs.jsonl").open("wb") as handle:
-        for proof in proofs:
-            handle.write(proof.to_bytes())
+    _write_jsonl(root / "proofs.jsonl", proof_bundles)
 
     route_dose = {}
     closure_reports = {}
@@ -310,23 +382,7 @@ def _build_private(root: Path) -> dict:
             "unmasked_token_occurrences": len(token_leaks),
         }
         _write_json(root / f"{stem}-semantic-leakage.json", leakage_json)
-        route_dose[split] = {
-            "target_fraction": (
-                f"{manifest.target_fraction.numerator}/"
-                f"{manifest.target_fraction.denominator}"
-            ),
-            "total_facts": manifest.total_facts,
-            "quota_facts": manifest.quota_count,
-            "external_facts": manifest.external_count,
-            "minimally_rounded": True,
-            "information_burden_fraction": (
-                f"{manifest.information_burden_fraction.numerator}/"
-                f"{manifest.information_burden_fraction.denominator}"
-            ),
-            "information_burden_quota_met": (
-                manifest.information_burden_quota_met
-            ),
-        }
+        route_dose[split] = _route_dose(manifest)
         closure_reports[split] = {
             "passed": leakage.passed and not token_leaks,
             "supervised_occurrences": leakage.supervised_occurrences,
@@ -343,7 +399,7 @@ def _build_private(root: Path) -> dict:
         for surface in fact.surfaces
     )
     state_surface_copies = sum(
-        surface in state
+        surface in state["state"]
         for state in states
         for surface in surfaces
     )
@@ -364,7 +420,7 @@ def _build_private(root: Path) -> dict:
             "surface_value_copies": state_surface_copies,
         },
         "proofs": {
-            "families": [proof.family for proof in proofs],
+            "families": [family for family, _ in proof_inputs],
             "verified": True,
         },
     }
@@ -411,13 +467,173 @@ def _read_records(path: Path) -> tuple[SupervisedField, ...]:
     )
 
 
-def _read_semantic_facts(route_manifest: dict) -> tuple[SemanticFact, ...]:
-    return tuple(
-        SemanticFact(
-            decision["fact_id"],
-            tuple(decision["surfaces"]),
+def _read_jsonl(path: Path) -> tuple[dict, ...]:
+    raw = path.read_bytes()
+    try:
+        rows = tuple(json.loads(line) for line in raw.splitlines())
+    except (TypeError, ValueError) as error:
+        raise ValueError(f"invalid canonical JSONL: {path.name}") from error
+    if not rows or any(not isinstance(row, dict) for row in rows):
+        raise ValueError(f"invalid canonical JSONL rows: {path.name}")
+    if raw != b"".join(_canonical_bytes(row) for row in rows):
+        raise ValueError(f"non-canonical JSONL: {path.name}")
+    return rows
+
+
+def _parse_proof_premises(family: str, values: object) -> tuple:
+    if not isinstance(values, list) or not values:
+        raise ValueError("proof bundle premises must be a non-empty list")
+    premises = []
+    for value in values:
+        if not isinstance(value, dict):
+            raise ValueError("proof premise must be an object")
+        if family == "graph_composition_mod4":
+            if set(value) != {"type", "fact_id", "hop", "compose_code"}:
+                raise ValueError("invalid composition proof premise fields")
+            if value["type"] != "composition":
+                raise ValueError("invalid composition proof premise type")
+            premises.append(
+                CompositionPremise(
+                    fact_id=value["fact_id"],
+                    hop=value["hop"],
+                    compose_code=value["compose_code"],
+                )
+            )
+        elif family == "slot_equality":
+            if set(value) != {"type", "fact_id", "slot", "value"}:
+                raise ValueError("invalid equality proof premise fields")
+            if value["type"] != "equality":
+                raise ValueError("invalid equality proof premise type")
+            premises.append(
+                EqualityPremise(
+                    fact_id=value["fact_id"],
+                    slot=value["slot"],
+                    value=value["value"],
+                )
+            )
+        else:
+            raise ValueError(f"unknown proof family: {family}")
+    return tuple(premises)
+
+
+def _verify_proof_bundles(path: Path) -> tuple[str, ...]:
+    bundles = _read_jsonl(path)
+    recomputed = []
+    for bundle in bundles:
+        if set(bundle) != {"family", "premises", "proof"}:
+            raise ValueError("invalid proof bundle fields")
+        family = bundle["family"]
+        if not isinstance(family, str):
+            raise ValueError("proof bundle family must be a string")
+        premises = _parse_proof_premises(family, bundle["premises"])
+        expected = _proof_bundle(family, premises)
+        if _canonical_bytes(bundle) != _canonical_bytes(expected):
+            raise ValueError(f"{family} proof bundle failed deterministic replay")
+        recomputed.append(expected)
+    expected_fixture = _fixture_proof_bundles()
+    if b"".join(_canonical_bytes(row) for row in recomputed) != b"".join(
+        _canonical_bytes(row) for row in expected_fixture
+    ):
+        raise ValueError("proof bundle differs from deterministic smoke inputs")
+    return tuple(bundle["family"] for bundle in recomputed)
+
+
+def _verify_answer_states(
+    path: Path,
+    surfaces: tuple[str, ...],
+) -> tuple[int, tuple[str, ...]]:
+    rows = _read_jsonl(path)
+    recomputed = []
+    phases = []
+    for row in rows:
+        if set(row) != {"phase", "pointer", "state"}:
+            raise ValueError("invalid answer-state bundle fields")
+        pointer_value = row["pointer"]
+        if (
+            not isinstance(pointer_value, dict)
+            or set(pointer_value) != {"slot", "read_index", "member_index"}
+        ):
+            raise ValueError("invalid answer-state pointer fields")
+        phase = row["phase"]
+        if not isinstance(phase, str):
+            raise ValueError("answer-state phase must be a string")
+        pointer = AnswerPointer(
+            slot=pointer_value["slot"],
+            read_index=pointer_value["read_index"],
+            member_index=pointer_value["member_index"],
         )
-        for decision in route_manifest["decisions"]
+        expected = _state_bundle(pointer, phase)
+        if _canonical_bytes(row) != _canonical_bytes(expected):
+            raise ValueError("answer-state failed deterministic replay")
+        if any(surface in expected["state"] for surface in surfaces):
+            raise ValueError("answer-state contains a declared factual surface")
+        recomputed.append(expected)
+        phases.append(phase)
+    expected_fixture = _fixture_state_bundles()
+    if b"".join(_canonical_bytes(row) for row in recomputed) != b"".join(
+        _canonical_bytes(row) for row in expected_fixture
+    ):
+        raise ValueError("answer-state differs from deterministic smoke inputs")
+    return len(recomputed), tuple(sorted(set(phases)))
+
+
+def _read_fraction(value: object, field: str) -> Fraction:
+    if (
+        not isinstance(value, dict)
+        or set(value) != {"numerator", "denominator"}
+        or isinstance(value["numerator"], bool)
+        or not isinstance(value["numerator"], int)
+        or isinstance(value["denominator"], bool)
+        or not isinstance(value["denominator"], int)
+        or value["denominator"] <= 0
+    ):
+        raise ValueError(f"invalid route fraction: {field}")
+    return Fraction(value["numerator"], value["denominator"])
+
+
+def _read_fact_metadata(route_manifest: dict) -> tuple[FactMetadata, ...]:
+    if not isinstance(route_manifest, dict):
+        raise ValueError("route manifest must be an object")
+    decisions = route_manifest.get("decisions")
+    if not isinstance(decisions, list) or not decisions:
+        raise ValueError("route manifest decisions must be a non-empty list")
+    facts = []
+    for index, decision in enumerate(decisions):
+        if not isinstance(decision, dict):
+            raise ValueError(f"route decision {index} must be an object")
+        surfaces = decision.get("surfaces")
+        if not isinstance(surfaces, list):
+            raise ValueError(f"route decision {index} surfaces must be a list")
+        facts.append(
+            FactMetadata(
+                fact_id=decision.get("fact_id"),
+                source=decision.get("source"),
+                record_type=decision.get("record_type"),
+                payload_entropy_bits=_read_fraction(
+                    decision.get("payload_entropy_bits"),
+                    f"decisions[{index}].payload_entropy_bits",
+                ),
+                scheduled_exposures=decision.get("scheduled_exposures"),
+                expected_reads=_read_fraction(
+                    decision.get("expected_reads"),
+                    f"decisions[{index}].expected_reads",
+                ),
+                expected_hops=_read_fraction(
+                    decision.get("expected_hops"),
+                    f"decisions[{index}].expected_hops",
+                ),
+                surfaces=tuple(surfaces),
+            )
+        )
+    return tuple(facts)
+
+
+def _semantic_facts_from_metadata(
+    facts: tuple[FactMetadata, ...],
+) -> tuple[SemanticFact, ...]:
+    return tuple(
+        SemanticFact(fact.fact_id, fact.surfaces)
+        for fact in facts
     )
 
 
@@ -425,6 +641,12 @@ def verify_v2_smoke_fixture(out_dir: Path | str) -> dict:
     root = Path(out_dir)
     if not root.is_dir() or root.is_symlink():
         raise ValueError("missing regular v2 smoke directory")
+    for entry in root.rglob("*"):
+        if entry.is_symlink() or not entry.is_file():
+            raise ValueError(
+                "v2 smoke artifact tree contains a non-regular entry: "
+                f"{entry.relative_to(root)}"
+            )
     manifest_path = root / "manifest.json"
     if not manifest_path.is_file() or manifest_path.is_symlink():
         raise ValueError("v2 smoke manifest is missing or unsafe")
@@ -478,10 +700,6 @@ def verify_v2_smoke_fixture(out_dir: Path | str) -> dict:
         or report.get("scientific_result") is not False
         or report.get("scientific_readiness") is not False
         or report.get("status") != "non-scientific implementation smoke only"
-        or report.get("answer_states", {}).get("surface_value_copies") != 0
-        or report.get("answer_states", {}).get("phases")
-        != ["candidate", "final"]
-        or report.get("proofs", {}).get("verified") is not True
     ):
         raise ValueError("v2 smoke report failed non-scientific core checks")
 
@@ -492,21 +710,31 @@ def verify_v2_smoke_fixture(out_dir: Path | str) -> dict:
         raise ValueError("v2 smoke train stream and Dense sidecar disagree")
     fields = _read_records(root / "records.jsonl")
 
+    declared_facts: tuple[FactMetadata, ...] | None = None
     for split in ("Split50", "Split90"):
         stem = split.lower()
-        route = json.loads((root / f"{stem}-route-manifest.json").read_bytes())
-        semantic_facts = _read_semantic_facts(route)
+        route_path = root / f"{stem}-route-manifest.json"
+        route_bytes = route_path.read_bytes()
+        route = json.loads(route_bytes)
+        fact_metadata = _read_fact_metadata(route)
+        if declared_facts is None:
+            declared_facts = fact_metadata
+        elif tuple(fact.as_dict() for fact in fact_metadata) != tuple(
+            fact.as_dict() for fact in declared_facts
+        ):
+            raise ValueError("Split route manifests disagree on fact metadata")
+        rebuilt_route = build_route_manifest(fact_metadata, split)
+        if route_bytes != rebuilt_route.to_bytes():
+            raise ValueError(f"{split} route manifest is not canonical")
+        semantic_facts = _semantic_facts_from_metadata(fact_metadata)
         rebuilt_ids, slices = _encode_fields(semantic_facts, fields)
         if not np.array_equal(rebuilt_ids, train):
             raise ValueError(f"{split} semantic reconstruction changed train.bin")
-        external = frozenset(
-            decision["fact_id"]
-            for decision in route["decisions"]
-            if decision["route"] == "external"
-        )
+        external = frozenset(rebuilt_route.external_fact_ids)
         weights = (root / f"{stem}.weights.bin").read_bytes()
-        if len(weights) != tokens or set(weights) - {0, 1} or 0 not in weights:
-            raise ValueError(f"{split} sidecar is invalid")
+        expected_weights = _mask_for_manifest(tokens, slices, rebuilt_route)
+        if weights != expected_weights:
+            raise ValueError(f"{split} sidecar differs from canonical mask")
         leaks = _token_leaks(
             semantic_facts,
             fields,
@@ -520,13 +748,7 @@ def verify_v2_smoke_fixture(out_dir: Path | str) -> dict:
         dose = report["route_dose"][split]
         closure = report["semantic_closure"][split]
         if (
-            route["metadata_scope"] != "training-only"
-            or route["policy"] != "train-score-ranked-quota-v1"
-            or route["external_facts"] != route["quota_facts"]
-            or route["information_burden_quota_met"] is not True
-            or len(external) != dose["external_facts"]
-            or dose["external_facts"] != dose["quota_facts"]
-            or dose["information_burden_quota_met"] is not True
+            dose != _route_dose(rebuilt_route)
             or leaks
             or leakage["passed"] is not True
             or leakage["unmasked_supervised_occurrences"] != 0
@@ -536,6 +758,31 @@ def verify_v2_smoke_fixture(out_dir: Path | str) -> dict:
             or closure["unmasked_token_occurrences"] != 0
         ):
             raise ValueError(f"{split} route or semantic closure proof failed")
+
+    if declared_facts is None:
+        raise ValueError("v2 smoke routes declared no facts")
+    surfaces = tuple(
+        surface
+        for fact in declared_facts
+        for surface in fact.surfaces
+    )
+    proof_families = _verify_proof_bundles(root / "proofs.jsonl")
+    state_count, state_phases = _verify_answer_states(
+        root / "answer-states.jsonl",
+        surfaces,
+    )
+    if report.get("proofs") != {
+        "families": list(proof_families),
+        "verified": True,
+    }:
+        raise ValueError("v2 smoke proof report disagrees with replay")
+    if report.get("answer_states") != {
+        "format": "pointer-slot",
+        "states": state_count,
+        "phases": list(state_phases),
+        "surface_value_copies": 0,
+    }:
+        raise ValueError("v2 smoke answer-state report disagrees with replay")
     return report
 
 

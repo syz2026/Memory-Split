@@ -36,6 +36,8 @@ class CompositionPremise:
     compose_code: int
 
     def __post_init__(self) -> None:
+        if not isinstance(self.fact_id, str):
+            raise TypeError("composition fact_id must be a string")
         if not self.fact_id:
             raise ValueError("composition fact_id must be non-empty")
         if isinstance(self.hop, bool) or not isinstance(self.hop, int) or self.hop < 0:
@@ -55,6 +57,8 @@ class EqualityPremise:
     value: str
 
     def __post_init__(self) -> None:
+        if not isinstance(self.fact_id, str):
+            raise TypeError("equality fact_id must be a string")
         if not self.fact_id:
             raise ValueError("equality fact_id must be non-empty")
         if (
@@ -63,7 +67,9 @@ class EqualityPremise:
             or self.slot not in range(4)
         ):
             raise ValueError("slot must be in [0, 3]")
-        if not isinstance(self.value, str) or not self.value:
+        if not isinstance(self.value, str):
+            raise TypeError("equality value must be a string")
+        if not self.value:
             raise ValueError("equality value must be a non-empty string")
 
 

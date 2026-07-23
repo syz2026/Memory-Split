@@ -12,16 +12,21 @@ class SemanticFact:
     surfaces: tuple[str, ...]
 
     def __post_init__(self) -> None:
+        if not isinstance(self.fact_id, str):
+            raise TypeError("semantic fact_id must be a string")
         if not self.fact_id:
             raise ValueError("semantic fact_id must be non-empty")
-        surfaces = tuple(self.surfaces)
-        if not surfaces:
+        if not isinstance(self.surfaces, tuple):
+            raise TypeError("semantic surfaces must be an ordered tuple")
+        if not self.surfaces:
             raise ValueError("semantic facts require at least one surface")
-        if any(not isinstance(surface, str) or not surface for surface in surfaces):
+        if any(
+            not isinstance(surface, str) or not surface
+            for surface in self.surfaces
+        ):
             raise ValueError("semantic surfaces must be non-empty strings")
-        if len(surfaces) != len(set(surfaces)):
+        if len(self.surfaces) != len(set(self.surfaces)):
             raise ValueError("semantic surfaces must be distinct")
-        object.__setattr__(self, "surfaces", surfaces)
 
 
 @dataclass(frozen=True)
@@ -31,6 +36,8 @@ class SupervisedField:
     supervised: bool = True
 
     def __post_init__(self) -> None:
+        if not isinstance(self.field_id, str):
+            raise TypeError("field_id must be a string")
         if not self.field_id:
             raise ValueError("field_id must be non-empty")
         if not isinstance(self.text, str):
@@ -143,6 +150,29 @@ def _find_all(text: str, surface: str):
         start = index + 1
 
 
+def _reject_cross_fact_overlaps(
+    occurrences: tuple[SemanticOccurrence, ...],
+) -> None:
+    active: dict[str, list[SemanticOccurrence]] = {}
+    for occurrence in occurrences:
+        field_active = [
+            previous
+            for previous in active.get(occurrence.field_id, [])
+            if previous.end > occurrence.start
+        ]
+        for previous in field_active:
+            if previous.fact_id != occurrence.fact_id:
+                raise ValueError(
+                    "cross-fact overlapping semantic occurrences: "
+                    f"{occurrence.field_id} "
+                    f"{previous.fact_id}[{previous.start}:{previous.end}] "
+                    f"overlaps {occurrence.fact_id}"
+                    f"[{occurrence.start}:{occurrence.end}]"
+                )
+        field_active.append(occurrence)
+        active[occurrence.field_id] = field_active
+
+
 def plan_occurrence_closure(
     facts: Iterable[SemanticFact],
     fields: Iterable[SupervisedField],
@@ -176,10 +206,12 @@ def plan_occurrence_closure(
                     )
                     for start in _find_all(field.text, surface)
                 )
+    ordered_occurrences = tuple(sorted(occurrences))
+    _reject_cross_fact_overlaps(ordered_occurrences)
     return OccurrenceClosurePlan(
         facts=fact_rows,
         fields=field_rows,
-        occurrences=tuple(sorted(occurrences)),
+        occurrences=ordered_occurrences,
     )
 
 

@@ -1,4 +1,9 @@
-"""Deterministic, train-only routing for fixed intervention doses."""
+"""Deterministic, train-only routing for fixed intervention doses.
+
+This local core materializes and sorts one row per fact, so it uses O(n)
+memory. Burden repair is bounded-memory with respect to candidate pairs, but a
+production corpus still needs an external-memory sort/manifest writer.
+"""
 
 from __future__ import annotations
 
@@ -74,12 +79,15 @@ class FactMetadata:
     surfaces: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
-        if not self.fact_id:
-            raise ValueError("fact_id must be non-empty")
-        if not self.source:
-            raise ValueError("source must be non-empty")
-        if not self.record_type:
-            raise ValueError("record_type must be non-empty")
+        for field, value in (
+            ("fact_id", self.fact_id),
+            ("source", self.source),
+            ("record_type", self.record_type),
+        ):
+            if not isinstance(value, str):
+                raise TypeError(f"{field} must be a string")
+            if not value:
+                raise ValueError(f"{field} must be non-empty")
         if (
             isinstance(self.scheduled_exposures, bool)
             or not isinstance(self.scheduled_exposures, int)
@@ -101,12 +109,15 @@ class FactMetadata:
             "expected_hops",
             _fraction(self.expected_hops, "expected_hops"),
         )
-        surfaces = tuple(self.surfaces)
-        if any(not isinstance(surface, str) or not surface for surface in surfaces):
+        if not isinstance(self.surfaces, tuple):
+            raise TypeError("surfaces must be an ordered tuple")
+        if any(
+            not isinstance(surface, str) or not surface
+            for surface in self.surfaces
+        ):
             raise ValueError("surfaces must contain non-empty strings")
-        if len(surfaces) != len(set(surfaces)):
+        if len(self.surfaces) != len(set(self.surfaces)):
             raise ValueError("surfaces must be distinct")
-        object.__setattr__(self, "surfaces", surfaces)
 
     @property
     def information_burden_bits(self) -> Fraction:
@@ -285,63 +296,60 @@ def build_route_manifest(
     if len(fact_ids) != len(set(fact_ids)):
         raise ValueError("routing fact ids must be unique")
 
+    scores = {fact.fact_id: route_score(fact) for fact in fact_rows}
+    burdens = {
+        fact.fact_id: fact.information_burden_bits
+        for fact in fact_rows
+    }
     ranked = sorted(
         fact_rows,
-        key=lambda fact: (-route_score(fact), fact.fact_id),
+        key=lambda fact: (-scores[fact.fact_id], fact.fact_id),
     )
     quota = minimally_rounded_quota(len(ranked), target_fraction)
     selected_ids = {fact.fact_id for fact in ranked[:quota]}
     total_burden = sum(
-        (fact.information_burden_bits for fact in ranked),
+        (burdens[fact.fact_id] for fact in ranked),
         Fraction(),
     )
     target_burden = total_burden * target_fraction
-
-    def selected_burden() -> Fraction:
-        return sum(
-            (
-                fact.information_burden_bits
-                for fact in ranked
-                if fact.fact_id in selected_ids
-            ),
-            Fraction(),
-        )
-
-    while selected_burden() < target_burden:
-        swaps = [
-            (incoming, outgoing)
-            for incoming in ranked
-            if incoming.fact_id not in selected_ids
-            for outgoing in ranked
-            if outgoing.fact_id in selected_ids
-            and (
-                incoming.information_burden_bits
-                > outgoing.information_burden_bits
-            )
-        ]
-        if not swaps:
-            raise ValueError(
-                f"{split} fact quota cannot meet information-burden dose"
-            )
-        incoming, outgoing = min(
-            swaps,
-            key=lambda pair: (
-                -(
-                    pair[0].information_burden_bits
-                    - pair[1].information_burden_bits
-                ),
-                -(route_score(pair[0]) - route_score(pair[1])),
-                pair[0].fact_id,
-                pair[1].fact_id,
-            ),
-        )
+    selected_burden = sum(
+        (burdens[fact_id] for fact_id in selected_ids),
+        Fraction(),
+    )
+    incoming_candidates = sorted(
+        ranked[quota:],
+        key=lambda fact: (
+            -burdens[fact.fact_id],
+            -scores[fact.fact_id],
+            fact.fact_id,
+        ),
+    )
+    outgoing_candidates = sorted(
+        ranked[:quota],
+        key=lambda fact: (
+            burdens[fact.fact_id],
+            scores[fact.fact_id],
+            fact.fact_id,
+        ),
+    )
+    for incoming, outgoing in zip(incoming_candidates, outgoing_candidates):
+        if selected_burden >= target_burden:
+            break
+        gain = burdens[incoming.fact_id] - burdens[outgoing.fact_id]
+        if gain <= 0:
+            break
         selected_ids.remove(outgoing.fact_id)
         selected_ids.add(incoming.fact_id)
+        selected_burden += gain
+    if selected_burden < target_burden:
+        raise ValueError(
+            f"{split} fact quota cannot meet information-burden dose"
+        )
 
     decisions = tuple(
         RouteDecision(
             fact=fact,
-            score=route_score(fact),
+            score=scores[fact.fact_id],
             rank=rank,
             route="external" if fact.fact_id in selected_ids else "internal",
             reason=(
