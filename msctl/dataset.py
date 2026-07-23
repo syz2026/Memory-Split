@@ -88,25 +88,29 @@ FILE_IDENTITY_KEYS = {
 def _publication_root(
     pointer: dict[str, object],
     dataset_root: Path,
+    approved_shared_root: Path,
 ) -> Path:
     relative = PurePosixPath(str(pointer["relative_path"]))
     parts = relative.parts
+    prefix = Path(str(pointer["shared_root_prefix"]))
+    approved = Path(os.path.abspath(os.fspath(approved_shared_root)))
+    try:
+        approved.relative_to(prefix)
+    except ValueError as error:
+        raise MsctlError(
+            "DATASET_ROOT_MISMATCH",
+            "approved shared root is outside the pointer prefix",
+        ) from error
+    expected = approved.joinpath(*parts)
     if (
         not dataset_root.is_absolute()
-        or len(dataset_root.parts) <= len(parts)
-        or tuple(dataset_root.parts[-len(parts) :]) != parts
+        or dataset_root != expected
     ):
         raise MsctlError(
             "DATASET_ROOT_MISMATCH",
             "dataset root does not match the pointer publication path",
         )
-    publication = dataset_root.parents[len(parts) - 1]
-    if publication / Path(*parts) != dataset_root:
-        raise MsctlError(
-            "DATASET_ROOT_MISMATCH",
-            "dataset root does not match the pointer publication path",
-        )
-    return publication
+    return approved
 
 
 def load_pointer(path: Path | str, profile: IlluminaProfile) -> dict[str, object]:
@@ -504,6 +508,7 @@ def verify_dataset(
     profile: IlluminaProfile,
     pointer_path: Path | str,
     dataset_root: Path | str,
+    approved_shared_root: Path | str,
     release: Release,
     manifest: RunManifest,
     repo_root: Path | str,
@@ -516,7 +521,11 @@ def verify_dataset(
         repo_root=repo_root,
     )
     root = Path(os.path.abspath(os.fspath(dataset_root)))
-    publication_root = _publication_root(pointer, root)
+    publication_root = _publication_root(
+        pointer,
+        root,
+        Path(approved_shared_root),
+    )
     try:
         root_fd = open_directory(root, label="dataset root")
     except MsctlError as error:
@@ -596,6 +605,7 @@ def load_dataset_verification(
     *,
     profile: IlluminaProfile,
     pointer_path: Path | str,
+    approved_shared_root: Path | str,
     release: Release,
     manifest: RunManifest,
     repo_root: Path | str,
@@ -689,7 +699,11 @@ def load_dataset_verification(
     if (
         not isinstance(publication_value, str)
         or not Path(publication_value).is_absolute()
-        or _publication_root(pointer, Path(root_value))
+        or _publication_root(
+            pointer,
+            Path(root_value),
+            Path(approved_shared_root),
+        )
         != Path(publication_value)
     ):
         raise MsctlError(

@@ -20,15 +20,20 @@ umask 077
 : "${MS_DATASET_SHA256:?}"
 : "${MS_RUN_IDS:?}"
 : "${MS_SHARED_ROOT:?}"
+: "${MS_SHARED_ROOT_PREFIX:?}"
 : "${MS_ENV_ROOT:?}"
 : "${MS_DATA_ROOT:?}"
+: "${MS_DATA_RELATIVE_PATH:?}"
 : "${MS_OUT_ROOT:?}"
 : "${MS_SEALED_ROOT:?}"
 : "${MS_EVALUATOR_ENTRYPOINT:?}"
 : "${MS_EVALUATOR_ENTRYPOINT_SHA256:?}"
 
 [[ "$MS_PROVIDER" == "illumina-usfc-prd" ]]
-[[ "$MS_SHARED_ROOT" == /illumina/* ]]
+[[ "$MS_SHARED_ROOT_PREFIX" == "/illumina" ]]
+[[ "$MS_SHARED_ROOT" == "$MS_SHARED_ROOT_PREFIX" || "$MS_SHARED_ROOT" == "$MS_SHARED_ROOT_PREFIX/"* ]]
+[[ "$MS_DATA_RELATIVE_PATH" != /* && "$MS_DATA_RELATIVE_PATH" != *".."* ]]
+[[ "$MS_DATA_ROOT" == "$MS_SHARED_ROOT/$MS_DATA_RELATIVE_PATH" ]]
 MS_JOB_HOME="$MS_SHARED_ROOT/memorysplit/job-home"
 PYTHON="$MS_ENV_ROOT/bin/python"
 [[ -x "$PYTHON" ]]

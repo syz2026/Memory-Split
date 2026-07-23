@@ -36,16 +36,21 @@ training, and evaluation through Slurm.
 ```text
 msctl auth check
 msctl capacity check
-msctl env ensure
+msctl env ensure --release RELEASE.json
 msctl dataset ensure
-msctl dataset verify --verification-out DATASET-VERIFICATION.json
-msctl dataset verify --verification-out DATASET-VERIFICATION.json --apply
-msctl runs render --dataset-verification DATASET-VERIFICATION.json \
+msctl dataset verify --shared-root /illumina/... \
+  --verification-out DATASET-VERIFICATION.json
+msctl dataset verify --shared-root /illumina/... \
+  --verification-out DATASET-VERIFICATION.json --apply
+msctl runs render --shared-root /illumina/... \
+  --dataset-verification DATASET-VERIFICATION.json \
   --environment-receipt /illumina/.../env/msctl-env-receipt.json
-msctl submit --dataset-verification DATASET-VERIFICATION.json \
+msctl submit --shared-root /illumina/... \
+  --dataset-verification DATASET-VERIFICATION.json \
   --environment-receipt /illumina/.../env/msctl-env-receipt.json
 msctl status --release RELEASE.json
-msctl evaluate --dataset-verification DATASET-VERIFICATION.json \
+msctl evaluate --shared-root /illumina/... \
+  --dataset-verification DATASET-VERIFICATION.json \
   --environment-receipt /illumina/.../env/msctl-env-receipt.json
 msctl collect
 msctl cleanup plan
@@ -61,14 +66,25 @@ small native receipt and filesystem metadata. Alternatively, `--dataset-root`
 requests a direct full verification. Exactly one of `--dataset-root` and
 `--dataset-verification` is required.
 
-For runtime commands, `--repo-root` is the absolute extraction root of the
-authenticated release ZIP, not an arbitrary checkout or the caller's current
-directory. `msctl` rehashes every packaged member there, binds `--chdir` plus
-the absolute sbatch/config/entrypoint paths to that root, and exports the exact
-dataset publication recorded by the verification receipt. Ambient
-`MS_DATA_ROOT`, `MS_SHARED_ROOT`, and `MS_ENV_ROOT` values are not forwarded.
-Paid operations perform the DDP/evaluator checks before creating state or
-invoking `sbatch`.
+For runtime commands, `--repo-root` is a controller-side extraction used only
+for preflight. `msctl` never gives that mutable pathname to Slurm. It sends a
+fixed, hash-bound bootstrap on `sbatch` stdin; the compute node opens the
+release ZIP without following links, copies and hashes the same bytes into
+private `SLURM_TMPDIR`, verifies the authenticated member manifest, safely
+extracts to a content-addressed directory, and executes only that local copy.
+`--shared-root` must be an approved directory under the pointer's `/illumina`
+prefix, and the dataset must equal that root plus the exact pointer
+`relative_path`; the bootstrap and extracted job both recheck this equation.
+Ambient `MS_DATA_ROOT` and `MS_ENV_ROOT` values are not forwarded. Paid
+operations perform environment, DDP, and evaluator checks before creating
+state or invoking `sbatch`.
+
+Environment receipts use the strict v2 schema and bind the release and lock
+SHA-256, a deterministic Merkle commitment over the installed tree, the exact
+Python executable, and installed distribution metadata. Paid submission
+recomputes the tree, runs the Python probe, and explicitly rechecks `nvcc` plus
+the `nvidia-smi` driver before `sbatch`. The fixed bootstrap requires
+`/usr/bin/python3` on compute nodes.
 
 Mutation is always a separate invocation with `--apply`. Paid GPU submission,
 resume, cancellation, sealed scoring, and cleanup additionally require an

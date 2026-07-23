@@ -10,6 +10,7 @@ from pathlib import Path
 
 from .cleanup import apply_cleanup, make_cleanup_plan
 from .collect import collect_evidence
+from .contracts import load_release
 from .dataset import (
     ensure_dataset,
     verify_dataset,
@@ -89,6 +90,7 @@ def build_parser() -> JsonArgumentParser:
     ensure_env = _leaf(env_sub, "ensure", help_text="plan or build environment")
     ensure_env.add_argument("--root")
     ensure_env.add_argument("--lock", default="requirements-illumina.lock")
+    ensure_env.add_argument("--release")
     ensure_env.add_argument("--apply", action="store_true")
 
     dataset = _leaf(commands, "dataset", help_text="dataset lifecycle")
@@ -103,6 +105,7 @@ def build_parser() -> JsonArgumentParser:
     )
     verify_dataset.add_argument("--pointer", default="DATASET-POINTER.json")
     verify_dataset.add_argument("--dataset-root", required=True)
+    verify_dataset.add_argument("--shared-root", required=True)
     verify_dataset.add_argument("--release", required=True)
     verify_dataset.add_argument("--manifest", required=True)
     verify_dataset.add_argument("--verification-out")
@@ -114,6 +117,7 @@ def build_parser() -> JsonArgumentParser:
     render.add_argument("--release", required=True)
     render.add_argument("--manifest", required=True)
     render.add_argument("--dataset-pointer", required=True)
+    render.add_argument("--shared-root", required=True)
     render_dataset = render.add_mutually_exclusive_group(required=True)
     render_dataset.add_argument("--dataset-root")
     render_dataset.add_argument("--dataset-verification")
@@ -125,6 +129,7 @@ def build_parser() -> JsonArgumentParser:
         leaf.add_argument("--manifest", required=True)
         if name in {"submit", "resume", "evaluate"}:
             leaf.add_argument("--dataset-pointer", required=True)
+            leaf.add_argument("--shared-root", required=True)
             dataset_binding = leaf.add_mutually_exclusive_group(required=True)
             dataset_binding.add_argument("--dataset-root")
             dataset_binding.add_argument("--dataset-verification")
@@ -210,6 +215,7 @@ def dispatch(args: argparse.Namespace) -> tuple[bool, dict[str, object]]:
             release_path=args.release,
             manifest_path=args.manifest,
             dataset_pointer=args.dataset_pointer,
+            shared_root=args.shared_root,
             dataset_root=args.dataset_root,
             dataset_verification=args.dataset_verification,
             environment_receipt=args.environment_receipt,
@@ -221,6 +227,7 @@ def dispatch(args: argparse.Namespace) -> tuple[bool, dict[str, object]]:
             release_path=args.release,
             manifest_path=args.manifest,
             dataset_pointer=args.dataset_pointer,
+            shared_root=args.shared_root,
             dataset_root=args.dataset_root,
             dataset_verification=args.dataset_verification,
             environment_receipt=args.environment_receipt,
@@ -231,11 +238,14 @@ def dispatch(args: argparse.Namespace) -> tuple[bool, dict[str, object]]:
             environ=dict(os.environ),
         )
     if command == "env ensure":
+        release = load_release(args.release) if args.release else None
         return not args.apply, ensure_environment(
             profile=profile,
+            release=release,
             root=args.root,
             lock=args.lock,
             apply=args.apply,
+            environ=dict(os.environ),
         )
     if command == "dataset ensure":
         return not args.apply, ensure_dataset(
@@ -256,6 +266,7 @@ def dispatch(args: argparse.Namespace) -> tuple[bool, dict[str, object]]:
             profile=profile,
             pointer_path=args.pointer,
             dataset_root=args.dataset_root,
+            approved_shared_root=args.shared_root,
             release=release,
             manifest=manifest,
             repo_root=args.repo_root,
@@ -280,6 +291,7 @@ def dispatch(args: argparse.Namespace) -> tuple[bool, dict[str, object]]:
             manifest_path=args.manifest,
             checkpoint_receipt=args.checkpoint_receipt,
             dataset_pointer=args.dataset_pointer,
+            shared_root=args.shared_root,
             dataset_root=args.dataset_root,
             dataset_verification=args.dataset_verification,
             environment_receipt=args.environment_receipt,
@@ -306,6 +318,7 @@ def dispatch(args: argparse.Namespace) -> tuple[bool, dict[str, object]]:
             release_path=args.release,
             manifest_path=args.manifest,
             dataset_pointer=args.dataset_pointer,
+            shared_root=args.shared_root,
             dataset_root=args.dataset_root,
             dataset_verification=args.dataset_verification,
             environment_receipt=args.environment_receipt,

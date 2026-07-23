@@ -9,6 +9,7 @@ import subprocess
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 
+from .bootstrap import BOOTSTRAP_PAYLOAD, BOOTSTRAP_SHA256
 from .contracts import CheckpointReceipt, Release, RunManifest
 from .errors import MsctlError
 from .jsonutil import canonical_sha256
@@ -93,6 +94,31 @@ def _resource_args(profile: IlluminaProfile) -> list[str]:
     return result
 
 
+def _job_shape_args(*, operation: str, shared_root: str) -> list[str]:
+    if operation in {"submit", "resume"}:
+        cpus = 32
+        memory = "0"
+        output = "ms-v2-seed0-%j.out"
+    elif operation == "evaluate":
+        cpus = 8
+        memory = "96G"
+        output = "ms-v2-evaluate-%j.out"
+    else:  # pragma: no cover - callers are closed over known operations.
+        raise MsctlError(
+            "RESOURCE_REQUEST_INVALID",
+            "unsupported Slurm job shape",
+        )
+    return [
+        "--nodes=1",
+        "--ntasks=1",
+        f"--cpus-per-task={cpus}",
+        f"--mem={memory}",
+        "--open-mode=append",
+        f"--output={Path(shared_root) / output}",
+        "--chdir=/",
+    ]
+
+
 def resource_request(
     profile: IlluminaProfile,
     operation: str,
@@ -145,6 +171,7 @@ def submission_identity(
 ) -> tuple[str, str, str]:
     value = {
         "schema_version": 1,
+        "bootstrap_sha256": BOOTSTRAP_SHA256,
         "provider": profile.provider,
         "profile_sha256": profile.sha256,
         "release_sha256": release.archive_sha256,
@@ -213,14 +240,46 @@ def render_seed0_command(
     publication_root = str(dataset["publication_root"])
     environment_root = str(environment["root"])
     output_root = str(Path(publication_root) / "memorysplit" / "runs")
-    train_entrypoint = str(release_root / TRAIN_ENTRYPOINT)
+    dataset_relative = (
+        Path(dataset_root).relative_to(Path(publication_root)).as_posix()
+    )
     exports = [
         _safe_export("MS_SHARED_ROOT", publication_root, profile),
+        _safe_export(
+            "MS_SHARED_ROOT_PREFIX",
+            profile.shared_root_prefix,
+            profile,
+        ),
         _safe_export("MS_ENV_ROOT", environment_root, profile),
         _safe_export("MS_DATA_ROOT", dataset_root, profile),
+        _safe_export("MS_DATA_RELATIVE_PATH", dataset_relative, profile),
         _safe_export("MS_OUT_ROOT", output_root, profile),
-        _safe_export("MS_RELEASE_ROOT", release_root, profile),
-        _safe_export("MS_TRAIN_ENTRYPOINT", train_entrypoint, profile),
+        _safe_export(
+            "MS_RELEASE_ARCHIVE",
+            release.archive_path,
+            profile,
+        ),
+        _safe_export(
+            "MS_RELEASE_ARCHIVE_SHA256",
+            release.archive_sha256,
+            profile,
+        ),
+        _safe_export(
+            "MS_RELEASE_ARCHIVE_BYTES",
+            release.archive_bytes,
+            profile,
+        ),
+        _safe_export(
+            "MS_RELEASE_MEMBERS_SHA256",
+            release.members_sha256,
+            profile,
+        ),
+        _safe_export("MS_JOB_SCRIPT_REL", SEED0_SCRIPT, profile),
+        _safe_export(
+            "MS_TRAIN_ENTRYPOINT_REL",
+            TRAIN_ENTRYPOINT,
+            profile,
+        ),
         _safe_export(
             "MS_TRAIN_ENTRYPOINT_SHA256",
             release.members[TRAIN_ENTRYPOINT]["sha256"],
@@ -238,8 +297,8 @@ def render_seed0_command(
         _safe_export("MS_DATASET_SHA256", manifest.dataset_sha256, profile),
         _safe_export("MS_DENSE_RUN_ID", by_arm["dense"].run_id, profile),
         _safe_export(
-            "MS_DENSE_CONFIG",
-            release_root / by_arm["dense"].config,
+            "MS_DENSE_CONFIG_REL",
+            by_arm["dense"].config,
             profile,
         ),
         _safe_export(
@@ -249,8 +308,8 @@ def render_seed0_command(
         ),
         _safe_export("MS_SPLIT_RUN_ID", by_arm["split90"].run_id, profile),
         _safe_export(
-            "MS_SPLIT_CONFIG",
-            release_root / by_arm["split90"].config,
+            "MS_SPLIT_CONFIG_REL",
+            by_arm["split90"].config,
             profile,
         ),
         _safe_export(
@@ -287,13 +346,15 @@ def render_seed0_command(
         "sbatch",
         "--parsable",
         *_resource_args(profile),
+        *_job_shape_args(
+            operation=operation,
+            shared_root=publication_root,
+        ),
         f"--gres={profile.gres}:{profile.allocated_gpus}",
         f"--time={_wall_time(profile.seed0_wall_minutes)}",
         f"--job-name={job_name}",
         f"--comment={comment}",
         f"--export={','.join(exports)}",
-        f"--chdir={release_root}",
-        str(release_root / SEED0_SCRIPT),
     ]
 
 
@@ -322,17 +383,45 @@ def render_evaluate_command(
     environment_root = str(environment["root"])
     output_root = str(Path(publication_root) / "memorysplit" / "runs")
     sealed_root = str(Path(publication_root) / "memorysplit" / "sealed-eval")
-    evaluator_entrypoint = str(release_root / EVALUATOR_ENTRYPOINT)
+    dataset_relative = (
+        Path(dataset_root).relative_to(Path(publication_root)).as_posix()
+    )
     exports = [
         _safe_export("MS_SHARED_ROOT", publication_root, profile),
+        _safe_export(
+            "MS_SHARED_ROOT_PREFIX",
+            profile.shared_root_prefix,
+            profile,
+        ),
         _safe_export("MS_ENV_ROOT", environment_root, profile),
         _safe_export("MS_DATA_ROOT", dataset_root, profile),
+        _safe_export("MS_DATA_RELATIVE_PATH", dataset_relative, profile),
         _safe_export("MS_OUT_ROOT", output_root, profile),
         _safe_export("MS_SEALED_ROOT", sealed_root, profile),
-        _safe_export("MS_RELEASE_ROOT", release_root, profile),
         _safe_export(
-            "MS_EVALUATOR_ENTRYPOINT",
-            evaluator_entrypoint,
+            "MS_RELEASE_ARCHIVE",
+            release.archive_path,
+            profile,
+        ),
+        _safe_export(
+            "MS_RELEASE_ARCHIVE_SHA256",
+            release.archive_sha256,
+            profile,
+        ),
+        _safe_export(
+            "MS_RELEASE_ARCHIVE_BYTES",
+            release.archive_bytes,
+            profile,
+        ),
+        _safe_export(
+            "MS_RELEASE_MEMBERS_SHA256",
+            release.members_sha256,
+            profile,
+        ),
+        _safe_export("MS_JOB_SCRIPT_REL", EVALUATE_SCRIPT, profile),
+        _safe_export(
+            "MS_EVALUATOR_ENTRYPOINT_REL",
+            EVALUATOR_ENTRYPOINT,
             profile,
         ),
         _safe_export(
@@ -359,13 +448,15 @@ def render_evaluate_command(
         "sbatch",
         "--parsable",
         *_resource_args(profile),
+        *_job_shape_args(
+            operation="evaluate",
+            shared_root=publication_root,
+        ),
         f"--gres={profile.gres}:{profile.evaluation_gpus}",
         f"--time={_wall_time(profile.evaluation_wall_minutes)}",
         f"--job-name={job_name}",
         f"--comment={comment}",
         f"--export={','.join(exports)}",
-        f"--chdir={release_root}",
-        str(release_root / EVALUATE_SCRIPT),
     ]
 
 
@@ -422,6 +513,7 @@ def run_command(
     operation: str,
     environ: Mapping[str, str] | None = None,
     timeout: int = 30,
+    input_text: str | None = None,
 ) -> subprocess.CompletedProcess[str]:
     require_tools([command[0]], operation=operation, environ=environ)
     try:
@@ -432,6 +524,7 @@ def run_command(
             check=False,
             timeout=timeout,
             env=_child_environment(environ),
+            input=input_text,
         )
     except (OSError, subprocess.TimeoutExpired) as error:
         raise MsctlError(
@@ -462,6 +555,7 @@ def submit(
         command,
         operation="sbatch submission",
         environ=environ,
+        input_text=BOOTSTRAP_PAYLOAD.decode("ascii"),
     )
     output = completed.stdout.strip()
     match = JOB_ID_RE.fullmatch(output)

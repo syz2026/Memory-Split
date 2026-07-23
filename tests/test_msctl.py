@@ -4,6 +4,7 @@ import hashlib
 import hmac
 import json
 import os
+import shutil
 import stat
 import subprocess
 import sys
@@ -45,6 +46,10 @@ def _write_json(path: Path, value: object) -> Path:
     return path
 
 
+def _test_shared_root(tmp_path: Path) -> Path:
+    return (tmp_path / "publication").resolve()
+
+
 def _test_profile(tmp_path: Path) -> Path:
     path = tmp_path / "cluster" / "profiles" / PROFILE.name
     if path.is_file():
@@ -60,13 +65,6 @@ def _test_profile(tmp_path: Path) -> Path:
             "cuda_version": "12.4",
         },
     }
-    for name in (
-        "MS_RELEASE_ROOT",
-        "MS_TRAIN_ENTRYPOINT",
-        "MS_EVALUATOR_ENTRYPOINT",
-    ):
-        if name not in value["job_env_allowlist"]:
-            value["job_env_allowlist"].append(name)
     return _write_json(path, value)
 
 
@@ -286,26 +284,34 @@ def _approval(
 
 
 def _environment_receipt(tmp_path: Path) -> Path:
+    from msctl.environment import _runtime_receipt_fields
     from msctl.profile import load_profile
 
-    _release(tmp_path)
+    release_path = _release(tmp_path)
     profile = load_profile(_test_profile(tmp_path))
     root = tmp_path / "environment"
+    receipt_path = root / "msctl-env-receipt.json"
+    if receipt_path.is_file():
+        return receipt_path
     python = root / "bin" / "python"
     python.parent.mkdir(parents=True, exist_ok=True)
-    python.write_text("#!/bin/sh\nexit 0\n")
-    python.chmod(0o755)
+    shutil.copy2(sys.executable, python)
+    runtime = _runtime_receipt_fields(root, profile=profile)
+    release = json.loads(release_path.read_text())
     return _write_json(
-        root / "msctl-env-receipt.json",
+        receipt_path,
         {
-            "schema_version": 1,
+            "schema_version": 2,
             "provider": profile.provider,
             "profile_sha256": profile.sha256,
+            "release_sha256": release["archive"]["sha256"],
             "lock_sha256": _sha256(tmp_path / "requirements-illumina.lock"),
             "environment_root": str(root.resolve()),
             "python": profile.python_version,
             "platform": profile.platform,
             "cuda_version": profile.cuda_version,
+            "cuda_driver_version": "550.54",
+            **runtime,
             "created_at": "2026-07-23T00:00:00Z",
         },
     )
@@ -319,8 +325,30 @@ def _run_msctl(
     bind_environment: bool = True,
 ) -> subprocess.CompletedProcess[str]:
     rendered = list(arguments)
+    test_prefix: str | None = None
     if "--repo-root" in rendered:
         root = Path(rendered[rendered.index("--repo-root") + 1])
+        test_prefix = str(root.resolve())
+        requires_dataset = (
+            any(
+                command in rendered
+                for command in ("submit", "resume", "evaluate")
+            )
+            or ("runs" in rendered and "render" in rendered)
+            or ("dataset" in rendered and "verify" in rendered)
+        )
+        if requires_dataset and "--shared-root" not in rendered:
+            rendered.extend(["--shared-root", str(_test_shared_root(root))])
+        if (
+            "env" in rendered
+            and "ensure" in rendered
+            and "--release" not in rendered
+            and Path(rendered[rendered.index("--profile") + 1]).resolve()
+            == (
+                root / "cluster" / "profiles" / PROFILE.name
+            ).resolve()
+        ):
+            rendered.extend(["--release", str(_release(root))])
         if bind_dataset:
             if any(
                 command in rendered
@@ -360,10 +388,45 @@ def _run_msctl(
                 )
     merged = dict(os.environ)
     merged["PYTHONPATH"] = str(REPO_ROOT)
+    if test_prefix is not None:
+        merged["MSCTL_TEST_SHARED_ROOT_PREFIX"] = test_prefix
     if env:
         merged.update(env)
+    if (
+        "--apply" in rendered
+        and (
+            any(
+                command in rendered
+                for command in ("submit", "resume", "evaluate")
+            )
+            or ("env" in rendered and "ensure" in rendered)
+        )
+        and "--repo-root" in rendered
+    ):
+        root = Path(rendered[rendered.index("--repo-root") + 1])
+        probes = root / ".test-runtime-probes"
+        probes.mkdir(exist_ok=True)
+        _write_executable(
+            probes / "nvcc",
+            "printf 'Cuda compilation tools, release 12.4, V12.4.0\\n'\n",
+        )
+        _write_executable(
+            probes / "nvidia-smi",
+            "printf '550.54\\n'\n",
+        )
+        merged["PATH"] = str(probes) + os.pathsep + merged.get("PATH", "")
+    runner = (
+        "import dataclasses,os,sys;"
+        "import msctl.cli as c;"
+        "_load=c.load_profile;"
+        "c.load_profile=lambda path: dataclasses.replace("
+        "_load(path),shared_root_prefix="
+        "os.environ.get('MSCTL_TEST_SHARED_ROOT_PREFIX') or _load(path).shared_root_prefix"
+        ");"
+        "raise SystemExit(c.main(sys.argv[1:]))"
+    )
     return subprocess.run(
-        [sys.executable, "-m", "msctl", *rendered],
+        [sys.executable, "-c", runner, *rendered],
         cwd=cwd,
         env=merged,
         capture_output=True,
@@ -466,9 +529,11 @@ def test_runs_render_is_deterministic_dry_run_with_explicit_environment(tmp_path
     assert "ALL" not in exports
     assert "NONE" not in exports
     assert "MSCTL_APPROVAL_KEY" not in exports
-    assert command[-1] == str(
+    assert report["result"]["bootstrap_sha256"]
+    assert "--chdir=/" in command
+    assert str(
         (tmp_path / "cluster" / "slurm" / "v2_seed0.sbatch").resolve()
-    )
+    ) not in command
 
 
 @pytest.mark.parametrize(
@@ -976,7 +1041,7 @@ def _dataset_fixture(tmp_path: Path) -> tuple[Path, Path]:
             "dataset_id": "memorysplit-v2-20x-seed0",
             "provider": "illumina-usfc-prd",
             "shared_root_env": "MS_SHARED_ROOT",
-            "shared_root_prefix": "/illumina",
+            "shared_root_prefix": str(tmp_path.resolve()),
             "relative_path": "memorysplit/datasets/v2-20x-seed0",
             "materialization": "slurm",
             "full_corpus_in_release": False,
@@ -2462,13 +2527,16 @@ def test_render_binds_verified_runtime_roots_independent_of_cwd_and_ambient_data
     command = _single_report(completed)["result"]["commands"][0]
     export = next(item for item in command if item.startswith("--export="))
     assert f"MS_DATA_ROOT={_dataset_fixture(tmp_path)[1].resolve()}" in export
-    assert f"MS_RELEASE_ROOT={tmp_path.resolve()}" in export
+    release_value = json.loads(release.read_text())
+    assert (
+        f"MS_RELEASE_ARCHIVE={tmp_path / release_value['archive']['path']}"
+        in export
+    )
+    assert "MS_JOB_SCRIPT_REL=cluster/slurm/v2_seed0.sbatch" in export
+    assert "MS_RELEASE_ROOT=" not in export
     assert f"MS_ENV_ROOT={(tmp_path / 'environment').resolve()}" in export
     assert "/attacker" not in export
-    assert f"--chdir={tmp_path.resolve()}" in command
-    assert command[-1] == str(
-        (tmp_path / "cluster" / "slurm" / "v2_seed0.sbatch").resolve()
-    )
+    assert "--chdir=/" in command
 
 
 def test_submit_requires_environment_receipt_before_any_sbatch(tmp_path):
@@ -2860,3 +2928,290 @@ def test_dataset_verification_caches_device_identity_and_rejects_device_drift(
     assert _single_report(completed)["error"]["code"] == (
         "DATASET_VERIFICATION_STALE"
     )
+
+
+def test_paid_submission_sends_only_fixed_bootstrap_on_stdin(tmp_path):
+    from msctl.slurm import BOOTSTRAP_SHA256
+
+    release = _release(tmp_path)
+    manifest, runs = _runs(tmp_path)
+    key = "b" * 32
+    approval = _approval(
+        tmp_path,
+        operation="submit",
+        runs=runs,
+        key=key,
+    )
+    captured = tmp_path / "captured-bootstrap.py"
+    argv = tmp_path / "captured-argv"
+    marker = tmp_path / "untrusted-script-executed"
+    shared_script = tmp_path / "cluster" / "slurm" / "v2_seed0.sbatch"
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    _write_executable(
+        bin_dir / "sbatch",
+        f"printf '#!/bin/sh\\ntouch {marker}\\n' > '{shared_script}'\n"
+        f"cat > '{captured}'\nprintf '%s\\n' \"$@\" > '{argv}'\n"
+        "last=''\nfor item in \"$@\"; do last=\"$item\"; done\n"
+        "if [ -f \"$last\" ]; then \"$last\"; fi\n"
+        "printf '777;usfc-prd\\n'\n",
+    )
+
+    completed = _run_msctl(
+        *_base_args(tmp_path),
+        "submit",
+        "--release",
+        str(release),
+        "--manifest",
+        str(manifest),
+        "--approval",
+        str(approval),
+        "--apply",
+        env={"PATH": str(bin_dir), "MSCTL_APPROVAL_KEY": key},
+    )
+
+    assert completed.returncode == 0
+    assert hashlib.sha256(captured.read_bytes()).hexdigest() == BOOTSTRAP_SHA256
+    submitted_argv = argv.read_text()
+    assert "MS_RELEASE_ARCHIVE_SHA256=" in submitted_argv
+    assert "MS_RELEASE_MEMBERS_SHA256=" in submitted_argv
+    assert str(tmp_path / "cluster" / "slurm" / "v2_seed0.sbatch") not in (
+        submitted_argv
+    )
+    assert "--chdir=/" in submitted_argv
+    assert f"--chdir={tmp_path}" not in submitted_argv
+    assert not marker.exists()
+
+
+def test_bootstrap_rejects_archive_replacement_without_executing_payload(
+    tmp_path,
+):
+    from msctl.slurm import BOOTSTRAP_PAYLOAD
+
+    release_path = _release(tmp_path)
+    release = json.loads(release_path.read_text())
+    archive = tmp_path / release["archive"]["path"]
+    marker = tmp_path / "unauthenticated-code-executed"
+    malicious = tmp_path / "malicious.zip"
+    with zipfile.ZipFile(malicious, "w") as handle:
+        handle.writestr(
+            "cluster/slurm/v2_seed0.sbatch",
+            f"#!/bin/sh\ntouch '{marker}'\n",
+        )
+    archive.write_bytes(malicious.read_bytes())
+    bootstrap = tmp_path / "bootstrap.py"
+    bootstrap.write_bytes(BOOTSTRAP_PAYLOAD)
+    (tmp_path / "node-local").mkdir()
+    env = {
+        "PATH": os.environ["PATH"],
+        "SLURM_TMPDIR": str(tmp_path / "node-local"),
+        "MS_RELEASE_ARCHIVE": str(archive),
+        "MS_RELEASE_ARCHIVE_SHA256": release["archive"]["sha256"],
+        "MS_RELEASE_ARCHIVE_BYTES": str(release["archive"]["bytes"]),
+        "MS_RELEASE_MEMBERS_SHA256": release["members_sha256"],
+        "MS_JOB_SCRIPT_REL": "cluster/slurm/v2_seed0.sbatch",
+        "MS_SHARED_ROOT_PREFIX": str(tmp_path / "publication"),
+        "MS_SHARED_ROOT": str(tmp_path / "publication"),
+        "MS_DATA_RELATIVE_PATH": "memorysplit/datasets/v2-20x-seed0",
+        "MS_DATA_ROOT": str(_dataset_fixture(tmp_path)[1]),
+    }
+
+    completed = subprocess.run(
+        [sys.executable, str(bootstrap)],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert completed.returncode != 0
+    assert not marker.exists()
+
+
+def test_bootstrap_executes_only_authenticated_node_local_member(tmp_path):
+    from msctl.slurm import BOOTSTRAP_PAYLOAD
+
+    marker = tmp_path / "authenticated-code-executed"
+    job_name = "cluster/slurm/job.sbatch"
+    job = (
+        "#!/usr/bin/env python3\n"
+        "import os\n"
+        "from pathlib import Path\n"
+        f"Path({str(marker)!r}).write_text(os.environ['MS_RELEASE_ROOT'])\n"
+    ).encode()
+    sums = f"{hashlib.sha256(job).hexdigest()}  {job_name}\n".encode()
+    archive = tmp_path / "release.zip"
+    with zipfile.ZipFile(archive, "w") as handle:
+        for name, data in ((job_name, job), ("SHA256SUMS", sums)):
+            info = zipfile.ZipInfo(name)
+            info.create_system = 3
+            info.external_attr = (stat.S_IFREG | 0o644) << 16
+            handle.writestr(info, data)
+    bootstrap = tmp_path / "bootstrap.py"
+    bootstrap.write_bytes(BOOTSTRAP_PAYLOAD)
+    node_local = tmp_path / "node-local"
+    node_local.mkdir()
+    _, dataset_root = _dataset_fixture(tmp_path)
+    env = {
+        "PATH": os.environ["PATH"],
+        "SLURM_TMPDIR": str(node_local),
+        "MS_RELEASE_ARCHIVE": str(archive),
+        "MS_RELEASE_ARCHIVE_SHA256": _sha256(archive),
+        "MS_RELEASE_ARCHIVE_BYTES": str(archive.stat().st_size),
+        "MS_RELEASE_MEMBERS_SHA256": hashlib.sha256(sums).hexdigest(),
+        "MS_JOB_SCRIPT_REL": job_name,
+        "MS_SHARED_ROOT_PREFIX": str(tmp_path),
+        "MS_SHARED_ROOT": str(_test_shared_root(tmp_path)),
+        "MS_DATA_RELATIVE_PATH": "memorysplit/datasets/v2-20x-seed0",
+        "MS_DATA_ROOT": str(dataset_root),
+    }
+
+    completed = subprocess.run(
+        [sys.executable, str(bootstrap)],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    executed_root = Path(marker.read_text())
+    assert executed_root == (
+        node_local / "memorysplit-release" / _sha256(archive)
+    )
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "shell_stub",
+        "shell_stub_recommitted",
+        "changed_runtime",
+        "changed_receipt",
+    ],
+)
+def test_environment_runtime_mutation_fails_before_sbatch(tmp_path, mutation):
+    from msctl.environment import measure_environment
+
+    release = _release(tmp_path)
+    manifest, runs = _runs(tmp_path)
+    receipt = _environment_receipt(tmp_path)
+    python = receipt.parent / "bin" / "python"
+    if mutation in {"shell_stub", "shell_stub_recommitted"}:
+        python.write_text("#!/bin/sh\nprintf '{}\\n'\n")
+        python.chmod(0o755)
+        if mutation == "shell_stub_recommitted":
+            value = json.loads(receipt.read_text())
+            value.update(measure_environment(receipt.parent))
+            _write_json(receipt, value)
+    else:
+        if mutation == "changed_runtime":
+            with python.open("ab") as handle:
+                handle.write(b"runtime replacement")
+        else:
+            value = json.loads(receipt.read_text())
+            value["environment_tree_merkle_sha256"] = "0" * 64
+            _write_json(receipt, value)
+    key = "m" * 32
+    approval = _approval(
+        tmp_path,
+        operation="submit",
+        runs=runs,
+        key=key,
+    )
+    marker = tmp_path / "sbatch-called"
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    _write_executable(
+        bin_dir / "sbatch",
+        f"touch '{marker}'\nprintf '777;usfc-prd\\n'\n",
+    )
+
+    completed = _run_msctl(
+        *_base_args(tmp_path),
+        "submit",
+        "--release",
+        str(release),
+        "--manifest",
+        str(manifest),
+        "--environment-receipt",
+        str(receipt),
+        "--approval",
+        str(approval),
+        "--apply",
+        env={"PATH": str(bin_dir), "MSCTL_APPROVAL_KEY": key},
+        bind_environment=False,
+    )
+
+    assert completed.returncode != 0
+    assert _single_report(completed)["error"]["code"] == (
+        "ENV_RUNTIME_MISMATCH"
+    )
+    assert not marker.exists()
+
+
+@pytest.mark.parametrize("shared_root_kind", ["alternate", "outside_prefix"])
+def test_dataset_rejects_alternate_approved_root_before_sbatch(
+    tmp_path,
+    shared_root_kind,
+):
+    release = _release(tmp_path)
+    manifest, runs = _runs(tmp_path)
+    key = "d" * 32
+    approval = _approval(
+        tmp_path,
+        operation="submit",
+        runs=runs,
+        key=key,
+    )
+    marker = tmp_path / "sbatch-called"
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    _write_executable(
+        bin_dir / "sbatch",
+        f"touch '{marker}'\nprintf '777;usfc-prd\\n'\n",
+    )
+
+    shared_root = (
+        tmp_path / "alternate-publication"
+        if shared_root_kind == "alternate"
+        else Path("/alternate-publication")
+    )
+    completed = _run_msctl(
+        *_base_args(tmp_path),
+        "submit",
+        "--release",
+        str(release),
+        "--manifest",
+        str(manifest),
+        "--shared-root",
+        str(shared_root),
+        "--approval",
+        str(approval),
+        "--apply",
+        env={"PATH": str(bin_dir), "MSCTL_APPROVAL_KEY": key},
+    )
+
+    assert completed.returncode != 0
+    assert _single_report(completed)["error"]["code"] == "DATASET_ROOT_MISMATCH"
+    assert not marker.exists()
+
+
+def test_dataset_pointer_rejects_relative_path_traversal(tmp_path):
+    from dataclasses import replace
+
+    from msctl.dataset import load_pointer
+    from msctl.errors import MsctlError
+    from msctl.profile import load_profile
+
+    pointer, _ = _dataset_fixture(tmp_path)
+    value = json.loads(pointer.read_text())
+    value["relative_path"] = "../outside"
+    _write_json(pointer, value)
+    profile = replace(
+        load_profile(_test_profile(tmp_path)),
+        shared_root_prefix=str(tmp_path.resolve()),
+    )
+
+    with pytest.raises(MsctlError):
+        load_pointer(pointer, profile)

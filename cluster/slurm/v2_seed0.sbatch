@@ -30,8 +30,10 @@ umask 077
 : "${MS_EVAL_GPU:?}"
 : "${MS_RESUME:?}"
 : "${MS_SHARED_ROOT:?}"
+: "${MS_SHARED_ROOT_PREFIX:?}"
 : "${MS_ENV_ROOT:?}"
 : "${MS_DATA_ROOT:?}"
+: "${MS_DATA_RELATIVE_PATH:?}"
 : "${MS_OUT_ROOT:?}"
 : "${MS_TRAIN_ENTRYPOINT:?}"
 : "${MS_TRAIN_ENTRYPOINT_SHA256:?}"
@@ -40,7 +42,10 @@ umask 077
 [[ "$MS_WORLD_SIZE" == "3" ]]
 [[ "$MS_EVAL_GPU" == "6" ]]
 [[ "$MS_RESUME" == "0" || "$MS_RESUME" == "1" ]]
-[[ "$MS_SHARED_ROOT" == /illumina/* ]]
+[[ "$MS_SHARED_ROOT_PREFIX" == "/illumina" ]]
+[[ "$MS_SHARED_ROOT" == "$MS_SHARED_ROOT_PREFIX" || "$MS_SHARED_ROOT" == "$MS_SHARED_ROOT_PREFIX/"* ]]
+[[ "$MS_DATA_RELATIVE_PATH" != /* && "$MS_DATA_RELATIVE_PATH" != *".."* ]]
+[[ "$MS_DATA_ROOT" == "$MS_SHARED_ROOT/$MS_DATA_RELATIVE_PATH" ]]
 if [[ "$MS_RESUME" == "1" ]]; then
   : "${MS_DENSE_RESUME_PATH:?}"
   : "${MS_DENSE_RESUME_SHA256:?}"

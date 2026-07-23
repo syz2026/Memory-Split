@@ -24,6 +24,7 @@ from .errors import MsctlError
 from .profile import IlluminaProfile
 from .slurm import (
     ACTIVE_STATES,
+    BOOTSTRAP_SHA256,
     EVALUATE_SCRIPT,
     EVALUATOR_ENTRYPOINT,
     RESUMABLE_TERMINAL_STATES,
@@ -129,6 +130,7 @@ def _resolve_dataset_verification(
     *,
     profile: IlluminaProfile,
     dataset_pointer: Path | str,
+    shared_root: Path | str,
     dataset_root: Path | str | None,
     dataset_verification: Path | str | None,
     release,
@@ -145,6 +147,7 @@ def _resolve_dataset_verification(
             dataset_verification,
             profile=profile,
             pointer_path=dataset_pointer,
+            approved_shared_root=shared_root,
             release=release,
             manifest=manifest,
             repo_root=repo_root,
@@ -154,6 +157,7 @@ def _resolve_dataset_verification(
         profile=profile,
         pointer_path=dataset_pointer,
         dataset_root=dataset_root,
+        approved_shared_root=shared_root,
         release=release,
         manifest=manifest,
         repo_root=repo_root,
@@ -166,6 +170,7 @@ def render_runs(
     release_path: Path | str,
     manifest_path: Path | str,
     dataset_pointer: Path | str,
+    shared_root: Path | str,
     dataset_root: Path | str | None,
     dataset_verification: Path | str | None,
     environment_receipt: Path | str | None,
@@ -180,6 +185,7 @@ def render_runs(
     dataset = _resolve_dataset_verification(
         profile=profile,
         dataset_pointer=dataset_pointer,
+        shared_root=shared_root,
         dataset_root=dataset_root,
         dataset_verification=dataset_verification,
         release=release,
@@ -198,6 +204,7 @@ def render_runs(
         "release_sha256": release.archive_sha256,
         "run_manifest_sha256": manifest.sha256,
         "dataset_verification": dataset,
+        "bootstrap_sha256": BOOTSTRAP_SHA256,
         "resource_request": resources,
         "layout": {
             "allocated_gpus": profile.allocated_gpus,
@@ -375,6 +382,7 @@ def submit_runs(
     release_path: Path | str,
     manifest_path: Path | str,
     dataset_pointer: Path | str,
+    shared_root: Path | str,
     dataset_root: Path | str | None,
     dataset_verification: Path | str | None,
     environment_receipt: Path | str | None,
@@ -393,6 +401,7 @@ def submit_runs(
     dataset = _resolve_dataset_verification(
         profile=profile,
         dataset_pointer=dataset_pointer,
+        shared_root=shared_root,
         dataset_root=dataset_root,
         dataset_verification=dataset_verification,
         release=release,
@@ -403,6 +412,8 @@ def submit_runs(
         environment_receipt,
         profile=profile,
         release=release,
+        probe_site=apply,
+        environ=environ,
     )
     command = render_seed0_command(
         profile,
@@ -654,6 +665,7 @@ def resume_runs(
     manifest_path: Path | str,
     checkpoint_receipt: Path | str,
     dataset_pointer: Path | str,
+    shared_root: Path | str,
     dataset_root: Path | str | None,
     dataset_verification: Path | str | None,
     environment_receipt: Path | str | None,
@@ -672,6 +684,7 @@ def resume_runs(
     dataset = _resolve_dataset_verification(
         profile=profile,
         dataset_pointer=dataset_pointer,
+        shared_root=shared_root,
         dataset_root=dataset_root,
         dataset_verification=dataset_verification,
         release=release,
@@ -682,6 +695,8 @@ def resume_runs(
         environment_receipt,
         profile=profile,
         release=release,
+        probe_site=apply,
+        environ=environ,
     )
     checkpoint = verify_checkpoint_receipt(
         checkpoint_receipt,
@@ -1114,6 +1129,7 @@ def evaluate_runs(
     release_path: Path | str,
     manifest_path: Path | str,
     dataset_pointer: Path | str,
+    shared_root: Path | str,
     dataset_root: Path | str | None,
     dataset_verification: Path | str | None,
     environment_receipt: Path | str | None,
@@ -1132,6 +1148,7 @@ def evaluate_runs(
     dataset = _resolve_dataset_verification(
         profile=profile,
         dataset_pointer=dataset_pointer,
+        shared_root=shared_root,
         dataset_root=dataset_root,
         dataset_verification=dataset_verification,
         release=release,
@@ -1142,6 +1159,8 @@ def evaluate_runs(
         environment_receipt,
         profile=profile,
         release=release,
+        probe_site=apply,
+        environ=environ,
     )
     command = render_evaluate_command(
         profile,
