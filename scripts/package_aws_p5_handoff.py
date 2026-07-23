@@ -59,6 +59,7 @@ REQUIRED_MEMBERS = EXPECTED_CONFIGS | {
     "msctl/__init__.py",
     "msctl/__main__.py",
     "msctl/aws_p5.py",
+    "msctl/dataset.py",
     "scripts/build_parallel_corpus.py",
     "scripts/package_aws_p5_handoff.py",
     "scripts/run_train.py",
@@ -921,6 +922,8 @@ def _classification(path: str) -> str:
     parts = PurePosixPath(path).parts
     if not parts:
         return "unknown"
+    if path == "msctl/dataset.py":
+        return "included"
     if path == STATIC_ENVIRONMENT_LOCK_PATH:
         return "forbidden"
     if path in _ROOT_EXCLUDED or path in _PROVIDER_EXCLUDED:
