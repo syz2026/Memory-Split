@@ -4,30 +4,30 @@ from dataclasses import replace
 
 import pytest
 
+from evals.confirmatory import contracts as contracts_module
 from evals.confirmatory.contracts import Arm, Control, MemoryMode, Stratum, Twin
 from evals.confirmatory.metrics import (
     ItemOutcome,
     balanced_counterfactual_pair_metric,
 )
-from evals.confirmatory.status import (
-    STATUS_PRECEDENCE,
-    classify_status,
-    resolve_status,
-)
+from evals.confirmatory import metrics as metrics_module
+from evals.confirmatory import status as status_module
 
 
 def _pair(
-    stratum: Stratum,
+    family: str,
+    stratum: str,
     index: int,
     *,
     original: bool = True,
     counterfactual: bool = True,
 ) -> list[ItemOutcome]:
     common = {
-        "pair_id": f"{stratum.value}-pair-{index}",
+        "pair_id": f"{family}-{stratum}-pair-{index}",
+        "family": family,
         "stratum": stratum,
         "seed": 1001,
-        "world_id": f"{stratum.value}-world-{index // 2}",
+        "world_id": f"{family}-{stratum}-world-{index // 2}",
         "checkpoint_sha256": "a" * 64,
         "arm": Arm.SPLIT,
         "memory_mode": MemoryMode.MEMORY_ON,
@@ -53,30 +53,105 @@ def _pair(
     ]
 
 
-def test_balanced_pair_metric_requires_both_twins_and_equal_weights_strata():
-    rows = [
-        *_pair(Stratum.IID, 0),
-        *_pair(Stratum.COMPOSITION, 0),
-        *_pair(Stratum.COMPOSITION, 1, counterfactual=False),
-        *_pair(Stratum.LENGTH, 0, original=False),
-        *_pair(Stratum.LENGTH, 1, counterfactual=False),
-        *_pair(Stratum.LENGTH, 2, original=False, counterfactual=False),
-        *_pair(Stratum.JOINT, 0),
-        *_pair(Stratum.JOINT, 1),
-        *_pair(Stratum.JOINT, 2),
-        *_pair(Stratum.JOINT, 3),
-    ]
+def _records(rows):
+    stratum_shape = {
+        "iid": (2, "seen"),
+        "composition_ood": (2, "heldout"),
+        "length_ood": (7, "seen"),
+        "joint_ood": (7, "heldout"),
+    }
+    items = {}
+    checkpoints = {}
+    for row in rows:
+        path_length, composition_split = stratum_shape[row.stratum.value]
+        items[row.item_id] = contracts_module.ItemRecord.from_dict(
+            {
+                "record_type": contracts_module.ITEM_SCHEMA,
+                "schema_version": contracts_module.CONTRACT_VERSION,
+                "item_id": row.item_id,
+                "pair_id": row.pair_id,
+                "twin": row.twin.value,
+                "stratum": row.stratum.value,
+                "family": row.family.value,
+                "world_id": row.world_id,
+                "task": "fixture_task",
+                "path_length": path_length,
+                "composition_split": composition_split,
+                "composition_id": "fixture-composition",
+                "prompt": "fixture prompt",
+                "initial_slots": ["Q1", None, None, None],
+                "store_id": f"store-{row.world_id}",
+                "memory_mode": row.memory_mode.value,
+                "control": row.control.value,
+            }
+        )
+        checkpoints[row.checkpoint_sha256] = (
+            contracts_module.CheckpointRecord.from_dict(
+                {
+                    "record_type": contracts_module.CHECKPOINT_SCHEMA,
+                    "schema_version": contracts_module.CONTRACT_VERSION,
+                    "checkpoint_sha256": row.checkpoint_sha256,
+                    "model_id": "fixture-model",
+                    "arm": row.arm.value,
+                    "seed": row.seed,
+                    "raw_token_count": 1,
+                    "configuration_sha256": "b" * 64,
+                    "corpus_sha256": "c" * 64,
+                    "code_sha256": "d" * 64,
+                }
+            )
+        )
+    return items, checkpoints
 
-    result = balanced_counterfactual_pair_metric(rows)
 
-    assert result.by_stratum[Stratum.IID].value == 1.0
-    assert result.by_stratum[Stratum.COMPOSITION].value == 0.5
-    assert result.by_stratum[Stratum.LENGTH].value == 0.0
-    assert result.by_stratum[Stratum.JOINT].value == 1.0
-    assert result.balanced_accuracy == pytest.approx(0.625)
-    assert result.overall_pair_accuracy.value == pytest.approx(0.6)
-    assert result.overall_pair_accuracy.numerator == 6
-    assert result.overall_pair_accuracy.denominator == 10
+def _metric(rows):
+    items, checkpoints = _records(rows)
+    return balanced_counterfactual_pair_metric(
+        rows,
+        items=items,
+        checkpoints=checkpoints,
+    )
+
+
+def test_primary_metric_equal_weights_only_four_family_ood_cells():
+    rows = []
+    rows.extend(_pair("graph", "composition_ood", 0))
+    rows.extend(_pair("graph", "joint_ood", 0))
+    rows.extend(_pair("graph", "joint_ood", 1, counterfactual=False))
+    for index in range(4):
+        rows.extend(
+            _pair(
+                "non_path",
+                "composition_ood",
+                index,
+                counterfactual=False,
+            )
+        )
+    for index in range(8):
+        rows.extend(_pair("non_path", "joint_ood", index))
+    for index in range(10):
+        rows.extend(_pair("graph", "iid", index, counterfactual=False))
+        rows.extend(_pair("non_path", "length_ood", index))
+
+    result = _metric(rows)
+
+    assert result.primary_accuracy == pytest.approx(0.625)
+    assert {
+        name: rate.value for name, rate in result.primary_cells.items()
+    } == {
+        "graph__composition_ood": 1.0,
+        "graph__joint_ood": 0.5,
+        "non_path__composition_ood": 0.0,
+        "non_path__joint_ood": 1.0,
+    }
+    assert result.overall_pair_accuracy.numerator == 20
+    assert result.overall_pair_accuracy.denominator == 35
+    assert result.by_stratum[Stratum.IID].value == 0.0
+    assert result.by_stratum[Stratum.LENGTH_OOD].value == 1.0
+    assert result.by_stratum[Stratum.COMPOSITION_OOD].value == pytest.approx(
+        0.2
+    )
+    assert result.by_stratum[Stratum.JOINT_OOD].value == pytest.approx(0.9)
     assert result.arm is Arm.SPLIT
     assert result.memory_mode is MemoryMode.MEMORY_ON
     assert result.control is Control.CORRECT
@@ -85,42 +160,125 @@ def test_balanced_pair_metric_requires_both_twins_and_equal_weights_strata():
 def test_pair_metric_rejects_missing_duplicate_crossed_or_incomplete_twins():
     complete = [
         row
-        for stratum in Stratum
-        for row in _pair(stratum, 0)
+        for family in ("graph", "non_path")
+        for stratum in ("composition_ood", "joint_ood")
+        for row in _pair(family, stratum, 0)
     ]
 
     with pytest.raises(ValueError, match="both twins"):
-        balanced_counterfactual_pair_metric(complete[:-1])
+        _metric(complete[:-1])
     with pytest.raises(ValueError, match="duplicate"):
-        balanced_counterfactual_pair_metric([*complete, complete[0]])
+        _metric([*complete, complete[0]])
 
     crossed = list(complete)
-    crossed[1] = replace(crossed[1], world_id="crossed-world")
+    crossed[1] = replace(crossed[1], family="non_path")
     with pytest.raises(ValueError, match="metadata"):
-        balanced_counterfactual_pair_metric(crossed)
+        _metric(crossed)
 
     incomplete = list(complete)
     incomplete[0] = replace(incomplete[0], complete=False)
     with pytest.raises(ValueError, match="incomplete"):
-        balanced_counterfactual_pair_metric(incomplete)
+        _metric(incomplete)
 
 
-def test_pair_metric_requires_all_four_named_strata_and_one_explicit_cell():
+def test_pair_metric_requires_four_primary_cells_but_not_iid_or_length():
     rows = [
         row
-        for stratum in (Stratum.IID, Stratum.COMPOSITION, Stratum.LENGTH)
-        for row in _pair(stratum, 0)
+        for family in ("graph", "non_path")
+        for stratum in ("composition_ood", "joint_ood")
+        for row in _pair(family, stratum, 0)
     ]
-    with pytest.raises(ValueError, match="strata"):
-        balanced_counterfactual_pair_metric(rows)
+    result = _metric(rows)
+    assert result.primary_accuracy == 1.0
+    assert set(result.by_stratum) == {
+        Stratum.COMPOSITION_OOD,
+        Stratum.JOINT_OOD,
+    }
 
-    rows.extend(_pair(Stratum.JOINT, 0))
+    missing = [
+        row
+        for row in rows
+        if not (
+            row.family == "non_path"
+            and row.stratum == "joint_ood"
+        )
+    ]
+    with pytest.raises(ValueError, match="primary"):
+        _metric(missing)
+
     rows[-1] = replace(rows[-1], memory_mode=MemoryMode.MEMORY_OFF)
     with pytest.raises(ValueError, match="cell"):
-        balanced_counterfactual_pair_metric(rows)
+        _metric(rows)
 
 
-def test_memory_modes_and_controls_are_explicit_closed_enums():
+def test_outcome_binding_authenticates_item_and_checkpoint_identity():
+    outcome = _pair("graph", "composition_ood", 0)[0]
+    items, checkpoints = _records([outcome])
+    item = items[outcome.item_id]
+    checkpoint = checkpoints[outcome.checkpoint_sha256]
+
+    assert (
+        metrics_module.validate_item_outcome_binding(
+            outcome=outcome,
+            item=item,
+            checkpoint=checkpoint,
+        )
+        is outcome
+    )
+
+    for changes in (
+        {"pair_id": "crossed-pair"},
+        {"twin": Twin.COUNTERFACTUAL},
+        {"world_id": "crossed-world"},
+        {"family": "non_path"},
+        {"stratum": "joint_ood"},
+        {"memory_mode": MemoryMode.MEMORY_OFF},
+        {"control": Control.NO_QUERY},
+    ):
+        with pytest.raises(ValueError, match="item binding"):
+            metrics_module.validate_item_outcome_binding(
+                outcome=replace(outcome, **changes),
+                item=item,
+                checkpoint=checkpoint,
+            )
+
+    seed_two_dense = replace(outcome, seed=1002, arm=Arm.DENSE)
+    with pytest.raises(ValueError, match="checkpoint binding"):
+        metrics_module.validate_item_outcome_binding(
+            outcome=seed_two_dense,
+            item=item,
+            checkpoint=checkpoint,
+        )
+
+
+def test_metric_validation_rejects_cross_checkpoint_attribution():
+    rows = [
+        row
+        for family in ("graph", "non_path")
+        for stratum in ("composition_ood", "joint_ood")
+        for row in _pair(family, stratum, 0)
+    ]
+    items, checkpoints = _records(rows)
+    rows[0] = replace(rows[0], seed=1002, arm=Arm.DENSE)
+
+    with pytest.raises(ValueError, match="checkpoint binding"):
+        balanced_counterfactual_pair_metric(
+            rows,
+            items=items,
+            checkpoints=checkpoints,
+        )
+
+
+def test_families_strata_memory_modes_and_controls_are_closed_enums():
+    assert {
+        family.value for family in contracts_module.ReasoningFamily
+    } == {"graph", "non_path"}
+    assert {stratum.value for stratum in Stratum} == {
+        "iid",
+        "composition_ood",
+        "length_ood",
+        "joint_ood",
+    }
     assert {mode.value for mode in MemoryMode} == {"memory_off", "memory_on"}
     assert {arm.value for arm in Arm} == {"dense", "split", "random"}
     assert {control.value for control in Control} == {
@@ -137,44 +295,11 @@ def test_memory_modes_and_controls_are_explicit_closed_enums():
         "graph_isomorphism",
         "page_order_permutation",
     }
+    with pytest.raises(ValueError, match="family"):
+        _pair("unknown", "composition_ood", 0)
 
 
-def test_status_precedence_is_frozen_and_resolves_worst_status():
-    assert STATUS_PRECEDENCE == (
-        "incomplete",
-        "invalid",
-        "directional_only",
-        "sign_consistent_only",
-        "inconclusive",
-        "supports_effect",
-        "supports_practical_null",
-    )
-    assert resolve_status(["supports_effect", "invalid"]) == "invalid"
-    assert (
-        resolve_status(["supports_practical_null", "directional_only"])
-        == "directional_only"
-    )
-    with pytest.raises(ValueError, match="status"):
-        resolve_status(["positive"])
-
-
-@pytest.mark.parametrize(
-    ("changes", "expected"),
-    [
-        ({"observed_seeds": 0}, "incomplete"),
-        ({"complete": False, "valid": False}, "incomplete"),
-        ({"valid": False, "supports_effect": True}, "invalid"),
-        ({"observed_seeds": 1}, "directional_only"),
-        (
-            {"observed_seeds": 3, "sign_consistent": True},
-            "sign_consistent_only",
-        ),
-        ({"sign_consistent": False}, "inconclusive"),
-        ({"supports_effect": True}, "supports_effect"),
-        ({"supports_practical_null": True}, "supports_practical_null"),
-    ],
-)
-def test_status_classification_honors_precedence(changes, expected):
+def _status(**changes):
     values = {
         "complete": True,
         "valid": True,
@@ -185,4 +310,74 @@ def test_status_classification_honors_precedence(changes, expected):
         "supports_practical_null": False,
     }
     values.update(changes)
-    assert classify_status(**values) == expected
+    return status_module.classify_status(**values)
+
+
+def test_status_axes_keep_measured_invalidity_when_evidence_is_incomplete():
+    result = _status(complete=False, valid=False, observed_seeds=2)
+
+    assert result.scientific_status == "invalid"
+    assert result.interim_evidence_label == "directional_only"
+    assert result.final_inference_conclusion == "not_evaluated"
+
+
+def test_interim_sign_consistency_requires_three_preterminal_pairs():
+    two = _status(complete=False, observed_seeds=2, sign_consistent=True)
+    three = _status(complete=False, observed_seeds=3, sign_consistent=True)
+
+    assert two.scientific_status == three.scientific_status == "incomplete"
+    assert two.interim_evidence_label == "directional_only"
+    assert three.interim_evidence_label == "sign_consistent_only"
+    assert (
+        two.final_inference_conclusion
+        == three.final_inference_conclusion
+        == "not_evaluated"
+    )
+
+
+@pytest.mark.parametrize(
+    ("changes", "scientific", "interim", "conclusion"),
+    [
+        (
+            {"observed_seeds": 0, "complete": False},
+            "incomplete",
+            "none",
+            "not_evaluated",
+        ),
+        (
+            {"observed_seeds": 1, "complete": False},
+            "incomplete",
+            "directional_only",
+            "not_evaluated",
+        ),
+        (
+            {"sign_consistent": False},
+            "complete",
+            "none",
+            "inconclusive",
+        ),
+        (
+            {"supports_effect": True},
+            "complete",
+            "none",
+            "supports_effect",
+        ),
+        (
+            {"supports_practical_null": True},
+            "complete",
+            "none",
+            "supports_practical_null",
+        ),
+    ],
+)
+def test_status_classification_returns_three_orthogonal_axes(
+    changes,
+    scientific,
+    interim,
+    conclusion,
+):
+    result = _status(**changes)
+
+    assert result.scientific_status == scientific
+    assert result.interim_evidence_label == interim
+    assert result.final_inference_conclusion == conclusion

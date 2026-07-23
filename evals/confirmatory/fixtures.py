@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from evals.confirmatory.inference import PairedObservation
-from evals.confirmatory.status import STATUS_PRECEDENCE
+from evals.confirmatory.status import StatusAxes
 
 
 @dataclass(frozen=True)
@@ -17,13 +17,13 @@ class DeterministicFixture:
     sign_consistent: bool
     supports_effect: bool
     supports_practical_null: bool
-    expected_status: str
+    expected_status: StatusAxes
 
     def __post_init__(self) -> None:
         if self.name not in {"positive", "null", "invalid"}:
             raise ValueError("unknown deterministic fixture name")
-        if self.expected_status not in STATUS_PRECEDENCE:
-            raise ValueError("unknown deterministic fixture status")
+        if not isinstance(self.expected_status, StatusAxes):
+            raise ValueError("fixture expected_status must contain all three axes")
         if not self.observations:
             raise ValueError("deterministic fixture requires observations")
         for field in (
@@ -61,7 +61,11 @@ def positive_fixture() -> DeterministicFixture:
         sign_consistent=True,
         supports_effect=True,
         supports_practical_null=False,
-        expected_status="supports_effect",
+        expected_status=StatusAxes(
+            "complete",
+            "none",
+            "supports_effect",
+        ),
     )
 
 
@@ -74,7 +78,11 @@ def null_fixture() -> DeterministicFixture:
         sign_consistent=False,
         supports_effect=False,
         supports_practical_null=True,
-        expected_status="supports_practical_null",
+        expected_status=StatusAxes(
+            "complete",
+            "none",
+            "supports_practical_null",
+        ),
     )
 
 
@@ -87,7 +95,11 @@ def invalid_fixture() -> DeterministicFixture:
         sign_consistent=True,
         supports_effect=False,
         supports_practical_null=False,
-        expected_status="invalid",
+        expected_status=StatusAxes(
+            "invalid",
+            "sign_consistent_only",
+            "not_evaluated",
+        ),
     )
 
 

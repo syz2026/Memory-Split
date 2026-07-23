@@ -85,6 +85,7 @@ def _records():
             "pair_id": "pair-1",
             "twin": "original",
             "stratum": "iid",
+            "family": "graph",
             "world_id": "world-1",
             "task": "path_composition",
             "path_length": 2,

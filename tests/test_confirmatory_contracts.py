@@ -6,6 +6,7 @@ import json
 import pytest
 
 import evals.confirmatory as confirmatory
+from evals.confirmatory import contracts as contracts_module
 from evals.confirmatory.contracts import (
     CHECKPOINT_SCHEMA,
     CONTRACT_VERSION,
@@ -27,6 +28,7 @@ def test_confirmatory_package_exports_the_supported_core_api():
     assert confirmatory.ItemRecord is ItemRecord
     assert confirmatory.StoreRecord is StoreRecord
     assert confirmatory.CheckpointRecord is CheckpointRecord
+    assert confirmatory.ReasoningFamily is contracts_module.ReasoningFamily
     assert callable(confirmatory.balanced_counterfactual_pair_metric)
     assert callable(confirmatory.hierarchical_paired_bootstrap)
     assert callable(confirmatory.verify_proof_and_answer)
@@ -74,6 +76,7 @@ def _item(**changes) -> dict:
         "pair_id": "pair-1",
         "twin": "original",
         "stratum": "iid",
+        "family": "graph",
         "world_id": "world-1",
         "task": "path_composition",
         "path_length": 2,
@@ -210,13 +213,35 @@ def test_contracts_reject_unknown_missing_old_mistyped_or_drifted_fields(
         factory(value)
 
 
+@pytest.mark.parametrize("schema_version", [True, 2.0])
+@pytest.mark.parametrize(
+    ("factory", "record"),
+    [
+        (ItemRecord.from_dict, _item()),
+        (StoreRecord.from_dict, _store()),
+        (
+            SealedGoldRecord.from_dict,
+            _gold(_store()["content_sha256"]),
+        ),
+        (CheckpointRecord.from_dict, _checkpoint()),
+    ],
+)
+def test_contract_schema_versions_are_exact_integers(
+    factory,
+    record,
+    schema_version,
+):
+    with pytest.raises(ValueError, match="schema_version"):
+        factory({**record, "schema_version": schema_version})
+
+
 @pytest.mark.parametrize(
     ("stratum", "path_length", "composition_split"),
     [
         ("iid", 2, "heldout"),
-        ("composition", 7, "heldout"),
-        ("length", 6, "seen"),
-        ("joint", 10, "seen"),
+        ("composition_ood", 7, "heldout"),
+        ("length_ood", 6, "seen"),
+        ("joint_ood", 10, "seen"),
     ],
 )
 def test_item_contract_enforces_the_four_frozen_strata(
@@ -232,6 +257,15 @@ def test_item_contract_enforces_the_four_frozen_strata(
                 composition_split=composition_split,
             )
         )
+
+
+def test_item_contract_requires_a_strict_reasoning_family():
+    assert {
+        family.value for family in contracts_module.ReasoningFamily
+    } == {"graph", "non_path"}
+
+    with pytest.raises(ValueError, match="family"):
+        ItemRecord.from_dict(_item(family="path"))
 
 
 def test_contract_bundle_rejects_crossed_gold_store_and_world_bindings():

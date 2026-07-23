@@ -26,9 +26,17 @@ _SHA256_RE = re.compile(r"[0-9a-f]{64}")
 
 class Stratum(StrEnum):
     IID = "iid"
-    COMPOSITION = "composition"
-    LENGTH = "length"
-    JOINT = "joint"
+    COMPOSITION_OOD = "composition_ood"
+    LENGTH_OOD = "length_ood"
+    JOINT_OOD = "joint_ood"
+    COMPOSITION = "composition_ood"
+    LENGTH = "length_ood"
+    JOINT = "joint_ood"
+
+
+class ReasoningFamily(StrEnum):
+    GRAPH = "graph"
+    NON_PATH = "non_path"
 
 
 class Twin(StrEnum):
@@ -110,6 +118,12 @@ def _integer(
         raise ValueError(f"{name} must be an integer")
     if value < minimum or (maximum is not None and value > maximum):
         raise ValueError(f"{name} is outside its allowed range")
+    return value
+
+
+def _schema_version(value: object, name: str) -> int:
+    if type(value) is not int or value != CONTRACT_VERSION:
+        raise ValueError(f"unsupported {name} schema_version")
     return value
 
 
@@ -269,6 +283,7 @@ class ItemRecord:
     pair_id: str
     twin: Twin
     stratum: Stratum
+    family: ReasoningFamily
     world_id: str
     task: str
     path_length: int
@@ -288,6 +303,7 @@ class ItemRecord:
             "pair_id",
             "twin",
             "stratum",
+            "family",
             "world_id",
             "task",
             "path_length",
@@ -304,8 +320,7 @@ class ItemRecord:
     def __post_init__(self) -> None:
         if self.record_type != ITEM_SCHEMA:
             raise ValueError(f"item record_type must be {ITEM_SCHEMA}")
-        if self.schema_version != CONTRACT_VERSION:
-            raise ValueError("unsupported item schema_version")
+        _schema_version(self.schema_version, "item")
         for field in (
             "item_id",
             "pair_id",
@@ -318,6 +333,11 @@ class ItemRecord:
             object.__setattr__(self, field, _string(getattr(self, field), field))
         object.__setattr__(self, "twin", _enum(self.twin, Twin, "twin"))
         object.__setattr__(self, "stratum", _enum(self.stratum, Stratum, "stratum"))
+        object.__setattr__(
+            self,
+            "family",
+            _enum(self.family, ReasoningFamily, "family"),
+        )
         object.__setattr__(
             self,
             "composition_split",
@@ -359,9 +379,9 @@ class ItemRecord:
         seen = self.composition_split is CompositionSplit.SEEN
         expected = {
             (True, True): Stratum.IID,
-            (True, False): Stratum.COMPOSITION,
-            (False, True): Stratum.LENGTH,
-            (False, False): Stratum.JOINT,
+            (True, False): Stratum.COMPOSITION_OOD,
+            (False, True): Stratum.LENGTH_OOD,
+            (False, False): Stratum.JOINT_OOD,
         }[(short, seen)]
         if self.stratum is not expected:
             raise ValueError(
@@ -381,6 +401,7 @@ class ItemRecord:
             "pair_id": self.pair_id,
             "twin": self.twin.value,
             "stratum": self.stratum.value,
+            "family": self.family.value,
             "world_id": self.world_id,
             "task": self.task,
             "path_length": self.path_length,
@@ -423,8 +444,7 @@ class SealedGoldRecord:
     def __post_init__(self) -> None:
         if self.record_type != SEALED_GOLD_SCHEMA:
             raise ValueError(f"gold record_type must be {SEALED_GOLD_SCHEMA}")
-        if self.schema_version != CONTRACT_VERSION:
-            raise ValueError("unsupported sealed-gold schema_version")
+        _schema_version(self.schema_version, "sealed-gold")
         for field in ("item_id", "pair_id", "solver_id"):
             object.__setattr__(self, field, _string(getattr(self, field), field))
         object.__setattr__(
@@ -485,8 +505,7 @@ class StoreRecord:
     def __post_init__(self) -> None:
         if self.record_type != STORE_SCHEMA:
             raise ValueError(f"store record_type must be {STORE_SCHEMA}")
-        if self.schema_version != CONTRACT_VERSION:
-            raise ValueError("unsupported store schema_version")
+        _schema_version(self.schema_version, "store")
         object.__setattr__(self, "store_id", _string(self.store_id, "store_id"))
         object.__setattr__(self, "world_id", _string(self.world_id, "world_id"))
         if not isinstance(self.rows, (list, tuple)) or not self.rows:
@@ -563,8 +582,7 @@ class CheckpointRecord:
             raise ValueError(
                 f"checkpoint record_type must be {CHECKPOINT_SCHEMA}"
             )
-        if self.schema_version != CONTRACT_VERSION:
-            raise ValueError("unsupported checkpoint schema_version")
+        _schema_version(self.schema_version, "checkpoint")
         object.__setattr__(
             self,
             "checkpoint_sha256",

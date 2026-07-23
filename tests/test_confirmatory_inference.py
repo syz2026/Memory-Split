@@ -128,6 +128,16 @@ def test_exact_sign_flip_is_valid_for_five_paired_seeds():
     ) == greater
 
 
+def test_exact_sign_flip_uses_exact_ordering_for_tiny_floats_and_zero_ties():
+    tiny = exact_sign_flip_test([1e-20] * 5, alternative="greater")
+    zeros = exact_sign_flip_test([0.0] * 5, alternative="greater")
+
+    assert tiny.statistic == 1e-20
+    assert tiny.p_value == 1 / 32
+    assert zeros.statistic == 0.0
+    assert zeros.p_value == 1.0
+
+
 def test_exact_sign_test_ignores_ties_and_handles_five_seeds_without_scipy():
     all_positive = exact_paired_sign_test(
         [0.1, 0.2, 0.3, 0.4, 0.5],

@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections import defaultdict
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from fractions import Fraction
 import math
 from statistics import fmean
 
@@ -280,21 +281,27 @@ def exact_sign_flip_test(
     if len(values) > 20:
         raise ValueError("exact sign-flip enumeration is limited to 20 pairs")
     observed = fmean(values)
-    magnitudes = tuple(abs(value) for value in values)
+    exact_values = tuple(Fraction.from_float(value) for value in values)
+    denominator = max(value.denominator for value in exact_values)
+    scaled_values = tuple(
+        value.numerator * (denominator // value.denominator)
+        for value in exact_values
+    )
+    observed_sum = sum(scaled_values)
+    magnitudes = tuple(abs(value) for value in scaled_values)
     total = 1 << len(values)
     extreme = 0
-    tolerance = 1e-15
     for mask in range(total):
-        statistic = fmean(
+        statistic_sum = sum(
             magnitude if mask & (1 << index) else -magnitude
             for index, magnitude in enumerate(magnitudes)
         )
         if alternative_value == "greater":
-            is_extreme = statistic >= observed - tolerance
+            is_extreme = statistic_sum >= observed_sum
         elif alternative_value == "less":
-            is_extreme = statistic <= observed + tolerance
+            is_extreme = statistic_sum <= observed_sum
         else:
-            is_extreme = abs(statistic) >= abs(observed) - tolerance
+            is_extreme = abs(statistic_sum) >= abs(observed_sum)
         extreme += is_extreme
     return ExactTestResult(
         method="paired_sign_flip",
