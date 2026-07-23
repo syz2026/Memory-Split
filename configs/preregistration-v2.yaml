@@ -2,6 +2,7 @@ schema_version: 2
 preregistration_id: memorysplit-confirmatory-v2
 frozen: true
 current_scientific_status: incomplete
+current_interim_evidence_label: none
 protected_launch_allowed: false
 canonical_hypothesis: >-
   At matched parameters, initialization, raw tokens, token order, optimizer
@@ -9,23 +10,36 @@ canonical_hypothesis: >-
   factual payloads improves OOD relational reasoning.
 
 status_policy:
-  precedence:
-    - invalid
-    - incomplete
-    - directional_only
-    - sign_consistent_only
-    - inconclusive
-    - supports_effect
-    - supports_practical_null
-  invalid_precedes_incomplete_on_measured_failure: true
-  rules:
-    invalid: measured_protocol_provenance_endpoint_or_instrument_failure
-    incomplete: missing_required_runs_evaluations_instruments_or_replication
-    directional_only: exactly_one_valid_360m_pair
-    sign_consistent_only: three_same_sign_pairs_without_completed_confirmatory_test
-    inconclusive: complete_valid_procedure_crosses_neither_superiority_nor_equivalence
-    supports_effect: completed_preregistered_holm_adjusted_superiority_procedure
-    supports_practical_null: completed_preregistered_equivalence_procedure
+  scientific_status:
+    values:
+      - incomplete
+      - invalid
+      - complete
+    rules:
+      incomplete: missing_required_runs_evaluations_instruments_or_replication
+      invalid: measured_protocol_provenance_endpoint_or_instrument_failure
+      complete: terminal_evidence_complete_and_no_measured_validity_failure
+    resolution: measured_failure_invalid_else_missing_terminal_evidence_incomplete_else_complete
+  interim_evidence_label:
+    values:
+      - none
+      - directional_only
+      - sign_consistent_only
+    rules:
+      none: no_valid_interim_seed_bundle_evidence
+      directional_only: exactly_one_valid_360m_pair
+      sign_consistent_only: three_same_sign_pairs_without_completed_confirmatory_test
+  final_inference_conclusion:
+    values:
+      - not_evaluated
+      - inconclusive
+      - supports_effect
+      - supports_practical_null
+    rules:
+      not_evaluated: scientific_status_not_complete
+      inconclusive: complete_valid_primary_procedure_crosses_neither_effect_nor_equivalence
+      supports_effect: narrow_primary_omnibus_passes_and_all_validity_guardrail_gates_pass
+      supports_practical_null: narrow_primary_omnibus_meets_frozen_equivalence_rule
   forbidden_labels:
     - failed_to_reject
     - statistically_significant_single_seed
@@ -49,7 +63,8 @@ protected_cohort:
     - measured_validity_failure
     - infrastructure_failure
   seed0:
-    analysis_label: directional_only
+    scientific_status_after_valid_completion: incomplete
+    interim_evidence_label: directional_only
     completion_label: 1/5
     retained_in_terminal_cohort: true
     stop_only_for_validity_or_infrastructure_failure: true
@@ -147,15 +162,34 @@ intervention_gates:
 
 evaluation:
   primary_endpoint: counterfactual_pair_and_proof_accuracy
+  primary_contrast_id: primary_omnibus_pair_and_proof__graph_non_path__composition_joint_ood__split90_minus_dense
   verifier_required: true
   pair_credit: one_iff_both_twins_have_correct_answers_and_verifier_accepted_proofs
-  equal_weight_by:
-    - reasoning_family
-    - ood_stratum
   reasoning_families:
     - graph
     - non_path
   model_visible_and_sealed_gold_separate: true
+  stratum_classification:
+    primary_ood_strata:
+      - composition_ood
+      - joint_ood
+    secondary_strata:
+      - length_ood
+    guardrail_strata:
+      - iid
+  primary_cell_ids:
+    - graph__composition_ood
+    - graph__joint_ood
+    - non_path__composition_ood
+    - non_path__joint_ood
+  primary_weighting:
+    method: equal_across_four_primary_cells
+    cell_weight: 0.25
+    cell_ids:
+      - graph__composition_ood
+      - graph__joint_ood
+      - non_path__composition_ood
+      - non_path__joint_ood
   sealed_strata:
     - iid
     - composition_ood
@@ -178,33 +212,74 @@ evaluation:
 
 analysis:
   independent_unit: paired_training_bundle
+  single_primary_hypothesis: true
+  primary_hypothesis:
+    contrast_id: primary_omnibus_pair_and_proof__graph_non_path__composition_joint_ood__split90_minus_dense
+    endpoint: counterfactual_pair_and_proof_accuracy
+    estimand: split90_minus_dense
+    reasoning_families:
+      - graph
+      - non_path
+    primary_ood_strata:
+      - composition_ood
+      - joint_ood
+    cell_ids:
+      - graph__composition_ood
+      - graph__joint_ood
+      - non_path__composition_ood
+      - non_path__joint_ood
+    cell_weight: 0.25
+    paired_seed_bundle_delta: split90_equal_weight_omnibus_minus_dense_equal_weight_omnibus
+    test:
+      method: exact_one_sided_exhaustive_sign_flip
+      alpha: 0.05
+      statistic: arithmetic_mean_of_paired_seed_bundle_deltas
+      sign_assignments: all_2_to_n
+      tail_count_rule: permuted_statistic_greater_than_or_equal_to_observed
+      equality_counted: true
+      zero_deltas: retained
+      n_pairs: 5
+      minimum_attainable_p: 0.03125
+      confirmatory_scope: primary_omnibus_only
   hierarchical_bootstrap:
     draws: 20000
     resampling_levels:
       - seed
       - world
       - counterfactual_pair
-  paired_effect_test:
-    method: exact_sign_flip
-    alternative: split90_greater_than_dense
-  cohort_direction_test:
-    method: exact_one_sided_sign_test
-    n_pairs: 5
-    all_positive_p: 0.03125
-  three_pair_sign_consistency:
-    n_pairs: 3
-    all_positive_p: 0.125
-    maximum_status: sign_consistent_only
-  multiple_testing:
-    method: holm
-    family: confirmatory_primary_stratum_and_reasoning_family_contrasts
-  noninferiority_and_equivalence:
-    enabled: true
-    margins_frozen_before_unblinding: true
-    all_required_instruments_must_pass: true
+  secondary_family_contrasts:
+    contrast_ids:
+      - secondary_graph_pair_and_proof__composition_joint_ood__split90_minus_dense
+      - secondary_non_path_pair_and_proof__composition_joint_ood__split90_minus_dense
+    holm:
+      method: holm
+      family_size: 2
+      tie_break: stable_lexicographic_contrast_id_order
+    required_for_n5_primary_status: false
+    broader_both_families_claim:
+      n5_can_establish: false
+      minimum_pilot_powered_cohort_n: 6
+  practical_equivalence:
+    contrast_id: primary_omnibus_pair_and_proof__graph_non_path__composition_joint_ood__split90_minus_dense
+    margin_absolute_pair_accuracy: 0.01
+    method: two_one_sided_90_percent_confidence_bounds
+    bound_estimator: hierarchical_bootstrap_seed_world_pair
+    lower_rule: strictly_greater_than_negative_margin
+    upper_rule: strictly_less_than_positive_margin
+    boundary_equality: does_not_support_equivalence
   fixed_checkpoint_aulc:
     enabled: true
-    checkpoints_frozen_before_unblinding: true
+    optimizer_steps:
+      - 1358
+      - 3396
+      - 6791
+      - 10187
+      - 13582
+    interpolation: none
+  conclusion_scope:
+    supports_effect_at_n5: narrow_primary_omnibus_only
+    requires_all_validity_and_guardrail_gates: true
+    does_not_establish_both_families_claim: true
   effect_direction_may_not_change_continuation: true
 
 protected_run_gates:

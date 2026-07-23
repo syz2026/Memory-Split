@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+from decimal import Decimal
 from pathlib import Path
 
 import yaml
@@ -27,7 +28,32 @@ EXPECTED_MIXTURE = {
     "relational_refinement": 2.5,
     "objective_auxiliary": 5.0,
 }
+EXPECTED_REALIZED_TOKEN_QUOTAS = {
+    "fineweb_edu": 1_780_219_904,
+    "finemath": 1_068_131_943,
+    "wikidata_graph": 1_424_175_923,
+    "synthetic_graph": 712_087_962,
+    "verified_synthetic_multihop": 1_068_131_942,
+    "wikidata_path_reasoning": 534_065_971,
+    "relational_refinement": 178_021_990,
+    "objective_auxiliary": 356_043_981,
+}
 EXPECTED_STRATA = {"iid", "composition_ood", "length_ood", "joint_ood"}
+PRIMARY_OOD_STRATA = ["composition_ood", "joint_ood"]
+PRIMARY_CELL_IDS = [
+    "graph__composition_ood",
+    "graph__joint_ood",
+    "non_path__composition_ood",
+    "non_path__joint_ood",
+]
+PRIMARY_CONTRAST_ID = (
+    "primary_omnibus_pair_and_proof__graph_non_path__"
+    "composition_joint_ood__split90_minus_dense"
+)
+SECONDARY_CONTRAST_IDS = [
+    "secondary_graph_pair_and_proof__composition_joint_ood__split90_minus_dense",
+    "secondary_non_path_pair_and_proof__composition_joint_ood__split90_minus_dense",
+]
 EXPECTED_CONTROLS = {
     "correct_memory",
     "memory_off",
@@ -97,6 +123,7 @@ def test_dataset_contract_freezes_status_hypothesis_and_sprint_budget():
     assert contract["contract_id"] == "memorysplit-reasoning-dataset-v2"
     assert contract["status"] == {
         "scientific_status": "incomplete",
+        "interim_evidence_label": "none",
         "protected_launch_allowed": False,
         "reason": "No valid claim-bearing MemorySplit v2 experiment has finished.",
     }
@@ -121,13 +148,37 @@ def test_dataset_contract_freezes_status_hypothesis_and_sprint_budget():
     )
 
 
-def test_sprint_mixture_is_exact_and_language_floors_hold():
+def test_target_shares_use_stable_hamilton_realized_token_quotas():
     sprint = _load_json(DATASET_PATH)["sprint_recipe"]
     lanes = sprint["lanes"]
     shares = {lane["id"]: lane["share_percent"] for lane in lanes}
 
     assert shares == EXPECTED_MIXTURE
     assert sum(shares.values()) == 100.0
+    assert sprint.get("share_semantics") == "target_percentages"
+
+    allocation = sprint.get("realized_token_allocation")
+    assert allocation, "realized Hamilton token allocation is missing"
+    assert allocation["method"] == "hamilton_largest_remainder"
+    assert allocation["tie_break"] == "stable_lane_order"
+    assert allocation["lane_order"] == list(EXPECTED_MIXTURE)
+    assert allocation["total_tokens"] == 7_120_879_616
+    assert allocation["token_quotas"] == EXPECTED_REALIZED_TOKEN_QUOTAS
+    assert sum(allocation["token_quotas"].values()) == allocation["total_tokens"]
+
+    for lane_id, target_percent in EXPECTED_MIXTURE.items():
+        ideal = (
+            Decimal(allocation["total_tokens"])
+            * Decimal(str(target_percent))
+            / Decimal(100)
+        )
+        error = abs(Decimal(allocation["token_quotas"][lane_id]) - ideal)
+        assert error < Decimal(1), f"{lane_id} allocation error is {error}"
+
+
+def test_language_floors_hold_for_target_mixture():
+    sprint = _load_json(DATASET_PATH)["sprint_recipe"]
+    lanes = sprint["lanes"]
 
     floors = sprint["language_floors_percent"]
     assert floors == {
@@ -229,8 +280,10 @@ def test_primary_endpoint_requires_counterfactual_pair_and_proof():
     assert endpoint["pair_credit"] == (
         "one_iff_both_twins_have_correct_answers_and_verifier_accepted_proofs"
     )
-    assert endpoint["weighting"] == "equal_by_reasoning_family_and_ood_stratum"
+    assert endpoint["weighting"] == "equal_across_four_primary_cells"
     assert set(endpoint["reasoning_families"]) == {"graph", "non_path"}
+    assert endpoint["primary_ood_strata"] == PRIMARY_OOD_STRATA
+    assert endpoint["primary_cell_ids"] == PRIMARY_CELL_IDS
 
     release = evaluation["release_contract"]
     assert release["model_visible_separate_from_sealed_gold"] is True
@@ -244,6 +297,39 @@ def test_primary_endpoint_requires_counterfactual_pair_and_proof():
     assert {control["id"] for control in evaluation["controls"]} == EXPECTED_CONTROLS
 
 
+def test_strata_roles_exclude_iid_and_length_from_primary_ood_endpoint():
+    dataset_evaluation = _load_json(DATASET_PATH)["evaluation"]
+    prereg_evaluation = _load_yaml(PREREG_PATH)["evaluation"]
+    expected_classification = {
+        "primary_ood_strata": ["composition_ood", "joint_ood"],
+        "secondary_strata": ["length_ood"],
+        "guardrail_strata": ["iid"],
+    }
+
+    assert dataset_evaluation.get("stratum_classification") == expected_classification
+    assert prereg_evaluation.get("stratum_classification") == expected_classification
+    assert prereg_evaluation["primary_cell_ids"] == PRIMARY_CELL_IDS
+    assert "equal_weight_by" not in prereg_evaluation
+    assert prereg_evaluation["primary_weighting"] == {
+        "method": "equal_across_four_primary_cells",
+        "cell_weight": 0.25,
+        "cell_ids": PRIMARY_CELL_IDS,
+    }
+    assert "iid" not in prereg_evaluation["stratum_classification"]["primary_ood_strata"]
+    assert "length_ood" not in prereg_evaluation["primary_cell_ids"]
+
+    roles = {
+        stratum["id"]: stratum["role"]
+        for stratum in dataset_evaluation["sealed_strata"]
+    }
+    assert roles == {
+        "iid": "guardrail",
+        "composition_ood": "primary_ood",
+        "length_ood": "secondary",
+        "joint_ood": "primary_ood",
+    }
+
+
 def test_preregistration_freezes_n5_seed0_and_symmetric_seven_a100_plan():
     prereg = _load_yaml(PREREG_PATH)
 
@@ -251,6 +337,7 @@ def test_preregistration_freezes_n5_seed0_and_symmetric_seven_a100_plan():
     assert prereg["preregistration_id"] == "memorysplit-confirmatory-v2"
     assert prereg["frozen"] is True
     assert prereg["current_scientific_status"] == "incomplete"
+    assert prereg["current_interim_evidence_label"] == "none"
     assert prereg["protected_launch_allowed"] is False
     assert prereg["canonical_hypothesis"] == CANONICAL_HYPOTHESIS
 
@@ -262,7 +349,8 @@ def test_preregistration_freezes_n5_seed0_and_symmetric_seven_a100_plan():
     assert cohort["precommit_before_seed0_unblinding"] is True
     assert cohort["continue_after_seed0_regardless_of_effect"] is True
     assert cohort["seed0"] == {
-        "analysis_label": "directional_only",
+        "scientific_status_after_valid_completion": "incomplete",
+        "interim_evidence_label": "directional_only",
         "completion_label": "1/5",
         "retained_in_terminal_cohort": True,
         "stop_only_for_validity_or_infrastructure_failure": True,
@@ -320,7 +408,7 @@ def test_six_29m_diagnostic_runs_are_exact_and_pending():
     }
 
 
-def test_controls_and_statistical_procedures_are_preregistered():
+def test_primary_inference_is_operationally_frozen_and_narrow_at_n5():
     prereg = _load_yaml(PREREG_PATH)
 
     assert set(prereg["evaluation"]["required_controls"]) == EXPECTED_CONTROLS
@@ -332,51 +420,109 @@ def test_controls_and_statistical_procedures_are_preregistered():
 
     analysis = prereg["analysis"]
     assert analysis["independent_unit"] == "paired_training_bundle"
+    assert analysis["single_primary_hypothesis"] is True
+    primary = analysis.get("primary_hypothesis")
+    assert primary, "single primary hypothesis is not operationally specified"
+    assert primary["contrast_id"] == PRIMARY_CONTRAST_ID
+    assert primary["endpoint"] == "counterfactual_pair_and_proof_accuracy"
+    assert primary["estimand"] == "split90_minus_dense"
+    assert primary["reasoning_families"] == ["graph", "non_path"]
+    assert primary["primary_ood_strata"] == PRIMARY_OOD_STRATA
+    assert primary["cell_ids"] == PRIMARY_CELL_IDS
+    assert primary["cell_weight"] == 0.25
+    assert primary["paired_seed_bundle_delta"] == (
+        "split90_equal_weight_omnibus_minus_dense_equal_weight_omnibus"
+    )
+    assert primary["test"] == {
+        "method": "exact_one_sided_exhaustive_sign_flip",
+        "alpha": 0.05,
+        "statistic": "arithmetic_mean_of_paired_seed_bundle_deltas",
+        "sign_assignments": "all_2_to_n",
+        "tail_count_rule": "permuted_statistic_greater_than_or_equal_to_observed",
+        "equality_counted": True,
+        "zero_deltas": "retained",
+        "n_pairs": 5,
+        "minimum_attainable_p": 0.03125,
+        "confirmatory_scope": "primary_omnibus_only",
+    }
+
     assert analysis["hierarchical_bootstrap"] == {
         "draws": 20_000,
         "resampling_levels": ["seed", "world", "counterfactual_pair"],
     }
-    assert analysis["paired_effect_test"] == {
-        "method": "exact_sign_flip",
-        "alternative": "split90_greater_than_dense",
+    secondary = analysis["secondary_family_contrasts"]
+    assert secondary["contrast_ids"] == SECONDARY_CONTRAST_IDS
+    assert secondary["holm"] == {
+        "method": "holm",
+        "family_size": 2,
+        "tie_break": "stable_lexicographic_contrast_id_order",
     }
-    assert analysis["cohort_direction_test"] == {
-        "method": "exact_one_sided_sign_test",
-        "n_pairs": 5,
-        "all_positive_p": 0.03125,
+    assert secondary["required_for_n5_primary_status"] is False
+    assert secondary["broader_both_families_claim"] == {
+        "n5_can_establish": False,
+        "minimum_pilot_powered_cohort_n": 6,
     }
-    assert analysis["three_pair_sign_consistency"] == {
-        "n_pairs": 3,
-        "all_positive_p": 0.125,
-        "maximum_status": "sign_consistent_only",
+
+    assert analysis["practical_equivalence"] == {
+        "contrast_id": PRIMARY_CONTRAST_ID,
+        "margin_absolute_pair_accuracy": 0.01,
+        "method": "two_one_sided_90_percent_confidence_bounds",
+        "bound_estimator": "hierarchical_bootstrap_seed_world_pair",
+        "lower_rule": "strictly_greater_than_negative_margin",
+        "upper_rule": "strictly_less_than_positive_margin",
+        "boundary_equality": "does_not_support_equivalence",
     }
-    assert analysis["multiple_testing"]["method"] == "holm"
-    assert analysis["noninferiority_and_equivalence"]["enabled"] is True
-    assert analysis["fixed_checkpoint_aulc"]["enabled"] is True
+    assert analysis["fixed_checkpoint_aulc"] == {
+        "enabled": True,
+        "optimizer_steps": [1358, 3396, 6791, 10187, 13582],
+        "interpolation": "none",
+    }
+    assert analysis["conclusion_scope"] == {
+        "supports_effect_at_n5": "narrow_primary_omnibus_only",
+        "requires_all_validity_and_guardrail_gates": True,
+        "does_not_establish_both_families_claim": True,
+    }
 
 
-def test_status_precedence_and_protected_run_gates_fail_closed():
+def test_scientific_status_and_interim_evidence_are_separate_axes():
     prereg = _load_yaml(PREREG_PATH)
     policy = prereg["status_policy"]
 
-    assert policy["precedence"] == [
-        "invalid",
+    assert "precedence" not in policy
+    assert policy["scientific_status"]["values"] == [
         "incomplete",
+        "invalid",
+        "complete",
+    ]
+    assert policy["scientific_status"]["rules"]["incomplete"] == (
+        "missing_required_runs_evaluations_instruments_or_replication"
+    )
+    assert policy["scientific_status"]["rules"]["invalid"] == (
+        "measured_protocol_provenance_endpoint_or_instrument_failure"
+    )
+    assert policy["interim_evidence_label"]["values"] == [
+        "none",
         "directional_only",
         "sign_consistent_only",
+    ]
+    assert set(policy["scientific_status"]["values"]).isdisjoint(
+        {"directional_only", "sign_consistent_only"}
+    )
+    assert policy["final_inference_conclusion"]["values"] == [
+        "not_evaluated",
         "inconclusive",
         "supports_effect",
         "supports_practical_null",
     ]
-    assert policy["invalid_precedes_incomplete_on_measured_failure"] is True
-    assert policy["rules"]["incomplete"] == (
-        "missing_required_runs_evaluations_instruments_or_replication"
-    )
-    assert policy["rules"]["invalid"] == (
-        "measured_protocol_provenance_endpoint_or_instrument_failure"
-    )
     assert "failed_to_reject" in policy["forbidden_labels"]
 
+    seed0 = prereg["protected_cohort"]["seed0"]
+    assert seed0["scientific_status_after_valid_completion"] == "incomplete"
+    assert seed0["interim_evidence_label"] == "directional_only"
+
+
+def test_protected_run_gates_fail_closed():
+    prereg = _load_yaml(PREREG_PATH)
     gates = prereg["protected_run_gates"]
     assert gates["required_order"] == EXPECTED_GATES
     assert gates["all_required"] is True
@@ -401,15 +547,21 @@ def test_unbuilt_artifact_hashes_are_null_and_never_placeholders():
         assert re.search(r"\b[0-9a-fA-F]{64}\b", text) is None
 
 
-def test_audit_records_incomplete_status_invalid_precedence_and_known_gaps():
+def test_audit_records_separate_status_axes_and_known_gaps():
     assert AUDIT_PATH.is_file(), "missing dataset audit"
     audit = AUDIT_PATH.read_text(encoding="utf-8")
 
     required_text = (
         "**Current scientific status:** `incomplete`",
         "**Protected launch allowed:** `false`",
-        "`invalid` takes precedence over `incomplete`",
         "No valid claim-bearing MemorySplit v2 experiment has finished.",
+        "A measured protocol failure sets `scientific_status: invalid`.",
+        "Missing terminal evidence sets `scientific_status: incomplete`.",
+        "After one valid seed-0 pair, the experiment remains "
+        "`scientific_status: incomplete`",
+        "`interim_evidence_label: directional_only`",
+        "target percentages",
+        "Hamilton largest-remainder",
         "six relation programs",
         "Wikidata reasoning is one hop",
         "one refinement template",
@@ -433,3 +585,9 @@ def test_audit_records_incomplete_status_invalid_precedence_and_known_gaps():
     ):
         assert total in audit
         assert relational in audit
+
+    for lane_id, token_quota in EXPECTED_REALIZED_TOKEN_QUOTAS.items():
+        assert lane_id in audit
+        assert f"{token_quota:,}" in audit
+
+    assert "`invalid` takes precedence over `incomplete`" not in audit

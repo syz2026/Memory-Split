@@ -3,6 +3,7 @@
   "contract_id": "memorysplit-reasoning-dataset-v2",
   "status": {
     "scientific_status": "incomplete",
+    "interim_evidence_label": "none",
     "protected_launch_allowed": false,
     "reason": "No valid claim-bearing MemorySplit v2 experiment has finished."
   },
@@ -16,6 +17,7 @@
     "optimizer_steps": 13582,
     "raw_target_tokens": 7120879616,
     "mixture_unit": "raw_causal_target_tokens_before_condition_weights",
+    "share_semantics": "target_percentages",
     "lanes": [
       {
         "id": "fineweb_edu",
@@ -82,6 +84,32 @@
         "role": "diverse_objective_reasoning"
       }
     ],
+    "realized_token_allocation": {
+      "method": "hamilton_largest_remainder",
+      "procedure": "floor_each_ideal_then_award_remaining_tokens_by_descending_fractional_remainder",
+      "tie_break": "stable_lane_order",
+      "lane_order": [
+        "fineweb_edu",
+        "finemath",
+        "wikidata_graph",
+        "synthetic_graph",
+        "verified_synthetic_multihop",
+        "wikidata_path_reasoning",
+        "relational_refinement",
+        "objective_auxiliary"
+      ],
+      "total_tokens": 7120879616,
+      "token_quotas": {
+        "fineweb_edu": 1780219904,
+        "finemath": 1068131943,
+        "wikidata_graph": 1424175923,
+        "synthetic_graph": 712087962,
+        "verified_synthetic_multihop": 1068131942,
+        "wikidata_path_reasoning": 534065971,
+        "relational_refinement": 178021990,
+        "objective_auxiliary": 356043981
+      }
+    },
     "language_floors_percent": {
       "human_language": 40.0,
       "broad_general_language": 25.0
@@ -193,12 +221,35 @@
     },
     "primary_endpoint": {
       "id": "counterfactual_pair_and_proof_accuracy",
+      "contrast_id": "primary_omnibus_pair_and_proof__graph_non_path__composition_joint_ood__split90_minus_dense",
       "verifier_required": true,
       "pair_credit": "one_iff_both_twins_have_correct_answers_and_verifier_accepted_proofs",
-      "weighting": "equal_by_reasoning_family_and_ood_stratum",
+      "weighting": "equal_across_four_primary_cells",
       "reasoning_families": [
         "graph",
         "non_path"
+      ],
+      "primary_ood_strata": [
+        "composition_ood",
+        "joint_ood"
+      ],
+      "primary_cell_ids": [
+        "graph__composition_ood",
+        "graph__joint_ood",
+        "non_path__composition_ood",
+        "non_path__joint_ood"
+      ]
+    },
+    "stratum_classification": {
+      "primary_ood_strata": [
+        "composition_ood",
+        "joint_ood"
+      ],
+      "secondary_strata": [
+        "length_ood"
+      ],
+      "guardrail_strata": [
+        "iid"
       ]
     },
     "sealed_strata": [
@@ -206,25 +257,25 @@
         "id": "iid",
         "sealed": true,
         "training_overlap_allowed": false,
-        "role": "calibration_guardrail"
+        "role": "guardrail"
       },
       {
         "id": "composition_ood",
         "sealed": true,
         "training_overlap_allowed": false,
-        "role": "primary"
+        "role": "primary_ood"
       },
       {
         "id": "length_ood",
         "sealed": true,
         "training_overlap_allowed": false,
-        "role": "primary"
+        "role": "secondary"
       },
       {
         "id": "joint_ood",
         "sealed": true,
         "training_overlap_allowed": false,
-        "role": "primary"
+        "role": "primary_ood"
       }
     ],
     "controls": [
