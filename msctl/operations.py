@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 import os
 from datetime import UTC, datetime
 from pathlib import Path
@@ -12,23 +13,29 @@ from .contracts import (
     bind_release,
     load_release,
     load_run_manifest,
+    read_release_member,
+    verify_release_extraction,
     verify_release_member,
     verify_checkpoint_receipt,
 )
 from .dataset import load_dataset_verification, verify_dataset
+from .environment import verify_environment_receipt
 from .errors import MsctlError
 from .profile import IlluminaProfile
 from .slurm import (
     ACTIVE_STATES,
     EVALUATE_SCRIPT,
+    EVALUATOR_ENTRYPOINT,
     RESUMABLE_TERMINAL_STATES,
     SEED0_SCRIPT,
+    TRAIN_ENTRYPOINT,
     capacity_check as slurm_capacity_check,
     discover_jobs,
     query_states,
     render_evaluate_command,
     render_seed0_command,
     resource_request,
+    runtime_binding_sha256,
     run_command,
     submission_identity,
     submit as slurm_submit,
@@ -48,7 +55,8 @@ def load_bound_inputs(
     repo_root: Path | str,
 ):
     release = load_release(release_path)
-    manifest = load_run_manifest(manifest_path, repo_root=repo_root)
+    release_root = verify_release_extraction(release, repo_root)
+    manifest = load_run_manifest(manifest_path, repo_root=release_root)
     bind_release(release, manifest)
     if release.metadata.get("profile_sha256") != profile.source_sha256:
         raise MsctlError(
@@ -59,17 +67,62 @@ def load_bound_inputs(
         verify_release_member(
             release,
             member_path=script,
-            local_path=Path(repo_root) / script,
+            local_path=release_root / script,
             label="Slurm entrypoint",
         )
     for run in manifest.runs:
         verify_release_member(
             release,
             member_path=run.config,
-            local_path=Path(repo_root) / run.config,
+            local_path=release_root / run.config,
             label="run config",
         )
-    return release, manifest
+    return release, manifest, release_root
+
+
+def _preflight_entrypoint(
+    *,
+    release,
+    release_root: Path,
+    member: str,
+    marker_name: str,
+    marker_value: str,
+    required_interface: set[str],
+) -> None:
+    try:
+        data = read_release_member(
+            release,
+            member_path=member,
+            release_root=release_root,
+            label="runtime entrypoint",
+        )
+        tree = ast.parse(data, filename=member)
+        marker = None
+        for node in tree.body:
+            if not isinstance(node, ast.Assign):
+                continue
+            if any(
+                isinstance(target, ast.Name) and target.id == marker_name
+                for target in node.targets
+            ):
+                marker = ast.literal_eval(node.value)
+        strings = {
+            node.value
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Constant) and isinstance(node.value, str)
+        }
+    except (OSError, SyntaxError, TypeError, ValueError) as error:
+        raise MsctlError(
+            "RUNTIME_PREFLIGHT_FAILED",
+            "authenticated runtime entrypoint could not be inspected",
+            details={"member": member},
+        ) from error
+    if marker != marker_value or not required_interface <= strings:
+        raise MsctlError(
+            "RUNTIME_PREFLIGHT_FAILED",
+            "authenticated runtime entrypoint does not implement its contract",
+            details={"member": member},
+        )
 
 
 def _resolve_dataset_verification(
@@ -115,9 +168,10 @@ def render_runs(
     dataset_pointer: Path | str,
     dataset_root: Path | str | None,
     dataset_verification: Path | str | None,
+    environment_receipt: Path | str | None,
     repo_root: Path | str,
 ) -> dict[str, object]:
-    release, manifest = load_bound_inputs(
+    release, manifest, release_root = load_bound_inputs(
         profile=profile,
         release_path=release_path,
         manifest_path=manifest_path,
@@ -131,6 +185,11 @@ def render_runs(
         release=release,
         manifest=manifest,
         repo_root=repo_root,
+    )
+    environment = verify_environment_receipt(
+        environment_receipt,
+        profile=profile,
+        release=release,
     )
     resources = resource_request(profile, "submit")
     return {
@@ -146,7 +205,14 @@ def render_runs(
             "evaluation_gpus": profile.evaluation_gpus,
         },
         "commands": [
-            render_seed0_command(profile, release, manifest),
+            render_seed0_command(
+                profile,
+                release,
+                manifest,
+                release_root=release_root,
+                dataset=dataset,
+                environment=environment,
+            ),
         ],
     }
 
@@ -160,26 +226,117 @@ def _same_binding(state: dict[str, object], manifest: RunManifest) -> bool:
     )
 
 
-def _recover_submission(
+def _new_pair_intent(
+    *,
+    profile: IlluminaProfile,
+    manifest: RunManifest,
+    submission_key: str,
+    dataset: dict[str, object],
+    environment: dict[str, object],
+    resources: dict[str, object],
+    operation: str,
+    attempt: int,
+    checkpoint_receipt_sha256: str | None,
+) -> dict[str, object]:
+    now = _timestamp()
+    return {
+        "schema_version": 1,
+        "submission_key": submission_key,
+        "provider": profile.provider,
+        "release_sha256": manifest.release_sha256,
+        "run_manifest_sha256": manifest.sha256,
+        "dataset_sha256": manifest.dataset_sha256,
+        "dataset_verification_sha256": dataset["verification_sha256"],
+        "environment_receipt_sha256": environment["receipt_sha256"],
+        "operation": operation,
+        "resource_request": resources,
+        "run_ids": [run.run_id for run in manifest.runs],
+        "attempt": attempt,
+        "checkpoint_receipt_sha256": checkpoint_receipt_sha256,
+        "phase": "PREPARED",
+        "job_id": None,
+        "created_at": now,
+        "updated_at": now,
+    }
+
+
+def _intent_matches(
+    intent: dict[str, object],
+    *,
+    profile: IlluminaProfile,
+    manifest: RunManifest,
+    dataset: dict[str, object],
+    environment: dict[str, object],
+    operation: str,
+    attempt: int,
+    checkpoint_receipt_sha256: str | None,
+) -> bool:
+    return (
+        intent["provider"] == profile.provider
+        and intent["release_sha256"] == manifest.release_sha256
+        and intent["run_manifest_sha256"] == manifest.sha256
+        and intent["dataset_sha256"] == manifest.dataset_sha256
+        and intent["dataset_verification_sha256"]
+        == dataset["verification_sha256"]
+        and intent["environment_receipt_sha256"]
+        == environment["receipt_sha256"]
+        and intent["operation"] == operation
+        and intent["resource_request"] == resource_request(profile, operation)
+        and intent["attempt"] == attempt
+        and intent["checkpoint_receipt_sha256"]
+        == checkpoint_receipt_sha256
+        and intent["run_ids"] == [run.run_id for run in manifest.runs]
+    )
+
+
+def _initial_submit_state(
+    *,
+    run,
+    manifest: RunManifest,
+    intent: dict[str, object],
+) -> dict[str, object]:
+    return {
+        "schema_version": 1,
+        "run_id": run.run_id,
+        "arm": run.arm,
+        "seed": run.seed,
+        "provider": intent["provider"],
+        "release_sha256": intent["release_sha256"],
+        "run_manifest_sha256": manifest.sha256,
+        "config_sha256": run.config_sha256,
+        "dataset_sha256": intent["dataset_sha256"],
+        "dataset_verification_sha256": intent[
+            "dataset_verification_sha256"
+        ],
+        "environment_receipt_sha256": intent[
+            "environment_receipt_sha256"
+        ],
+        "operation": "submit",
+        "submission_key": intent["submission_key"],
+        "resource_request": intent["resource_request"],
+        "job_id": intent["job_id"],
+        "status": (
+            "SUBMITTED" if intent["phase"] == "SUBMITTED" else "SUBMITTING"
+        ),
+        "attempt": 1,
+        "created_at": intent["created_at"],
+        "updated_at": intent["updated_at"],
+    }
+
+
+def _reconcile_pair_intent(
     *,
     store: StateStore,
-    runs,
-    states: list[dict[str, object]],
+    intent: dict[str, object],
     submission_key: str,
     job_name: str,
     environ: dict[str, str] | None,
-) -> tuple[str, str]:
-    if not all(
-        state.get("submission_key") == submission_key
-        and state.get("status")
-        in {"SUBMITTING", "RESUBMITTING", "SUBMITTED"}
-        for state in states
-    ):
-        raise MsctlError(
-            "SUBMISSION_UNCERTAIN",
-            "submission state does not bind one recoverable intent",
-            details={"recoverable": False},
-        )
+) -> tuple[str, str] | None:
+    if intent["phase"] == "PREPARED":
+        return None
+    if intent["phase"] == "SUBMITTED":
+        job_id = str(intent["job_id"])
+        return job_id, query_states([job_id], environ=environ)[job_id]
     discovered = discover_jobs(
         submission_key,
         job_name,
@@ -188,7 +345,7 @@ def _recover_submission(
     if not discovered:
         raise MsctlError(
             "SUBMISSION_UNCERTAIN",
-            "Slurm cannot prove whether the recorded intent was submitted",
+            "Slurm cannot prove whether the durable pair intent was submitted",
             details={
                 "recoverable": True,
                 "submission_key": submission_key,
@@ -198,40 +355,17 @@ def _recover_submission(
     if len(discovered) != 1:
         raise MsctlError(
             "SUBMISSION_MULTIPLE_MATCHES",
-            "multiple Slurm jobs match one submission intent",
+            "multiple Slurm jobs match one durable pair intent",
             details={
                 "submission_key": submission_key,
                 "job_ids": sorted(discovered, key=int),
             },
         )
     job_id, status = next(iter(discovered.items()))
-    recorded_ids = {
-        str(state["job_id"])
-        for state in states
-        if state.get("job_id") is not None
-    }
-    if any(not job.isdigit() for job in recorded_ids):
-        raise MsctlError(
-            "SUBMISSION_UNCERTAIN",
-            "recorded recovery job ID is invalid",
-            details={"recoverable": False},
-        )
-    if recorded_ids and recorded_ids != {job_id}:
-        raise MsctlError(
-            "SUBMISSION_UNCERTAIN",
-            "recorded job ID conflicts with exact-key Slurm recovery",
-            details={
-                "recoverable": False,
-                "recorded_job_ids": sorted(recorded_ids, key=int),
-                "discovered_job_id": job_id,
-            },
-        )
-    now = _timestamp()
-    for run, state in zip(runs, states):
-        state["job_id"] = job_id
-        state["status"] = status
-        state["updated_at"] = now
-        store.write_run(run.run_id, state)
+    intent["phase"] = "SUBMITTED"
+    intent["job_id"] = job_id
+    intent["updated_at"] = _timestamp()
+    store.write_intent(submission_key, intent)
     return job_id, status
 
 
@@ -243,13 +377,14 @@ def submit_runs(
     dataset_pointer: Path | str,
     dataset_root: Path | str | None,
     dataset_verification: Path | str | None,
+    environment_receipt: Path | str | None,
     repo_root: Path | str,
     state_root: Path | str,
     approval_path: Path | str | None,
     apply: bool,
     environ: dict[str, str] | None = None,
 ) -> dict[str, object]:
-    release, manifest = load_bound_inputs(
+    release, manifest, release_root = load_bound_inputs(
         profile=profile,
         release_path=release_path,
         manifest_path=manifest_path,
@@ -264,13 +399,31 @@ def submit_runs(
         manifest=manifest,
         repo_root=repo_root,
     )
-    command = render_seed0_command(profile, release, manifest)
+    environment = verify_environment_receipt(
+        environment_receipt,
+        profile=profile,
+        release=release,
+    )
+    command = render_seed0_command(
+        profile,
+        release,
+        manifest,
+        release_root=release_root,
+        dataset=dataset,
+        environment=environment,
+    )
     resources = resource_request(profile, "submit")
+    runtime_hash = runtime_binding_sha256(
+        release_root=release_root,
+        dataset=dataset,
+        environment=environment,
+    )
     submission_key, job_name, _ = submission_identity(
         profile,
         release,
         manifest,
         operation="submit",
+        runtime_binding_sha256=runtime_hash,
     )
     if not apply:
         return {
@@ -284,6 +437,14 @@ def submit_runs(
             "submitted": 0,
             "idempotent": False,
         }
+    _preflight_entrypoint(
+        release=release,
+        release_root=release_root,
+        member=TRAIN_ENTRYPOINT,
+        marker_name="MSCTL_DDP_CONTRACT",
+        marker_value="memorysplit-ddp-v1",
+        required_interface={"--config", "--resume-path"},
+    )
     verify_approval(
         approval_path,
         operation="submit",
@@ -294,43 +455,77 @@ def submit_runs(
     )
     store = StateStore(state_root)
     with store.locked():
+        intent = store.read_intent(submission_key)
         states = [store.read_run(run.run_id) for run in manifest.runs]
-        existing = [state for state in states if state is not None]
-        if existing:
-            if len(existing) != len(manifest.runs):
+        if intent is None:
+            if any(state is not None for state in states):
                 raise MsctlError(
                     "STATE_INCOMPLETE",
-                    "only part of the paired run has lifecycle state",
+                    "paired run state exists without its durable intent",
                 )
-            if not all(_same_binding(state, manifest) for state in existing):
+            intent = _new_pair_intent(
+                profile=profile,
+                manifest=manifest,
+                submission_key=submission_key,
+                dataset=dataset,
+                environment=environment,
+                resources=resources,
+                operation="submit",
+                attempt=1,
+                checkpoint_receipt_sha256=None,
+            )
+            store.write_intent(submission_key, intent)
+        elif not _intent_matches(
+            intent,
+            profile=profile,
+            manifest=manifest,
+            dataset=dataset,
+            environment=environment,
+            operation="submit",
+            attempt=1,
+            checkpoint_receipt_sha256=None,
+        ):
+            raise MsctlError(
+                "RUN_ID_CONFLICT",
+                "durable pair intent has different provenance",
+            )
+
+        repaired: list[dict[str, object]] = []
+        for run, state in zip(manifest.runs, states):
+            if state is None:
+                state = _initial_submit_state(
+                    run=run,
+                    manifest=manifest,
+                    intent=intent,
+                )
+                store.write_run(run.run_id, state)
+            elif (
+                not _same_binding(state, manifest)
+                or state.get("submission_key") != submission_key
+                or state.get("environment_receipt_sha256")
+                != environment["receipt_sha256"]
+            ):
                 raise MsctlError(
                     "RUN_ID_CONFLICT",
                     "run ID already exists with different provenance",
                 )
-            job_ids = {state.get("job_id") for state in existing}
-            if None in job_ids:
-                job_id, status = _recover_submission(
-                    store=store,
-                    runs=manifest.runs,
-                    states=existing,
-                    submission_key=submission_key,
-                    job_name=job_name,
-                    environ=environ,
-                )
-            elif len(job_ids) != 1:
-                raise MsctlError(
-                    "SUBMISSION_UNCERTAIN",
-                    "prior submission intent lacks one authoritative job ID",
-                )
-            else:
-                job_id = str(next(iter(job_ids)))
-                reconciled = query_states([job_id], environ=environ)
-                status = reconciled[job_id]
-                for run, state in zip(manifest.runs, existing):
-                    updated = dict(state)
-                    updated["status"] = status
-                    updated["updated_at"] = _timestamp()
-                    store.write_run(run.run_id, updated)
+            repaired.append(state)
+
+        recovered = _reconcile_pair_intent(
+            store=store,
+            intent=intent,
+            submission_key=submission_key,
+            job_name=job_name,
+            environ=environ,
+        )
+        if recovered is not None:
+            job_id, status = recovered
+            now = _timestamp()
+            for run, state in zip(manifest.runs, repaired):
+                state["job_id"] = job_id
+                state["status"] = status
+                state["updated_at"] = now
+                store.write_run(run.run_id, state)
             return {
                 "provider": profile.provider,
                 "release_sha256": release.archive_sha256,
@@ -342,38 +537,16 @@ def submit_runs(
                 "active": status in ACTIVE_STATES,
             }
 
-        intent_time = _timestamp()
-        for run in manifest.runs:
-            store.write_run(
-                run.run_id,
-                {
-                    "schema_version": 1,
-                    "run_id": run.run_id,
-                    "arm": run.arm,
-                    "seed": run.seed,
-                    "provider": profile.provider,
-                    "release_sha256": release.archive_sha256,
-                    "run_manifest_sha256": manifest.sha256,
-                    "config_sha256": run.config_sha256,
-                    "dataset_sha256": manifest.dataset_sha256,
-                    "dataset_verification_sha256": dataset[
-                        "verification_sha256"
-                    ],
-                    "operation": "submit",
-                    "submission_key": submission_key,
-                    "resource_request": resources,
-                    "job_id": None,
-                    "status": "SUBMITTING",
-                    "attempt": 1,
-                    "created_at": intent_time,
-                    "updated_at": intent_time,
-                },
-            )
+        intent["phase"] = "SUBMITTING"
+        intent["updated_at"] = _timestamp()
+        store.write_intent(submission_key, intent)
         job_id = slurm_submit(command, environ=environ)
         submitted_at = _timestamp()
-        for run in manifest.runs:
-            state = store.read_run(run.run_id)
-            assert state is not None
+        intent["phase"] = "SUBMITTED"
+        intent["job_id"] = job_id
+        intent["updated_at"] = submitted_at
+        store.write_intent(submission_key, intent)
+        for run, state in zip(manifest.runs, repaired):
             state["job_id"] = job_id
             state["status"] = "SUBMITTED"
             state["updated_at"] = submitted_at
@@ -431,7 +604,7 @@ def status_runs(
     cached: bool,
     environ: dict[str, str] | None = None,
 ) -> dict[str, object]:
-    release, manifest = load_bound_inputs(
+    release, manifest, _ = load_bound_inputs(
         profile=profile,
         release_path=release_path,
         manifest_path=manifest_path,
@@ -483,13 +656,14 @@ def resume_runs(
     dataset_pointer: Path | str,
     dataset_root: Path | str | None,
     dataset_verification: Path | str | None,
+    environment_receipt: Path | str | None,
     repo_root: Path | str,
     state_root: Path | str,
     approval_path: Path | str | None,
     apply: bool,
     environ: dict[str, str] | None = None,
 ) -> dict[str, object]:
-    release, manifest = load_bound_inputs(
+    release, manifest, release_root = load_bound_inputs(
         profile=profile,
         release_path=release_path,
         manifest_path=manifest_path,
@@ -504,16 +678,29 @@ def resume_runs(
         manifest=manifest,
         repo_root=repo_root,
     )
+    environment = verify_environment_receipt(
+        environment_receipt,
+        profile=profile,
+        release=release,
+    )
     checkpoint = verify_checkpoint_receipt(
         checkpoint_receipt,
         release=release,
         manifest=manifest,
     )
     resources = resource_request(profile, "resume")
+    runtime_hash = runtime_binding_sha256(
+        release_root=release_root,
+        dataset=dataset,
+        environment=environment,
+    )
     command = render_seed0_command(
         profile,
         release,
         manifest,
+        release_root=release_root,
+        dataset=dataset,
+        environment=environment,
         checkpoint_receipt=checkpoint,
         attempt=2,
     )
@@ -526,6 +713,14 @@ def resume_runs(
             "checkpoint_receipt_sha256": checkpoint.sha256,
             "resource_request": resources,
         }
+    _preflight_entrypoint(
+        release=release,
+        release_root=release_root,
+        member=TRAIN_ENTRYPOINT,
+        marker_name="MSCTL_DDP_CONTRACT",
+        marker_value="memorysplit-ddp-v1",
+        required_interface={"--config", "--resume-path"},
+    )
     verify_approval(
         approval_path,
         operation="resume",
@@ -540,12 +735,74 @@ def resume_runs(
         if not all(
             state.get("dataset_verification_sha256")
             == dataset["verification_sha256"]
+            and state.get("environment_receipt_sha256")
+            == environment["receipt_sha256"]
             for state in states
         ):
             raise MsctlError(
                 "DATASET_STATE_MISMATCH",
                 "resume state was not created from this verified dataset",
             )
+        candidate_attempt = max(int(state["attempt"]) for state in states)
+        candidate_key, _, _ = submission_identity(
+            profile,
+            release,
+            manifest,
+            operation="resume",
+            attempt=candidate_attempt,
+            checkpoint_receipt_sha256=checkpoint.sha256,
+            runtime_binding_sha256=runtime_hash,
+        )
+        candidate_intent = store.read_intent(candidate_key)
+        if candidate_intent is not None:
+            if not _intent_matches(
+                candidate_intent,
+                profile=profile,
+                manifest=manifest,
+                dataset=dataset,
+                environment=environment,
+                operation="resume",
+                attempt=candidate_attempt,
+                checkpoint_receipt_sha256=checkpoint.sha256,
+            ):
+                raise MsctlError(
+                    "RUN_ID_CONFLICT",
+                    "resume pair intent has different provenance",
+                )
+            previous_ids = {
+                str(state["job_id"])
+                for state in states
+                if state["operation"] == "submit" and state["job_id"] is not None
+            }
+            for state in states:
+                previous_ids.update(
+                    str(job_id)
+                    for job_id in state.get("prior_job_ids", [])
+                )
+            if len(previous_ids) != 1:
+                raise MsctlError(
+                    "SUBMISSION_UNCERTAIN",
+                    "partial resume intent lacks one previous Slurm job",
+                )
+            previous_id = next(iter(previous_ids))
+            repaired_at = _timestamp()
+            for run, state in zip(manifest.runs, states):
+                if state["operation"] == "resume":
+                    continue
+                state.update(
+                    {
+                        "job_id": None,
+                        "status": "RESUBMITTING",
+                        "attempt": candidate_attempt,
+                        "operation": "resume",
+                        "submission_key": candidate_key,
+                        "resource_request": resources,
+                        "checkpoint_receipt_sha256": checkpoint.sha256,
+                        "prior_job_ids": [previous_id],
+                        "updated_at": repaired_at,
+                    }
+                )
+                store.write_run(run.run_id, state)
         existing_resume = all(
             state.get("operation") == "resume"
             and state.get("checkpoint_receipt_sha256") == checkpoint.sha256
@@ -560,36 +817,68 @@ def resume_runs(
                 operation="resume",
                 attempt=attempt,
                 checkpoint_receipt_sha256=checkpoint.sha256,
+                runtime_binding_sha256=runtime_hash,
             )
-            job_ids = {state.get("job_id") for state in states}
-            if None in job_ids:
-                job_id, status = _recover_submission(
-                    store=store,
-                    runs=manifest.runs,
-                    states=states,
-                    submission_key=submission_key,
-                    job_name=job_name,
-                    environ=environ,
-                )
-            elif len(job_ids) != 1:
+            intent = store.read_intent(submission_key)
+            if intent is None or not _intent_matches(
+                intent,
+                profile=profile,
+                manifest=manifest,
+                dataset=dataset,
+                environment=environment,
+                operation="resume",
+                attempt=attempt,
+                checkpoint_receipt_sha256=checkpoint.sha256,
+            ):
                 raise MsctlError(
-                    "SUBMISSION_UNCERTAIN",
-                    "resume intent lacks one authoritative Slurm job",
+                    "STATE_INCOMPLETE",
+                    "resume state lacks its matching durable pair intent",
                 )
+            recovered = _reconcile_pair_intent(
+                store=store,
+                intent=intent,
+                submission_key=submission_key,
+                job_name=job_name,
+                environ=environ,
+            )
+            if recovered is None:
+                command = render_seed0_command(
+                    profile,
+                    release,
+                    manifest,
+                    release_root=release_root,
+                    dataset=dataset,
+                    environment=environment,
+                    checkpoint_receipt=checkpoint,
+                    attempt=attempt,
+                )
+                intent["phase"] = "SUBMITTING"
+                intent["updated_at"] = _timestamp()
+                store.write_intent(submission_key, intent)
+                job_id = slurm_submit(command, environ=environ)
+                status = "SUBMITTED"
+                intent["phase"] = "SUBMITTED"
+                intent["job_id"] = job_id
+                intent["updated_at"] = _timestamp()
+                store.write_intent(submission_key, intent)
+                submitted = 1
+                idempotent = False
             else:
-                job_id = str(next(iter(job_ids)))
-                status = query_states([job_id], environ=environ)[job_id]
-                now = _timestamp()
-                for run, state in zip(manifest.runs, states):
-                    state["status"] = status
-                    state["updated_at"] = now
-                    store.write_run(run.run_id, state)
+                job_id, status = recovered
+                submitted = 0
+                idempotent = True
+            now = _timestamp()
+            for run, state in zip(manifest.runs, states):
+                state["job_id"] = job_id
+                state["status"] = status
+                state["updated_at"] = now
+                store.write_run(run.run_id, state)
             return {
                 "job_id": job_id,
                 "status": status,
                 "attempt": attempt,
-                "submitted": 0,
-                "idempotent": True,
+                "submitted": submitted,
+                "idempotent": idempotent,
                 "run_manifest_sha256": manifest.sha256,
             }
         previous_ids = {
@@ -632,18 +921,53 @@ def resume_runs(
             operation="resume",
             attempt=attempt,
             checkpoint_receipt_sha256=checkpoint.sha256,
+            runtime_binding_sha256=runtime_hash,
         )
         command = render_seed0_command(
             profile,
             release,
             manifest,
+            release_root=release_root,
+            dataset=dataset,
+            environment=environment,
             checkpoint_receipt=checkpoint,
             attempt=attempt,
         )
+        intent = store.read_intent(submission_key)
+        if intent is None:
+            intent = _new_pair_intent(
+                profile=profile,
+                manifest=manifest,
+                submission_key=submission_key,
+                dataset=dataset,
+                environment=environment,
+                resources=resources,
+                operation="resume",
+                attempt=attempt,
+                checkpoint_receipt_sha256=checkpoint.sha256,
+            )
+            store.write_intent(submission_key, intent)
+        elif not _intent_matches(
+            intent,
+            profile=profile,
+            manifest=manifest,
+            dataset=dataset,
+            environment=environment,
+            operation="resume",
+            attempt=attempt,
+            checkpoint_receipt_sha256=checkpoint.sha256,
+        ):
+            raise MsctlError(
+                "RUN_ID_CONFLICT",
+                "resume intent key already exists with incompatible state",
+            )
         intent_time = _timestamp()
         for run, state in zip(manifest.runs, states):
-            prior = list(state.get("prior_job_ids", []))
-            prior.append(previous_id)
+            if (
+                state["operation"] == "resume"
+                and state["submission_key"] == submission_key
+            ):
+                continue
             state.update(
                 {
                     "job_id": None,
@@ -656,13 +980,43 @@ def resume_runs(
                     "dataset_verification_sha256": dataset[
                         "verification_sha256"
                     ],
-                    "prior_job_ids": prior,
+                    "prior_job_ids": [previous_id],
                     "updated_at": intent_time,
                 }
             )
             store.write_run(run.run_id, state)
+        recovered = _reconcile_pair_intent(
+            store=store,
+            intent=intent,
+            submission_key=submission_key,
+            job_name=job_name,
+            environ=environ,
+        )
+        if recovered is not None:
+            job_id, status = recovered
+            reconciled_at = _timestamp()
+            for run, state in zip(manifest.runs, states):
+                state["job_id"] = job_id
+                state["status"] = status
+                state["updated_at"] = reconciled_at
+                store.write_run(run.run_id, state)
+            return {
+                "job_id": job_id,
+                "status": status,
+                "attempt": attempt,
+                "submitted": 0,
+                "idempotent": True,
+                "run_manifest_sha256": manifest.sha256,
+            }
+        intent["phase"] = "SUBMITTING"
+        intent["updated_at"] = _timestamp()
+        store.write_intent(submission_key, intent)
         job_id = slurm_submit(command, environ=environ)
         submitted_at = _timestamp()
+        intent["phase"] = "SUBMITTED"
+        intent["job_id"] = job_id
+        intent["updated_at"] = submitted_at
+        store.write_intent(submission_key, intent)
         for run in manifest.runs:
             state = store.read_run(run.run_id)
             assert state is not None
@@ -695,7 +1049,7 @@ def cancel_runs(
     apply: bool,
     environ: dict[str, str] | None = None,
 ) -> dict[str, object]:
-    release, manifest = load_bound_inputs(
+    release, manifest, _ = load_bound_inputs(
         profile=profile,
         release_path=release_path,
         manifest_path=manifest_path,
@@ -762,13 +1116,14 @@ def evaluate_runs(
     dataset_pointer: Path | str,
     dataset_root: Path | str | None,
     dataset_verification: Path | str | None,
+    environment_receipt: Path | str | None,
     repo_root: Path | str,
     state_root: Path | str,
     approval_path: Path | str | None,
     apply: bool,
     environ: dict[str, str] | None = None,
 ) -> dict[str, object]:
-    release, manifest = load_bound_inputs(
+    release, manifest, release_root = load_bound_inputs(
         profile=profile,
         release_path=release_path,
         manifest_path=manifest_path,
@@ -783,13 +1138,31 @@ def evaluate_runs(
         manifest=manifest,
         repo_root=repo_root,
     )
-    command = render_evaluate_command(profile, release, manifest)
+    environment = verify_environment_receipt(
+        environment_receipt,
+        profile=profile,
+        release=release,
+    )
+    command = render_evaluate_command(
+        profile,
+        release,
+        manifest,
+        release_root=release_root,
+        dataset=dataset,
+        environment=environment,
+    )
     resources = resource_request(profile, "evaluate")
+    runtime_hash = runtime_binding_sha256(
+        release_root=release_root,
+        dataset=dataset,
+        environment=environment,
+    )
     submission_key, job_name, _ = submission_identity(
         profile,
         release,
         manifest,
         operation="evaluate",
+        runtime_binding_sha256=runtime_hash,
     )
     if not apply:
         return {
@@ -800,6 +1173,14 @@ def evaluate_runs(
             "resource_request": resources,
             "submission_key": submission_key,
         }
+    _preflight_entrypoint(
+        release=release,
+        release_root=release_root,
+        member=EVALUATOR_ENTRYPOINT,
+        marker_name="MSCTL_EVALUATOR_CONTRACT",
+        marker_value="memorysplit-confirmatory-evaluator-v1",
+        required_interface={"evaluate", "--run", "--sealed-release", "--device"},
+    )
     verify_approval(
         approval_path,
         operation="evaluate",
@@ -817,6 +1198,8 @@ def evaluate_runs(
                 or existing.get("dataset_sha256") != manifest.dataset_sha256
                 or existing.get("dataset_verification_sha256")
                 != dataset["verification_sha256"]
+                or existing.get("environment_receipt_sha256")
+                != environment["receipt_sha256"]
                 or existing.get("submission_key") != submission_key
             ):
                 raise MsctlError(
@@ -873,6 +1256,7 @@ def evaluate_runs(
                 "dataset_verification_sha256": dataset[
                     "verification_sha256"
                 ],
+                "environment_receipt_sha256": environment["receipt_sha256"],
                 "operation": "evaluate",
                 "submission_key": submission_key,
                 "resource_request": resources,

@@ -12,10 +12,12 @@ import tempfile
 from datetime import UTC, datetime
 from pathlib import Path
 
+from .contracts import Release
 from .errors import MsctlError
+from .fsutil import load_json_at, open_directory, open_regular_at
 from .jsonutil import (
     atomic_write_json,
-    load_json,
+    canonical_sha256,
     regular_file,
     require_exact_keys,
     require_object,
@@ -60,8 +62,20 @@ def _run(command: list[str], *, operation: str) -> None:
 
 def _read_receipt(path: Path) -> dict[str, object]:
     try:
+        parent_fd = open_directory(
+            path.parent,
+            label="environment receipt directory",
+        )
+        try:
+            raw = load_json_at(
+                parent_fd,
+                path.name,
+                label="environment receipt",
+            )
+        finally:
+            os.close(parent_fd)
         value = require_object(
-            load_json(path, label="environment receipt"),
+            raw,
             label="environment receipt",
         )
         require_exact_keys(
@@ -71,6 +85,7 @@ def _read_receipt(path: Path) -> dict[str, object]:
                 "provider",
                 "profile_sha256",
                 "lock_sha256",
+                "environment_root",
                 "python",
                 "platform",
                 "cuda_version",
@@ -94,6 +109,7 @@ def _read_receipt(path: Path) -> dict[str, object]:
             isinstance(value[field], str) and value[field]
             for field in (
                 "provider",
+                "environment_root",
                 "python",
                 "platform",
                 "cuda_version",
@@ -110,6 +126,84 @@ def _read_receipt(path: Path) -> dict[str, object]:
             "environment receipt is invalid",
         ) from error
     return value
+
+
+def verify_environment_receipt(
+    path: Path | str | None,
+    *,
+    profile: IlluminaProfile,
+    release: Release,
+) -> dict[str, object]:
+    """Authenticate the exact runtime environment before paid submission."""
+
+    if path is None:
+        raise MsctlError(
+            "ENV_RECEIPT_REQUIRED",
+            "paid runtime operations require an environment receipt",
+        )
+    candidate = Path(os.path.abspath(os.fspath(path)))
+    if candidate.name != RECEIPT_NAME:
+        raise MsctlError(
+            "ENV_RECEIPT_INVALID",
+            "environment receipt must use the canonical filename",
+        )
+    receipt = _read_receipt(candidate)
+    root = candidate.parent
+    if (
+        receipt["provider"] != profile.provider
+        or receipt["profile_sha256"] != profile.sha256
+        or receipt["environment_root"] != str(root)
+        or profile.environment_status != "pinned"
+        or profile.python_version is None
+        or profile.cuda_version is None
+        or receipt["python"] != profile.python_version
+        or receipt["platform"] != profile.platform
+        or receipt["cuda_version"] != profile.cuda_version
+    ):
+        raise MsctlError(
+            "ENV_PROVENANCE_MISMATCH",
+            "environment receipt does not bind the provider profile",
+        )
+    environment_hashes = release.metadata.get("environment_hashes")
+    if (
+        not isinstance(environment_hashes, dict)
+        or environment_hashes.get(profile.environment_lock)
+        != receipt["lock_sha256"]
+    ):
+        raise MsctlError(
+            "ENV_PROVENANCE_MISMATCH",
+            "environment receipt lock is not authenticated by the release",
+        )
+    root_fd = open_directory(root, label="environment root")
+    try:
+        descriptor, parent_fd, _ = open_regular_at(
+            root_fd,
+            "bin/python",
+            label="environment Python",
+        )
+        try:
+            executable = os.fstat(descriptor)
+        finally:
+            os.close(descriptor)
+            os.close(parent_fd)
+    except MsctlError as error:
+        raise MsctlError(
+            "ENV_PROVENANCE_MISMATCH",
+            "environment Python is unavailable or unsafe",
+        ) from error
+    finally:
+        os.close(root_fd)
+    if executable.st_mode & 0o111 == 0:
+        raise MsctlError(
+            "ENV_PROVENANCE_MISMATCH",
+            "environment Python is not executable",
+        )
+    return {
+        "root": str(root),
+        "receipt": str(candidate),
+        "receipt_sha256": canonical_sha256(receipt),
+        "lock_sha256": receipt["lock_sha256"],
+    }
 
 
 def _validate_lock_contract(path: Path, profile: IlluminaProfile) -> None:
@@ -277,6 +371,8 @@ def ensure_environment(
                 and receipt.get("provider") == profile.provider
                 and receipt.get("profile_sha256") == profile.sha256
                 and receipt.get("lock_sha256") == lock_hash
+                and receipt.get("environment_root")
+                == str(destination.absolute())
                 and receipt.get("python") == profile.python_version
                 and receipt.get("platform") == profile.platform
                 and receipt.get("cuda_version") == profile.cuda_version
@@ -305,7 +401,7 @@ def ensure_environment(
     )
     try:
         _run(
-            [sys.executable, "-m", "venv", str(temporary)],
+            [sys.executable, "-m", "venv", "--copies", str(temporary)],
             operation="Python venv creation",
         )
         python = temporary / "bin" / "python"
@@ -327,6 +423,7 @@ def ensure_environment(
             "provider": profile.provider,
             "profile_sha256": profile.sha256,
             "lock_sha256": lock_hash,
+            "environment_root": str(destination.absolute()),
             "python": profile.python_version,
             "platform": profile.platform,
             "cuda_version": profile.cuda_version,

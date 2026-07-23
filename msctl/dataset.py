@@ -7,6 +7,7 @@ import json
 import os
 import stat
 from pathlib import Path
+from pathlib import PurePosixPath
 
 from corpusgen.parallel import verify_parallel_corpus
 
@@ -66,6 +67,7 @@ VERIFICATION_KEYS = {
     "dataset_sha256",
     "dataset_id",
     "dataset_root",
+    "publication_root",
     "identity",
     "receipt_sha256",
     "file_identities",
@@ -75,11 +77,36 @@ VERIFICATION_KEYS = {
 }
 FILE_IDENTITY_KEYS = {
     "path",
+    "device",
     "inode",
     "bytes",
     "mtime_ns",
     "ctime_ns",
 }
+
+
+def _publication_root(
+    pointer: dict[str, object],
+    dataset_root: Path,
+) -> Path:
+    relative = PurePosixPath(str(pointer["relative_path"]))
+    parts = relative.parts
+    if (
+        not dataset_root.is_absolute()
+        or len(dataset_root.parts) <= len(parts)
+        or tuple(dataset_root.parts[-len(parts) :]) != parts
+    ):
+        raise MsctlError(
+            "DATASET_ROOT_MISMATCH",
+            "dataset root does not match the pointer publication path",
+        )
+    publication = dataset_root.parents[len(parts) - 1]
+    if publication / Path(*parts) != dataset_root:
+        raise MsctlError(
+            "DATASET_ROOT_MISMATCH",
+            "dataset root does not match the pointer publication path",
+        )
+    return publication
 
 
 def load_pointer(path: Path | str, profile: IlluminaProfile) -> dict[str, object]:
@@ -386,6 +413,7 @@ def _snapshot_dataset(
         identities.append(
             {
                 "path": relative,
+                "device": metadata.st_dev,
                 "inode": metadata.st_ino,
                 "bytes": metadata.st_size,
                 "mtime_ns": metadata.st_mtime_ns,
@@ -420,6 +448,7 @@ def _snapshot_dataset(
     identities.append(
         {
             "path": receipt_name,
+            "device": receipt_metadata.st_dev,
             "inode": receipt_metadata.st_ino,
             "bytes": receipt_metadata.st_size,
             "mtime_ns": receipt_metadata.st_mtime_ns,
@@ -487,6 +516,7 @@ def verify_dataset(
         repo_root=repo_root,
     )
     root = Path(os.path.abspath(os.fspath(dataset_root)))
+    publication_root = _publication_root(pointer, root)
     try:
         root_fd = open_directory(root, label="dataset root")
     except MsctlError as error:
@@ -550,6 +580,7 @@ def verify_dataset(
         "dataset_sha256": identity_sha256,
         "dataset_id": pointer["dataset_id"],
         "dataset_root": str(root),
+        "publication_root": str(publication_root),
         "identity": identity,
         "receipt_sha256": receipt_sha256,
         "file_identities": file_identities,
@@ -654,6 +685,17 @@ def load_dataset_verification(
             "DATASET_VERIFICATION_INVALID",
             "prior dataset verification root must be absolute",
         )
+    publication_value = verification["publication_root"]
+    if (
+        not isinstance(publication_value, str)
+        or not Path(publication_value).is_absolute()
+        or _publication_root(pointer, Path(root_value))
+        != Path(publication_value)
+    ):
+        raise MsctlError(
+            "DATASET_VERIFICATION_INVALID",
+            "prior dataset publication root does not match the pointer",
+        )
     try:
         root_fd = open_directory(root_value, label="verified dataset root")
     except MsctlError as error:
@@ -728,6 +770,7 @@ def load_dataset_verification(
                 label=f"dataset file identities[{index}].path",
             )
             for field in (
+                "device",
                 "inode",
                 "bytes",
                 "mtime_ns",

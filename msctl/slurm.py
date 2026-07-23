@@ -7,6 +7,7 @@ import re
 import shutil
 import subprocess
 from collections.abc import Mapping, Sequence
+from pathlib import Path
 
 from .contracts import CheckpointReceipt, Release, RunManifest
 from .errors import MsctlError
@@ -16,6 +17,8 @@ from .profile import IlluminaProfile
 
 SEED0_SCRIPT = "cluster/slurm/v2_seed0.sbatch"
 EVALUATE_SCRIPT = "cluster/slurm/v2_evaluate.sbatch"
+TRAIN_ENTRYPOINT = "scripts/run_train.py"
+EVALUATOR_ENTRYPOINT = "evals/confirmatory/runner.py"
 MAX_CAPTURE = 16_384
 JOB_ID_RE = re.compile(r"^(?P<job>[0-9]+)(?:;(?P<cluster>[A-Za-z0-9._-]+))?$")
 ACTIVE_STATES = {
@@ -44,11 +47,6 @@ _SAFE_CHILD_ENV = {
     "PATH",
     "TMPDIR",
     "USER",
-    "MS_SHARED_ROOT",
-    "MS_ENV_ROOT",
-    "MS_DATA_ROOT",
-    "MS_OUT_ROOT",
-    "MS_SEALED_ROOT",
 }
 _REDACT_PATTERNS = (
     re.compile(r"(?i)(token|secret|password|key)=([^,\s]+)"),
@@ -82,20 +80,6 @@ def _safe_export(name: str, value: object, profile: IlluminaProfile) -> str:
             details={"name": name},
         )
     return f"{name}={text}"
-
-
-def _forward_exports(
-    profile: IlluminaProfile,
-    names: Sequence[str],
-) -> list[str]:
-    for name in names:
-        if name not in profile.job_env_allowlist:
-            raise MsctlError(
-                "ENV_NOT_ALLOWED",
-                "runtime root is not allowlisted for Slurm",
-                details={"name": name},
-            )
-    return list(names)
 
 
 def _resource_args(profile: IlluminaProfile) -> list[str]:
@@ -157,6 +141,7 @@ def submission_identity(
     operation: str,
     attempt: int = 1,
     checkpoint_receipt_sha256: str | None = None,
+    runtime_binding_sha256: str | None = None,
 ) -> tuple[str, str, str]:
     value = {
         "schema_version": 1,
@@ -167,10 +152,30 @@ def submission_identity(
         "operation": operation,
         "attempt": attempt,
         "checkpoint_receipt_sha256": checkpoint_receipt_sha256,
+        "runtime_binding_sha256": runtime_binding_sha256,
         "resource_request": resource_request(profile, operation),
     }
     key = canonical_sha256(value)
     return key, f"ms-v2-{operation}-{key[:12]}", f"msctl:{key}"
+
+
+def runtime_binding_sha256(
+    *,
+    release_root: Path,
+    dataset: Mapping[str, object],
+    environment: Mapping[str, object],
+) -> str:
+    return canonical_sha256(
+        {
+            "schema_version": 1,
+            "release_root": str(release_root),
+            "dataset_root": dataset["dataset_root"],
+            "publication_root": dataset["publication_root"],
+            "dataset_verification_sha256": dataset["verification_sha256"],
+            "environment_root": environment["root"],
+            "environment_receipt_sha256": environment["receipt_sha256"],
+        }
+    )
 
 
 def render_seed0_command(
@@ -178,11 +183,19 @@ def render_seed0_command(
     release: Release,
     manifest: RunManifest,
     *,
+    release_root: Path,
+    dataset: Mapping[str, object],
+    environment: Mapping[str, object],
     checkpoint_receipt: CheckpointReceipt | None = None,
     attempt: int = 1,
 ) -> list[str]:
     operation = "resume" if checkpoint_receipt is not None else "submit"
     by_arm = {run.arm: run for run in manifest.runs}
+    runtime_hash = runtime_binding_sha256(
+        release_root=release_root,
+        dataset=dataset,
+        environment=environment,
+    )
     key, job_name, comment = submission_identity(
         profile,
         release,
@@ -194,11 +207,25 @@ def render_seed0_command(
             if checkpoint_receipt is not None
             else None
         ),
+        runtime_binding_sha256=runtime_hash,
     )
-    exports = _forward_exports(
-        profile,
-        ("MS_SHARED_ROOT", "MS_ENV_ROOT", "MS_DATA_ROOT", "MS_OUT_ROOT"),
-    ) + [
+    dataset_root = str(dataset["dataset_root"])
+    publication_root = str(dataset["publication_root"])
+    environment_root = str(environment["root"])
+    output_root = str(Path(publication_root) / "memorysplit" / "runs")
+    train_entrypoint = str(release_root / TRAIN_ENTRYPOINT)
+    exports = [
+        _safe_export("MS_SHARED_ROOT", publication_root, profile),
+        _safe_export("MS_ENV_ROOT", environment_root, profile),
+        _safe_export("MS_DATA_ROOT", dataset_root, profile),
+        _safe_export("MS_OUT_ROOT", output_root, profile),
+        _safe_export("MS_RELEASE_ROOT", release_root, profile),
+        _safe_export("MS_TRAIN_ENTRYPOINT", train_entrypoint, profile),
+        _safe_export(
+            "MS_TRAIN_ENTRYPOINT_SHA256",
+            release.members[TRAIN_ENTRYPOINT]["sha256"],
+            profile,
+        ),
         _safe_export("MS_PROVIDER", profile.provider, profile),
         _safe_export("MS_PROFILE_SHA256", profile.sha256, profile),
         _safe_export("MS_RELEASE_ID", release.release_id, profile),
@@ -210,14 +237,22 @@ def render_seed0_command(
         ),
         _safe_export("MS_DATASET_SHA256", manifest.dataset_sha256, profile),
         _safe_export("MS_DENSE_RUN_ID", by_arm["dense"].run_id, profile),
-        _safe_export("MS_DENSE_CONFIG", by_arm["dense"].config, profile),
+        _safe_export(
+            "MS_DENSE_CONFIG",
+            release_root / by_arm["dense"].config,
+            profile,
+        ),
         _safe_export(
             "MS_DENSE_CONFIG_SHA256",
             by_arm["dense"].config_sha256,
             profile,
         ),
         _safe_export("MS_SPLIT_RUN_ID", by_arm["split90"].run_id, profile),
-        _safe_export("MS_SPLIT_CONFIG", by_arm["split90"].config, profile),
+        _safe_export(
+            "MS_SPLIT_CONFIG",
+            release_root / by_arm["split90"].config,
+            profile,
+        ),
         _safe_export(
             "MS_SPLIT_CONFIG_SHA256",
             by_arm["split90"].config_sha256,
@@ -257,7 +292,8 @@ def render_seed0_command(
         f"--job-name={job_name}",
         f"--comment={comment}",
         f"--export={','.join(exports)}",
-        SEED0_SCRIPT,
+        f"--chdir={release_root}",
+        str(release_root / SEED0_SCRIPT),
     ]
 
 
@@ -265,23 +301,45 @@ def render_evaluate_command(
     profile: IlluminaProfile,
     release: Release,
     manifest: RunManifest,
+    *,
+    release_root: Path,
+    dataset: Mapping[str, object],
+    environment: Mapping[str, object],
 ) -> list[str]:
     _, job_name, comment = submission_identity(
         profile,
         release,
         manifest,
         operation="evaluate",
-    )
-    exports = _forward_exports(
-        profile,
-        (
-            "MS_SHARED_ROOT",
-            "MS_ENV_ROOT",
-            "MS_DATA_ROOT",
-            "MS_OUT_ROOT",
-            "MS_SEALED_ROOT",
+        runtime_binding_sha256=runtime_binding_sha256(
+            release_root=release_root,
+            dataset=dataset,
+            environment=environment,
         ),
-    ) + [
+    )
+    dataset_root = str(dataset["dataset_root"])
+    publication_root = str(dataset["publication_root"])
+    environment_root = str(environment["root"])
+    output_root = str(Path(publication_root) / "memorysplit" / "runs")
+    sealed_root = str(Path(publication_root) / "memorysplit" / "sealed-eval")
+    evaluator_entrypoint = str(release_root / EVALUATOR_ENTRYPOINT)
+    exports = [
+        _safe_export("MS_SHARED_ROOT", publication_root, profile),
+        _safe_export("MS_ENV_ROOT", environment_root, profile),
+        _safe_export("MS_DATA_ROOT", dataset_root, profile),
+        _safe_export("MS_OUT_ROOT", output_root, profile),
+        _safe_export("MS_SEALED_ROOT", sealed_root, profile),
+        _safe_export("MS_RELEASE_ROOT", release_root, profile),
+        _safe_export(
+            "MS_EVALUATOR_ENTRYPOINT",
+            evaluator_entrypoint,
+            profile,
+        ),
+        _safe_export(
+            "MS_EVALUATOR_ENTRYPOINT_SHA256",
+            release.members[EVALUATOR_ENTRYPOINT]["sha256"],
+            profile,
+        ),
         _safe_export("MS_PROVIDER", profile.provider, profile),
         _safe_export("MS_PROFILE_SHA256", profile.sha256, profile),
         _safe_export(
@@ -306,7 +364,8 @@ def render_evaluate_command(
         f"--job-name={job_name}",
         f"--comment={comment}",
         f"--export={','.join(exports)}",
-        EVALUATE_SCRIPT,
+        f"--chdir={release_root}",
+        str(release_root / EVALUATE_SCRIPT),
     ]
 
 

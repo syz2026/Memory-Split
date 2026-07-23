@@ -117,6 +117,7 @@ def build_parser() -> JsonArgumentParser:
     render_dataset = render.add_mutually_exclusive_group(required=True)
     render_dataset.add_argument("--dataset-root")
     render_dataset.add_argument("--dataset-verification")
+    render.add_argument("--environment-receipt")
 
     for name in ("submit", "resume", "cancel", "evaluate"):
         leaf = _leaf(commands, name, help_text=f"plan or {name} runs")
@@ -127,6 +128,7 @@ def build_parser() -> JsonArgumentParser:
             dataset_binding = leaf.add_mutually_exclusive_group(required=True)
             dataset_binding.add_argument("--dataset-root")
             dataset_binding.add_argument("--dataset-verification")
+            leaf.add_argument("--environment-receipt")
         leaf.add_argument("--approval")
         if name == "resume":
             leaf.add_argument("--checkpoint-receipt", required=True)
@@ -210,6 +212,7 @@ def dispatch(args: argparse.Namespace) -> tuple[bool, dict[str, object]]:
             dataset_pointer=args.dataset_pointer,
             dataset_root=args.dataset_root,
             dataset_verification=args.dataset_verification,
+            environment_receipt=args.environment_receipt,
             repo_root=args.repo_root,
         )
     if command == "submit":
@@ -220,6 +223,7 @@ def dispatch(args: argparse.Namespace) -> tuple[bool, dict[str, object]]:
             dataset_pointer=args.dataset_pointer,
             dataset_root=args.dataset_root,
             dataset_verification=args.dataset_verification,
+            environment_receipt=args.environment_receipt,
             repo_root=args.repo_root,
             state_root=args.state_root,
             approval_path=args.approval,
@@ -242,7 +246,7 @@ def dispatch(args: argparse.Namespace) -> tuple[bool, dict[str, object]]:
             environ=dict(os.environ),
         )
     if command == "dataset verify":
-        release, manifest = load_bound_inputs(
+        release, manifest, _ = load_bound_inputs(
             profile=profile,
             release_path=args.release,
             manifest_path=args.manifest,
@@ -278,6 +282,7 @@ def dispatch(args: argparse.Namespace) -> tuple[bool, dict[str, object]]:
             dataset_pointer=args.dataset_pointer,
             dataset_root=args.dataset_root,
             dataset_verification=args.dataset_verification,
+            environment_receipt=args.environment_receipt,
             repo_root=args.repo_root,
             state_root=args.state_root,
             approval_path=args.approval,
@@ -303,6 +308,7 @@ def dispatch(args: argparse.Namespace) -> tuple[bool, dict[str, object]]:
             dataset_pointer=args.dataset_pointer,
             dataset_root=args.dataset_root,
             dataset_verification=args.dataset_verification,
+            environment_receipt=args.environment_receipt,
             repo_root=args.repo_root,
             state_root=args.state_root,
             approval_path=args.approval,

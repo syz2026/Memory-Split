@@ -16,6 +16,7 @@ umask 077
 
 : "${MS_PROVIDER:?}"
 : "${MS_PROFILE_SHA256:?}"
+: "${MS_RELEASE_ROOT:?}"
 : "${MS_RELEASE_SHA256:?}"
 : "${MS_RUN_MANIFEST_SHA256:?}"
 : "${MS_DATASET_SHA256:?}"
@@ -29,6 +30,11 @@ umask 077
 : "${MS_EVAL_GPU:?}"
 : "${MS_RESUME:?}"
 : "${MS_SHARED_ROOT:?}"
+: "${MS_ENV_ROOT:?}"
+: "${MS_DATA_ROOT:?}"
+: "${MS_OUT_ROOT:?}"
+: "${MS_TRAIN_ENTRYPOINT:?}"
+: "${MS_TRAIN_ENTRYPOINT_SHA256:?}"
 
 [[ "$MS_PROVIDER" == "illumina-usfc-prd" ]]
 [[ "$MS_WORLD_SIZE" == "3" ]]
@@ -42,13 +48,11 @@ if [[ "$MS_RESUME" == "1" ]]; then
   : "${MS_SPLIT_RESUME_SHA256:?}"
 fi
 
-MS_ENV_ROOT="${MS_ENV_ROOT:-$MS_SHARED_ROOT/memorysplit/env}"
-MS_DATA_ROOT="${MS_DATA_ROOT:-$MS_SHARED_ROOT/memorysplit/data}"
-MS_OUT_ROOT="${MS_OUT_ROOT:-$MS_SHARED_ROOT/memorysplit/runs}"
 MS_JOB_HOME="$MS_SHARED_ROOT/memorysplit/job-home"
 PYTHON="$MS_ENV_ROOT/bin/python"
 [[ -x "$PYTHON" ]]
-cd "${SLURM_SUBMIT_DIR:?}"
+[[ "$MS_RELEASE_ROOT" == /* && -d "$MS_RELEASE_ROOT" && ! -L "$MS_RELEASE_ROOT" ]]
+cd "$MS_RELEASE_ROOT"
 [[ -f "$MS_DENSE_CONFIG" && ! -L "$MS_DENSE_CONFIG" ]]
 [[ -f "$MS_SPLIT_CONFIG" && ! -L "$MS_SPLIT_CONFIG" ]]
 mkdir -p "$MS_OUT_ROOT" "$MS_JOB_HOME"
@@ -73,8 +77,10 @@ PY
 verify_config "$MS_DENSE_CONFIG" "$MS_DENSE_CONFIG_SHA256"
 verify_config "$MS_SPLIT_CONFIG" "$MS_SPLIT_CONFIG_SHA256"
 
-TRAIN_ENTRYPOINT="scripts/run_train.py"
+TRAIN_ENTRYPOINT="$MS_TRAIN_ENTRYPOINT"
+[[ "$TRAIN_ENTRYPOINT" == "$MS_RELEASE_ROOT/scripts/run_train.py" ]]
 [[ -f "$TRAIN_ENTRYPOINT" && ! -L "$TRAIN_ENTRYPOINT" ]]
+verify_config "$TRAIN_ENTRYPOINT" "$MS_TRAIN_ENTRYPOINT_SHA256"
 env -i "PATH=/usr/bin:/bin" "$PYTHON" - "$TRAIN_ENTRYPOINT" <<'PY'
 import ast
 import pathlib
@@ -100,7 +106,7 @@ train_help="$(
   env -i \
     "HOME=$MS_JOB_HOME" \
     "PATH=/usr/bin:/bin" \
-    "PYTHONPATH=$SLURM_SUBMIT_DIR" \
+    "PYTHONPATH=$MS_RELEASE_ROOT" \
     "$PYTHON" "$TRAIN_ENTRYPOINT" --help
 )"
 grep -q -- "--resume-path" <<< "$train_help" || {
@@ -122,7 +128,7 @@ fi
 common_env=(
   "HOME=$MS_JOB_HOME"
   "PATH=/usr/bin:/bin"
-  "PYTHONPATH=$SLURM_SUBMIT_DIR"
+  "PYTHONPATH=$MS_RELEASE_ROOT"
   "MS_PROVIDER=$MS_PROVIDER"
   "MS_PROFILE_SHA256=$MS_PROFILE_SHA256"
   "MS_RELEASE_SHA256=$MS_RELEASE_SHA256"

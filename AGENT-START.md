@@ -28,6 +28,8 @@ training, and evaluation through Slurm.
    command. `msctl` searches `squeue` and then `sacct` by its exact deterministic
    comment. Zero or multiple matches remain failed and recoverable; never invoke
    `sbatch` manually to work around that state.
+10. Paired submit/resume operations persist one strict pair journal before
+    either per-run record and repair an interrupted first record from it.
 
 ## Ordered bring-up
 
@@ -38,10 +40,13 @@ msctl env ensure
 msctl dataset ensure
 msctl dataset verify --verification-out DATASET-VERIFICATION.json
 msctl dataset verify --verification-out DATASET-VERIFICATION.json --apply
-msctl runs render --dataset-verification DATASET-VERIFICATION.json
-msctl submit --dataset-verification DATASET-VERIFICATION.json
+msctl runs render --dataset-verification DATASET-VERIFICATION.json \
+  --environment-receipt /illumina/.../env/msctl-env-receipt.json
+msctl submit --dataset-verification DATASET-VERIFICATION.json \
+  --environment-receipt /illumina/.../env/msctl-env-receipt.json
 msctl status --release RELEASE.json
-msctl evaluate --dataset-verification DATASET-VERIFICATION.json
+msctl evaluate --dataset-verification DATASET-VERIFICATION.json \
+  --environment-receipt /illumina/.../env/msctl-env-receipt.json
 msctl collect
 msctl cleanup plan
 ```
@@ -55,6 +60,15 @@ identities. Login-side run commands can use that receipt and recheck only the
 small native receipt and filesystem metadata. Alternatively, `--dataset-root`
 requests a direct full verification. Exactly one of `--dataset-root` and
 `--dataset-verification` is required.
+
+For runtime commands, `--repo-root` is the absolute extraction root of the
+authenticated release ZIP, not an arbitrary checkout or the caller's current
+directory. `msctl` rehashes every packaged member there, binds `--chdir` plus
+the absolute sbatch/config/entrypoint paths to that root, and exports the exact
+dataset publication recorded by the verification receipt. Ambient
+`MS_DATA_ROOT`, `MS_SHARED_ROOT`, and `MS_ENV_ROOT` values are not forwarded.
+Paid operations perform the DDP/evaluator checks before creating state or
+invoking `sbatch`.
 
 Mutation is always a separate invocation with `--apply`. Paid GPU submission,
 resume, cancellation, sealed scoring, and cleanup additionally require an

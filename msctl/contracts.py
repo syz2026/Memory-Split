@@ -41,6 +41,7 @@ class Release:
     source_commit: str
     members_sha256: str
     members: dict[str, dict[str, object]]
+    archive_files: dict[str, str]
     metadata: dict[str, object]
     value: dict[str, object]
 
@@ -236,7 +237,11 @@ def _verify_release_internals(
     archive_data: bytes,
     *,
     release_value: dict[str, object],
-) -> tuple[dict[str, dict[str, object]], dict[str, object]]:
+) -> tuple[
+    dict[str, dict[str, object]],
+    dict[str, object],
+    dict[str, str],
+]:
     try:
         archive = zipfile.ZipFile(io.BytesIO(archive_data))
     except (OSError, zipfile.BadZipFile) as error:
@@ -431,7 +436,9 @@ def _verify_release_internals(
                 "RELEASE_INTERNAL_INVALID",
                 "environment hash does not bind a release member",
             )
-    return members, metadata
+    archive_files = dict(checksum_rows)
+    archive_files["SHA256SUMS"] = hashlib.sha256(sums_bytes).hexdigest()
+    return members, metadata, archive_files
 
 
 def load_release(path: Path | str) -> Release:
@@ -540,7 +547,7 @@ def load_release(path: Path | str) -> Release:
             "external archive checksum does not match RELEASE.json",
             path=release_path.parent / f"{archive_relative}.sha256",
         )
-    members, metadata = _verify_release_internals(
+    members, metadata, archive_files = _verify_release_internals(
         archive_data,
         release_value=value,
     )
@@ -552,6 +559,7 @@ def load_release(path: Path | str) -> Release:
         source_commit=source["commit"],
         members_sha256=members_hash,
         members=members,
+        archive_files=archive_files,
         metadata=metadata,
         value=value,
     )
@@ -748,6 +756,102 @@ def verify_release_member(
             details={"path": member_path},
         )
     return digest
+
+
+def read_release_member(
+    release: Release,
+    *,
+    member_path: str,
+    release_root: Path,
+    label: str,
+) -> bytes:
+    """Read the same descriptor whose bytes are authenticated as a member."""
+
+    member = release.members.get(member_path)
+    if member is None:
+        raise MsctlError(
+            "RELEASE_MEMBER_MISMATCH",
+            f"{label} is absent from the verified release",
+            details={"path": member_path},
+        )
+    root_fd = open_directory(release_root, label="release extraction root")
+    try:
+        descriptor, parent_fd, _ = open_regular_at(
+            root_fd,
+            member_path,
+            label=label,
+        )
+        try:
+            before = os.fstat(descriptor)
+            data = read_fd(descriptor)
+            after = os.fstat(descriptor)
+        finally:
+            os.close(descriptor)
+            os.close(parent_fd)
+    except MsctlError as error:
+        raise MsctlError(
+            "RELEASE_MEMBER_MISMATCH",
+            f"{label} is not a safe release member",
+            details={"path": member_path},
+        ) from error
+    finally:
+        os.close(root_fd)
+    before_identity = (
+        before.st_dev,
+        before.st_ino,
+        before.st_size,
+        before.st_mtime_ns,
+        before.st_ctime_ns,
+    )
+    after_identity = (
+        after.st_dev,
+        after.st_ino,
+        after.st_size,
+        after.st_mtime_ns,
+        after.st_ctime_ns,
+    )
+    if (
+        before_identity != after_identity
+        or len(data) != member["bytes"]
+        or hashlib.sha256(data).hexdigest() != member["sha256"]
+    ):
+        raise MsctlError(
+            "RELEASE_MEMBER_MISMATCH",
+            f"{label} bytes differ from the verified release",
+            details={"path": member_path},
+        )
+    return data
+
+
+def verify_release_extraction(
+    release: Release,
+    release_root: Path | str,
+) -> Path:
+    """Authenticate every packaged source byte under one absolute runtime root."""
+
+    root = Path(os.path.abspath(os.fspath(release_root)))
+    root_fd = open_directory(root, label="release extraction root")
+    os.close(root_fd)
+    for relative, expected in sorted(release.archive_files.items()):
+        try:
+            data = _read_regular_relative(
+                root,
+                relative,
+                label="release extraction member",
+            )
+        except MsctlError as error:
+            raise MsctlError(
+                "RELEASE_MEMBER_MISMATCH",
+                "release extraction is incomplete or unsafe",
+                details={"path": relative},
+            ) from error
+        if hashlib.sha256(data).hexdigest() != expected:
+            raise MsctlError(
+                "RELEASE_MEMBER_MISMATCH",
+                "release extraction bytes differ from the archive",
+                details={"path": relative},
+            )
+    return root
 
 
 def verify_checkpoint_receipt(

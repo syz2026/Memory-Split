@@ -16,6 +16,14 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parents[1]
 PROFILE = REPO_ROOT / "cluster" / "profiles" / "illumina-usfc-prd.json"
 HEX64 = "a" * 64
+TRAIN_ENTRYPOINT = b"""\
+MSCTL_DDP_CONTRACT = "memorysplit-ddp-v1"
+FLAGS = ("--config", "--resume-path")
+"""
+EVALUATOR_ENTRYPOINT = b"""\
+MSCTL_EVALUATOR_CONTRACT = "memorysplit-confirmatory-evaluator-v1"
+FLAGS = ("evaluate", "--run", "--sealed-release", "--device")
+"""
 
 
 def _canonical(value: object) -> bytes:
@@ -37,7 +45,37 @@ def _write_json(path: Path, value: object) -> Path:
     return path
 
 
-def _release(tmp_path: Path) -> Path:
+def _test_profile(tmp_path: Path) -> Path:
+    path = tmp_path / "cluster" / "profiles" / PROFILE.name
+    if path.is_file():
+        return path
+    value = json.loads(PROFILE.read_text())
+    value["environment"] = {
+        "status": "pinned",
+        "lock_path": "requirements-illumina.lock",
+        "contract": {
+            "python_implementation": "CPython",
+            "python_version": "3.12.0",
+            "platform": "linux_x86_64",
+            "cuda_version": "12.4",
+        },
+    }
+    for name in (
+        "MS_RELEASE_ROOT",
+        "MS_TRAIN_ENTRYPOINT",
+        "MS_EVALUATOR_ENTRYPOINT",
+    ):
+        if name not in value["job_env_allowlist"]:
+            value["job_env_allowlist"].append(name)
+    return _write_json(path, value)
+
+
+def _release(
+    tmp_path: Path,
+    *,
+    train_entrypoint_bytes: bytes = TRAIN_ENTRYPOINT,
+    evaluator_entrypoint_bytes: bytes = EVALUATOR_ENTRYPOINT,
+) -> Path:
     release_path = tmp_path / "RELEASE.json"
     if release_path.is_file():
         return release_path
@@ -45,9 +83,7 @@ def _release(tmp_path: Path) -> Path:
     source_lock = tmp_path / "configs" / "reasoning-dataset-v2.json"
     source_lock.parent.mkdir(parents=True, exist_ok=True)
     source_lock.write_text('{"schema_version":2,"fixture":true}\n')
-    profile_copy = tmp_path / "cluster" / "profiles" / PROFILE.name
-    profile_copy.parent.mkdir(parents=True, exist_ok=True)
-    profile_copy.write_bytes(PROFILE.read_bytes())
+    profile_copy = _test_profile(tmp_path)
     dense = _write_json(
         tmp_path / "configs" / "v2" / "dense-s0.json",
         {"arm": "dense", "seed": 0},
@@ -65,6 +101,21 @@ def _release(tmp_path: Path) -> Path:
     evaluate_script.write_bytes(
         (REPO_ROOT / "cluster" / "slurm" / evaluate_script.name).read_bytes()
     )
+    train_entrypoint = tmp_path / "scripts" / "run_train.py"
+    train_entrypoint.parent.mkdir(parents=True, exist_ok=True)
+    train_entrypoint.write_bytes(train_entrypoint_bytes)
+    evaluator_entrypoint = tmp_path / "evals" / "confirmatory" / "runner.py"
+    evaluator_entrypoint.parent.mkdir(parents=True, exist_ok=True)
+    evaluator_entrypoint.write_bytes(evaluator_entrypoint_bytes)
+    environment_lock = tmp_path / "requirements-illumina.lock"
+    environment_lock.write_text(
+        "# memorysplit-illumina-lock-v1\n"
+        "# platform: linux_x86_64\n"
+        "# python-implementation: CPython\n"
+        "# python-version: 3.12.0\n"
+        "# cuda-version: 12.4\n"
+        "fixture==1 --hash=sha256:" + "1" * 64 + "\n"
+    )
     source_members = {
         "DATASET-POINTER.json": pointer.read_bytes(),
         "cluster/profiles/illumina-usfc-prd.json": profile_copy.read_bytes(),
@@ -73,6 +124,9 @@ def _release(tmp_path: Path) -> Path:
         "configs/reasoning-dataset-v2.json": source_lock.read_bytes(),
         "configs/v2/dense-s0.json": dense.read_bytes(),
         "configs/v2/split90-s0.json": split.read_bytes(),
+        "evals/confirmatory/runner.py": evaluator_entrypoint.read_bytes(),
+        "requirements-illumina.lock": environment_lock.read_bytes(),
+        "scripts/run_train.py": train_entrypoint.read_bytes(),
     }
     member_rows = [
         {
@@ -94,7 +148,11 @@ def _release(tmp_path: Path) -> Path:
                         "cluster/profiles/illumina-usfc-prd.json"
                     ]
                 ).hexdigest(),
-                "environment_hashes": {},
+                "environment_hashes": {
+                    "requirements-illumina.lock": hashlib.sha256(
+                        environment_lock.read_bytes()
+                    ).hexdigest()
+                },
                 "members": member_rows,
             },
             indent=2,
@@ -108,6 +166,8 @@ def _release(tmp_path: Path) -> Path:
         for name in sorted(payload)
     ).encode("ascii")
     payload["SHA256SUMS"] = sums
+    (tmp_path / "RELEASE-METADATA.json").write_bytes(metadata)
+    (tmp_path / "SHA256SUMS").write_bytes(sums)
     archive = tmp_path / "ms-illumina-r1-test.zip"
     with zipfile.ZipFile(
         archive,
@@ -202,7 +262,7 @@ def _approval(
     from msctl.profile import load_profile
     from msctl.slurm import resource_request
 
-    resources = resource_request(load_profile(PROFILE), operation)
+    resources = resource_request(load_profile(_test_profile(tmp_path)), operation)
     if release_sha256 is None:
         release_sha256 = str(runs["release_sha256"])
     if gpu_hours is None:
@@ -225,38 +285,77 @@ def _approval(
     return _write_json(tmp_path / f"{operation}-approval.json", unsigned)
 
 
+def _environment_receipt(tmp_path: Path) -> Path:
+    from msctl.profile import load_profile
+
+    _release(tmp_path)
+    profile = load_profile(_test_profile(tmp_path))
+    root = tmp_path / "environment"
+    python = root / "bin" / "python"
+    python.parent.mkdir(parents=True, exist_ok=True)
+    python.write_text("#!/bin/sh\nexit 0\n")
+    python.chmod(0o755)
+    return _write_json(
+        root / "msctl-env-receipt.json",
+        {
+            "schema_version": 1,
+            "provider": profile.provider,
+            "profile_sha256": profile.sha256,
+            "lock_sha256": _sha256(tmp_path / "requirements-illumina.lock"),
+            "environment_root": str(root.resolve()),
+            "python": profile.python_version,
+            "platform": profile.platform,
+            "cuda_version": profile.cuda_version,
+            "created_at": "2026-07-23T00:00:00Z",
+        },
+    )
+
+
 def _run_msctl(
     *arguments: str,
     cwd: Path = REPO_ROOT,
     env: dict[str, str] | None = None,
     bind_dataset: bool = True,
+    bind_environment: bool = True,
 ) -> subprocess.CompletedProcess[str]:
     rendered = list(arguments)
-    if bind_dataset and "--repo-root" in rendered:
+    if "--repo-root" in rendered:
         root = Path(rendered[rendered.index("--repo-root") + 1])
-        if any(
-            command in rendered
-            for command in ("submit", "resume", "evaluate")
-        ) or ("runs" in rendered and "render" in rendered):
-            if "--dataset-pointer" not in rendered:
+        if bind_dataset:
+            if any(
+                command in rendered
+                for command in ("submit", "resume", "evaluate")
+            ) or ("runs" in rendered and "render" in rendered):
+                if "--dataset-pointer" not in rendered:
+                    rendered.extend(
+                        [
+                            "--dataset-pointer",
+                            str(root / "DATASET-POINTER.json"),
+                            "--dataset-root",
+                            str(_dataset_fixture(root)[1]),
+                        ]
+                    )
+            if "dataset" in rendered and "verify" in rendered:
+                release = _release(root)
+                manifest, _ = _runs(root)
+                if "--release" not in rendered:
+                    rendered.extend(
+                        [
+                            "--release",
+                            str(release),
+                            "--manifest",
+                            str(manifest),
+                        ]
+                    )
+        if bind_environment and (
+            any(command in rendered for command in ("submit", "resume", "evaluate"))
+            or ("runs" in rendered and "render" in rendered)
+        ):
+            if "--environment-receipt" not in rendered:
                 rendered.extend(
                     [
-                        "--dataset-pointer",
-                        str(root / "DATASET-POINTER.json"),
-                        "--dataset-root",
-                        str(root / "dataset"),
-                    ]
-                )
-        if "dataset" in rendered and "verify" in rendered:
-            release = _release(root)
-            manifest, _ = _runs(root)
-            if "--release" not in rendered:
-                rendered.extend(
-                    [
-                        "--release",
-                        str(release),
-                        "--manifest",
-                        str(manifest),
+                        "--environment-receipt",
+                        str(_environment_receipt(root)),
                     ]
                 )
     merged = dict(os.environ)
@@ -286,6 +385,17 @@ def _single_report(completed: subprocess.CompletedProcess[str]) -> dict:
 
 
 def _base_args(tmp_path: Path) -> list[str]:
+    return [
+        "--profile",
+        str(_test_profile(tmp_path)),
+        "--repo-root",
+        str(tmp_path),
+        "--state-root",
+        str(tmp_path / "state"),
+    ]
+
+
+def _production_base_args(tmp_path: Path) -> list[str]:
     return [
         "--profile",
         str(PROFILE),
@@ -356,7 +466,9 @@ def test_runs_render_is_deterministic_dry_run_with_explicit_environment(tmp_path
     assert "ALL" not in exports
     assert "NONE" not in exports
     assert "MSCTL_APPROVAL_KEY" not in exports
-    assert command[-1] == "cluster/slurm/v2_seed0.sbatch"
+    assert command[-1] == str(
+        (tmp_path / "cluster" / "slurm" / "v2_seed0.sbatch").resolve()
+    )
 
 
 @pytest.mark.parametrize(
@@ -578,15 +690,13 @@ def test_submit_recovery_repairs_a_partial_post_sbatch_state_update(tmp_path):
     release, manifest, _, key, bin_dir = _submitted_pair(tmp_path)
     dense_path = tmp_path / "state" / "runs" / "v2-dense-s0.json"
     split_path = tmp_path / "state" / "runs" / "v2-split90-s0.json"
-    dense = json.loads(dense_path.read_text())
     split = json.loads(split_path.read_text())
     split["job_id"] = None
     split["status"] = "SUBMITTING"
     _write_json(split_path, split)
-    submission_comment = f"msctl:{dense['submission_key']}"
     _write_executable(
         bin_dir / "squeue",
-        f"printf '777|{submission_comment}|RUNNING\\n'\n",
+        "printf '777|RUNNING\\n'\n",
     )
     _write_executable(bin_dir / "sacct", "exit 0\n")
     marker = tmp_path / "unexpected-resubmit"
@@ -807,7 +917,7 @@ def test_env_ensure_dry_run_reports_missing_site_contract(tmp_path):
     lock.write_text("# empty test lock; production lock contains hashes\n")
     environment = tmp_path / "environment"
     args = [
-        *_base_args(tmp_path),
+        *_production_base_args(tmp_path),
         "env",
         "ensure",
         "--root",
@@ -837,7 +947,13 @@ def _dataset_fixture(tmp_path: Path) -> tuple[Path, Path]:
         fixture_catalog,
     )
 
-    root = tmp_path / "dataset"
+    root = (
+        tmp_path
+        / "publication"
+        / "memorysplit"
+        / "datasets"
+        / "v2-20x-seed0"
+    )
     if not root.exists():
         build_parallel_corpus(
             fixture_catalog(record_count=6),
@@ -1683,7 +1799,7 @@ def test_run_operations_execute_only_local_bytes_bound_to_release(
         "--dataset-pointer",
         str(tmp_path / "DATASET-POINTER.json"),
         "--dataset-root",
-        str(tmp_path / "dataset"),
+        str(_dataset_fixture(tmp_path)[1]),
         bind_dataset=False,
     )
 
@@ -1715,7 +1831,7 @@ def test_submit_accepts_exact_prior_dataset_verification_and_rejects_staleness(
     release = _release(tmp_path)
     manifest, _ = _runs(tmp_path)
     pointer = tmp_path / "DATASET-POINTER.json"
-    root = tmp_path / "dataset"
+    root = _dataset_fixture(tmp_path)[1]
     verified = _run_msctl(
         *_base_args(tmp_path),
         "dataset",
@@ -1772,6 +1888,7 @@ def test_dataset_verification_receipt_write_is_dry_run_first_and_strict(
 ):
     release = _release(tmp_path)
     manifest, _ = _runs(tmp_path)
+    dataset_root = _dataset_fixture(tmp_path)[1]
     verification = tmp_path / "dataset-verification.json"
     args = [
         *_base_args(tmp_path),
@@ -1780,7 +1897,7 @@ def test_dataset_verification_receipt_write_is_dry_run_first_and_strict(
         "--pointer",
         str(tmp_path / "DATASET-POINTER.json"),
         "--dataset-root",
-        str(tmp_path / "dataset"),
+        str(dataset_root),
         "--release",
         str(release),
         "--manifest",
@@ -1863,6 +1980,7 @@ def test_dataset_verification_binds_release_pointer_and_source_lock(
     release = _release(tmp_path)
     manifest, _ = _runs(tmp_path)
     pointer = tmp_path / "DATASET-POINTER.json"
+    dataset_root = _dataset_fixture(tmp_path)[1]
     if binding == "pointer":
         value = json.loads(pointer.read_text())
         value["relative_path"] = value["relative_path"] + "-different"
@@ -1879,7 +1997,7 @@ def test_dataset_verification_binds_release_pointer_and_source_lock(
         "--pointer",
         str(pointer),
         "--dataset-root",
-        str(tmp_path / "dataset"),
+        str(dataset_root),
         "--release",
         str(release),
         "--manifest",
@@ -1891,6 +2009,7 @@ def test_dataset_verification_binds_release_pointer_and_source_lock(
     assert _single_report(completed)["error"]["code"] in {
         "DATASET_RELEASE_MISMATCH",
         "DATASET_SOURCE_LOCK_MISMATCH",
+        "RELEASE_MEMBER_MISMATCH",
     }
 
 
@@ -2205,7 +2324,7 @@ def test_production_environment_apply_fails_closed_until_site_contract_is_pinned
     lock.write_text("# deliberately empty test lock\n")
 
     completed = _run_msctl(
-        *_base_args(tmp_path),
+        *_production_base_args(tmp_path),
         "env",
         "ensure",
         "--root",
@@ -2313,3 +2432,431 @@ def test_rendered_submission_has_manifest_bound_job_name_and_comment(tmp_path):
     assert job_name != "--job-name=ms-v2-seed0"
     assert comment.startswith("--comment=msctl:")
     assert len(comment.removeprefix("--comment=msctl:")) == 64
+
+
+def test_render_binds_verified_runtime_roots_independent_of_cwd_and_ambient_data(
+    tmp_path,
+):
+    release = _release(tmp_path)
+    manifest, _ = _runs(tmp_path)
+    alternate_cwd = tmp_path / "untrusted-cwd"
+    alternate_cwd.mkdir()
+
+    completed = _run_msctl(
+        *_base_args(tmp_path),
+        "runs",
+        "render",
+        "--release",
+        str(release),
+        "--manifest",
+        str(manifest),
+        cwd=alternate_cwd,
+        env={
+            "MS_SHARED_ROOT": "/attacker/shared",
+            "MS_DATA_ROOT": "/attacker/data",
+            "MS_ENV_ROOT": "/attacker/environment",
+        },
+    )
+
+    assert completed.returncode == 0
+    command = _single_report(completed)["result"]["commands"][0]
+    export = next(item for item in command if item.startswith("--export="))
+    assert f"MS_DATA_ROOT={_dataset_fixture(tmp_path)[1].resolve()}" in export
+    assert f"MS_RELEASE_ROOT={tmp_path.resolve()}" in export
+    assert f"MS_ENV_ROOT={(tmp_path / 'environment').resolve()}" in export
+    assert "/attacker" not in export
+    assert f"--chdir={tmp_path.resolve()}" in command
+    assert command[-1] == str(
+        (tmp_path / "cluster" / "slurm" / "v2_seed0.sbatch").resolve()
+    )
+
+
+def test_submit_requires_environment_receipt_before_any_sbatch(tmp_path):
+    release = _release(tmp_path)
+    manifest, runs = _runs(tmp_path)
+    key = "e" * 32
+    approval = _approval(
+        tmp_path,
+        operation="submit",
+        runs=runs,
+        key=key,
+    )
+    marker = tmp_path / "sbatch-called"
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    _write_executable(
+        bin_dir / "sbatch",
+        f"touch '{marker}'\nprintf '777;usfc-prd\\n'\n",
+    )
+
+    completed = _run_msctl(
+        *_base_args(tmp_path),
+        "submit",
+        "--release",
+        str(release),
+        "--manifest",
+        str(manifest),
+        "--approval",
+        str(approval),
+        "--apply",
+        env={"PATH": str(bin_dir), "MSCTL_APPROVAL_KEY": key},
+        bind_environment=False,
+    )
+
+    assert completed.returncode != 0
+    assert _single_report(completed)["error"]["code"] == "ENV_RECEIPT_REQUIRED"
+    assert not marker.exists()
+
+
+@pytest.mark.parametrize(
+    ("operation", "member"),
+    [
+        ("submit", "scripts/run_train.py"),
+        ("evaluate", "evals/confirmatory/runner.py"),
+    ],
+)
+def test_paid_submission_rejects_replaced_entrypoint_before_sbatch(
+    tmp_path,
+    operation,
+    member,
+):
+    release = _release(tmp_path)
+    manifest, runs = _runs(tmp_path)
+    key = "x" * 32
+    approval = _approval(
+        tmp_path,
+        operation=operation,
+        runs=runs,
+        key=key,
+    )
+    (tmp_path / member).write_text(
+        'MSCTL_DDP_CONTRACT = "memorysplit-ddp-v1"\n'
+        'MSCTL_EVALUATOR_CONTRACT = "memorysplit-confirmatory-evaluator-v1"\n'
+    )
+    marker = tmp_path / "sbatch-called"
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    _write_executable(
+        bin_dir / "sbatch",
+        f"touch '{marker}'\nprintf '777;usfc-prd\\n'\n",
+    )
+
+    completed = _run_msctl(
+        *_base_args(tmp_path),
+        operation,
+        "--release",
+        str(release),
+        "--manifest",
+        str(manifest),
+        "--approval",
+        str(approval),
+        "--apply",
+        env={"PATH": str(bin_dir), "MSCTL_APPROVAL_KEY": key},
+    )
+
+    assert completed.returncode != 0
+    assert _single_report(completed)["error"]["code"] == (
+        "RELEASE_MEMBER_MISMATCH"
+    )
+    assert not marker.exists()
+
+
+@pytest.mark.parametrize("operation", ["submit", "evaluate"])
+def test_authenticated_but_incomplete_runtime_contract_fails_before_sbatch(
+    tmp_path,
+    operation,
+):
+    incomplete = b'FLAGS = ("--config", "--run")\n'
+    release = _release(
+        tmp_path,
+        train_entrypoint_bytes=(
+            incomplete if operation == "submit" else TRAIN_ENTRYPOINT
+        ),
+        evaluator_entrypoint_bytes=(
+            incomplete if operation == "evaluate" else EVALUATOR_ENTRYPOINT
+        ),
+    )
+    manifest, runs = _runs(tmp_path)
+    key = "p" * 32
+    approval = _approval(
+        tmp_path,
+        operation=operation,
+        runs=runs,
+        key=key,
+    )
+    marker = tmp_path / "sbatch-called"
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    _write_executable(
+        bin_dir / "sbatch",
+        f"touch '{marker}'\nprintf '777;usfc-prd\\n'\n",
+    )
+
+    completed = _run_msctl(
+        *_base_args(tmp_path),
+        operation,
+        "--release",
+        str(release),
+        "--manifest",
+        str(manifest),
+        "--approval",
+        str(approval),
+        "--apply",
+        env={"PATH": str(bin_dir), "MSCTL_APPROVAL_KEY": key},
+    )
+
+    assert completed.returncode != 0
+    assert _single_report(completed)["error"]["code"] == (
+        "RUNTIME_PREFLIGHT_FAILED"
+    )
+    assert not marker.exists()
+
+
+def test_partial_prepared_pair_intent_repairs_first_state_and_submits_once(
+    tmp_path,
+):
+    release = _release(tmp_path)
+    manifest, runs = _runs(tmp_path)
+    key = "j" * 32
+    approval = _approval(
+        tmp_path,
+        operation="submit",
+        runs=runs,
+        key=key,
+    )
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    _write_executable(bin_dir / "sbatch", "printf 'invalid\\n'\n")
+    args = [
+        *_base_args(tmp_path),
+        "submit",
+        "--release",
+        str(release),
+        "--manifest",
+        str(manifest),
+        "--approval",
+        str(approval),
+        "--apply",
+    ]
+    env = {"PATH": str(bin_dir), "MSCTL_APPROVAL_KEY": key}
+
+    interrupted = _run_msctl(*args, env=env)
+    assert interrupted.returncode != 0
+    intents = list((tmp_path / "state" / "intents").glob("*.json"))
+    assert len(intents) == 1
+    intent = json.loads(intents[0].read_text())
+    intent["phase"] = "PREPARED"
+    intent["job_id"] = None
+    _write_json(intents[0], intent)
+    (tmp_path / "state" / "runs" / "v2-split90-s0.json").unlink()
+    count = tmp_path / "submit-count"
+    _write_executable(
+        bin_dir / "sbatch",
+        f"printf '1' > '{count}'\nprintf '777;usfc-prd\\n'\n",
+    )
+
+    recovered = _run_msctl(*args, env=env)
+
+    assert recovered.returncode == 0
+    assert count.read_text() == "1"
+    assert _single_report(recovered)["result"]["job_id"] == "777"
+    for run_id in ("v2-dense-s0", "v2-split90-s0"):
+        state = json.loads(
+            (tmp_path / "state" / "runs" / f"{run_id}.json").read_text()
+        )
+        assert state["job_id"] == "777"
+
+
+@pytest.mark.parametrize("mutation", ["unknown", "missing", "wrong_type"])
+def test_run_state_reader_rejects_nonexact_or_wrongly_typed_schema(
+    tmp_path,
+    mutation,
+):
+    from msctl.errors import MsctlError
+    from msctl.state import StateStore
+
+    run_id = "v2-dense-s0"
+    value = {
+        "schema_version": 1,
+        "run_id": run_id,
+        "arm": "dense",
+        "seed": 0,
+        "provider": "illumina-usfc-prd",
+        "release_sha256": "1" * 64,
+        "run_manifest_sha256": "2" * 64,
+        "config_sha256": "3" * 64,
+        "dataset_sha256": "4" * 64,
+        "dataset_verification_sha256": "5" * 64,
+        "environment_receipt_sha256": "6" * 64,
+        "operation": "submit",
+        "submission_key": "7" * 64,
+        "resource_request": {
+            "schema_version": 1,
+            "operation": "submit",
+            "jobs": 1,
+            "allocated_gpus": 7,
+            "wall_minutes": 2160,
+            "gpu_hours": 252.0,
+            "gres": "gpu:a100:7",
+            "script": "cluster/slurm/v2_seed0.sbatch",
+        },
+        "job_id": None,
+        "status": "SUBMITTING",
+        "attempt": 1,
+        "created_at": "2026-07-23T00:00:00Z",
+        "updated_at": "2026-07-23T00:00:00Z",
+    }
+    if mutation == "unknown":
+        value["unexpected"] = True
+    elif mutation == "missing":
+        del value["arm"]
+    else:
+        value["attempt"] = True
+    store = StateStore(tmp_path / "state")
+    with store.locked():
+        pass
+    _write_json(tmp_path / "state" / "runs" / f"{run_id}.json", value)
+
+    with store.locked(), pytest.raises(MsctlError) as caught:
+        store.read_run(run_id)
+
+    assert caught.value.code == "STATE_CORRUPT"
+
+
+@pytest.mark.parametrize("reader", ["evaluation", "intent"])
+@pytest.mark.parametrize("mutation", ["unknown", "missing", "wrong_type"])
+def test_other_lifecycle_readers_are_exact_and_strict(
+    tmp_path,
+    reader,
+    mutation,
+):
+    from msctl.errors import MsctlError
+    from msctl.state import StateStore
+
+    resource = {
+        "schema_version": 1,
+        "operation": "evaluate" if reader == "evaluation" else "submit",
+        "jobs": 1,
+        "allocated_gpus": 1 if reader == "evaluation" else 7,
+        "wall_minutes": 360 if reader == "evaluation" else 2160,
+        "gpu_hours": 6.0 if reader == "evaluation" else 252.0,
+        "gres": "gpu:a100:1" if reader == "evaluation" else "gpu:a100:7",
+        "script": (
+            "cluster/slurm/v2_evaluate.sbatch"
+            if reader == "evaluation"
+            else "cluster/slurm/v2_seed0.sbatch"
+        ),
+    }
+    if reader == "evaluation":
+        key = "2" * 64
+        value = {
+            "schema_version": 1,
+            "provider": "illumina-usfc-prd",
+            "release_sha256": "1" * 64,
+            "run_manifest_sha256": key,
+            "dataset_sha256": "3" * 64,
+            "dataset_verification_sha256": "4" * 64,
+            "environment_receipt_sha256": "5" * 64,
+            "operation": "evaluate",
+            "submission_key": "6" * 64,
+            "resource_request": resource,
+            "job_id": None,
+            "status": "SUBMITTING",
+            "created_at": "2026-07-23T00:00:00Z",
+            "updated_at": "2026-07-23T00:00:00Z",
+        }
+        path = tmp_path / "state" / "evaluations" / f"{key}.json"
+    else:
+        key = "6" * 64
+        value = {
+            "schema_version": 1,
+            "submission_key": key,
+            "provider": "illumina-usfc-prd",
+            "release_sha256": "1" * 64,
+            "run_manifest_sha256": "2" * 64,
+            "dataset_sha256": "3" * 64,
+            "dataset_verification_sha256": "4" * 64,
+            "environment_receipt_sha256": "5" * 64,
+            "operation": "submit",
+            "resource_request": resource,
+            "run_ids": ["v2-dense-s0", "v2-split90-s0"],
+            "attempt": 1,
+            "checkpoint_receipt_sha256": None,
+            "phase": "PREPARED",
+            "job_id": None,
+            "created_at": "2026-07-23T00:00:00Z",
+            "updated_at": "2026-07-23T00:00:00Z",
+        }
+        path = tmp_path / "state" / "intents" / f"{key}.json"
+    if mutation == "unknown":
+        value["unexpected"] = True
+    elif mutation == "missing":
+        del value["provider"]
+    else:
+        value["schema_version"] = True
+    store = StateStore(tmp_path / "state")
+    with store.locked():
+        pass
+    _write_json(path, value)
+
+    with store.locked(), pytest.raises(MsctlError) as caught:
+        if reader == "evaluation":
+            store.read_evaluation(key)
+        else:
+            store.read_intent(key)
+
+    assert caught.value.code == "STATE_CORRUPT"
+
+
+def test_dataset_verification_caches_device_identity_and_rejects_device_drift(
+    tmp_path,
+):
+    release = _release(tmp_path)
+    manifest, _ = _runs(tmp_path)
+    verified = _run_msctl(
+        *_base_args(tmp_path),
+        "dataset",
+        "verify",
+        "--pointer",
+        str(tmp_path / "DATASET-POINTER.json"),
+        "--dataset-root",
+        str(_dataset_fixture(tmp_path)[1]),
+        "--release",
+        str(release),
+        "--manifest",
+        str(manifest),
+    )
+    verification = _single_report(verified)["result"]
+    assert all("device" in row for row in verification["file_identities"])
+    for row in verification["file_identities"]:
+        row["device"] += 1
+    unsigned = {
+        key: value
+        for key, value in verification.items()
+        if key != "verification_sha256"
+    }
+    verification["verification_sha256"] = hashlib.sha256(
+        _canonical(unsigned)
+    ).hexdigest()
+    verification_path = _write_json(
+        tmp_path / "dataset-verification-device-drift.json",
+        verification,
+    )
+
+    completed = _run_msctl(
+        *_base_args(tmp_path),
+        "submit",
+        "--release",
+        str(release),
+        "--manifest",
+        str(manifest),
+        "--dataset-pointer",
+        str(tmp_path / "DATASET-POINTER.json"),
+        "--dataset-verification",
+        str(verification_path),
+    )
+
+    assert completed.returncode != 0
+    assert _single_report(completed)["error"]["code"] == (
+        "DATASET_VERIFICATION_STALE"
+    )
