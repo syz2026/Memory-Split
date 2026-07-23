@@ -239,3 +239,193 @@ Broader lifecycle/state/evaluation/IaC/verifier/runbook field alignment was
 deliberately not changed. Those areas remain for the separately scoped Task
 2B2 or later tasks and must not be treated as v3-operational solely because
 this package-to-planner path is now green.
+
+## Review follow-up: canonical pointer and typed numeric equality
+
+Review found two fail-closed gaps in the Task 2B1 implementation:
+
+1. The generic loader, bootstrap verifier, and paired launcher authenticated
+   the dataset-pointer bytes but checked only provider, receipt path, and
+   `full_corpus_in_release`. Hash-consistent pointers with missing fields,
+   unknown fields, concrete dataset identity, or a float schema version could
+   pass runtime validation.
+2. Several nested comparisons used Python equality. Consequently `false` and
+   `0.0` could compare equal to integer seed `0`, and integer-valued floats
+   could compare equal to assignment/package integer fields.
+
+The follow-up implementation commit is:
+
+- `4e3c74eea7ef60a65f449ed7b00b74a9c0f76434`
+  (`fix: close Task 2B1 typed contracts`)
+- This report append is committed separately in the commit containing this
+  section.
+
+### Review RED
+
+The tests were added before the review-fix production changes. Package
+mutation helpers rebuilt hash-consistent archives, internal metadata,
+`SHA256SUMS`, external receipts, and launcher roots so each mutation reached
+the intended semantic consumer rather than failing at an earlier hash check.
+
+Command:
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 python -m pytest -q -p no:cacheprovider \
+  --basetemp=/tmp/memorysplit-v3-task2b1-review-red \
+  tests/test_aws_contract_roundtrip.py::\
+test_real_v3_loader_rejects_noncanonical_dataset_pointer \
+  tests/test_aws_contract_roundtrip.py::\
+test_real_v3_bootstrap_rejects_noncanonical_dataset_pointer \
+  tests/test_aws_contract_roundtrip.py::\
+test_real_v3_loader_rejects_outer_seed_numeric_alias \
+  tests/test_aws_contract_roundtrip.py::\
+test_real_v3_bootstrap_rejects_internal_seed_numeric_alias \
+  tests/test_aws_contract_roundtrip.py::\
+test_real_v3_loader_rejects_integer_valued_assignment_float \
+  tests/test_aws_p5_launcher.py::\
+test_launcher_rejects_noncanonical_dataset_pointer \
+  tests/test_aws_p5_launcher.py::\
+test_launcher_rejects_internal_seed_numeric_alias \
+  tests/test_aws_p5_launcher.py::\
+test_launcher_rejects_bootstrap_receipt_numeric_alias
+```
+
+Output:
+
+```text
+FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF                                       [100%]
+...
+34 failed in 10.21s
+```
+
+Every case failed with `DID NOT RAISE`, confirming that all mutations passed
+the pre-fix consumers:
+
+- pointer field deletion, unknown-field addition, and `schema_version: 1.0`;
+- injected `dataset_receipt_sha256`, `dataset_build_id`, `build_id`, and
+  `ordered_stream_sha256`;
+- package seed `0` replaced by `false` or `0.0` at loader, bootstrap, and
+  launcher boundaries;
+- integer-valued floats in all four cohort assignment geometry fields;
+- bootstrap receipt schema, durable-upload boolean, and instance-store device
+  count numeric aliases.
+
+### Review implementation
+
+`msctl/contracts.py` now provides one recursive type-aware comparison for
+JSON-like values. It requires identical concrete types before comparing
+dictionaries, lists, or scalar values, so Python's `False == 0` and
+`0.0 == 0` behavior cannot satisfy an exact contract.
+
+The same module defines the exact canonical Task 2A dataset pointer:
+
+- all and only the 11 canonical fields;
+- exact strings, boolean, integer schema version, ordered sidecar list, and
+  values;
+- no concrete dataset receipt hash, build ID, or ordered-stream identity.
+
+The generic loader invokes this validator on the authenticated pointer member.
+Bootstrap and launcher invoke the same validator through runtime-local imports,
+preserving their `python -S ... --help` behavior without duplicating the
+canonical object.
+
+Type-aware equality now covers:
+
+- v3 internal and external seed assignments;
+- loader and bootstrap external/internal release-receipt bindings;
+- launcher release metadata and bootstrap receipt bindings;
+- nested bootstrap instance-store evidence.
+
+The four integer cohort assignment fields handled by
+`msctl/contracts.py` now require exact `int` types, matching the already strict
+bootstrap and launcher checks. The historical package-format-1 branch remains
+available for valid read-only legacy receipts; only numerically aliased
+noncanonical values are newly rejected.
+
+### Review focused GREEN
+
+The unchanged RED command after the production fix produced:
+
+```text
+..................................                                       [100%]
+34 passed in 9.60s
+```
+
+Focused regression files:
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 python -m pytest -q -p no:cacheprovider \
+  --basetemp=/tmp/memorysplit-v3-task2b1-review-roundtrip \
+  tests/test_aws_contract_roundtrip.py
+```
+
+```text
+26 passed in 12.05s
+```
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 python -m pytest -q -p no:cacheprovider \
+  --basetemp=/tmp/memorysplit-v3-task2b1-review-launcher \
+  tests/test_aws_p5_launcher.py
+```
+
+```text
+135 passed in 5.34s
+```
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 python -m pytest -q -p no:cacheprovider \
+  --basetemp=/tmp/memorysplit-v3-task2b1-review-msctl \
+  tests/test_msctl.py
+```
+
+```text
+157 passed in 44.99s
+```
+
+### Review required seven-file GREEN
+
+Command:
+
+```bash
+git diff --check
+python -m py_compile \
+  msctl/contracts.py \
+  cluster/aws/p5/bootstrap.py \
+  cluster/aws/p5/launch_seed_pair.py \
+  tests/test_aws_contract_roundtrip.py \
+  tests/test_aws_p5_launcher.py
+PYTHONDONTWRITEBYTECODE=1 python -m pytest -q -p no:cacheprovider \
+  --basetemp=/tmp/memorysplit-v3-task2b1-review-final \
+  tests/test_aws_contract_roundtrip.py \
+  tests/test_aws_p5_launcher.py \
+  tests/test_package_aws_p5_handoff.py \
+  tests/test_aws_contracts.py \
+  tests/test_cohort_assignment_v3.py \
+  tests/test_aws_p5_profile.py \
+  tests/test_msctl.py
+```
+
+Output:
+
+```text
+........................................................................ [ 14%]
+........................................................................ [ 28%]
+........................................................................ [ 43%]
+........................................................................ [ 57%]
+........................................................................ [ 71%]
+........................................................................ [ 86%]
+......................................................................   [100%]
+502 passed in 97.07s (0:01:37)
+```
+
+`git diff --check` and `py_compile` produced no output and exited `0`.
+
+### Review scope and concerns
+
+Only the three reviewed consumers and their Task 2B1 tests changed in the
+implementation commit. No packager, lifecycle/state/operation, evaluation,
+IaC, verifier, runbook, Illumina, v2 artifact, or `corpusgen/` file changed.
+
+No known Task 2B1 review finding remains. Broader Task 2B2 work remains
+deliberately out of scope.
