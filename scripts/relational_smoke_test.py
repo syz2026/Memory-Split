@@ -17,6 +17,7 @@ import torch
 from corpusgen.current_dataset import verify_current_dataset
 from evals.relational_generate import decode_items
 from organizer.graph_store import AtomicGraphStore
+from train.safeio import read_regular_path
 from train.tokenizer import get_tok
 from train.trainer import Trainer
 
@@ -85,7 +86,11 @@ def _resume_is_exact(trainer: Trainer, root: Path) -> bool:
         out_dir=str(root / "runs" / "resume-check"),
     )
     resumed = Trainer(resumed_cfg)
-    resumed.load_ckpt(trainer.ckpt_path)
+    checkpoint = read_regular_path(
+        trainer.ckpt_path,
+        label="smoke resume checkpoint",
+    )
+    resumed.load_ckpt(trainer.ckpt_path, sha256=checkpoint.sha256)
     if (
         resumed.step != trainer.step
         or resumed.data.state_dict() != trainer.data.state_dict()
@@ -200,7 +205,11 @@ def _resume_one_step(trainer: Trainer, root: Path) -> int:
         out_dir=str(root / "runs" / "resume-one-step"),
     )
     resumed = Trainer(resumed_cfg)
-    resumed.load_ckpt(trainer.ckpt_path)
+    checkpoint = read_regular_path(
+        trainer.ckpt_path,
+        label="smoke resume checkpoint",
+    )
+    resumed.load_ckpt(trainer.ckpt_path, sha256=checkpoint.sha256)
     resumed.train_steps(1)
     return resumed.step
 
