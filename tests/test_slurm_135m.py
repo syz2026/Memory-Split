@@ -6,12 +6,15 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+import torch
+import yaml
 
 import msctl.operations as operations
 from msctl.adapters.slurm import plan_sbatch
 from msctl.cohort import COHORT_ID
 from msctl.operations import inspect_paired_resume, submit
 from msctl.profile import load_profile
+from scripts.run_135m_pair import _write_pair_checkpoint_receipt
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -305,4 +308,79 @@ def test_instantiate_writes_two_hash_bound_pairs_without_replacement(
             runtime_root=tmp_path / "runtime",
             out_root=tmp_path / "outputs",
             repository_root=ROOT,
+        )
+
+
+def test_terminal_pair_checkpoint_receipt_is_hash_bound_and_no_replace(tmp_path):
+    profile = load_profile(FARM_PROFILE)
+    pair_path = _pair_manifest(tmp_path, profile.sha256)
+    pair = json.loads(pair_path.read_text())
+    terminal_step = 13_582
+    terminal_cursor = 7_120_879_616
+    for record in pair["arms"]:
+        cfg = {
+            "arm": record["arm"],
+            "max_steps": terminal_step,
+            "run_id": record["run_id"],
+        }
+        runtime_path = Path(record["runtime_config"])
+        runtime_path.write_text(yaml.safe_dump(cfg, sort_keys=False))
+        record["runtime_config_sha256"] = _sha(runtime_path)
+        output = Path(record["out_dir"])
+        output.mkdir()
+        torch.save(
+            {
+                "cfg": cfg,
+                "data": {"cursor": terminal_cursor, "epoch": 0},
+                "step": terminal_step,
+            },
+            output / "ckpt.pt",
+        )
+
+    receipt_path = _write_pair_checkpoint_receipt(
+        pair,
+        evidence_root=tmp_path / "evidence",
+    )
+    receipt = json.loads(receipt_path.read_text())
+    assert receipt["pair_id"] == "d135m_full_s0"
+    assert receipt["terminal_step"] == terminal_step
+    assert receipt["terminal_cursor"] == terminal_cursor
+    assert set(receipt["checkpoints"]) == {"dense", "split90"}
+    for checkpoint in receipt["checkpoints"].values():
+        path = Path(checkpoint["checkpoint_path"])
+        assert checkpoint["checkpoint_sha256"] == _sha(path)
+        assert checkpoint["bytes"] == path.stat().st_size
+    with pytest.raises(FileExistsError):
+        _write_pair_checkpoint_receipt(
+            pair,
+            evidence_root=tmp_path / "evidence",
+        )
+
+
+def test_terminal_pair_checkpoint_receipt_rejects_cursor_drift(tmp_path):
+    profile = load_profile(FARM_PROFILE)
+    pair = json.loads(_pair_manifest(tmp_path, profile.sha256).read_text())
+    for index, record in enumerate(pair["arms"]):
+        cfg = {
+            "arm": record["arm"],
+            "max_steps": 13_582,
+            "run_id": record["run_id"],
+        }
+        runtime_path = Path(record["runtime_config"])
+        runtime_path.write_text(yaml.safe_dump(cfg, sort_keys=False))
+        record["runtime_config_sha256"] = _sha(runtime_path)
+        output = Path(record["out_dir"])
+        output.mkdir()
+        torch.save(
+            {
+                "cfg": cfg,
+                "data": {"cursor": 7_120_879_616 + index, "epoch": 0},
+                "step": 13_582,
+            },
+            output / "ckpt.pt",
+        )
+    with pytest.raises(ValueError, match="cursor"):
+        _write_pair_checkpoint_receipt(
+            pair,
+            evidence_root=tmp_path / "evidence",
         )

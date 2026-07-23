@@ -20,6 +20,7 @@ if str(ROOT) not in sys.path:
 
 from cluster.corpus_contract import sha256_file  # noqa: E402
 from msctl.adapters.slurm import load_pair_manifest  # noqa: E402
+from msctl.manifest import write_json_no_replace  # noqa: E402
 from msctl.profile import load_profile  # noqa: E402
 
 
@@ -117,6 +118,108 @@ def _throughput(path: Path) -> float | None:
     except (UnicodeDecodeError, json.JSONDecodeError):
         return None
     return sum(values) / len(values) if values else None
+
+
+def _checkpoint_record(record: dict) -> dict:
+    runtime_path = Path(record["runtime_config"])
+    if (
+        not runtime_path.is_file()
+        or runtime_path.is_symlink()
+        or sha256_file(runtime_path) != record["runtime_config_sha256"]
+    ):
+        raise ValueError(
+            f"{record['arm']} runtime config is missing, unsafe, or mismatched"
+        )
+    cfg = yaml.safe_load(runtime_path.read_text())
+    if (
+        not isinstance(cfg, dict)
+        or cfg.get("arm") != record["arm"]
+        or cfg.get("run_id") != record["run_id"]
+    ):
+        raise ValueError(f"{record['arm']} runtime config identity differs")
+    expected_step = cfg.get("max_steps")
+    if (
+        isinstance(expected_step, bool)
+        or not isinstance(expected_step, int)
+        or expected_step <= 0
+    ):
+        raise ValueError(f"{record['arm']} runtime config has no terminal update")
+
+    checkpoint = Path(record["out_dir"]) / "ckpt.pt"
+    if not checkpoint.is_file() or checkpoint.is_symlink():
+        raise ValueError(f"{record['arm']} terminal checkpoint is missing or unsafe")
+    import torch
+
+    state = torch.load(checkpoint, map_location="cpu", weights_only=False)
+    if not isinstance(state, dict) or state.get("step") != expected_step:
+        raise ValueError(
+            f"{record['arm']} checkpoint is not at terminal update {expected_step}"
+        )
+    data = state.get("data")
+    if not isinstance(data, dict):
+        raise ValueError(f"{record['arm']} checkpoint has no data cursor")
+    cursor = data.get("cursor")
+    epoch = data.get("epoch", 0)
+    if (
+        isinstance(cursor, bool)
+        or not isinstance(cursor, int)
+        or cursor < 0
+        or isinstance(epoch, bool)
+        or not isinstance(epoch, int)
+        or epoch < 0
+    ):
+        raise ValueError(f"{record['arm']} checkpoint data cursor is invalid")
+    checkpoint_cfg = state.get("cfg")
+    if (
+        not isinstance(checkpoint_cfg, dict)
+        or checkpoint_cfg.get("arm") != record["arm"]
+        or checkpoint_cfg.get("run_id") != record["run_id"]
+    ):
+        raise ValueError(f"{record['arm']} checkpoint config identity differs")
+    del state
+    return {
+        "arm": record["arm"],
+        "bytes": checkpoint.stat().st_size,
+        "checkpoint_path": str(checkpoint.resolve()),
+        "checkpoint_sha256": sha256_file(checkpoint),
+        "cursor": cursor,
+        "epoch": epoch,
+        "run_id": record["run_id"],
+        "step": expected_step,
+    }
+
+
+def _write_pair_checkpoint_receipt(
+    pair: dict,
+    *,
+    evidence_root: Path,
+) -> Path:
+    checkpoints = {
+        record["arm"]: _checkpoint_record(record)
+        for record in pair["arms"]
+    }
+    dense = checkpoints["dense"]
+    split90 = checkpoints["split90"]
+    for field in ("step", "cursor", "epoch"):
+        if dense[field] != split90[field]:
+            raise ValueError(f"paired checkpoints do not share the same {field}")
+    receipt = {
+        "checkpoints": checkpoints,
+        "cohort_id": pair["cohort_id"],
+        "dataset": pair["dataset"],
+        "pair_id": pair["pair_id"],
+        "profile_sha256": pair["profile_sha256"],
+        "provider": pair["provider"],
+        "schema_version": 1,
+        "seed": pair["seed"],
+        "terminal_cursor": dense["cursor"],
+        "terminal_epoch": dense["epoch"],
+        "terminal_step": dense["step"],
+    }
+    return write_json_no_replace(
+        evidence_root / f"{pair['pair_id']}-pair-checkpoint-receipt.json",
+        receipt,
+    )
 
 
 def run_arm(
@@ -249,6 +352,12 @@ def finalize(
         and len(set(names)) == 1
         and names[0] not in (None, "unavailable")
     )
+    pair_checkpoint = None
+    if passed and mode == "protected":
+        pair_checkpoint = _write_pair_checkpoint_receipt(
+            pair,
+            evidence_root=evidence_root,
+        )
     evidence = {
         "arms": arms,
         "dataset": pair["dataset"],
@@ -264,6 +373,11 @@ def finalize(
         "seed": pair["seed"],
         "status": "completed" if passed else "failed",
     }
+    if pair_checkpoint is not None:
+        evidence["pair_checkpoint_receipt"] = {
+            "path": str(pair_checkpoint.resolve()),
+            "sha256": sha256_file(pair_checkpoint),
+        }
     name = (
         f"{pair['pair_id']}-train-evidence.json"
         if mode == "protected"
