@@ -23,34 +23,38 @@ from typing import Iterator
 
 import yaml
 
+if __package__ in {None, ""}:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-PROVIDER = "aws-p5.48xlarge"
-COHORT_ID = "memorysplit-confirmatory-v2-360m-n5"
-AWS_SEEDS = (1, 2, 3, 4)
-ARMS = ("dense", "split90")
-SNAPSHOT_STEPS = (1_358, 3_396, 6_791, 10_187, 13_582)
-PACKAGE_FORMAT_VERSION = 1
+from msctl.aws_contracts import (
+    ARMS,
+    COHORT_ASSIGNMENT_PATH as COHORT_PATH,
+    COHORT_ID,
+    CONFIG_ROOT,
+    DATASET_POINTER_PATH,
+    DATASET_RECEIPT_PATH,
+    EXPECTED_CONFIG_PATHS,
+    PACKAGE_FORMAT_VERSION,
+    PREREGISTRATION_ID,
+    PREREGISTRATION_PATH,
+    PROFILE_PATH,
+    PROVIDER,
+    SEEDS as AWS_SEEDS,
+    SNAPSHOT_STEPS,
+)
+
+
 NORMALIZED_TIME = (1980, 1, 1, 0, 0, 0)
-COHORT_PATH = "configs/cohort-assignment-v2.json"
-PROFILE_PATH = "cluster/profiles/aws-p5.48xlarge.json"
 STATIC_ENVIRONMENT_LOCK_PATH = "requirements-aws-p5.lock"
-DATASET_POINTER_PATH = "DATASET-POINTER-AWS.json"
 RUNBOOK_PATH = "docs/AWS-P5-360M-RUNBOOK.md"
 RELEASE_RECEIPT_NAME = "RELEASE-AWS-P5.json"
 CONTAINER_IMAGE_DIGEST_PATTERN = "^sha256:[0-9a-f]{64}$"
-EXPECTED_CONFIGS = {
-    f"configs/360m-v2/{arm}-s{seed}.yaml"
-    for seed in AWS_SEEDS
-    for arm in ARMS
-}
-SEED_ZERO_CONFIGS = {
-    f"configs/360m-v2/{arm}-s0.yaml" for arm in ARMS
-}
+EXPECTED_CONFIGS = frozenset(EXPECTED_CONFIG_PATHS)
 REQUIRED_MEMBERS = EXPECTED_CONFIGS | {
     "AWS-P5-START.md",
     DATASET_POINTER_PATH,
     COHORT_PATH,
-    "configs/preregistration-v2.yaml",
+    PREREGISTRATION_PATH,
     PROFILE_PATH,
     RUNBOOK_PATH,
     "cluster/aws/p5/bootstrap.sh",
@@ -60,6 +64,7 @@ REQUIRED_MEMBERS = EXPECTED_CONFIGS | {
     "evals/confirmatory/__init__.py",
     "msctl/__init__.py",
     "msctl/__main__.py",
+    "msctl/aws_contracts.py",
     "msctl/aws_p5.py",
     "msctl/dataset.py",
     "scripts/build_parallel_corpus.py",
@@ -150,7 +155,6 @@ _APPROVED_VENDOR = {
 }
 _SHARED_CONFIGS = {
     "configs/current-dataset-lock.json",
-    "configs/preregistration-v2.yaml",
     "configs/reasoning-dataset-v2.json",
     "configs/route-policy.json",
 }
@@ -162,13 +166,17 @@ _LEGACY_CONFIG_PREFIXES = (
     "configs/29m/",
     "configs/160m/",
     "configs/360m/",
+    "configs/360m-v2/",
 )
 _LEGACY_CONFIG_FILES = {
     "configs/29m.tsv",
     "configs/160m.tsv",
     "configs/360m.tsv",
+    "configs/cohort-assignment-v2.json",
+    "configs/preregistration-v2.yaml",
 }
 _PROVIDER_EXCLUDED = {
+    "cluster/profiles/aws-p5.48xlarge.json",
     "cluster/profiles/illumina-usfc-prd.json",
     "scripts/package_illumina_handoff.py",
     "tests/test_package_illumina_handoff.py",
@@ -240,6 +248,7 @@ _SENSITIVE_FIELD_VALUE_FORMS = (
 )
 _TEXT_SUFFIXES = {".json", ".lock", ".md", ".py", ".sh", ".txt", ".yaml", ".yml"}
 _OBJECT_ID_PATTERN = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})")
+_SOURCE_OBJECT_ID_PATTERN = re.compile(r"[0-9a-f]{40}")
 _CONFIG_KEYS = {
     "schema_version",
     "cohort_id",
@@ -788,8 +797,8 @@ def _head_revision(repository: _Repository) -> str:
         .decode("ascii", errors="strict")
         .strip()
     )
-    if _OBJECT_ID_PATTERN.fullmatch(revision) is None:
-        raise PackageError("Git HEAD is not a full commit ID")
+    if _SOURCE_OBJECT_ID_PATTERN.fullmatch(revision) is None:
+        raise PackageError("Git HEAD is not a 40-character lowercase commit ID")
     return revision
 
 
@@ -821,8 +830,10 @@ def _commit_tree(repository: _Repository, revision: str) -> str:
         .decode("ascii", errors="strict")
         .strip()
     )
-    if _OBJECT_ID_PATTERN.fullmatch(tree_id) is None:
-        raise PackageError("Git commit does not identify a full tree ID")
+    if _SOURCE_OBJECT_ID_PATTERN.fullmatch(tree_id) is None:
+        raise PackageError(
+            "Git commit does not identify a 40-character lowercase tree ID"
+        )
     return tree_id
 
 
@@ -941,10 +952,12 @@ def _classification(path: str) -> str:
         return "excluded"
     if path in _ROOT_INCLUDED:
         return "included"
-    if path == COHORT_PATH or path in EXPECTED_CONFIGS or path in _SHARED_CONFIGS:
+    if (
+        path in {COHORT_PATH, PREREGISTRATION_PATH}
+        or path in EXPECTED_CONFIGS
+        or path in _SHARED_CONFIGS
+    ):
         return "included"
-    if path in SEED_ZERO_CONFIGS:
-        return "excluded"
     if path in _LEGACY_CONFIG_FILES or path.startswith(_LEGACY_CONFIG_PREFIXES):
         return "excluded"
     if path.startswith("configs/"):
@@ -1136,11 +1149,10 @@ def _expected_assignment() -> dict[str, object]:
         "model_parameters": 356_033_536,
         "optimizer_steps": 13_582,
         "provider_seeds": {
-            PROVIDER: [1, 2, 3, 4],
-            "illumina-usfc-prd": [0],
+            PROVIDER: list(AWS_SEEDS),
         },
         "raw_target_tokens": 7_120_879_616,
-        "schema_version": 2,
+        "schema_version": 3,
         "targets_per_update": 524_288,
     }
 
@@ -1149,8 +1161,8 @@ def _validate_assignment(data: bytes) -> dict[str, object]:
     assignment = _load_json_object(data, label="cohort assignment")
     if not _same_typed_value(assignment, _expected_assignment()):
         raise PackageError(
-            "cohort assignment must assign seed 0 to Illumina and "
-            "exactly seeds 1-4 to AWS P5"
+            "cohort assignment must assign exactly seeds 0-9 to AWS P5 "
+            "with no other provider"
         )
     if (
         assignment["optimizer_steps"] * assignment["targets_per_update"]
@@ -1164,12 +1176,12 @@ def _expected_config(seed: int, arm: str) -> dict[str, object]:
     return {
         "schema_version": 2,
         "cohort_id": COHORT_ID,
-        "run_id": f"memorysplit-v2-360m-s{seed}-{arm}",
+        "run_id": f"memorysplit-v3-360m-s{seed}-{arm}",
         "condition": arm,
         "seed": seed,
         "model": "d360m",
         "ctx": 1024,
-        "train_corpus": "dataset/corpus-receipt.json",
+        "train_corpus": DATASET_RECEIPT_PATH,
         "sidecar_name": (
             "dense_target_weights"
             if arm == "dense"
@@ -1270,10 +1282,12 @@ def _validate_profile(data: bytes) -> None:
             "AWS P5 profile runtime must not claim a static environment identity"
         )
     expected_values = {
+        ("schema_version",): 1,
+        ("profile_id",): "aws-p5.48xlarge-v3",
         ("provider",): PROVIDER,
         ("instance_type",): "p5.48xlarge",
         ("purchase_model",): "on_demand",
-        ("assigned_seeds",): [1, 2, 3, 4],
+        ("assigned_seeds",): list(AWS_SEEDS),
         ("gpu", "model"): "NVIDIA H100 80GB",
         ("gpu", "allocated"): 8,
         ("gpu", "seed_train_groups"): [4, 4],
@@ -1330,6 +1344,7 @@ def _validate_dataset_pointer(data: bytes) -> None:
         "provider": PROVIDER,
         "durable_uri_env": "MS_S3_ROOT",
         "full_corpus_in_release": False,
+        "required_receipt": DATASET_RECEIPT_PATH,
     }
     for field, expected_value in expected.items():
         if field not in pointer or not _same_typed_value(
@@ -1337,6 +1352,21 @@ def _validate_dataset_pointer(data: bytes) -> None:
         ):
             raise PackageError(
                 f"AWS dataset pointer field {field} is invalid"
+            )
+
+
+def _validate_preregistration(data: bytes) -> None:
+    preregistration = _load_yaml_object(data, path=PREREGISTRATION_PATH)
+    expected = {
+        "schema_version": 3,
+        "preregistration_id": PREREGISTRATION_ID,
+    }
+    for field, expected_value in expected.items():
+        if field not in preregistration or not _same_typed_value(
+            preregistration[field], expected_value
+        ):
+            raise PackageError(
+                f"preregistration {field} does not match the v3 contract"
             )
 
 
@@ -1391,9 +1421,10 @@ def _collect_payload(
         )
 
     assignment = _validate_assignment(payload[COHORT_PATH])
+    _validate_preregistration(payload[PREREGISTRATION_PATH])
     for seed in AWS_SEEDS:
         for arm in ARMS:
-            path = f"configs/360m-v2/{arm}-s{seed}.yaml"
+            path = f"{CONFIG_ROOT}/{arm}-s{seed}.yaml"
             _validate_config(path, payload[path], seed=seed, arm=arm)
     _validate_profile(payload[PROFILE_PATH])
     _validate_dataset_pointer(payload[DATASET_POINTER_PATH])

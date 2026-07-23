@@ -4,6 +4,7 @@ import hashlib
 import importlib.util
 import json
 import os
+import re
 import stat
 import subprocess
 import sys
@@ -19,10 +20,10 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = REPO_ROOT / "scripts" / "package_aws_p5_handoff.py"
 START_GUIDE = REPO_ROOT / "AWS-P5-START.md"
 PROVIDER = "aws-p5.48xlarge"
-COHORT_ID = "memorysplit-confirmatory-v2-360m-n5"
+COHORT_ID = "memorysplit-confirmatory-v3-360m-n10-aws"
 EXPECTED_CONFIGS = {
-    f"configs/360m-v2/{arm}-s{seed}.yaml"
-    for seed in (1, 2, 3, 4)
+    f"configs/360m-v3/{arm}-s{seed}.yaml"
+    for seed in range(10)
     for arm in ("dense", "split90")
 }
 EXPECTED_EXECUTABLES = {
@@ -104,15 +105,30 @@ def _cohort(
     aws_seeds: list[int] | None = None,
     illumina_seeds: list[int] | None = None,
 ) -> dict[str, object]:
+    provider_seeds = {
+        PROVIDER: aws_seeds if aws_seeds is not None else list(range(10)),
+    }
+    if illumina_seeds is not None:
+        provider_seeds["illumina-usfc-prd"] = illumina_seeds
     return {
         "cohort_id": COHORT_ID,
         "model_parameters": 356_033_536,
         "optimizer_steps": 13_582,
+        "provider_seeds": provider_seeds,
+        "raw_target_tokens": 7_120_879_616,
+        "schema_version": 3,
+        "targets_per_update": 524_288,
+    }
+
+
+def _v2_cohort() -> dict[str, object]:
+    return {
+        "cohort_id": "memorysplit-confirmatory-v2-360m-n5",
+        "model_parameters": 356_033_536,
+        "optimizer_steps": 13_582,
         "provider_seeds": {
-            PROVIDER: aws_seeds if aws_seeds is not None else [1, 2, 3, 4],
-            "illumina-usfc-prd": (
-                illumina_seeds if illumina_seeds is not None else [0]
-            ),
+            PROVIDER: [1, 2, 3, 4],
+            "illumina-usfc-prd": [0],
         },
         "raw_target_tokens": 7_120_879_616,
         "schema_version": 2,
@@ -125,12 +141,12 @@ def _config(seed: int, arm: str) -> dict[str, object]:
     return {
         "schema_version": 2,
         "cohort_id": COHORT_ID,
-        "run_id": f"memorysplit-v2-360m-s{seed}-{arm}",
+        "run_id": f"memorysplit-v3-360m-s{seed}-{arm}",
         "condition": arm,
         "seed": seed,
         "model": "d360m",
         "ctx": 1024,
-        "train_corpus": "dataset/corpus-receipt.json",
+        "train_corpus": "dataset/receipt.json",
         "sidecar_name": (
             "dense_target_weights"
             if arm == "dense"
@@ -153,10 +169,18 @@ def _config(seed: int, arm: str) -> dict[str, object]:
     }
 
 
+def _v2_config(seed: int, arm: str) -> dict[str, object]:
+    value = _config(seed, arm)
+    value["cohort_id"] = "memorysplit-confirmatory-v2-360m-n5"
+    value["run_id"] = f"memorysplit-v2-360m-s{seed}-{arm}"
+    value["train_corpus"] = "dataset/corpus-receipt.json"
+    return value
+
+
 def _profile() -> dict[str, object]:
     return {
         "schema_version": 1,
-        "profile_id": PROVIDER,
+        "profile_id": "aws-p5.48xlarge-v3",
         "provider": PROVIDER,
         "instance_type": "p5.48xlarge",
         "purchase_model": "on_demand",
@@ -184,8 +208,15 @@ def _profile() -> dict[str, object]:
             "runtime_uid_env": "MS_RUNTIME_UID",
         },
         "process_env_allowlist": ["AWS_REGION", "LANG", "LC_ALL"],
-        "assigned_seeds": [1, 2, 3, 4],
+        "assigned_seeds": list(range(10)),
     }
+
+
+def _v2_profile() -> dict[str, object]:
+    value = _profile()
+    value["profile_id"] = PROVIDER
+    value["assigned_seeds"] = [1, 2, 3, 4]
+    return value
 
 
 def _dataset_pointer() -> dict[str, object]:
@@ -227,25 +258,37 @@ def _runtime_environment_contract(profile_sha256: str) -> dict[str, object]:
     }
 
 
-def _minimal_repo(tmp_path: Path, *, name: str = "source") -> Path:
+def _minimal_repo(
+    tmp_path: Path,
+    *,
+    name: str = "source",
+    object_format: str | None = None,
+) -> Path:
     root = tmp_path / name
     root.mkdir()
     files: dict[str, bytes | str] = {
         "AWS-P5-START.md": (
-            "# Fixture P5 start\nSeeds 1-4 only; seed 0 is forbidden.\n"
+            "# Fixture P5 start\nAWS-only v3 seeds 0-9.\n"
         ),
         "docs/AWS-P5-360M-RUNBOOK.md": "# Fixture AWS P5 runbook\n",
         "DATASET-POINTER-AWS.json": _canonical_json(_dataset_pointer()),
         "requirements.txt": "PyYAML>=6.0\npytest>=8.0\n",
         "pytest.ini": "[pytest]\n",
-        "configs/cohort-assignment-v2.json": _canonical_json(_cohort()),
+        "configs/cohort-assignment-v3.json": _canonical_json(_cohort()),
+        "configs/preregistration-v3.yaml": (
+            "schema_version: 3\n"
+            "preregistration_id: memorysplit-confirmatory-v3\n"
+        ),
+        "configs/cohort-assignment-v2.json": _canonical_json(_v2_cohort()),
         "configs/preregistration-v2.yaml": (
-            "schema_version: 2\nstudy: memorysplit-confirmatory-v2\n"
+            "schema_version: 2\n"
+            "preregistration_id: memorysplit-confirmatory-v2\n"
         ),
         "configs/current-dataset-lock.json": '{"schema_version":1}\n',
         "configs/reasoning-dataset-v2.json": '{"schema_version":2}\n',
         "configs/route-policy.json": '{"schema_version":1}\n',
-        "cluster/profiles/aws-p5.48xlarge.json": _canonical_json(_profile()),
+        "cluster/profiles/aws-p5.48xlarge-v3.json": _canonical_json(_profile()),
+        "cluster/profiles/aws-p5.48xlarge.json": _canonical_json(_v2_profile()),
         "cluster/aws/p5/bootstrap.sh": "#!/bin/sh\nset -eu\n",
         "cluster/aws/p5/launch_seed_pair.py": (
             "#!/usr/bin/env python3\nraise SystemExit(0)\n"
@@ -259,6 +302,9 @@ def _minimal_repo(tmp_path: Path, *, name: str = "source") -> Path:
         "msctl/__init__.py": '"""fixture contracts"""\n',
         "msctl/__main__.py": "raise SystemExit(0)\n",
         "msctl/aws_p5.py": "PROVIDER = 'aws-p5.48xlarge'\n",
+        "msctl/aws_contracts.py": (
+            REPO_ROOT / "msctl" / "aws_contracts.py"
+        ).read_bytes(),
         "msctl/dataset.py": "DATASET_CONTRACT = 'receipt-v2'\n",
         "corpusgen/__init__.py": "",
         "corpusgen/parallel/__init__.py": "",
@@ -313,11 +359,19 @@ def _minimal_repo(tmp_path: Path, *, name: str = "source") -> Path:
         "sealed/gold.json": '{"answer":"excluded"}\n',
         ".cache/compiler.bin": b"excluded cache",
     }
+    for seed in range(10):
+        for arm in ("dense", "split90"):
+            relative = f"configs/360m-v3/{arm}-s{seed}.yaml"
+            files[relative] = yaml.safe_dump(
+                _config(seed, arm),
+                sort_keys=False,
+                allow_unicode=False,
+            )
     for seed in range(5):
         for arm in ("dense", "split90"):
             relative = f"configs/360m-v2/{arm}-s{seed}.yaml"
             files[relative] = yaml.safe_dump(
-                _config(seed, arm),
+                _v2_config(seed, arm),
                 sort_keys=False,
                 allow_unicode=False,
             )
@@ -328,7 +382,10 @@ def _minimal_repo(tmp_path: Path, *, name: str = "source") -> Path:
             executable=relative in EXPECTED_EXECUTABLES
             or relative == "cluster/slurm/v2_seed0.sbatch",
         )
-    _git(root, "init", "-q")
+    init_arguments = ["init", "-q"]
+    if object_format is not None:
+        init_arguments.append(f"--object-format={object_format}")
+    _git(root, *init_arguments)
     _git(root, "config", "user.name", "Package Test")
     _git(root, "config", "user.email", "package@example.invalid")
     _git(root, "config", "commit.gpgsign", "false")
@@ -379,8 +436,27 @@ def test_double_build_is_byte_identical_and_emits_external_receipts(tmp_path):
         f"{archive_digest}  {first.archive.name}\n"
     )
     receipt = json.loads(first.release.read_text())
+    assert set(receipt) == {
+        "archive",
+        "cohort_assignment",
+        "cohort_assignment_sha256",
+        "config_sha256",
+        "dataset_pointer",
+        "dataset_pointer_sha256",
+        "environment",
+        "members_sha256",
+        "package_format_version",
+        "profile",
+        "profile_sha256",
+        "provider",
+        "release_id",
+        "schema_version",
+        "seed_assignment",
+        "source",
+    }
     assert receipt["schema_version"] == 1
-    assert receipt["package_format_version"] == 1
+    assert receipt["package_format_version"] == 2
+    assert type(receipt["package_format_version"]) is int
     assert receipt["provider"] == PROVIDER
     assert receipt["archive"] == {
         "path": first.archive.name,
@@ -392,12 +468,31 @@ def test_double_build_is_byte_identical_and_emits_external_receipts(tmp_path):
         "dirty": False,
         "tree": _git(source, "rev-parse", "HEAD^{tree}"),
     }
+    assert set(receipt["source"]) == {"commit", "dirty", "tree"}
+    assert re.fullmatch(r"[0-9a-f]{40}", receipt["source"]["commit"])
+    assert re.fullmatch(r"[0-9a-f]{40}", receipt["source"]["tree"])
     assert receipt["seed_assignment"] == {
         "cohort_id": COHORT_ID,
         "provider": PROVIDER,
-        "seeds": [1, 2, 3, 4],
+        "seeds": list(range(10)),
         "arms": ["dense", "split90"],
     }
+    serialized = json.dumps(receipt, sort_keys=True)
+    assert "dataset_receipt_sha256" not in serialized
+    assert "dataset_build_id" not in serialized
+    assert "ordered_stream_sha256" not in serialized
+
+
+def test_packager_rejects_non_sha1_source_object_ids(tmp_path):
+    module = _load_module()
+    source = _minimal_repo(tmp_path, object_format="sha256")
+
+    with pytest.raises(module.PackageError, match="40-character|commit|tree"):
+        module.build_handoff(
+            source_root=source,
+            out_dir=tmp_path / "out",
+            apply=True,
+        )
 
 
 def test_archive_contains_only_semantic_seed_pairs_and_hash_bound_metadata(
@@ -412,17 +507,20 @@ def test_archive_contains_only_semantic_seed_pairs_and_hash_bound_metadata(
         config_names = {
             name
             for name in names
-            if name.startswith("configs/360m-v2/") and not name.endswith("/")
+            if name.startswith("configs/360m-v3/") and not name.endswith("/")
         }
         assert config_names == EXPECTED_CONFIGS
-        assert {
-            "configs/360m-v2/dense-s0.yaml",
-            "configs/360m-v2/split90-s0.yaml",
-        }.isdisjoint(names)
+        assert not any(name.startswith("configs/360m-v2/") for name in names)
+        assert "configs/cohort-assignment-v2.json" not in names
+        assert "configs/preregistration-v2.yaml" not in names
+        assert "cluster/profiles/aws-p5.48xlarge.json" not in names
+        assert "configs/preregistration-v3.yaml" in names
+        assert "cluster/profiles/aws-p5.48xlarge-v3.json" in names
+        assert "msctl/aws_contracts.py" in names
         assert "tests/fixtures/current_sources/README.md" in names
         assert "tests/fixtures/relational-smoke-route-policy.json" in names
 
-        assignment_bytes = archive.read("configs/cohort-assignment-v2.json")
+        assignment_bytes = archive.read("configs/cohort-assignment-v3.json")
         assignment = json.loads(assignment_bytes)
         assert assignment == _cohort()
         for name in sorted(EXPECTED_CONFIGS):
@@ -432,28 +530,45 @@ def test_archive_contains_only_semantic_seed_pairs_and_hash_bound_metadata(
             assert config == _config(int(raw_seed), arm)
 
         metadata = json.loads(archive.read("RELEASE-METADATA.json"))
+        assert set(metadata) == {
+            "cohort_assignment",
+            "config_sha256",
+            "dataset_pointer",
+            "environment",
+            "members",
+            "package_format_version",
+            "profile",
+            "provider",
+            "schema_version",
+            "seed_assignment",
+            "source",
+        }
         assert metadata["schema_version"] == 1
-        assert metadata["package_format_version"] == 1
+        assert metadata["package_format_version"] == 2
+        assert type(metadata["package_format_version"]) is int
         assert metadata["provider"] == PROVIDER
         assert metadata["source"] == {
             "commit": _git(source, "rev-parse", "HEAD"),
             "dirty": False,
             "tree": _git(source, "rev-parse", "HEAD^{tree}"),
         }
+        assert set(metadata["source"]) == {"commit", "dirty", "tree"}
+        assert re.fullmatch(r"[0-9a-f]{40}", metadata["source"]["commit"])
+        assert re.fullmatch(r"[0-9a-f]{40}", metadata["source"]["tree"])
         assert metadata["seed_assignment"] == {
             "cohort_id": COHORT_ID,
             "provider": PROVIDER,
-            "seeds": [1, 2, 3, 4],
+            "seeds": list(range(10)),
             "arms": ["dense", "split90"],
         }
         assert metadata["cohort_assignment"] == {
-            "path": "configs/cohort-assignment-v2.json",
+            "path": "configs/cohort-assignment-v3.json",
             "sha256": _sha256_bytes(assignment_bytes),
         }
         assert metadata["profile"] == {
-            "path": "cluster/profiles/aws-p5.48xlarge.json",
+            "path": "cluster/profiles/aws-p5.48xlarge-v3.json",
             "sha256": _sha256_bytes(
-                archive.read("cluster/profiles/aws-p5.48xlarge.json")
+                archive.read("cluster/profiles/aws-p5.48xlarge-v3.json")
             ),
         }
         environment = _runtime_environment_contract(
@@ -467,6 +582,10 @@ def test_archive_contains_only_semantic_seed_pairs_and_hash_bound_metadata(
             name: _sha256_bytes(archive.read(name))
             for name in sorted(EXPECTED_CONFIGS)
         }
+        serialized = json.dumps(metadata, sort_keys=True)
+        assert "dataset_receipt_sha256" not in serialized
+        assert "dataset_build_id" not in serialized
+        assert "ordered_stream_sha256" not in serialized
 
         member_rows = metadata["members"]
         member_paths = {row["path"] for row in member_rows}
@@ -550,13 +669,94 @@ def test_packager_rejects_fabricated_profile_runtime_identity(
 ):
     module = _load_module()
     source = _minimal_repo(tmp_path)
-    path = source / "cluster/profiles/aws-p5.48xlarge.json"
+    path = source / "cluster/profiles/aws-p5.48xlarge-v3.json"
     profile = json.loads(path.read_text())
     profile["runtime"][field] = value
     path.write_text(_canonical_json(profile))
     _commit(source, f"add fabricated runtime identity: {field}")
 
     with pytest.raises(module.PackageError, match="runtime|environment|identity"):
+        module.build_handoff(
+            source_root=source,
+            out_dir=tmp_path / "out",
+            apply=True,
+        )
+
+
+def test_packager_rejects_wrong_v3_profile_seeds(tmp_path):
+    module = _load_module()
+    source = _minimal_repo(tmp_path)
+    path = source / "cluster/profiles/aws-p5.48xlarge-v3.json"
+    profile = json.loads(path.read_text())
+    profile["assigned_seeds"] = list(range(9))
+    path.write_text(_canonical_json(profile))
+    _commit(source, "remove one assigned v3 seed")
+
+    with pytest.raises(module.PackageError, match="assigned_seeds|seed|profile"):
+        module.build_handoff(
+            source_root=source,
+            out_dir=tmp_path / "out",
+            apply=True,
+        )
+
+
+def test_packager_rejects_wrong_dataset_receipt_pointer(tmp_path):
+    module = _load_module()
+    source = _minimal_repo(tmp_path)
+    path = source / "DATASET-POINTER-AWS.json"
+    pointer = json.loads(path.read_text())
+    pointer["required_receipt"] = "dataset/corpus-receipt.json"
+    path.write_text(_canonical_json(pointer))
+    _commit(source, "change canonical dataset receipt pointer")
+
+    with pytest.raises(module.PackageError, match="pointer|required_receipt|receipt"):
+        module.build_handoff(
+            source_root=source,
+            out_dir=tmp_path / "out",
+            apply=True,
+        )
+
+
+@pytest.mark.parametrize(
+    ("substitution", "source_relative", "target_relative"),
+    [
+        (
+            "assignment",
+            "configs/cohort-assignment-v2.json",
+            "configs/cohort-assignment-v3.json",
+        ),
+        (
+            "preregistration",
+            "configs/preregistration-v2.yaml",
+            "configs/preregistration-v3.yaml",
+        ),
+        (
+            "run-config",
+            "configs/360m-v2/dense-s0.yaml",
+            "configs/360m-v3/dense-s0.yaml",
+        ),
+        (
+            "profile",
+            "cluster/profiles/aws-p5.48xlarge.json",
+            "cluster/profiles/aws-p5.48xlarge-v3.json",
+        ),
+    ],
+)
+def test_packager_rejects_cross_version_substitution(
+    tmp_path,
+    substitution,
+    source_relative,
+    target_relative,
+):
+    module = _load_module()
+    source = _minimal_repo(tmp_path)
+    (source / target_relative).write_bytes((source / source_relative).read_bytes())
+    _commit(source, f"substitute v2 {substitution}")
+
+    with pytest.raises(
+        module.PackageError,
+        match="assignment|preregistration|config|profile|contract|v3",
+    ):
         module.build_handoff(
             source_root=source,
             out_dir=tmp_path / "out",
@@ -593,10 +793,12 @@ def test_archive_excludes_materialized_provider_and_sealed_content(tmp_path):
     assert "AGENT-START.md" not in names
     assert "DATASET-POINTER.json" not in names
     assert "cluster/profiles/illumina-usfc-prd.json" not in names
+    assert "cluster/profiles/aws-p5.48xlarge.json" not in names
     assert "cluster/slurm/v2_seed0.sbatch" not in names
     assert "scripts/package_illumina_handoff.py" not in names
     assert "tests/test_package_illumina_handoff.py" not in names
     assert not any(name.startswith("configs/360m/") for name in names)
+    assert not any(name.startswith("configs/360m-v2/") for name in names)
 
 
 def test_zip_metadata_is_normalized_and_preserves_git_executable_modes(tmp_path):
@@ -780,7 +982,7 @@ def test_packager_rejects_static_credential_fields_in_profile(tmp_path):
     source = _minimal_repo(tmp_path)
     profile = _profile()
     profile["aws_access_key_id"] = "static-credential-must-not-ship"
-    (source / "cluster/profiles/aws-p5.48xlarge.json").write_text(
+    (source / "cluster/profiles/aws-p5.48xlarge-v3.json").write_text(
         _canonical_json(profile)
     )
     _commit(source, "add static profile credential")
@@ -862,7 +1064,7 @@ def test_packager_rejects_unenumerated_vendor_and_source_paths(
     "relative",
     [
         "configs/current-dataset-lock.json",
-        "configs/preregistration-v2.yaml",
+        "configs/preregistration-v3.yaml",
     ],
 )
 def test_packager_recursively_rejects_secret_keys_without_echoing_values(
@@ -904,21 +1106,21 @@ def test_packager_recursively_rejects_secret_keys_without_echoing_values(
     ("relative", "sensitive_key"),
     [
         ("configs/current-dataset-lock.json", "client-secret"),
-        ("configs/preregistration-v2.yaml", "clientSecret"),
+        ("configs/preregistration-v3.yaml", "clientSecret"),
         ("configs/current-dataset-lock.json", "apiKey"),
-        ("configs/preregistration-v2.yaml", "api-key"),
+        ("configs/preregistration-v3.yaml", "api-key"),
         ("configs/current-dataset-lock.json", "accessKey"),
-        ("configs/preregistration-v2.yaml", "privateKey"),
+        ("configs/preregistration-v3.yaml", "privateKey"),
         ("configs/current-dataset-lock.json", "password"),
-        ("configs/preregistration-v2.yaml", "passphrase"),
+        ("configs/preregistration-v3.yaml", "passphrase"),
         ("configs/current-dataset-lock.json", "token"),
-        ("configs/preregistration-v2.yaml", "credentials"),
+        ("configs/preregistration-v3.yaml", "credentials"),
         ("configs/current-dataset-lock.json", "secretValue"),
-        ("configs/preregistration-v2.yaml", "secret_value"),
+        ("configs/preregistration-v3.yaml", "secret_value"),
         ("configs/current-dataset-lock.json", "tokenValue"),
-        ("configs/preregistration-v2.yaml", "token_value"),
+        ("configs/preregistration-v3.yaml", "token_value"),
         ("configs/current-dataset-lock.json", "apiToken"),
-        ("configs/preregistration-v2.yaml", "api_token_value"),
+        ("configs/preregistration-v3.yaml", "api_token_value"),
     ],
 )
 def test_structured_credential_key_variants_are_rejected_without_values(
@@ -997,16 +1199,16 @@ def test_packager_rejects_unknown_tracked_path(tmp_path):
         )
 
 
-def test_packager_rejects_seed_zero_in_aws_assignment(tmp_path):
+def test_packager_rejects_illumina_reintroduction_in_v3_assignment(tmp_path):
     module = _load_module()
     source = _minimal_repo(tmp_path)
-    assignment = _cohort(aws_seeds=[0, 1, 2, 3, 4], illumina_seeds=[])
-    (source / "configs/cohort-assignment-v2.json").write_text(
+    assignment = _cohort(illumina_seeds=[0])
+    (source / "configs/cohort-assignment-v3.json").write_text(
         _canonical_json(assignment)
     )
-    _commit(source, "misassign seed zero")
+    _commit(source, "reintroduce Illumina provider")
 
-    with pytest.raises(module.PackageError, match="seed|assignment"):
+    with pytest.raises(module.PackageError, match="provider|assignment|Illumina"):
         module.build_handoff(
             source_root=source,
             out_dir=tmp_path / "out",
@@ -1018,28 +1220,34 @@ def test_packager_rejects_seed_zero_in_aws_assignment(tmp_path):
     ("relative", "field", "value", "message"),
     [
         (
-            "configs/360m-v2/dense-s1.yaml",
+            "configs/360m-v3/dense-s0.yaml",
             "seed",
-            0,
+            10,
             "seed",
         ),
         (
-            "configs/360m-v2/split90-s2.yaml",
+            "configs/360m-v3/split90-s2.yaml",
             "condition",
             "split",
             "condition|split90",
         ),
         (
-            "configs/360m-v2/dense-s3.yaml",
+            "configs/360m-v3/dense-s3.yaml",
             "max_steps",
             13_581,
             "max_steps|token",
         ),
         (
-            "configs/360m-v2/split90-s4.yaml",
+            "configs/360m-v3/split90-s9.yaml",
             "sidecar_name",
             "dense_target_weights",
             "sidecar",
+        ),
+        (
+            "configs/360m-v3/dense-s4.yaml",
+            "train_corpus",
+            "dataset/corpus-receipt.json",
+            "train_corpus|dataset",
         ),
     ],
 )
@@ -1088,7 +1296,7 @@ def test_packager_rejects_invalid_snapshot_schedule(
 ):
     module = _load_module()
     source = _minimal_repo(tmp_path)
-    path = source / "configs/360m-v2/dense-s1.yaml"
+    path = source / "configs/360m-v3/dense-s0.yaml"
     config = yaml.safe_load(path.read_text())
     if case == "bool":
         config["snapshot_steps"][2] = True
@@ -1137,7 +1345,7 @@ def test_packager_rejects_partial_pair_and_unassigned_provider_config(tmp_path):
         partial_source,
         "rm",
         "-q",
-        "configs/360m-v2/split90-s4.yaml",
+        "configs/360m-v3/split90-s9.yaml",
     )
     _git(partial_source, "commit", "-qm", "remove half of pair")
 
@@ -1150,8 +1358,8 @@ def test_packager_rejects_partial_pair_and_unassigned_provider_config(tmp_path):
 
     extra_source = _minimal_repo(tmp_path, name="extra")
     _write(
-        extra_source / "configs/360m-v2/dense-s5.yaml",
-        yaml.safe_dump(_config(5, "dense"), sort_keys=False),
+        extra_source / "configs/360m-v3/dense-s10.yaml",
+        yaml.safe_dump(_config(10, "dense"), sort_keys=False),
     )
     _commit(extra_source, "add unassigned config")
 
