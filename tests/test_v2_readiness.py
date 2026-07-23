@@ -68,6 +68,12 @@ def test_contract_is_strict_and_hashes_are_real_sha256():
     with pytest.raises(ValueError, match="fields"):
         evaluate_readiness(evidence)
 
+    for invalid_version in (True, 1.0):
+        evidence = _evidence()
+        evidence["schema_version"] = invalid_version
+        with pytest.raises(ValueError, match="schema_version"):
+            evaluate_readiness(evidence)
+
     evidence = _evidence()
     evidence["artifact_hashes"]["code"] = "not-a-hash"
     with pytest.raises(ValueError, match="SHA-256"):

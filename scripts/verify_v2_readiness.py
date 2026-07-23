@@ -45,7 +45,7 @@ def evaluate_readiness(raw: Mapping) -> dict:
         {"schema_version", "artifact_hashes", "gates"},
         "readiness evidence",
     )
-    if value["schema_version"] != 1:
+    if type(value["schema_version"]) is not int or value["schema_version"] != 1:
         raise ValueError("unsupported readiness schema_version")
 
     artifacts = _strict_fields(
