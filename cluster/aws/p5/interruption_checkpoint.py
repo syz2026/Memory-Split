@@ -7,11 +7,12 @@ import argparse
 import base64
 import hashlib
 import json
+import math
 import os
 import re
 import signal
+import stat
 import subprocess
-import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -26,9 +27,6 @@ RESUMABLE_EXIT_CODE = 75
 NON_RESUMABLE_EXIT_CODE = 74
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
-_SECRET_NAME_RE = re.compile(
-    r"(?:^|_)(?:CREDENTIALS?|PASSWORD|PRIVATE_KEY|SECRET|TOKEN)(?:_|$)"
-)
 _ARMS = ("dense", "split90")
 _IMDS_ROOT = "http://169.254.169.254/latest"
 
@@ -41,7 +39,14 @@ class CommandResult:
 
 
 class VerifiedObjectStore(Protocol):
-    def put_verified(self, path: Path, uri: str) -> bool: ...
+    def put_verified(
+        self,
+        path: Path,
+        uri: str,
+        *,
+        deadline: float,
+        monotonic: Callable[[], float],
+    ) -> bool: ...
 
 
 @dataclass(frozen=True)
@@ -57,6 +62,7 @@ class InterruptionRequest:
     code_commit: str
     config_sha256: Mapping[str, str]
     timeout_seconds: float
+    upload_reserve_seconds: float
 
     def __post_init__(self) -> None:
         if type(self.seed) is not int or self.seed not in {1, 2, 3, 4}:
@@ -97,10 +103,21 @@ class InterruptionRequest:
         if (
             isinstance(self.timeout_seconds, bool)
             or not isinstance(self.timeout_seconds, (int, float))
+            or not math.isfinite(self.timeout_seconds)
             or self.timeout_seconds <= 0
             or self.timeout_seconds > 900
         ):
             raise ValueError("checkpoint timeout must be between 0 and 900 seconds")
+        if (
+            isinstance(self.upload_reserve_seconds, bool)
+            or not isinstance(self.upload_reserve_seconds, (int, float))
+            or not math.isfinite(self.upload_reserve_seconds)
+            or self.upload_reserve_seconds <= 0
+            or self.upload_reserve_seconds >= self.timeout_seconds
+        ):
+            raise ValueError(
+                "upload reserve must be positive and below checkpoint timeout"
+            )
         _split_s3_uri(self.s3_root + "/sentinel")
 
 
@@ -115,6 +132,7 @@ class InterruptionResult:
 def _default_runner(
     argv: Sequence[str],
     environment: Mapping[str, str],
+    timeout_seconds: float,
 ) -> CommandResult:
     completed = subprocess.run(
         list(argv),
@@ -122,6 +140,7 @@ def _default_runner(
         capture_output=True,
         text=True,
         check=False,
+        timeout=timeout_seconds,
     )
     return CommandResult(
         returncode=completed.returncode,
@@ -171,80 +190,159 @@ class S3ObjectStore:
         region: str,
         environment: Mapping[str, str],
         runner: Callable[
-            [Sequence[str], Mapping[str, str]], CommandResult
+            [Sequence[str], Mapping[str, str], float], CommandResult
         ] = _default_runner,
     ) -> None:
         if not isinstance(region, str) or not region:
             raise ValueError("S3 region must be non-empty")
-        unsafe = sorted(
-            name
-            for name, value in environment.items()
-            if value and _SECRET_NAME_RE.search(name.upper()) is not None
-        )
-        if unsafe:
+        expected_environment = {
+            "AWS_REGION",
+            "HOME",
+            "LANG",
+            "LC_ALL",
+            "PATH",
+        }
+        unsafe = sorted(set(environment) - expected_environment)
+        if unsafe or set(environment) != expected_environment:
             raise ValueError(
-                "S3 command environment contains secret variables: "
+                "S3 command environment is not the closed instance-role environment: "
                 + ", ".join(unsafe)
             )
+        if (
+            environment.get("AWS_REGION") != region
+            or environment.get("PATH") != "/usr/bin:/bin"
+            or environment.get("LANG") != "C.UTF-8"
+            or environment.get("LC_ALL") != "C.UTF-8"
+        ):
+            raise ValueError("S3 command environment has unsafe fixed values")
+        home = Path(environment["HOME"])
+        try:
+            home_metadata = home.stat()
+        except OSError as error:
+            raise ValueError("S3 private HOME is unavailable") from error
+        if (
+            home.is_symlink()
+            or not home.is_dir()
+            or stat.S_IMODE(home_metadata.st_mode) != 0o700
+            or home_metadata.st_uid != os.geteuid()
+            or any(home.iterdir())
+        ):
+            raise ValueError("S3 private HOME must be owned, mode 0700, and empty")
         self._region = region
         self._environment = dict(environment)
         self._runner = runner
 
-    def put_verified(self, path: Path, uri: str) -> bool:
+    def put_verified(
+        self,
+        path: Path,
+        uri: str,
+        *,
+        deadline: float,
+        monotonic: Callable[[], float] = time.monotonic,
+    ) -> bool:
         if path.is_symlink() or not path.is_file():
             return False
+        if (
+            isinstance(deadline, bool)
+            or not isinstance(deadline, (int, float))
+            or not math.isfinite(deadline)
+            or monotonic() >= float(deadline)
+        ):
+            return False
         bucket, key = _split_s3_uri(uri)
+        before = path.stat()
         raw_digest = hashlib.sha256(path.read_bytes()).digest()
+        after_hash = path.stat()
+        if (
+            before.st_ino,
+            before.st_dev,
+            before.st_size,
+            before.st_mtime_ns,
+        ) != (
+            after_hash.st_ino,
+            after_hash.st_dev,
+            after_hash.st_size,
+            after_hash.st_mtime_ns,
+        ):
+            return False
         checksum = base64.b64encode(raw_digest).decode("ascii")
-        put = self._runner(
-            [
-                "aws",
-                "s3api",
-                "put-object",
-                "--bucket",
-                bucket,
-                "--key",
-                key,
-                "--body",
-                str(path),
-                "--checksum-algorithm",
-                "SHA256",
-                "--checksum-sha256",
-                checksum,
-                "--region",
-                self._region,
-                "--output",
-                "json",
-                "--no-cli-pager",
-            ],
-            self._environment,
-        )
+        remaining = float(deadline) - monotonic()
+        if remaining <= 0:
+            return False
+        try:
+            put = self._runner(
+                [
+                    "aws",
+                    "s3api",
+                    "put-object",
+                    "--bucket",
+                    bucket,
+                    "--key",
+                    key,
+                    "--body",
+                    str(path),
+                    "--checksum-algorithm",
+                    "SHA256",
+                    "--checksum-sha256",
+                    checksum,
+                    "--region",
+                    self._region,
+                    "--output",
+                    "json",
+                    "--no-cli-pager",
+                ],
+                self._environment,
+                remaining,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return False
         put_value = _load_json_output(put)
         if put_value is None or put_value.get("ChecksumSHA256") != checksum:
             return False
-        head = self._runner(
-            [
-                "aws",
-                "s3api",
-                "head-object",
-                "--bucket",
-                bucket,
-                "--key",
-                key,
-                "--checksum-mode",
-                "ENABLED",
-                "--region",
-                self._region,
-                "--output",
-                "json",
-                "--no-cli-pager",
-            ],
-            self._environment,
-        )
+        after_upload = path.stat()
+        if (
+            before.st_ino,
+            before.st_dev,
+            before.st_size,
+            before.st_mtime_ns,
+        ) != (
+            after_upload.st_ino,
+            after_upload.st_dev,
+            after_upload.st_size,
+            after_upload.st_mtime_ns,
+        ):
+            return False
+        remaining = float(deadline) - monotonic()
+        if remaining <= 0:
+            return False
+        try:
+            head = self._runner(
+                [
+                    "aws",
+                    "s3api",
+                    "head-object",
+                    "--bucket",
+                    bucket,
+                    "--key",
+                    key,
+                    "--checksum-mode",
+                    "ENABLED",
+                    "--region",
+                    self._region,
+                    "--output",
+                    "json",
+                    "--no-cli-pager",
+                ],
+                self._environment,
+                remaining,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return False
         head_value = _load_json_output(head)
         return (
             head_value is not None
             and head_value.get("ChecksumSHA256") == checksum
+            and monotonic() < float(deadline)
         )
 
 
@@ -300,7 +398,10 @@ def _stable_checkpoint(
                 ):
                     return len(data), hashlib.sha256(data).hexdigest()
             previous = identity
-        sleep(0.25)
+        remaining = deadline - monotonic()
+        if remaining <= 0:
+            break
+        sleep(min(0.25, remaining))
     return None
 
 
@@ -328,6 +429,9 @@ def handle_interruption(
 ) -> InterruptionResult:
     """Checkpoint both arms and durably receipt them as one resumable pair."""
 
+    start = monotonic()
+    deadline = start + float(request.timeout_seconds)
+    checkpoint_deadline = deadline - float(request.upload_reserve_seconds)
     signal_errors: dict[str, str] = {}
     for arm in _ARMS:
         try:
@@ -335,17 +439,22 @@ def handle_interruption(
         except OSError as error:
             signal_errors[arm] = type(error).__name__
 
-    deadline = monotonic() + float(request.timeout_seconds)
-    checkpoint_rows = []
-    all_verified = not signal_errors
+    stable_by_arm: dict[str, tuple[int, str] | None] = {}
     for arm in _ARMS:
         path = request.checkpoint_paths[arm]
-        stable = _stable_checkpoint(
+        stable_by_arm[arm] = _stable_checkpoint(
             path,
-            deadline=deadline,
+            deadline=checkpoint_deadline,
             monotonic=monotonic,
             sleep=sleep,
         )
+    checkpoint_rows = []
+    all_verified = not signal_errors and all(
+        stable_by_arm[arm] is not None for arm in _ARMS
+    )
+    for arm in _ARMS:
+        path = request.checkpoint_paths[arm]
+        stable = stable_by_arm[arm]
         uri = _checkpoint_uri(request, arm)
         if stable is None:
             row = {
@@ -360,7 +469,15 @@ def handle_interruption(
             all_verified = False
         else:
             size, digest = stable
-            uploaded = object_store.put_verified(path, uri)
+            uploaded = (
+                monotonic() < deadline
+                and object_store.put_verified(
+                    path,
+                    uri,
+                    deadline=deadline,
+                    monotonic=monotonic,
+                )
+            )
             row = {
                 "arm": arm,
                 "bytes": size,
@@ -373,6 +490,12 @@ def handle_interruption(
             all_verified = all_verified and uploaded
         checkpoint_rows.append(row)
 
+    deadline_exhausted = monotonic() >= checkpoint_deadline and any(
+        stable_by_arm[arm] is None for arm in _ARMS
+    )
+    if monotonic() >= deadline:
+        all_verified = False
+        deadline_exhausted = True
     receipt = {
         "checkpoints": checkpoint_rows,
         "code_commit": request.code_commit,
@@ -382,28 +505,59 @@ def handle_interruption(
         "provider": PROVIDER,
         "receipt_type": "aws-p5-paired-interruption",
         "release_sha256": request.release_sha256,
-        "resumable": all_verified,
-        "schema_version": 1,
+        "deadline_exhausted": deadline_exhausted,
+        "resumable": False,
+        "schema_version": 2,
         "seed": request.seed,
         "signal_errors": signal_errors,
+        "timeout_seconds": float(request.timeout_seconds),
+        "upload_reserve_seconds": float(request.upload_reserve_seconds),
     }
     _write_receipt(request.receipt_path, receipt)
-    receipt_uploaded = object_store.put_verified(
-        request.receipt_path, _receipt_uri(request)
+    receipt_uploaded = (
+        monotonic() < deadline
+        and object_store.put_verified(
+            request.receipt_path,
+            _receipt_uri(request),
+            deadline=deadline,
+            monotonic=monotonic,
+        )
     )
-    if all_verified and not receipt_uploaded:
-        receipt["resumable"] = False
+    resumable = False
+    if all_verified and receipt_uploaded and monotonic() < deadline:
+        receipt["resumable"] = True
         _write_receipt(request.receipt_path, receipt)
-        object_store.put_verified(request.receipt_path, _receipt_uri(request))
-        all_verified = False
+        receipt_uploaded = object_store.put_verified(
+            request.receipt_path,
+            _receipt_uri(request),
+            deadline=deadline,
+            monotonic=monotonic,
+        )
+        resumable = receipt_uploaded and monotonic() < deadline
+        if not resumable:
+            receipt["resumable"] = False
+            receipt["deadline_exhausted"] = monotonic() >= deadline
+            _write_receipt(request.receipt_path, receipt)
+            if monotonic() < deadline:
+                receipt_uploaded = object_store.put_verified(
+                    request.receipt_path,
+                    _receipt_uri(request),
+                    deadline=deadline,
+                    monotonic=monotonic,
+                )
+    else:
+        receipt["deadline_exhausted"] = (
+            receipt["deadline_exhausted"] or monotonic() >= deadline
+        )
+        _write_receipt(request.receipt_path, receipt)
 
     return InterruptionResult(
-        resumable=all_verified,
+        resumable=resumable,
         exit_code=(
-            RESUMABLE_EXIT_CODE if all_verified else NON_RESUMABLE_EXIT_CODE
+            RESUMABLE_EXIT_CODE if resumable else NON_RESUMABLE_EXIT_CODE
         ),
         receipt_path=request.receipt_path,
-        receipt_upload_verified=receipt_uploaded and all_verified,
+        receipt_upload_verified=receipt_uploaded,
     )
 
 
@@ -476,6 +630,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--s3-root", required=True)
     parser.add_argument("--receipt", type=Path, required=True)
     parser.add_argument("--timeout-seconds", type=float, default=120.0)
+    parser.add_argument("--upload-reserve-seconds", type=float, default=30.0)
     parser.add_argument("--poll-seconds", type=float, default=5.0)
     return parser
 
@@ -494,7 +649,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             region=region,
             environment={
                 name: os.environ[name]
-                for name in ("AWS_REGION", "HOME", "PATH")
+                for name in ("AWS_REGION", "HOME", "LANG", "LC_ALL", "PATH")
                 if name in os.environ
             },
         )
@@ -519,6 +674,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "split90": arguments.split90_config_sha256,
             },
             timeout_seconds=arguments.timeout_seconds,
+            upload_reserve_seconds=arguments.upload_reserve_seconds,
         )
         result = handle_interruption(request, object_store=store)
         report = {

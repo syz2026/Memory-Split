@@ -20,10 +20,8 @@
   "instance_type": "p5.48xlarge",
   "process_env_allowlist": [
     "AWS_REGION",
-    "HOME",
     "LANG",
-    "LC_ALL",
-    "PATH"
+    "LC_ALL"
   ],
   "profile_id": "aws-p5.48xlarge",
   "provider": "aws-p5.48xlarge",
@@ -31,7 +29,9 @@
   "runtime": {
     "ami_id_env": "MS_AWS_AMI_ID",
     "container_digest_env": "MS_CONTAINER_DIGEST",
-    "region_env": "AWS_REGION"
+    "region_env": "AWS_REGION",
+    "runtime_gid_env": "MS_RUNTIME_GID",
+    "runtime_uid_env": "MS_RUNTIME_UID"
   },
   "schema_version": 1,
   "storage": {

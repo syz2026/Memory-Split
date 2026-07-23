@@ -5,7 +5,7 @@
   "materialization": "s3",
   "provider": "aws-p5.48xlarge",
   "relative_path": "dataset",
-  "required_receipt": "dataset/corpus-receipt.json",
+  "required_receipt": "dataset/receipt.json",
   "required_sidecars": [
     "dense_target_weights",
     "split90_target_weights"

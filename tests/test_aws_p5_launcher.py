@@ -4,9 +4,12 @@ import base64
 import fcntl
 import hashlib
 import json
+import os
 import signal
 import subprocess
 import sys
+import time
+import zipfile
 from copy import deepcopy
 from pathlib import Path
 from urllib.error import HTTPError
@@ -15,6 +18,8 @@ import pytest
 import yaml
 
 import cluster.aws.p5.interruption_checkpoint as interruption_module
+import cluster.aws.p5.bootstrap as bootstrap_module
+import cluster.aws.p5.launch_seed_pair as launch_module
 from cluster.aws.p5.bootstrap import (
     BootstrapError,
     build_bootstrap_receipt,
@@ -35,7 +40,9 @@ from cluster.aws.p5.interruption_checkpoint import (
 from cluster.aws.p5.launch_seed_pair import (
     LaunchError,
     load_launch_plan,
+    preflight_trainer_contract,
     render_plan,
+    render_trainer_preflight,
     supervise_pair,
 )
 from cluster.aws.p5.profile import (
@@ -53,16 +60,23 @@ HEX = {
     "ordered": "3" * 64,
 }
 CODE_COMMIT = "4" * 40
+CONTAINER_IMAGE = (
+    "public.ecr.aws/pytorch/pytorch-training:2.4.0-gpu-py311"
+    "@sha256:"
+    + "a" * 64
+)
+BOOT_ID = "01234567-89ab-4cde-8f01-23456789abcd"
+RUNTIME_UID = os.getuid() or 1000
+RUNTIME_GID = os.getgid() or 1000
 SAFE_ENVIRONMENT = {
     "AWS_REGION": "us-east-1",
-    "HOME": "/home/operator",
     "LANG": "C.UTF-8",
     "LC_ALL": "C.UTF-8",
-    "PATH": "/usr/local/bin:/usr/bin:/bin",
-    "PYTHONPATH": ".",
     "MS_S3_ROOT": "s3://memorysplit-prod/cohort-v2",
     "MS_AWS_AMI_ID": "ami-0123456789abcdef0",
     "MS_CONTAINER_DIGEST": "sha256:" + "a" * 64,
+    "MS_RUNTIME_GID": str(RUNTIME_GID),
+    "MS_RUNTIME_UID": str(RUNTIME_UID),
 }
 H100_NAMES = ("NVIDIA H100 80GB HBM3",) * 8
 
@@ -114,49 +128,130 @@ def _write_config(path: Path, *, seed: int, arm: str) -> Path:
     return path
 
 
-def _sidecar_set(path: str, content: bytes) -> dict:
+def _artifact(root: Path, relative: str, content: bytes) -> dict:
+    path = root / relative
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(content)
     return {
-        "artifacts": [
-            {
-                "bytes": len(content),
-                "path": path,
-                "sha256": hashlib.sha256(content).hexdigest(),
-            }
-        ],
+        "bytes": len(content),
+        "path": relative,
+        "sha256": hashlib.sha256(content).hexdigest(),
+    }
+
+
+def _sidecar_set(root: Path, name: str, chunks: list[bytes]) -> dict:
+    artifacts = [
+        _artifact(
+            root,
+            f"sidecars/{name}/shard-{index:05d}-of-{len(chunks):05d}.bin",
+            chunk,
+        )
+        for index, chunk in enumerate(chunks)
+    ]
+    content = b"".join(chunks)
+    return {
+        "artifacts": artifacts,
         "dtype": "uint8",
         "items": len(content),
-        "ordered_stream_sha256": hashlib.sha256(content).hexdigest(),
+        "name": name,
+        "stream_sha256": hashlib.sha256(content).hexdigest(),
     }
 
 
 def _launcher_fixture(tmp_path: Path, seed: int = 1) -> dict[str, Path | dict]:
-    repo_root = tmp_path / "release"
     scratch_root = tmp_path / "scratch"
+    repo_root = scratch_root / "releases" / HEX["release"]
     repo_root.mkdir(parents=True)
-    scratch_root.mkdir(parents=True)
+    scratch_root.mkdir(parents=True, exist_ok=True)
 
     dataset = scratch_root / "dataset"
-    dense_bytes = b"\x01\x01\x01\x01"
-    split_bytes = b"\x01\x00\x01\x00"
-    dense_sidecar = dataset / "sidecars" / "dense" / "000.bin"
-    split_sidecar = dataset / "sidecars" / "split90" / "000.bin"
-    dense_sidecar.parent.mkdir(parents=True)
-    split_sidecar.parent.mkdir(parents=True)
-    dense_sidecar.write_bytes(dense_bytes)
-    split_sidecar.write_bytes(split_bytes)
-    corpus = {
-        "format": "memorysplit-parallel-corpus-v2",
-        "ordered_stream_sha256": HEX["ordered"],
-        "sidecar_sets": {
-            "dense_target_weights": _sidecar_set(
-                "sidecars/dense/000.bin", dense_bytes
-            ),
-            "split90_target_weights": _sidecar_set(
-                "sidecars/split90/000.bin", split_bytes
-            ),
-        },
+    assignments = [
+        {
+            "shard_count": 2,
+            "shard_index": index,
+            "token_end": (index + 1) * 4,
+            "token_start": index * 4,
+            "update_end": index + 1,
+            "update_start": index,
+        }
+        for index in range(2)
+    ]
+    assignment_bytes = b"".join(
+        (
+            json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n"
+        ).encode("ascii")
+        for value in assignments
+    )
+    foundation = {
+        "assignments.jsonl": assignment_bytes,
+        "catalog.jsonl": b'{"fixture":"catalog"}\n',
+        "metadata.jsonl": b'{"fixture":"metadata"}\n',
+        "schedule.jsonl": b'{"fixture":"schedule"}\n',
     }
-    corpus_path = _write_json(dataset / "corpus-receipt.json", corpus)
+    token_values = range(8)
+    token_bytes = b"".join(value.to_bytes(2, "little") for value in token_values)
+    token_chunks = [token_bytes[:8], token_bytes[8:]]
+    artifacts = [
+        *(
+            _artifact(dataset, relative, content)
+            for relative, content in foundation.items()
+        ),
+        *(
+            _artifact(
+                dataset,
+                f"shards/shard-{index:05d}-of-00002.bin",
+                content,
+            )
+            for index, content in enumerate(token_chunks)
+        ),
+    ]
+    artifacts.sort(key=lambda artifact: artifact["path"])
+    dense_chunks = [b"\x01" * 4, b"\x01\x01\x00\x00"]
+    split_chunks = [b"\x01\x00\x01\x00", b"\x01\x00\x00\x00"]
+    corpus = {
+        "artifacts": artifacts,
+        "assignments_sha256": hashlib.sha256(assignment_bytes).hexdigest(),
+        "build_id": "8" * 64,
+        "catalog_sha256": hashlib.sha256(
+            foundation["catalog.jsonl"]
+        ).hexdigest(),
+        "compiler_version": "metadata-first-foundation-v1",
+        "config": {
+            "allow_fewer_shards": False,
+            "lane_weights": [{"lane": "natural", "weight": 1}],
+            "shard_count": 2,
+            "update_tokens": 4,
+        },
+        "format": "memorysplit-parallel-corpus-v2",
+        "logical_tokens": 6,
+        "merkle_root_sha256": "9" * 64,
+        "metadata_sha256": hashlib.sha256(
+            foundation["metadata.jsonl"]
+        ).hexdigest(),
+        "ordered_stream_sha256": HEX["ordered"],
+        "packed_stream_sha256": hashlib.sha256(token_bytes).hexdigest(),
+        "packed_tokens": 8,
+        "padding_tokens": 2,
+        "record_count": 1,
+        "renderer_id": "fixture-renderer-v1",
+        "schedule_sha256": hashlib.sha256(
+            foundation["schedule.jsonl"]
+        ).hexdigest(),
+        "shard_count": 2,
+        "sidecar_sets": [
+            _sidecar_set(
+                dataset,
+                "dense_target_weights",
+                dense_chunks,
+            ),
+            _sidecar_set(
+                dataset,
+                "split90_target_weights",
+                split_chunks,
+            ),
+        ],
+    }
+    corpus_path = _write_json(dataset / "receipt.json", corpus)
 
     configs = {}
     for arm in ("dense", "split90"):
@@ -165,12 +260,97 @@ def _launcher_fixture(tmp_path: Path, seed: int = 1) -> dict[str, Path | dict]:
             seed=seed,
             arm=arm,
         )
+    release_sources = {
+        "scripts/run_train.py": (
+            "import argparse\n"
+            "parser = argparse.ArgumentParser()\n"
+            "parser.add_argument('--resume-path')\n"
+            "parser.add_argument('--resume-sha256')\n"
+        ),
+        "train/data.py": (
+            "PARALLEL_SIDECAR_V2_CONTRACT = {'format': "
+            "'memorysplit-parallel-corpus-v2'}\n"
+            "def load(train_corpus, sidecar_name):\n"
+            "    return train_corpus, sidecar_name\n"
+        ),
+        "train/trainer.py": (
+            "import os, signal\n"
+            "def train(cfg, *, resume_path=None, resume_sha256=None):\n"
+            "    signal.signal(signal.SIGUSR1, lambda *_: None)\n"
+            "    return os.environ['MS_RANK_ZERO_PID_FILE']\n"
+        ),
+    }
+    for relative, content in release_sources.items():
+        path = repo_root / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content, encoding="utf-8")
+    member_paths = sorted(
+        [
+            *release_sources,
+            *(
+                path.relative_to(repo_root).as_posix()
+                for path in configs.values()
+            ),
+        ]
+    )
+    member_rows = [
+        {
+            "bytes": (repo_root / relative).stat().st_size,
+            "git_blob": "5" * 40,
+            "git_mode": "100644",
+            "path": relative,
+            "sha256": _sha256(repo_root / relative),
+        }
+        for relative in member_paths
+    ]
+    release_metadata = {
+        "members": member_rows,
+        "package_format_version": 1,
+        "provider": "aws-p5.48xlarge",
+        "schema_version": 1,
+        "seed_assignment": {
+            "arms": ["dense", "split90"],
+            "cohort_id": "memorysplit-confirmatory-v2-360m-n5",
+            "provider": "aws-p5.48xlarge",
+            "seeds": [1, 2, 3, 4],
+        },
+        "source": {"commit": CODE_COMMIT, "dirty": False},
+    }
+    metadata_path = repo_root / "RELEASE-METADATA.json"
+    metadata_path.write_text(
+        json.dumps(release_metadata, indent=2, sort_keys=True) + "\n",
+        encoding="ascii",
+    )
+    checksum_paths = sorted([*member_paths, "RELEASE-METADATA.json"])
+    sums_path = repo_root / "SHA256SUMS"
+    sums_path.write_text(
+        "".join(
+            f"{_sha256(repo_root / relative)}  {relative}\n"
+            for relative in checksum_paths
+        ),
+        encoding="ascii",
+    )
+    release_members_sha256 = _sha256(sums_path)
+    for path in repo_root.rglob("*"):
+        if path.is_file():
+            path.chmod(0o444)
+    for path in sorted(
+        (path for path in repo_root.rglob("*") if path.is_dir()),
+        key=lambda path: len(path.parts),
+        reverse=True,
+    ):
+        path.chmod(0o555)
+    repo_root.chmod(0o555)
 
     bootstrap = {
+        "account_id": "123456789012",
         "ami_id": SAFE_ENVIRONMENT["MS_AWS_AMI_ID"],
+        "boot_id": BOOT_ID,
         "code_commit": CODE_COMMIT,
         "cohort_assignment_sha256": HEX["cohort"],
+        "container_image": CONTAINER_IMAGE,
         "container_digest": SAFE_ENVIRONMENT["MS_CONTAINER_DIGEST"],
+        "corpus_build_id": corpus["build_id"],
         "corpus_receipt_sha256": _sha256(corpus_path),
         "durable_upload_verified": True,
         "instance_id": "i-0123456789abcdef0",
@@ -185,8 +365,17 @@ def _launcher_fixture(tmp_path: Path, seed: int = 1) -> dict[str, Path | dict]:
         "provider": "aws-p5.48xlarge",
         "receipt_type": "aws-p5-bootstrap",
         "region": SAFE_ENVIRONMENT["AWS_REGION"],
+        "release_members_sha256": release_members_sha256,
+        "release_root": f"releases/{HEX['release']}",
         "release_sha256": HEX["release"],
-        "schema_version": 1,
+        "role_arn": (
+            "arn:aws:sts::123456789012:"
+            "assumed-role/MemorySplitP5Role/i-0123456789abcdef0"
+        ),
+        "role_name": "MemorySplitP5Role",
+        "runtime_gid": RUNTIME_GID,
+        "runtime_uid": RUNTIME_UID,
+        "schema_version": 2,
         "scratch_root": "/mnt/memorysplit",
     }
     bootstrap_path = _write_json(
@@ -203,7 +392,7 @@ def _launcher_fixture(tmp_path: Path, seed: int = 1) -> dict[str, Path | dict]:
         runs.append(
             {
                 "arm": arm,
-                "checkpoint": f"runs/seed-{seed}/{arm}/checkpoint.pt",
+                "checkpoint": f"runs/seed-{seed}/{arm}/run/ckpt.pt",
                 "config": config.relative_to(repo_root).as_posix(),
                 "config_sha256": _sha256(config),
                 "cpu_affinity": cpus,
@@ -227,25 +416,35 @@ def _launcher_fixture(tmp_path: Path, seed: int = 1) -> dict[str, Path | dict]:
         },
         "profile_sha256": _sha256(PROFILE_PATH),
         "provider": "aws-p5.48xlarge",
+        "release_members_sha256": release_members_sha256,
         "release_sha256": HEX["release"],
         "runs": runs,
         "schema_version": 1,
         "seed": seed,
     }
-    manifest_path = _write_json(repo_root / "run-manifest.json", manifest)
+    manifest_path = _write_json(
+        scratch_root / "staging" / "run-manifest.json", manifest
+    )
     return {
         "repo_root": repo_root,
         "scratch_root": scratch_root,
         "manifest": manifest,
         "manifest_path": manifest_path,
         "corpus_path": corpus_path,
+        "corpus": corpus,
         "bootstrap_path": bootstrap_path,
         "configs": configs,
+        "metadata_path": metadata_path,
+        "sums_path": sums_path,
+        "release_members_sha256": release_members_sha256,
     }
 
 
 def _load_fixture_plan(fixture: dict, *, seed: int | None = None, **kwargs):
     manifest = fixture["manifest"]
+    kwargs.setdefault("observed_instance_id", "i-0123456789abcdef0")
+    kwargs.setdefault("observed_boot_id", BOOT_ID)
+    kwargs.setdefault("enforce_profile_scratch", False)
     return load_launch_plan(
         seed=manifest["seed"] if seed is None else seed,
         manifest_path=fixture["manifest_path"],
@@ -256,8 +455,25 @@ def _load_fixture_plan(fixture: dict, *, seed: int | None = None, **kwargs):
         observed_instance_type="p5.48xlarge",
         gpu_names=H100_NAMES,
         port_available=lambda _port: True,
+        semantic_corpus_verifier=lambda _root: fixture["corpus"],
         **kwargs,
     )
+
+
+def _refresh_corpus_bindings(fixture: dict) -> None:
+    _write_json(fixture["corpus_path"], fixture["corpus"])
+    fixture["manifest"]["corpus_receipt"]["sha256"] = _sha256(
+        fixture["corpus_path"]
+    )
+    bootstrap = json.loads(
+        fixture["bootstrap_path"].read_text(encoding="utf-8")
+    )
+    bootstrap["corpus_receipt_sha256"] = _sha256(fixture["corpus_path"])
+    _write_json(fixture["bootstrap_path"], bootstrap)
+    fixture["manifest"]["bootstrap_receipt"]["sha256"] = _sha256(
+        fixture["bootstrap_path"]
+    )
+    _write_json(fixture["manifest_path"], fixture["manifest"])
 
 
 @pytest.mark.parametrize("seed", [1, 2, 3, 4])
@@ -271,39 +487,63 @@ def test_dry_run_renders_exact_symmetric_four_plus_four_commands(tmp_path, seed)
     dense, split90 = report["commands"]
     base_port = 29500 + seed * 2
     assert dense["arm"] == "dense"
-    assert dense["env"]["CUDA_VISIBLE_DEVICES"] == "0,1,2,3"
-    assert dense["argv"] == [
-        "torchrun",
-        "--standalone",
+    assert dense["argv"][0:3] == ["docker", "run", "--rm"]
+    assert dense["argv"][-12:] == [
+        "/opt/conda/bin/python",
+        "-m",
+        "torch.distributed.run",
+        "--nnodes=1",
         "--nproc_per_node=4",
-        f"--master_port={base_port}",
-        "scripts/run_train.py",
+        "--rdzv_backend=c10d",
+        f"--rdzv_endpoint=127.0.0.1:{base_port}",
+        "/workspace/scripts/run_train.py",
         "--config",
-        f"configs/360m-v2/dense-s{seed}.yaml",
+        "/runtime/config.yaml",
+        "--resume",
+        "none",
     ]
+    assert "--standalone" not in dense["argv"]
+    assert "torchrun" not in dense["argv"]
+    assert CONTAINER_IMAGE in dense["argv"]
+    assert "device=0,1,2,3" in dense["argv"]
+    assert "--read-only" in dense["argv"]
+    assert "--network=host" in dense["argv"]
+    assert "--ipc=host" in dense["argv"]
+    assert "--pid=host" in dense["argv"]
+    assert ["--user", f"{RUNTIME_UID}:{RUNTIME_GID}"] == dense["argv"][
+        dense["argv"].index("--user") : dense["argv"].index("--user") + 2
+    ]
+    assert (
+        f"type=bind,src={fixture['repo_root']},dst=/workspace,readonly"
+        in dense["argv"]
+    )
+    assert (
+        f"type=bind,src={fixture['scratch_root'] / 'dataset'},"
+        "dst=/dataset,readonly"
+        in dense["argv"]
+    )
     assert dense["cpu_affinity"] == [0, 95]
     assert split90["arm"] == "split90"
-    assert split90["env"]["CUDA_VISIBLE_DEVICES"] == "4,5,6,7"
-    assert split90["argv"] == [
-        "torchrun",
-        "--standalone",
-        "--nproc_per_node=4",
-        f"--master_port={base_port + 1}",
-        "scripts/run_train.py",
-        "--config",
-        f"configs/360m-v2/split90-s{seed}.yaml",
-    ]
-    assert split90["cpu_affinity"] == [96, 191]
-    assert dense["env"]["MS_DATA_LOADER_WORKERS"] == "16"
-    assert split90["env"]["MS_DATA_LOADER_WORKERS"] == "16"
-    assert dense["env"]["MS_DATA_ROOT"] == str(fixture["scratch_root"] / "dataset")
-    assert split90["env"]["MS_DATA_ROOT"] == str(
-        fixture["scratch_root"] / "dataset"
+    assert split90["argv"][-6] == (
+        f"--rdzv_endpoint=127.0.0.1:{base_port + 1}"
     )
-    assert dense["env"]["MS_RUN_ROOT"] == str(fixture["scratch_root"])
-    assert split90["env"]["MS_RUN_ROOT"] == str(fixture["scratch_root"])
-    assert dense["env"]["PYTHONPATH"] == str(fixture["repo_root"])
-    assert split90["env"]["PYTHONPATH"] == str(fixture["repo_root"])
+    assert "device=4,5,6,7" in split90["argv"]
+    assert split90["cpu_affinity"] == [96, 191]
+    assert dense["env"] == {"PATH": "/usr/bin:/bin"}
+    assert split90["env"] == {"PATH": "/usr/bin:/bin"}
+    assert dense["runtime_config"]["train_corpus"] == "/dataset"
+    assert dense["runtime_config"]["out_dir"] == "/output/run"
+    assert dense["runtime_config"]["sidecar_name"] == "dense_target_weights"
+    assert split90["runtime_config"]["train_corpus"] == "/dataset"
+    assert split90["runtime_config"]["out_dir"] == "/output/run"
+    assert (
+        split90["runtime_config"]["sidecar_name"]
+        == "split90_target_weights"
+    )
+    assert len(dense["runtime_config_sha256"]) == 64
+    assert len(dense["scientific_config_sha256"]) == 64
+    assert not Path(dense["runtime_config_path"]).exists()
+    assert not Path(split90["runtime_config_path"]).exists()
     assert not any(
         marker in name
         for command in report["commands"]
@@ -360,8 +600,12 @@ def test_launcher_rejects_equal_or_occupied_ports(tmp_path):
             scratch_root=fixture["scratch_root"],
             environment=SAFE_ENVIRONMENT,
             observed_instance_type="p5.48xlarge",
+            observed_instance_id="i-0123456789abcdef0",
+            observed_boot_id=BOOT_ID,
             gpu_names=H100_NAMES,
             port_available=lambda port: port != occupied,
+            semantic_corpus_verifier=lambda _root: fixture["corpus"],
+            enforce_profile_scratch=False,
         )
 
 
@@ -387,8 +631,12 @@ def test_launcher_fails_closed_on_wrong_instance_or_gpus(
             scratch_root=fixture["scratch_root"],
             environment=SAFE_ENVIRONMENT,
             observed_instance_type=instance_type,
+            observed_instance_id="i-0123456789abcdef0",
+            observed_boot_id=BOOT_ID,
             gpu_names=gpu_names,
             port_available=lambda _port: True,
+            semantic_corpus_verifier=lambda _root: fixture["corpus"],
+            enforce_profile_scratch=False,
         )
 
 
@@ -417,19 +665,295 @@ def test_launcher_rejects_wrong_config_or_corpus_hash(tmp_path):
         _load_fixture_plan(fixture)
 
 
+def test_launcher_preserves_scientific_config_while_replacing_locations(tmp_path):
+    fixture = _launcher_fixture(tmp_path)
+    report = render_plan(_load_fixture_plan(fixture))
+
+    for command in report["commands"]:
+        source = yaml.safe_load(
+            fixture["configs"][command["arm"]].read_text(encoding="utf-8")
+        )
+        runtime = command["runtime_config"]
+        assert {
+            key: value
+            for key, value in runtime.items()
+            if key not in {"train_corpus", "out_dir"}
+        } == {
+            key: value
+            for key, value in source.items()
+            if key not in {"train_corpus", "out_dir"}
+        }
+        assert runtime["train_corpus"] == "/dataset"
+        assert runtime["out_dir"] == "/output/run"
+
+
+def test_trainer_contract_preflight_runs_inside_pinned_container(tmp_path):
+    fixture = _launcher_fixture(tmp_path)
+    plan = _load_fixture_plan(fixture)
+    calls = []
+
+    def runner(argv, environment, timeout):
+        calls.append((list(argv), dict(environment), timeout))
+        return CommandResult(
+            0,
+            json.dumps(
+                {
+                    "rank_zero_pid_file": True,
+                    "resume_sha256": True,
+                    "sidecar_name": True,
+                    "sigusr1_checkpoint": True,
+                    "train_corpus": True,
+                },
+                sort_keys=True,
+            )
+            + "\n",
+            "",
+        )
+
+    preflight_trainer_contract(plan, runner=runner, timeout_seconds=90)
+
+    assert len(calls) == 1
+    argv, environment, timeout = calls[0]
+    assert argv == list(render_trainer_preflight(plan))
+    assert argv[:3] == ["docker", "run", "--rm"]
+    assert "--network=none" in argv
+    assert "--read-only" in argv
+    assert CONTAINER_IMAGE in argv
+    assert (
+        f"type=bind,src={fixture['repo_root']},dst=/workspace,readonly"
+        in argv
+    )
+    assert environment == {"PATH": "/usr/bin:/bin"}
+    assert timeout == 90
+
+
+def test_trainer_contract_preflight_fails_before_any_output_or_spawn(tmp_path):
+    fixture = _launcher_fixture(tmp_path)
+    plan = _load_fixture_plan(fixture)
+    spawner = _FakeSpawner(
+        {
+            "dense": _FakeProcess(101, [0]),
+            "split90": _FakeProcess(202, [0]),
+        }
+    )
+
+    def reject(_plan):
+        raise LaunchError("integrated trainer lacks SIGUSR1 checkpoint support")
+
+    with pytest.raises(LaunchError, match="SIGUSR1"):
+        supervise_pair(
+            plan,
+            spawner=spawner,
+            sleep=lambda _delay: None,
+            trainer_preflight=reject,
+        )
+
+    assert spawner.started == []
+    assert all(not launch.out_dir.exists() for launch in plan.arms)
+    assert all(
+        not launch.runtime_config_path.exists() for launch in plan.arms
+    )
+
+
+def test_trainer_contract_preflight_rejects_missing_capability(tmp_path):
+    plan = _load_fixture_plan(_launcher_fixture(tmp_path))
+    contract = {
+        "rank_zero_pid_file": True,
+        "resume_sha256": True,
+        "sidecar_name": True,
+        "sigusr1_checkpoint": False,
+        "train_corpus": True,
+    }
+
+    with pytest.raises(LaunchError, match="trainer contract|SIGUSR1"):
+        preflight_trainer_contract(
+            plan,
+            runner=lambda _argv, _environment, _timeout: CommandResult(
+                0,
+                json.dumps(contract, sort_keys=True) + "\n",
+                "",
+            ),
+        )
+
+
+def test_launcher_recomputes_every_verified_release_member(tmp_path):
+    fixture = _launcher_fixture(tmp_path)
+    trainer = fixture["repo_root"] / "train" / "trainer.py"
+    trainer.chmod(0o644)
+    trainer.write_text("print('tampered')\n", encoding="utf-8")
+
+    with pytest.raises(LaunchError, match="release|member|SHA-256"):
+        _load_fixture_plan(fixture)
+
+
+def test_launcher_rejects_release_root_or_member_binding_drift(tmp_path):
+    fixture = _launcher_fixture(tmp_path)
+    receipt = json.loads(fixture["bootstrap_path"].read_text(encoding="utf-8"))
+    receipt["release_root"] = "releases/" + "0" * 64
+    _write_json(fixture["bootstrap_path"], receipt)
+    fixture["manifest"]["bootstrap_receipt"]["sha256"] = _sha256(
+        fixture["bootstrap_path"]
+    )
+    _write_json(fixture["manifest_path"], fixture["manifest"])
+    with pytest.raises(LaunchError, match="release root|release"):
+        _load_fixture_plan(fixture)
+
+    fixture = _launcher_fixture(tmp_path / "members")
+    fixture["manifest"]["release_members_sha256"] = "0" * 64
+    _write_json(fixture["manifest_path"], fixture["manifest"])
+    with pytest.raises(LaunchError, match="release member"):
+        _load_fixture_plan(fixture)
+
+
+def test_launcher_requires_exact_profile_scratch_root(tmp_path):
+    fixture = _launcher_fixture(tmp_path)
+
+    with pytest.raises(LaunchError, match="/mnt/memorysplit|scratch"):
+        _load_fixture_plan(fixture, enforce_profile_scratch=True)
+
+
+@pytest.mark.parametrize(
+    ("argument", "value", "message"),
+    [
+        ("observed_instance_id", "i-0fedcba9876543210", "instance"),
+        (
+            "observed_boot_id",
+            "fedcba98-7654-4cba-8012-3456789abcde",
+            "boot",
+        ),
+    ],
+)
+def test_launcher_rejects_bootstrap_receipt_from_another_boot(
+    tmp_path,
+    argument,
+    value,
+    message,
+):
+    fixture = _launcher_fixture(tmp_path)
+
+    with pytest.raises(LaunchError, match=message):
+        _load_fixture_plan(fixture, **{argument: value})
+
+
 def test_launcher_rejects_missing_or_tampered_sidecar(tmp_path):
     fixture = _launcher_fixture(tmp_path)
     sidecar = (
         fixture["scratch_root"]
         / "dataset"
         / "sidecars"
-        / "split90"
-        / "000.bin"
+        / "split90_target_weights"
+        / "shard-00000-of-00002.bin"
     )
     sidecar.unlink()
 
     with pytest.raises(LaunchError, match="sidecar"):
         _load_fixture_plan(fixture)
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "legacy-sidecar-mapping",
+        "reordered-sidecar-sets",
+        "reordered-sidecar-artifacts",
+        "wrong-sidecar-stream",
+        "reordered-primary-artifacts",
+    ],
+)
+def test_launcher_rejects_noncanonical_task4_receipt_shapes(tmp_path, mutation):
+    fixture = _launcher_fixture(tmp_path)
+    corpus = fixture["corpus"]
+    if mutation == "legacy-sidecar-mapping":
+        corpus["sidecar_sets"] = {
+            value["name"]: value for value in corpus["sidecar_sets"]
+        }
+    elif mutation == "reordered-sidecar-sets":
+        corpus["sidecar_sets"].reverse()
+    elif mutation == "reordered-sidecar-artifacts":
+        corpus["sidecar_sets"][1]["artifacts"].reverse()
+    elif mutation == "wrong-sidecar-stream":
+        corpus["sidecar_sets"][1]["stream_sha256"] = "0" * 64
+    else:
+        corpus["artifacts"].reverse()
+    _refresh_corpus_bindings(fixture)
+
+    with pytest.raises(
+        LaunchError,
+        match="canonical|corpus|sidecar|artifact|order|stream",
+    ):
+        _load_fixture_plan(fixture)
+
+
+@pytest.mark.parametrize(
+    "relative",
+    [
+        "shards/shard-00000-of-00002.bin",
+        "sidecars/dense_target_weights/shard-00000-of-00002.bin",
+        "sidecars/split90_target_weights/shard-00001-of-00002.bin",
+    ],
+)
+def test_launcher_recomputes_every_task4_artifact_hash(tmp_path, relative):
+    fixture = _launcher_fixture(tmp_path)
+    artifact = fixture["scratch_root"] / "dataset" / relative
+    artifact.write_bytes(artifact.read_bytes() + b"\xff")
+
+    with pytest.raises(LaunchError, match="artifact|corpus|sidecar|digest|bytes"):
+        _load_fixture_plan(fixture)
+
+
+def test_launcher_recomputes_sidecar_ordered_stream_hash(tmp_path):
+    fixture = _launcher_fixture(tmp_path)
+    sidecar_set = fixture["corpus"]["sidecar_sets"][1]
+    artifact_record = sidecar_set["artifacts"][0]
+    artifact = fixture["scratch_root"] / "dataset" / artifact_record["path"]
+    payload = b"\x00" + artifact.read_bytes()[1:]
+    artifact.write_bytes(payload)
+    artifact_record["bytes"] = len(payload)
+    artifact_record["sha256"] = hashlib.sha256(payload).hexdigest()
+    _refresh_corpus_bindings(fixture)
+
+    with pytest.raises(LaunchError, match="stream|sidecar|corpus"):
+        _load_fixture_plan(fixture)
+
+
+def test_launcher_rejects_extra_or_symlinked_task4_artifacts(tmp_path):
+    fixture = _launcher_fixture(tmp_path)
+    extra = fixture["scratch_root"] / "dataset" / "shards" / "extra.bin"
+    extra.write_bytes(b"extra")
+    with pytest.raises(LaunchError, match="extra|namespace|corpus"):
+        _load_fixture_plan(fixture)
+
+    extra.unlink()
+    sidecar = (
+        fixture["scratch_root"]
+        / "dataset"
+        / fixture["corpus"]["sidecar_sets"][0]["artifacts"][0]["path"]
+    )
+    target = tmp_path / "outside.bin"
+    sidecar.replace(target)
+    sidecar.symlink_to(target)
+    with pytest.raises(LaunchError, match="unsafe|symlink|sidecar|corpus"):
+        _load_fixture_plan(fixture)
+
+
+def test_launcher_requires_canonical_task4_semantic_verifier(tmp_path):
+    fixture = _launcher_fixture(tmp_path)
+
+    with pytest.raises(LaunchError, match="Task 4|semantic|canonical"):
+        load_launch_plan(
+            seed=1,
+            manifest_path=fixture["manifest_path"],
+            profile_path=PROFILE_PATH,
+            repo_root=fixture["repo_root"],
+            scratch_root=fixture["scratch_root"],
+            environment=SAFE_ENVIRONMENT,
+            observed_instance_type="p5.48xlarge",
+            observed_instance_id="i-0123456789abcdef0",
+            observed_boot_id=BOOT_ID,
+            gpu_names=H100_NAMES,
+            port_available=lambda _port: True,
+            enforce_profile_scratch=False,
+        )
 
 
 def test_launcher_rejects_unverified_bootstrap_or_inherited_secret(tmp_path):
@@ -456,18 +980,30 @@ def test_launcher_rejects_unverified_bootstrap_or_inherited_secret(tmp_path):
             scratch_root=fixture["scratch_root"],
             environment=environment,
             observed_instance_type="p5.48xlarge",
+            observed_instance_id="i-0123456789abcdef0",
+            observed_boot_id=BOOT_ID,
             gpu_names=H100_NAMES,
             port_available=lambda _port: True,
+            semantic_corpus_verifier=lambda _root: fixture["corpus"],
+            enforce_profile_scratch=False,
         )
 
 
 class _FakeProcess:
-    def __init__(self, pid: int, polls: list[int | None], *, waited: int = -15):
+    def __init__(
+        self,
+        pid: int,
+        polls: list[int | None],
+        *,
+        waited: int = -15,
+        on_terminate=None,
+    ):
         self.pid = pid
         self._polls = list(polls)
         self._last = polls[-1]
         self.waited = waited
         self.terminated = False
+        self.on_terminate = on_terminate
 
     def poll(self):
         if self._polls:
@@ -479,6 +1015,8 @@ class _FakeProcess:
         return self.waited if self.terminated else int(self._last or 0)
 
     def terminate_tree(self):
+        if self.on_terminate is not None:
+            self.on_terminate()
         self.terminated = True
 
 
@@ -495,6 +1033,14 @@ class _FakeSpawner:
         return process
 
 
+def _pass_trainer_preflight(_plan):
+    return None
+
+
+def _pass_rank_zero_resolver(_plan, child_pids):
+    return dict(child_pids)
+
+
 def test_supervisor_records_both_pids_and_accepts_only_paired_success(tmp_path):
     fixture = _launcher_fixture(tmp_path)
     plan = _load_fixture_plan(fixture)
@@ -505,7 +1051,13 @@ def test_supervisor_records_both_pids_and_accepts_only_paired_success(tmp_path):
         }
     )
 
-    result = supervise_pair(plan, spawner=spawner, sleep=lambda _delay: None)
+    result = supervise_pair(
+        plan,
+        spawner=spawner,
+        sleep=lambda _delay: None,
+        trainer_preflight=_pass_trainer_preflight,
+        rank_zero_resolver=_pass_rank_zero_resolver,
+    )
 
     assert result.status == "completed"
     assert result.returncode == 0
@@ -532,6 +1084,8 @@ def test_supervisor_rejects_a_second_seed_pair_on_the_same_p5(tmp_path):
                     }
                 ),
                 sleep=lambda _delay: None,
+                trainer_preflight=_pass_trainer_preflight,
+                rank_zero_resolver=_pass_rank_zero_resolver,
             )
 
 
@@ -548,7 +1102,13 @@ def test_supervisor_preflights_both_output_directories_before_spawning(tmp_path)
     )
 
     with pytest.raises(LaunchError, match="output"):
-        supervise_pair(plan, spawner=spawner, sleep=lambda _delay: None)
+        supervise_pair(
+            plan,
+            spawner=spawner,
+            sleep=lambda _delay: None,
+            trainer_preflight=_pass_trainer_preflight,
+            rank_zero_resolver=_pass_rank_zero_resolver,
+        )
 
     assert spawner.started == []
     assert dense.terminated is False
@@ -561,7 +1121,13 @@ def test_supervisor_propagates_failure_and_terminates_peer(tmp_path):
     split90 = _FakeProcess(202, [None])
     spawner = _FakeSpawner({"dense": dense, "split90": split90})
 
-    result = supervise_pair(plan, spawner=spawner, sleep=lambda _delay: None)
+    result = supervise_pair(
+        plan,
+        spawner=spawner,
+        sleep=lambda _delay: None,
+        trainer_preflight=_pass_trainer_preflight,
+        rank_zero_resolver=_pass_rank_zero_resolver,
+    )
 
     assert result.status == "failed"
     assert result.returncode == 7
@@ -579,7 +1145,13 @@ def test_supervisor_terminates_first_arm_when_second_spawn_fails(tmp_path):
     )
 
     with pytest.raises(LaunchError, match="spawn"):
-        supervise_pair(plan, spawner=spawner, sleep=lambda _delay: None)
+        supervise_pair(
+            plan,
+            spawner=spawner,
+            sleep=lambda _delay: None,
+            trainer_preflight=_pass_trainer_preflight,
+            rank_zero_resolver=_pass_rank_zero_resolver,
+        )
 
     assert dense.terminated is True
 
@@ -602,19 +1174,119 @@ def test_supervisor_fail_stops_both_arms_when_interruption_handling_fails(
             interruption_handler=lambda _plan, _pids, _notice: (_ for _ in ()).throw(
                 RuntimeError("receipt failed")
             ),
+            trainer_preflight=_pass_trainer_preflight,
+            rank_zero_resolver=_pass_rank_zero_resolver,
         )
 
     assert dense.terminated is True
     assert split90.terminated is True
 
 
+def test_supervisor_requires_both_preexisting_rank_zero_pid_files(tmp_path):
+    fixture = _launcher_fixture(tmp_path)
+    plan = _load_fixture_plan(fixture)
+    dense = _FakeProcess(101, [None])
+    split90 = _FakeProcess(202, [None])
+    spawner = _FakeSpawner({"dense": dense, "split90": split90})
+
+    with pytest.raises(LaunchError, match="rank-zero PID"):
+        supervise_pair(
+            plan,
+            spawner=spawner,
+            sleep=lambda _delay: None,
+            trainer_preflight=_pass_trainer_preflight,
+            rank_zero_resolver=lambda _plan, _pids: (_ for _ in ()).throw(
+                LaunchError("rank-zero PID files were not created")
+            ),
+        )
+
+    assert dense.terminated is True
+    assert split90.terminated is True
+
+
+@pytest.mark.parametrize("signum", [signal.SIGTERM, signal.SIGHUP, signal.SIGINT])
+def test_supervisor_holds_lock_while_signal_stops_both_process_groups(
+    tmp_path,
+    signum,
+):
+    fixture = _launcher_fixture(tmp_path)
+    plan = _load_fixture_plan(fixture)
+    lock_path = fixture["scratch_root"] / ".p5-seed-pair.lock"
+    lock_observations = []
+
+    def assert_lock_held():
+        with lock_path.open("r+b") as contender:
+            try:
+                fcntl.flock(
+                    contender.fileno(),
+                    fcntl.LOCK_EX | fcntl.LOCK_NB,
+                )
+            except BlockingIOError:
+                lock_observations.append(True)
+            else:
+                fcntl.flock(contender.fileno(), fcntl.LOCK_UN)
+                lock_observations.append(False)
+
+    dense = _FakeProcess(101, [None], on_terminate=assert_lock_held)
+    split90 = _FakeProcess(202, [None], on_terminate=assert_lock_held)
+    result = supervise_pair(
+        plan,
+        spawner=_FakeSpawner({"dense": dense, "split90": split90}),
+        sleep=lambda _delay: None,
+        trainer_preflight=_pass_trainer_preflight,
+        rank_zero_resolver=_pass_rank_zero_resolver,
+        shutdown_source=lambda: signum,
+    )
+
+    assert result.status == "terminated"
+    assert result.returncode == 128 + signum
+    assert dense.terminated is True
+    assert split90.terminated is True
+    assert lock_observations == [True, True]
+
+
+def test_installed_shutdown_handlers_capture_and_restore_all_signals(monkeypatch):
+    installed = {}
+    restored = []
+
+    monkeypatch.setattr(signal, "getsignal", lambda signum: f"old-{signum}")
+
+    def install(signum, handler):
+        if isinstance(handler, str):
+            restored.append((signum, handler))
+        else:
+            installed[signum] = handler
+
+    monkeypatch.setattr(signal, "signal", install)
+
+    with launch_module.installed_shutdown_handlers() as source:
+        assert set(installed) == {signal.SIGTERM, signal.SIGHUP, signal.SIGINT}
+        installed[signal.SIGHUP](signal.SIGHUP, None)
+        assert source() == signal.SIGHUP
+
+    assert set(restored) == {
+        (signal.SIGTERM, f"old-{signal.SIGTERM}"),
+        (signal.SIGHUP, f"old-{signal.SIGHUP}"),
+        (signal.SIGINT, f"old-{signal.SIGINT}"),
+    }
+
+
 class _FakeStore:
     def __init__(self, *, fail_suffix: str | None = None):
         self.fail_suffix = fail_suffix
-        self.calls: list[tuple[Path, str]] = []
+        self.calls = []
 
-    def put_verified(self, path: Path, uri: str) -> bool:
-        self.calls.append((path, uri))
+    def put_verified(
+        self,
+        path: Path,
+        uri: str,
+        *,
+        deadline=float("inf"),
+        monotonic=time.monotonic,
+    ) -> bool:
+        self.calls.append((path, uri, deadline, monotonic()))
+        if monotonic() >= deadline:
+            return False
         return self.fail_suffix is None or not uri.endswith(self.fail_suffix)
 
 
@@ -634,7 +1306,31 @@ def _interruption_request(tmp_path: Path) -> InterruptionRequest:
         code_commit=CODE_COMMIT,
         config_sha256={"dense": "6" * 64, "split90": "7" * 64},
         timeout_seconds=5.0,
+        upload_reserve_seconds=2.0,
     )
+
+
+@pytest.mark.parametrize(
+    ("timeout_seconds", "upload_reserve_seconds"),
+    [
+        (float("nan"), 1.0),
+        (float("inf"), 1.0),
+        (5.0, float("nan")),
+        (5.0, float("inf")),
+    ],
+)
+def test_interruption_rejects_nonfinite_deadlines(
+    tmp_path,
+    timeout_seconds,
+    upload_reserve_seconds,
+):
+    request = _interruption_request(tmp_path)
+    values = dict(request.__dict__)
+    values["timeout_seconds"] = timeout_seconds
+    values["upload_reserve_seconds"] = upload_reserve_seconds
+
+    with pytest.raises(ValueError, match="timeout|reserve"):
+        InterruptionRequest(**values)
 
 
 def test_interruption_signals_both_rank_zero_processes_and_emits_paired_receipt(
@@ -674,7 +1370,7 @@ def test_interruption_signals_both_rank_zero_processes_and_emits_paired_receipt(
         "split90",
     ]
     assert all(item["upload_verified"] for item in receipt["checkpoints"])
-    assert len(store.calls) == 3
+    assert len(store.calls) == 4
 
 
 def test_interruption_never_labels_failed_upload_resumable(tmp_path):
@@ -697,14 +1393,75 @@ def test_interruption_never_labels_failed_upload_resumable(tmp_path):
     assert any(not item["upload_verified"] for item in receipt["checkpoints"])
 
 
+class _Clock:
+    def __init__(self):
+        self.now = 10.0
+
+    def monotonic(self):
+        return self.now
+
+    def sleep(self, delay):
+        self.now += delay
+
+
+def test_interruption_reserves_upload_time_inside_one_deadline(tmp_path):
+    request = _interruption_request(tmp_path)
+    clock = _Clock()
+
+    def signal_process(pid, _signum):
+        arm = {101: "dense", 202: "split90"}[pid]
+        request.checkpoint_paths[arm].write_bytes(arm.encode("ascii"))
+
+    store = _FakeStore()
+    result = handle_interruption(
+        request,
+        signal_process=signal_process,
+        object_store=store,
+        monotonic=clock.monotonic,
+        sleep=clock.sleep,
+    )
+
+    assert result.resumable is True
+    overall_deadline = 10.0 + request.timeout_seconds
+    assert all(call[2] == overall_deadline for call in store.calls)
+    assert all(call[3] < overall_deadline for call in store.calls)
+    assert clock.now <= overall_deadline
+
+
+def test_interruption_deadline_exhaustion_is_nonresumable_and_stops_uploads(
+    tmp_path,
+):
+    request = _interruption_request(tmp_path)
+    clock = _Clock()
+    store = _FakeStore()
+
+    result = handle_interruption(
+        request,
+        signal_process=lambda _pid, _signum: None,
+        object_store=store,
+        monotonic=clock.monotonic,
+        sleep=clock.sleep,
+    )
+
+    assert result.resumable is False
+    assert result.exit_code == NON_RESUMABLE_EXIT_CODE
+    receipt = json.loads(request.receipt_path.read_text(encoding="utf-8"))
+    assert receipt["resumable"] is False
+    assert receipt["deadline_exhausted"] is True
+    assert all(call[3] < call[2] for call in store.calls)
+
+
 def test_s3_object_store_uses_argv_and_checksum_verification(tmp_path):
     artifact = tmp_path / "checkpoint.pt"
     artifact.write_bytes(b"checkpoint")
     expected = base64.b64encode(hashlib.sha256(b"checkpoint").digest()).decode()
     calls = []
 
-    def runner(argv, environment):
-        calls.append((argv, environment))
+    private_home = tmp_path / "aws-home"
+    private_home.mkdir(mode=0o700)
+
+    def runner(argv, environment, timeout):
+        calls.append((argv, environment, timeout))
         assert isinstance(argv, list)
         if "put-object" in argv:
             return CommandResult(0, json.dumps({"ChecksumSHA256": expected}), "")
@@ -716,20 +1473,25 @@ def test_s3_object_store_uses_argv_and_checksum_verification(tmp_path):
         environment={
             "AWS_REGION": "us-east-1",
             "PATH": "/usr/bin:/bin",
-            "HOME": "/home/operator",
+            "HOME": str(private_home),
+            "LANG": "C.UTF-8",
+            "LC_ALL": "C.UTF-8",
         },
     )
 
     assert store.put_verified(
         artifact,
         "s3://memorysplit-prod/cohort-v2/checkpoints/seed-1/dense.pt",
+        deadline=20.0,
+        monotonic=lambda: 10.0,
     )
     assert len(calls) == 2
     assert calls[0][0][:3] == ["aws", "s3api", "put-object"]
     assert calls[1][0][:3] == ["aws", "s3api", "head-object"]
+    assert all(0 < timeout <= 10.0 for _, _, timeout in calls)
     assert all(
         "AWS_SECRET_ACCESS_KEY" not in environment
-        for _, environment in calls
+        for _, environment, _timeout in calls
     )
 
 
@@ -777,14 +1539,39 @@ def test_imdsv2_client_refreshes_an_expired_token(monkeypatch):
 
 
 class _ProbeRunner:
-    def __init__(self, *, gpu_names=H100_NAMES, devices=8, fabric_active=True):
+    def __init__(
+        self,
+        *,
+        gpu_names=H100_NAMES,
+        devices=8,
+        fabric_active=True,
+        block_override=None,
+        holders="",
+        swap="",
+        md_member=False,
+        wipe_signatures=None,
+        caller_account="123456789012",
+        caller_arn=(
+            "arn:aws:sts::123456789012:"
+            "assumed-role/MemorySplitP5Role/i-0123456789abcdef0"
+        ),
+    ):
         self.gpu_names = gpu_names
         self.devices = devices
         self.fabric_active = fabric_active
+        self.block_override = block_override or {}
+        self.holders = holders
+        self.swap = swap
+        self.md_member = md_member
+        self.wipe_signatures = (
+            [] if wipe_signatures is None else wipe_signatures
+        )
+        self.caller_account = caller_account
+        self.caller_arn = caller_arn
         self.calls = []
 
-    def __call__(self, argv, environment):
-        self.calls.append((argv, environment))
+    def __call__(self, argv, environment, timeout):
+        self.calls.append((argv, environment, timeout))
         if argv[0] == "nvidia-smi":
             return CommandResult(0, "\n".join(self.gpu_names) + "\n", "")
         if argv[:2] == ["systemctl", "is-active"]:
@@ -801,11 +1588,43 @@ class _ProbeRunner:
                     "path": f"/dev/test-instance-store-{index}",
                     "size": 3_840_000_000_000,
                     "type": "disk",
+                    "fstype": None,
+                    "fsver": None,
+                    "label": None,
+                    "uuid": None,
+                    "pttype": None,
+                    "parttype": None,
                 }
                 for index in range(self.devices)
             ]
+            if blockdevices:
+                blockdevices[0].update(self.block_override)
             return CommandResult(
                 0, json.dumps({"blockdevices": blockdevices}), ""
+            )
+        if argv[0] == "swapon":
+            return CommandResult(0, self.swap, "")
+        if argv[0] == "ls" and argv[-1].endswith("/holders"):
+            return CommandResult(0, self.holders, "")
+        if argv[0] == "mdadm" and argv[1:3] == ["--examine", "--brief"]:
+            return CommandResult(0 if self.md_member else 1, "", "")
+        if argv[0] == "wipefs":
+            return CommandResult(
+                0,
+                json.dumps({"signatures": self.wipe_signatures}),
+                "",
+            )
+        if argv[:3] == ["aws", "sts", "get-caller-identity"]:
+            return CommandResult(
+                0,
+                json.dumps(
+                    {
+                        "Account": self.caller_account,
+                        "Arn": self.caller_arn,
+                        "UserId": "AROATEST:i-0123456789abcdef0",
+                    }
+                ),
+                "",
             )
         if argv[:3] == ["docker", "image", "inspect"]:
             digest_ref = argv[-1]
@@ -818,6 +1637,16 @@ def _metadata(instance_type="p5.48xlarge"):
         "meta-data/instance-id": "i-0123456789abcdef0",
         "meta-data/instance-type": instance_type,
         "meta-data/ami-id": SAFE_ENVIRONMENT["MS_AWS_AMI_ID"],
+        "meta-data/iam/security-credentials/": "MemorySplitP5Role",
+        "dynamic/instance-identity/document": json.dumps(
+            {
+                "accountId": "123456789012",
+                "imageId": SAFE_ENVIRONMENT["MS_AWS_AMI_ID"],
+                "instanceId": "i-0123456789abcdef0",
+                "instanceType": instance_type,
+                "region": SAFE_ENVIRONMENT["AWS_REGION"],
+            }
+        ),
     }
     return values.__getitem__
 
@@ -838,10 +1667,11 @@ def test_bootstrap_inspects_p5_hardware_by_nvme_model_and_renders_argv_commands(
         runner=runner,
         command_environment={
             "AWS_REGION": runtime.region,
-            "PATH": SAFE_ENVIRONMENT["PATH"],
-            "HOME": SAFE_ENVIRONMENT["HOME"],
+            "PATH": "/usr/bin:/bin",
+            "HOME": "/private/empty",
         },
         container_image=image,
+        boot_id_get=lambda: BOOT_ID,
     )
     commands = render_bootstrap_commands(
         profile,
@@ -859,6 +1689,182 @@ def test_bootstrap_inspects_p5_hardware_by_nvme_model_and_renders_argv_commands(
     assert mdadm[-8:] == list(evidence.instance_store_devices)
     assert any(command[:3] == ["aws", "s3", "sync"] for command in commands)
     assert all("AWS_SECRET_ACCESS_KEY" not in command for command in commands)
+
+
+def test_bootstrap_binds_imdsv2_role_sts_identity_and_boot_id():
+    profile = load_aws_p5_profile(PROFILE_PATH)
+    runtime = validate_runtime_environment(profile, SAFE_ENVIRONMENT)
+    runner = _ProbeRunner()
+
+    evidence = inspect_hardware(
+        profile,
+        runtime,
+        metadata_get=_metadata(),
+        runner=runner,
+        command_environment={
+            "AWS_REGION": runtime.region,
+            "PATH": "/usr/bin:/bin",
+            "HOME": "/private/empty",
+        },
+        container_image=CONTAINER_IMAGE,
+        boot_id_get=lambda: BOOT_ID,
+    )
+
+    assert evidence.boot_id == BOOT_ID
+    assert evidence.role_name == "MemorySplitP5Role"
+    assert evidence.account_id == "123456789012"
+    assert evidence.role_arn.endswith(
+        "assumed-role/MemorySplitP5Role/i-0123456789abcdef0"
+    )
+    assert any(
+        argv[:3] == ["aws", "sts", "get-caller-identity"]
+        for argv, _environment, _timeout in runner.calls
+    )
+    assert all(0 < timeout <= 30 for _argv, _environment, timeout in runner.calls)
+
+
+def test_bootstrap_rejects_sts_identity_not_bound_to_imdsv2_role():
+    profile = load_aws_p5_profile(PROFILE_PATH)
+    runtime = validate_runtime_environment(profile, SAFE_ENVIRONMENT)
+
+    with pytest.raises(BootstrapError, match="role|identity|account"):
+        inspect_hardware(
+            profile,
+            runtime,
+            metadata_get=_metadata(),
+            runner=_ProbeRunner(caller_account="999999999999"),
+            command_environment={
+                "AWS_REGION": runtime.region,
+                "PATH": "/usr/bin:/bin",
+                "HOME": "/private/empty",
+            },
+            container_image=CONTAINER_IMAGE,
+            boot_id_get=lambda: BOOT_ID,
+        )
+
+
+def test_aws_commands_use_only_private_empty_home_and_fixed_allowlist(tmp_path):
+    profile = load_aws_p5_profile(PROFILE_PATH)
+    runtime = validate_runtime_environment(profile, SAFE_ENVIRONMENT)
+    private_home = tmp_path / "aws-home"
+    private_home.mkdir(mode=0o700)
+
+    environment = bootstrap_module.build_aws_command_environment(
+        profile,
+        runtime,
+        private_home=private_home,
+    )
+
+    assert environment == {
+        "AWS_REGION": "us-east-1",
+        "HOME": str(private_home),
+        "LANG": "C.UTF-8",
+        "LC_ALL": "C.UTF-8",
+        "PATH": "/usr/bin:/bin",
+    }
+    assert set(environment).isdisjoint(
+        {
+            "AWS_PROFILE",
+            "AWS_CONFIG_FILE",
+            "AWS_SHARED_CREDENTIALS_FILE",
+        }
+    )
+
+    (private_home / "credentials").write_text("not empty", encoding="utf-8")
+    with pytest.raises(BootstrapError, match="empty"):
+        bootstrap_module.build_aws_command_environment(
+            profile,
+            runtime,
+            private_home=private_home,
+        )
+
+
+@pytest.mark.parametrize(
+    ("runner", "message"),
+    [
+        (
+            _ProbeRunner(
+                block_override={
+                    "children": [
+                        {
+                            "path": "/dev/test-instance-store-0p1",
+                            "type": "part",
+                        }
+                    ]
+                }
+            ),
+            "children|partition",
+        ),
+        (_ProbeRunner(block_override={"fstype": "xfs"}), "filesystem|signature"),
+        (_ProbeRunner(block_override={"pttype": "gpt"}), "partition|signature"),
+        (_ProbeRunner(holders="md127\n"), "holder"),
+        (_ProbeRunner(swap="/dev/test-instance-store-0\n"), "swap"),
+        (_ProbeRunner(md_member=True), "RAID|md"),
+        (
+            _ProbeRunner(
+                wipe_signatures=[
+                    {"offset": "0x0", "type": "ext4", "uuid": "fixture"}
+                ]
+            ),
+            "signature|filesystem",
+        ),
+    ],
+)
+def test_bootstrap_recursively_rejects_in_use_or_signed_nvme(runner, message):
+    profile = load_aws_p5_profile(PROFILE_PATH)
+    runtime = validate_runtime_environment(profile, SAFE_ENVIRONMENT)
+
+    with pytest.raises(BootstrapError, match=message):
+        inspect_hardware(
+            profile,
+            runtime,
+            metadata_get=_metadata(),
+            runner=runner,
+            command_environment={
+                "AWS_REGION": runtime.region,
+                "PATH": "/usr/bin:/bin",
+                "HOME": "/private/empty",
+            },
+            container_image=CONTAINER_IMAGE,
+            boot_id_get=lambda: BOOT_ID,
+        )
+
+
+def test_destructive_nvme_render_requires_apply_authorization_and_nonroot_owner():
+    profile = load_aws_p5_profile(PROFILE_PATH)
+    runtime = validate_runtime_environment(profile, SAFE_ENVIRONMENT)
+    evidence = inspect_hardware(
+        profile,
+        runtime,
+        metadata_get=_metadata(),
+        runner=_ProbeRunner(),
+        command_environment={
+            "AWS_REGION": runtime.region,
+            "PATH": "/usr/bin:/bin",
+            "HOME": "/private/empty",
+        },
+        container_image=CONTAINER_IMAGE,
+        boot_id_get=lambda: BOOT_ID,
+    )
+
+    with pytest.raises(BootstrapError, match="authorization"):
+        render_bootstrap_commands(
+            profile,
+            runtime,
+            evidence,
+            owner_uid=1000,
+            owner_gid=1000,
+            apply=True,
+            destructive_authorized=False,
+        )
+    with pytest.raises(BootstrapError, match="non-root"):
+        render_bootstrap_commands(
+            profile,
+            runtime,
+            evidence,
+            owner_uid=0,
+            owner_gid=0,
+        )
 
 
 @pytest.mark.parametrize(
@@ -885,33 +1891,157 @@ def test_bootstrap_fails_closed_on_hardware_drift(
             runner=runner,
             command_environment={
                 "AWS_REGION": runtime.region,
-                "PATH": SAFE_ENVIRONMENT["PATH"],
-                "HOME": SAFE_ENVIRONMENT["HOME"],
+                "PATH": "/usr/bin:/bin",
+                "HOME": "/private/empty",
             },
             container_image=(
                 "public.ecr.aws/example/memorysplit@"
                 + SAFE_ENVIRONMENT["MS_CONTAINER_DIGEST"]
             ),
+            boot_id_get=lambda: BOOT_ID,
+        )
+
+
+def _task7_release_fixture(tmp_path: Path, *, corrupt_sum: bool = False):
+    member_payload = {
+        "scripts/run_train.py": b"print('verified release')\n",
+        "train/trainer.py": b"def train():\n    return None\n",
+    }
+    metadata = {
+        "members": [
+            {
+                "bytes": len(payload),
+                "git_blob": "5" * 40,
+                "git_mode": "100644",
+                "path": relative,
+                "sha256": hashlib.sha256(payload).hexdigest(),
+            }
+            for relative, payload in sorted(member_payload.items())
+        ],
+        "package_format_version": 1,
+        "provider": "aws-p5.48xlarge",
+        "schema_version": 1,
+        "seed_assignment": {
+            "arms": ["dense", "split90"],
+            "cohort_id": "memorysplit-confirmatory-v2-360m-n5",
+            "provider": "aws-p5.48xlarge",
+            "seeds": [1, 2, 3, 4],
+        },
+        "source": {"commit": CODE_COMMIT, "dirty": False},
+    }
+    metadata_bytes = (
+        json.dumps(metadata, indent=2, sort_keys=True) + "\n"
+    ).encode("ascii")
+    payload = {**member_payload, "RELEASE-METADATA.json": metadata_bytes}
+    sums = "".join(
+        (
+            ("0" * 64 if corrupt_sum and index == 0 else hashlib.sha256(data).hexdigest())
+            + f"  {relative}\n"
+        )
+        for index, (relative, data) in enumerate(sorted(payload.items()))
+    ).encode("ascii")
+    payload["SHA256SUMS"] = sums
+    archive = tmp_path / "ms-aws-p5-r1-fixture.zip"
+    with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_STORED) as output:
+        for relative, data in sorted(payload.items()):
+            info = zipfile.ZipInfo(relative)
+            info.create_system = 3
+            info.external_attr = 0o100444 << 16
+            output.writestr(info, data)
+    dataset_receipt = tmp_path / "receipt.json"
+    cohort = tmp_path / "cohort.json"
+    dataset_receipt.write_bytes(
+        ('{"build_id":"' + "b" * 64 + '"}\n').encode("ascii")
+    )
+    cohort.write_bytes(b'{"cohort":true}\n')
+    release_receipt = _write_json(
+        tmp_path / "RELEASE-AWS-P5.json",
+        {
+            "archive": {
+                "bytes": archive.stat().st_size,
+                "path": archive.name,
+                "sha256": _sha256(archive),
+            },
+            "cohort_assignment_sha256": _sha256(cohort),
+            "dataset_receipt_sha256": _sha256(dataset_receipt),
+            "members_sha256": hashlib.sha256(sums).hexdigest(),
+            "source": {"commit": CODE_COMMIT, "dirty": False},
+        },
+    )
+    return archive, release_receipt, dataset_receipt, cohort
+
+
+def test_bootstrap_extracts_only_verified_task7_release_read_only(tmp_path):
+    archive, release_receipt, dataset_receipt, cohort = _task7_release_fixture(
+        tmp_path
+    )
+    artifacts = verify_bootstrap_artifacts(
+        release_archive=archive,
+        release_sha256=_sha256(archive),
+        release_receipt=release_receipt,
+        release_receipt_sha256=_sha256(release_receipt),
+        dataset_receipt=dataset_receipt,
+        dataset_receipt_sha256=_sha256(dataset_receipt),
+        cohort_assignment=cohort,
+        cohort_assignment_sha256=_sha256(cohort),
+        code_commit=CODE_COMMIT,
+    )
+
+    prepared = bootstrap_module.extract_verified_release(
+        release_archive=archive,
+        artifacts=artifacts,
+        scratch_root=tmp_path / "scratch",
+        owner_uid=os.getuid(),
+        owner_gid=os.getgid(),
+    )
+
+    assert prepared.root == (
+        tmp_path / "scratch" / "releases" / _sha256(archive)
+    )
+    assert prepared.members_sha256 == hashlib.sha256(
+        (prepared.root / "SHA256SUMS").read_bytes()
+    ).hexdigest()
+    assert (prepared.root / "scripts" / "run_train.py").read_bytes() == (
+        b"print('verified release')\n"
+    )
+    assert all(
+        path.stat().st_mode & 0o222 == 0
+        for path in prepared.root.rglob("*")
+    )
+
+
+def test_bootstrap_rejects_hash_consistent_outer_archive_with_bad_inner_sum(
+    tmp_path,
+):
+    archive, release_receipt, dataset_receipt, cohort = _task7_release_fixture(
+        tmp_path,
+        corrupt_sum=True,
+    )
+
+    with pytest.raises(BootstrapError, match="SHA256SUMS|member"):
+        verify_bootstrap_artifacts(
+            release_archive=archive,
+            release_sha256=_sha256(archive),
+            release_receipt=release_receipt,
+            release_receipt_sha256=_sha256(release_receipt),
+            dataset_receipt=dataset_receipt,
+            dataset_receipt_sha256=_sha256(dataset_receipt),
+            cohort_assignment=cohort,
+            cohort_assignment_sha256=_sha256(cohort),
+            code_commit=CODE_COMMIT,
         )
 
 
 def test_bootstrap_verifies_all_hashes_and_publishes_canonical_receipt(tmp_path):
     profile = load_aws_p5_profile(PROFILE_PATH)
     runtime = validate_runtime_environment(profile, SAFE_ENVIRONMENT)
-    release_archive = tmp_path / "release.zip"
-    dataset_receipt = tmp_path / "corpus-receipt.json"
-    cohort = tmp_path / "cohort.json"
-    release_archive.write_bytes(b"release")
-    dataset_receipt.write_bytes(b'{"dataset":true}\n')
-    cohort.write_bytes(b'{"cohort":true}\n')
-    release_receipt = _write_json(
-        tmp_path / "RELEASE-AWS-P5.json",
-        {
-            "archive": {"sha256": _sha256(release_archive)},
-            "cohort_assignment_sha256": _sha256(cohort),
-            "dataset_receipt_sha256": _sha256(dataset_receipt),
-            "source": {"commit": CODE_COMMIT},
-        },
+    (
+        release_archive,
+        release_receipt,
+        dataset_receipt,
+        cohort,
+    ) = _task7_release_fixture(
+        tmp_path,
     )
     artifacts = verify_bootstrap_artifacts(
         release_archive=release_archive,
@@ -931,19 +2061,29 @@ def test_bootstrap_verifies_all_hashes_and_publishes_canonical_receipt(tmp_path)
         runner=_ProbeRunner(),
         command_environment={
             "AWS_REGION": runtime.region,
-            "PATH": SAFE_ENVIRONMENT["PATH"],
-            "HOME": SAFE_ENVIRONMENT["HOME"],
+            "PATH": "/usr/bin:/bin",
+            "HOME": "/private/empty",
         },
         container_image=(
             "public.ecr.aws/example/memorysplit@"
             + SAFE_ENVIRONMENT["MS_CONTAINER_DIGEST"]
         ),
+        boot_id_get=lambda: BOOT_ID,
+    )
+    prepared = bootstrap_module.PreparedRelease(
+        root=(
+            Path(profile.scratch_root)
+            / "releases"
+            / artifacts.release_sha256
+        ),
+        members_sha256=artifacts.release_members_sha256,
     )
     receipt = build_bootstrap_receipt(
         profile=profile,
         runtime=runtime,
         evidence=evidence,
         artifacts=artifacts,
+        prepared_release=prepared,
         durable_upload_verified=True,
     )
     store = _FakeStore()
@@ -964,7 +2104,12 @@ def test_bootstrap_verifies_all_hashes_and_publishes_canonical_receipt(tmp_path)
     ).encode("ascii")
     assert receipt["durable_upload_verified"] is True
     assert receipt["release_sha256"] == _sha256(release_archive)
+    assert receipt["release_members_sha256"] == artifacts.release_members_sha256
     assert receipt["corpus_receipt_sha256"] == _sha256(dataset_receipt)
+    assert receipt["corpus_build_id"] == "b" * 64
+    assert receipt["runtime_uid"] == RUNTIME_UID
+    assert receipt["runtime_gid"] == RUNTIME_GID
+    assert receipt["boot_id"] == BOOT_ID
 
 
 def test_bootstrap_rejects_non_utf8_release_receipt(tmp_path):
@@ -972,7 +2117,9 @@ def test_bootstrap_rejects_non_utf8_release_receipt(tmp_path):
     dataset_receipt = tmp_path / "corpus-receipt.json"
     cohort = tmp_path / "cohort.json"
     release_archive.write_bytes(b"release")
-    dataset_receipt.write_bytes(b'{"dataset":true}\n')
+    dataset_receipt.write_bytes(
+        ('{"build_id":"' + "b" * 64 + '"}\n').encode("ascii")
+    )
     cohort.write_bytes(b'{"cohort":true}\n')
     release_receipt = tmp_path / "RELEASE-AWS-P5.json"
     release_receipt.write_bytes(
@@ -1020,7 +2167,7 @@ def test_p5_commands_start_from_outside_repository_without_pythonpath(
     tmp_path, script
 ):
     completed = subprocess.run(
-        [sys.executable, str(script), "--help"],
+        [sys.executable, "-S", str(script), "--help"],
         cwd=tmp_path,
         env={"HOME": str(tmp_path), "PATH": "/usr/bin:/bin"},
         capture_output=True,

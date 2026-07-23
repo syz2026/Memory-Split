@@ -31,6 +31,20 @@ _STATIC_AWS_CREDENTIALS = frozenset(
         "AWS_SECURITY_TOKEN",
     }
 )
+_NON_ROLE_AWS_CREDENTIAL_SOURCES = frozenset(
+    {
+        "AWS_CONFIG_FILE",
+        "AWS_CONTAINER_CREDENTIALS_FULL_URI",
+        "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
+        "AWS_DEFAULT_PROFILE",
+        "AWS_EC2_METADATA_DISABLED",
+        "AWS_PROFILE",
+        "AWS_ROLE_ARN",
+        "AWS_ROLE_SESSION_NAME",
+        "AWS_SHARED_CREDENTIALS_FILE",
+        "AWS_WEB_IDENTITY_TOKEN_FILE",
+    }
+)
 _ROOT_FIELDS = frozenset(
     {
         "schema_version",
@@ -48,10 +62,8 @@ _ROOT_FIELDS = frozenset(
 )
 _PROCESS_ENV_ALLOWLIST = (
     "AWS_REGION",
-    "HOME",
     "LANG",
     "LC_ALL",
-    "PATH",
 )
 
 
@@ -78,6 +90,8 @@ class AwsP5Profile:
     region_env: str
     ami_id_env: str
     container_digest_env: str
+    runtime_uid_env: str
+    runtime_gid_env: str
     assigned_seeds: tuple[int, ...]
     process_env_allowlist: tuple[str, ...]
     sha256: str
@@ -91,6 +105,8 @@ class AwsP5Runtime:
     s3_root: str
     ami_id: str
     container_digest: str
+    uid: int
+    gid: int
 
 
 def _unique_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
@@ -224,7 +240,13 @@ def _parse_profile(raw: object, *, sha256: str) -> AwsP5Profile:
     runtime = _object(
         value["runtime"],
         fields=frozenset(
-            {"region_env", "ami_id_env", "container_digest_env"}
+            {
+                "region_env",
+                "ami_id_env",
+                "container_digest_env",
+                "runtime_uid_env",
+                "runtime_gid_env",
+            }
         ),
         label="profile.runtime",
     )
@@ -240,6 +262,16 @@ def _parse_profile(raw: object, *, sha256: str) -> AwsP5Profile:
         runtime["container_digest_env"],
         "MS_CONTAINER_DIGEST",
         label="profile.runtime.container_digest_env",
+    )
+    runtime_uid_env = _exact_string(
+        runtime["runtime_uid_env"],
+        "MS_RUNTIME_UID",
+        label="profile.runtime.runtime_uid_env",
+    )
+    runtime_gid_env = _exact_string(
+        runtime["runtime_gid_env"],
+        "MS_RUNTIME_GID",
+        label="profile.runtime.runtime_gid_env",
     )
 
     seeds = value["assigned_seeds"]
@@ -280,6 +312,8 @@ def _parse_profile(raw: object, *, sha256: str) -> AwsP5Profile:
         region_env=region_env,
         ami_id_env=ami_id_env,
         container_digest_env=container_digest_env,
+        runtime_uid_env=runtime_uid_env,
+        runtime_gid_env=runtime_gid_env,
         assigned_seeds=(1, 2, 3, 4),
         process_env_allowlist=_PROCESS_ENV_ALLOWLIST,
         sha256=sha256,
@@ -341,12 +375,31 @@ def _validate_s3_root(value: str) -> str:
     return value.rstrip("/")
 
 
+def _nonroot_id(value: str, *, label: str) -> int:
+    if re.fullmatch(r"[1-9][0-9]{0,9}", value) is None:
+        raise ValueError(f"{label} must be an explicit non-root decimal ID")
+    parsed = int(value)
+    if parsed > 2_147_483_647:
+        raise ValueError(f"{label} exceeds the supported ID range")
+    return parsed
+
+
 def validate_runtime_environment(
     profile: AwsP5Profile,
     environment: Mapping[str, str],
 ) -> AwsP5Runtime:
     """Validate region, S3 prefix, AMI, digest, and absence of ambient secrets."""
 
+    alternate_sources = sorted(
+        name
+        for name, value in environment.items()
+        if value and name.upper() in _NON_ROLE_AWS_CREDENTIAL_SOURCES
+    )
+    if alternate_sources:
+        raise ValueError(
+            "runtime environment selects a non-instance-role credential source: "
+            + ", ".join(alternate_sources)
+        )
     inherited_secrets = sorted(
         name
         for name, value in environment.items()
@@ -378,9 +431,19 @@ def validate_runtime_environment(
         raise ValueError(
             "MS_CONTAINER_DIGEST must be sha256 followed by 64 lowercase hex"
         )
+    uid = _nonroot_id(
+        _required_environment(environment, profile.runtime_uid_env),
+        label="MS_RUNTIME_UID",
+    )
+    gid = _nonroot_id(
+        _required_environment(environment, profile.runtime_gid_env),
+        label="MS_RUNTIME_GID",
+    )
     return AwsP5Runtime(
         region=region,
         s3_root=s3_root,
         ami_id=ami_id,
         container_digest=container_digest,
+        uid=uid,
+        gid=gid,
     )

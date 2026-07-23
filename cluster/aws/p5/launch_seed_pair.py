@@ -14,22 +14,27 @@ import socket
 import stat
 import subprocess
 import sys
+import tempfile
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
-from typing import Callable, Mapping, Protocol, Sequence
-
-import yaml
+from typing import Callable, Iterator, Mapping, Protocol, Sequence
 
 if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 
 from cluster.aws.p5.interruption_checkpoint import (
+    CommandResult,
     ImdsV2Client,
     InterruptionRequest,
     InterruptionResult,
     S3ObjectStore,
     handle_interruption,
+)
+from cluster.aws.p5.corpus_contract import (
+    CorpusContractError,
+    verify_canonical_corpus,
 )
 from cluster.aws.p5.profile import (
     AwsP5Profile,
@@ -45,6 +50,9 @@ _ARMS = ("dense", "split90")
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
 _H100_RE = re.compile(r"^NVIDIA H100 80GB(?: HBM3)?$")
+_CONTAINER_IMAGE_RE = re.compile(
+    r"^[A-Za-z0-9][A-Za-z0-9./:_-]*@sha256:[0-9a-f]{64}$"
+)
 _MANIFEST_FIELDS = frozenset(
     {
         "schema_version",
@@ -53,6 +61,7 @@ _MANIFEST_FIELDS = frozenset(
         "seed",
         "profile_sha256",
         "release_sha256",
+        "release_members_sha256",
         "cohort_assignment_sha256",
         "code_commit",
         "bootstrap_receipt",
@@ -104,17 +113,27 @@ _BOOTSTRAP_FIELDS = frozenset(
         "schema_version",
         "receipt_type",
         "provider",
+        "account_id",
         "instance_id",
+        "boot_id",
         "instance_type",
         "region",
         "ami_id",
         "container_digest",
+        "container_image",
         "profile_sha256",
         "release_sha256",
+        "release_members_sha256",
+        "release_root",
         "cohort_assignment_sha256",
         "corpus_receipt_sha256",
+        "corpus_build_id",
         "code_commit",
         "scratch_root",
+        "runtime_uid",
+        "runtime_gid",
+        "role_name",
+        "role_arn",
         "instance_store",
         "durable_upload_verified",
     }
@@ -139,6 +158,11 @@ class ArmLaunch:
     cwd: Path
     config_path: Path
     config_sha256: str
+    runtime_config: Mapping[str, object]
+    runtime_config_bytes: bytes
+    runtime_config_path: Path
+    runtime_config_sha256: str
+    scientific_config_sha256: str
     out_dir: Path
     checkpoint_path: Path
     rank_zero_pid_file: Path
@@ -158,8 +182,12 @@ class LaunchPlan:
     arms: tuple[ArmLaunch, ArmLaunch]
     verified_files: tuple[VerifiedFile, ...]
     release_sha256: str
+    release_members_sha256: str
     corpus_receipt_sha256: str
     code_commit: str
+    container_image: str
+    runtime_uid: int
+    runtime_gid: int
 
 
 @dataclass(frozen=True)
@@ -181,6 +209,8 @@ class ProcessHandle(Protocol):
     def wait(self, timeout: float | None = None) -> int: ...
 
     def terminate_tree(self) -> None: ...
+
+    def kill_tree(self) -> None: ...
 
 
 def _unique_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
@@ -247,6 +277,161 @@ def _hash_regular(path: Path, *, label: str) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def _canonical_pretty(value: object) -> bytes:
+    return (
+        json.dumps(
+            value,
+            indent=2,
+            sort_keys=True,
+            ensure_ascii=True,
+            allow_nan=False,
+        )
+        + "\n"
+    ).encode("ascii")
+
+
+def _validate_release_root(
+    repo: Path,
+    scratch: Path,
+    *,
+    release_sha256: str,
+    release_members_sha256: str,
+    code_commit: str,
+) -> tuple[VerifiedFile, ...]:
+    expected_root = scratch / "releases" / release_sha256
+    if repo != expected_root.resolve(strict=True):
+        raise LaunchError(
+            "release root must be the digest-named root under scratch"
+        )
+    entries = [repo, *repo.rglob("*")]
+    for path in entries:
+        if path.is_symlink():
+            raise LaunchError("verified release must not contain symlinks")
+        metadata = path.stat()
+        if metadata.st_mode & 0o222:
+            raise LaunchError("verified release root must be read-only")
+        if path.is_file() and (
+            not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1
+        ):
+            raise LaunchError(
+                "verified release members must be singly linked regular files"
+            )
+        if not path.is_file() and not path.is_dir():
+            raise LaunchError("verified release contains a special entry")
+
+    sums_path = repo / "SHA256SUMS"
+    metadata_path = repo / "RELEASE-METADATA.json"
+    if (
+        sums_path.is_symlink()
+        or not sums_path.is_file()
+        or metadata_path.is_symlink()
+        or not metadata_path.is_file()
+    ):
+        raise LaunchError("verified release is missing its member manifests")
+    sums_bytes = sums_path.read_bytes()
+    if hashlib.sha256(sums_bytes).hexdigest() != release_members_sha256:
+        raise LaunchError("release member manifest SHA-256 mismatch")
+    try:
+        sums_text = sums_bytes.decode("ascii")
+    except UnicodeDecodeError as error:
+        raise LaunchError("release SHA256SUMS must be ASCII") from error
+    if not sums_text or not sums_text.endswith("\n"):
+        raise LaunchError("release SHA256SUMS must be newline-terminated")
+    checksums: dict[str, str] = {}
+    paths: list[str] = []
+    for line in sums_text.splitlines():
+        if len(line) < 67 or line[64:66] != "  ":
+            raise LaunchError("release SHA256SUMS line is malformed")
+        digest = _sha256(line[:64], label="release member")
+        relative = _portable_relative(
+            line[66:], label="release member path"
+        )
+        if relative in checksums:
+            raise LaunchError("release SHA256SUMS repeats a member")
+        checksums[relative] = digest
+        paths.append(relative)
+    if paths != sorted(paths):
+        raise LaunchError("release SHA256SUMS members must be sorted")
+    actual_files = {
+        path.relative_to(repo).as_posix()
+        for path in repo.rglob("*")
+        if path.is_file()
+    }
+    if actual_files != set(checksums) | {"SHA256SUMS"}:
+        raise LaunchError("release member namespace contains extras or omissions")
+    verified = [
+        VerifiedFile(path=sums_path, sha256=release_members_sha256)
+    ]
+    for relative, expected_digest in checksums.items():
+        path = _inside_existing(repo, relative, label="release member")
+        digest = _hash_regular(path, label=f"release member {relative}")
+        if digest != expected_digest:
+            raise LaunchError(f"release member SHA-256 mismatch: {relative}")
+        verified.append(VerifiedFile(path=path, sha256=digest))
+
+    try:
+        metadata_bytes = metadata_path.read_bytes()
+        metadata = json.loads(metadata_bytes.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise LaunchError("release metadata must contain UTF-8 JSON") from error
+    if (
+        not isinstance(metadata, dict)
+        or _canonical_pretty(metadata) != metadata_bytes
+        or metadata.get("schema_version") != 1
+        or metadata.get("package_format_version") != 1
+        or metadata.get("provider") != PROVIDER
+        or metadata.get("source")
+        != {"commit": code_commit, "dirty": False}
+        or metadata.get("seed_assignment")
+        != {
+            "arms": ["dense", "split90"],
+            "cohort_id": COHORT_ID,
+            "provider": PROVIDER,
+            "seeds": [1, 2, 3, 4],
+        }
+    ):
+        raise LaunchError("release metadata identity does not match")
+    rows = metadata.get("members")
+    if not isinstance(rows, list):
+        raise LaunchError("release metadata member list is missing")
+    row_paths: list[str] = []
+    for row in rows:
+        if (
+            not isinstance(row, dict)
+            or set(row)
+            != {"bytes", "git_blob", "git_mode", "path", "sha256"}
+        ):
+            raise LaunchError("release metadata member row is invalid")
+        relative = _portable_relative(
+            row["path"], label="release metadata member"
+        )
+        row_paths.append(relative)
+        path = repo / relative
+        if (
+            relative not in checksums
+            or relative in {"RELEASE-METADATA.json", "SHA256SUMS"}
+            or type(row["bytes"]) is not int
+            or row["bytes"] != path.stat().st_size
+            or row["sha256"] != checksums[relative]
+            or row["git_mode"] not in {"100644", "100755"}
+            or not isinstance(row["git_blob"], str)
+            or re.fullmatch(
+                r"(?:[0-9a-f]{40}|[0-9a-f]{64})", row["git_blob"]
+            )
+            is None
+        ):
+            raise LaunchError(
+                f"release metadata member binding drift: {relative}"
+            )
+    if (
+        row_paths != sorted(row_paths)
+        or set(row_paths)
+        != set(checksums) - {"RELEASE-METADATA.json"}
+    ):
+        raise LaunchError("release metadata does not bind every member")
+    return tuple(verified)
+
+
 def _portable_relative(value: object, *, label: str) -> str:
     if (
         not isinstance(value, str)
@@ -293,38 +478,56 @@ def _inside_output(root: Path, relative: str, *, label: str) -> Path:
     return candidate
 
 
-class _NoDuplicateSafeLoader(yaml.SafeLoader):
-    pass
-
-
-def _yaml_mapping(loader, node, deep=False):
-    mapping = {}
-    for key_node, value_node in node.value:
-        key = loader.construct_object(key_node, deep=deep)
-        if not isinstance(key, str):
-            raise LaunchError("config keys must be strings")
-        if key in mapping:
-            raise LaunchError(f"config contains duplicate key: {key}")
-        mapping[key] = loader.construct_object(value_node, deep=deep)
-    return mapping
-
-
-_NoDuplicateSafeLoader.add_constructor(
-    yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG,
-    _yaml_mapping,
-)
-
-
 def _load_config(path: Path) -> dict[str, object]:
     try:
-        value = yaml.load(
-            path.read_text(encoding="utf-8"),
-            Loader=_NoDuplicateSafeLoader,
-        )
-    except (UnicodeDecodeError, yaml.YAMLError) as error:
+        text = path.read_bytes().decode("utf-8")
+    except UnicodeDecodeError as error:
         raise LaunchError("config must contain valid UTF-8 YAML") from error
-    if not isinstance(value, dict):
-        raise LaunchError("config must contain a YAML object")
+    value: dict[str, object] = {}
+    for line in text.splitlines():
+        if not line or line.isspace():
+            continue
+        if line.startswith((" ", "\t", "#", "---", "...")) or ":" not in line:
+            raise LaunchError("config must use strict flat YAML")
+        key, raw_value = line.split(":", 1)
+        if (
+            re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key) is None
+            or key in value
+        ):
+            raise LaunchError("config contains an invalid or duplicate key")
+        scalar = raw_value.strip()
+        if (
+            not scalar
+            or scalar[0] in "[{&*!|>@`"
+            or " #" in scalar
+            or "\t" in scalar
+        ):
+            raise LaunchError("config contains an unsupported YAML scalar")
+        if scalar == "true":
+            parsed: object = True
+        elif scalar == "false":
+            parsed = False
+        elif re.fullmatch(r"-?(?:0|[1-9][0-9]*)", scalar):
+            parsed = int(scalar)
+        elif re.fullmatch(
+            r"-?(?:0|[1-9][0-9]*)\.[0-9]+(?:[eE][+-]?[0-9]+)?",
+            scalar,
+        ):
+            parsed = float(scalar)
+        elif scalar.startswith('"') and scalar.endswith('"'):
+            try:
+                parsed = json.loads(scalar)
+            except json.JSONDecodeError as error:
+                raise LaunchError("config quoted scalar is invalid") from error
+            if not isinstance(parsed, str):
+                raise LaunchError("config quoted scalar must be a string")
+        elif scalar.startswith("'") and scalar.endswith("'"):
+            parsed = scalar[1:-1].replace("''", "'")
+        elif re.fullmatch(r"[A-Za-z0-9_./-]+", scalar):
+            parsed = scalar
+        else:
+            raise LaunchError("config contains an unsupported YAML scalar")
+        value[key] = parsed
     _exact_fields(value, _CONFIG_FIELDS, label="config")
     return value
 
@@ -398,17 +601,21 @@ def _validate_bootstrap_receipt(
     profile: AwsP5Profile,
     runtime: AwsP5Runtime,
     release_sha256: str,
+    release_members_sha256: str,
     cohort_sha256: str,
     corpus_sha256: str,
+    corpus_build_id: str,
     code_commit: str,
-) -> VerifiedFile:
+    observed_instance_id: str,
+    observed_boot_id: str,
+) -> tuple[VerifiedFile, Mapping[str, object]]:
     digest = _hash_regular(path, label="bootstrap receipt")
     if digest != expected_sha256:
         raise LaunchError("bootstrap receipt SHA-256 mismatch")
     receipt = _load_json(path, label="bootstrap receipt")
     _exact_fields(receipt, _BOOTSTRAP_FIELDS, label="bootstrap receipt")
     expected = {
-        "schema_version": 1,
+        "schema_version": 2,
         "receipt_type": "aws-p5-bootstrap",
         "provider": PROVIDER,
         "instance_type": "p5.48xlarge",
@@ -417,14 +624,25 @@ def _validate_bootstrap_receipt(
         "container_digest": runtime.container_digest,
         "profile_sha256": profile.sha256,
         "release_sha256": release_sha256,
+        "release_members_sha256": release_members_sha256,
+        "release_root": f"releases/{release_sha256}",
         "cohort_assignment_sha256": cohort_sha256,
         "corpus_receipt_sha256": corpus_sha256,
+        "corpus_build_id": corpus_build_id,
         "code_commit": code_commit,
+        "instance_id": observed_instance_id,
+        "boot_id": observed_boot_id,
         "scratch_root": profile.scratch_root,
+        "runtime_uid": runtime.uid,
+        "runtime_gid": runtime.gid,
         "durable_upload_verified": True,
     }
     for key, expected_value in expected.items():
         if receipt.get(key) != expected_value:
+            if key == "release_members_sha256":
+                raise LaunchError(
+                    "bootstrap receipt release member SHA-256 does not match"
+                )
             raise LaunchError(f"bootstrap receipt {key} does not match")
     instance_id = receipt["instance_id"]
     if (
@@ -432,6 +650,16 @@ def _validate_bootstrap_receipt(
         or re.fullmatch(r"i-[0-9a-f]{8,17}", instance_id) is None
     ):
         raise LaunchError("bootstrap receipt instance ID is invalid")
+    if (
+        not isinstance(receipt["boot_id"], str)
+        or re.fullmatch(
+            r"[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-"
+            r"[89ab][0-9a-f]{3}-[0-9a-f]{12}",
+            receipt["boot_id"],
+        )
+        is None
+    ):
+        raise LaunchError("bootstrap receipt boot ID is invalid")
     store = receipt["instance_store"]
     if store != {
         "device_bytes": profile.instance_store_device_bytes,
@@ -440,100 +668,33 @@ def _validate_bootstrap_receipt(
         "raid_level": profile.raid_level,
     }:
         raise LaunchError("bootstrap receipt instance-store contract does not match")
-    return VerifiedFile(path=path, sha256=digest)
-
-
-def _validate_sidecar_set(
-    receipt_root: Path,
-    value: object,
-    *,
-    name: str,
-) -> tuple[VerifiedFile, ...]:
-    if not isinstance(value, dict):
-        raise LaunchError(f"corpus sidecar {name} must be an object")
-    _exact_fields(
-        value,
-        frozenset({"artifacts", "dtype", "items", "ordered_stream_sha256"}),
-        label=f"corpus sidecar {name}",
-    )
-    if value["dtype"] != "uint8":
-        raise LaunchError(f"corpus sidecar {name} must use uint8")
-    if type(value["items"]) is not int or value["items"] <= 0:
-        raise LaunchError(f"corpus sidecar {name} item count is invalid")
-    _sha256(
-        value["ordered_stream_sha256"],
-        label=f"corpus sidecar {name} ordered stream",
-    )
-    artifacts = value["artifacts"]
-    if not isinstance(artifacts, list) or not artifacts:
-        raise LaunchError(f"corpus sidecar {name} is missing artifacts")
-    verified = []
-    total_bytes = 0
-    seen: set[str] = set()
-    for artifact in artifacts:
-        if not isinstance(artifact, dict):
-            raise LaunchError(f"corpus sidecar {name} artifact is invalid")
-        _exact_fields(
-            artifact,
-            frozenset({"path", "bytes", "sha256"}),
-            label=f"corpus sidecar {name} artifact",
+    container_image = receipt["container_image"]
+    if (
+        not isinstance(container_image, str)
+        or _CONTAINER_IMAGE_RE.fullmatch(container_image) is None
+        or not container_image.endswith("@" + runtime.container_digest)
+    ):
+        raise LaunchError("bootstrap receipt container image is not digest pinned")
+    for name in ("runtime_uid", "runtime_gid"):
+        if type(receipt[name]) is not int or receipt[name] <= 0:
+            raise LaunchError(
+                "bootstrap receipt runtime UID/GID must be explicitly non-root"
+            )
+    account_id = receipt["account_id"]
+    role_name = receipt["role_name"]
+    role_arn = receipt["role_arn"]
+    if (
+        not isinstance(account_id, str)
+        or re.fullmatch(r"[0-9]{12}", account_id) is None
+        or not isinstance(role_name, str)
+        or re.fullmatch(r"[A-Za-z0-9+=,.@_-]{1,64}", role_name) is None
+        or not isinstance(role_arn, str)
+        or not role_arn.startswith(
+            f"arn:aws:sts::{account_id}:assumed-role/{role_name}/"
         )
-        relative = _portable_relative(
-            artifact["path"], label=f"corpus sidecar {name} artifact path"
-        )
-        if relative in seen:
-            raise LaunchError(f"corpus sidecar {name} repeats an artifact")
-        seen.add(relative)
-        expected_digest = _sha256(
-            artifact["sha256"],
-            label=f"corpus sidecar {name} artifact",
-        )
-        expected_bytes = artifact["bytes"]
-        if type(expected_bytes) is not int or expected_bytes <= 0:
-            raise LaunchError(f"corpus sidecar {name} artifact size is invalid")
-        path = _inside_existing(
-            receipt_root,
-            relative,
-            label=f"corpus sidecar {name} artifact",
-        )
-        if path.stat().st_size != expected_bytes:
-            raise LaunchError(f"corpus sidecar {name} artifact byte mismatch")
-        actual_digest = _hash_regular(path, label=f"corpus sidecar {name}")
-        if actual_digest != expected_digest:
-            raise LaunchError(f"corpus sidecar {name} SHA-256 mismatch")
-        total_bytes += expected_bytes
-        verified.append(VerifiedFile(path=path, sha256=actual_digest))
-    if total_bytes != value["items"]:
-        raise LaunchError(f"corpus sidecar {name} is not byte aligned")
-    return tuple(verified)
-
-
-def _validate_corpus_receipt(
-    path: Path,
-    *,
-    expected_sha256: str,
-    expected_ordered_sha256: str,
-) -> tuple[VerifiedFile, ...]:
-    digest = _hash_regular(path, label="corpus receipt")
-    if digest != expected_sha256:
-        raise LaunchError("corpus receipt SHA-256 mismatch")
-    value = _load_json(path, label="corpus receipt")
-    if value.get("format") != "memorysplit-parallel-corpus-v2":
-        raise LaunchError("corpus receipt format must be v2")
-    if value.get("ordered_stream_sha256") != expected_ordered_sha256:
-        raise LaunchError("corpus receipt ordered stream does not match")
-    sidecars = value.get("sidecar_sets")
-    if not isinstance(sidecars, dict):
-        raise LaunchError("corpus receipt is missing sidecar sets")
-    required = {"dense_target_weights", "split90_target_weights"}
-    if not required <= set(sidecars):
-        raise LaunchError("corpus receipt is missing required sidecars")
-    files = [VerifiedFile(path=path, sha256=digest)]
-    for name in sorted(required):
-        files.extend(
-            _validate_sidecar_set(path.parent, sidecars[name], name=name)
-        )
-    return tuple(files)
+    ):
+        raise LaunchError("bootstrap receipt instance-role identity is invalid")
+    return VerifiedFile(path=path, sha256=digest), receipt
 
 
 def _default_instance_type() -> str:
@@ -543,18 +704,38 @@ def _default_instance_type() -> str:
     return value
 
 
+def _default_instance_id() -> str:
+    value = ImdsV2Client().get("meta-data/instance-id")
+    if value is None:
+        raise LaunchError("IMDSv2 did not return an instance ID")
+    return value
+
+
+def _default_boot_id() -> str:
+    try:
+        return Path("/proc/sys/kernel/random/boot_id").read_text(
+            encoding="ascii"
+        ).strip()
+    except (OSError, UnicodeDecodeError) as error:
+        raise LaunchError("kernel boot ID is unavailable") from error
+
+
 def _default_gpu_names(environment: Mapping[str, str]) -> tuple[str, ...]:
-    completed = subprocess.run(
-        [
-            "nvidia-smi",
-            "--query-gpu=name",
-            "--format=csv,noheader",
-        ],
-        env=dict(environment),
-        capture_output=True,
-        text=True,
-        check=False,
-    )
+    try:
+        completed = subprocess.run(
+            [
+                "nvidia-smi",
+                "--query-gpu=name",
+                "--format=csv,noheader",
+            ],
+            env=dict(environment),
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=30.0,
+        )
+    except subprocess.TimeoutExpired as error:
+        raise LaunchError("nvidia-smi GPU discovery timed out") from error
     if completed.returncode != 0:
         raise LaunchError("nvidia-smi GPU discovery failed")
     return tuple(
@@ -600,8 +781,15 @@ def load_launch_plan(
     scratch_root: Path | str,
     environment: Mapping[str, str],
     observed_instance_type: str | None = None,
+    observed_instance_id: str | None = None,
+    observed_boot_id: str | None = None,
     gpu_names: Sequence[str] | None = None,
     port_available: Callable[[int], bool] = _default_port_available,
+    semantic_corpus_verifier: Callable[
+        [Path], Mapping[str, object]
+    ]
+    | None = None,
+    enforce_profile_scratch: bool = True,
 ) -> LaunchPlan:
     """Validate all trust roots and return an immutable paired launch plan."""
 
@@ -619,6 +807,25 @@ def load_launch_plan(
     )
     if actual_instance_type != "p5.48xlarge":
         raise LaunchError("launch requires an actual p5.48xlarge instance")
+    actual_instance_id = (
+        _default_instance_id()
+        if observed_instance_id is None
+        else observed_instance_id
+    )
+    if re.fullmatch(r"i-[0-9a-f]{8,17}", actual_instance_id) is None:
+        raise LaunchError("observed instance ID is invalid")
+    actual_boot_id = (
+        _default_boot_id() if observed_boot_id is None else observed_boot_id
+    )
+    if (
+        re.fullmatch(
+            r"[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-"
+            r"[89ab][0-9a-f]{3}-[0-9a-f]{12}",
+            actual_boot_id,
+        )
+        is None
+    ):
+        raise LaunchError("observed boot ID is invalid")
     safe_environment = {
         name: environment[name]
         for name in profile.process_env_allowlist
@@ -636,6 +843,14 @@ def load_launch_plan(
 
     repo = Path(repo_root).resolve(strict=True)
     scratch = Path(scratch_root).resolve(strict=True)
+    if not isinstance(enforce_profile_scratch, bool):
+        raise LaunchError("scratch enforcement flag must be boolean")
+    if enforce_profile_scratch and scratch != Path(
+        os.path.abspath(profile.scratch_root)
+    ):
+        raise LaunchError(
+            "scratch root must be exactly the profile /mnt/memorysplit path"
+        )
     manifest_file = Path(manifest_path)
     manifest_digest = _hash_regular(manifest_file, label="run manifest")
     manifest = _load_json(manifest_file, label="run manifest")
@@ -654,6 +869,10 @@ def load_launch_plan(
         raise LaunchError("manifest profile SHA-256 does not match")
     release_sha256 = _sha256(
         manifest["release_sha256"], label="manifest release"
+    )
+    release_members_sha256 = _sha256(
+        manifest["release_members_sha256"],
+        label="manifest release members",
     )
     cohort_sha256 = _sha256(
         manifest["cohort_assignment_sha256"],
@@ -682,12 +901,20 @@ def load_launch_plan(
     corpus_path = _inside_existing(
         scratch, corpus_relative, label="corpus receipt"
     )
-    verified_files = [
-        VerifiedFile(path=manifest_file, sha256=manifest_digest),
-        *_validate_corpus_receipt(
+    try:
+        corpus_evidence = verify_canonical_corpus(
             corpus_path,
             expected_sha256=corpus_sha256,
             expected_ordered_sha256=ordered_sha256,
+            semantic_verifier=semantic_corpus_verifier,
+        )
+    except CorpusContractError as error:
+        raise LaunchError(str(error)) from error
+    verified_files = [
+        VerifiedFile(path=manifest_file, sha256=manifest_digest),
+        *(
+            VerifiedFile(path=item.path, sha256=item.sha256)
+            for item in corpus_evidence.files
         ),
     ]
 
@@ -705,17 +932,29 @@ def load_launch_plan(
     bootstrap_path = _inside_existing(
         scratch, bootstrap_relative, label="bootstrap receipt"
     )
-    verified_files.append(
-        _validate_bootstrap_receipt(
-            bootstrap_path,
-            expected_sha256=_sha256(
-                bootstrap_binding["sha256"], label="manifest bootstrap receipt"
-            ),
-            profile=profile,
-            runtime=runtime,
+    bootstrap_file, bootstrap_receipt = _validate_bootstrap_receipt(
+        bootstrap_path,
+        expected_sha256=_sha256(
+            bootstrap_binding["sha256"], label="manifest bootstrap receipt"
+        ),
+        profile=profile,
+        runtime=runtime,
+        release_sha256=release_sha256,
+        release_members_sha256=release_members_sha256,
+        cohort_sha256=cohort_sha256,
+        corpus_sha256=corpus_sha256,
+        corpus_build_id=str(corpus_evidence.receipt["build_id"]),
+        code_commit=code_commit,
+        observed_instance_id=actual_instance_id,
+        observed_boot_id=actual_boot_id,
+    )
+    verified_files.append(bootstrap_file)
+    verified_files.extend(
+        _validate_release_root(
+            repo,
+            scratch,
             release_sha256=release_sha256,
-            cohort_sha256=cohort_sha256,
-            corpus_sha256=corpus_sha256,
+            release_members_sha256=release_members_sha256,
             code_commit=code_commit,
         )
     )
@@ -748,7 +987,7 @@ def load_launch_plan(
             config,
             seed=seed,
             arm=arm,
-            corpus_path=corpus_relative,
+            corpus_path="dataset/corpus-receipt.json",
         )
         out_dir = _inside_output(
             scratch, out_relative, label=f"{arm} output"
@@ -801,37 +1040,138 @@ def load_launch_plan(
                     f"{arm} {label} must be inside its output directory"
                 ) from error
 
-        child_environment = dict(safe_environment)
-        child_environment.update(
-            {
-                "CUDA_VISIBLE_DEVICES": (
-                    "0,1,2,3" if arm == "dense" else "4,5,6,7"
-                ),
-                "MS_DATA_ROOT": str(scratch / "dataset"),
-                "MS_DATA_LOADER_WORKERS": str(workers),
-                "MS_RANK_ZERO_PID_FILE": str(pid_path),
-                "MS_RUN_ROOT": str(scratch),
-                "OMP_NUM_THREADS": "1",
-                "PYTHONPATH": str(repo),
-                "PYTHONUNBUFFERED": "1",
-            }
+        runtime_config = dict(config)
+        runtime_config["train_corpus"] = "/dataset"
+        runtime_config["out_dir"] = "/output/run"
+        runtime_config_bytes = (
+            json.dumps(
+                runtime_config,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=True,
+                allow_nan=False,
+            )
+            + "\n"
+        ).encode("ascii")
+        runtime_config_sha256 = hashlib.sha256(
+            runtime_config_bytes
+        ).hexdigest()
+        scientific_config = {
+            key: value
+            for key, value in config.items()
+            if key not in {"train_corpus", "out_dir"}
+        }
+        scientific_config_sha256 = hashlib.sha256(
+            (
+                json.dumps(
+                    scientific_config,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    ensure_ascii=True,
+                    allow_nan=False,
+                )
+                + "\n"
+            ).encode("ascii")
+        ).hexdigest()
+        runtime_config_path = (
+            scratch
+            / "staging"
+            / "runtime-configs"
+            / f"seed-{seed}"
+            / f"{arm}.json"
+        )
+        gpu_ids = "0,1,2,3" if arm == "dense" else "4,5,6,7"
+        container_image = str(bootstrap_receipt["container_image"])
+        runtime_uid = int(bootstrap_receipt["runtime_uid"])
+        runtime_gid = int(bootstrap_receipt["runtime_gid"])
+        mount_values = {
+            "release": str(repo),
+            "dataset": str(scratch / "dataset"),
+            "config": str(runtime_config_path),
+            "output": str(out_dir),
+        }
+        if any(
+            any(character in value for character in ",\n\r\x00")
+            for value in mount_values.values()
+        ):
+            raise LaunchError("container bind-mount path contains unsafe characters")
+        child_environment = {"PATH": "/usr/bin:/bin"}
+        container_argv = (
+            "docker",
+            "run",
+            "--rm",
+            "--name",
+            f"memorysplit-s{seed}-{arm}",
+            "--read-only",
+            "--network=host",
+            "--ipc=host",
+            "--pid=host",
+            "--user",
+            f"{runtime_uid}:{runtime_gid}",
+            "--workdir",
+            "/workspace",
+            "--cpuset-cpus",
+            f"{affinity[0]}-{affinity[1]}",
+            "--gpus",
+            f"device={gpu_ids}",
+            "--security-opt",
+            "no-new-privileges",
+            "--cap-drop",
+            "ALL",
+            "--pids-limit",
+            "4096",
+            "--tmpfs",
+            "/tmp:rw,noexec,nosuid,nodev,size=4g",
+            "--mount",
+            f"type=bind,src={mount_values['release']},dst=/workspace,readonly",
+            "--mount",
+            f"type=bind,src={mount_values['dataset']},dst=/dataset,readonly",
+            "--mount",
+            (
+                f"type=bind,src={mount_values['config']},"
+                "dst=/runtime/config.yaml,readonly"
+            ),
+            "--mount",
+            f"type=bind,src={mount_values['output']},dst=/output",
+            "--env",
+            "HOME=/tmp/home",
+            "--env",
+            f"CUDA_VISIBLE_DEVICES={gpu_ids}",
+            "--env",
+            f"MS_DATA_LOADER_WORKERS={workers}",
+            "--env",
+            "MS_RANK_ZERO_PID_FILE=/output/rank-zero.pid",
+            "--env",
+            "OMP_NUM_THREADS=1",
+            "--env",
+            "PYTHONUNBUFFERED=1",
+            container_image,
+            "/opt/conda/bin/python",
+            "-m",
+            "torch.distributed.run",
+            "--nnodes=1",
+            "--nproc_per_node=4",
+            "--rdzv_backend=c10d",
+            f"--rdzv_endpoint=127.0.0.1:{port}",
+            "/workspace/scripts/run_train.py",
+            "--config",
+            "/runtime/config.yaml",
+            "--resume",
+            "none",
         )
         parsed_runs.append(
             ArmLaunch(
                 arm=arm,
-                argv=(
-                    "torchrun",
-                    "--standalone",
-                    "--nproc_per_node=4",
-                    f"--master_port={port}",
-                    "scripts/run_train.py",
-                    "--config",
-                    config_relative,
-                ),
+                argv=container_argv,
                 environment=child_environment,
-                cwd=repo,
+                cwd=scratch,
                 config_path=config_path,
                 config_sha256=config_digest,
+                runtime_config=runtime_config,
+                runtime_config_bytes=runtime_config_bytes,
+                runtime_config_path=runtime_config_path,
+                runtime_config_sha256=runtime_config_sha256,
+                scientific_config_sha256=scientific_config_sha256,
                 out_dir=out_dir,
                 checkpoint_path=checkpoint_path,
                 rank_zero_pid_file=pid_path,
@@ -862,8 +1202,12 @@ def load_launch_plan(
         arms=(parsed_runs[0], parsed_runs[1]),
         verified_files=tuple(verified_files),
         release_sha256=release_sha256,
+        release_members_sha256=release_members_sha256,
         corpus_receipt_sha256=corpus_sha256,
         code_commit=code_commit,
+        container_image=str(bootstrap_receipt["container_image"]),
+        runtime_uid=int(bootstrap_receipt["runtime_uid"]),
+        runtime_gid=int(bootstrap_receipt["runtime_gid"]),
     )
 
 
@@ -879,6 +1223,10 @@ def render_plan(plan: LaunchPlan) -> dict[str, object]:
                 "data_loader_workers": launch.data_loader_workers,
                 "env": dict(sorted(launch.environment.items())),
                 "out_dir": str(launch.out_dir),
+                "runtime_config": dict(launch.runtime_config),
+                "runtime_config_path": str(launch.runtime_config_path),
+                "runtime_config_sha256": launch.runtime_config_sha256,
+                "scientific_config_sha256": launch.scientific_config_sha256,
             }
             for launch in plan.arms
         ],
@@ -888,6 +1236,158 @@ def render_plan(plan: LaunchPlan) -> dict[str, object]:
         "schema_version": 1,
         "seed": plan.seed,
     }
+
+
+_TRAINER_CONTRACT_FIELDS = frozenset(
+    {
+        "rank_zero_pid_file",
+        "resume_sha256",
+        "sidecar_name",
+        "sigusr1_checkpoint",
+        "train_corpus",
+    }
+)
+_TRAINER_CONTRACT_PROBE = """\
+import inspect
+import json
+from pathlib import Path
+from train import data, trainer
+
+data_source = inspect.getsource(data)
+trainer_source = inspect.getsource(trainer)
+runner_source = Path("/workspace/scripts/run_train.py").read_text(encoding="utf-8")
+train_parameters = inspect.signature(trainer.train).parameters
+combined = data_source + "\\n" + trainer_source + "\\n" + runner_source
+contract = {
+    "rank_zero_pid_file": "MS_RANK_ZERO_PID_FILE" in combined,
+    "resume_sha256": (
+        "resume_sha256" in train_parameters
+        and "--resume-sha256" in runner_source
+        and "--resume-path" in runner_source
+    ),
+    "sidecar_name": (
+        "sidecar_name" in data_source
+        and "memorysplit-parallel-corpus-v2" in data_source
+    ),
+    "sigusr1_checkpoint": (
+        "SIGUSR1" in combined
+        and "signal.signal" in combined
+        and ("save_ckpt" in combined or "checkpoint" in combined)
+    ),
+    "train_corpus": "train_corpus" in combined,
+}
+print(json.dumps(contract, sort_keys=True, separators=(",", ":")))
+"""
+
+
+def render_trainer_preflight(plan: LaunchPlan) -> tuple[str, ...]:
+    """Render the no-GPU contract probe in the same immutable image and release."""
+
+    release = str(plan.repo_root)
+    if any(character in release for character in ",\n\r\x00"):
+        raise LaunchError("trainer preflight release path is unsafe")
+    return (
+        "docker",
+        "run",
+        "--rm",
+        "--read-only",
+        "--network=none",
+        "--ipc=none",
+        "--user",
+        f"{plan.runtime_uid}:{plan.runtime_gid}",
+        "--workdir",
+        "/workspace",
+        "--security-opt",
+        "no-new-privileges",
+        "--cap-drop",
+        "ALL",
+        "--pids-limit",
+        "256",
+        "--tmpfs",
+        "/tmp:rw,noexec,nosuid,nodev,size=256m",
+        "--mount",
+        f"type=bind,src={release},dst=/workspace,readonly",
+        "--env",
+        "HOME=/tmp/home",
+        plan.container_image,
+        "/opt/conda/bin/python",
+        "-c",
+        _TRAINER_CONTRACT_PROBE,
+    )
+
+
+def _run_trainer_preflight(
+    argv: Sequence[str],
+    environment: Mapping[str, str],
+    timeout_seconds: float,
+) -> CommandResult:
+    try:
+        completed = subprocess.run(
+            list(argv),
+            env=dict(environment),
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=timeout_seconds,
+        )
+    except subprocess.TimeoutExpired as error:
+        raise LaunchError("trainer contract preflight timed out") from error
+    return CommandResult(
+        returncode=completed.returncode,
+        stdout=completed.stdout,
+        stderr=completed.stderr,
+    )
+
+
+def preflight_trainer_contract(
+    plan: LaunchPlan,
+    *,
+    runner: Callable[
+        [Sequence[str], Mapping[str, str], float], CommandResult
+    ] = _run_trainer_preflight,
+    timeout_seconds: float = 120.0,
+) -> None:
+    """Fail before launch unless the integrated trainer exposes every P5 hook."""
+
+    if (
+        isinstance(timeout_seconds, bool)
+        or not isinstance(timeout_seconds, (int, float))
+        or not 0 < float(timeout_seconds) <= 300
+    ):
+        raise LaunchError("trainer contract timeout must be between 0 and 300 seconds")
+    result = runner(
+        render_trainer_preflight(plan),
+        {"PATH": "/usr/bin:/bin"},
+        float(timeout_seconds),
+    )
+    if result.returncode != 0:
+        raise LaunchError("trainer contract preflight failed inside pinned container")
+    if result.stderr:
+        raise LaunchError("trainer contract preflight wrote unexpected stderr")
+    try:
+        contract = json.loads(result.stdout)
+    except json.JSONDecodeError as error:
+        raise LaunchError("trainer contract preflight returned invalid JSON") from error
+    if (
+        not isinstance(contract, dict)
+        or set(contract) != _TRAINER_CONTRACT_FIELDS
+        or any(type(value) is not bool for value in contract.values())
+    ):
+        raise LaunchError("trainer contract preflight returned invalid evidence")
+    missing = sorted(name for name, supported in contract.items() if not supported)
+    if missing:
+        labels = {
+            "rank_zero_pid_file": "rank-zero PID file",
+            "resume_sha256": "explicit resume SHA",
+            "sidecar_name": "sidecar_name",
+            "sigusr1_checkpoint": "SIGUSR1 checkpoint",
+            "train_corpus": "train_corpus",
+        }
+        raise LaunchError(
+            "trainer contract is unavailable: "
+            + ", ".join(labels[name] for name in missing)
+        )
 
 
 class _SubprocessHandle:
@@ -913,25 +1413,21 @@ class _SubprocessHandle:
             return
         try:
             os.killpg(self._process.pid, signal.SIGTERM)
-            self._process.wait(timeout=10)
-        except subprocess.TimeoutExpired:
+        except ProcessLookupError:
+            pass
+
+    def kill_tree(self) -> None:
+        if self._process.poll() is not None:
+            return
+        try:
             os.killpg(self._process.pid, signal.SIGKILL)
-            self._process.wait(timeout=10)
-        finally:
-            if not self._log_handle.closed:
-                self._log_handle.close()
+        except ProcessLookupError:
+            pass
 
 
 def _spawn_process(launch: ArmLaunch) -> ProcessHandle:
     log_path = launch.out_dir / "launcher.log"
     log_handle = log_path.open("xb")
-
-    def set_affinity() -> None:
-        if not hasattr(os, "sched_setaffinity"):
-            raise RuntimeError("CPU affinity is unavailable on this platform")
-        start, end = launch.cpu_affinity
-        os.sched_setaffinity(0, set(range(start, end + 1)))
-
     try:
         process = subprocess.Popen(
             list(launch.argv),
@@ -941,7 +1437,6 @@ def _spawn_process(launch: ArmLaunch) -> ProcessHandle:
             stdout=log_handle,
             stderr=subprocess.STDOUT,
             start_new_session=True,
-            preexec_fn=set_affinity,
         )
     except BaseException:
         log_handle.close()
@@ -955,15 +1450,93 @@ def _revalidate_files(plan: LaunchPlan) -> None:
             raise LaunchError(f"launch input changed after planning: {item.path}")
 
 
+def _materialize_runtime_config(launch: ArmLaunch) -> None:
+    path = launch.runtime_config_path
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    if path.is_symlink():
+        raise LaunchError("runtime config path must not be a symlink")
+    if path.exists():
+        if (
+            not path.is_file()
+            or _hash_regular(path, label="runtime config")
+            != launch.runtime_config_sha256
+            or path.stat().st_mode & 0o222
+        ):
+            raise LaunchError("existing runtime config does not match the plan")
+        return
+    try:
+        with path.open("xb") as handle:
+            handle.write(launch.runtime_config_bytes)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(path, 0o444)
+    except BaseException:
+        if path.exists() and not path.is_symlink():
+            path.unlink()
+        raise
+
+
 def _safe_terminate(process: ProcessHandle) -> None:
+    _terminate_all((process,))
+
+
+def _terminate_all(processes: Sequence[ProcessHandle]) -> None:
+    active = tuple(
+        process for process in processes if process.poll() is None
+    )
+    for process in active:
+        try:
+            process.terminate_tree()
+        except (OSError, subprocess.SubprocessError):
+            pass
+    deadline = time.monotonic() + 10.0
+    pending = []
+    for process in active:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            pending.append(process)
+            continue
+        try:
+            process.wait(timeout=remaining)
+        except (OSError, subprocess.SubprocessError):
+            pending.append(process)
+    for process in pending:
+        kill_tree = getattr(process, "kill_tree", None)
+        if kill_tree is not None:
+            try:
+                kill_tree()
+            except (OSError, subprocess.SubprocessError):
+                pass
+    kill_deadline = time.monotonic() + 2.0
+    for process in pending:
+        remaining = kill_deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        try:
+            process.wait(timeout=remaining)
+        except (OSError, subprocess.SubprocessError):
+            pass
+
+
+@contextmanager
+def installed_shutdown_handlers() -> Iterator[Callable[[], int | None]]:
+    """Capture termination requests without releasing the supervision lock."""
+
+    requested: dict[str, int | None] = {"signum": None}
+    watched = (signal.SIGTERM, signal.SIGHUP, signal.SIGINT)
+    previous = {signum: signal.getsignal(signum) for signum in watched}
+
+    def capture(signum, _frame) -> None:
+        if requested["signum"] is None:
+            requested["signum"] = int(signum)
+
     try:
-        process.terminate_tree()
-    except (OSError, subprocess.SubprocessError):
-        pass
-    try:
-        process.wait(timeout=10)
-    except (OSError, subprocess.SubprocessError):
-        pass
+        for signum in watched:
+            signal.signal(signum, capture)
+        yield lambda: requested["signum"]
+    finally:
+        for signum in watched:
+            signal.signal(signum, previous[signum])
 
 
 def _acquire_host_lock(scratch_root: Path):
@@ -1002,6 +1575,12 @@ def supervise_pair(
         [LaunchPlan, Mapping[str, int], str], InterruptionResult
     ]
     | None = None,
+    trainer_preflight: Callable[[LaunchPlan], None] = preflight_trainer_contract,
+    rank_zero_resolver: Callable[
+        [LaunchPlan, Mapping[str, int]], Mapping[str, int]
+    ]
+    | None = None,
+    shutdown_source: Callable[[], int | None] | None = None,
 ) -> SupervisionResult:
     """Hold the host-wide lock while supervising exactly one seed pair."""
 
@@ -1013,6 +1592,9 @@ def supervise_pair(
             sleep=sleep,
             notice_source=notice_source,
             interruption_handler=interruption_handler,
+            trainer_preflight=trainer_preflight,
+            rank_zero_resolver=rank_zero_resolver,
+            shutdown_source=shutdown_source,
         )
     finally:
         fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
@@ -1029,12 +1611,21 @@ def _supervise_pair_locked(
         [LaunchPlan, Mapping[str, int], str], InterruptionResult
     ]
     | None = None,
+    trainer_preflight: Callable[[LaunchPlan], None] = preflight_trainer_contract,
+    rank_zero_resolver: Callable[
+        [LaunchPlan, Mapping[str, int]], Mapping[str, int]
+    ]
+    | None = None,
+    shutdown_source: Callable[[], int | None] | None = None,
 ) -> SupervisionResult:
     """Launch both arms, then accept only paired zero exit status."""
 
     _revalidate_files(plan)
+    trainer_preflight(plan)
     processes: dict[str, ProcessHandle] = {}
     try:
+        for launch in plan.arms:
+            _materialize_runtime_config(launch)
         for launch in plan.arms:
             try:
                 launch.out_dir.mkdir(parents=True, mode=0o700, exist_ok=False)
@@ -1042,34 +1633,59 @@ def _supervise_pair_locked(
                 raise LaunchError(
                     f"{launch.arm} output became stale before launch"
                 ) from error
+            os.chown(launch.out_dir, plan.runtime_uid, plan.runtime_gid)
             os.chmod(launch.out_dir, 0o700)
         for launch in plan.arms:
             try:
                 processes[launch.arm] = spawner(launch)
             except BaseException as error:
-                for process in processes.values():
-                    _safe_terminate(process)
+                _terminate_all(tuple(processes.values()))
                 raise LaunchError(
                     f"failed to spawn {launch.arm} process group"
                 ) from error
         child_pids = {arm: process.pid for arm, process in processes.items()}
         if set(child_pids) != set(_ARMS):
             raise LaunchError("both child PIDs must be recorded before supervision")
+        resolver = rank_zero_resolver or _resolve_rank_zero_pids
+        try:
+            rank_zero_pids = dict(resolver(plan, child_pids))
+        except Exception as error:
+            _terminate_all(tuple(processes.values()))
+            if isinstance(error, LaunchError):
+                raise
+            raise LaunchError(
+                "rank-zero PID files were not created by both arms"
+            ) from error
+        if set(rank_zero_pids) != set(_ARMS) or any(
+            isinstance(pid, bool) or not isinstance(pid, int) or pid <= 1
+            for pid in rank_zero_pids.values()
+        ):
+            _terminate_all(tuple(processes.values()))
+            raise LaunchError("both pre-existing rank-zero PID files are required")
 
         while True:
+            requested_signal = (
+                shutdown_source() if shutdown_source is not None else None
+            )
+            if requested_signal is not None:
+                _terminate_all(tuple(processes.values()))
+                return SupervisionResult(
+                    status="terminated",
+                    returncode=128 + int(requested_signal),
+                    child_pids=child_pids,
+                    peer_terminated=True,
+                )
             if notice_source is not None:
                 try:
                     notice = notice_source()
                 except Exception as error:
-                    for process in processes.values():
-                        _safe_terminate(process)
+                    _terminate_all(tuple(processes.values()))
                     raise LaunchError(
                         "interruption notice polling failed; pair was stopped"
                     ) from error
                 if notice is not None:
                     if interruption_handler is None:
-                        for process in processes.values():
-                            _safe_terminate(process)
+                        _terminate_all(tuple(processes.values()))
                         return SupervisionResult(
                             status="interrupted",
                             returncode=74,
@@ -1077,16 +1693,14 @@ def _supervise_pair_locked(
                         )
                     try:
                         interruption = interruption_handler(
-                            plan, child_pids, notice
+                            plan, rank_zero_pids, notice
                         )
                     except Exception as error:
-                        for process in processes.values():
-                            _safe_terminate(process)
+                        _terminate_all(tuple(processes.values()))
                         raise LaunchError(
                             "interruption handling failed; pair was stopped"
                         ) from error
-                    for process in processes.values():
-                        _safe_terminate(process)
+                    _terminate_all(tuple(processes.values()))
                     return SupervisionResult(
                         status="interrupted",
                         returncode=interruption.exit_code,
@@ -1127,8 +1741,7 @@ def _supervise_pair_locked(
                 )
             sleep(0.25)
     except KeyboardInterrupt:
-        for process in processes.values():
-            _safe_terminate(process)
+        _terminate_all(tuple(processes.values()))
         return SupervisionResult(
             status="interrupted",
             returncode=130,
@@ -1141,79 +1754,114 @@ def _supervise_pair_locked(
 def _read_rank_zero_pid(
     path: Path,
     *,
-    supervisor_pid: int,
+    runtime_uid: int,
     deadline: float,
+    monotonic: Callable[[], float] = time.monotonic,
+    sleep: Callable[[float], None] = time.sleep,
 ) -> int:
-    while time.monotonic() <= deadline:
-        if not path.is_symlink() and path.is_file():
-            text = path.read_text(encoding="ascii").strip()
-            if text.isdigit():
-                pid = int(text)
-                if pid > 1 and _is_descendant(pid, supervisor_pid):
-                    return pid
-        time.sleep(0.25)
+    while monotonic() <= deadline:
+        flags = os.O_RDONLY
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        try:
+            descriptor = os.open(path, flags)
+        except FileNotFoundError:
+            descriptor = None
+        except OSError as error:
+            raise LaunchError("rank-zero PID file is unsafe") from error
+        if descriptor is not None:
+            try:
+                metadata = os.fstat(descriptor)
+                if (
+                    not stat.S_ISREG(metadata.st_mode)
+                    or metadata.st_nlink != 1
+                    or metadata.st_uid != runtime_uid
+                    or metadata.st_size > 32
+                ):
+                    raise LaunchError("rank-zero PID file is unsafe")
+                raw = os.read(descriptor, 33)
+            finally:
+                os.close(descriptor)
+            try:
+                text = raw.decode("ascii").strip()
+            except UnicodeDecodeError as error:
+                raise LaunchError("rank-zero PID file is invalid") from error
+            if not text.isdigit():
+                raise LaunchError("rank-zero PID file is invalid")
+            pid = int(text)
+            if pid <= 1:
+                raise LaunchError("rank-zero PID file is invalid")
+            try:
+                os.kill(pid, 0)
+            except OSError as error:
+                raise LaunchError("rank-zero process is not running") from error
+            return pid
+        remaining = deadline - monotonic()
+        if remaining <= 0:
+            break
+        sleep(min(0.25, remaining))
     raise LaunchError("rank-zero PID file was not produced by torchrun")
 
 
-def _is_descendant(pid: int, ancestor: int) -> bool:
-    current = pid
-    seen = set()
-    while current > 1 and current not in seen:
-        if current == ancestor:
-            return True
-        seen.add(current)
-        try:
-            fields = Path(f"/proc/{current}/stat").read_text().split()
-            current = int(fields[3])
-        except (OSError, ValueError, IndexError):
-            return False
-    return False
-
-
-def _production_interruption_handler(
+def _resolve_rank_zero_pids(
     plan: LaunchPlan,
-    child_pids: Mapping[str, int],
-    notice: str,
-) -> InterruptionResult:
+    _child_pids: Mapping[str, int],
+) -> Mapping[str, int]:
     deadline = time.monotonic() + 30.0
-    rank_zero_pids = {
+    resolved = {
         launch.arm: _read_rank_zero_pid(
             launch.rank_zero_pid_file,
-            supervisor_pid=child_pids[launch.arm],
+            runtime_uid=plan.runtime_uid,
             deadline=deadline,
         )
         for launch in plan.arms
     }
-    store = S3ObjectStore(
-        region=plan.runtime.region,
-        environment={
-            name: plan.arms[0].environment[name]
-            for name in ("AWS_REGION", "HOME", "PATH")
-            if name in plan.arms[0].environment
-        },
-    )
-    request = InterruptionRequest(
-        seed=plan.seed,
-        notice=notice,
-        rank_zero_pids=rank_zero_pids,
-        checkpoint_paths={
-            launch.arm: launch.checkpoint_path for launch in plan.arms
-        },
-        s3_root=plan.runtime.s3_root,
-        receipt_path=(
-            plan.scratch_root
-            / "staging"
-            / f"interruption-seed-{plan.seed}.json"
-        ),
-        release_sha256=plan.release_sha256,
-        corpus_receipt_sha256=plan.corpus_receipt_sha256,
-        code_commit=plan.code_commit,
-        config_sha256={
-            launch.arm: launch.config_sha256 for launch in plan.arms
-        },
-        timeout_seconds=120.0,
-    )
-    return handle_interruption(request, object_store=store)
+    if len(set(resolved.values())) != len(_ARMS):
+        raise LaunchError("rank-zero PID files must identify distinct processes")
+    return resolved
+
+
+def _production_interruption_handler(
+    plan: LaunchPlan,
+    rank_zero_pids: Mapping[str, int],
+    notice: str,
+) -> InterruptionResult:
+    staging = plan.scratch_root / "staging"
+    with tempfile.TemporaryDirectory(prefix="aws-home-", dir=staging) as home:
+        os.chmod(home, 0o700)
+        store = S3ObjectStore(
+            region=plan.runtime.region,
+            environment={
+                "AWS_REGION": plan.runtime.region,
+                "HOME": home,
+                "LANG": "C.UTF-8",
+                "LC_ALL": "C.UTF-8",
+                "PATH": "/usr/bin:/bin",
+            },
+        )
+        request = InterruptionRequest(
+            seed=plan.seed,
+            notice=notice,
+            rank_zero_pids=rank_zero_pids,
+            checkpoint_paths={
+                launch.arm: launch.checkpoint_path for launch in plan.arms
+            },
+            s3_root=plan.runtime.s3_root,
+            receipt_path=(
+                plan.scratch_root
+                / "staging"
+                / f"interruption-seed-{plan.seed}.json"
+            ),
+            release_sha256=plan.release_sha256,
+            corpus_receipt_sha256=plan.corpus_receipt_sha256,
+            code_commit=plan.code_commit,
+            config_sha256={
+                launch.arm: launch.config_sha256 for launch in plan.arms
+            },
+            timeout_seconds=120.0,
+            upload_reserve_seconds=30.0,
+        )
+        return handle_interruption(request, object_store=store)
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -1248,11 +1896,13 @@ def main(argv: Sequence[str] | None = None) -> int:
             print(json.dumps(report, sort_keys=True, separators=(",", ":")))
             return 0
         client = ImdsV2Client()
-        result = supervise_pair(
-            plan,
-            notice_source=client.interruption_notice,
-            interruption_handler=_production_interruption_handler,
-        )
+        with installed_shutdown_handlers() as shutdown_source:
+            result = supervise_pair(
+                plan,
+                notice_source=client.interruption_notice,
+                interruption_handler=_production_interruption_handler,
+                shutdown_source=shutdown_source,
+            )
         report = {
             "child_pids": dict(sorted(result.child_pids.items())),
             "dry_run": False,

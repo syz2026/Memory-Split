@@ -55,13 +55,13 @@ def test_production_profile_freezes_exact_p5_hardware_and_seed_assignment():
     assert profile.durable_uri_env == "MS_S3_ROOT"
     assert profile.ami_id_env == "MS_AWS_AMI_ID"
     assert profile.container_digest_env == "MS_CONTAINER_DIGEST"
+    assert profile.runtime_uid_env == "MS_RUNTIME_UID"
+    assert profile.runtime_gid_env == "MS_RUNTIME_GID"
     assert profile.assigned_seeds == (1, 2, 3, 4)
     assert profile.process_env_allowlist == (
         "AWS_REGION",
-        "HOME",
         "LANG",
         "LC_ALL",
-        "PATH",
     )
     assert re.fullmatch(r"[0-9a-f]{64}", profile.sha256)
 
@@ -79,6 +79,8 @@ def test_production_profile_freezes_exact_p5_hardware_and_seed_assignment():
         lambda value: value["runtime"].update(
             container_digest_env="memorysplit:latest"
         ),
+        lambda value: value["runtime"].update(runtime_uid_env="UID"),
+        lambda value: value["runtime"].update(runtime_gid_env="GID"),
         lambda value: value.update(assigned_seeds=[0, 1, 2, 3]),
         lambda value: value["process_env_allowlist"].append(
             "AWS_SECRET_ACCESS_KEY"
@@ -94,6 +96,8 @@ def test_production_profile_freezes_exact_p5_hardware_and_seed_assignment():
         "wrong-scratch-root",
         "mutable-ami-label",
         "mutable-container-tag",
+        "implicit-runtime-uid",
+        "implicit-runtime-gid",
         "seed-zero",
         "static-aws-key",
         "unknown-field",
@@ -145,6 +149,8 @@ def test_runtime_environment_requires_immutable_aws_identity():
             "MS_S3_ROOT": "s3://memorysplit-prod/cohort-v2",
             "MS_AWS_AMI_ID": "ami-0123456789abcdef0",
             "MS_CONTAINER_DIGEST": "sha256:" + "a" * 64,
+            "MS_RUNTIME_UID": "1000",
+            "MS_RUNTIME_GID": "1000",
         },
     )
 
@@ -152,6 +158,8 @@ def test_runtime_environment_requires_immutable_aws_identity():
     assert runtime.s3_root == "s3://memorysplit-prod/cohort-v2"
     assert runtime.ami_id == "ami-0123456789abcdef0"
     assert runtime.container_digest == "sha256:" + "a" * 64
+    assert runtime.uid == 1000
+    assert runtime.gid == 1000
 
 
 @pytest.mark.parametrize(
@@ -164,6 +172,10 @@ def test_runtime_environment_requires_immutable_aws_identity():
         ("MS_AWS_AMI_ID", "ami-latest"),
         ("MS_CONTAINER_DIGEST", "memorysplit:latest"),
         ("MS_CONTAINER_DIGEST", "sha256:" + "A" * 64),
+        ("MS_RUNTIME_UID", "0"),
+        ("MS_RUNTIME_UID", "-1"),
+        ("MS_RUNTIME_UID", "01000"),
+        ("MS_RUNTIME_GID", "root"),
     ],
 )
 def test_runtime_environment_rejects_mutable_or_unsafe_values(name, value):
@@ -173,6 +185,8 @@ def test_runtime_environment_rejects_mutable_or_unsafe_values(name, value):
         "MS_S3_ROOT": "s3://memorysplit-prod/cohort-v2",
         "MS_AWS_AMI_ID": "ami-0123456789abcdef0",
         "MS_CONTAINER_DIGEST": "sha256:" + "a" * 64,
+        "MS_RUNTIME_UID": "1000",
+        "MS_RUNTIME_GID": "1000",
     }
     environment[name] = value
 
@@ -198,10 +212,42 @@ def test_runtime_environment_rejects_inherited_secrets(secret_name):
         "MS_S3_ROOT": "s3://memorysplit-prod/cohort-v2",
         "MS_AWS_AMI_ID": "ami-0123456789abcdef0",
         "MS_CONTAINER_DIGEST": "sha256:" + "a" * 64,
+        "MS_RUNTIME_UID": "1000",
+        "MS_RUNTIME_GID": "1000",
         secret_name: "must-not-be-inherited",
     }
 
     with pytest.raises(ValueError, match="secret"):
+        validate_runtime_environment(profile, environment)
+
+
+@pytest.mark.parametrize(
+    "source_name",
+    [
+        "AWS_PROFILE",
+        "AWS_DEFAULT_PROFILE",
+        "AWS_CONFIG_FILE",
+        "AWS_SHARED_CREDENTIALS_FILE",
+        "AWS_WEB_IDENTITY_TOKEN_FILE",
+        "AWS_ROLE_ARN",
+        "AWS_CONTAINER_CREDENTIALS_FULL_URI",
+        "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
+        "AWS_EC2_METADATA_DISABLED",
+    ],
+)
+def test_runtime_environment_rejects_non_instance_role_sources(source_name):
+    profile = load_aws_p5_profile(PROFILE_PATH)
+    environment = {
+        "AWS_REGION": "us-east-1",
+        "MS_S3_ROOT": "s3://memorysplit-prod/cohort-v2",
+        "MS_AWS_AMI_ID": "ami-0123456789abcdef0",
+        "MS_CONTAINER_DIGEST": "sha256:" + "a" * 64,
+        "MS_RUNTIME_UID": "1000",
+        "MS_RUNTIME_GID": "1000",
+        source_name: "configured",
+    }
+
+    with pytest.raises(ValueError, match="credential source|instance role"):
         validate_runtime_environment(profile, environment)
 
 
@@ -215,7 +261,7 @@ def test_aws_dataset_pointer_uses_s3_as_the_durable_boundary():
         "materialization": "s3",
         "provider": "aws-p5.48xlarge",
         "relative_path": "dataset",
-        "required_receipt": "dataset/corpus-receipt.json",
+        "required_receipt": "dataset/receipt.json",
         "required_sidecars": [
             "dense_target_weights",
             "split90_target_weights",
