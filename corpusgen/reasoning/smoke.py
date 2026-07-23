@@ -7,13 +7,13 @@ import json
 import os
 import shutil
 from dataclasses import dataclass
-from fractions import Fraction
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 
 from corpusgen.reasoning.closure import (
+    LeakageReport,
     SemanticFact,
     SupervisedField,
     audit_occurrence_closure,
@@ -30,7 +30,6 @@ from corpusgen.reasoning.proofs import (
 from corpusgen.reasoning.routing import (
     FactMetadata,
     RouteManifest,
-    build_route_manifest,
     build_route_manifests,
 )
 from corpusgen.reasoning.state import AnswerPointer, serialize_answer_state
@@ -145,6 +144,14 @@ def _fixture_fields(states: tuple[dict, ...]) -> tuple[SupervisedField, ...]:
         )
         for index, (value, alias) in enumerate(_VALUES)
     )
+
+
+def _record_json(field: SupervisedField) -> dict:
+    return {
+        "field_id": field.field_id,
+        "text": field.text,
+        "supervised": field.supervised,
+    }
 
 
 def _fixture_proof_inputs() -> tuple[tuple[str, tuple], ...]:
@@ -312,6 +319,66 @@ def _token_leaks(
     return leaks
 
 
+def _semantic_leakage_json(
+    leakage: LeakageReport,
+    token_leaks: list[dict[str, Any]],
+) -> dict:
+    return {
+        **leakage.as_dict(),
+        "unmasked_token_occurrences": len(token_leaks),
+        "token_leaks": token_leaks,
+    }
+
+
+def _closure_report_json(
+    leakage: LeakageReport,
+    token_leaks: list[dict[str, Any]],
+) -> dict:
+    return {
+        "passed": leakage.passed and not token_leaks,
+        "supervised_occurrences": leakage.supervised_occurrences,
+        "masked_occurrences": leakage.masked_occurrences,
+        "unmasked_supervised_occurrences": len(
+            leakage.unmasked_occurrences
+        ),
+        "unmasked_token_occurrences": len(token_leaks),
+    }
+
+
+def _smoke_report(
+    *,
+    fact_count: int,
+    token_count: int,
+    route_dose: dict,
+    closure_reports: dict,
+    state_count: int,
+    state_phases: tuple[str, ...],
+    state_surface_copies: int,
+    proof_families: tuple[str, ...],
+) -> dict:
+    return {
+        "format": _FORMAT,
+        "profile": "smoke",
+        "scientific_result": False,
+        "scientific_readiness": False,
+        "status": "non-scientific implementation smoke only",
+        "facts": fact_count,
+        "tokens": token_count,
+        "route_dose": route_dose,
+        "semantic_closure": closure_reports,
+        "answer_states": {
+            "format": "pointer-slot",
+            "states": state_count,
+            "phases": list(state_phases),
+            "surface_value_copies": state_surface_copies,
+        },
+        "proofs": {
+            "families": list(proof_families),
+            "verified": True,
+        },
+    }
+
+
 def _write_jsonl(path: Path, rows) -> None:
     with path.open("wb") as handle:
         for row in rows:
@@ -338,14 +405,7 @@ def _build_private(root: Path) -> dict:
     (root / "dense.weights.bin").write_bytes(dense)
     _write_jsonl(
         root / "records.jsonl",
-        (
-            {
-                "field_id": field.field_id,
-                "text": field.text,
-                "supervised": field.supervised,
-            }
-            for field in fields
-        ),
+        (_record_json(field) for field in fields),
     )
     _write_jsonl(
         root / "answer-states.jsonl",
@@ -377,21 +437,10 @@ def _build_private(root: Path) -> dict:
         )
         if token_leaks:
             raise ValueError(f"{split} left supervised token copies unmasked")
-        leakage_json = {
-            **leakage.as_dict(),
-            "unmasked_token_occurrences": len(token_leaks),
-        }
+        leakage_json = _semantic_leakage_json(leakage, token_leaks)
         _write_json(root / f"{stem}-semantic-leakage.json", leakage_json)
         route_dose[split] = _route_dose(manifest)
-        closure_reports[split] = {
-            "passed": leakage.passed and not token_leaks,
-            "supervised_occurrences": leakage.supervised_occurrences,
-            "masked_occurrences": leakage.masked_occurrences,
-            "unmasked_supervised_occurrences": len(
-                leakage.unmasked_occurrences
-            ),
-            "unmasked_token_occurrences": len(token_leaks),
-        }
+        closure_reports[split] = _closure_report_json(leakage, token_leaks)
 
     surfaces = tuple(
         surface
@@ -403,27 +452,16 @@ def _build_private(root: Path) -> dict:
         for state in states
         for surface in surfaces
     )
-    report = {
-        "format": _FORMAT,
-        "profile": "smoke",
-        "scientific_result": False,
-        "scientific_readiness": False,
-        "status": "non-scientific implementation smoke only",
-        "facts": len(facts),
-        "tokens": len(token_ids),
-        "route_dose": route_dose,
-        "semantic_closure": closure_reports,
-        "answer_states": {
-            "format": "pointer-slot",
-            "states": len(states),
-            "phases": ["candidate", "final"],
-            "surface_value_copies": state_surface_copies,
-        },
-        "proofs": {
-            "families": [family for family, _ in proof_inputs],
-            "verified": True,
-        },
-    }
+    report = _smoke_report(
+        fact_count=len(facts),
+        token_count=len(token_ids),
+        route_dose=route_dose,
+        closure_reports=closure_reports,
+        state_count=len(states),
+        state_phases=tuple(sorted({state["phase"] for state in states})),
+        state_surface_copies=state_surface_copies,
+        proof_families=tuple(family for family, _ in proof_inputs),
+    )
     if state_surface_copies:
         raise ValueError("pointer answer state repeated a factual surface")
     _write_json(root / "report.json", report)
@@ -450,20 +488,6 @@ def _write_manifest(root: Path) -> None:
             "report": "report.json",
             "artifacts": artifacts,
         },
-    )
-
-
-def _read_records(path: Path) -> tuple[SupervisedField, ...]:
-    return tuple(
-        SupervisedField(
-            field_id=row["field_id"],
-            text=row["text"],
-            supervised=row["supervised"],
-        )
-        for row in (
-            json.loads(line)
-            for line in path.read_text(encoding="utf-8").splitlines()
-        )
     )
 
 
@@ -541,10 +565,11 @@ def _verify_proof_bundles(path: Path) -> tuple[str, ...]:
 def _verify_answer_states(
     path: Path,
     surfaces: tuple[str, ...],
-) -> tuple[int, tuple[str, ...]]:
+) -> tuple[int, tuple[str, ...], int]:
     rows = _read_jsonl(path)
     recomputed = []
     phases = []
+    surface_copies = 0
     for row in rows:
         if set(row) != {"phase", "pointer", "state"}:
             raise ValueError("invalid answer-state bundle fields")
@@ -565,8 +590,13 @@ def _verify_answer_states(
         expected = _state_bundle(pointer, phase)
         if _canonical_bytes(row) != _canonical_bytes(expected):
             raise ValueError("answer-state failed deterministic replay")
-        if any(surface in expected["state"] for surface in surfaces):
+        row_surface_copies = sum(
+            surface in expected["state"]
+            for surface in surfaces
+        )
+        if row_surface_copies:
             raise ValueError("answer-state contains a declared factual surface")
+        surface_copies += row_surface_copies
         recomputed.append(expected)
         phases.append(phase)
     expected_fixture = _fixture_state_bundles()
@@ -574,67 +604,7 @@ def _verify_answer_states(
         _canonical_bytes(row) for row in expected_fixture
     ):
         raise ValueError("answer-state differs from deterministic smoke inputs")
-    return len(recomputed), tuple(sorted(set(phases)))
-
-
-def _read_fraction(value: object, field: str) -> Fraction:
-    if (
-        not isinstance(value, dict)
-        or set(value) != {"numerator", "denominator"}
-        or isinstance(value["numerator"], bool)
-        or not isinstance(value["numerator"], int)
-        or isinstance(value["denominator"], bool)
-        or not isinstance(value["denominator"], int)
-        or value["denominator"] <= 0
-    ):
-        raise ValueError(f"invalid route fraction: {field}")
-    return Fraction(value["numerator"], value["denominator"])
-
-
-def _read_fact_metadata(route_manifest: dict) -> tuple[FactMetadata, ...]:
-    if not isinstance(route_manifest, dict):
-        raise ValueError("route manifest must be an object")
-    decisions = route_manifest.get("decisions")
-    if not isinstance(decisions, list) or not decisions:
-        raise ValueError("route manifest decisions must be a non-empty list")
-    facts = []
-    for index, decision in enumerate(decisions):
-        if not isinstance(decision, dict):
-            raise ValueError(f"route decision {index} must be an object")
-        surfaces = decision.get("surfaces")
-        if not isinstance(surfaces, list):
-            raise ValueError(f"route decision {index} surfaces must be a list")
-        facts.append(
-            FactMetadata(
-                fact_id=decision.get("fact_id"),
-                source=decision.get("source"),
-                record_type=decision.get("record_type"),
-                payload_entropy_bits=_read_fraction(
-                    decision.get("payload_entropy_bits"),
-                    f"decisions[{index}].payload_entropy_bits",
-                ),
-                scheduled_exposures=decision.get("scheduled_exposures"),
-                expected_reads=_read_fraction(
-                    decision.get("expected_reads"),
-                    f"decisions[{index}].expected_reads",
-                ),
-                expected_hops=_read_fraction(
-                    decision.get("expected_hops"),
-                    f"decisions[{index}].expected_hops",
-                ),
-                surfaces=tuple(surfaces),
-            )
-        )
-    return tuple(facts)
-
-
-def _semantic_facts_from_metadata(
-    facts: tuple[FactMetadata, ...],
-) -> tuple[SemanticFact, ...]:
-    return tuple(
-        SemanticFact(fact.fact_id, fact.surfaces)
-        for fact in facts
-    )
+    return len(recomputed), tuple(sorted(set(phases))), surface_copies
 
 
 def verify_v2_smoke_fixture(out_dir: Path | str) -> dict:
@@ -693,43 +663,37 @@ def verify_v2_smoke_fixture(out_dir: Path | str) -> dict:
     if actual_files != expected_files:
         raise ValueError("v2 smoke manifest is not hash-complete")
 
-    report = json.loads((root / manifest["report"]).read_bytes())
-    if (
-        report.get("format") != _FORMAT
-        or report.get("profile") != "smoke"
-        or report.get("scientific_result") is not False
-        or report.get("scientific_readiness") is not False
-        or report.get("status") != "non-scientific implementation smoke only"
-    ):
-        raise ValueError("v2 smoke report failed non-scientific core checks")
+    fields = _fixture_fields(_fixture_state_bundles())
+    expected_records = b"".join(
+        _canonical_bytes(_record_json(field))
+        for field in fields
+    )
+    if (root / "records.jsonl").read_bytes() != expected_records:
+        raise ValueError("records.jsonl differs from fixed supervised records")
 
-    tokens = int(report["tokens"])
+    report_path = root / manifest["report"]
     train = np.fromfile(root / "train.bin", dtype=np.uint16)
+    tokens = len(train)
     dense = (root / "dense.weights.bin").read_bytes()
-    if len(train) != tokens or dense != bytes([1]) * tokens:
+    if dense != bytes([1]) * tokens:
         raise ValueError("v2 smoke train stream and Dense sidecar disagree")
-    fields = _read_records(root / "records.jsonl")
 
-    declared_facts: tuple[FactMetadata, ...] | None = None
+    fixed_facts = _fixture_facts()
+    fixed_routes = build_route_manifests(fixed_facts)
+    semantic_facts = _semantic_facts(fixed_facts)
+    rebuilt_ids, slices = _encode_fields(semantic_facts, fields)
+    if not np.array_equal(rebuilt_ids, train):
+        raise ValueError("fixed semantic reconstruction changed train.bin")
+    closure_plan = plan_occurrence_closure(semantic_facts, fields)
+    route_dose = {}
+    closure_reports = {}
     for split in ("Split50", "Split90"):
         stem = split.lower()
         route_path = root / f"{stem}-route-manifest.json"
         route_bytes = route_path.read_bytes()
-        route = json.loads(route_bytes)
-        fact_metadata = _read_fact_metadata(route)
-        if declared_facts is None:
-            declared_facts = fact_metadata
-        elif tuple(fact.as_dict() for fact in fact_metadata) != tuple(
-            fact.as_dict() for fact in declared_facts
-        ):
-            raise ValueError("Split route manifests disagree on fact metadata")
-        rebuilt_route = build_route_manifest(fact_metadata, split)
+        rebuilt_route = fixed_routes[split]
         if route_bytes != rebuilt_route.to_bytes():
-            raise ValueError(f"{split} route manifest is not canonical")
-        semantic_facts = _semantic_facts_from_metadata(fact_metadata)
-        rebuilt_ids, slices = _encode_fields(semantic_facts, fields)
-        if not np.array_equal(rebuilt_ids, train):
-            raise ValueError(f"{split} semantic reconstruction changed train.bin")
+            raise ValueError(f"{split} route differs from fixed fixture route")
         external = frozenset(rebuilt_route.external_fact_ids)
         weights = (root / f"{stem}.weights.bin").read_bytes()
         expected_weights = _mask_for_manifest(tokens, slices, rebuilt_route)
@@ -742,48 +706,47 @@ def verify_v2_smoke_fixture(out_dir: Path | str) -> dict:
             slices,
             weights,
         )
-        leakage = json.loads(
-            (root / f"{stem}-semantic-leakage.json").read_bytes()
+        char_masks = closure_plan.mask_for_routes(
+            rebuilt_route.external_fact_ids
         )
-        dose = report["route_dose"][split]
-        closure = report["semantic_closure"][split]
-        if (
-            dose != _route_dose(rebuilt_route)
-            or leaks
-            or leakage["passed"] is not True
-            or leakage["unmasked_supervised_occurrences"] != 0
-            or leakage["unmasked_token_occurrences"] != 0
-            or closure["passed"] is not True
-            or closure["unmasked_supervised_occurrences"] != 0
-            or closure["unmasked_token_occurrences"] != 0
-        ):
+        leakage = audit_occurrence_closure(
+            semantic_facts,
+            fields,
+            rebuilt_route.external_fact_ids,
+            char_masks,
+        )
+        expected_leakage = _semantic_leakage_json(leakage, leaks)
+        leakage_path = root / f"{stem}-semantic-leakage.json"
+        if leakage_path.read_bytes() != _canonical_bytes(expected_leakage):
+            raise ValueError(f"{split} semantic leakage artifact differs")
+        route_dose[split] = _route_dose(rebuilt_route)
+        closure_reports[split] = _closure_report_json(leakage, leaks)
+        if leaks:
             raise ValueError(f"{split} route or semantic closure proof failed")
 
-    if declared_facts is None:
-        raise ValueError("v2 smoke routes declared no facts")
     surfaces = tuple(
         surface
-        for fact in declared_facts
+        for fact in fixed_facts
         for surface in fact.surfaces
     )
     proof_families = _verify_proof_bundles(root / "proofs.jsonl")
-    state_count, state_phases = _verify_answer_states(
+    state_count, state_phases, state_surface_copies = _verify_answer_states(
         root / "answer-states.jsonl",
         surfaces,
     )
-    if report.get("proofs") != {
-        "families": list(proof_families),
-        "verified": True,
-    }:
-        raise ValueError("v2 smoke proof report disagrees with replay")
-    if report.get("answer_states") != {
-        "format": "pointer-slot",
-        "states": state_count,
-        "phases": list(state_phases),
-        "surface_value_copies": 0,
-    }:
-        raise ValueError("v2 smoke answer-state report disagrees with replay")
-    return report
+    expected_report = _smoke_report(
+        fact_count=len(fixed_facts),
+        token_count=tokens,
+        route_dose=route_dose,
+        closure_reports=closure_reports,
+        state_count=state_count,
+        state_phases=state_phases,
+        state_surface_copies=state_surface_copies,
+        proof_families=proof_families,
+    )
+    if report_path.read_bytes() != _canonical_bytes(expected_report):
+        raise ValueError("v2 smoke complete report differs from replay")
+    return expected_report
 
 
 def build_v2_smoke_fixture(out_dir: Path | str) -> dict:

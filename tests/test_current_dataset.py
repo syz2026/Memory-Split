@@ -3,6 +3,8 @@ from __future__ import annotations
 import hashlib
 import json
 from collections import Counter
+from dataclasses import replace
+from fractions import Fraction
 from pathlib import Path
 
 import numpy as np
@@ -19,6 +21,16 @@ from corpusgen.current_dataset import (
     fixture_current_sources,
     verify_current_dataset,
     verify_reasoning_v2_smoke_fixture,
+)
+from corpusgen.reasoning.routing import build_route_manifests
+from corpusgen.reasoning.smoke import (
+    _encode_fields,
+    _fixture_facts,
+    _fixture_fields,
+    _fixture_state_bundles,
+    _mask_for_manifest,
+    _route_dose,
+    _semantic_facts,
 )
 from train.tokenizer import get_tok
 
@@ -394,6 +406,155 @@ def test_v2_verifier_rejects_rehashed_false_route_claims(tmp_path):
     _refresh_manifest_artifact(tmp_path, route_path.name)
 
     with pytest.raises(ValueError, match="Split90 route"):
+        verify_reasoning_v2_smoke_fixture(tmp_path)
+
+
+def test_v2_verifier_binds_routes_to_fixed_fixture_metadata(tmp_path):
+    build_reasoning_v2_smoke_fixture(tmp_path)
+    fixed_facts = _fixture_facts()
+    tampered_facts = tuple(
+        replace(
+            fact,
+            payload_entropy_bits=(
+                1
+                if fact.fact_id == "fact-00"
+                else 1_000
+                if fact.fact_id == "fact-09"
+                else fact.payload_entropy_bits
+            ),
+        )
+        for fact in fixed_facts
+    )
+    manifests = build_route_manifests(tampered_facts)
+    fields = _fixture_fields(_fixture_state_bundles())
+    train = np.fromfile(tmp_path / "train.bin", dtype=np.uint16)
+    _, slices = _encode_fields(_semantic_facts(tampered_facts), fields)
+    report_path = tmp_path / "report.json"
+    report = json.loads(report_path.read_text())
+
+    for split, manifest in manifests.items():
+        stem = split.lower()
+        route_path = tmp_path / f"{stem}-route-manifest.json"
+        sidecar_path = tmp_path / f"{stem}.weights.bin"
+        route_path.write_bytes(manifest.to_bytes())
+        sidecar_path.write_bytes(_mask_for_manifest(len(train), slices, manifest))
+        report["route_dose"][split] = _route_dose(manifest)
+        _refresh_manifest_artifact(tmp_path, route_path.name)
+        _refresh_manifest_artifact(tmp_path, sidecar_path.name)
+
+    report_path.write_text(
+        json.dumps(report, sort_keys=True, separators=(",", ":")) + "\n"
+    )
+    _refresh_manifest_artifact(tmp_path, report_path.name)
+    true_burdens = {
+        fact.fact_id: fact.information_burden_bits
+        for fact in fixed_facts
+    }
+    split90_external = manifests["Split90"].external_fact_ids
+    true_fraction = sum(
+        (true_burdens[fact_id] for fact_id in split90_external),
+        Fraction(),
+    ) / sum(true_burdens.values(), Fraction())
+    assert true_fraction < Fraction(9, 10)
+
+    with pytest.raises(ValueError, match="fixed fixture route"):
+        verify_reasoning_v2_smoke_fixture(tmp_path)
+
+
+def test_v2_verifier_binds_records_to_fixed_supervised_fields(tmp_path):
+    build_reasoning_v2_smoke_fixture(tmp_path)
+    facts = _fixture_facts()
+    fields = tuple(
+        replace(field, supervised=False)
+        for field in _fixture_fields(_fixture_state_bundles())
+    )
+    records_path = tmp_path / "records.jsonl"
+    _write_jsonl(
+        records_path,
+        [
+            {
+                "field_id": field.field_id,
+                "text": field.text,
+                "supervised": field.supervised,
+            }
+            for field in fields
+        ],
+    )
+    token_ids, slices = _encode_fields(_semantic_facts(facts), fields)
+    train_path = tmp_path / "train.bin"
+    dense_path = tmp_path / "dense.weights.bin"
+    token_ids.tofile(train_path)
+    dense_path.write_bytes(bytes([1]) * len(token_ids))
+    manifests = build_route_manifests(facts)
+    for split, manifest in manifests.items():
+        sidecar_path = tmp_path / f"{split.lower()}.weights.bin"
+        sidecar_path.write_bytes(_mask_for_manifest(len(token_ids), slices, manifest))
+        _refresh_manifest_artifact(tmp_path, sidecar_path.name)
+    report_path = tmp_path / "report.json"
+    report = json.loads(report_path.read_text())
+    report["tokens"] = len(token_ids)
+    report_path.write_text(
+        json.dumps(report, sort_keys=True, separators=(",", ":")) + "\n"
+    )
+    for path in (records_path, train_path, dense_path, report_path):
+        _refresh_manifest_artifact(tmp_path, path.name)
+
+    with pytest.raises(ValueError, match="fixed supervised records"):
+        verify_reasoning_v2_smoke_fixture(tmp_path)
+
+
+@pytest.mark.parametrize(
+    ("field", "replacement"),
+    [
+        (
+            "leaks",
+            [
+                {
+                    "field_id": "record-00",
+                    "start": 0,
+                    "end": 1,
+                    "fact_id": "fact-00",
+                    "surface": "forged",
+                }
+            ],
+        ),
+        ("metadata_errors", ["forged metadata error"]),
+        ("routed_fact_ids", []),
+        ("supervised_occurrences", -1),
+        ("masked_occurrences", -1),
+    ],
+)
+def test_v2_verifier_replays_complete_semantic_leakage_artifact(
+    tmp_path,
+    field,
+    replacement,
+):
+    build_reasoning_v2_smoke_fixture(tmp_path)
+    leakage_path = tmp_path / "split50-semantic-leakage.json"
+    leakage = json.loads(leakage_path.read_text())
+    leakage[field] = replacement
+    leakage_path.write_text(
+        json.dumps(leakage, sort_keys=True, separators=(",", ":")) + "\n"
+    )
+    _refresh_manifest_artifact(tmp_path, leakage_path.name)
+
+    with pytest.raises(ValueError, match="semantic leakage artifact"):
+        verify_reasoning_v2_smoke_fixture(tmp_path)
+
+
+def test_v2_verifier_derives_complete_report_from_replayed_evidence(tmp_path):
+    build_reasoning_v2_smoke_fixture(tmp_path)
+    report_path = tmp_path / "report.json"
+    report = json.loads(report_path.read_text())
+    report["facts"] = 999
+    report["semantic_closure"]["Split50"]["supervised_occurrences"] = -1
+    report["semantic_closure"]["Split50"]["masked_occurrences"] = -1
+    report_path.write_text(
+        json.dumps(report, sort_keys=True, separators=(",", ":")) + "\n"
+    )
+    _refresh_manifest_artifact(tmp_path, report_path.name)
+
+    with pytest.raises(ValueError, match="complete report"):
         verify_reasoning_v2_smoke_fixture(tmp_path)
 
 
