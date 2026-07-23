@@ -15,6 +15,7 @@ from .metadata import (
 )
 from .publication import (
     ParallelBuildConfig,
+    VerifiedParallelCorpus,
     build_parallel_corpus,
     build_parallel_corpus_from_tasks,
     parallel_build_id,
@@ -23,7 +24,15 @@ from .publication import (
     rerender_and_pack,
     verify_parallel_corpus,
 )
-from .safeio import atomic_rename_noreplace
+from .safeio import (
+    RETAINED_TOMBSTONE_MAX_BYTES,
+    RETAINED_TOMBSTONE_MAX_COUNT,
+    RetainedTombstoneInventory,
+    RetainedTombstoneLimitError,
+    atomic_rename_noreplace,
+    retained_tombstone_inventory,
+    retained_tombstone_maintenance_contract,
+)
 from .tasks import (
     CachedTaskRecord,
     TaskResult,
@@ -62,13 +71,18 @@ __all__ = [
     "IncompleteTaskResults",
     "MetadataRecord",
     "ParallelBuildConfig",
+    "RETAINED_TOMBSTONE_MAX_BYTES",
+    "RETAINED_TOMBSTONE_MAX_COUNT",
     "RenderedRecord",
     "Renderer",
+    "RetainedTombstoneInventory",
+    "RetainedTombstoneLimitError",
     "ScheduleRecord",
     "ShardAssignment",
     "TaskResult",
     "UnsupportedProductionRenderer",
     "UnsupportedSourceError",
+    "VerifiedParallelCorpus",
     "assign_update_aligned_shards",
     "atomic_rename_noreplace",
     "assignments_from_bytes",
@@ -93,6 +107,8 @@ __all__ = [
     "reduce_task_results",
     "render_metadata",
     "render_task_result",
+    "retained_tombstone_inventory",
+    "retained_tombstone_maintenance_contract",
     "rerender_and_pack",
     "schedule_from_bytes",
     "schedule_to_bytes",

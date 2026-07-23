@@ -4,12 +4,15 @@ from __future__ import annotations
 
 import ctypes
 import errno
+import fcntl
 import hashlib
+import json
 import os
 import re
 import secrets
 import stat
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 
 _DIRECTORY_FLAGS = (
@@ -29,10 +32,147 @@ _WRITE_FLAGS = (
 _SAFE_TOKEN = re.compile(r"[A-Za-z0-9._-]+\Z")
 _RENAME_NOREPLACE = 1
 _RENAME_EXCL = 0x00000004
+_TOMBSTONE_DIRECTORY_NAME = ".memorysplit-v2-retained-tombstones"
 _TOMBSTONE_DIRECTORY_PREFIX = ".memorysplit-v2-retained-tombstones-"
+_TOMBSTONE_OWNER_NAME = ".owner.json"
+_TOMBSTONE_LOCK_NAME = ".lock"
+_TOMBSTONE_OWNER_BYTES = (
+    b'{"format":"memorysplit-v2-retained-tombstones-v1","owner":"memorysplit"}\n'
+)
+_TOMBSTONE_LOCK_FLAGS = (
+    os.O_RDWR
+    | getattr(os, "O_CLOEXEC", 0)
+    | getattr(os, "O_NOFOLLOW", 0)
+)
+RETAINED_TOMBSTONE_MAX_COUNT = 4096
+RETAINED_TOMBSTONE_MAX_BYTES = 64 * 1024**3
 
 if not getattr(os, "O_DIRECTORY", 0) or not getattr(os, "O_NOFOLLOW", 0):
     raise RuntimeError("secure corpus publication requires O_DIRECTORY and O_NOFOLLOW")
+
+
+def retained_tombstone_maintenance_contract() -> dict[str, object]:
+    return {
+        "requires_no_active_build_or_finalizer": True,
+        "library_path_deletion": False,
+        "procedure": (
+            "Stop submissions and confirm no corpus build, task publisher, "
+            "or finalizer is active; snapshot the reported inventory; then "
+            "remove only the reported entries and their containing tombstone "
+            "roots in an operator-controlled maintenance window."
+        ),
+    }
+
+
+@dataclass(frozen=True)
+class RetainedTombstoneInventory:
+    count: int
+    byte_count: int
+    paths: tuple[str, ...]
+    roots: tuple[str, ...]
+
+    def summary_dict(self) -> dict[str, object]:
+        return {
+            "bytes": self.byte_count,
+            "count": self.count,
+            "paths": list(self.paths),
+        }
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            **self.summary_dict(),
+            "roots": list(self.roots),
+            "maintenance": retained_tombstone_maintenance_contract(),
+        }
+
+
+class RetainedTombstoneLimitError(ValueError):
+    def __init__(
+        self,
+        inventory: RetainedTombstoneInventory,
+        *,
+        max_count: int,
+        max_bytes: int,
+        additional_count: int,
+        additional_bytes: int,
+    ) -> None:
+        self.inventory = inventory
+        self.report = {
+            "inventory": inventory.summary_dict(),
+            "limits": {
+                "bytes": max_bytes,
+                "count": max_count,
+            },
+            "projected": {
+                "bytes": inventory.byte_count + additional_bytes,
+                "count": inventory.count + additional_count,
+            },
+        }
+        super().__init__(
+            "retained tombstone limit exceeded: "
+            + json.dumps(self.report, sort_keys=True, separators=(",", ":"))
+        )
+
+
+@dataclass
+class RetainedTombstoneStore:
+    parent_fd: int
+    directory_fd: int
+    lock_fd: int
+    max_count: int
+    max_bytes: int
+
+    def duplicate(self) -> "RetainedTombstoneStore":
+        parent_fd = os.dup(self.parent_fd)
+        directory_fd = -1
+        lock_fd = -1
+        try:
+            directory_fd = os.dup(self.directory_fd)
+            lock_fd = _open_tombstone_lock(directory_fd)
+            return RetainedTombstoneStore(
+                parent_fd=parent_fd,
+                directory_fd=directory_fd,
+                lock_fd=lock_fd,
+                max_count=self.max_count,
+                max_bytes=self.max_bytes,
+            )
+        except BaseException:
+            if lock_fd >= 0:
+                os.close(lock_fd)
+            if directory_fd >= 0:
+                os.close(directory_fd)
+            os.close(parent_fd)
+            raise
+
+    def close(self) -> None:
+        for field_name in ("lock_fd", "directory_fd", "parent_fd"):
+            descriptor = getattr(self, field_name)
+            if descriptor >= 0:
+                os.close(descriptor)
+                setattr(self, field_name, -1)
+
+    def inventory(self) -> RetainedTombstoneInventory:
+        return retained_tombstone_inventory_fd(self.parent_fd)
+
+    def enforce_capacity(
+        self,
+        *,
+        additional_count: int,
+        additional_bytes: int,
+    ) -> RetainedTombstoneInventory:
+        inventory = self.inventory()
+        if (
+            inventory.count + additional_count > self.max_count
+            or inventory.byte_count + additional_bytes > self.max_bytes
+        ):
+            raise RetainedTombstoneLimitError(
+                inventory,
+                max_count=self.max_count,
+                max_bytes=self.max_bytes,
+                additional_count=additional_count,
+                additional_bytes=additional_bytes,
+            )
+        return inventory
 
 
 def _entry_name(name: str) -> str:
@@ -226,33 +366,262 @@ def open_directory_path(
         raise
 
 
-def open_tombstone_directory(parent_fd: int) -> int:
-    """Open a pinned sibling namespace for retained, never-path-deleted objects."""
+def _write_control_file(directory_fd: int, name: str, payload: bytes) -> None:
+    descriptor = os.open(
+        name,
+        _WRITE_FLAGS,
+        0o600,
+        dir_fd=directory_fd,
+    )
+    try:
+        view = memoryview(payload)
+        while view:
+            written = os.write(descriptor, view)
+            view = view[written:]
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
 
-    for _attempt in range(16):
-        name = f"{_TOMBSTONE_DIRECTORY_PREFIX}{secrets.token_hex(16)}"
+
+def _open_tombstone_lock(
+    directory_fd: int,
+    *,
+    create: bool = False,
+    writable: bool = True,
+) -> int:
+    flags = _TOMBSTONE_LOCK_FLAGS if writable else _READ_FLAGS
+    if create:
+        if not writable:
+            raise ValueError("creating a tombstone lock requires write access")
+        flags |= os.O_CREAT | os.O_EXCL
+    descriptor = os.open(
+        _TOMBSTONE_LOCK_NAME,
+        flags,
+        0o600,
+        dir_fd=directory_fd,
+    )
+    metadata = os.fstat(descriptor)
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_uid != os.geteuid()
+        or metadata.st_nlink != 1
+        or metadata.st_size != 0
+    ):
+        os.close(descriptor)
+        raise ValueError("retained tombstone lock is unsafe")
+    return descriptor
+
+
+def _validate_tombstone_root(directory_fd: int) -> None:
+    owner_metadata = entry_lstat(directory_fd, _TOMBSTONE_OWNER_NAME)
+    if (
+        not stat.S_ISREG(owner_metadata.st_mode)
+        or owner_metadata.st_uid != os.geteuid()
+        or owner_metadata.st_nlink != 1
+        or read_regular_file(directory_fd, _TOMBSTONE_OWNER_NAME)
+        != _TOMBSTONE_OWNER_BYTES
+    ):
+        raise ValueError("retained tombstone ownership marker is unsafe")
+
+
+def _is_tombstone_root_name(name: str) -> bool:
+    return name == _TOMBSTONE_DIRECTORY_NAME or re.fullmatch(
+        re.escape(_TOMBSTONE_DIRECTORY_PREFIX) + r"[0-9a-f]{32}",
+        name,
+    ) is not None
+
+
+def retained_tombstone_inventory_fd(
+    parent_fd: int,
+) -> RetainedTombstoneInventory:
+    paths: list[str] = []
+    byte_count = 0
+    root_names = sorted(
+        name for name in list_entries(parent_fd) if _is_tombstone_root_name(name)
+    )
+    for root_name in root_names:
+        root_metadata = entry_lstat(parent_fd, root_name)
+        if not stat.S_ISDIR(root_metadata.st_mode):
+            raise ValueError(f"retained tombstone root is unsafe: {root_name}")
+        root_fd, _created = open_directory_at(parent_fd, root_name)
         try:
-            os.mkdir(name, mode=0o700, dir_fd=parent_fd)
-        except FileExistsError:
-            continue
+            pinned_root = os.fstat(root_fd)
+            if (pinned_root.st_dev, pinned_root.st_ino) != (
+                root_metadata.st_dev,
+                root_metadata.st_ino,
+            ):
+                raise ValueError(
+                    f"retained tombstone root identity changed: {root_name}"
+                )
+            if root_name == _TOMBSTONE_DIRECTORY_NAME:
+                _validate_tombstone_root(root_fd)
+                lock_fd = _open_tombstone_lock(root_fd, writable=False)
+                os.close(lock_fd)
+                control_names = {
+                    _TOMBSTONE_LOCK_NAME,
+                    _TOMBSTONE_OWNER_NAME,
+                }
+            else:
+                control_names = set()
+            for name in sorted(set(list_entries(root_fd)) - control_names):
+                relative = f"{root_name}/{name}"
+                metadata = entry_lstat(root_fd, name)
+                if stat.S_ISREG(metadata.st_mode):
+                    descriptor, pinned_metadata = open_regular_file_at(
+                        root_fd,
+                        name,
+                    )
+                    os.close(descriptor)
+                    current = entry_lstat(root_fd, name)
+                    if (
+                        not stat.S_ISREG(current.st_mode)
+                        or (
+                            current.st_dev,
+                            current.st_ino,
+                            current.st_size,
+                        )
+                        != (
+                            pinned_metadata.st_dev,
+                            pinned_metadata.st_ino,
+                            pinned_metadata.st_size,
+                        )
+                    ):
+                        raise ValueError(
+                            f"retained tombstone identity changed: {relative}"
+                        )
+                    byte_count += pinned_metadata.st_size
+                elif stat.S_ISDIR(metadata.st_mode):
+                    directory_fd, _created = open_directory_at(root_fd, name)
+                    try:
+                        pinned_directory = os.fstat(directory_fd)
+                        if (
+                            pinned_directory.st_dev,
+                            pinned_directory.st_ino,
+                        ) != (metadata.st_dev, metadata.st_ino):
+                            raise ValueError(
+                                "retained directory tombstone identity changed: "
+                                + relative
+                            )
+                        if list_entries(directory_fd):
+                            raise ValueError(
+                                "retained directory tombstone is not empty: "
+                                + relative
+                            )
+                        current = entry_lstat(root_fd, name)
+                        if (
+                            not stat.S_ISDIR(current.st_mode)
+                            or (current.st_dev, current.st_ino)
+                            != (
+                                pinned_directory.st_dev,
+                                pinned_directory.st_ino,
+                            )
+                        ):
+                            raise ValueError(
+                                "retained directory tombstone identity changed: "
+                                + relative
+                            )
+                    finally:
+                        os.close(directory_fd)
+                else:
+                    raise ValueError(
+                        f"retained tombstone entry is unsafe: {relative}"
+                    )
+                paths.append(relative)
+            current_root = entry_lstat(parent_fd, root_name)
+            if (
+                not stat.S_ISDIR(current_root.st_mode)
+                or (current_root.st_dev, current_root.st_ino)
+                != (pinned_root.st_dev, pinned_root.st_ino)
+            ):
+                raise ValueError(
+                    f"retained tombstone root identity changed: {root_name}"
+                )
+        finally:
+            os.close(root_fd)
+    return RetainedTombstoneInventory(
+        count=len(paths),
+        byte_count=byte_count,
+        paths=tuple(paths),
+        roots=tuple(root_names),
+    )
+
+
+def retained_tombstone_inventory(
+    parent: Path | str,
+) -> RetainedTombstoneInventory:
+    parent_fd = open_directory_path(parent)
+    try:
+        return retained_tombstone_inventory_fd(parent_fd)
+    finally:
+        os.close(parent_fd)
+
+
+def open_tombstone_directory(
+    parent_fd: int,
+    *,
+    max_count: int | None = None,
+    max_bytes: int | None = None,
+) -> RetainedTombstoneStore:
+    """Open the bounded pinned store used instead of path-based deletion."""
+
+    resolved_count = (
+        RETAINED_TOMBSTONE_MAX_COUNT if max_count is None else max_count
+    )
+    resolved_bytes = (
+        RETAINED_TOMBSTONE_MAX_BYTES if max_bytes is None else max_bytes
+    )
+    if (
+        isinstance(resolved_count, bool)
+        or not isinstance(resolved_count, int)
+        or resolved_count < 0
+        or isinstance(resolved_bytes, bool)
+        or not isinstance(resolved_bytes, int)
+        or resolved_bytes < 0
+    ):
+        raise ValueError("retained tombstone ceilings must be non-negative integers")
+    created = False
+    try:
+        os.mkdir(_TOMBSTONE_DIRECTORY_NAME, mode=0o700, dir_fd=parent_fd)
+        created = True
         fsync_directory(parent_fd)
-        descriptor, _created = open_directory_at(parent_fd, name)
-        try:
-            metadata = os.fstat(descriptor)
-            named_metadata = entry_lstat(parent_fd, name)
-        except BaseException:
-            os.close(descriptor)
-            raise
-        if (
-            not stat.S_ISDIR(named_metadata.st_mode)
-            or (metadata.st_dev, metadata.st_ino)
-            != (named_metadata.st_dev, named_metadata.st_ino)
-            or metadata.st_uid != os.geteuid()
-        ):
-            os.close(descriptor)
-            raise ValueError("retained tombstone directory identity changed")
-        return descriptor
-    raise FileExistsError("could not allocate a retained tombstone directory")
+    except FileExistsError:
+        pass
+    directory_fd, _created = open_directory_at(
+        parent_fd,
+        _TOMBSTONE_DIRECTORY_NAME,
+    )
+    lock_fd = -1
+    retained_parent_fd = -1
+    try:
+        directory_metadata = os.fstat(directory_fd)
+        if directory_metadata.st_uid != os.geteuid():
+            raise ValueError("retained tombstone directory owner is unsafe")
+        if created:
+            _write_control_file(
+                directory_fd,
+                _TOMBSTONE_OWNER_NAME,
+                _TOMBSTONE_OWNER_BYTES,
+            )
+            lock_fd = _open_tombstone_lock(directory_fd, create=True)
+            fsync_directory(directory_fd)
+        else:
+            _validate_tombstone_root(directory_fd)
+            lock_fd = _open_tombstone_lock(directory_fd)
+        retained_parent_fd = os.dup(parent_fd)
+        return RetainedTombstoneStore(
+            parent_fd=retained_parent_fd,
+            directory_fd=directory_fd,
+            lock_fd=lock_fd,
+            max_count=resolved_count,
+            max_bytes=resolved_bytes,
+        )
+    except BaseException:
+        if retained_parent_fd >= 0:
+            os.close(retained_parent_fd)
+        if lock_fd >= 0:
+            os.close(lock_fd)
+        os.close(directory_fd)
+        raise
 
 
 def open_parent_directory(
@@ -404,14 +773,14 @@ def _retain_regular_tombstone(
     directory_fd: int,
     name: str,
     *,
-    tombstone_fd: int,
+    tombstone_fd: RetainedTombstoneStore,
     expected_identity: tuple[int, int] | None = None,
     expected_payload: bytes | None = None,
     missing_ok: bool,
-) -> None:
+) -> RetainedTombstoneInventory:
     name = _entry_name(name)
     source_directory = os.fstat(directory_fd)
-    tombstone_directory = os.fstat(tombstone_fd)
+    tombstone_directory = os.fstat(tombstone_fd.directory_fd)
     if (source_directory.st_dev, source_directory.st_ino) == (
         tombstone_directory.st_dev,
         tombstone_directory.st_ino,
@@ -421,8 +790,9 @@ def _retain_regular_tombstone(
         source_fd, source_metadata = open_regular_file_at(directory_fd, name)
     except FileNotFoundError:
         if missing_ok:
-            return
+            return tombstone_fd.inventory()
         raise
+    locked = False
     try:
         source_identity = (source_metadata.st_dev, source_metadata.st_ino)
         if expected_identity is not None and source_identity != expected_identity:
@@ -433,6 +803,12 @@ def _retain_regular_tombstone(
         ):
             raise ValueError(f"owned file content drift: {name}")
 
+        fcntl.flock(tombstone_fd.lock_fd, fcntl.LOCK_EX)
+        locked = True
+        tombstone_fd.enforce_capacity(
+            additional_count=1,
+            additional_bytes=source_metadata.st_size,
+        )
         tombstone_name = ""
         name_digest = hashlib.sha256(os.fsencode(name)).hexdigest()[:16]
         for _attempt in range(16):
@@ -441,7 +817,7 @@ def _retain_regular_tombstone(
                 atomic_rename_noreplace(
                     directory_fd,
                     name,
-                    tombstone_fd,
+                    tombstone_fd.directory_fd,
                     candidate,
                 )
             except FileExistsError:
@@ -453,11 +829,11 @@ def _retain_regular_tombstone(
                 "could not allocate a unique retained tombstone"
             )
         fsync_directory(directory_fd)
-        fsync_directory(tombstone_fd)
+        fsync_directory(tombstone_fd.directory_fd)
 
         try:
             quarantined_fd, quarantined_metadata = open_regular_file_at(
-                tombstone_fd,
+                tombstone_fd.directory_fd,
                 tombstone_name,
             )
             try:
@@ -472,7 +848,7 @@ def _retain_regular_tombstone(
             _restore_quarantined_entry(
                 directory_fd,
                 name,
-                tombstone_fd,
+                tombstone_fd.directory_fd,
                 tombstone_name,
             )
             raise
@@ -483,6 +859,7 @@ def _retain_regular_tombstone(
         )
         if (
             quarantined_identity != source_identity
+            or quarantined_metadata.st_size != source_metadata.st_size
             or (
                 expected_payload is not None
                 and quarantined_payload != expected_payload
@@ -491,27 +868,31 @@ def _retain_regular_tombstone(
             _restore_quarantined_entry(
                 directory_fd,
                 name,
-                tombstone_fd,
+                tombstone_fd.directory_fd,
                 tombstone_name,
             )
             raise ValueError(
                 f"owned file identity changed during quarantine: {name}"
             )
-        current = entry_lstat(tombstone_fd, tombstone_name)
+        current = entry_lstat(tombstone_fd.directory_fd, tombstone_name)
         if (
             not stat.S_ISREG(current.st_mode)
             or (current.st_dev, current.st_ino) != source_identity
+            or current.st_size != source_metadata.st_size
         ):
             _restore_quarantined_entry(
                 directory_fd,
                 name,
-                tombstone_fd,
+                tombstone_fd.directory_fd,
                 tombstone_name,
             )
             raise ValueError(
                 f"owned file identity changed during quarantine: {name}"
             )
+        return tombstone_fd.inventory()
     finally:
+        if locked:
+            fcntl.flock(tombstone_fd.lock_fd, fcntl.LOCK_UN)
         os.close(source_fd)
 
 
@@ -520,9 +901,9 @@ def _retain_same_regular_tombstone(
     name: str,
     identity: tuple[int, int],
     *,
-    tombstone_fd: int,
-) -> None:
-    _retain_regular_tombstone(
+    tombstone_fd: RetainedTombstoneStore,
+) -> RetainedTombstoneInventory:
+    return _retain_regular_tombstone(
         directory_fd,
         name,
         tombstone_fd=tombstone_fd,
@@ -536,7 +917,7 @@ def clean_owned_temporaries(
     *,
     final_names: set[str],
     owner: str,
-    tombstone_fd: int,
+    tombstone_fd: RetainedTombstoneStore,
 ) -> tuple[str, ...]:
     """Remove only regular stale files carrying the exact ownership token."""
 
@@ -563,11 +944,11 @@ def unlink_regular_if_matches(
     name: str,
     expected_payload: bytes,
     *,
-    tombstone_fd: int,
-) -> None:
+    tombstone_fd: RetainedTombstoneStore,
+) -> RetainedTombstoneInventory:
     """Remove a verified name only by atomically retaining its opened inode."""
 
-    _retain_regular_tombstone(
+    return _retain_regular_tombstone(
         directory_fd,
         name,
         tombstone_fd=tombstone_fd,
@@ -585,16 +966,16 @@ class AtomicFileWriter:
         final_name: str,
         *,
         owner: str,
-        tombstone_fd: int,
+        tombstone_fd: RetainedTombstoneStore,
         mode: int = 0o600,
     ) -> None:
         self.directory_fd = os.dup(directory_fd)
-        self.tombstone_fd = -1
+        self.tombstone_store: RetainedTombstoneStore | None = None
         self.temporary_name = ""
         self.descriptor = -1
         self._closed = True
         try:
-            self.tombstone_fd = os.dup(tombstone_fd)
+            self.tombstone_store = tombstone_fd.duplicate()
             self.final_name = _entry_name(final_name)
             prefix = _temporary_prefix(self.final_name, owner)
             for _attempt in range(16):
@@ -618,8 +999,9 @@ class AtomicFileWriter:
             metadata = os.fstat(self.descriptor)
             self._identity = (metadata.st_dev, metadata.st_ino)
             self._closed = False
-        except BaseException:
+        except BaseException as construction_error:
             identity = None
+            limit_error = None
             if self.descriptor >= 0:
                 try:
                     metadata = os.fstat(self.descriptor)
@@ -634,13 +1016,17 @@ class AtomicFileWriter:
                         self.directory_fd,
                         self.temporary_name,
                         identity,
-                        tombstone_fd=self.tombstone_fd,
+                        tombstone_fd=self.tombstone_store,
                     )
+                except RetainedTombstoneLimitError as error:
+                    limit_error = error
                 except (OSError, ValueError):
                     pass
             os.close(self.directory_fd)
-            if self.tombstone_fd >= 0:
-                os.close(self.tombstone_fd)
+            if self.tombstone_store is not None:
+                self.tombstone_store.close()
+            if limit_error is not None:
+                raise limit_error from construction_error
             raise
 
     def write(self, payload: bytes) -> None:
@@ -679,13 +1065,13 @@ class AtomicFileWriter:
                 self.directory_fd,
                 self.temporary_name,
                 self._identity,
-                tombstone_fd=self.tombstone_fd,
+                tombstone_fd=self.tombstone_store,
             )
         else:
             fsync_directory(self.directory_fd)
         self._closed = True
         os.close(self.directory_fd)
-        os.close(self.tombstone_fd)
+        self.tombstone_store.close()
 
     def abort(self) -> None:
         if self._closed:
@@ -698,12 +1084,12 @@ class AtomicFileWriter:
                 self.directory_fd,
                 self.temporary_name,
                 self._identity,
-                tombstone_fd=self.tombstone_fd,
+                tombstone_fd=self.tombstone_store,
             )
         finally:
             self._closed = True
             os.close(self.directory_fd)
-            os.close(self.tombstone_fd)
+            self.tombstone_store.close()
 
 
 def atomic_write_or_match(
@@ -712,7 +1098,7 @@ def atomic_write_or_match(
     payload: bytes,
     *,
     owner: str,
-    tombstone_fd: int,
+    tombstone_fd: RetainedTombstoneStore,
 ) -> None:
     """Install bytes no-replace, accepting only an exact existing regular file."""
 

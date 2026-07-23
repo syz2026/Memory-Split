@@ -2,6 +2,7 @@ import base64
 import hashlib
 import json
 import os
+import shutil
 import subprocess
 import sys
 import threading
@@ -456,6 +457,47 @@ def test_task_workspace_cleanup_never_uses_path_rmdir(tmp_path, monkeypatch):
         path.is_dir() and "cleanup-" in path.name
         for path in shared_root.rglob("*")
     )
+
+
+def test_task_workspace_cleanup_reports_retained_tombstones(tmp_path):
+    catalog, renderer, config = _fixture_build(record_count=6)
+    result = parallel.render_task_result(
+        catalog,
+        renderer,
+        config,
+        task_index=0,
+        task_count=1,
+    )
+    shared_root = tmp_path / "shared"
+    parallel.publish_task_result(
+        shared_root,
+        result,
+        scheduler_id="job-42",
+        nonce="nonce-a",
+    )
+    workspace = parallel.task_workspace_path(
+        shared_root,
+        result.build_id,
+        scheduler_id="job-42",
+        nonce="nonce-a",
+    )
+
+    inventory = parallel.cleanup_task_workspace(
+        workspace,
+        build_id=result.build_id,
+        scheduler_id="job-42",
+        nonce="nonce-a",
+    )
+
+    assert inventory.count >= 3
+    assert inventory.byte_count > 0
+    assert len(inventory.paths) == inventory.count
+    report = inventory.to_dict()
+    assert report["count"] == inventory.count
+    assert report["bytes"] == inventory.byte_count
+    assert report["paths"] == list(inventory.paths)
+    assert report["roots"] == list(inventory.roots)
+    assert report["maintenance"]["requires_no_active_build_or_finalizer"] is True
 
 
 def test_task_workspace_loader_requires_exact_complete_foreign_free_results(tmp_path):
@@ -921,13 +963,9 @@ def test_atomic_file_writer_closes_duplicated_directory_fd_on_open_error(
         tmp_path,
         os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
     )
-    tombstones = tmp_path / "tombstones"
-    tombstones.mkdir()
-    tombstone_fd = os.open(
-        tombstones,
-        os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
-    )
+    tombstone_store = safeio_module.open_tombstone_directory(directory_fd)
     real_dup = os.dup
+    real_open = os.open
     duplicated_fds = []
 
     def record_duplicate(descriptor):
@@ -935,8 +973,10 @@ def test_atomic_file_writer_closes_duplicated_directory_fd_on_open_error(
         duplicated_fds.append(duplicate)
         return duplicate
 
-    def deny_temporary_open(*args, **kwargs):
-        raise PermissionError("injected temporary open denial")
+    def deny_temporary_open(name, *args, **kwargs):
+        if str(name).startswith(".artifact.bin.tmp-"):
+            raise PermissionError("injected temporary open denial")
+        return real_open(name, *args, **kwargs)
 
     monkeypatch.setattr(safeio_module.os, "dup", record_duplicate)
     monkeypatch.setattr(safeio_module.os, "open", deny_temporary_open)
@@ -946,13 +986,13 @@ def test_atomic_file_writer_closes_duplicated_directory_fd_on_open_error(
                 directory_fd,
                 "artifact.bin",
                 owner="owner",
-                tombstone_fd=tombstone_fd,
+                tombstone_fd=tombstone_store,
             )
     finally:
-        os.close(tombstone_fd)
+        tombstone_store.close()
         os.close(directory_fd)
 
-    assert len(duplicated_fds) == 2
+    assert len(duplicated_fds) == 3
     for duplicate in duplicated_fds:
         try:
             os.fstat(duplicate)
@@ -970,36 +1010,78 @@ def test_regular_cleanup_moves_to_retained_tombstone_without_path_unlink(
 ):
     owned = tmp_path / "owned"
     owned.write_bytes(b"expected")
-    tombstones = tmp_path / "tombstones"
-    tombstones.mkdir()
     directory_fd = os.open(
         tmp_path,
         os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
     )
-    tombstone_fd = os.open(
-        tombstones,
-        os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
-    )
+    tombstone_store = safeio_module.open_tombstone_directory(directory_fd)
 
     def reject_path_unlink(*args, **kwargs):
         raise AssertionError("path unlink can delete a replacement")
 
     monkeypatch.setattr(safeio_module.os, "unlink", reject_path_unlink)
     try:
-        safeio_module.unlink_regular_if_matches(
+        inventory = safeio_module.unlink_regular_if_matches(
             directory_fd,
             owned.name,
             b"expected",
-            tombstone_fd=tombstone_fd,
+            tombstone_fd=tombstone_store,
         )
     finally:
-        os.close(tombstone_fd)
+        tombstone_store.close()
         os.close(directory_fd)
 
     assert not owned.exists()
-    retained = list(tombstones.iterdir())
-    assert len(retained) == 1
-    assert retained[0].read_bytes() == b"expected"
+    assert inventory.count == 1
+    assert (tmp_path / inventory.paths[0]).read_bytes() == b"expected"
+
+
+def test_retained_tombstone_cap_reports_existing_inventory_before_move(tmp_path):
+    first = tmp_path / "first"
+    second = tmp_path / "second"
+    first.write_bytes(b"four")
+    second.write_bytes(b"five!")
+    directory_fd = os.open(
+        tmp_path,
+        os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+    )
+    store = safeio_module.open_tombstone_directory(
+        directory_fd,
+        max_count=1,
+        max_bytes=1024,
+    )
+    try:
+        first_inventory = safeio_module.unlink_regular_if_matches(
+            directory_fd,
+            first.name,
+            b"four",
+            tombstone_fd=store,
+        )
+        with pytest.raises(
+            safeio_module.RetainedTombstoneLimitError
+        ) as captured:
+            safeio_module.unlink_regular_if_matches(
+                directory_fd,
+                second.name,
+                b"five!",
+                tombstone_fd=store,
+            )
+    finally:
+        store.close()
+        os.close(directory_fd)
+
+    assert first_inventory.count == 1
+    assert first_inventory.byte_count == 4
+    assert captured.value.report["inventory"] == {
+        "bytes": 4,
+        "count": 1,
+        "paths": list(first_inventory.paths),
+    }
+    assert captured.value.report["projected"] == {
+        "bytes": 9,
+        "count": 2,
+    }
+    assert second.read_bytes() == b"five!"
 
 
 def test_unlink_regular_if_matches_never_deletes_swapped_replacement(
@@ -1009,16 +1091,11 @@ def test_unlink_regular_if_matches_never_deletes_swapped_replacement(
     owned = tmp_path / "owned"
     owned.write_bytes(b"expected")
     held = tmp_path / "held-original"
-    tombstones = tmp_path / "tombstones"
-    tombstones.mkdir()
     directory_fd = os.open(
         tmp_path,
         os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
     )
-    tombstone_fd = os.open(
-        tombstones,
-        os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
-    )
+    tombstone_store = safeio_module.open_tombstone_directory(directory_fd)
     real_rename = safeio_module.atomic_rename_noreplace
     swapped = False
 
@@ -1065,15 +1142,16 @@ def test_unlink_regular_if_matches_never_deletes_swapped_replacement(
                 directory_fd,
                 owned.name,
                 b"expected",
-                tombstone_fd=tombstone_fd,
+                tombstone_fd=tombstone_store,
             )
+        inventory = tombstone_store.inventory()
     finally:
-        os.close(tombstone_fd)
+        tombstone_store.close()
         os.close(directory_fd)
 
     assert held.read_bytes() == b"expected"
     assert owned.read_bytes() == b"replacement"
-    assert list(tombstones.iterdir()) == []
+    assert inventory.count == 0
 
 
 def test_staging_shards_symlink_receives_no_temporary_bytes(tmp_path):
@@ -1464,6 +1542,80 @@ def test_verifier_rejects_shard_replaced_after_initial_fstat(
         verify_parallel_corpus(destination)
 
 
+def test_verifier_rejects_receipt_append_after_initial_read(
+    tmp_path,
+    monkeypatch,
+):
+    catalog, renderer, config = _fixture_build()
+    destination = tmp_path / "corpus"
+    build_parallel_corpus(catalog, renderer, config, destination)
+    receipt_path = destination / "receipt.json"
+    before = receipt_path.stat()
+    real_finish = publication_module._PinnedPackedReader.finish
+
+    def append_receipt_after_artifact_verification(reader):
+        digest = real_finish(reader)
+        with receipt_path.open("ab") as handle:
+            handle.write(b" ")
+            handle.flush()
+            os.fsync(handle.fileno())
+        return digest
+
+    monkeypatch.setattr(
+        publication_module._PinnedPackedReader,
+        "finish",
+        append_receipt_after_artifact_verification,
+    )
+
+    with pytest.raises(ValueError, match="receipt.*(EOF|identity|content|drift)"):
+        verify_parallel_corpus(destination)
+    after = receipt_path.stat()
+    assert (after.st_dev, after.st_ino) == (before.st_dev, before.st_ino)
+    assert after.st_size == before.st_size + 1
+
+
+def test_verifier_rejects_receipt_in_place_mutation_after_initial_read(
+    tmp_path,
+    monkeypatch,
+):
+    catalog, renderer, config = _fixture_build()
+    destination = tmp_path / "corpus"
+    build_parallel_corpus(catalog, renderer, config, destination)
+    receipt_path = destination / "receipt.json"
+    before = receipt_path.stat()
+    real_finish = publication_module._PinnedPackedReader.finish
+
+    def mutate_receipt_after_artifact_verification(reader):
+        digest = real_finish(reader)
+        descriptor = os.open(receipt_path, os.O_RDWR | os.O_NOFOLLOW)
+        try:
+            os.lseek(descriptor, 0, os.SEEK_SET)
+            os.write(descriptor, b"[")
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+        return digest
+
+    monkeypatch.setattr(
+        publication_module._PinnedPackedReader,
+        "finish",
+        mutate_receipt_after_artifact_verification,
+    )
+
+    with pytest.raises(ValueError, match="receipt.*(content|digest|drift)"):
+        verify_parallel_corpus(destination)
+    after = receipt_path.stat()
+    assert (
+        after.st_dev,
+        after.st_ino,
+        after.st_size,
+    ) == (
+        before.st_dev,
+        before.st_ino,
+        before.st_size,
+    )
+
+
 def test_malformed_later_shard_closes_every_popped_descriptor(
     tmp_path,
     monkeypatch,
@@ -1521,6 +1673,119 @@ def test_malformed_later_shard_closes_every_popped_descriptor(
     assert shard_descriptors
     assert binding_descriptors
     assert open_descriptors == []
+
+
+def _retained_tombstone_directories(root):
+    return {
+        path.relative_to(root).as_posix()
+        for path in root.rglob(".memorysplit-v2-retained-tombstones*")
+        if path.is_dir()
+    }
+
+
+def test_read_only_verification_and_task_loading_create_no_tombstones(tmp_path):
+    catalog, renderer, config = _fixture_build(record_count=6)
+    corpus = tmp_path / "corpus"
+    build_parallel_corpus(catalog, renderer, config, corpus)
+    result = parallel.render_task_result(
+        catalog,
+        renderer,
+        config,
+        task_index=0,
+        task_count=1,
+    )
+    shared_root = tmp_path / "shared"
+    parallel.publish_task_result(
+        shared_root,
+        result,
+        scheduler_id="job-42",
+        nonce="nonce-a",
+    )
+    for path in sorted(
+        tmp_path.rglob(".memorysplit-v2-retained-tombstones*"),
+        reverse=True,
+    ):
+        shutil.rmtree(path)
+    before = _retained_tombstone_directories(tmp_path)
+    assert before == set()
+
+    verify_parallel_corpus(corpus)
+    loaded = parallel.load_task_results(
+        shared_root,
+        result.build_id,
+        scheduler_id="job-42",
+        nonce="nonce-a",
+        expected_task_count=1,
+    )
+
+    assert loaded == (result,)
+    assert _retained_tombstone_directories(tmp_path) == before
+
+
+@pytest.mark.parametrize(
+    ("max_count", "max_bytes"),
+    [(0, 1 << 30), (100, 0)],
+)
+def test_retained_tombstone_caps_fail_before_quarantine(
+    tmp_path,
+    monkeypatch,
+    max_count,
+    max_bytes,
+):
+    monkeypatch.setattr(
+        safeio_module,
+        "RETAINED_TOMBSTONE_MAX_COUNT",
+        max_count,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        safeio_module,
+        "RETAINED_TOMBSTONE_MAX_BYTES",
+        max_bytes,
+        raising=False,
+    )
+    catalog, renderer, config = _fixture_build()
+    destination = tmp_path / "corpus"
+    build_id = parallel_build_id(catalog, renderer.renderer_id, config)
+    stage = publication_staging_path(destination, build_id)
+
+    with pytest.raises(ValueError, match="retained tombstone limit") as captured:
+        build_parallel_corpus(catalog, renderer, config, destination)
+
+    report = captured.value.report
+    assert report["inventory"] == {
+        "bytes": 0,
+        "count": 0,
+        "paths": [],
+    }
+    assert report["limits"] == {
+        "bytes": max_bytes,
+        "count": max_count,
+    }
+    assert report["projected"]["count"] == 1
+    assert report["projected"]["bytes"] > 0
+    assert not destination.exists()
+    assert (stage / ".parallel-owner.json").is_file()
+
+
+def test_publication_result_reports_retained_tombstones(tmp_path):
+    catalog, renderer, config = _fixture_build()
+    destination = tmp_path / "corpus"
+
+    result = build_parallel_corpus(catalog, renderer, config, destination)
+
+    inventory = result.retained_tombstones
+    assert inventory.count >= 1
+    assert inventory.byte_count > 0
+    assert len(inventory.paths) == inventory.count
+    assert inventory.roots
+    assert verify_parallel_corpus(destination).retained_tombstones == inventory
+    assert (
+        inventory.to_dict()["maintenance"][
+            "requires_no_active_build_or_finalizer"
+        ]
+        is True
+    )
 
 
 def test_verifier_uses_pinned_root_when_path_component_is_replaced(

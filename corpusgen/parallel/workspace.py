@@ -12,6 +12,8 @@ from pathlib import Path
 
 from .canonical import canonical_json_bytes, sha256_hex
 from .safeio import (
+    RetainedTombstoneInventory,
+    RetainedTombstoneStore,
     atomic_rename_noreplace,
     atomic_write_or_match,
     clean_owned_temporaries,
@@ -22,9 +24,9 @@ from .safeio import (
     list_entries,
     open_directory_at,
     open_directory_path,
-    open_parent_directory,
     open_tombstone_directory,
     read_regular_file,
+    retained_tombstone_inventory_fd,
     unlink_regular_if_matches,
 )
 from .tasks import (
@@ -183,7 +185,7 @@ def _open_workspace(
     scheduler_id: str,
     nonce: str,
     create: bool,
-) -> tuple[int, int, Path, bytes, str]:
+) -> tuple[int, RetainedTombstoneStore | None, Path, bytes, str]:
     workspace = task_workspace_path(
         shared_root,
         build_id,
@@ -193,9 +195,9 @@ def _open_workspace(
     root_fd = open_directory_path(shared_root, create=create)
     namespace_fd = -1
     build_fd = -1
-    tombstone_fd = -1
+    tombstone_parent_fd = -1
+    tombstone_fd = None
     try:
-        tombstone_fd = open_tombstone_directory(root_fd)
         namespace_fd, _created = open_directory_at(
             root_fd,
             _WORKSPACE_ROOT,
@@ -211,9 +213,11 @@ def _open_workspace(
             workspace.name,
             create=create,
         )
+        if create:
+            tombstone_parent_fd = os.dup(root_fd)
     except BaseException:
-        if tombstone_fd >= 0:
-            os.close(tombstone_fd)
+        if tombstone_parent_fd >= 0:
+            os.close(tombstone_parent_fd)
         raise
     finally:
         if build_fd >= 0:
@@ -232,6 +236,7 @@ def _open_workspace(
         if created:
             if list_entries(workspace_fd):
                 raise ValueError("new task workspace is not empty")
+            tombstone_fd = open_tombstone_directory(tombstone_parent_fd)
             atomic_write_or_match(
                 workspace_fd,
                 _OWNER_NAME,
@@ -246,10 +251,17 @@ def _open_workspace(
                 raise ValueError("task workspace ownership marker is missing") from error
             if actual_owner != owner_payload:
                 raise ValueError("task workspace ownership marker mismatch")
+            if create:
+                tombstone_fd = open_tombstone_directory(tombstone_parent_fd)
     except BaseException:
         os.close(workspace_fd)
-        os.close(tombstone_fd)
+        if tombstone_fd is not None:
+            tombstone_fd.close()
+        if tombstone_parent_fd >= 0:
+            os.close(tombstone_parent_fd)
         raise
+    if tombstone_parent_fd >= 0:
+        os.close(tombstone_parent_fd)
     return workspace_fd, tombstone_fd, workspace, owner_payload, owner_token
 
 
@@ -308,6 +320,9 @@ def publish_task_result(
         nonce=nonce,
         create=True,
     )
+    if tombstone_fd is None:
+        os.close(workspace_fd)
+        raise RuntimeError("task publication requires retained tombstones")
     try:
         result_names = _result_names(result.build_id, result.task_count)
         _validate_workspace_entries(
@@ -332,7 +347,8 @@ def publish_task_result(
         return workspace / name
     finally:
         os.close(workspace_fd)
-        os.close(tombstone_fd)
+        if tombstone_fd is not None:
+            tombstone_fd.close()
 
 
 def _open_local_task_workspace(
@@ -342,7 +358,7 @@ def _open_local_task_workspace(
     scheduler_id: str,
     job_id: str,
     nonce: str,
-) -> tuple[int, int, int, Path, bytes, str]:
+) -> tuple[int, int, RetainedTombstoneStore, Path, bytes, str]:
     workspace = local_task_workspace_path(
         local_root,
         result.build_id,
@@ -355,9 +371,8 @@ def _open_local_task_workspace(
     namespace_fd = -1
     build_fd = -1
     workspace_fd = -1
-    tombstone_fd = -1
+    tombstone_fd = None
     try:
-        tombstone_fd = open_tombstone_directory(root_fd)
         namespace_fd, _created = open_directory_at(
             root_fd,
             _LOCAL_WORKSPACE_ROOT,
@@ -373,13 +388,14 @@ def _open_local_task_workspace(
             workspace.name,
             create=True,
         )
+        tombstone_fd = open_tombstone_directory(root_fd)
     except BaseException:
         if workspace_fd >= 0:
             os.close(workspace_fd)
         if build_fd >= 0:
             os.close(build_fd)
-        if tombstone_fd >= 0:
-            os.close(tombstone_fd)
+        if tombstone_fd is not None:
+            tombstone_fd.close()
         raise
     finally:
         if namespace_fd >= 0:
@@ -414,7 +430,7 @@ def _open_local_task_workspace(
     except BaseException:
         os.close(workspace_fd)
         os.close(build_fd)
-        os.close(tombstone_fd)
+        tombstone_fd.close()
         raise
     return (
         workspace_fd,
@@ -450,7 +466,7 @@ def _cleanup_local_task_workspace(
     *,
     result_name: str,
     owner_token: str,
-    tombstone_fd: int,
+    tombstone_fd: RetainedTombstoneStore,
 ) -> None:
     _validate_local_task_workspace(
         workspace_fd,
@@ -501,48 +517,55 @@ def _remove_owned_empty_directory(
     name: str,
     directory_fd: int,
     *,
-    tombstone_fd: int,
-) -> None:
+    tombstone_fd: RetainedTombstoneStore,
+) -> RetainedTombstoneInventory:
     metadata = os.fstat(directory_fd)
     identity = (metadata.st_dev, metadata.st_ino)
     if list_entries(directory_fd):
         raise ValueError(f"owned cleanup directory is not empty: {name}")
     source_parent = os.fstat(parent_fd)
-    tombstone_parent = os.fstat(tombstone_fd)
+    tombstone_parent = os.fstat(tombstone_fd.directory_fd)
     if (source_parent.st_dev, source_parent.st_ino) == (
         tombstone_parent.st_dev,
         tombstone_parent.st_ino,
     ):
         raise ValueError("retained tombstones require a distinct directory")
-    tombstone_name = ""
-    name_digest = sha256_hex(name.encode("utf-8"))[:16]
-    for _attempt in range(16):
-        candidate = f"directory-{name_digest}-cleanup-{secrets.token_hex(16)}"
-        try:
-            atomic_rename_noreplace(
-                parent_fd,
-                name,
-                tombstone_fd,
-                candidate,
-            )
-        except FileExistsError:
-            continue
-        tombstone_name = candidate
-        break
-    if not tombstone_name:
-        raise FileExistsError(
-            "could not allocate a unique retained directory tombstone"
-        )
-    fsync_directory(parent_fd)
-    fsync_directory(tombstone_fd)
+    fcntl.flock(tombstone_fd.lock_fd, fcntl.LOCK_EX)
     quarantined_fd = -1
+    tombstone_name = ""
     try:
+        tombstone_fd.enforce_capacity(
+            additional_count=1,
+            additional_bytes=0,
+        )
+        name_digest = sha256_hex(name.encode("utf-8"))[:16]
+        for _attempt in range(16):
+            candidate = (
+                f"directory-{name_digest}-cleanup-{secrets.token_hex(16)}"
+            )
+            try:
+                atomic_rename_noreplace(
+                    parent_fd,
+                    name,
+                    tombstone_fd.directory_fd,
+                    candidate,
+                )
+            except FileExistsError:
+                continue
+            tombstone_name = candidate
+            break
+        if not tombstone_name:
+            raise FileExistsError(
+                "could not allocate a unique retained directory tombstone"
+            )
+        fsync_directory(parent_fd)
+        fsync_directory(tombstone_fd.directory_fd)
         quarantined_fd, _created = open_directory_at(
-            tombstone_fd,
+            tombstone_fd.directory_fd,
             tombstone_name,
         )
         quarantined = os.fstat(quarantined_fd)
-        current = entry_lstat(tombstone_fd, tombstone_name)
+        current = entry_lstat(tombstone_fd.directory_fd, tombstone_name)
         if (
             (quarantined.st_dev, quarantined.st_ino) != identity
             or (current.st_dev, current.st_ino) != identity
@@ -553,7 +576,7 @@ def _remove_owned_empty_directory(
             _restore_quarantined_directory(
                 parent_fd,
                 name,
-                tombstone_fd,
+                tombstone_fd.directory_fd,
                 tombstone_name,
             )
             raise ValueError(
@@ -563,17 +586,22 @@ def _remove_owned_empty_directory(
         if quarantined_fd >= 0:
             os.close(quarantined_fd)
             quarantined_fd = -1
-        if entry_exists(tombstone_fd, tombstone_name):
+        if tombstone_name and entry_exists(
+            tombstone_fd.directory_fd,
+            tombstone_name,
+        ):
             _restore_quarantined_directory(
                 parent_fd,
                 name,
-                tombstone_fd,
+                tombstone_fd.directory_fd,
                 tombstone_name,
             )
         raise
     finally:
         if quarantined_fd >= 0:
             os.close(quarantined_fd)
+        fcntl.flock(tombstone_fd.lock_fd, fcntl.LOCK_UN)
+    return tombstone_fd.inventory()
 
 
 def publish_task_result_via_local_cache(
@@ -656,7 +684,7 @@ def publish_task_result_via_local_cache(
             if workspace_open:
                 os.close(workspace_fd)
             os.close(build_fd)
-            os.close(tombstone_fd)
+            tombstone_fd.close()
 
 
 def load_task_results(
@@ -689,12 +717,6 @@ def load_task_results(
             result_names=result_names,
             owner_token=owner_token,
         )
-        clean_owned_temporaries(
-            workspace_fd,
-            final_names=result_names,
-            owner=owner_token,
-            tombstone_fd=tombstone_fd,
-        )
         actual_names = set(list_entries(workspace_fd)) - {_OWNER_NAME}
         missing = sorted(result_names - actual_names)
         if missing:
@@ -713,7 +735,8 @@ def load_task_results(
         return results
     finally:
         os.close(workspace_fd)
-        os.close(tombstone_fd)
+        if tombstone_fd is not None:
+            tombstone_fd.close()
 
 
 def cleanup_task_workspace(
@@ -722,7 +745,7 @@ def cleanup_task_workspace(
     build_id: str,
     scheduler_id: str,
     nonce: str,
-) -> None:
+) -> RetainedTombstoneInventory:
     """Remove a flat task workspace only after exact ownership proof."""
 
     workspace_path = Path(workspace)
@@ -734,11 +757,19 @@ def cleanup_task_workspace(
     )
     if workspace_path != expected_path:
         raise ValueError("task workspace ownership path mismatch")
-    parent_fd, workspace_name = open_parent_directory(workspace_path)
+    workspace_name = workspace_path.name
+    shared_root_fd = open_directory_path(workspace_path.parents[2])
+    namespace_fd = -1
+    parent_fd = -1
     workspace_fd = -1
-    tombstone_fd = -1
+    tombstone_fd = None
+    inventory = None
     try:
-        tombstone_fd = open_tombstone_directory(parent_fd)
+        namespace_fd, _created = open_directory_at(
+            shared_root_fd,
+            _WORKSPACE_ROOT,
+        )
+        parent_fd, _created = open_directory_at(namespace_fd, build_id)
         workspace_fd, _created = open_directory_at(parent_fd, workspace_name)
         fcntl.flock(workspace_fd, fcntl.LOCK_EX)
         expected_owner = _owner_bytes(
@@ -771,6 +802,7 @@ def cleanup_task_workspace(
                 and temporary_pattern.fullmatch(name) is None
             ):
                 raise ValueError(f"foreign task workspace cleanup entry: {name}")
+        tombstone_fd = open_tombstone_directory(shared_root_fd)
         for name in sorted(names, key=lambda name: name == _OWNER_NAME):
             payload = read_regular_file(workspace_fd, name)
             unlink_regular_if_matches(
@@ -779,7 +811,7 @@ def cleanup_task_workspace(
                 payload,
                 tombstone_fd=tombstone_fd,
             )
-        _remove_owned_empty_directory(
+        inventory = _remove_owned_empty_directory(
             parent_fd,
             workspace_name,
             workspace_fd,
@@ -790,6 +822,13 @@ def cleanup_task_workspace(
     finally:
         if workspace_fd >= 0:
             os.close(workspace_fd)
-        if tombstone_fd >= 0:
-            os.close(tombstone_fd)
-        os.close(parent_fd)
+        if tombstone_fd is not None:
+            tombstone_fd.close()
+        if parent_fd >= 0:
+            os.close(parent_fd)
+        if namespace_fd >= 0:
+            os.close(namespace_fd)
+        os.close(shared_root_fd)
+    if inventory is None:
+        raise RuntimeError("task workspace cleanup did not produce an inventory")
+    return inventory

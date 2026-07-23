@@ -35,6 +35,8 @@ from .schedule import (
 )
 from .safeio import (
     AtomicFileWriter,
+    RetainedTombstoneInventory,
+    RetainedTombstoneStore,
     atomic_rename_noreplace,
     atomic_write_or_match,
     clean_owned_temporaries,
@@ -51,6 +53,7 @@ from .safeio import (
     read_file_descriptor,
     read_regular_file,
     regular_file_digest,
+    retained_tombstone_inventory_fd,
     unlink_regular_if_matches,
 )
 
@@ -87,6 +90,28 @@ _RECEIPT_FIELDS = {
     "shard_count",
 }
 _ARTIFACT_FIELDS = {"bytes", "path", "sha256"}
+
+
+class VerifiedParallelCorpus(dict[str, Any]):
+    """Canonical receipt bytes plus out-of-band cleanup visibility."""
+
+    def __init__(
+        self,
+        receipt: dict[str, Any],
+        retained_tombstones: RetainedTombstoneInventory,
+    ) -> None:
+        super().__init__(receipt)
+        self.retained_tombstones = retained_tombstones
+
+
+def _with_retained_tombstones(
+    receipt: dict[str, Any],
+    parent_fd: int,
+) -> VerifiedParallelCorpus:
+    return VerifiedParallelCorpus(
+        receipt,
+        retained_tombstone_inventory_fd(parent_fd),
+    )
 
 
 def _positive_integer(value: object, field_name: str) -> int:
@@ -203,7 +228,7 @@ class _ShardSink:
         assignment: ShardAssignment,
         *,
         owner: str,
-        tombstone_fd: int,
+        tombstone_fd: RetainedTombstoneStore,
     ) -> None:
         self.assignment = assignment
         self.final_name = f"{assignment.shard_id}.bin"
@@ -252,7 +277,7 @@ def _rerender_and_pack_pinned(
     shards_fd: int,
     *,
     owner: str,
-    tombstone_fd: int,
+    tombstone_fd: RetainedTombstoneStore,
     cached_payloads: dict[str, bytes] | None = None,
 ) -> dict[str, object]:
     reduced = reduce_metadata(
@@ -366,12 +391,12 @@ def rerender_and_pack(
 
     parent_fd, root_name = open_parent_directory(root)
     root_fd = -1
-    tombstone_fd = -1
+    tombstone_fd = None
     try:
         root_fd, _created = open_directory_at(parent_fd, root_name)
-        tombstone_fd = open_tombstone_directory(parent_fd)
         shards_fd, _created = open_directory_at(root_fd, "shards", create=True)
         try:
+            tombstone_fd = open_tombstone_directory(parent_fd)
             return _rerender_and_pack_pinned(
                 catalog,
                 metadata,
@@ -385,8 +410,8 @@ def rerender_and_pack(
         finally:
             os.close(shards_fd)
     finally:
-        if tombstone_fd >= 0:
-            os.close(tombstone_fd)
+        if tombstone_fd is not None:
+            tombstone_fd.close()
         if root_fd >= 0:
             os.close(root_fd)
         os.close(parent_fd)
@@ -452,7 +477,7 @@ def _prepare_staging(
     created: bool,
     build_id: str,
     shard_names: set[str],
-    tombstone_fd: int,
+    tombstone_fd: RetainedTombstoneStore,
 ) -> int:
     owner_payload = _stage_owner_bytes(build_id)
     if created:
@@ -533,8 +558,8 @@ def _publish_staging(
     stage_name: str,
     output_name: str,
     build_id: str,
-    tombstone_fd: int,
-) -> dict[str, Any]:
+    tombstone_fd: RetainedTombstoneStore,
+) -> VerifiedParallelCorpus:
     stage_metadata = os.fstat(stage_fd)
     named_metadata = entry_lstat(parent_fd, stage_name)
     if (
@@ -562,9 +587,12 @@ def _publish_staging(
         try:
             published_fd, _created = open_directory_at(parent_fd, output_name)
             try:
-                return _verify_parallel_corpus_fd(
-                    published_fd,
-                    expected_build_id=build_id,
+                return _with_retained_tombstones(
+                    _verify_parallel_corpus_fd(
+                        published_fd,
+                        expected_build_id=build_id,
+                    ),
+                    parent_fd,
                 )
             finally:
                 os.close(published_fd)
@@ -581,9 +609,12 @@ def _publish_staging(
         ):
             raise ValueError("published corpus directory identity changed")
         fsync_directory(parent_fd)
-        return _verify_parallel_corpus_fd(
-            published_fd,
-            expected_build_id=build_id,
+        return _with_retained_tombstones(
+            _verify_parallel_corpus_fd(
+                published_fd,
+                expected_build_id=build_id,
+            ),
+            parent_fd,
         )
     finally:
         os.close(published_fd)
@@ -936,6 +967,69 @@ class _PinnedPackedReader:
         self.index = len(self.entries)
 
 
+def _verify_receipt_after_verification(
+    publication_fd: int,
+    receipt_fd: int,
+    initial_metadata: os.stat_result,
+    initial_bytes: bytes,
+    initial_sha256: str,
+) -> None:
+    try:
+        trailing = os.read(receipt_fd, 1)
+        first_post_read = os.fstat(receipt_fd)
+        named_before = entry_lstat(publication_fd, "receipt.json")
+        os.lseek(receipt_fd, 0, os.SEEK_SET)
+        final_bytes = read_file_descriptor(receipt_fd)
+        final_eof = os.read(receipt_fd, 1)
+        final_metadata = os.fstat(receipt_fd)
+        named_after = entry_lstat(publication_fd, "receipt.json")
+    except (OSError, ValueError) as error:
+        raise ValueError(
+            "parallel corpus receipt EOF, identity, or content drift"
+        ) from error
+    expected_identity = (
+        initial_metadata.st_dev,
+        initial_metadata.st_ino,
+        initial_metadata.st_size,
+    )
+    if (
+        trailing
+        or final_eof
+        or initial_metadata.st_size != len(initial_bytes)
+        or sha256_hex(initial_bytes) != initial_sha256
+        or len(final_bytes) != len(initial_bytes)
+        or sha256_hex(final_bytes) != initial_sha256
+        or final_bytes != initial_bytes
+        or (
+            first_post_read.st_dev,
+            first_post_read.st_ino,
+            first_post_read.st_size,
+        )
+        != expected_identity
+        or (
+            final_metadata.st_dev,
+            final_metadata.st_ino,
+            final_metadata.st_size,
+        )
+        != expected_identity
+        or not stat.S_ISREG(named_before.st_mode)
+        or not stat.S_ISREG(named_after.st_mode)
+        or (
+            named_before.st_dev,
+            named_before.st_ino,
+            named_before.st_size,
+        )
+        != expected_identity
+        or (
+            named_after.st_dev,
+            named_after.st_ino,
+            named_after.st_size,
+        )
+        != expected_identity
+    ):
+        raise ValueError("parallel corpus receipt EOF, identity, or content drift")
+
+
 def _verify_parallel_corpus_fd(
     publication_fd: int,
     *,
@@ -950,9 +1044,27 @@ def _verify_parallel_corpus_fd(
     except (OSError, ValueError) as error:
         raise ValueError("parallel corpus receipt is missing or unsafe") from error
     try:
-        receipt_bytes = read_file_descriptor(receipt_fd)
+        return _verify_parallel_corpus_with_receipt_fd(
+            publication_fd,
+            receipt_fd,
+            receipt_metadata,
+            expected_build_id=expected_build_id,
+            allow_stage_owner=allow_stage_owner,
+        )
     finally:
         os.close(receipt_fd)
+
+
+def _verify_parallel_corpus_with_receipt_fd(
+    publication_fd: int,
+    receipt_fd: int,
+    receipt_metadata: os.stat_result,
+    *,
+    expected_build_id: str | None = None,
+    allow_stage_owner: bool = False,
+) -> dict[str, Any]:
+    receipt_bytes = read_file_descriptor(receipt_fd)
+    receipt_sha256 = sha256_hex(receipt_bytes)
     try:
         receipt = json.loads(receipt_bytes)
     except (UnicodeDecodeError, json.JSONDecodeError) as error:
@@ -1120,6 +1232,13 @@ def _verify_parallel_corpus_fd(
             reader.close()
         if receipt["packed_stream_sha256"] != packed_digest:
             raise ValueError("packed stream digest drift")
+        _verify_receipt_after_verification(
+            publication_fd,
+            receipt_fd,
+            receipt_metadata,
+            receipt_bytes,
+            receipt_sha256,
+        )
         return receipt
     finally:
         for descriptor, _metadata, binding_fd, _name in opened_files.values():
@@ -1132,21 +1251,30 @@ def verify_parallel_corpus(
     *,
     expected_build_id: str | None = None,
     _allow_stage_owner: bool = False,
-) -> dict[str, Any]:
+) -> VerifiedParallelCorpus:
+    parent_fd = -1
+    publication_fd = -1
     try:
-        publication_fd = open_directory_path(root)
+        parent_fd, name = open_parent_directory(root)
+        publication_fd, _created = open_directory_at(parent_fd, name)
     except (OSError, ValueError) as error:
+        if parent_fd >= 0:
+            os.close(parent_fd)
         raise ValueError(
             "parallel corpus publication is missing or unsafe"
         ) from error
     try:
-        return _verify_parallel_corpus_fd(
-            publication_fd,
-            expected_build_id=expected_build_id,
-            allow_stage_owner=_allow_stage_owner,
+        return _with_retained_tombstones(
+            _verify_parallel_corpus_fd(
+                publication_fd,
+                expected_build_id=expected_build_id,
+                allow_stage_owner=_allow_stage_owner,
+            ),
+            parent_fd,
         )
     finally:
         os.close(publication_fd)
+        os.close(parent_fd)
 
 
 def _verify_parallel_corpus_at(
@@ -1154,12 +1282,15 @@ def _verify_parallel_corpus_at(
     name: str,
     *,
     expected_build_id: str,
-) -> dict[str, Any]:
+) -> VerifiedParallelCorpus:
     publication_fd, _created = open_directory_at(parent_fd, name)
     try:
-        return _verify_parallel_corpus_fd(
-            publication_fd,
-            expected_build_id=expected_build_id,
+        return _with_retained_tombstones(
+            _verify_parallel_corpus_fd(
+                publication_fd,
+                expected_build_id=expected_build_id,
+            ),
+            parent_fd,
         )
     finally:
         os.close(publication_fd)
@@ -1174,7 +1305,7 @@ def build_parallel_corpus(
     workers: int = 1,
     _materialized_metadata: tuple[MetadataRecord, ...] | None = None,
     _cached_payloads: dict[str, bytes] | None = None,
-) -> dict[str, Any]:
+) -> VerifiedParallelCorpus:
     """Build or resume a corpus using pinned, no-replace publication."""
 
     output = Path(destination)
@@ -1183,7 +1314,7 @@ def build_parallel_corpus(
     stage_path = publication_staging_path(output, build_id)
     stage_name = stage_path.name
     owner_payload = _stage_owner_bytes(build_id)
-    tombstone_fd = -1
+    tombstone_fd = None
     try:
         if entry_exists(parent_fd, output_name):
             try:
@@ -1237,11 +1368,13 @@ def build_parallel_corpus(
                 raise ValueError(
                     f"conflicting parallel corpus output: {output}"
                 ) from error
-        tombstone_fd = open_tombstone_directory(parent_fd)
-        if entry_exists(parent_fd, stage_name):
+        stage_exists = entry_exists(parent_fd, stage_name)
+        if stage_exists:
             stage_metadata = entry_lstat(parent_fd, stage_name)
             if not stat.S_ISDIR(stage_metadata.st_mode):
                 raise ValueError("parallel corpus staging path is unsafe")
+        tombstone_fd = open_tombstone_directory(parent_fd)
+        if stage_exists:
             existing_stage_fd, _created = open_directory_at(parent_fd, stage_name)
             try:
                 _validate_stage_namespace(existing_stage_fd, build_id)
@@ -1425,8 +1558,8 @@ def build_parallel_corpus(
                 os.close(shards_fd)
             os.close(stage_fd)
     finally:
-        if tombstone_fd >= 0:
-            os.close(tombstone_fd)
+        if tombstone_fd is not None:
+            tombstone_fd.close()
         os.close(parent_fd)
 
 
@@ -1438,7 +1571,7 @@ def build_parallel_corpus_from_tasks(
     task_results: tuple[TaskResult, ...],
     *,
     expected_task_count: int,
-) -> dict[str, Any]:
+) -> VerifiedParallelCorpus:
     """Validate task results and publish directly from their cached token bytes."""
 
     from .tasks import reduce_task_results
@@ -1476,7 +1609,7 @@ def publish_verification_receipt(
     destination: Path | str,
     *,
     expected_build_id: str,
-) -> dict[str, Any]:
+) -> VerifiedParallelCorpus:
     """Verify a corpus and install its canonical receipt under a pinned fd."""
 
     receipt = verify_parallel_corpus(
@@ -1485,7 +1618,7 @@ def publish_verification_receipt(
     )
     receipt_bytes = canonical_json_bytes(receipt)
     parent_fd, name = open_parent_directory(destination, create=True)
-    tombstone_fd = -1
+    tombstone_fd = None
     try:
         tombstone_fd = open_tombstone_directory(parent_fd)
         atomic_write_or_match(
@@ -1496,7 +1629,7 @@ def publish_verification_receipt(
             tombstone_fd=tombstone_fd,
         )
     finally:
-        if tombstone_fd >= 0:
-            os.close(tombstone_fd)
+        if tombstone_fd is not None:
+            tombstone_fd.close()
         os.close(parent_fd)
     return receipt
