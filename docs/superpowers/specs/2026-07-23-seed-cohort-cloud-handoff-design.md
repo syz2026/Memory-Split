@@ -39,8 +39,10 @@ infrastructure stop condition fires.
 ## Release architecture
 
 A canonical `COHORT-ASSIGNMENT.json` is included in both archives. It binds the
-cohort ID, all five seeds, provider assignment, arm identities, model size,
-training-token math, and source commit.
+cohort ID, all five seeds, provider assignment, arm identities, model size, and
+training-token math. Each release metadata record jointly binds that assignment
+to the clean source commit, avoiding an impossible self-referential commit hash
+inside a tracked source file.
 
 The Illumina packager must fail unless its archive contains:
 

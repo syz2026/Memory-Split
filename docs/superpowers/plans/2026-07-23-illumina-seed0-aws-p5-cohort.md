@@ -95,6 +95,9 @@ AWS Deep Learning AMI, deterministic ZIP.
 
 **Runbook and release verification**
 
+- Create: `evals/confirmatory/__main__.py`
+- Create: `evals/confirmatory/runner.py`
+- Create: `tests/test_confirmatory_runner.py`
 - Create: `docs/AWS-P5-360M-RUNBOOK.md`
 - Create: `scripts/verify_cohort_releases.py`
 - Create: `tests/test_verify_cohort_releases.py`
@@ -661,7 +664,69 @@ git commit -m "feat: package AWS P5 seeds one through four"
 
 ---
 
-### Task 8: Verify the two releases as one cohort
+### Task 8: Make sealed confirmatory evaluation executable
+
+**Files:**
+- Create: `evals/confirmatory/__main__.py`
+- Create: `evals/confirmatory/runner.py`
+- Create: `tests/test_confirmatory_runner.py`
+
+**Interfaces:**
+- CLI:
+  `python -m evals.confirmatory evaluate --run RUN --sealed-release RELEASE --expected-study-lock-sha256 HASH --device cuda`
+- Produces: hash-bound submissions, replayed outcomes, metrics, inference
+  evidence, and artifact report
+
+- [ ] **Step 1: Write CLI and replay tests**
+
+Use a deterministic tiny model adapter and sealed fixture. Assert the runner:
+
+- verifies the external study-lock hash before opening model-visible items;
+- checks checkpoint/config/corpus/code/seed/arm bindings;
+- keeps sealed gold outside the model adapter;
+- records submitted answer plus exactly 12 action slots;
+- derives correctness only through the trusted solver;
+- writes canonical outcomes, metrics, inference, and report artifacts;
+- refuses wrong study lock, malformed submission, missing item, duplicate item,
+  generic `split`, or invalid checkpoint binding.
+
+- [ ] **Step 2: Run and confirm red**
+
+```bash
+pytest -q tests/test_confirmatory_runner.py
+```
+
+- [ ] **Step 3: Implement the runner**
+
+`runner.py` owns orchestration only. Reuse strict contracts, solver replay,
+metrics, and reporting; do not duplicate their validation. Inject a
+`ModelAdapter.generate(item) -> Submission` interface so tests need no GPU and
+the production adapter can load the repository GPT checkpoint.
+
+- [ ] **Step 4: Implement the strict CLI**
+
+Emit one JSON object to stdout. Send logs to stderr. Default to dry-run unless
+`evaluate` receives an explicit output directory and all trust roots. Refuse
+to overwrite any artifact.
+
+- [ ] **Step 5: Verify**
+
+```bash
+pytest -q tests/test_confirmatory_runner.py tests/test_confirmatory_replay.py \
+  tests/test_confirmatory_reporting.py tests/test_confirmatory_validation.py
+```
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add evals/confirmatory/__main__.py evals/confirmatory/runner.py \
+  tests/test_confirmatory_runner.py
+git commit -m "feat: run sealed confirmatory evaluation"
+```
+
+---
+
+### Task 9: Verify the two releases as one cohort
 
 **Files:**
 - Create: `scripts/verify_cohort_releases.py`
@@ -708,7 +773,7 @@ git commit -m "feat: verify split-provider cohort releases"
 
 ---
 
-### Task 9: End-to-end local release gate
+### Task 10: End-to-end local release gate
 
 **Files:**
 - Modify only files needed to correct failures found by this gate
