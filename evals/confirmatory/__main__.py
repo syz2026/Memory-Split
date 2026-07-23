@@ -7,7 +7,25 @@ import json
 import sys
 from typing import Sequence
 
-from evals.confirmatory.runner import ModelAdapter, evaluate, preflight
+from evals.confirmatory.runner import (
+    MSCTL_EVALUATOR_CONTRACT,
+    ModelAdapter,
+    evaluate,
+    preflight,
+)
+
+
+_CANONICAL_FLAGS = (
+    "--run",
+    "--sealed-release",
+    "--expected-study-lock-sha256",
+    "--device",
+    "--output-dir",
+)
+_CANONICAL_INVOCATION = (
+    "evaluate --run RUN --sealed-release RELEASE "
+    "--expected-study-lock-sha256 HASH --device DEVICE --output-dir OUTPUT"
+)
 
 
 class _UsageError(ValueError):
@@ -92,18 +110,13 @@ def main(
             print("confirmatory evaluation dry-run verified", file=sys.stderr)
             return_code = 0
         else:
-            if model_adapter is None:
-                raise RuntimeError(
-                    "evaluate with --output-dir requires an injected "
-                    "ModelAdapter; no production checkpoint adapter is "
-                    "registered"
-                )
             result = evaluate(
                 run=arguments.run,
                 sealed_release=arguments.sealed_release,
                 expected_study_lock_sha256=(arguments.expected_study_lock_sha256),
-                model_adapter=model_adapter,
                 output_dir=arguments.output_dir,
+                model_adapter=model_adapter,
+                device=arguments.device,
             )
             payload = {
                 "status": "published",
@@ -119,7 +132,13 @@ def main(
             print("confirmatory evidence published", file=sys.stderr)
             return_code = 0
     except _HelpRequested:
-        payload = {"status": "help"}
+        payload = {
+            "status": "help",
+            "contract": MSCTL_EVALUATOR_CONTRACT,
+            "command": "evaluate",
+            "canonical_flags": list(_CANONICAL_FLAGS),
+            "canonical_invocation": _CANONICAL_INVOCATION,
+        }
         return_code = 0
     except _UsageError as exc:
         payload = {"status": "error", "error": str(exc)}

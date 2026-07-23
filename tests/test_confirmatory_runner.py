@@ -1,13 +1,17 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+import copy
+from dataclasses import dataclass, replace
 import hashlib
 import importlib
 import importlib.util
 import json
 from pathlib import Path
+import subprocess
+import sys
 
 import pytest
+import torch
 
 from evals.confirmatory.contracts import (
     CHECKPOINT_SCHEMA,
@@ -19,6 +23,8 @@ from evals.confirmatory.contracts import (
     canonical_json_bytes,
     store_content_sha256,
 )
+from train.model import GPT, GPTConfig
+from train.tokenizer import get_tok
 
 
 def _runner():
@@ -38,7 +44,7 @@ def _proof() -> list[dict[str, object]]:
     return [
         {
             "source_slot": 0,
-            "relation_id": "P1",
+            "relation_id": "r0",
             "direction": "out",
             "op": "read",
         },
@@ -63,25 +69,50 @@ class _Fixture:
 
 def _sealed_fixture(tmp_path: Path) -> _Fixture:
     runner = _runner()
+    tmp_path.mkdir(parents=True, exist_ok=True)
     run = tmp_path / "run"
     release = tmp_path / "sealed"
     run.mkdir()
     release.mkdir()
 
-    checkpoint_path = run / "ckpt.pt"
-    checkpoint_path.write_bytes(b"fixture checkpoint bytes\n")
-    checkpoint_sha256 = hashlib.sha256(checkpoint_path.read_bytes()).hexdigest()
+    model_config = {
+        "n_layer": 0,
+        "n_head": 1,
+        "d_model": 2,
+        "vocab_size": 50304,
+        "ctx": 512,
+    }
+    run_config = {
+        "condition": "split90",
+        "model": model_config,
+        "seed": 0,
+    }
     config_path = run / "config.json"
-    config_path.write_bytes(
-        canonical_json_bytes(
-            {
-                "condition": "split90",
-                "model": "fixture-model",
-                "seed": 0,
-            }
-        )
-    )
+    config_path.write_bytes(canonical_json_bytes(run_config))
     configuration_sha256 = hashlib.sha256(config_path.read_bytes()).hexdigest()
+    tok = get_tok()
+    answer_ids = tok.encode("done")
+    assert len(answer_ids) == 1
+    answer_id = answer_ids[0]
+    model = GPT(GPTConfig(**model_config))
+    with torch.no_grad():
+        for parameter in model.parameters():
+            parameter.zero_()
+        model.ln_f.weight.fill_(1.0)
+        model.wte.weight[tok.ANSWER_STATE] = torch.tensor([1.0, 0.0])
+        model.lm_head.weight[answer_id] = torch.tensor([1.0, 0.0])
+        model.wte.weight[answer_id] = torch.tensor([0.0, 1.0])
+        model.lm_head.weight[tok.GRAPH_START] = torch.tensor([0.0, 1.0])
+    checkpoint_path = run / "ckpt.pt"
+    torch.save(
+        {
+            "model": model.state_dict(),
+            "cfg": run_config,
+            "step": 0,
+        },
+        checkpoint_path,
+    )
+    checkpoint_sha256 = hashlib.sha256(checkpoint_path.read_bytes()).hexdigest()
     route_dose_sha256 = "e" * 64
     corpus_sha256 = "c" * 64
     code_sha256 = "d" * 64
@@ -117,7 +148,7 @@ def _sealed_fixture(tmp_path: Path) -> _Fixture:
                 rows = [
                     {
                         "source_id": "Q1",
-                        "relation_id": "P1",
+                        "relation_id": "r0",
                         "direction": "out",
                         "target_kind": "literal",
                         "target": "done",
@@ -151,7 +182,7 @@ def _sealed_fixture(tmp_path: Path) -> _Fixture:
                             "path_length": path_length,
                             "composition_split": composition_split,
                             "composition_id": f"composition-{pair_id}",
-                            "prompt": "Follow P1 from Q1.",
+                            "prompt": "Follow r0 from Q1.",
                             "initial_slots": ["Q1", None, None, None],
                             "store_id": store_id,
                             "memory_mode": memory_mode,
@@ -389,70 +420,17 @@ def _reseal_study_lock(fixture: _Fixture, **release_changes) -> str:
     return hashlib.sha256(content).hexdigest()
 
 
-def _install_trusted_reporting(monkeypatch, runner) -> None:
-    required = (
-        "checkpoints.jsonl",
-        "inference.json",
-        "items.jsonl",
-        "metrics.json",
-        "outcomes.jsonl",
-        "sealed-gold.jsonl",
-        "study-lock.json",
-        "stores.jsonl",
-        "validity.json",
-    )
+def _mutate_study_lock(fixture: _Fixture, mutation) -> str:
+    path = fixture.release / "study-lock.json"
+    lock = json.loads(path.read_bytes())
+    mutation(lock)
+    content = canonical_json_bytes(lock)
+    path.write_bytes(content)
+    return hashlib.sha256(content).hexdigest()
 
-    @dataclass(frozen=True)
-    class Report:
-        study_lock_sha256: str
-        artifacts_sha256: str
 
-        def to_dict(self):
-            return {
-                "record_type": "memorysplit.confirmatory.artifact-report.v2",
-                "schema_version": CONTRACT_VERSION,
-                "study_lock_sha256": self.study_lock_sha256,
-                "artifacts_sha256": self.artifacts_sha256,
-            }
-
-    def build_artifact_report(*, artifacts, expected_study_lock_sha256):
-        assert set(artifacts) == set(required)
-        assert hashlib.sha256(artifacts["study-lock.json"]).hexdigest() == (
-            expected_study_lock_sha256
-        )
-        digest = hashlib.sha256(
-            b"".join(artifacts[name] for name in sorted(artifacts))
-        ).hexdigest()
-        return Report(expected_study_lock_sha256, digest)
-
-    def publish_artifact_report(
-        path,
-        report,
-        artifacts,
-        *,
-        expected_study_lock_sha256,
-    ):
-        assert (
-            build_artifact_report(
-                artifacts=artifacts,
-                expected_study_lock_sha256=expected_study_lock_sha256,
-            )
-            == report
-        )
-        Path(path).write_bytes(canonical_json_bytes(report))
-        return Path(path)
-
-    monkeypatch.setattr(runner.reporting, "REQUIRED_ARTIFACTS", required)
-    monkeypatch.setattr(
-        runner.reporting,
-        "build_artifact_report",
-        build_artifact_report,
-    )
-    monkeypatch.setattr(
-        runner.reporting,
-        "publish_artifact_report",
-        publish_artifact_report,
-    )
+def _staging_paths(fixture: _Fixture) -> list[Path]:
+    return list(fixture.output.parent.glob(f".{fixture.output.name}.confirmatory-*"))
 
 
 def test_runner_exposes_injected_model_adapter_contract():
@@ -466,11 +444,61 @@ def test_runner_exposes_injected_model_adapter_contract():
     )
     adapter = runner.DeterministicFixtureAdapter({"item-1": submission})
 
-    assert adapter.generate(type("VisibleItem", (), {"item_id": "item-1"})()) == (
-        submission
-    )
+    visible = type("VisibleItem", (), {"item_id": "item-1"})()
+    assert adapter.generate(visible, None) == submission
     with pytest.raises(ValueError, match="missing"):
-        adapter.generate(type("VisibleItem", (), {"item_id": "item-2"})())
+        adapter.generate(type("VisibleItem", (), {"item_id": "item-2"})(), None)
+
+
+def test_repository_adapter_rejects_checkpoint_hash_architecture_and_state_drift(
+    tmp_path,
+):
+    runner = _runner()
+
+    hash_fixture = _sealed_fixture(tmp_path / "hash")
+    binding = runner._load_run_binding(hash_fixture.run)
+    hash_fixture.run.joinpath("ckpt.pt").write_bytes(b"drift")
+    with pytest.raises(ValueError, match="checkpoint.*hash"):
+        runner.RepositoryGPTAdapter.from_bound_run(
+            hash_fixture.run,
+            binding,
+            "cpu",
+        )
+
+    architecture_fixture = _sealed_fixture(tmp_path / "architecture")
+    binding = runner._load_run_binding(architecture_fixture.run)
+    checkpoint_path = architecture_fixture.run / "ckpt.pt"
+    state = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
+    state["cfg"] = copy.deepcopy(state["cfg"])
+    state["cfg"]["model"]["d_model"] = 4
+    torch.save(state, checkpoint_path)
+    binding = replace(
+        binding,
+        checkpoint_sha256=hashlib.sha256(checkpoint_path.read_bytes()).hexdigest(),
+    )
+    with pytest.raises(ValueError, match="architecture|config"):
+        runner.RepositoryGPTAdapter.from_bound_run(
+            architecture_fixture.run,
+            binding,
+            "cpu",
+        )
+
+    state_fixture = _sealed_fixture(tmp_path / "state")
+    binding = runner._load_run_binding(state_fixture.run)
+    checkpoint_path = state_fixture.run / "ckpt.pt"
+    state = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
+    del state["model"]["ln_f.weight"]
+    torch.save(state, checkpoint_path)
+    binding = replace(
+        binding,
+        checkpoint_sha256=hashlib.sha256(checkpoint_path.read_bytes()).hexdigest(),
+    )
+    with pytest.raises(ValueError, match="state"):
+        runner.RepositoryGPTAdapter.from_bound_run(
+            state_fixture.run,
+            binding,
+            "cpu",
+        )
 
 
 def test_submission_requires_exactly_twelve_valid_action_slots():
@@ -496,8 +524,8 @@ def test_external_study_lock_is_checked_before_model_visible_items(tmp_path):
     class RecordingAdapter:
         calls = []
 
-        def generate(self, item):
-            self.calls.append(item)
+        def generate(self, item, store):
+            self.calls.append((item, store))
             raise AssertionError("adapter must not be called")
 
     adapter = RecordingAdapter()
@@ -514,13 +542,132 @@ def test_external_study_lock_is_checked_before_model_visible_items(tmp_path):
     assert not fixture.output.exists()
 
 
-def test_runner_keeps_gold_sealed_replays_solver_and_publishes_canonical_evidence(
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    [
+        ("preregistration", "preregistration"),
+        ("controls", "control|required"),
+        ("receipts", "receipt"),
+    ],
+)
+def test_real_hardened_study_lock_rejects_malformed_trust_roots(
     tmp_path,
-    monkeypatch,
+    mutation,
+    message,
 ):
     runner = _runner()
     fixture = _sealed_fixture(tmp_path)
-    _install_trusted_reporting(monkeypatch, runner)
+
+    def change(lock):
+        if mutation == "preregistration":
+            lock["preregistration_sha256"] = "0" * 64
+        elif mutation == "controls":
+            lock["release"]["required_controls"] = []
+        else:
+            lock["validity_receipts"] = []
+
+    expected = _mutate_study_lock(fixture, change)
+    with pytest.raises(ValueError, match=message):
+        runner.preflight(
+            run=fixture.run,
+            sealed_release=fixture.release,
+            expected_study_lock_sha256=expected,
+        )
+
+
+def test_missing_hardened_study_lock_api_fails_closed(tmp_path, monkeypatch):
+    runner = _runner()
+    fixture = _sealed_fixture(tmp_path)
+
+    def unavailable():
+        raise runner.ValidationInterfaceUnavailable(
+            "hardened study-lock validation API unavailable"
+        )
+
+    monkeypatch.setattr(runner, "_hardened_study_lock_api", unavailable)
+    with pytest.raises(
+        runner.ValidationInterfaceUnavailable,
+        match="hardened study-lock validation API unavailable",
+    ):
+        runner.preflight(
+            run=fixture.run,
+            sealed_release=fixture.release,
+            expected_study_lock_sha256=fixture.expected_study_lock_sha256,
+        )
+
+
+def test_pre_f934_readiness_semantics_fail_closed(tmp_path, monkeypatch):
+    runner = _runner()
+    fixture = _sealed_fixture(tmp_path)
+    hardening = runner._hardened_study_lock_api()
+    monkeypatch.setattr(
+        hardening,
+        "evaluate_readiness",
+        lambda _lock, _evidence: object(),
+    )
+
+    with pytest.raises(
+        runner.ValidationInterfaceUnavailable,
+        match="externally rooted readiness.*f934124",
+    ):
+        runner.preflight(
+            run=fixture.run,
+            sealed_release=fixture.release,
+            expected_study_lock_sha256=fixture.expected_study_lock_sha256,
+        )
+
+
+def test_runner_rejects_store_relation_outside_frozen_model_vocabulary(tmp_path):
+    runner = _runner()
+    fixture = _sealed_fixture(tmp_path)
+    stores_path = fixture.release / "stores.jsonl"
+    changed = []
+    for line in stores_path.read_bytes().splitlines():
+        store = json.loads(line)
+        store["rows"][0]["relation_id"] = "P1"
+        store["content_sha256"] = store_content_sha256(
+            store["store_id"],
+            store["world_id"],
+            store["rows"],
+        )
+        changed.append(canonical_json_bytes(store))
+    stores_content = b"".join(changed)
+    stores_path.write_bytes(stores_content)
+    expected = _reseal_study_lock(
+        fixture,
+        stores_sha256=hashlib.sha256(stores_content).hexdigest(),
+    )
+
+    with pytest.raises(ValueError, match="unsupported.*relation"):
+        runner.preflight(
+            run=fixture.run,
+            sealed_release=fixture.release,
+            expected_study_lock_sha256=expected,
+        )
+
+
+def test_runner_rejects_drifted_frozen_graph_protocol(tmp_path, monkeypatch):
+    runner = _runner()
+    fixture = _sealed_fixture(tmp_path)
+    tok = get_tok()
+    monkeypatch.setattr(tok, "GRAPH_START", tok.GRAPH_START + 1)
+
+    with pytest.raises(
+        runner.ValidationInterfaceUnavailable,
+        match="graph action protocol",
+    ):
+        runner.preflight(
+            run=fixture.run,
+            sealed_release=fixture.release,
+            expected_study_lock_sha256=fixture.expected_study_lock_sha256,
+        )
+
+
+def test_runner_keeps_gold_sealed_replays_solver_and_publishes_canonical_evidence(
+    tmp_path,
+):
+    runner = _runner()
+    fixture = _sealed_fixture(tmp_path)
     gold_path = fixture.release / "sealed-gold.jsonl"
     gold_path.chmod(0)
     delegate = runner.DeterministicFixtureAdapter(fixture.submissions)
@@ -529,14 +676,19 @@ def test_runner_keeps_gold_sealed_replays_solver_and_publishes_canonical_evidenc
         def __init__(self):
             self.item_ids = []
 
-        def generate(self, item):
+        def generate(self, item, store):
             assert isinstance(item, ItemRecord)
             assert not hasattr(item, "answer")
             assert not hasattr(item, "proof")
+            if item.memory_mode.value == "memory_off":
+                assert store is None
+            else:
+                assert store is not None
+                assert store.store_id == item.store_id
             self.item_ids.append(item.item_id)
             if len(self.item_ids) == 1:
                 gold_path.chmod(0o600)
-            return delegate.generate(item)
+            return delegate.generate(item, store)
 
     adapter = GoldOpeningGuardAdapter()
     result = runner.evaluate(
@@ -585,13 +737,112 @@ def test_runner_keeps_gold_sealed_replays_solver_and_publishes_canonical_evidenc
     assert tuple(adapter.item_ids) == fixture.item_ids
 
 
-def test_solver_replay_not_adapter_assertions_determines_metrics(
+def test_transactional_publication_cleans_mid_write_failure_and_allows_retry(
     tmp_path,
     monkeypatch,
 ):
     runner = _runner()
     fixture = _sealed_fixture(tmp_path)
-    _install_trusted_reporting(monkeypatch, runner)
+    adapter = runner.DeterministicFixtureAdapter(fixture.submissions)
+    original = runner._publish_file
+    writes = 0
+
+    def fail_mid_write(path, content):
+        nonlocal writes
+        writes += 1
+        if writes == 3:
+            raise OSError("injected artifact write failure")
+        return original(path, content)
+
+    monkeypatch.setattr(runner, "_publish_file", fail_mid_write)
+    with pytest.raises(OSError, match="injected artifact write failure"):
+        runner.evaluate(
+            run=fixture.run,
+            sealed_release=fixture.release,
+            expected_study_lock_sha256=fixture.expected_study_lock_sha256,
+            model_adapter=adapter,
+            output_dir=fixture.output,
+        )
+    assert not fixture.output.exists()
+    assert _staging_paths(fixture) == []
+
+    monkeypatch.setattr(runner, "_publish_file", original)
+    result = runner.evaluate(
+        run=fixture.run,
+        sealed_release=fixture.release,
+        expected_study_lock_sha256=fixture.expected_study_lock_sha256,
+        model_adapter=adapter,
+        output_dir=fixture.output,
+    )
+    assert result.output_dir == fixture.output
+
+
+def test_transactional_publication_cleans_report_failure(tmp_path, monkeypatch):
+    runner = _runner()
+    fixture = _sealed_fixture(tmp_path)
+    original = runner.reporting.publish_artifact_report
+
+    def fail_after_report(
+        path,
+        report,
+        artifacts,
+        *,
+        expected_study_lock_sha256,
+    ):
+        original(
+            path,
+            report,
+            artifacts,
+            expected_study_lock_sha256=expected_study_lock_sha256,
+        )
+        raise OSError("injected report failure")
+
+    monkeypatch.setattr(
+        runner.reporting,
+        "publish_artifact_report",
+        fail_after_report,
+    )
+    with pytest.raises(OSError, match="injected report failure"):
+        runner.evaluate(
+            run=fixture.run,
+            sealed_release=fixture.release,
+            expected_study_lock_sha256=fixture.expected_study_lock_sha256,
+            model_adapter=runner.DeterministicFixtureAdapter(fixture.submissions),
+            output_dir=fixture.output,
+        )
+    assert not fixture.output.exists()
+    assert _staging_paths(fixture) == []
+
+
+def test_transactional_publication_never_replaces_collision(
+    tmp_path,
+    monkeypatch,
+):
+    runner = _runner()
+    fixture = _sealed_fixture(tmp_path)
+    original = runner._atomic_publish_directory
+
+    def collide(staging, output):
+        output.mkdir()
+        output.joinpath("other-owner").write_text("untouched")
+        return original(staging, output)
+
+    monkeypatch.setattr(runner, "_atomic_publish_directory", collide)
+    with pytest.raises(FileExistsError, match="output|exists"):
+        runner.evaluate(
+            run=fixture.run,
+            sealed_release=fixture.release,
+            expected_study_lock_sha256=fixture.expected_study_lock_sha256,
+            model_adapter=runner.DeterministicFixtureAdapter(fixture.submissions),
+            output_dir=fixture.output,
+        )
+    assert [path.name for path in fixture.output.iterdir()] == ["other-owner"]
+    assert _staging_paths(fixture) == []
+
+
+def test_solver_replay_not_adapter_assertions_determines_metrics(tmp_path):
+    runner = _runner()
+    fixture = _sealed_fixture(tmp_path)
     wrong = {
         item_id: runner.Submission(
             item_id=item_id,
@@ -621,7 +872,7 @@ def test_runner_rejects_malformed_submission_without_publishing(tmp_path):
     fixture = _sealed_fixture(tmp_path)
 
     class MalformedAdapter:
-        def generate(self, item):
+        def generate(self, item, store):
             return {
                 "item_id": item.item_id,
                 "answer": "done",
@@ -788,12 +1039,10 @@ def test_cli_dry_run_emits_one_json_object_and_only_logs_to_stderr(
 
 def test_cli_evaluate_uses_injected_adapter_and_publishes_once(
     tmp_path,
-    monkeypatch,
     capsys,
 ):
     runner = _runner()
     fixture = _sealed_fixture(tmp_path)
-    _install_trusted_reporting(monkeypatch, runner)
     entry = importlib.import_module("evals.confirmatory.__main__")
 
     return_code = entry.main(
@@ -824,6 +1073,70 @@ def test_cli_evaluate_uses_injected_adapter_and_publishes_once(
     assert "published" in captured.err
 
 
+def test_cli_builds_real_repository_adapter_with_memory_boundaries(
+    tmp_path,
+    monkeypatch,
+    capsys,
+):
+    runner = _runner()
+    fixture = _sealed_fixture(tmp_path)
+    entry = importlib.import_module("evals.confirmatory.__main__")
+    original = runner.RepositoryGPTAdapter.generate
+    observed = []
+
+    def record_and_generate(self, item, store):
+        observed.append(
+            (
+                item.memory_mode.value,
+                store is None,
+                type(self.model),
+            )
+        )
+        return original(self, item, store)
+
+    monkeypatch.setattr(
+        runner.RepositoryGPTAdapter,
+        "generate",
+        record_and_generate,
+    )
+    return_code = entry.main(
+        [
+            "evaluate",
+            "--run",
+            str(fixture.run),
+            "--sealed-release",
+            str(fixture.release),
+            "--expected-study-lock-sha256",
+            fixture.expected_study_lock_sha256,
+            "--device",
+            "cpu",
+            "--output-dir",
+            str(fixture.output),
+        ]
+    )
+
+    captured = capsys.readouterr()
+    assert return_code == 0, captured.err
+    assert len(captured.out.splitlines()) == 1
+    assert json.loads(captured.out)["status"] == "published"
+    assert observed
+    assert all(model_type is GPT for _, _, model_type in observed)
+    assert {
+        (memory_mode, store_is_none) for memory_mode, store_is_none, _ in observed
+    } == {("memory_off", True), ("memory_on", False)}
+    outcomes = [
+        json.loads(line)
+        for line in fixture.output.joinpath("outcomes.jsonl").read_bytes().splitlines()
+    ]
+    assert all(row["submitted_answer"] == "done" for row in outcomes)
+    assert all(
+        [action["op"] for action in row["submitted_proof"]]
+        == [*(["read"] * 10), "halt", "noop"]
+        for row in outcomes
+    )
+    assert fixture.output.joinpath("artifact-report.json").is_file()
+
+
 @pytest.mark.parametrize(
     "arguments",
     [
@@ -847,6 +1160,7 @@ def test_cli_errors_still_emit_one_json_object(arguments, capsys):
 
 
 def test_cli_help_preserves_json_only_stdout(capsys):
+    runner = _runner()
     entry = importlib.import_module("evals.confirmatory.__main__")
 
     return_code = entry.main(["--help"])
@@ -855,5 +1169,54 @@ def test_cli_help_preserves_json_only_stdout(capsys):
     lines = captured.out.splitlines()
     assert return_code == 0
     assert len(lines) == 1
-    assert json.loads(lines[0]) == {"status": "help"}
+    assert runner.MSCTL_EVALUATOR_CONTRACT == ("memorysplit-confirmatory-evaluator-v1")
+    assert json.loads(lines[0]) == {
+        "canonical_flags": [
+            "--run",
+            "--sealed-release",
+            "--expected-study-lock-sha256",
+            "--device",
+            "--output-dir",
+        ],
+        "canonical_invocation": (
+            "evaluate --run RUN --sealed-release RELEASE "
+            "--expected-study-lock-sha256 HASH --device DEVICE "
+            "--output-dir OUTPUT"
+        ),
+        "command": "evaluate",
+        "contract": runner.MSCTL_EVALUATOR_CONTRACT,
+        "status": "help",
+    }
     assert "usage:" in captured.err
+
+
+@pytest.mark.parametrize("mode", ["module", "direct"])
+def test_module_and_direct_cli_help_match_machine_contract(mode):
+    runner = _runner()
+    root = Path(__file__).resolve().parents[1]
+    command = (
+        [sys.executable, "-m", "evals.confirmatory", "--help"]
+        if mode == "module"
+        else [sys.executable, str(Path(runner.__file__).resolve()), "--help"]
+    )
+
+    completed = subprocess.run(
+        command,
+        cwd=root,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert len(completed.stdout.splitlines()) == 1
+    payload = json.loads(completed.stdout)
+    assert payload["contract"] == "memorysplit-confirmatory-evaluator-v1"
+    assert payload["canonical_flags"] == [
+        "--run",
+        "--sealed-release",
+        "--expected-study-lock-sha256",
+        "--device",
+        "--output-dir",
+    ]
+    assert "usage:" in completed.stderr

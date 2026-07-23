@@ -3,15 +3,16 @@
 Date: 2026-07-23
 Branch: `feat/memorysplit-v2-confirmatory-runner`
 Base: `c190429b1542`
-Reviewed hardening revision: `198d2953ae2ab41c844a79b79e71c3cf6311f730`
+Validated hardening revision: `f9341246012e83c3647069840218261e860466f6`
 
 ## Outcome
 
-Task 8 is implemented in the requested isolated worktree. The scoped code adds
-an injected `ModelAdapter`, deterministic fixture adapter, strict preflight and
-evaluation orchestration, and a JSON-only command-line boundary.
+The review findings are fixed in the requested isolated worktree. The CLI now
+constructs a real checkpoint-backed `RepositoryGPTAdapter` whenever
+`--output-dir` is supplied, while tests may still inject the strict
+`ModelAdapter` or `DeterministicFixtureAdapter`.
 
-Files added:
+Scoped files:
 
 - `evals/confirmatory/runner.py`
 - `evals/confirmatory/__main__.py`
@@ -21,71 +22,71 @@ Files added:
 No reporting, contracts, metrics, solver, or unrelated subsystem file was
 modified.
 
-## Trust and replay behavior
+## Trust, model, and replay behavior
 
-- Requires an external lowercase study-lock SHA-256 and authenticates it before
-  opening model-visible items.
-- Parses model-visible items before model invocation and opens sealed gold only
-  after every model submission has been collected.
-- Binds checkpoint bytes, configuration bytes, route-dose, corpus, code, seed,
-  arm, and explicit `dense`/`split90` condition identity across the run,
-  checkpoint registry, and study lock; generic `split` is rejected.
-- Requires one answer and exactly 12 validated action slots per item.
-- Replays submissions through the registered trusted solver and public metrics
-  APIs. Persisted outcomes contain submissions, not model-asserted correctness.
-- Produces canonical artifacts and creates a new output directory and files
-  with no-replace semantics.
-- Requires the externally hash-rooted hardened reporting signatures from
-  revision `198d295`; the older API fails closed before publication with the
-  exact required interface.
-- The CLI defaults to preflight without `--output-dir`, emits exactly one JSON
-  object to stdout on success, help, and error paths, and sends diagnostics and
-  help text to stderr.
+- Requires and authenticates an external lowercase study-lock SHA-256 before
+  opening model-visible items. The permissive local validator is gone; the
+  externally rooted `f934124` study-lock/readiness API is mandatory.
+- Rejects malformed frozen preregistration, control registries, receipt
+  commitments, and drift in the repository graph-token protocol or `r0`-`r15`
+  relation vocabulary.
+- Loads hash-bound config/checkpoint bytes with safe PyTorch loading, checks
+  seed, explicit `dense`/`split90` identity, architecture metadata, strict
+  state-dict shape/keys, and selected device availability.
+- Gives the model only a validated `ItemRecord` and its validated `StoreRecord`;
+  `memory_off` receives no store. Sealed gold is not opened until every
+  submission has been generated.
+- Executes the frozen read/return protocol for exactly 12 slots, caps reads at
+  10, and pads every post-HALT slot with canonical NOOP. Store targets and
+  addresses never become action candidate lists.
+- Replays submitted answers/proofs through the trusted solver. Persisted
+  outcomes remain submission-only and contain no asserted correctness flags.
+- Requires the hardened reporting API and publishes all evidence in an owned
+  sibling staging directory. Every artifact and report is fsynced, the staging
+  directory is fsynced, and the complete directory is atomically published
+  no-replace before the parent is fsynced.
+- Cleans or quarantines failed staging trees; injected write/report failures
+  leave no final output, and destination collisions preserve the other owner.
+- Exposes `MSCTL_EVALUATOR_CONTRACT =
+  "memorysplit-confirmatory-evaluator-v1"`. Module and direct-script help emit
+  one machine-readable JSON object to stdout; help/log text goes to stderr.
 
 ## TDD and verification evidence
 
-Tests were written before implementation. Initial red runs failed because
-`runner.evaluate`, the reporting boundary, and `evals.confirmatory.__main__`
-did not yet exist. The final help-path regression was also observed red with
-`SystemExit: 0` and argparse help on stdout before the parser fix.
+RED was observed before each implementation slice: missing production adapter
+and contract symbols, permissive validation, non-transactional publication,
+and the graph-protocol drift regression all failed first. The final protocol
+RED was `DID NOT RAISE`; its focused GREEN result was `1 passed`.
 
-Final focused command:
-
-```text
-python -m pytest -q tests/test_confirmatory_runner.py \
-  tests/test_confirmatory_reporting.py tests/test_confirmatory_validation.py
-```
-
-Result: `48 passed in 5.32s`. The runner-only suite reports `20 passed`.
-
-Quality gates:
+The final cross-worktree run loaded this runner with the committed confirmatory
+modules from `f934124` and ran the runner plus every `test_confirmatory*.py`:
 
 ```text
-uvx ruff check evals/confirmatory/runner.py \
-  evals/confirmatory/__main__.py tests/test_confirmatory_runner.py
-uvx ruff format --check evals/confirmatory/runner.py \
-  evals/confirmatory/__main__.py tests/test_confirmatory_runner.py
-git diff --check
+136 passed in 41.07s
 ```
 
-Result: all Ruff checks passed, all three files were already formatted, and
-the diff whitespace check passed. IDE diagnostics reported no errors.
+This comprises 34 runner tests and 102 hardening tests, including real hardened
+report construction/publication, replay, trust, metrics, validation, contracts,
+and inference fixtures. The real tiny GPT/checkpoint CLI test evaluates 160
+items across both memory boundaries without mocking reporting.
 
-A live compatibility replay loaded the runner against committed hardening
-revision `198d295`, evaluated 160 fixture items, published the hardened report,
-and verified report/study-lock binding. Report SHA-256:
-`ebd7592ba1f49d65b631df9a06a504eb23cb3c452ba71165581d1748013599a7`.
+Additional gates:
+
+```text
+module CLI help: evaluate help 1 True
+direct CLI help: evaluate help 1 True
+ruff check: All checks passed
+ruff format --check: 3 files already formatted
+py_compile: passed
+git diff --check: passed
+```
 
 ## Concerns and limits
 
-- `tests/test_confirmatory_replay.py`, named by the approved brief, does not
-  exist at base `c190429`, so that one file could not be run on this isolated
-  branch. The available reporting and validation suites passed, and replay
-  compatibility was exercised directly against the latest committed hardening
-  implementation.
-- The base branch's reporting API is intentionally insufficient and full
-  publication fails closed until revision `198d295` (or an equivalent hardened
-  interface) is integrated.
-- A production checkpoint-backed adapter and GPU inference are outside this
-  task's scoped files; full CLI publication therefore requires an injected
-  adapter. Dry-run preflight is directly executable.
+- The branch base intentionally predates the hardened modules. Evaluation and
+  publication therefore fail closed until `f934124` (or its exact compatible
+  API) is integrated.
+- CPU production construction and inference are exercised with a tiny real
+  checkpoint. CUDA and MPS availability paths were not executable on this host.
+- Atomic no-replace directory publication supports Darwin and Linux and fails
+  closed on unsupported platforms.

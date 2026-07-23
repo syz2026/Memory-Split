@@ -4,23 +4,37 @@ from __future__ import annotations
 
 from collections import defaultdict
 from collections.abc import Mapping
-from dataclasses import dataclass
+import ctypes
+from dataclasses import asdict, dataclass, replace
+import errno
 import hashlib
+import importlib
 import inspect
+import io
 import json
 import os
 from pathlib import Path
 import re
+import shutil
 import stat
+import sys
+import tempfile
 from types import MappingProxyType
 from typing import Any, Protocol
 
+if __name__ == "__main__" and __package__ in (None, ""):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+    from evals.confirmatory.__main__ import main
+
+    raise SystemExit(main())
+
 from evals.confirmatory import metrics, reporting, solver as solver_module
-from evals.confirmatory.actions import ActionSlot, validate_action_slots
+from evals.confirmatory.actions import ActionOp, ActionSlot, validate_action_slots
 from evals.confirmatory.contracts import (
     CONTRACT_VERSION,
     CheckpointRecord,
     ItemRecord,
+    MemoryMode,
     SealedGoldRecord,
     StoreRecord,
     canonical_json_bytes,
@@ -29,10 +43,10 @@ from evals.confirmatory.contracts import (
 )
 
 
+MSCTL_EVALUATOR_CONTRACT = "memorysplit-confirmatory-evaluator-v1"
 RUN_BINDING_SCHEMA = "memorysplit.confirmatory.run-binding.v2"
 OUTCOME_SCHEMA = "memorysplit.confirmatory.outcome.v2"
 METRICS_SCHEMA = "memorysplit.confirmatory.metrics.v2"
-STUDY_LOCK_SCHEMA = "memorysplit.confirmatory.study-lock.v2"
 INFERENCE_EVIDENCE_SCHEMA = "memorysplit.confirmatory.inference-evidence.v2"
 VALIDITY_EVIDENCE_SCHEMA = "memorysplit.confirmatory.validity-evidence.v2"
 PRIMARY_CONTRAST_ID = (
@@ -57,48 +71,6 @@ _RUN_FIELDS = frozenset(
         "condition_id",
     }
 )
-_STUDY_LOCK_FIELDS = frozenset(
-    {
-        "record_type",
-        "schema_version",
-        "preregistration_sha256",
-        "release",
-        "checkpoints",
-        "validity_receipts",
-    }
-)
-_RELEASE_FIELDS = frozenset(
-    {
-        "items_sha256",
-        "sealed_gold_sha256",
-        "stores_sha256",
-        "checkpoints_sha256",
-        "item_ids",
-        "pair_ids",
-        "world_ids",
-        "evaluation_cells",
-        "item_count",
-        "pair_count",
-        "world_count",
-        "evaluation_cell_count",
-        "required_families",
-        "required_strata",
-        "required_memory_modes",
-        "required_controls",
-    }
-)
-_EVALUATION_CELL_FIELDS = frozenset(
-    {"item_id", "checkpoint_sha256", "seed", "condition_id"}
-)
-_CHECKPOINT_APPROVAL_FIELDS = frozenset(
-    {
-        "checkpoint_sha256",
-        "seed",
-        "condition_id",
-        "configuration_sha256",
-        "route_dose_sha256",
-    }
-)
 _HARDENED_ARTIFACTS = (
     "checkpoints.jsonl",
     "inference.json",
@@ -110,10 +82,83 @@ _HARDENED_ARTIFACTS = (
     "stores.jsonl",
     "validity.json",
 )
+_FROZEN_RELATION_TOKENS = MappingProxyType(
+    {f"r{index}": 50276 + index for index in range(16)}
+)
+_FROZEN_SLOT_TOKENS = (50267, 50268, 50269, 50270)
+_FROZEN_GRAPH_SPECIAL_TOKENS = MappingProxyType(
+    {
+        "<|graph_start|>": 50261,
+        "<|graph_read|>": 50262,
+        "<|graph_return|>": 50263,
+        "<|graph_end|>": 50264,
+        "<|graph_halt|>": 50265,
+        "<|graph_noop|>": 50266,
+        "<|slot_0|>": 50267,
+        "<|slot_1|>": 50268,
+        "<|slot_2|>": 50269,
+        "<|slot_3|>": 50270,
+        "<|dir_out|>": 50271,
+        "<|dir_in|>": 50272,
+        "<|graph_step|>": 50273,
+        "<|answer_state|>": 50274,
+        "<|graph_miss|>": 50275,
+        **{f"<|rel_{index}|>": 50276 + index for index in range(16)},
+        "<|relation_start|>": 50292,
+        "<|relation_end|>": 50293,
+        "<|page_start|>": 50294,
+        "<|page_end|>": 50295,
+    }
+)
+_FROZEN_PROTOCOL_ATTRIBUTES = MappingProxyType(
+    {
+        "DB_START": 50257,
+        "DB_RETRIEVE": 50258,
+        "DB_END": 50259,
+        "EOT": 50260,
+        "GRAPH_START": 50261,
+        "GRAPH_READ": 50262,
+        "GRAPH_RETURN": 50263,
+        "GRAPH_END": 50264,
+        "GRAPH_HALT": 50265,
+        "GRAPH_NOOP": 50266,
+        "DIR_OUT": 50271,
+        "DIR_IN": 50272,
+        "GRAPH_STEP": 50273,
+        "ANSWER_STATE": 50274,
+        "GRAPH_MISS": 50275,
+        "RELATION_START": 50292,
+        "RELATION_END": 50293,
+        "PAGE_START": 50294,
+        "PAGE_END": 50295,
+    }
+)
 
 
 class ReportingInterfaceUnavailable(RuntimeError):
     """The installed reporting core cannot safely replay runner evidence."""
+
+
+class ValidationInterfaceUnavailable(RuntimeError):
+    """The installed validation core lacks the externally rooted contract."""
+
+
+def _require_frozen_repository_protocol(tokenizer) -> None:
+    if (
+        getattr(tokenizer, "VOCAB_SIZE", None) != 50304
+        or tuple(getattr(tokenizer, "SLOTS", ())) != _FROZEN_SLOT_TOKENS
+        or getattr(tokenizer, "RELATIONS", None) != _FROZEN_RELATION_TOKENS
+        or getattr(tokenizer, "graph_special_tokens", None)
+        != _FROZEN_GRAPH_SPECIAL_TOKENS
+        or any(
+            getattr(tokenizer, attribute, None) != token_id
+            for attribute, token_id in _FROZEN_PROTOCOL_ATTRIBUTES.items()
+        )
+    ):
+        raise ValidationInterfaceUnavailable(
+            "repository tokenizer graph action protocol and relation "
+            "vocabulary are not globally frozen"
+        )
 
 
 @dataclass(frozen=True)
@@ -152,6 +197,7 @@ class RunBinding:
 
 @dataclass(frozen=True)
 class _StudyLockView:
+    typed: Any
     raw: Mapping[str, Any]
     release: Mapping[str, Any]
     approvals: tuple[Mapping[str, Any], ...]
@@ -168,6 +214,7 @@ class _CheckpointView:
 
 @dataclass(frozen=True)
 class _PreparedEvaluation:
+    run: Path
     release: Path
     lock: _StudyLockView
     binding: RunBinding
@@ -175,6 +222,8 @@ class _PreparedEvaluation:
     selected_ids: tuple[str, ...]
     items_content: bytes
     items: Mapping[str, ItemRecord]
+    stores_content: bytes
+    stores: Mapping[str, StoreRecord]
 
 
 @dataclass(frozen=True)
@@ -188,8 +237,9 @@ class Submission:
     def __post_init__(self) -> None:
         if not isinstance(self.item_id, str) or not self.item_id:
             raise ValueError("submission item_id must be a non-empty string")
-        if not isinstance(self.answer, str):
-            raise ValueError("submission answer must be a string")
+        if not isinstance(self.answer, str) or not self.answer.strip():
+            raise ValueError("submission answer must be a non-empty string")
+        object.__setattr__(self, "answer", self.answer.strip())
         object.__setattr__(self, "actions", validate_action_slots(self.actions))
 
     @property
@@ -200,7 +250,11 @@ class Submission:
 class ModelAdapter(Protocol):
     """Injected model boundary; sealed records never cross this interface."""
 
-    def generate(self, item: ItemRecord) -> Submission: ...
+    def generate(
+        self,
+        item: ItemRecord,
+        store: StoreRecord | None,
+    ) -> Submission: ...
 
 
 class DeterministicFixtureAdapter:
@@ -227,7 +281,12 @@ class DeterministicFixtureAdapter:
             copied[item_id] = submission
         self._submissions = MappingProxyType(copied)
 
-    def generate(self, item: ItemRecord) -> Submission:
+    def generate(
+        self,
+        item: ItemRecord,
+        store: StoreRecord | None,
+    ) -> Submission:
+        del store
         item_id = getattr(item, "item_id", None)
         if not isinstance(item_id, str) or not item_id:
             raise ValueError("model-visible item has no item_id")
@@ -235,6 +294,445 @@ class DeterministicFixtureAdapter:
             return self._submissions[item_id]
         except KeyError as exc:
             raise ValueError(f"fixture adapter missing item: {item_id}") from exc
+
+
+class RepositoryGPTAdapter:
+    """Checkpoint-backed adapter for the repository's frozen graph protocol."""
+
+    _MAX_ANSWER_TOKENS = 128
+
+    def __init__(self, model, tokenizer, device) -> None:
+        import torch
+
+        _require_frozen_repository_protocol(tokenizer)
+        if model.cfg.vocab_size != 50304:
+            raise ValueError(
+                "repository model/tokenizer vocabulary architecture mismatch"
+            )
+        self.model = model
+        self.tokenizer = tokenizer
+        self.device = torch.device(device)
+        self._torch = torch
+        terminators = {50256, tokenizer.GRAPH_START, tokenizer.EOT}
+        self._answer_token_ids = torch.tensor(
+            [
+                *(token_id for token_id in range(50296) if token_id not in terminators),
+                50256,
+                tokenizer.GRAPH_START,
+                tokenizer.EOT,
+            ],
+            dtype=torch.long,
+            device=self.device,
+        )
+
+    @staticmethod
+    def _model_config(config: Mapping[str, Any]):
+        from train.model import GPTConfig, PRESETS
+
+        model_value = config.get("model")
+        if isinstance(model_value, str):
+            try:
+                model_config = replace(PRESETS[model_value])
+            except KeyError as exc:
+                raise ValueError(
+                    f"unknown repository model architecture: {model_value}"
+                ) from exc
+        elif isinstance(model_value, Mapping):
+            try:
+                model_config = GPTConfig(**dict(model_value))
+            except (AssertionError, TypeError, ValueError) as exc:
+                raise ValueError("repository model architecture is invalid") from exc
+        else:
+            raise ValueError("repository model architecture must be a preset or object")
+        if "ctx" in config:
+            ctx = config["ctx"]
+            if isinstance(ctx, bool) or not isinstance(ctx, int) or ctx <= 0:
+                raise ValueError("repository model context must be a positive integer")
+            model_config = replace(model_config, ctx=ctx)
+        try:
+            _ = model_config.head_dim
+        except AssertionError as exc:
+            raise ValueError(
+                "repository model architecture head size mismatch"
+            ) from exc
+        if (
+            model_config.n_layer < 0
+            or model_config.n_head <= 0
+            or model_config.d_model <= 0
+            or model_config.ctx <= 0
+        ):
+            raise ValueError("repository model architecture values are invalid")
+        return model_config
+
+    @staticmethod
+    def _device(requested: str):
+        import torch
+
+        if requested not in {"cpu", "cuda", "mps"}:
+            raise ValueError("device must be cpu, cuda, or mps")
+        if requested == "cuda" and not torch.cuda.is_available():
+            raise RuntimeError("requested CUDA device is unavailable")
+        if requested == "mps" and not torch.backends.mps.is_available():
+            raise RuntimeError("requested MPS device is unavailable")
+        return torch.device(requested)
+
+    @classmethod
+    def from_bound_run(
+        cls,
+        run: str | Path,
+        binding: RunBinding,
+        device: str,
+    ) -> "RepositoryGPTAdapter":
+        """Load only hash-bound config/checkpoint bytes into the repository GPT."""
+
+        import torch
+        from train.model import GPT, GPTConfig
+        from train.tokenizer import get_tok
+
+        if not isinstance(binding, RunBinding):
+            raise TypeError("repository adapter requires a validated RunBinding")
+        run_root = _directory(run, "run")
+        config_path = _relative_file(
+            run_root,
+            binding.configuration_path,
+            "configuration_path",
+        )
+        checkpoint_path = _relative_file(
+            run_root,
+            binding.checkpoint_path,
+            "checkpoint_path",
+        )
+        config_content = _read_regular_file(config_path, "configuration")
+        checkpoint_content = _read_regular_file(checkpoint_path, "checkpoint")
+        if hashlib.sha256(config_content).hexdigest() != binding.configuration_sha256:
+            raise ValueError("configuration hash mismatch while loading model")
+        if hashlib.sha256(checkpoint_content).hexdigest() != binding.checkpoint_sha256:
+            raise ValueError("checkpoint hash mismatch while loading model")
+        config = _parse_config(config_content)
+        if _integer(config.get("seed"), "configuration seed") != binding.seed:
+            raise ValueError("configuration seed does not match bound run")
+        if (
+            _condition(config.get("condition"), "configuration condition")
+            != binding.condition_id
+        ):
+            raise ValueError("configuration condition does not match bound run")
+        expected_config = cls._model_config(config)
+
+        try:
+            state = torch.load(
+                io.BytesIO(checkpoint_content),
+                map_location="cpu",
+                weights_only=True,
+            )
+        except Exception as exc:
+            raise ValueError("checkpoint state could not be safely loaded") from exc
+        if not isinstance(state, Mapping):
+            raise ValueError("checkpoint state must be an object")
+        state_dict = state.get("model")
+        if not isinstance(state_dict, Mapping) or not state_dict:
+            raise ValueError("checkpoint model state is missing")
+
+        checkpoint_architectures = []
+        checkpoint_config = state.get("cfg")
+        if checkpoint_config is not None:
+            if not isinstance(checkpoint_config, Mapping):
+                raise ValueError("checkpoint config state must be an object")
+            if (
+                _integer(checkpoint_config.get("seed"), "checkpoint config seed")
+                != binding.seed
+            ):
+                raise ValueError("checkpoint config seed mismatch")
+            if (
+                _condition(
+                    checkpoint_config.get("condition"),
+                    "checkpoint config condition",
+                )
+                != binding.condition_id
+            ):
+                raise ValueError("checkpoint config condition mismatch")
+            checkpoint_architectures.append(cls._model_config(checkpoint_config))
+        raw_model_config = state.get("model_cfg")
+        if raw_model_config is not None:
+            if not isinstance(raw_model_config, Mapping):
+                raise ValueError("checkpoint model_cfg state must be an object")
+            try:
+                checkpoint_architectures.append(GPTConfig(**dict(raw_model_config)))
+            except (AssertionError, TypeError, ValueError) as exc:
+                raise ValueError(
+                    "checkpoint model_cfg architecture is invalid"
+                ) from exc
+        if not checkpoint_architectures:
+            raise ValueError("checkpoint lacks bound architecture metadata")
+        expected_architecture = asdict(expected_config)
+        if any(
+            asdict(checkpoint_architecture) != expected_architecture
+            for checkpoint_architecture in checkpoint_architectures
+        ):
+            raise ValueError("checkpoint/config architecture mismatch")
+
+        try:
+            model = GPT(expected_config)
+            model.load_state_dict(dict(state_dict), strict=True)
+        except (AssertionError, RuntimeError, TypeError, ValueError) as exc:
+            raise ValueError("checkpoint model state mismatch") from exc
+        resolved_device = cls._device(device)
+        try:
+            model.to(resolved_device).eval()
+        except (RuntimeError, TypeError, ValueError) as exc:
+            raise RuntimeError(
+                "checkpoint could not be loaded on selected device"
+            ) from exc
+        return cls(model, get_tok(), resolved_device)
+
+    def _step(self, token_id: int, cache):
+        if not 0 <= token_id < self.model.cfg.vocab_size:
+            raise ValueError("generated token is outside the frozen vocabulary")
+        if cache is not None and getattr(cache, "pos", 0) >= self.model.cfg.ctx:
+            raise ValueError("model interaction exceeds bound context")
+        value = self._torch.tensor(
+            [[token_id]],
+            dtype=self._torch.long,
+            device=self.device,
+        )
+        try:
+            logits, cache = self.model.forward_step(value, cache)
+        except (AssertionError, RuntimeError) as exc:
+            raise ValueError("model interaction exceeds bound architecture") from exc
+        return logits[0, -1], cache
+
+    def _force(self, token_ids, cache):
+        logits = None
+        for token_id in token_ids:
+            logits, cache = self._step(int(token_id), cache)
+        if logits is None:
+            raise ValueError("cannot force an empty protocol sequence")
+        return logits, cache
+
+    def _choose(self, logits, allowed) -> int:
+        choices = tuple(int(token_id) for token_id in allowed)
+        if not choices:
+            raise ValueError("frozen token class is empty")
+        index = self._torch.tensor(
+            choices,
+            dtype=self._torch.long,
+            device=self.device,
+        )
+        return choices[int(logits.index_select(0, index).argmax())]
+
+    def _generate_action(self, logits, cache, *, start_ready: bool, reads: int):
+        tok = self.tokenizer
+        if not start_ready:
+            logits, cache = self._step(tok.GRAPH_START, cache)
+        source_token = self._choose(logits, tok.SLOTS)
+        logits, cache = self._step(source_token, cache)
+        relation_token = self._choose(logits, tok.RELATIONS.values())
+        logits, cache = self._step(relation_token, cache)
+        direction_token = self._choose(logits, (tok.DIR_OUT, tok.DIR_IN))
+        logits, cache = self._step(direction_token, cache)
+        operations = (
+            (tok.GRAPH_HALT, tok.GRAPH_NOOP)
+            if reads >= 10
+            else (tok.GRAPH_READ, tok.GRAPH_NOOP, tok.GRAPH_HALT)
+        )
+        operation_token = self._choose(logits, operations)
+        logits, cache = self._step(operation_token, cache)
+        end_token = self._choose(logits, (tok.GRAPH_END,))
+        logits, cache = self._step(end_token, cache)
+
+        source_slot = tok.SLOTS.index(source_token)
+        relation_id = next(
+            relation
+            for relation, token_id in tok.RELATIONS.items()
+            if token_id == relation_token
+        )
+        direction = "out" if direction_token == tok.DIR_OUT else "in"
+        if operation_token == tok.GRAPH_READ:
+            action = ActionSlot(source_slot, relation_id, direction, ActionOp.READ)
+        elif operation_token == tok.GRAPH_HALT:
+            action = ActionSlot(None, None, None, ActionOp.HALT)
+        else:
+            action = ActionSlot(None, None, None, ActionOp.NOOP)
+        return action, source_slot, relation_id, direction, logits, cache
+
+    def _force_noop(self, logits, cache, *, start_ready: bool):
+        del logits
+        tok = self.tokenizer
+        token_ids = [
+            tok.GRAPH_START,
+            tok.SLOTS[0],
+            tok.RELATIONS["r0"],
+            tok.DIR_OUT,
+            tok.GRAPH_NOOP,
+            tok.GRAPH_END,
+        ]
+        if start_ready:
+            token_ids = token_ids[1:]
+        return self._force(token_ids, cache)
+
+    def _return_tokens(
+        self,
+        item: ItemRecord,
+        store: StoreRecord | None,
+        slots: list[str | None],
+        action: ActionSlot,
+    ) -> list[int]:
+        from corpusgen.graph_records import GraphRow
+        from corpusgen.graph_trace import serialize_return
+
+        returned = None
+        fact_id = None
+        if action.op is ActionOp.READ:
+            source_slot = action.source_slot
+            if source_slot is None:
+                raise AssertionError("validated read lacks source slot")
+            source_id = slots[source_slot]
+            row = (
+                None
+                if source_id is None or store is None
+                else store.lookup(
+                    source_id,
+                    str(action.relation_id),
+                    str(action.direction),
+                )
+            )
+            if row is not None:
+                returned = GraphRow(
+                    source_id=row.source_id,
+                    relation_id=row.relation_id,
+                    direction=row.direction,
+                    target_kind=row.target_kind,
+                    target=row.target,
+                    qualifiers=tuple(sorted(row.qualifiers.items())),
+                    provenance_id=store.store_id,
+                )
+                fact_id = (
+                    f"{item.world_id}:{source_id}:"
+                    f"{action.relation_id}:{action.direction}"
+                )
+                if row.target_kind == "entity":
+                    slots[source_slot] = row.target
+        segments = serialize_return(returned, fact_id)
+        token_ids, _, _ = self.tokenizer.encode_tagged_segments(segments)
+        if not token_ids:
+            raise ValueError("repository return protocol encoded no tokens")
+        return token_ids
+
+    def _decode_answer(self, logits, cache, *, final: bool):
+        tok = self.tokenizer
+        answer_tokens: list[int] = []
+        terminators = {50256, tok.GRAPH_START, tok.EOT}
+        for _ in range(self._MAX_ANSWER_TOKENS):
+            selected_logits = logits.index_select(0, self._answer_token_ids)
+            token_id = int(self._answer_token_ids[int(selected_logits.argmax())].item())
+            logits, cache = self._step(token_id, cache)
+            if token_id in terminators:
+                if not answer_tokens:
+                    raise ValueError("model produced an empty answer")
+                if not final and token_id != tok.GRAPH_START:
+                    raise ValueError(
+                        "model ended before completing twelve action slots"
+                    )
+                answer = tok.decode(answer_tokens).strip()
+                if not answer:
+                    raise ValueError("model answer decodes to empty text")
+                return answer, logits, cache, token_id == tok.GRAPH_START
+            answer_tokens.append(token_id)
+        raise ValueError("model answer exceeded the frozen token budget")
+
+    def generate(
+        self,
+        item: ItemRecord,
+        store: StoreRecord | None,
+    ) -> Submission:
+        if not isinstance(item, ItemRecord):
+            raise TypeError("repository adapter requires a validated ItemRecord")
+        if item.memory_mode is MemoryMode.MEMORY_OFF:
+            if store is not None:
+                raise ValueError("memory_off adapter boundary must receive no store")
+        elif not isinstance(store, StoreRecord):
+            raise TypeError(
+                "memory_on adapter boundary requires a validated StoreRecord"
+            )
+        if store is not None and (
+            store.store_id != item.store_id or store.world_id != item.world_id
+        ):
+            raise ValueError("model-visible item/store identity mismatch")
+        if store is not None and any(
+            row.relation_id not in self.tokenizer.RELATIONS for row in store.rows
+        ):
+            raise ValueError("store uses an unsupported frozen relation vocabulary")
+
+        prompt_ids = self.tokenizer.encode(item.prompt)
+        if not prompt_ids:
+            raise ValueError("model-visible prompt encodes to no tokens")
+        if len(prompt_ids) >= self.model.cfg.ctx:
+            raise ValueError("model-visible prompt exceeds bound context")
+        prompt = self._torch.tensor(
+            [prompt_ids],
+            dtype=self._torch.long,
+            device=self.device,
+        )
+        try:
+            with self._torch.no_grad():
+                raw_logits, cache = self.model.forward_step(prompt, None)
+        except (AssertionError, RuntimeError) as exc:
+            raise ValueError("model-visible prompt exceeds bound architecture") from exc
+        logits = raw_logits[0, -1]
+        slots = list(item.initial_slots)
+        actions = []
+        answers = []
+        reads = 0
+        halted = False
+        start_ready = False
+        with self._torch.no_grad():
+            for slot_index in range(12):
+                if halted:
+                    action = ActionSlot(None, None, None, ActionOp.NOOP)
+                    logits, cache = self._force_noop(
+                        logits,
+                        cache,
+                        start_ready=start_ready,
+                    )
+                else:
+                    (
+                        action,
+                        _source_slot,
+                        _relation_id,
+                        _direction,
+                        logits,
+                        cache,
+                    ) = self._generate_action(
+                        logits,
+                        cache,
+                        start_ready=start_ready,
+                        reads=reads,
+                    )
+                    if action.op is ActionOp.READ:
+                        reads += 1
+                    elif action.op is ActionOp.HALT:
+                        halted = True
+                actions.append(action)
+                logits, cache = self._force(
+                    self._return_tokens(item, store, slots, action),
+                    cache,
+                )
+                logits, cache = self._step(
+                    self.tokenizer.ANSWER_STATE,
+                    cache,
+                )
+                answer, logits, cache, start_ready = self._decode_answer(
+                    logits,
+                    cache,
+                    final=slot_index == 11,
+                )
+                answers.append(answer)
+        if reads > 10:
+            raise AssertionError("repository adapter exceeded read cap")
+        # Slot 11 is the last clean provisional answer before the final record
+        # tail. A solver-valid trace cannot READ after it because slot 12 must
+        # HALT (or is post-HALT padding), so this answer contains every return
+        # without accidentally concatenating the duplicated final-answer tail.
+        return Submission(item.item_id, answers[-2], tuple(actions))
 
 
 def _strict_mapping(
@@ -387,91 +885,37 @@ def _load_run_binding(run: Path) -> RunBinding:
     )
 
 
-def _validate_study_lock_fallback(raw: Mapping[str, Any]) -> None:
-    value = _strict_mapping(raw, _STUDY_LOCK_FIELDS, "study lock")
-    if value["record_type"] != STUDY_LOCK_SCHEMA:
-        raise ValueError("study lock record_type is invalid")
+def _hardened_study_lock_api():
+    try:
+        module = importlib.import_module("evals.confirmatory.study_lock")
+    except ImportError as exc:
+        raise ValidationInterfaceUnavailable(
+            "hardened study-lock validation API unavailable; require "
+            "evals.confirmatory.study_lock.StudyLock from f934124"
+        ) from exc
+    required = (
+        "StudyLock",
+        "ValidityEvidence",
+        "evaluate_readiness",
+        "VALIDITY_EVIDENCE_SCHEMA",
+        "FROZEN_PREREGISTRATION_SHA256",
+        "REQUIRED_CONTROL_IDS",
+        "REQUIRED_RECEIPTS",
+    )
+    if any(not hasattr(module, name) for name in required):
+        raise ValidationInterfaceUnavailable(
+            "hardened study-lock validation API unavailable; require "
+            "StudyLock plus frozen preregistration/control/receipt contracts"
+        )
     if (
-        type(value["schema_version"]) is not int
-        or value["schema_version"] != CONTRACT_VERSION
+        not callable(getattr(module.StudyLock, "from_dict", None))
+        or not callable(getattr(module.ValidityEvidence, "from_dict", None))
+        or not callable(module.evaluate_readiness)
     ):
-        raise ValueError("study lock schema_version is invalid")
-    _sha256(value["preregistration_sha256"], "preregistration_sha256")
-    release = _strict_mapping(value["release"], _RELEASE_FIELDS, "release binding")
-    for field in (
-        "items_sha256",
-        "sealed_gold_sha256",
-        "stores_sha256",
-        "checkpoints_sha256",
-    ):
-        _sha256(release[field], f"release {field}")
-    for field in ("item_ids", "pair_ids", "world_ids"):
-        values = release[field]
-        if (
-            not isinstance(values, list)
-            or any(not isinstance(item, str) or not item for item in values)
-            or len(set(values)) != len(values)
-            or values != sorted(values)
-        ):
-            raise ValueError(f"release {field} is not a unique ordered registry")
-    for registry, count in (
-        ("item_ids", "item_count"),
-        ("pair_ids", "pair_count"),
-        ("world_ids", "world_count"),
-        ("evaluation_cells", "evaluation_cell_count"),
-    ):
-        if type(release[count]) is not int or release[count] != len(release[registry]):
-            raise ValueError(f"release {count} disagrees with {registry}")
-    cells = release["evaluation_cells"]
-    if not isinstance(cells, list):
-        raise ValueError("release evaluation_cells must be ordered")
-    cell_keys = []
-    for cell in cells:
-        typed = _strict_mapping(cell, _EVALUATION_CELL_FIELDS, "evaluation cell")
-        cell_keys.append(
-            (
-                _integer(typed["seed"], "evaluation cell seed"),
-                _condition(typed["condition_id"], "evaluation cell condition_id"),
-                _string(typed["item_id"], "evaluation cell item_id"),
-                _sha256(
-                    typed["checkpoint_sha256"],
-                    "evaluation cell checkpoint_sha256",
-                ),
-            )
+        raise ValidationInterfaceUnavailable(
+            "hardened study-lock/readiness validation API unavailable"
         )
-    if len(set(cell_keys)) != len(cell_keys) or cell_keys != sorted(cell_keys):
-        raise ValueError("release evaluation_cells are duplicated or unordered")
-    approvals = value["checkpoints"]
-    if not isinstance(approvals, list) or not approvals:
-        raise ValueError("study lock requires checkpoint approvals")
-    approval_keys = []
-    for approval in approvals:
-        typed = _strict_mapping(
-            approval,
-            _CHECKPOINT_APPROVAL_FIELDS,
-            "checkpoint approval",
-        )
-        approval_keys.append(
-            (
-                _integer(typed["seed"], "checkpoint approval seed"),
-                _condition(
-                    typed["condition_id"],
-                    "checkpoint approval condition_id",
-                ),
-            )
-        )
-        for field in (
-            "checkpoint_sha256",
-            "configuration_sha256",
-            "route_dose_sha256",
-        ):
-            _sha256(typed[field], f"checkpoint approval {field}")
-    if len(set(approval_keys)) != len(approval_keys) or approval_keys != sorted(
-        approval_keys
-    ):
-        raise ValueError("study lock checkpoint approvals are duplicated or unordered")
-    if not isinstance(value["validity_receipts"], list):
-        raise ValueError("study lock validity_receipts must be ordered")
+    return module
 
 
 def _load_study_lock(
@@ -487,19 +931,31 @@ def _load_study_lock(
     if actual != expected:
         raise ValueError("study lock disagrees with external commitment")
     raw = _canonical_object(content, "study-lock.json")
-    try:
-        from evals.confirmatory.study_lock import StudyLock
-    except ImportError:
-        _validate_study_lock_fallback(raw)
-    else:
-        StudyLock.from_dict(raw)
-    release_binding = _strict_mapping(
-        raw["release"],
-        _RELEASE_FIELDS,
-        "release binding",
+    api = _hardened_study_lock_api()
+    typed = api.StudyLock.from_dict(raw)
+    wrong_lock_sha256 = "0" * 64 if actual != "0" * 64 else "1" * 64
+    readiness_probe = api.ValidityEvidence.from_dict(
+        {
+            "record_type": api.VALIDITY_EVIDENCE_SCHEMA,
+            "schema_version": CONTRACT_VERSION,
+            "study_lock_sha256": wrong_lock_sha256,
+            "preregistration_sha256": typed.preregistration_sha256,
+            "receipts": [],
+        }
     )
-    approvals = raw["checkpoints"]
+    try:
+        api.evaluate_readiness(typed, readiness_probe)
+    except ValueError:
+        pass
+    else:
+        raise ValidationInterfaceUnavailable(
+            "hardened externally rooted readiness validation from f934124 "
+            "is unavailable"
+        )
+    release_binding = typed.release.to_dict()
+    approvals = tuple(approval.to_dict() for approval in typed.checkpoints)
     return _StudyLockView(
+        typed=typed,
         raw=MappingProxyType(dict(raw)),
         release=MappingProxyType(dict(release_binding)),
         approvals=tuple(approvals),
@@ -729,10 +1185,19 @@ def _score_and_summarize(
 ) -> tuple[bytes, bytes]:
     outcome_dicts = []
     scored = []
-    hardened = callable(getattr(metrics, "score_item_outcome", None)) and hasattr(
-        metrics.ItemOutcome,
-        "from_dict",
-    )
+    scored_type = getattr(metrics, "_ScoredItemOutcome", None)
+    from_solver_replay = getattr(scored_type, "_from_solver_replay", None)
+    aggregate = getattr(metrics, "_aggregate_scored_pair_metric", None)
+    if (
+        not callable(getattr(metrics.ItemOutcome, "from_dict", None))
+        or not callable(from_solver_replay)
+        or not callable(aggregate)
+    ):
+        raise ValidationInterfaceUnavailable(
+            "hardened internal metrics replay API unavailable; require f934124 "
+            "_ScoredItemOutcome._from_solver_replay and "
+            "_aggregate_scored_pair_metric"
+        )
     for item_id in sorted(submissions):
         item = items[item_id]
         sealed = gold[item_id]
@@ -754,37 +1219,8 @@ def _score_and_summarize(
             binding=binding,
         )
         outcome_dicts.append(outcome_dict)
-        if hardened:
-            persisted = metrics.ItemOutcome.from_dict(outcome_dict)
-            scored.append(
-                metrics.score_item_outcome(
-                    outcome=persisted,
-                    item=item,
-                    checkpoint=checkpoint.typed,
-                    gold=sealed,
-                    store=store,
-                )
-            )
-        else:
-            scored.append(
-                metrics.ItemOutcome(
-                    item_id=item.item_id,
-                    pair_id=item.pair_id,
-                    twin=item.twin,
-                    stratum=item.stratum,
-                    family=item.family,
-                    seed=binding.seed,
-                    world_id=item.world_id,
-                    checkpoint_sha256=binding.checkpoint_sha256,
-                    arm=checkpoint.typed.arm,
-                    memory_mode=item.memory_mode,
-                    control=item.control,
-                    proof_valid=verification.proof_valid,
-                    answer_valid=verification.answer_valid,
-                    complete=True,
-                    valid=True,
-                )
-            )
+        persisted = metrics.ItemOutcome.from_dict(outcome_dict)
+        scored.append(from_solver_replay(persisted, verification))
 
     grouped: dict[tuple[Any, Any], list[Any]] = defaultdict(list)
     for row in scored:
@@ -793,7 +1229,7 @@ def _score_and_summarize(
     for key in sorted(grouped, key=lambda value: (value[0].value, value[1].value)):
         rows = grouped[key]
         row_items = {row.item_id: items[row.item_id] for row in rows}
-        summary = metrics.balanced_counterfactual_pair_metric(
+        summary = aggregate(
             rows,
             items=row_items,
             checkpoints={
@@ -870,7 +1306,7 @@ def _require_hardened_reporting() -> None:
 
 
 def _publish_file(path: Path, content: bytes) -> None:
-    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0)
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
     descriptor = os.open(path, flags, 0o600)
@@ -887,24 +1323,147 @@ def _publish_file(path: Path, content: bytes) -> None:
         raise
 
 
+def _fsync_directory(path: Path) -> None:
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor = os.open(path, flags)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _atomic_publish_directory(staging: Path, output: Path) -> None:
+    """Atomically rename a directory while refusing every destination collision."""
+
+    libc = ctypes.CDLL(None, use_errno=True)
+    source_bytes = os.fsencode(staging)
+    output_bytes = os.fsencode(output)
+    if sys.platform == "darwin":
+        rename = getattr(libc, "renamex_np", None)
+        if rename is None:
+            raise RuntimeError("atomic no-replace directory publication is unsupported")
+        rename.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint]
+        rename.restype = ctypes.c_int
+        result = rename(source_bytes, output_bytes, 0x00000004)
+    elif sys.platform.startswith("linux"):
+        rename = getattr(libc, "renameat2", None)
+        if rename is None:
+            raise RuntimeError("atomic no-replace directory publication is unsupported")
+        rename.argtypes = [
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_uint,
+        ]
+        rename.restype = ctypes.c_int
+        result = rename(-100, source_bytes, -100, output_bytes, 1)
+    else:
+        raise RuntimeError("atomic no-replace directory publication is unsupported")
+    if result == 0:
+        return
+    error_number = ctypes.get_errno()
+    if error_number in {errno.EEXIST, errno.ENOTEMPTY}:
+        raise FileExistsError(
+            error_number,
+            f"output directory already exists: {output}",
+            str(output),
+        )
+    raise OSError(error_number, os.strerror(error_number), str(output))
+
+
+def _quarantine_or_clean_staging(staging: Path, parent: Path) -> None:
+    if not staging.exists() and not staging.is_symlink():
+        return
+    try:
+        shutil.rmtree(staging)
+        _fsync_directory(parent)
+        return
+    except OSError:
+        pass
+    quarantine = parent / (
+        f".{staging.name.lstrip('.')}.quarantine-{os.getpid()}-{id(staging):x}"
+    )
+    try:
+        _atomic_publish_directory(staging, quarantine)
+        _fsync_directory(parent)
+    except OSError:
+        pass
+
+
 def _publish_evidence(
     output: Path,
     artifacts: Mapping[str, bytes],
     report: Any,
     expected_study_lock_sha256: str,
 ) -> None:
+    if output.name in {"", ".", ".."}:
+        raise ValueError("output must name a directory")
+    parent = output.parent
     try:
-        output.mkdir(mode=0o700)
-    except FileExistsError:
-        raise FileExistsError(f"output directory already exists: {output}") from None
-    for name in _HARDENED_ARTIFACTS:
-        _publish_file(output / name, artifacts[name])
-    reporting.publish_artifact_report(
-        output / "artifact-report.json",
-        report,
-        artifacts,
-        expected_study_lock_sha256=expected_study_lock_sha256,
+        parent_status = parent.lstat()
+    except FileNotFoundError:
+        raise ValueError("output parent directory is missing") from None
+    if stat.S_ISLNK(parent_status.st_mode) or not stat.S_ISDIR(parent_status.st_mode):
+        raise ValueError("output parent must be a regular non-symlink directory")
+    if output.exists() or output.is_symlink():
+        raise FileExistsError(f"output directory already exists: {output}")
+    staging = Path(
+        tempfile.mkdtemp(
+            prefix=f".{output.name}.confirmatory-",
+            dir=parent,
+        )
     )
+    published = False
+    try:
+        for name in _HARDENED_ARTIFACTS:
+            _publish_file(staging / name, artifacts[name])
+        reporting.publish_artifact_report(
+            staging / "artifact-report.json",
+            report,
+            artifacts,
+            expected_study_lock_sha256=expected_study_lock_sha256,
+        )
+        _fsync_directory(staging)
+        _atomic_publish_directory(staging, output)
+        published = True
+        try:
+            _fsync_directory(parent)
+        except OSError:
+            quarantine = parent / (
+                f".{output.name}.confirmatory-quarantine-{os.getpid()}-{id(output):x}"
+            )
+            _atomic_publish_directory(output, quarantine)
+            _fsync_directory(parent)
+            raise
+    finally:
+        if not published:
+            _quarantine_or_clean_staging(staging, parent)
+
+
+def _validate_model_visible_protocol(
+    items: Mapping[str, ItemRecord],
+    stores: Mapping[str, StoreRecord],
+) -> None:
+    from train.tokenizer import get_tok
+
+    tok = get_tok()
+    _require_frozen_repository_protocol(tok)
+    expected_stores = {item.store_id for item in items.values()}
+    if set(stores) != expected_stores:
+        raise ValueError("sealed store registry is not exactly item-bound")
+    for item in items.values():
+        store = stores[item.store_id]
+        if store.world_id != item.world_id:
+            raise ValueError("model-visible item/store world identity mismatch")
+    if any(
+        row.relation_id not in _FROZEN_RELATION_TOKENS
+        for store in stores.values()
+        for row in store.rows
+    ):
+        raise ValueError("store uses an unsupported frozen relation vocabulary")
 
 
 def _prepare_evaluation(
@@ -934,7 +1493,21 @@ def _prepare_evaluation(
     items = {item.item_id: item for item in items_sequence}
     if tuple(items) != selected_ids:
         raise ValueError("model-visible item registry is missing or reordered")
+    stores_content = _read_bound_artifact(
+        release,
+        "stores.jsonl",
+        lock.release["stores_sha256"],
+    )
+    stores_sequence = _canonical_jsonl(
+        stores_content,
+        name="stores.jsonl",
+        parser=StoreRecord.from_dict,
+        identity=lambda record: record.store_id,
+    )
+    stores = {record.store_id: record for record in stores_sequence}
+    _validate_model_visible_protocol(items, stores)
     return _PreparedEvaluation(
+        run=run_root,
         release=release,
         lock=lock,
         binding=binding,
@@ -942,6 +1515,8 @@ def _prepare_evaluation(
         selected_ids=selected_ids,
         items_content=items_content,
         items=MappingProxyType(items),
+        stores_content=stores_content,
+        stores=MappingProxyType(stores),
     )
 
 
@@ -972,17 +1547,15 @@ def evaluate(
     run: str | Path,
     sealed_release: str | Path,
     expected_study_lock_sha256: str,
-    model_adapter: ModelAdapter,
     output_dir: str | Path,
+    model_adapter: ModelAdapter | None = None,
+    device: str = "cpu",
 ) -> EvaluationResult:
     """Evaluate one hash-bound checkpoint without exposing sealed gold."""
 
     output = Path(output_dir)
     if output.exists() or output.is_symlink():
         raise FileExistsError(f"output directory already exists: {output}")
-    if not callable(getattr(model_adapter, "generate", None)):
-        raise TypeError("model_adapter must expose generate(item)")
-
     prepared = _prepare_evaluation(
         run=run,
         sealed_release=sealed_release,
@@ -995,10 +1568,24 @@ def evaluate(
     selected_ids = prepared.selected_ids
     items_content = prepared.items_content
     items = prepared.items
+    stores_content = prepared.stores_content
+    stores = prepared.stores
+    if model_adapter is None:
+        model_adapter = RepositoryGPTAdapter.from_bound_run(
+            prepared.run,
+            binding,
+            device,
+        )
+    if not callable(getattr(model_adapter, "generate", None)):
+        raise TypeError("model_adapter must expose generate(item, store)")
 
     submissions: dict[str, Submission] = {}
     for item_id in selected_ids:
-        submission = model_adapter.generate(items[item_id])
+        item = items[item_id]
+        visible_store = (
+            None if item.memory_mode is MemoryMode.MEMORY_OFF else stores[item.store_id]
+        )
+        submission = model_adapter.generate(item, visible_store)
         if not isinstance(submission, Submission):
             raise ValueError("ModelAdapter.generate must return a Submission")
         if submission.item_id != item_id:
@@ -1025,20 +1612,6 @@ def evaluate(
     gold = {record.item_id: record for record in gold_sequence}
     if tuple(gold) != selected_ids:
         raise ValueError("sealed-gold registry disagrees with model-visible items")
-    stores_content = _read_bound_artifact(
-        release,
-        "stores.jsonl",
-        lock.release["stores_sha256"],
-    )
-    stores_sequence = _canonical_jsonl(
-        stores_content,
-        name="stores.jsonl",
-        parser=StoreRecord.from_dict,
-        identity=lambda record: record.store_id,
-    )
-    stores = {record.store_id: record for record in stores_sequence}
-    if set(stores) != {item.store_id for item in items.values()}:
-        raise ValueError("sealed store registry is not exactly item-bound")
 
     outcomes_content, metrics_content = _score_and_summarize(
         items=items,
@@ -1057,6 +1630,9 @@ def evaluate(
         raise ValueError("validity.json record_type is invalid")
     if validity.get("study_lock_sha256") != lock.sha256:
         raise ValueError("validity evidence is unbound from study lock")
+    readiness_api = _hardened_study_lock_api()
+    typed_validity = readiness_api.ValidityEvidence.from_dict(validity)
+    readiness_api.evaluate_readiness(lock.typed, typed_validity)
     artifacts = MappingProxyType(
         {
             "checkpoints.jsonl": checkpoint.content,
