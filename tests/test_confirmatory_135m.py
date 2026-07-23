@@ -243,7 +243,7 @@ def test_end_to_end_effect_null_and_inconclusive_reports():
     assert effect["decision"]["broader_family_claim"] is True
 
     practical_null = build_confirmatory_report(
-        _observations([0.002] * 10),
+        _observations([0.0] * 10),
         study_lock=lock,
         validity=ValidityGates(),
         n_resamples=500,
