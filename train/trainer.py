@@ -7,8 +7,10 @@ checkpoint/resume, rank-zero snapshots, and optional legacy-mask diagnostics.
 
 from __future__ import annotations
 
+import copy
 import contextlib
 import hashlib
+import io
 import json
 import math
 import os
@@ -26,6 +28,33 @@ from train.data import (
     synchronized_rank_batch_plan,
 )
 from train.model import GPT, GPTConfig, PRESETS
+from train.safeio import (
+    DurableOutput,
+    read_regular_path,
+    require_absent_path,
+)
+
+
+_CHECKPOINT_FIELDS = {
+    "checkpoint_version",
+    "cfg",
+    "config_fingerprint",
+    "data",
+    "data_provenance",
+    "model",
+    "opt",
+    "rng_by_rank",
+    "step",
+    "world_size",
+}
+_RNG_FIELDS = {"cuda", "numpy", "python", "torch"}
+_DATA_STATE_FIELDS = {
+    "cursor",
+    "epoch",
+    "format_version",
+    "global_cursor",
+    "provenance",
+}
 
 
 @dataclass(frozen=True)
@@ -190,6 +219,17 @@ def _jsonable(value):
     return value
 
 
+def _canonical_json_hash(value) -> str:
+    payload = json.dumps(
+        _jsonable(value),
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+        allow_nan=False,
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
 _DATA_LOCATION_KEYS = {
     "out_dir",
     "train_bin",
@@ -226,10 +266,41 @@ def resume_config_fingerprint(cfg: dict, model_cfg: GPTConfig) -> str:
 
 
 class Trainer:
-    def __init__(self, cfg: dict):
+    def __init__(
+        self,
+        cfg: dict,
+        *,
+        resume: str = "none",
+        resume_path: str | Path | None = None,
+        resume_sha256: str | None = None,
+    ):
         if not isinstance(cfg, dict):
             raise ValueError("training config must be a dictionary")
-        self.cfg = dict(cfg)
+        if resume not in {"auto", "none"}:
+            raise ValueError("resume must be 'auto' or 'none'")
+        if resume_path is not None and resume != "auto":
+            raise ValueError("resume_path requires resume='auto'")
+        if resume_path is not None and resume_sha256 is None:
+            raise ValueError("resume_path requires resume_sha256")
+        if resume_path is None and resume_sha256 is not None:
+            raise ValueError("resume_sha256 requires resume_path")
+        self.cfg = copy.deepcopy(cfg)
+        cfg = self.cfg
+        raw_out_dir = cfg.get("out_dir")
+        if not isinstance(raw_out_dir, (str, Path)):
+            raise ValueError("out_dir must be a path string")
+        self.out_dir = Path(raw_out_dir)
+        self.ckpt_path = self.out_dir / "ckpt.pt"
+        self.log_path = self.out_dir / "log.jsonl"
+        self._output: DurableOutput | None = None
+        self._resume_mode = resume
+        self._external_resume = resume_path is not None
+        self._resume_path = (
+            Path(resume_path)
+            if resume_path is not None
+            else (self.ckpt_path if resume == "auto" else None)
+        )
+        self._resume_sha256 = resume_sha256
         seed = cfg.get("seed")
         if isinstance(seed, bool) or not isinstance(seed, int) or seed < 0:
             raise ValueError("seed must be a non-negative integer")
@@ -289,12 +360,20 @@ class Trainer:
         self.local_rank = self.dist.local_rank
         self.is_master = self.dist.is_master
         self.device = self.dist.device
+        if resume == "none" or self._external_resume:
+            self._rank0_action(
+                lambda: require_absent_path(self.out_dir, label="output"),
+                "fresh output admission",
+            )
+        self.config_fingerprint = resume_config_fingerprint(cfg, model_cfg)
+        self._agree_config_fingerprint()
 
         torch.manual_seed(seed)
         if self.device.startswith("cuda"):
             torch.cuda.manual_seed_all(seed)
             torch.backends.cuda.matmul.allow_tf32 = True
             torch.backends.cudnn.allow_tf32 = True
+        self.model_cfg = model_cfg
         self.model = GPT(model_cfg).to(self.device)
         if cfg.get("compile", False) and self.device.startswith("cuda"):
             self.model = torch.compile(self.model)
@@ -346,6 +425,7 @@ class Trainer:
                 seed=seed,
                 mask_path=cfg.get("train_mask"),
                 weights_path=cfg.get("train_weights"),
+                sidecar_name=cfg.get("sidecar_name"),
             )
         else:
             self.data = PackedShards(
@@ -358,7 +438,6 @@ class Trainer:
                 weights_path=cfg.get("train_weights"),
             )
         self.data.validate_update_alignment(tokens_per_step)
-        self.config_fingerprint = resume_config_fingerprint(cfg, model_cfg)
 
         decay, no_decay = [], []
         for _, p in self.model.named_parameters():
@@ -375,31 +454,44 @@ class Trainer:
         )
 
         self.step = 0
-        self.out_dir = Path(cfg["out_dir"])
-
-        def initialize_output() -> None:
-            self.out_dir.mkdir(parents=True, exist_ok=True)
-            (self.out_dir / "snapshots").mkdir(exist_ok=True)
-
-        self._rank0_action(initialize_output, "output initialization")
-        self.ckpt_path = self.out_dir / "ckpt.pt"
-        self.log_path = self.out_dir / "log.jsonl"
         self.snap_every = max(1, int(self.max_steps * cfg.get("snap_frac", 0.10)))
         self.ckpt_seconds = cfg.get("ckpt_minutes", 30) * 60
         self.log_every = cfg.get("log_every", 20)
         self.eval_every = cfg.get("eval_every", 250)
         self._probe = None  # lazy masked-value probe batches
 
-        def write_config() -> None:
+        self._agree_startup_contract()
+        if self._resume_path is not None:
+            self.load_ckpt(
+                self._resume_path,
+                sha256=self._resume_sha256,
+                _default_path=not self._external_resume,
+            )
+
+        def initialize_output() -> None:
             import yaml
 
-            config_path = self.out_dir / "config.yaml"
-            temporary = config_path.with_suffix(".yaml.tmp")
-            with temporary.open("w") as handle:
-                yaml.safe_dump(cfg, handle, sort_keys=False)
-            os.replace(temporary, config_path)
+            if resume == "auto" and not self._external_resume:
+                output = DurableOutput.open_existing(self.out_dir)
+                saved_config = yaml.safe_load(
+                    output.root.read_regular(
+                        "config.yaml",
+                        label="resume config",
+                    ).payload
+                )
+                if saved_config != _jsonable(cfg):
+                    output.close()
+                    raise ValueError("resume config.yaml does not match current config")
+            else:
+                output = DurableOutput.create(self.out_dir)
+                payload = yaml.safe_dump(
+                    _jsonable(cfg),
+                    sort_keys=False,
+                ).encode("utf-8")
+                output.root.write_bytes("config.yaml", payload, replace=False)
+            self._output = output
 
-        self._rank0_action(write_config, "config write")
+        self._rank0_action(initialize_output, "output initialization")
 
     def _barrier(self) -> None:
         if self.dist.process_group_initialized:
@@ -429,14 +521,47 @@ class Trainer:
             try:
                 action()
             except BaseException as caught:
-                error = f"{type(caught).__name__}: {caught}"
+                error = {
+                    "type": type(caught).__name__,
+                    "message": str(caught),
+                }
         if self.dist.process_group_initialized:
             payload = [error]
             torch.distributed.broadcast_object_list(payload, src=0)
             error = payload[0]
         if error is not None:
-            raise RuntimeError(f"rank-0 {description} failed: {error}")
+            exception_type = {
+                "FileExistsError": FileExistsError,
+                "FileNotFoundError": FileNotFoundError,
+                "ValueError": ValueError,
+            }.get(error["type"], RuntimeError)
+            raise exception_type(
+                f"rank-0 {description} failed: "
+                f"{error['type']}: {error['message']}"
+            )
         self._barrier()
+
+    def _agree_config_fingerprint(self) -> None:
+        if not self.dist.process_group_initialized:
+            return
+        gathered: list[str | None] = [None] * self.world_size
+        torch.distributed.all_gather_object(gathered, self.config_fingerprint)
+        if any(item != gathered[0] for item in gathered[1:]):
+            raise RuntimeError("ranks disagree on training config")
+
+    def _agree_startup_contract(self) -> None:
+        local = {
+            "config_fingerprint": self.config_fingerprint,
+            "data_provenance_sha256": _canonical_json_hash(self.data.provenance),
+        }
+        if not self.dist.process_group_initialized:
+            return
+        gathered: list[dict | None] = [None] * self.world_size
+        torch.distributed.all_gather_object(gathered, local)
+        if any(item != gathered[0] for item in gathered[1:]):
+            raise RuntimeError(
+                "ranks disagree on training config or data provenance"
+            )
 
     def _raw_model(self):
         model = self.model
@@ -479,15 +604,262 @@ class Trainer:
         return result
 
     def close(self) -> None:
+        output = getattr(self, "_output", None)
+        if output is not None:
+            output.close()
+            self._output = None
+        if hasattr(self, "data"):
+            self.data.close()
+        dist = getattr(self, "dist", None)
         if (
-            self.dist.owns_process_group
+            dist is not None
+            and dist.owns_process_group
             and torch.distributed.is_available()
             and torch.distributed.is_initialized()
         ):
-            torch.distributed.barrier()
             torch.distributed.destroy_process_group()
 
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except BaseException:
+            pass
+
     # --- checkpointing -----------------------------------------------------
+
+    def _validate_model_state(self, state: object) -> None:
+        if not isinstance(state, dict):
+            raise ValueError("checkpoint model state must be a mapping")
+        current = self._raw_model().state_dict()
+        if tuple(state) != tuple(current):
+            raise ValueError("checkpoint model fields do not match the model")
+        for name, expected in current.items():
+            actual = state[name]
+            if (
+                not isinstance(actual, torch.Tensor)
+                or actual.shape != expected.shape
+                or actual.dtype != expected.dtype
+            ):
+                raise ValueError(f"checkpoint model tensor is incompatible: {name}")
+
+    def _validate_optimizer_state(self, state: object, *, saved_step: int) -> None:
+        if not isinstance(state, dict) or set(state) != {"state", "param_groups"}:
+            raise ValueError("checkpoint optimizer fields do not match AdamW")
+        candidate_groups = state["param_groups"]
+        candidate_state = state["state"]
+        current = self.opt.state_dict()
+        current_groups = current["param_groups"]
+        if (
+            not isinstance(candidate_groups, list)
+            or len(candidate_groups) != len(current_groups)
+            or not isinstance(candidate_state, dict)
+        ):
+            raise ValueError("checkpoint optimizer structure is incompatible")
+
+        parameter_ids = []
+        for candidate, expected in zip(
+            candidate_groups,
+            current_groups,
+            strict=True,
+        ):
+            if (
+                not isinstance(candidate, dict)
+                or set(candidate) != set(expected)
+                or not isinstance(candidate.get("params"), list)
+                or candidate["params"] != expected["params"]
+            ):
+                raise ValueError("checkpoint optimizer parameter groups are incompatible")
+            for key, expected_value in expected.items():
+                if key in {"params", "lr"}:
+                    continue
+                if candidate[key] != expected_value:
+                    raise ValueError(
+                        f"checkpoint optimizer setting is incompatible: {key}"
+                    )
+            learning_rate = candidate["lr"]
+            if (
+                isinstance(learning_rate, bool)
+                or not isinstance(learning_rate, (int, float))
+                or not math.isfinite(learning_rate)
+                or learning_rate < 0
+            ):
+                raise ValueError("checkpoint optimizer learning rate is invalid")
+            parameter_ids.extend(candidate["params"])
+        if (
+            any(type(parameter_id) is not int for parameter_id in parameter_ids)
+            or len(parameter_ids) != len(set(parameter_ids))
+        ):
+            raise ValueError("checkpoint optimizer parameter identifiers are invalid")
+        if saved_step == 0:
+            if candidate_state:
+                raise ValueError("step-zero checkpoint optimizer state must be empty")
+            return
+        if (
+            any(type(parameter_id) is not int for parameter_id in candidate_state)
+            or set(candidate_state) != set(parameter_ids)
+        ):
+            raise ValueError("checkpoint optimizer state does not bind every parameter")
+
+        parameters = [
+            parameter
+            for group in self.opt.param_groups
+            for parameter in group["params"]
+        ]
+        if len(parameters) != len(parameter_ids):
+            raise ValueError("checkpoint optimizer parameter count is incompatible")
+        parameter_by_id = dict(zip(parameter_ids, parameters, strict=True))
+        for parameter_id, record in candidate_state.items():
+            if (
+                not isinstance(record, dict)
+                or set(record) != {"step", "exp_avg", "exp_avg_sq"}
+            ):
+                raise ValueError("checkpoint AdamW state fields are incompatible")
+            parameter = parameter_by_id[parameter_id]
+            for field_name in ("exp_avg", "exp_avg_sq"):
+                value = record[field_name]
+                if (
+                    not isinstance(value, torch.Tensor)
+                    or value.shape != parameter.shape
+                    or value.dtype != parameter.dtype
+                ):
+                    raise ValueError(
+                        f"checkpoint AdamW tensor is incompatible: {field_name}"
+                    )
+            step_value = record["step"]
+            if (
+                not isinstance(step_value, torch.Tensor)
+                or step_value.ndim != 0
+                or step_value.dtype != torch.float32
+                or not torch.isfinite(step_value).item()
+                or step_value.item() < 0
+            ):
+                raise ValueError("checkpoint AdamW step is invalid")
+
+    def _validate_rng_record(self, record: object, *, rank: int) -> None:
+        if type(record) is not dict or set(record) != _RNG_FIELDS:
+            raise ValueError(f"checkpoint RNG fields are invalid for rank {rank}")
+        if type(record["python"]) is not tuple:
+            raise ValueError(
+                f"checkpoint Python RNG state is invalid for rank {rank}"
+            )
+        try:
+            random.Random().setstate(record["python"])
+        except (TypeError, ValueError) as error:
+            raise ValueError(
+                f"checkpoint Python RNG state is invalid for rank {rank}"
+            ) from error
+        numpy_state = record["numpy"]
+        if (
+            type(numpy_state) is not tuple
+            or len(numpy_state) != 5
+            or type(numpy_state[0]) is not str
+            or type(numpy_state[1]) is not np.ndarray
+            or numpy_state[1].dtype != np.uint32
+            or type(numpy_state[2]) is not int
+            or type(numpy_state[3]) is not int
+            or not isinstance(numpy_state[4], float)
+        ):
+            raise ValueError(f"checkpoint NumPy RNG state is invalid for rank {rank}")
+        try:
+            np.random.RandomState().set_state(numpy_state)
+        except (TypeError, ValueError) as error:
+            raise ValueError(
+                f"checkpoint NumPy RNG state is invalid for rank {rank}"
+            ) from error
+        torch_state = record["torch"]
+        if (
+            not isinstance(torch_state, torch.Tensor)
+            or torch_state.dtype != torch.uint8
+            or torch_state.ndim != 1
+            or torch_state.numel() != torch.get_rng_state().numel()
+        ):
+            raise ValueError(f"checkpoint torch RNG state is invalid for rank {rank}")
+        cuda_state = record["cuda"]
+        if self.device.startswith("cuda"):
+            expected_cuda_items = torch.cuda.get_rng_state(self.local_rank).numel()
+            if (
+                not isinstance(cuda_state, torch.Tensor)
+                or cuda_state.dtype != torch.uint8
+                or cuda_state.ndim != 1
+                or cuda_state.numel() != expected_cuda_items
+            ):
+                raise ValueError(
+                    f"checkpoint CUDA RNG state is invalid for rank {rank}"
+                )
+        elif cuda_state is not None:
+            raise ValueError(
+                f"CPU checkpoint CUDA RNG state must be null for rank {rank}"
+            )
+
+    def _validate_checkpoint_state(self, state: object) -> dict:
+        if type(state) is not dict or set(state) != _CHECKPOINT_FIELDS:
+            raise ValueError("checkpoint top-level fields do not match the contract")
+        version = state["checkpoint_version"]
+        if type(version) is not int or version != 3:
+            raise ValueError("checkpoint version is incompatible")
+        saved_world_size = state["world_size"]
+        if type(saved_world_size) is not int or saved_world_size != self.world_size:
+            raise ValueError(
+                "checkpoint world size does not match current world size"
+            )
+        saved_step = state["step"]
+        if type(saved_step) is not int or not 0 <= saved_step <= self.max_steps:
+            raise ValueError("checkpoint step is invalid for current config")
+        saved_cfg = state["cfg"]
+        if type(saved_cfg) is not dict or set(saved_cfg) != set(self.cfg):
+            raise ValueError("checkpoint config fields do not match current config")
+        for key in set(self.cfg) - _DATA_LOCATION_KEYS:
+            if _jsonable(saved_cfg[key]) != _jsonable(self.cfg[key]):
+                raise ValueError(
+                    f"checkpoint training config does not match current config: {key}"
+                )
+        fingerprint = state["config_fingerprint"]
+        if (
+            not isinstance(fingerprint, str)
+            or len(fingerprint) != 64
+            or fingerprint != self.config_fingerprint
+            or resume_config_fingerprint(saved_cfg, self.model_cfg) != fingerprint
+        ):
+            raise ValueError(
+                "checkpoint training config does not match current config"
+            )
+        provenance = state["data_provenance"]
+        if (
+            type(provenance) is not dict
+            or provenance != self.data.provenance
+        ):
+            raise ValueError(
+                "checkpoint data provenance does not match current dataset"
+            )
+        if not isinstance(state["data"], dict) or set(state["data"]) != _DATA_STATE_FIELDS:
+            raise ValueError("checkpoint data fields do not match the contract")
+        global_cursor = self.data.validate_state_dict(state["data"])
+        if global_cursor != saved_step * self.tokens_per_step:
+            raise ValueError("checkpoint step and global data cursor are inconsistent")
+
+        self._validate_model_state(state["model"])
+        self._validate_optimizer_state(state["opt"], saved_step=saved_step)
+        rng_by_rank = state["rng_by_rank"]
+        if type(rng_by_rank) is not list or len(rng_by_rank) != self.world_size:
+            raise ValueError("checkpoint RNG state does not match current world size")
+        for rank, record in enumerate(rng_by_rank):
+            self._validate_rng_record(record, rank=rank)
+        return state
+
+    def _apply_checkpoint_state(self, state: dict) -> None:
+        self._raw_model().load_state_dict(state["model"], strict=True)
+        self.opt.load_state_dict(state["opt"])
+        self.data.load_state_dict(state["data"])
+        self.step = state["step"]
+        rank_rng = state["rng_by_rank"][self.rank]
+        random.setstate(rank_rng["python"])
+        np.random.set_state(rank_rng["numpy"])
+        torch.set_rng_state(rank_rng["torch"].cpu())
+        if self.device.startswith("cuda"):
+            torch.cuda.set_rng_state(
+                rank_rng["cuda"].cpu(),
+                device=self.local_rank,
+            )
 
     def save_ckpt(self) -> None:
         rng_by_rank = self._rng_states_by_rank()
@@ -496,7 +868,7 @@ class Trainer:
         def write_checkpoint() -> None:
             raw = self._raw_model()
             state = {
-                "checkpoint_version": 2,
+                "checkpoint_version": 3,
                 "model": raw.state_dict(),
                 "opt": self.opt.state_dict(),
                 "data": data_states[0],
@@ -507,73 +879,106 @@ class Trainer:
                 "world_size": self.world_size,
                 "data_provenance": self.data.provenance,
             }
-            tmp = self.ckpt_path.with_suffix(".tmp")
-            torch.save(state, tmp)
-            os.replace(tmp, self.ckpt_path)
+            if self._output is None:
+                raise RuntimeError("durable output directory is not initialized")
+            self._output.root.write_atomic(
+                "ckpt.pt",
+                lambda handle: torch.save(state, handle),
+                replace=True,
+            )
 
         self._rank0_action(write_checkpoint, "checkpoint write")
 
-    def load_ckpt(self, path: str | Path | None = None) -> None:
-        self._barrier()
+    def load_ckpt(
+        self,
+        path: str | Path | None = None,
+        *,
+        sha256: str | None = None,
+        _default_path: bool = False,
+    ) -> None:
         checkpoint_path = Path(path) if path is not None else self.ckpt_path
-        state = torch.load(
-            checkpoint_path,
-            map_location=self.device,
-            weights_only=False,
-        )
-        if state.get("checkpoint_version") != 2:
-            raise ValueError("checkpoint version is incompatible")
-        if state.get("world_size") != self.world_size:
-            raise ValueError(
-                "checkpoint world size does not match current world size"
+        if checkpoint_path != self.ckpt_path and sha256 is None and not _default_path:
+            raise ValueError("external checkpoint load requires resume_sha256")
+
+        state = None
+        local_exception: BaseException | None = None
+        checkpoint_sha256 = None
+        try:
+            pinned = read_regular_path(
+                checkpoint_path,
+                label="resume checkpoint",
+                expected_sha256=sha256,
             )
-        if state.get("config_fingerprint") != self.config_fingerprint:
-            raise ValueError(
-                "checkpoint training config does not match current config"
+            checkpoint_sha256 = pinned.sha256
+            parsed = torch.load(
+                io.BytesIO(pinned.payload),
+                map_location=self.device,
+                weights_only=False,
             )
-        if state.get("data_provenance") != self.data.provenance:
-            raise ValueError(
-                "checkpoint data provenance does not match current dataset"
+            state = self._validate_checkpoint_state(parsed)
+            local_status = {
+                "ok": True,
+                "checkpoint_sha256": checkpoint_sha256,
+                "config_fingerprint": state["config_fingerprint"],
+                "data_provenance_sha256": _canonical_json_hash(
+                    state["data_provenance"]
+                ),
+            }
+        except BaseException as caught:
+            local_exception = caught
+            local_status = {
+                "ok": False,
+                "checkpoint_sha256": checkpoint_sha256,
+                "error_type": type(caught).__name__,
+                "error": str(caught),
+            }
+
+        if self.dist.process_group_initialized:
+            gathered: list[dict | None] = [None] * self.world_size
+            torch.distributed.all_gather_object(gathered, local_status)
+        else:
+            gathered = [local_status]
+        failures = [
+            (rank, status)
+            for rank, status in enumerate(gathered)
+            if status is None or not status.get("ok", False)
+        ]
+        if failures:
+            if not self.dist.process_group_initialized and local_exception is not None:
+                raise local_exception
+            details = "; ".join(
+                (
+                    f"rank {rank}: missing status"
+                    if status is None
+                    else f"rank {rank}: {status['error_type']}: {status['error']}"
+                )
+                for rank, status in failures
             )
-        rng_by_rank = state.get("rng_by_rank")
-        if not isinstance(rng_by_rank, list) or len(rng_by_rank) != self.world_size:
-            raise ValueError("checkpoint RNG state does not match current world size")
-        saved_step = state.get("step")
-        if (
-            isinstance(saved_step, bool)
-            or not isinstance(saved_step, int)
-            or not 0 <= saved_step <= self.max_steps
-        ):
-            raise ValueError("checkpoint step is invalid for current config")
-        raw = self._raw_model()
-        raw.load_state_dict(state["model"])
-        self.opt.load_state_dict(state["opt"])
-        self.data.load_state_dict(state["data"])
-        self.step = saved_step
-        rank_rng = rng_by_rank[self.rank]
-        random.setstate(rank_rng["python"])
-        np.random.set_state(rank_rng["numpy"])
-        torch.set_rng_state(rank_rng["torch"].cpu())
-        if self.device.startswith("cuda") and rank_rng.get("cuda") is not None:
-            torch.cuda.set_rng_state(rank_rng["cuda"], device=self.local_rank)
-        self._barrier()
+            raise RuntimeError(f"coordinated checkpoint load failed: {details}")
+        if any(status != gathered[0] for status in gathered[1:]):
+            raise RuntimeError(
+                "ranks validated different checkpoint, config, or data hashes"
+            )
+        assert state is not None
+        self._apply_checkpoint_state(state)
 
     def save_snapshot(self) -> None:
         def write_snapshot() -> None:
             raw = self._raw_model()
-            path = self.out_dir / "snapshots" / f"step{self.step:07d}.pt"
-            temporary = path.with_suffix(".tmp")
-            torch.save(
-                {
-                    "model": raw.state_dict(),
-                    "step": self.step,
-                    "model_cfg": raw.cfg.__dict__,
-                    "world_size": self.world_size,
-                    "data_provenance": self.data.provenance,
-                },
-                temporary,
+            if self._output is None:
+                raise RuntimeError("durable output directory is not initialized")
+            state = {
+                "model": raw.state_dict(),
+                "step": self.step,
+                "model_cfg": raw.cfg.__dict__,
+                "world_size": self.world_size,
+                "data_provenance": self.data.provenance,
+            }
+            self._output.snapshots.write_atomic(
+                f"step{self.step:07d}.pt",
+                lambda handle: torch.save(state, handle),
+                replace=False,
             )
-            os.replace(temporary, path)
 
         self._rank0_action(write_snapshot, "snapshot write")
 
@@ -720,9 +1125,16 @@ class Trainer:
                     mv = self.loss_masked_values()
                     if mv is not None:
                         row["loss_masked_values"] = round(mv, 4)
+
                 def write_log_row() -> None:
-                    with open(self.log_path, "a") as f:
-                        f.write(json.dumps(row) + "\n")
+                    if self._output is None:
+                        raise RuntimeError(
+                            "durable output directory is not initialized"
+                        )
+                    self._output.root.append_bytes(
+                        "log.jsonl",
+                        (json.dumps(row) + "\n").encode("utf-8"),
+                    )
 
                 self._rank0_action(write_log_row, "log write")
                 t0 = time.time()
@@ -739,21 +1151,25 @@ class Trainer:
         return running if running is not None else float("nan")
 
 
-def train(cfg: dict, resume: str = "none") -> Trainer:
-    if resume not in {"auto", "none"}:
-        raise ValueError("resume must be 'auto' or 'none'")
-    trainer = Trainer(cfg)
-    checkpoint_exists = trainer._broadcast_master_bool(
-        trainer.ckpt_path.exists() if trainer.is_master else False
+def train(
+    cfg: dict,
+    resume: str = "none",
+    *,
+    resume_path: str | Path | None = None,
+    resume_sha256: str | None = None,
+) -> Trainer:
+    trainer = Trainer(
+        cfg,
+        resume=resume,
+        resume_path=resume_path,
+        resume_sha256=resume_sha256,
     )
-    if resume == "none" and checkpoint_exists:
-        trainer.close()
-        raise FileExistsError(
-            "fresh launch refused existing checkpoint; use resume='auto'"
-        )
-    if resume == "auto" and checkpoint_exists:
-        trainer.load_ckpt()
+    if resume == "auto":
         if trainer.is_master:
             print(f"resumed from step {trainer.step}")
-    trainer.train_steps()
+    try:
+        trainer.train_steps()
+    except BaseException:
+        trainer.close()
+        raise
     return trainer

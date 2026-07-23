@@ -15,10 +15,17 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", required=True)
     ap.add_argument("--resume", default="none", choices=["auto", "none"])
+    ap.add_argument("--resume-path")
+    ap.add_argument("--resume-sha256")
     args = ap.parse_args()
     with open(args.config) as f:
         cfg = yaml.safe_load(f)
-    trainer = train(cfg, resume=args.resume)
+    trainer = train(
+        cfg,
+        resume=args.resume,
+        resume_path=args.resume_path,
+        resume_sha256=args.resume_sha256,
+    )
     try:
         if trainer.is_master:
             print(f"done: step={trainer.step} out={trainer.out_dir}")

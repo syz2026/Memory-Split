@@ -1,9 +1,14 @@
+import hashlib
 import json
+import os
+from pathlib import Path
+import stat
 
 import numpy as np
 import pytest
 import torch
 
+import train.safeio as safeio
 from train.model import GPT, GPTConfig
 from train.trainer import Trainer, cosine_lr
 
@@ -42,6 +47,272 @@ def base_cfg(tmp_path, bp, mp):
     }
 
 
+def file_sha256(path):
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def test_fresh_launch_refuses_even_an_empty_existing_output_before_mutation(tmp_path):
+    bp, mp = write_corpus(tmp_path)
+    cfg = base_cfg(tmp_path, bp, mp)
+    output = tmp_path / "out"
+    output.mkdir()
+    marker = output / "owner.txt"
+    marker.write_text("unchanged")
+
+    with pytest.raises(FileExistsError, match="fresh.*output"):
+        Trainer(cfg)
+
+    assert marker.read_text() == "unchanged"
+    assert set(output.iterdir()) == {marker}
+
+
+def test_auto_resume_requires_default_checkpoint_before_output_mutation(tmp_path):
+    bp, mp = write_corpus(tmp_path)
+    cfg = base_cfg(tmp_path, bp, mp)
+    output = tmp_path / "out"
+    output.mkdir()
+    marker = output / "owner.txt"
+    marker.write_text("unchanged")
+
+    with pytest.raises(FileNotFoundError, match="checkpoint"):
+        Trainer(cfg, resume="auto")
+
+    assert marker.read_text() == "unchanged"
+    assert set(output.iterdir()) == {marker}
+
+
+def test_auto_resume_never_starts_fresh_when_output_is_absent(tmp_path):
+    bp, mp = write_corpus(tmp_path)
+    cfg = base_cfg(tmp_path, bp, mp)
+
+    with pytest.raises(FileNotFoundError, match="checkpoint|missing"):
+        Trainer(cfg, resume="auto")
+
+    assert not Path(cfg["out_dir"]).exists()
+
+
+def test_default_auto_resume_loads_existing_checkpoint_without_rewriting_config(
+    tmp_path,
+):
+    bp, mp = write_corpus(tmp_path)
+    cfg = base_cfg(tmp_path, bp, mp)
+    cfg["max_steps"] = 2
+    first = Trainer(cfg)
+    first.train_steps(1)
+    config_before = (first.out_dir / "config.yaml").read_bytes()
+    first.close()
+
+    resumed = Trainer(cfg, resume="auto")
+
+    assert resumed.step == 1
+    assert (resumed.out_dir / "config.yaml").read_bytes() == config_before
+    resumed.close()
+
+
+def test_external_resume_requires_matching_sha_before_creating_output(tmp_path):
+    bp, mp = write_corpus(tmp_path)
+    source_cfg = base_cfg(tmp_path, bp, mp)
+    source_cfg["max_steps"] = 2
+    source = Trainer(source_cfg)
+    source.train_steps(1)
+    checkpoint = source.ckpt_path
+    source.close()
+    resumed_cfg = dict(source_cfg, out_dir=str(tmp_path / "resumed"))
+
+    with pytest.raises(ValueError, match="resume_sha256"):
+        Trainer(
+            resumed_cfg,
+            resume="auto",
+            resume_path=checkpoint,
+        )
+    assert not (tmp_path / "resumed").exists()
+
+    with pytest.raises(ValueError, match="SHA-256"):
+        Trainer(
+            resumed_cfg,
+            resume="auto",
+            resume_path=checkpoint,
+            resume_sha256="0" * 64,
+        )
+    assert not (tmp_path / "resumed").exists()
+
+    resumed = Trainer(
+        resumed_cfg,
+        resume="auto",
+        resume_path=checkpoint,
+        resume_sha256=file_sha256(checkpoint),
+    )
+    assert resumed.step == 1
+    assert resumed.data.global_cursor == source_cfg["tokens_per_step"]
+    resumed.close()
+
+
+def test_external_resume_rejects_symlinked_checkpoint_without_output_mutation(
+    tmp_path,
+):
+    bp, mp = write_corpus(tmp_path)
+    source_cfg = base_cfg(tmp_path, bp, mp)
+    source_cfg["max_steps"] = 1
+    source = Trainer(source_cfg)
+    source.save_ckpt()
+    linked = tmp_path / "linked-checkpoint.pt"
+    linked.symlink_to(source.ckpt_path)
+    resumed_cfg = dict(source_cfg, out_dir=str(tmp_path / "resumed"))
+
+    with pytest.raises(ValueError, match="symlink|unsafe"):
+        Trainer(
+            resumed_cfg,
+            resume="auto",
+            resume_path=linked,
+            resume_sha256=file_sha256(source.ckpt_path),
+        )
+
+    assert not (tmp_path / "resumed").exists()
+    source.close()
+
+
+def test_external_resume_hashes_and_loads_exactly_the_same_descriptor(
+    tmp_path,
+    monkeypatch,
+):
+    bp, mp = write_corpus(tmp_path, n=64)
+    source_cfg = base_cfg(tmp_path, bp, mp)
+    source_cfg.update(
+        {
+            "model": {
+                "n_layer": 1,
+                "n_head": 1,
+                "d_model": 8,
+                "ctx": 4,
+                "vocab_size": 256,
+            },
+            "tokens_per_step": 8,
+            "micro_batch_size": 2,
+            "max_steps": 2,
+        }
+    )
+    source = Trainer(source_cfg)
+    source.train_steps(1)
+    checkpoint = source.ckpt_path
+    expected_sha256 = file_sha256(checkpoint)
+    source.close()
+    replacement = tmp_path / "replacement.pt"
+    replacement.write_bytes(b"not a checkpoint")
+    real_read = safeio._read_and_hash_fd
+    swapped = False
+
+    def replace_during_read(fd):
+        nonlocal swapped
+        if not swapped:
+            os.replace(replacement, checkpoint)
+            swapped = True
+        return real_read(fd)
+
+    monkeypatch.setattr(safeio, "_read_and_hash_fd", replace_during_read)
+    resumed_cfg = dict(source_cfg, out_dir=str(tmp_path / "resumed-pinned"))
+    resumed = Trainer(
+        resumed_cfg,
+        resume="auto",
+        resume_path=checkpoint,
+        resume_sha256=expected_sha256,
+    )
+
+    assert resumed.step == 1
+    assert checkpoint.read_bytes() == b"not a checkpoint"
+    resumed.close()
+
+
+def test_output_rejects_symlinked_parent_component_before_mutation(tmp_path):
+    bp, mp = write_corpus(tmp_path)
+    real_parent = tmp_path / "real"
+    real_parent.mkdir()
+    linked_parent = tmp_path / "linked"
+    linked_parent.symlink_to(real_parent, target_is_directory=True)
+    cfg = base_cfg(tmp_path, bp, mp)
+    cfg["out_dir"] = str(linked_parent / "out")
+
+    with pytest.raises(ValueError, match="symlink|unsafe"):
+        Trainer(cfg)
+
+    assert not (real_parent / "out").exists()
+
+
+def test_durable_config_checkpoint_and_snapshot_fsync_files_and_directories(
+    tmp_path,
+    monkeypatch,
+):
+    bp, mp = write_corpus(tmp_path, n=64)
+    cfg = base_cfg(tmp_path, bp, mp)
+    cfg.update(
+        {
+            "model": {
+                "n_layer": 1,
+                "n_head": 1,
+                "d_model": 8,
+                "ctx": 4,
+                "vocab_size": 256,
+            },
+            "tokens_per_step": 8,
+            "micro_batch_size": 2,
+            "max_steps": 1,
+        }
+    )
+    real_fsync = safeio.os.fsync
+    fsync_kinds = []
+
+    def recording_fsync(fd):
+        fsync_kinds.append(
+            "directory" if stat.S_ISDIR(os.fstat(fd).st_mode) else "file"
+        )
+        return real_fsync(fd)
+
+    monkeypatch.setattr(safeio.os, "fsync", recording_fsync)
+    trainer = Trainer(cfg)
+    trainer.save_snapshot()
+    trainer.save_ckpt()
+
+    assert "file" in fsync_kinds
+    assert "directory" in fsync_kinds
+    assert not list(trainer.out_dir.rglob("*.tmp-*"))
+    trainer.close()
+
+
+def test_checkpoint_and_snapshot_writes_reject_symlink_swaps(tmp_path):
+    bp, mp = write_corpus(tmp_path, n=64)
+    cfg = base_cfg(tmp_path, bp, mp)
+    cfg.update(
+        {
+            "model": {
+                "n_layer": 1,
+                "n_head": 1,
+                "d_model": 8,
+                "ctx": 4,
+                "vocab_size": 256,
+            },
+            "tokens_per_step": 8,
+            "micro_batch_size": 2,
+            "max_steps": 1,
+        }
+    )
+    trainer = Trainer(cfg)
+    checkpoint_target = tmp_path / "checkpoint-target"
+    checkpoint_target.write_bytes(b"unchanged")
+    trainer.ckpt_path.symlink_to(checkpoint_target)
+
+    with pytest.raises(ValueError, match="symlink|unsafe"):
+        trainer.save_ckpt()
+    assert checkpoint_target.read_bytes() == b"unchanged"
+    trainer.ckpt_path.unlink()
+
+    snapshots = trainer.out_dir / "snapshots"
+    moved = trainer.out_dir / "moved-snapshots"
+    snapshots.rename(moved)
+    snapshots.symlink_to(moved, target_is_directory=True)
+    with pytest.raises(ValueError, match="changed|unsafe"):
+        trainer.save_snapshot()
+    trainer.close()
+
+
 def test_loss_decreases_and_logs(tmp_path):
     bp, mp = write_corpus(tmp_path)
     tr = Trainer(base_cfg(tmp_path, bp, mp))
@@ -65,8 +336,12 @@ def test_checkpoint_resume_exact_batches(tmp_path):
     cursor_after_6 = a.data.state_dict()["cursor"]
 
     cfg2 = dict(cfg, out_dir=str(tmp_path / "out2"))
-    b = Trainer(cfg2)
-    b.load_ckpt(a.ckpt_path)
+    b = Trainer(
+        cfg2,
+        resume="auto",
+        resume_path=a.ckpt_path,
+        resume_sha256=file_sha256(a.ckpt_path),
+    )
     assert b.step == 6
     assert b.data.state_dict()["cursor"] == cursor_after_6
     xb, _ = b.data.next_batch()
@@ -85,8 +360,14 @@ def test_checkpoint_rejects_world_size_mismatch(tmp_path):
     mismatched = tmp_path / "world-size-mismatch.pt"
     torch.save(state, mismatched)
 
+    resumed_cfg = dict(cfg, out_dir=str(tmp_path / "world-size-resume"))
     with pytest.raises(ValueError, match="world size"):
-        trainer.load_ckpt(mismatched)
+        Trainer(
+            resumed_cfg,
+            resume="auto",
+            resume_path=mismatched,
+            resume_sha256=file_sha256(mismatched),
+        )
 
 
 def test_checkpoint_rejects_data_provenance_mismatch(tmp_path):
@@ -100,8 +381,14 @@ def test_checkpoint_rejects_data_provenance_mismatch(tmp_path):
     mismatched = tmp_path / "provenance-mismatch.pt"
     torch.save(state, mismatched)
 
+    resumed_cfg = dict(cfg, out_dir=str(tmp_path / "provenance-resume"))
     with pytest.raises(ValueError, match="provenance"):
-        trainer.load_ckpt(mismatched)
+        Trainer(
+            resumed_cfg,
+            resume="auto",
+            resume_path=mismatched,
+            resume_sha256=file_sha256(mismatched),
+        )
 
 
 def test_checkpoint_rejects_training_config_mismatch(tmp_path):
@@ -115,10 +402,13 @@ def test_checkpoint_rejects_training_config_mismatch(tmp_path):
         lr=cfg["lr"] * 2,
         out_dir=str(tmp_path / "changed-out"),
     )
-    changed = Trainer(changed_cfg)
-
     with pytest.raises(ValueError, match="config"):
-        changed.load_ckpt(trainer.ckpt_path)
+        Trainer(
+            changed_cfg,
+            resume="auto",
+            resume_path=trainer.ckpt_path,
+            resume_sha256=file_sha256(trainer.ckpt_path),
+        )
 
 
 def test_checkpoint_rejects_changed_sidecar_content(tmp_path):
@@ -131,16 +421,18 @@ def test_checkpoint_rejects_changed_sidecar_content(tmp_path):
     mask = np.fromfile(mp, dtype=np.uint8)
     mask[0] ^= 1
     mask.tofile(changed_mask)
-    changed = Trainer(
-        dict(
-            cfg,
-            train_mask=str(changed_mask),
-            out_dir=str(tmp_path / "changed-sidecar-out"),
-        )
+    changed_cfg = dict(
+        cfg,
+        train_mask=str(changed_mask),
+        out_dir=str(tmp_path / "changed-sidecar-out"),
     )
-
     with pytest.raises(ValueError, match="provenance"):
-        changed.load_ckpt(trainer.ckpt_path)
+        Trainer(
+            changed_cfg,
+            resume="auto",
+            resume_path=trainer.ckpt_path,
+            resume_sha256=file_sha256(trainer.ckpt_path),
+        )
 
 
 def test_checkpoint_records_rng_state_by_rank(tmp_path):
@@ -159,6 +451,93 @@ def test_checkpoint_records_rng_state_by_rank(tmp_path):
         "cuda",
     }
     assert torch.equal(state["rng_by_rank"][0]["torch"], torch.get_rng_state())
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "top_extra",
+        "version_bool",
+        "world_bool",
+        "step_bool",
+        "cfg_extra",
+        "model_extra",
+        "optimizer_extra",
+        "data_extra",
+        "data_version_bool",
+        "cursor_bool",
+        "epoch_bool",
+        "rng_extra",
+        "cpu_cuda_rng",
+    ],
+)
+def test_checkpoint_schema_is_exact_and_rejects_bool_integers(tmp_path, case):
+    bp, mp = write_corpus(tmp_path, n=64)
+    cfg = base_cfg(tmp_path, bp, mp)
+    cfg.update(
+        {
+            "model": {
+                "n_layer": 1,
+                "n_head": 1,
+                "d_model": 8,
+                "ctx": 4,
+                "vocab_size": 256,
+            },
+            "tokens_per_step": 8,
+            "micro_batch_size": 2,
+            "max_steps": 1,
+        }
+    )
+    trainer = Trainer(cfg)
+    trainer.save_ckpt()
+    state = torch.load(trainer.ckpt_path, weights_only=False)
+    assert state["checkpoint_version"] == 3
+
+    if case == "top_extra":
+        state["unexpected"] = None
+    elif case == "version_bool":
+        state["checkpoint_version"] = True
+    elif case == "world_bool":
+        state["world_size"] = True
+    elif case == "step_bool":
+        state["step"] = False
+    elif case == "cfg_extra":
+        state["cfg"]["unexpected"] = None
+    elif case == "model_extra":
+        state["model"]["unexpected"] = torch.tensor(0)
+    elif case == "optimizer_extra":
+        state["opt"]["unexpected"] = None
+    elif case == "data_extra":
+        state["data"]["unexpected"] = None
+    elif case == "data_version_bool":
+        state["data"]["format_version"] = True
+    elif case == "cursor_bool":
+        state["data"]["cursor"] = False
+    elif case == "epoch_bool":
+        state["data"]["epoch"] = False
+    elif case == "rng_extra":
+        state["rng_by_rank"][0]["unexpected"] = None
+    elif case == "cpu_cuda_rng":
+        state["rng_by_rank"][0]["cuda"] = torch.zeros(8, dtype=torch.uint8)
+    else:
+        raise AssertionError(case)
+
+    malformed = tmp_path / f"{case}.pt"
+    torch.save(state, malformed)
+    model_before = {
+        name: value.detach().clone()
+        for name, value in trainer._raw_model().state_dict().items()
+    }
+    with pytest.raises(ValueError):
+        trainer.load_ckpt(malformed, sha256=file_sha256(malformed))
+
+    assert trainer.step == 0
+    assert trainer.data.global_cursor == 0
+    assert all(
+        torch.equal(value, model_before[name])
+        for name, value in trainer._raw_model().state_dict().items()
+    )
+    trainer.close()
 
 
 @pytest.mark.parametrize(

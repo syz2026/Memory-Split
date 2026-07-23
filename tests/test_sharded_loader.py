@@ -11,6 +11,7 @@ from corpusgen.parallel import (
     ParallelBuildConfig,
     build_parallel_corpus,
     fixture_catalog,
+    render_metadata,
 )
 from train.data import (
     PARALLEL_SIDECAR_V2_CONTRACT,
@@ -33,6 +34,48 @@ def build_aligned_publication(tmp_path, *, record_count=14, update_tokens=32):
         root,
     )
     return root
+
+
+def build_weighted_publication(tmp_path, *, record_count=13, update_tokens=32):
+    root = tmp_path / f"weighted-parallel-{record_count}"
+    catalog = fixture_catalog(record_count=record_count)
+    renderer = FixtureRenderer()
+    logical_tokens = sum(
+        record.token_length for record in render_metadata(catalog, renderer)
+    )
+    dense = np.ones(logical_tokens, dtype=np.uint8)
+    split90 = np.ones(logical_tokens, dtype=np.uint8)
+    split90[::3] = 0
+    values = {
+        "dense_target_weights": dense,
+        "split90_target_weights": split90,
+    }
+    paths = {}
+    for name, weights in values.items():
+        path = tmp_path / f"{name}-{record_count}.bin"
+        weights.tofile(path)
+        paths[name] = path
+    receipt = build_parallel_corpus(
+        catalog,
+        renderer,
+        ParallelBuildConfig(
+            lane_weights=(("natural", 1), ("facts", 1), ("reasoning", 1)),
+            update_tokens=update_tokens,
+            allow_fewer_shards=True,
+        ),
+        root,
+        sidecar_paths=paths,
+    )
+    padded = {
+        name: np.concatenate(
+            (
+                weights,
+                np.zeros(receipt["padding_tokens"], dtype=np.uint8),
+            )
+        )
+        for name, weights in values.items()
+    }
+    return root, receipt, padded
 
 
 def concatenate_shards(publication, destination):
@@ -128,6 +171,77 @@ def test_parallel_loader_rejects_receipt_symlink_swap_after_verification(
         PackedShards.from_parallel_corpus(publication, ctx=4, batch_size=2)
 
 
+def test_v2_loader_selects_ordered_descriptor_pinned_split90_sidecar(tmp_path):
+    publication, receipt, sidecars = build_weighted_publication(tmp_path)
+    loader = PackedShards.from_parallel_corpus(
+        publication,
+        ctx=4,
+        batch_size=2,
+        sidecar_name="split90_target_weights",
+    )
+    crossing = BatchSlice(global_start=28, sequence_count=2, ctx=4)
+
+    _, targets, weights = loader.weighted_batch_from_slice(crossing)
+
+    expected = torch.from_numpy(
+        sidecars["split90_target_weights"][29:37]
+        .reshape(2, 4)
+        .astype(np.float32)
+    )
+    assert receipt["format"] == "memorysplit-parallel-corpus-v2"
+    assert torch.equal(weights, expected)
+    assert targets.numel() == 8
+    assert len(loader.weight_paths) == receipt["shard_count"]
+    assert loader.provenance["sidecar_name"] == "split90_target_weights"
+
+
+@pytest.mark.parametrize("sidecar_name", [None, "unknown_target_weights"])
+def test_v2_loader_requires_one_receipt_bound_sidecar_name(tmp_path, sidecar_name):
+    publication, _, _ = build_weighted_publication(tmp_path)
+
+    with pytest.raises(ValueError, match="sidecar_name"):
+        PackedShards.from_parallel_corpus(
+            publication,
+            ctx=4,
+            batch_size=2,
+            sidecar_name=sidecar_name,
+        )
+
+
+def test_v2_loader_rehashes_pinned_sidecar_after_semantic_verification(
+    tmp_path,
+    monkeypatch,
+):
+    publication, receipt, _ = build_weighted_publication(tmp_path)
+    split90 = next(
+        record
+        for record in receipt["sidecar_sets"]
+        if record["name"] == "split90_target_weights"
+    )
+    relative = split90["artifacts"][0]["path"]
+    original_verify = parallel.verify_parallel_corpus
+
+    def verify_then_replace(root, **kwargs):
+        verified = original_verify(root, **kwargs)
+        artifact = publication / relative
+        replacement = tmp_path / "replacement-sidecar.bin"
+        payload = bytearray(artifact.read_bytes())
+        payload[0] ^= 1
+        replacement.write_bytes(payload)
+        os.replace(replacement, artifact)
+        return verified
+
+    monkeypatch.setattr(parallel, "verify_parallel_corpus", verify_then_replace)
+
+    with pytest.raises(ValueError, match="digest drift"):
+        PackedShards.from_parallel_corpus(
+            publication,
+            ctx=4,
+            batch_size=2,
+            sidecar_name="split90_target_weights",
+        )
+
+
 @pytest.mark.parametrize("sidecar_name", ["mask_path", "weights_path"])
 def test_parallel_v1_rejects_unbound_sidecars(tmp_path, sidecar_name):
     publication = build_aligned_publication(tmp_path)
@@ -155,7 +269,10 @@ def test_future_parallel_sidecar_contract_is_receipt_bound_and_padding_safe():
             "name",
             "stream_sha256",
         ),
-        "defined_names": ("loss_mask", "target_weights"),
+        "defined_names": (
+            "dense_target_weights",
+            "split90_target_weights",
+        ),
         "alignment": {
             "items": "packed_tokens",
             "shard_order": "token_assignments",
@@ -244,6 +361,34 @@ def test_trainer_loads_verified_parallel_publication_without_concatenation(tmp_p
 
     assert trainer.data.provenance["kind"] == "parallel-publication"
     assert len(trainer.data.token_paths) > 1
+
+
+def test_trainer_selects_verified_v2_target_weights_by_sidecar_name(tmp_path):
+    publication, _, _ = build_weighted_publication(tmp_path)
+    cfg = {
+        "model": {
+            "n_layer": 1,
+            "n_head": 1,
+            "d_model": 8,
+            "ctx": 4,
+            "vocab_size": 256,
+        },
+        "train_corpus": str(publication),
+        "sidecar_name": "split90_target_weights",
+        "micro_batch_size": 2,
+        "tokens_per_step": 32,
+        "max_steps": 1,
+        "lr": 1e-3,
+        "seed": 9,
+        "out_dir": str(tmp_path / "weighted-out"),
+        "device": "cpu",
+    }
+
+    trainer = Trainer(cfg)
+
+    assert trainer.data.target_weights is not None
+    assert trainer.data.provenance["sidecar_name"] == "split90_target_weights"
+    trainer.close()
 
 
 def test_trainer_rejects_ambiguous_legacy_and_parallel_sources(tmp_path):

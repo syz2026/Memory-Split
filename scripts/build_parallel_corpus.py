@@ -85,6 +85,8 @@ def _add_packing_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--update-tokens", type=_positive, required=True)
     parser.add_argument("--shards", type=_positive, default=32)
     parser.add_argument("--allow-fewer-shards", action="store_true")
+    parser.add_argument("--dense-target-weights", type=Path)
+    parser.add_argument("--split90-target-weights", type=Path)
     parser.add_argument(
         "--workers",
         type=_positive,
@@ -164,7 +166,8 @@ def _parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
-    args = _parser().parse_args(argv)
+    parser = _parser()
+    args = parser.parse_args(argv)
     if args.command == "verify":
         _print_receipt(
             verify_parallel_corpus(
@@ -249,12 +252,30 @@ def main(argv: list[str] | None = None) -> int:
         lane_weights = _lane_weights(args.lane_weight)
     else:
         raise AssertionError(f"unhandled command: {args.command}")
+    if (args.dense_target_weights is None) != (
+        args.split90_target_weights is None
+    ):
+        parser.error(
+            "--dense-target-weights and --split90-target-weights "
+            "must be supplied together"
+        )
     receipt = build_parallel_corpus(
         catalog,
         renderer,
         _config(args, lane_weights),
         args.output,
         workers=args.workers,
+        sidecar_paths=(
+            {
+                "dense_target_weights": args.dense_target_weights,
+                "split90_target_weights": args.split90_target_weights,
+            }
+            if (
+                args.dense_target_weights is not None
+                and args.split90_target_weights is not None
+            )
+            else None
+        ),
     )
     _print_receipt(receipt)
     return 0

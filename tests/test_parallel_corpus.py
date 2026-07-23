@@ -10,6 +10,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import FrozenInstanceError, replace
 from pathlib import Path
 
+import numpy as np
 import pytest
 
 import corpusgen.parallel as parallel
@@ -919,6 +920,41 @@ def _fixture_build(record_count=12):
     return catalog, renderer, config
 
 
+_TARGET_WEIGHT_NAMES = (
+    "dense_target_weights",
+    "split90_target_weights",
+)
+
+
+def _fixture_target_weight_sources(tmp_path, catalog, renderer):
+    logical_tokens = sum(
+        record.token_length for record in render_metadata(catalog, renderer)
+    )
+    dense = np.ones(logical_tokens, dtype=np.uint8)
+    split90 = np.ones(logical_tokens, dtype=np.uint8)
+    split90[::5] = 0
+    values = {
+        "dense_target_weights": dense,
+        "split90_target_weights": split90,
+    }
+    paths = {}
+    for name, weights in values.items():
+        path = tmp_path / f"{name}.bin"
+        weights.tofile(path)
+        paths[name] = path
+    return paths, values
+
+
+def _sidecar_record(receipt, name):
+    return next(
+        record for record in receipt["sidecar_sets"] if record["name"] == name
+    )
+
+
+def _write_receipt(root, receipt):
+    (root / "receipt.json").write_bytes(canonical_json_bytes(receipt))
+
+
 def _stage_owner_bytes(build_id):
     return canonical_json_bytes(
         {
@@ -1614,6 +1650,121 @@ def test_tiny_publication_is_worker_independent_and_self_verifying(tmp_path):
     assert len(serial["merkle_root_sha256"]) == 64
     assert len(serial["packed_stream_sha256"]) == 64
     assert all(len(artifact["sha256"]) == 64 for artifact in serial["artifacts"])
+
+
+def test_v2_publication_binds_ordered_dense_and_split90_weight_shards(tmp_path):
+    catalog, renderer, config = _fixture_build(record_count=13)
+    sidecar_paths, expected_values = _fixture_target_weight_sources(
+        tmp_path,
+        catalog,
+        renderer,
+    )
+    destination = tmp_path / "weighted-corpus"
+
+    receipt = build_parallel_corpus(
+        catalog,
+        renderer,
+        config,
+        destination,
+        sidecar_paths=sidecar_paths,
+    )
+
+    assert receipt["format"] == "memorysplit-parallel-corpus-v2"
+    assert [record["name"] for record in receipt["sidecar_sets"]] == list(
+        _TARGET_WEIGHT_NAMES
+    )
+    assignments = assignments_from_bytes(
+        (destination / "assignments.jsonl").read_bytes()
+    )
+    expected_padding = bytes(receipt["padding_tokens"])
+    for name in _TARGET_WEIGHT_NAMES:
+        record = _sidecar_record(receipt, name)
+        expected_paths = [
+            f"sidecars/{name}/{assignment.shard_id}.bin"
+            for assignment in assignments
+        ]
+        assert record["dtype"] == "uint8"
+        assert record["items"] == receipt["packed_tokens"]
+        assert [artifact["path"] for artifact in record["artifacts"]] == expected_paths
+        payload = b"".join(
+            (destination / artifact["path"]).read_bytes()
+            for artifact in record["artifacts"]
+        )
+        assert payload == expected_values[name].tobytes() + expected_padding
+        assert hashlib.sha256(payload).hexdigest() == record["stream_sha256"]
+        assert all(
+            artifact["bytes"]
+            == assignment.token_end - assignment.token_start
+            for artifact, assignment in zip(
+                record["artifacts"],
+                assignments,
+                strict=True,
+            )
+        )
+    assert verify_parallel_corpus(destination) == receipt
+
+
+@pytest.mark.parametrize("corruption", ["reordered", "symlinked", "partial"])
+def test_v2_verifier_rejects_reordered_symlinked_or_partial_sidecars(
+    tmp_path,
+    corruption,
+):
+    catalog, renderer, config = _fixture_build(record_count=13)
+    sidecar_paths, _ = _fixture_target_weight_sources(tmp_path, catalog, renderer)
+    destination = tmp_path / f"weighted-{corruption}"
+    receipt = build_parallel_corpus(
+        catalog,
+        renderer,
+        config,
+        destination,
+        sidecar_paths=sidecar_paths,
+    )
+    split90 = _sidecar_record(receipt, "split90_target_weights")
+
+    if corruption == "reordered":
+        split90["artifacts"] = list(reversed(split90["artifacts"]))
+        _write_receipt(destination, receipt)
+    else:
+        shard = destination / split90["artifacts"][0]["path"]
+        if corruption == "symlinked":
+            target = tmp_path / "sidecar-target.bin"
+            shard.replace(target)
+            shard.symlink_to(target)
+        else:
+            shard.unlink()
+
+    with pytest.raises(ValueError, match="order|unsafe|missing|complete"):
+        verify_parallel_corpus(destination)
+
+
+def test_v2_verifier_rejects_hash_consistent_nonzero_split90_padding(tmp_path):
+    catalog, renderer, config = _fixture_build(record_count=13)
+    sidecar_paths, _ = _fixture_target_weight_sources(tmp_path, catalog, renderer)
+    destination = tmp_path / "weighted-padding"
+    receipt = build_parallel_corpus(
+        catalog,
+        renderer,
+        config,
+        destination,
+        sidecar_paths=sidecar_paths,
+    )
+    assert receipt["padding_tokens"] > 0
+    split90 = _sidecar_record(receipt, "split90_target_weights")
+    last_artifact = split90["artifacts"][-1]
+    last_path = destination / last_artifact["path"]
+    payload = bytearray(last_path.read_bytes())
+    payload[-1] = 1
+    last_path.write_bytes(payload)
+    last_artifact["sha256"] = hashlib.sha256(payload).hexdigest()
+    split90_payload = b"".join(
+        (destination / artifact["path"]).read_bytes()
+        for artifact in split90["artifacts"]
+    )
+    split90["stream_sha256"] = hashlib.sha256(split90_payload).hexdigest()
+    _write_receipt(destination, receipt)
+
+    with pytest.raises(ValueError, match="padding"):
+        verify_parallel_corpus(destination)
 
 
 def test_publication_resumes_partial_stage_and_is_idempotent(tmp_path):

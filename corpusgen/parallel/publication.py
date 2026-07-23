@@ -46,7 +46,6 @@ from .safeio import (
     is_owned_temporary,
     list_entries,
     open_directory_at,
-    open_directory_path,
     open_parent_directory,
     open_regular_file_at,
     open_tombstone_directory,
@@ -61,8 +60,13 @@ if TYPE_CHECKING:
     from .tasks import TaskResult
 
 _FORMAT = "memorysplit-parallel-corpus-v1"
+_FORMAT_V2 = "memorysplit-parallel-corpus-v2"
 _COMPILER_VERSION = "metadata-first-foundation-v1"
 _STAGE_OWNER_NAME = ".parallel-owner.json"
+_TARGET_WEIGHT_NAMES = (
+    "dense_target_weights",
+    "split90_target_weights",
+)
 _FOUNDATION_NAMES = {
     "assignments.jsonl",
     "catalog.jsonl",
@@ -90,6 +94,13 @@ _RECEIPT_FIELDS = {
     "shard_count",
 }
 _ARTIFACT_FIELDS = {"bytes", "path", "sha256"}
+_SIDECAR_SET_FIELDS = {
+    "artifacts",
+    "dtype",
+    "items",
+    "name",
+    "stream_sha256",
+}
 
 
 class VerifiedParallelCorpus(dict[str, Any]):
@@ -190,19 +201,135 @@ def parallel_build_id(
     renderer_id: str,
     config: ParallelBuildConfig,
 ) -> str:
+    return _parallel_build_id(
+        catalog,
+        renderer_id,
+        config,
+        publication_format=_FORMAT,
+        sidecar_commitments=(),
+    )
+
+def _parallel_build_id(
+    catalog: InputCatalog,
+    renderer_id: str,
+    config: ParallelBuildConfig,
+    *,
+    publication_format: str,
+    sidecar_commitments: tuple[dict[str, object], ...],
+) -> str:
     if not isinstance(renderer_id, str) or not renderer_id:
         raise ValueError("renderer_id must be non-empty")
+    identity = {
+        "catalog_sha256": catalog.sha256,
+        "compiler_version": _COMPILER_VERSION,
+        "config": config.as_dict(),
+        "format": publication_format,
+        "renderer_id": renderer_id,
+    }
+    if publication_format == _FORMAT_V2:
+        identity["sidecar_sources"] = list(sidecar_commitments)
     return sha256_hex(
-        canonical_json_bytes(
-            {
-                "catalog_sha256": catalog.sha256,
-                "compiler_version": _COMPILER_VERSION,
-                "config": config.as_dict(),
-                "format": _FORMAT,
-                "renderer_id": renderer_id,
-            }
-        )
+        canonical_json_bytes(identity)
     )
+
+@dataclass
+class _PinnedSidecarSource:
+    name: str
+    path: Path
+    descriptor: int
+    items: int
+    sha256: str
+
+    @property
+    def commitment(self) -> dict[str, object]:
+        return {
+            "dtype": "uint8",
+            "items": self.items,
+            "name": self.name,
+            "sha256": self.sha256,
+        }
+
+    def read(self, offset: int, length: int) -> bytes:
+        payload = os.pread(self.descriptor, length, offset)
+        if len(payload) != length:
+            raise ValueError(f"sidecar source changed length while pinned: {self.name}")
+        return payload
+
+    def close(self) -> None:
+        if self.descriptor >= 0:
+            os.close(self.descriptor)
+            self.descriptor = -1
+
+def _open_sidecar_sources(
+    sidecar_paths: dict[str, Path | str] | None,
+) -> tuple[_PinnedSidecarSource, ...]:
+    if sidecar_paths is None:
+        return ()
+    if type(sidecar_paths) is not dict or tuple(sorted(sidecar_paths)) != (
+        _TARGET_WEIGHT_NAMES
+    ):
+        raise ValueError(
+            "sidecar_paths must contain exactly dense_target_weights and "
+            "split90_target_weights"
+        )
+    sources = []
+    try:
+        for name in _TARGET_WEIGHT_NAMES:
+            raw_path = sidecar_paths[name]
+            if not isinstance(raw_path, (str, Path)):
+                raise ValueError(f"sidecar path must be a path string: {name}")
+            path = Path(raw_path)
+            parent_fd, entry_name = open_parent_directory(path)
+            try:
+                descriptor, metadata = open_regular_file_at(parent_fd, entry_name)
+            except (OSError, ValueError) as error:
+                raise ValueError(
+                    f"sidecar source is missing, symlinked, or unsafe: {name}"
+                ) from error
+            finally:
+                os.close(parent_fd)
+            digest = hashlib.sha256()
+            offset = 0
+            dense_all_one = True
+            try:
+                while offset < metadata.st_size:
+                    chunk = os.pread(
+                        descriptor,
+                        min(1 << 20, metadata.st_size - offset),
+                        offset,
+                    )
+                    if not chunk:
+                        raise ValueError(
+                            f"sidecar source changed length while pinned: {name}"
+                        )
+                    if any(value not in (0, 1) for value in chunk):
+                        raise ValueError(
+                            f"sidecar source contains non-binary weights: {name}"
+                        )
+                    dense_all_one &= all(value == 1 for value in chunk)
+                    digest.update(chunk)
+                    offset += len(chunk)
+                if metadata.st_size <= 0:
+                    raise ValueError(f"sidecar source must not be empty: {name}")
+                if name == "dense_target_weights" and not dense_all_one:
+                    raise ValueError("dense_target_weights must be one at every target")
+                sources.append(
+                    _PinnedSidecarSource(
+                        name=name,
+                        path=path,
+                        descriptor=descriptor,
+                        items=metadata.st_size,
+                        sha256=digest.hexdigest(),
+                    )
+                )
+            except BaseException:
+                os.close(descriptor)
+                raise
+        return tuple(sources)
+    except BaseException:
+        for source in sources:
+            source.close()
+        raise
 
 
 def publication_staging_path(
@@ -267,6 +394,123 @@ class _ShardSink:
     def abort(self) -> None:
         self.writer.abort()
 
+
+class _SidecarShardSink:
+    def __init__(
+        self,
+        sidecar_fd: int,
+        assignment: ShardAssignment,
+        *,
+        sidecar_name: str,
+        owner: str,
+        tombstone_fd: RetainedTombstoneStore,
+    ) -> None:
+        self.assignment = assignment
+        self.sidecar_name = sidecar_name
+        self.final_name = f"{assignment.shard_id}.bin"
+        self.writer = AtomicFileWriter(
+            sidecar_fd,
+            self.final_name,
+            owner=owner,
+            tombstone_fd=tombstone_fd,
+        )
+        self.digest = hashlib.sha256()
+        self.byte_count = 0
+
+    def write(self, payload: bytes) -> None:
+        self.writer.write(payload)
+        self.digest.update(payload)
+        self.byte_count += len(payload)
+
+    def finish(self) -> dict[str, object]:
+        expected = self.assignment.token_end - self.assignment.token_start
+        if self.byte_count != expected:
+            self.abort()
+            raise ValueError(
+                f"sidecar shard byte count drift: {self.sidecar_name}/"
+                f"{self.assignment.shard_id}"
+            )
+        digest = self.digest.hexdigest()
+        self.writer.finish(
+            expected_bytes=expected,
+            expected_sha256=digest,
+        )
+        return {
+            "bytes": expected,
+            "path": (
+                f"sidecars/{self.sidecar_name}/{self.final_name}"
+            ),
+            "sha256": digest,
+        }
+
+    def abort(self) -> None:
+        self.writer.abort()
+
+def _pack_sidecar_sets(
+    sources: tuple[_PinnedSidecarSource, ...],
+    assignments: tuple[ShardAssignment, ...],
+    sidecar_fds: dict[str, int],
+    *,
+    logical_tokens: int,
+    packed_tokens: int,
+    owner: str,
+    tombstone_fd: RetainedTombstoneStore,
+) -> list[dict[str, object]]:
+    if not sources:
+        return []
+    for source in sources:
+        if source.items != logical_tokens:
+            raise ValueError(
+                f"sidecar source item count does not match logical tokens: "
+                f"{source.name}"
+            )
+
+    records = []
+    for source in sources:
+        stream_digest = hashlib.sha256()
+        artifacts = []
+        position = 0
+        for assignment in assignments:
+            sink = _SidecarShardSink(
+                sidecar_fds[source.name],
+                assignment,
+                sidecar_name=source.name,
+                owner=owner,
+                tombstone_fd=tombstone_fd,
+            )
+            remaining = assignment.token_end - assignment.token_start
+            try:
+                while remaining:
+                    if position < logical_tokens:
+                        take = min(
+                            remaining,
+                            logical_tokens - position,
+                            1 << 20,
+                        )
+                        chunk = source.read(position, take)
+                    else:
+                        take = min(remaining, 1 << 20)
+                        chunk = bytes(take)
+                    sink.write(chunk)
+                    stream_digest.update(chunk)
+                    position += take
+                    remaining -= take
+                artifacts.append(sink.finish())
+            except BaseException:
+                sink.abort()
+                raise
+        if position != packed_tokens:
+            raise ValueError(f"sidecar packed item count drift: {source.name}")
+        records.append(
+            {
+                "artifacts": artifacts,
+                "dtype": "uint8",
+                "items": packed_tokens,
+                "name": source.name,
+                "stream_sha256": stream_digest.hexdigest(),
+            }
+        )
+    return records
 
 def _rerender_and_pack_pinned(
     catalog: InputCatalog,
@@ -417,11 +661,14 @@ def rerender_and_pack(
         os.close(parent_fd)
 
 
-def _stage_owner_bytes(build_id: str) -> bytes:
+def _stage_owner_bytes(
+    build_id: str,
+    publication_format: str = _FORMAT,
+) -> bytes:
     return canonical_json_bytes(
         {
             "build_id": build_id,
-            "format": _FORMAT,
+            "format": publication_format,
             "kind": "publication-staging",
         }
     )
@@ -436,14 +683,19 @@ def _require_regular_entry(directory_fd: int, name: str, label: str) -> None:
         raise ValueError(f"{label} is unsafe: {name}")
 
 
-def _validate_stage_namespace(stage_fd: int, build_id: str) -> None:
+def _validate_stage_namespace(
+    stage_fd: int,
+    build_id: str,
+    *,
+    sidecar_names: tuple[str, ...] = (),
+) -> None:
     regular_names = {*_FOUNDATION_NAMES, _STAGE_OWNER_NAME, "receipt.json"}
     temporary_targets = {*_FOUNDATION_NAMES, "receipt.json"}
     for name in list_entries(stage_fd):
         metadata = entry_lstat(stage_fd, name)
-        if name == "shards":
+        if name == "shards" or (name == "sidecars" and sidecar_names):
             if not stat.S_ISDIR(metadata.st_mode):
-                raise ValueError("parallel corpus shards entry is unsafe")
+                raise ValueError(f"parallel corpus {name} entry is unsafe")
         elif name in regular_names:
             if not stat.S_ISREG(metadata.st_mode):
                 raise ValueError(f"parallel corpus staging entry is unsafe: {name}")
@@ -477,9 +729,11 @@ def _prepare_staging(
     created: bool,
     build_id: str,
     shard_names: set[str],
+    publication_format: str,
+    sidecar_names: tuple[str, ...],
     tombstone_fd: RetainedTombstoneStore,
-) -> int:
-    owner_payload = _stage_owner_bytes(build_id)
+) -> tuple[int, int, dict[str, int]]:
+    owner_payload = _stage_owner_bytes(build_id, publication_format)
     if created:
         if list_entries(stage_fd):
             raise ValueError("new parallel corpus staging directory is not empty")
@@ -488,6 +742,7 @@ def _prepare_staging(
             _STAGE_OWNER_NAME,
             owner_payload,
             owner=build_id,
+
             tombstone_fd=tombstone_fd,
         )
     else:
@@ -497,26 +752,66 @@ def _prepare_staging(
             raise ValueError("parallel corpus staging ownership marker is missing") from error
         if actual_owner != owner_payload:
             raise ValueError("parallel corpus staging ownership marker drift")
-    _validate_stage_namespace(stage_fd, build_id)
+    _validate_stage_namespace(
+        stage_fd,
+        build_id,
+        sidecar_names=sidecar_names,
+    )
     clean_owned_temporaries(
         stage_fd,
         final_names={*_FOUNDATION_NAMES, "receipt.json"},
         owner=build_id,
+
         tombstone_fd=tombstone_fd,
     )
     shards_fd, _created = open_directory_at(stage_fd, "shards", create=True)
+    sidecars_fd = -1
+    opened_sidecars: dict[str, int] = {}
     try:
         _validate_shard_namespace(shards_fd, shard_names, build_id)
         clean_owned_temporaries(
             shards_fd,
             final_names=shard_names,
             owner=build_id,
+
             tombstone_fd=tombstone_fd,
         )
+        if sidecar_names:
+            sidecars_fd, _created = open_directory_at(
+                stage_fd,
+                "sidecars",
+                create=True,
+            )
+            actual_names = set(list_entries(sidecars_fd))
+            extras = actual_names - set(sidecar_names)
+            if extras:
+                raise ValueError(
+                    "foreign parallel corpus sidecar set: "
+                    f"{sorted(extras)[0]}"
+                )
+            for sidecar_name in sidecar_names:
+                sidecar_fd, _created = open_directory_at(
+                    sidecars_fd,
+                    sidecar_name,
+                    create=True,
+                )
+                opened_sidecars[sidecar_name] = sidecar_fd
+                _validate_shard_namespace(sidecar_fd, shard_names, build_id)
+                clean_owned_temporaries(
+                    sidecar_fd,
+                    final_names=shard_names,
+                    owner=build_id,
+
+                    tombstone_fd=tombstone_fd,
+                )
     except BaseException:
         os.close(shards_fd)
+        for sidecar_fd in opened_sidecars.values():
+            os.close(sidecar_fd)
+        if sidecars_fd >= 0:
+            os.close(sidecars_fd)
         raise
-    return shards_fd
+    return shards_fd, sidecars_fd, opened_sidecars
 
 
 def _artifact_at(
@@ -537,8 +832,13 @@ def _assert_complete_stage(
     stage_fd: int,
     shards_fd: int,
     shard_names: set[str],
+    *,
+    sidecars_fd: int,
+    sidecar_fds: dict[str, int],
 ) -> None:
     expected_stage = {*_FOUNDATION_NAMES, _STAGE_OWNER_NAME, "shards"}
+    if sidecar_fds:
+        expected_stage.add("sidecars")
     if set(list_entries(stage_fd)) != expected_stage:
         raise ValueError("parallel corpus staging namespace is incomplete or foreign")
     for name in _FOUNDATION_NAMES | {_STAGE_OWNER_NAME}:
@@ -549,6 +849,22 @@ def _assert_complete_stage(
         raise ValueError("parallel corpus shard namespace is incomplete or foreign")
     for name in shard_names:
         _require_regular_entry(shards_fd, name, "parallel corpus shard")
+    if sidecar_fds:
+        if sidecars_fd < 0 or set(list_entries(sidecars_fd)) != set(sidecar_fds):
+            raise ValueError(
+                "parallel corpus sidecar namespace is incomplete or foreign"
+            )
+        for sidecar_name, sidecar_fd in sidecar_fds.items():
+            if set(list_entries(sidecar_fd)) != shard_names:
+                raise ValueError(
+                    f"parallel corpus sidecar set is incomplete: {sidecar_name}"
+                )
+            for name in shard_names:
+                _require_regular_entry(
+                    sidecar_fd,
+                    name,
+                    f"parallel corpus sidecar {sidecar_name}",
+                )
 
 
 def _publish_staging(
@@ -559,6 +875,7 @@ def _publish_staging(
     output_name: str,
     build_id: str,
     tombstone_fd: RetainedTombstoneStore,
+    publication_format: str,
 ) -> VerifiedParallelCorpus:
     stage_metadata = os.fstat(stage_fd)
     named_metadata = entry_lstat(parent_fd, stage_name)
@@ -579,7 +896,7 @@ def _publish_staging(
         atomic_write_or_match(
             stage_fd,
             _STAGE_OWNER_NAME,
-            _stage_owner_bytes(build_id),
+            _stage_owner_bytes(build_id, publication_format),
             owner=build_id,
             tombstone_fd=tombstone_fd,
         )
@@ -623,54 +940,98 @@ def _publish_staging(
 def _artifact_contract(
     receipt: dict[str, Any],
 ) -> tuple[dict[str, dict[str, Any]], set[tuple[str, ...]]]:
-    artifacts = receipt["artifacts"]
-    if not isinstance(artifacts, list) or not artifacts:
+    primary_artifacts = receipt["artifacts"]
+    if not isinstance(primary_artifacts, list) or not primary_artifacts:
         raise ValueError("publication artifacts must be a non-empty list")
+    groups = [(primary_artifacts, True)]
+    if receipt["format"] == _FORMAT_V2:
+        sidecar_sets = receipt["sidecar_sets"]
+        if not isinstance(sidecar_sets, list) or len(sidecar_sets) != len(
+            _TARGET_WEIGHT_NAMES
+        ):
+            raise ValueError("sidecar_sets must contain both target-weight sets")
+        names = []
+        for sidecar_set in sidecar_sets:
+            if (
+                not isinstance(sidecar_set, dict)
+                or set(sidecar_set) != _SIDECAR_SET_FIELDS
+            ):
+                raise ValueError("sidecar set fields do not match the contract")
+            name = sidecar_set["name"]
+            names.append(name)
+            if sidecar_set["dtype"] != "uint8":
+                raise ValueError(f"sidecar dtype must be uint8: {name}")
+            if (
+                isinstance(sidecar_set["items"], bool)
+                or not isinstance(sidecar_set["items"], int)
+                or sidecar_set["items"] <= 0
+            ):
+                raise ValueError(f"sidecar item count is invalid: {name}")
+            stream_sha256 = sidecar_set["stream_sha256"]
+            if (
+                not isinstance(stream_sha256, str)
+                or len(stream_sha256) != 64
+                or any(
+                    character not in "0123456789abcdef"
+                    for character in stream_sha256
+                )
+            ):
+                raise ValueError(f"sidecar stream digest is invalid: {name}")
+            artifacts = sidecar_set["artifacts"]
+            if not isinstance(artifacts, list) or not artifacts:
+                raise ValueError(f"sidecar artifacts must be non-empty: {name}")
+            groups.append((artifacts, False))
+        if tuple(names) != _TARGET_WEIGHT_NAMES:
+            raise ValueError("sidecar set names must be canonical and ordered")
+
     artifact_by_path = {}
     file_parts = set()
     directory_parts = {()}
-    ordered_paths = []
-    for artifact in artifacts:
-        if not isinstance(artifact, dict) or set(artifact) != _ARTIFACT_FIELDS:
-            raise ValueError("invalid publication artifact record")
-        relative_text = artifact["path"]
-        if (
-            not isinstance(relative_text, str)
-            or not relative_text
-            or "\\" in relative_text
-        ):
-            raise ValueError("artifact path must be a safe relative POSIX path")
-        relative = PurePosixPath(relative_text)
-        parts = relative.parts
-        if (
-            relative.is_absolute()
-            or relative.as_posix() != relative_text
-            or not parts
-            or any(part in {"", ".", ".."} for part in parts)
-            or relative_text in {"receipt.json", _STAGE_OWNER_NAME}
-        ):
-            raise ValueError("artifact path must be a safe relative POSIX path")
-        if (
-            isinstance(artifact["bytes"], bool)
-            or not isinstance(artifact["bytes"], int)
-            or artifact["bytes"] < 0
-            or not isinstance(artifact["sha256"], str)
-            or len(artifact["sha256"]) != 64
-            or any(
-                character not in "0123456789abcdef"
-                for character in artifact["sha256"]
-            )
-        ):
-            raise ValueError("invalid publication artifact digest record")
-        ordered_paths.append(relative_text)
-        artifact_by_path[relative_text] = artifact
-        file_parts.add(parts)
-        for depth in range(1, len(parts)):
-            directory_parts.add(parts[:depth])
-    if ordered_paths != sorted(ordered_paths) or len(ordered_paths) != len(
-        set(ordered_paths)
-    ):
-        raise ValueError("publication artifact paths must be sorted and unique")
+    all_paths = []
+    for artifacts, require_sorted in groups:
+        ordered_paths = []
+        for artifact in artifacts:
+            if not isinstance(artifact, dict) or set(artifact) != _ARTIFACT_FIELDS:
+                raise ValueError("invalid publication artifact record")
+            relative_text = artifact["path"]
+            if (
+                not isinstance(relative_text, str)
+                or not relative_text
+                or "\\" in relative_text
+            ):
+                raise ValueError("artifact path must be a safe relative POSIX path")
+            relative = PurePosixPath(relative_text)
+            parts = relative.parts
+            if (
+                relative.is_absolute()
+                or relative.as_posix() != relative_text
+                or not parts
+                or any(part in {"", ".", ".."} for part in parts)
+                or relative_text in {"receipt.json", _STAGE_OWNER_NAME}
+            ):
+                raise ValueError("artifact path must be a safe relative POSIX path")
+            if (
+                isinstance(artifact["bytes"], bool)
+                or not isinstance(artifact["bytes"], int)
+                or artifact["bytes"] < 0
+                or not isinstance(artifact["sha256"], str)
+                or len(artifact["sha256"]) != 64
+                or any(
+                    character not in "0123456789abcdef"
+                    for character in artifact["sha256"]
+                )
+            ):
+                raise ValueError("invalid publication artifact digest record")
+            ordered_paths.append(relative_text)
+            all_paths.append(relative_text)
+            artifact_by_path[relative_text] = artifact
+            file_parts.add(parts)
+            for depth in range(1, len(parts)):
+                directory_parts.add(parts[:depth])
+        if require_sorted and ordered_paths != sorted(ordered_paths):
+            raise ValueError("publication artifact paths must be sorted")
+    if len(all_paths) != len(set(all_paths)):
+        raise ValueError("publication artifact paths must be unique")
     if file_parts & directory_parts:
         raise ValueError("publication artifact path collides with a directory")
     return artifact_by_path, directory_parts
@@ -917,6 +1278,8 @@ class _PinnedPackedReader:
         byte_count: int,
         *,
         record_digest: Any | None = None,
+        require_binary: bool = False,
+        require_one: bool = False,
         require_zero: bool = False,
     ) -> None:
         remaining = byte_count
@@ -941,6 +1304,10 @@ class _PinnedPackedReader:
             self.global_digest.update(chunk)
             if record_digest is not None:
                 record_digest.update(chunk)
+            if require_binary and any(value not in (0, 1) for value in chunk):
+                raise ValueError("target-weight sidecar contains non-binary values")
+            if require_one and any(value != 1 for value in chunk):
+                raise ValueError("dense target-weight sidecar contains zero weights")
             if require_zero and any(chunk):
                 raise ValueError("packed update padding is not zero")
             self.remaining -= len(chunk)
@@ -966,6 +1333,86 @@ class _PinnedPackedReader:
                 pass
         self.index = len(self.entries)
 
+
+def _verify_sidecar_sets(
+    receipt: dict[str, Any],
+    assignments: tuple[ShardAssignment, ...],
+    opened_files: dict[str, tuple[int, os.stat_result, int, str]],
+    artifact_by_path: dict[str, dict[str, Any]],
+    *,
+    logical_tokens: int,
+    packed_tokens: int,
+) -> tuple[tuple[dict[str, object], ...], set[str]]:
+    if receipt["format"] == _FORMAT:
+        return (), set()
+
+    commitments = []
+    all_paths = set()
+    for sidecar_set in receipt["sidecar_sets"]:
+        name = sidecar_set["name"]
+        expected_paths = [
+            f"sidecars/{name}/{assignment.shard_id}.bin"
+            for assignment in assignments
+        ]
+        actual_paths = [
+            artifact["path"] for artifact in sidecar_set["artifacts"]
+        ]
+        if actual_paths != expected_paths:
+            raise ValueError(
+                f"sidecar artifacts are partial, reordered, or misnamed: {name}"
+            )
+        if sidecar_set["items"] != packed_tokens:
+            raise ValueError(f"sidecar item count drift: {name}")
+
+        entries = []
+        for assignment, relative in zip(
+            assignments,
+            expected_paths,
+            strict=True,
+        ):
+            expected_bytes = assignment.token_end - assignment.token_start
+            if artifact_by_path[relative]["bytes"] != expected_bytes:
+                raise ValueError(f"sidecar shard size drift: {relative}")
+            descriptor, metadata_stat, binding_fd, entry_name = opened_files.pop(relative)
+            entries.append(
+                (
+                    relative,
+                    descriptor,
+                    metadata_stat,
+                    binding_fd,
+                    entry_name,
+                    artifact_by_path[relative],
+                )
+            )
+            all_paths.add(relative)
+
+        logical_digest = hashlib.sha256()
+        reader = _PinnedPackedReader(entries)
+        try:
+            reader.consume(
+                logical_tokens,
+                record_digest=logical_digest,
+                require_binary=True,
+                require_one=name == "dense_target_weights",
+            )
+            reader.consume(
+                packed_tokens - logical_tokens,
+                require_zero=True,
+            )
+            packed_digest = reader.finish()
+        finally:
+            reader.close()
+        if sidecar_set["stream_sha256"] != packed_digest:
+            raise ValueError(f"sidecar stream digest drift: {name}")
+        commitments.append(
+            {
+                "dtype": "uint8",
+                "items": logical_tokens,
+                "name": name,
+                "sha256": logical_digest.hexdigest(),
+            }
+        )
+    return tuple(commitments), all_paths
 
 def _receipt_modification_identity(
     metadata: os.stat_result,
@@ -1123,14 +1570,18 @@ def _verify_parallel_corpus_with_receipt_fd(
         receipt = json.loads(receipt_bytes)
     except (UnicodeDecodeError, json.JSONDecodeError) as error:
         raise ValueError("parallel corpus receipt is invalid JSON") from error
-    if (
-        not isinstance(receipt, dict)
-        or set(receipt) != _RECEIPT_FIELDS
-        or canonical_json_bytes(receipt) != receipt_bytes
-    ):
+    if not isinstance(receipt, dict) or canonical_json_bytes(receipt) != receipt_bytes:
+        raise ValueError("parallel corpus receipt does not match the canonical contract")
+    publication_format = receipt.get("format")
+    expected_fields = (
+        _RECEIPT_FIELDS | {"sidecar_sets"}
+        if publication_format == _FORMAT_V2
+        else _RECEIPT_FIELDS
+    )
+    if set(receipt) != expected_fields:
         raise ValueError("parallel corpus receipt does not match the canonical contract")
     if (
-        receipt["format"] != _FORMAT
+        publication_format not in {_FORMAT, _FORMAT_V2}
         or receipt["compiler_version"] != _COMPILER_VERSION
     ):
         raise ValueError("parallel corpus format identity mismatch")
@@ -1203,12 +1654,10 @@ def _verify_parallel_corpus_with_receipt_fd(
         if assignments != expected_assignments:
             raise ValueError("published shard assignments are not canonical")
         ordered_hash, merkle_root = ordered_stream_commitments(schedule, reduced)
-        build_id = parallel_build_id(catalog, renderer_id, config)
         logical_tokens = schedule[-1].token_end
         packed_tokens = assignments[-1].token_end
         expected_scalars = {
             "assignments_sha256": sha256_hex(assignment_bytes),
-            "build_id": build_id,
             "catalog_sha256": catalog.sha256,
             "logical_tokens": logical_tokens,
             "merkle_root_sha256": merkle_root,
@@ -1223,18 +1672,19 @@ def _verify_parallel_corpus_with_receipt_fd(
         for field_name, expected in expected_scalars.items():
             if receipt[field_name] != expected:
                 raise ValueError(f"parallel corpus receipt drift: {field_name}")
-        if expected_build_id is not None and build_id != expected_build_id:
-            raise ValueError("parallel corpus build id does not match expectation")
-        if allow_stage_owner:
-            if owner_bytes != _stage_owner_bytes(build_id):
-                raise ValueError("parallel corpus staging ownership marker drift")
-        elif owner_bytes is not None:
-            raise ValueError("published corpus contains a staging owner marker")
 
         shard_paths = [
             f"shards/{assignment.shard_id}.bin" for assignment in assignments
         ]
-        if set(artifact_by_path) - required_paths != set(shard_paths):
+        declared_sidecar_paths = {
+            artifact["path"]
+            for sidecar_set in receipt.get("sidecar_sets", [])
+            for artifact in sidecar_set["artifacts"]
+        }
+        if (
+            set(artifact_by_path) - required_paths - declared_sidecar_paths
+            != set(shard_paths)
+        ):
             raise ValueError(
                 "parallel corpus shard namespace does not match assignments"
             )
@@ -1286,6 +1736,34 @@ def _verify_parallel_corpus_with_receipt_fd(
             reader.close()
         if receipt["packed_stream_sha256"] != packed_digest:
             raise ValueError("packed stream digest drift")
+        sidecar_commitments, verified_sidecar_paths = _verify_sidecar_sets(
+            receipt,
+            assignments,
+            opened_files,
+            artifact_by_path,
+            logical_tokens=logical_tokens,
+            packed_tokens=packed_tokens,
+        )
+        if verified_sidecar_paths != declared_sidecar_paths:
+            raise ValueError("parallel corpus sidecar namespace drift")
+        build_id = _parallel_build_id(
+            catalog,
+            renderer_id,
+            config,
+            publication_format=publication_format,
+            sidecar_commitments=sidecar_commitments,
+        )
+        if receipt["build_id"] != build_id:
+            raise ValueError("parallel corpus receipt drift: build_id")
+        if expected_build_id is not None and build_id != expected_build_id:
+            raise ValueError("parallel corpus build id does not match expectation")
+        if allow_stage_owner:
+            if owner_bytes != _stage_owner_bytes(build_id, publication_format):
+                raise ValueError("parallel corpus staging ownership marker drift")
+        elif owner_bytes is not None:
+            raise ValueError("published corpus contains a staging owner marker")
+        if opened_files:
+            raise ValueError("parallel corpus contains unverified artifacts")
         _verify_receipt_after_verification(
             publication_fd,
             receipt_fd,
@@ -1357,17 +1835,34 @@ def build_parallel_corpus(
     destination: Path | str,
     *,
     workers: int = 1,
+    sidecar_paths: dict[str, Path | str] | None = None,
     _materialized_metadata: tuple[MetadataRecord, ...] | None = None,
     _cached_payloads: dict[str, bytes] | None = None,
 ) -> VerifiedParallelCorpus:
     """Build or resume a corpus using pinned, no-replace publication."""
 
     output = Path(destination)
-    build_id = parallel_build_id(catalog, renderer.renderer_id, config)
-    parent_fd, output_name = open_parent_directory(output, create=True)
+    sidecar_sources = _open_sidecar_sources(sidecar_paths)
+    publication_format = _FORMAT_V2 if sidecar_sources else _FORMAT
+    build_id = _parallel_build_id(
+        catalog,
+        renderer.renderer_id,
+        config,
+        publication_format=publication_format,
+        sidecar_commitments=tuple(
+            source.commitment for source in sidecar_sources
+        ),
+    )
+    try:
+        parent_fd, output_name = open_parent_directory(output, create=True)
+    except BaseException:
+        for source in sidecar_sources:
+            source.close()
+        raise
     stage_path = publication_staging_path(output, build_id)
     stage_name = stage_path.name
-    owner_payload = _stage_owner_bytes(build_id)
+    sidecar_names = tuple(source.name for source in sidecar_sources)
+    owner_payload = _stage_owner_bytes(build_id, publication_format)
     tombstone_fd = None
     try:
         if entry_exists(parent_fd, output_name):
@@ -1431,7 +1926,11 @@ def build_parallel_corpus(
         if stage_exists:
             existing_stage_fd, _created = open_directory_at(parent_fd, stage_name)
             try:
-                _validate_stage_namespace(existing_stage_fd, build_id)
+                _validate_stage_namespace(
+                    existing_stage_fd,
+                    build_id,
+                    sidecar_names=sidecar_names,
+                )
                 if entry_exists(existing_stage_fd, "receipt.json"):
                     has_owner = entry_exists(
                         existing_stage_fd,
@@ -1464,6 +1963,7 @@ def build_parallel_corpus(
                         stage_name=stage_name,
                         output_name=output_name,
                         build_id=build_id,
+                        publication_format=publication_format,
                         tombstone_fd=tombstone_fd,
                     )
                 if not entry_exists(existing_stage_fd, _STAGE_OWNER_NAME):
@@ -1486,12 +1986,16 @@ def build_parallel_corpus(
             create=True,
         )
         shards_fd = -1
+        sidecars_fd = -1
+        sidecar_fds: dict[str, int] = {}
         try:
-            shards_fd = _prepare_staging(
+            shards_fd, sidecars_fd, sidecar_fds = _prepare_staging(
                 stage_fd,
                 created=created,
                 build_id=build_id,
                 shard_names=shard_names,
+                publication_format=publication_format,
+                sidecar_names=sidecar_names,
                 tombstone_fd=tombstone_fd,
             )
             atomic_write_or_match(
@@ -1499,6 +2003,7 @@ def build_parallel_corpus(
                 "catalog.jsonl",
                 catalog_bytes,
                 owner=build_id,
+
                 tombstone_fd=tombstone_fd,
             )
             atomic_write_or_match(
@@ -1506,6 +2011,7 @@ def build_parallel_corpus(
                 "metadata.jsonl",
                 metadata_bytes,
                 owner=build_id,
+
                 tombstone_fd=tombstone_fd,
             )
             atomic_write_or_match(
@@ -1513,6 +2019,7 @@ def build_parallel_corpus(
                 "schedule.jsonl",
                 schedule_bytes,
                 owner=build_id,
+
                 tombstone_fd=tombstone_fd,
             )
             atomic_write_or_match(
@@ -1520,6 +2027,7 @@ def build_parallel_corpus(
                 "assignments.jsonl",
                 assignment_bytes,
                 owner=build_id,
+
                 tombstone_fd=tombstone_fd,
             )
             packed = _rerender_and_pack_pinned(
@@ -1533,7 +2041,25 @@ def build_parallel_corpus(
                 tombstone_fd=tombstone_fd,
                 cached_payloads=_cached_payloads,
             )
-            _assert_complete_stage(stage_fd, shards_fd, shard_names)
+            logical_tokens = schedule[-1].token_end
+            packed_tokens = assignments[-1].token_end
+            sidecar_sets = _pack_sidecar_sets(
+                sidecar_sources,
+                assignments,
+                sidecar_fds,
+                logical_tokens=logical_tokens,
+                packed_tokens=packed_tokens,
+                owner=build_id,
+
+                tombstone_fd=tombstone_fd,
+            )
+            _assert_complete_stage(
+                stage_fd,
+                shards_fd,
+                shard_names,
+                sidecars_fd=sidecars_fd,
+                sidecar_fds=sidecar_fds,
+            )
             artifacts = [
                 *(
                     _artifact_at(stage_fd, name)
@@ -1553,8 +2079,6 @@ def build_parallel_corpus(
                 schedule,
                 metadata,
             )
-            logical_tokens = schedule[-1].token_end
-            packed_tokens = assignments[-1].token_end
             receipt = {
                 "artifacts": artifacts,
                 "assignments_sha256": sha256_hex(assignment_bytes),
@@ -1562,7 +2086,7 @@ def build_parallel_corpus(
                 "catalog_sha256": catalog.sha256,
                 "compiler_version": _COMPILER_VERSION,
                 "config": config.as_dict(),
-                "format": _FORMAT,
+                "format": publication_format,
                 "logical_tokens": logical_tokens,
                 "merkle_root_sha256": merkle_root,
                 "metadata_sha256": sha256_hex(metadata_bytes),
@@ -1575,14 +2099,21 @@ def build_parallel_corpus(
                 "schedule_sha256": sha256_hex(schedule_bytes),
                 "shard_count": len(assignments),
             }
+            if sidecar_sets:
+                receipt["sidecar_sets"] = sidecar_sets
             atomic_write_or_match(
                 stage_fd,
                 "receipt.json",
                 canonical_json_bytes(receipt),
                 owner=build_id,
+
                 tombstone_fd=tombstone_fd,
             )
             fsync_directory(shards_fd)
+            for sidecar_fd in sidecar_fds.values():
+                fsync_directory(sidecar_fd)
+            if sidecars_fd >= 0:
+                fsync_directory(sidecars_fd)
             fsync_directory(stage_fd)
             _verify_parallel_corpus_fd(
                 stage_fd,
@@ -1605,9 +2136,14 @@ def build_parallel_corpus(
                 stage_name=stage_name,
                 output_name=output_name,
                 build_id=build_id,
+                publication_format=publication_format,
                 tombstone_fd=tombstone_fd,
             )
         finally:
+            for sidecar_fd in sidecar_fds.values():
+                os.close(sidecar_fd)
+            if sidecars_fd >= 0:
+                os.close(sidecars_fd)
             if shards_fd >= 0:
                 os.close(shards_fd)
             os.close(stage_fd)
@@ -1615,6 +2151,8 @@ def build_parallel_corpus(
         if tombstone_fd is not None:
             tombstone_fd.close()
         os.close(parent_fd)
+        for source in sidecar_sources:
+            source.close()
 
 
 def build_parallel_corpus_from_tasks(

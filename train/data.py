@@ -36,7 +36,10 @@ PARALLEL_SIDECAR_V2_CONTRACT = {
         "name",
         "stream_sha256",
     ),
-    "defined_names": ("loss_mask", "target_weights"),
+    "defined_names": (
+        "dense_target_weights",
+        "split90_target_weights",
+    ),
     "alignment": {
         "items": "packed_tokens",
         "shard_order": "token_assignments",
@@ -46,14 +49,14 @@ PARALLEL_SIDECAR_V2_CONTRACT = {
         "required_value": 0,
     },
 }
-"""Loader-side integration contract for a future sidecar-aware publication.
+"""Loader-side integration contract for sidecar-aware publications.
 
 The publisher must put named sidecar sets in the canonical receipt. Each set
 must bind an ordered artifact list (path, byte length, SHA-256), scalar dtype,
 logical item count, and whole-stream SHA-256. A padded token publication must
-bind ``target_weights`` of equal packed length and require zero at every
-padding target. Version 1 has no such namespace and remains unsupported for
-Split90 sidecars.
+bind a named target-weight stream of equal packed length and require zero at
+every padding target. Version 1 has no such namespace and remains unsupported
+for Split90 sidecars.
 """
 
 
@@ -433,18 +436,18 @@ class PackedShards:
         seed: int = 0,
         mask_path: str | Path | None = None,
         weights_path: str | Path | None = None,
+        sidecar_name: str | None = None,
     ) -> PackedShards:
         """Open a fully verified immutable parallel-corpus publication.
 
-        The v1 receipt binds token shards but has no sidecar namespace. Masks
-        and target weights are therefore rejected instead of being paired by
-        filename convention.
+        Version 1 binds only token shards. Version 2 additionally requires an
+        explicit receipt-bound target-weight sidecar selection.
         """
 
         del seed
         if mask_path is not None or weights_path is not None:
             raise ValueError(
-                "parallel corpus v1 does not bind sidecars; "
+                "parallel corpus does not bind sidecars supplied by path; "
                 "mask_path and weights_path are unsupported"
             )
         from corpusgen.parallel import assignments_from_bytes, verify_parallel_corpus
@@ -452,7 +455,27 @@ class PackedShards:
 
         publication = Path(root)
         receipt = verify_parallel_corpus(publication)
-        if receipt["padding_tokens"] != 0:
+        publication_format = receipt["format"]
+        sidecar_set = None
+        if publication_format == PARALLEL_SIDECAR_V2_CONTRACT["format"]:
+            if sidecar_name not in PARALLEL_SIDECAR_V2_CONTRACT["defined_names"]:
+                raise ValueError(
+                    "sidecar_name must select dense_target_weights or "
+                    "split90_target_weights"
+                )
+            sidecar_set = next(
+                record
+                for record in receipt["sidecar_sets"]
+                if record["name"] == sidecar_name
+            )
+        elif sidecar_name is not None:
+            raise ValueError(
+                "parallel corpus v1 does not bind sidecars; "
+                "sidecar_name is unsupported"
+            )
+        if publication_format != PARALLEL_SIDECAR_V2_CONTRACT["format"] and receipt[
+            "padding_tokens"
+        ] != 0:
             raise ValueError(
                 "parallel corpus padding has no bound zero-weight sidecar"
             )
@@ -475,6 +498,38 @@ class PackedShards:
                     "parallel corpus shards directory is missing, symlinked, or unsafe"
                 ) from error
             directory_fds.append(shards_fd)
+            selected_sidecar_fd = None
+            if sidecar_set is not None:
+                try:
+                    sidecars_fd = os.open(
+                        "sidecars",
+                        os.O_RDONLY
+                        | os.O_DIRECTORY
+                        | getattr(os, "O_CLOEXEC", 0)
+                        | getattr(os, "O_NOFOLLOW", 0),
+                        dir_fd=root_fd,
+                    )
+                except OSError as error:
+                    raise ValueError(
+                        "parallel corpus sidecars directory is missing, "
+                        "symlinked, or unsafe"
+                    ) from error
+                directory_fds.append(sidecars_fd)
+                try:
+                    selected_sidecar_fd = os.open(
+                        sidecar_name,
+                        os.O_RDONLY
+                        | os.O_DIRECTORY
+                        | getattr(os, "O_CLOEXEC", 0)
+                        | getattr(os, "O_NOFOLLOW", 0),
+                        dir_fd=sidecars_fd,
+                    )
+                except OSError as error:
+                    raise ValueError(
+                        f"parallel corpus sidecar directory is missing, "
+                        f"symlinked, or unsafe: {sidecar_name}"
+                    ) from error
+                directory_fds.append(selected_sidecar_fd)
 
             receipt_file = _PinnedFile.open_at(
                 root_fd,
@@ -524,6 +579,37 @@ class PackedShards:
                         f"publication artifact digest drift: {artifact['path']}"
                     )
                 artifacts[artifact["path"]] = pinned
+            if sidecar_set is not None:
+                assert selected_sidecar_fd is not None
+                assert sidecar_name is not None
+                for artifact in sidecar_set["artifacts"]:
+                    relative = Path(artifact["path"])
+                    if (
+                        len(relative.parts) != 3
+                        or relative.parts[0] != "sidecars"
+                        or relative.parts[1] != sidecar_name
+                    ):
+                        raise ValueError(
+                            "parallel corpus sidecar artifact path is unsafe: "
+                            f"{artifact['path']}"
+                        )
+                    pinned = _PinnedFile.open_at(
+                        selected_sidecar_fd,
+                        relative.parts[2],
+                        path=publication / relative,
+                        label=f"parallel corpus sidecar {sidecar_name}",
+                        item_bytes=1,
+                    )
+                    opened.append(pinned)
+                    if (
+                        pinned.byte_count != artifact["bytes"]
+                        or pinned.sha256 != artifact["sha256"]
+                    ):
+                        raise ValueError(
+                            "publication artifact digest drift: "
+                            f"{artifact['path']}"
+                        )
+                    artifacts[artifact["path"]] = pinned
 
             assignments = assignments_from_bytes(
                 artifacts["assignments.jsonl"].read_bytes()
@@ -550,6 +636,35 @@ class PackedShards:
                     raise ValueError(
                         f"token shard length does not match assignment: {pinned.path}"
                     )
+            weight_files = None
+            if sidecar_set is not None:
+                assert sidecar_name is not None
+                expected_sidecar_paths = tuple(
+                    f"sidecars/{sidecar_name}/{assignment.shard_id}.bin"
+                    for assignment in assignments
+                )
+                actual_sidecar_paths = tuple(
+                    artifact["path"]
+                    for artifact in sidecar_set["artifacts"]
+                )
+                if actual_sidecar_paths != expected_sidecar_paths:
+                    raise ValueError(
+                        "parallel corpus sidecar artifacts are partial or reordered"
+                    )
+                weight_files = tuple(
+                    artifacts[relative] for relative in expected_sidecar_paths
+                )
+                for pinned, assignment in zip(
+                    weight_files,
+                    assignments,
+                    strict=True,
+                ):
+                    expected = assignment.token_end - assignment.token_start
+                    if pinned.item_count != expected:
+                        raise ValueError(
+                            "target-weight shard length does not match assignment: "
+                            f"{pinned.path}"
+                        )
             provenance = {
                 "format_version": 3,
                 "kind": "parallel-publication",
@@ -559,13 +674,18 @@ class PackedShards:
                 "ordered_stream_sha256": receipt["ordered_stream_sha256"],
                 "packed_stream_sha256": receipt["packed_stream_sha256"],
                 "mask": None,
-                "weights": None,
+                "sidecar_name": sidecar_name,
+                "weights": (
+                    _content_provenance(weight_files, item_bytes=1)
+                    if weight_files is not None
+                    else None
+                ),
             }
             result = cls.__new__(cls)
             result._initialize(
                 token_files=token_files,
                 mask_files=None,
-                weight_files=None,
+                weight_files=weight_files,
                 ctx=ctx,
                 batch_size=batch_size,
                 device=device,
@@ -690,12 +810,13 @@ class PackedShards:
             )
         if self.n_tokens < targets_per_update:
             raise ValueError("corpus is smaller than one optimizer update")
-        if self.n_tokens % targets_per_update:
-            raise ValueError("corpus token count is not update-aligned")
-        if len(self._token_shards) > 1 and any(
-            length % targets_per_update for length in self._shard_lengths
-        ):
-            raise ValueError("token shards are not update-aligned")
+        if self.publication_update_tokens is not None:
+            if self.n_tokens % targets_per_update:
+                raise ValueError("corpus token count is not update-aligned")
+            if any(
+                length % targets_per_update for length in self._shard_lengths
+            ):
+                raise ValueError("token shards are not update-aligned")
         if self.global_cursor % targets_per_update:
             raise ValueError("global cursor is not update-aligned")
         self.targets_per_update = targets_per_update
@@ -889,11 +1010,9 @@ class PackedShards:
             "provenance": self.provenance,
         }
 
-    def load_state_dict(self, state: dict) -> None:
-        if not isinstance(state, dict):
+    def validate_state_dict(self, state: dict) -> int:
+        if type(state) is not dict:
             raise ValueError("data state must be a dictionary")
-        if state.get("format_version") != 2:
-            raise ValueError("data state version is incompatible")
         expected_fields = {
             "format_version",
             "global_cursor",
@@ -903,22 +1022,26 @@ class PackedShards:
         }
         if set(state) != expected_fields:
             raise ValueError("data state fields do not match the contract")
+        if type(state["format_version"]) is not int or state["format_version"] != 2:
+            raise ValueError("data state version is incompatible")
         saved_provenance = state.get("provenance")
-        if saved_provenance != self.provenance:
+        if type(saved_provenance) is not dict or saved_provenance != self.provenance:
             raise ValueError("data shard provenance does not match checkpoint")
         global_cursor = state.get("global_cursor")
-        if (
-            isinstance(global_cursor, bool)
-            or not isinstance(global_cursor, int)
-            or global_cursor < 0
-        ):
+        if type(global_cursor) is not int or global_cursor < 0:
             raise ValueError("checkpoint global cursor is invalid")
-        if state.get("cursor") != global_cursor % self.n_tokens:
+        cursor = state.get("cursor")
+        if type(cursor) is not int or cursor != global_cursor % self.n_tokens:
             raise ValueError("checkpoint local cursor is inconsistent")
-        if state.get("epoch") != global_cursor // self.n_tokens:
+        epoch = state.get("epoch")
+        if type(epoch) is not int or epoch != global_cursor // self.n_tokens:
             raise ValueError("checkpoint epoch is inconsistent")
         if self.targets_per_update is not None and global_cursor % self.targets_per_update:
             raise ValueError("checkpoint global cursor is not update-aligned")
+        return global_cursor
+
+    def load_state_dict(self, state: dict) -> None:
+        global_cursor = self.validate_state_dict(state)
         self.global_cursor = global_cursor
         self.cursor = self.global_cursor % self.n_tokens
         self.epoch = self.global_cursor // self.n_tokens

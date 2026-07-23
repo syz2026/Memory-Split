@@ -6,7 +6,11 @@ import pytest
 import torch
 
 import train.data as data_module
-from train.data import PackedShards
+from train.data import (
+    PackedShards,
+    rank_sequence_counts,
+    synchronized_rank_batch_plan,
+)
 
 
 def make_shards(tmp_path, n=5000, masked_span=(100, 160)):
@@ -106,6 +110,39 @@ def test_validated_update_cursor_advances_only_by_exact_global_quota(tmp_path):
     assert ds.global_cursor == 8
 
 
+def test_legacy_cyclic_corpus_need_not_end_on_an_update_boundary(tmp_path):
+    bp, _ = make_shards(tmp_path, n=65, masked_span=(65, 65))
+    ds = PackedShards(bp, None, ctx=4, batch_size=2)
+
+    ds.validate_update_alignment(8)
+    ds.advance(8)
+
+    assert ds.global_cursor == 8
+
+
+def test_p5_world_size_four_geometry_is_128_sequences_and_16_microsteps():
+    counts = rank_sequence_counts(524288 // 1024, 4)
+    plans = tuple(
+        synchronized_rank_batch_plan(
+            global_cursor=0,
+            total_sequences=512,
+            ctx=1024,
+            micro_batch_size=8,
+            rank=rank,
+            world_size=4,
+        )
+        for rank in range(4)
+    )
+
+    assert counts == (128, 128, 128, 128)
+    assert tuple(len(plan) for plan in plans) == (16, 16, 16, 16)
+    assert all(
+        batch is not None and batch.sequence_count == 8
+        for plan in plans
+        for batch in plan
+    )
+
+
 def test_cursor_state_rejects_different_shard_provenance(tmp_path):
     first_path = tmp_path / "first.bin"
     second_path = tmp_path / "second.bin"
@@ -183,6 +220,36 @@ def test_cursor_state_rejects_incompatible_state_version(tmp_path):
 
     with pytest.raises(ValueError, match="version"):
         shard.load_state_dict(state)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("format_version", True),
+        ("global_cursor", False),
+        ("cursor", False),
+        ("epoch", False),
+    ],
+)
+def test_cursor_state_rejects_bool_integer_fields(tmp_path, field, value):
+    bp, _ = make_shards(tmp_path, n=64, masked_span=(64, 64))
+    shard = PackedShards(bp, None, ctx=4, batch_size=2)
+    state = shard.state_dict()
+    state[field] = value
+
+    with pytest.raises(ValueError):
+        shard.load_state_dict(state)
+
+
+def test_cursor_state_rejects_extra_fields_without_mutating(tmp_path):
+    bp, _ = make_shards(tmp_path, n=64, masked_span=(64, 64))
+    shard = PackedShards(bp, None, ctx=4, batch_size=2)
+    state = shard.state_dict()
+    state["unexpected"] = None
+
+    with pytest.raises(ValueError, match="fields"):
+        shard.load_state_dict(state)
+    assert shard.global_cursor == 0
 
 
 def test_unverified_multiple_shards_fail_closed(tmp_path):
