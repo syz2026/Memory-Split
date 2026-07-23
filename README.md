@@ -10,6 +10,8 @@ null.
 - **Design spec:** `docs/superpowers/specs/2026-07-17-memory-split-design.md`
 - **Implementation plan:** `docs/superpowers/plans/2026-07-17-memory-split.md`
 - **Research dossier:** `docs/superpowers/research/2026-07-17-memory-split/`
+- **Google Colab KQA continuation:** `docs/COLAB.md` and
+  `notebooks/kqa_memory_transfer_colab.ipynb`
 
 ## Layout
 

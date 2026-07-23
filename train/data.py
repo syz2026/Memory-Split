@@ -40,26 +40,42 @@ class PackedShards:
         self.cursor = start_cursor
         self.n_tokens = len(self.tokens)
         self.epoch = 0
-        span = self.batch_size * (self.ctx + 1)
+        span = self.batch_size * self.ctx + 1
         assert self.n_tokens > span, "corpus smaller than one batch"
 
     def _window(self, start: int, length: int) -> tuple[np.ndarray, np.ndarray | None]:
-        toks = np.asarray(self.tokens[start : start + length])
-        msk = np.asarray(self.mask[start : start + length]) if self.mask is not None else None
+        end = start + length
+        if end <= self.n_tokens:
+            toks = np.asarray(self.tokens[start:end])
+            msk = (
+                np.asarray(self.mask[start:end]) if self.mask is not None else None
+            )
+            return toks, msk
+        wrapped = end - self.n_tokens
+        toks = np.concatenate(
+            (np.asarray(self.tokens[start:]), np.asarray(self.tokens[:wrapped]))
+        )
+        msk = (
+            np.concatenate(
+                (np.asarray(self.mask[start:]), np.asarray(self.mask[:wrapped]))
+            )
+            if self.mask is not None
+            else None
+        )
         return toks, msk
 
     def next_batch(self) -> tuple[torch.Tensor, torch.Tensor]:
-        span = self.batch_size * (self.ctx + 1)
-        if self.cursor + span >= self.n_tokens:
-            self.cursor = 0
-            self.epoch += 1
+        targets = self.batch_size * self.ctx
+        span = targets + 1
+        start = self.cursor
         toks, msk = self._window(self.cursor, span)
-        self.cursor += self.batch_size * self.ctx  # overlap of 1 keeps every target trained
-        toks = toks.astype(np.int64).reshape(self.batch_size, self.ctx + 1)
-        x = torch.from_numpy(toks[:, :-1].copy())
-        y = torch.from_numpy(toks[:, 1:].copy())
+        self.cursor = (self.cursor + targets) % self.n_tokens
+        self.epoch += (start + targets) // self.n_tokens
+        toks = toks.astype(np.int64)
+        x = torch.from_numpy(toks[:-1].reshape(self.batch_size, self.ctx).copy())
+        y = torch.from_numpy(toks[1:].reshape(self.batch_size, self.ctx).copy())
         if msk is not None:
-            m = msk.reshape(self.batch_size, self.ctx + 1)[:, 1:]
+            m = msk[1:].reshape(self.batch_size, self.ctx)
             y[torch.from_numpy((m == 0).copy())] = -100
         if self.device == "cuda":
             x = x.pin_memory().to(self.device, non_blocking=True)
@@ -78,16 +94,18 @@ class PackedShards:
         """
         if self.mask is None:
             return None
-        span = self.batch_size * (self.ctx + 1)
-        toks, msk = self._window(0, span * max_batches)
+        max_targets = self.batch_size * self.ctx * max_batches
+        sample_length = min(self.n_tokens, max_targets + 1)
+        toks = np.asarray(self.tokens[:sample_length])
+        msk = np.asarray(self.mask[:sample_length])
         if (msk == 0).sum() == 0:
             return None
-        usable = (len(toks) // (self.ctx + 1)) * (self.ctx + 1)
-        toks = toks[:usable].astype(np.int64).reshape(-1, self.ctx + 1)
-        msk = msk[:usable].reshape(-1, self.ctx + 1)
-        x = torch.from_numpy(toks[:, :-1].copy())
-        y = torch.from_numpy(toks[:, 1:].copy())
-        keep = torch.from_numpy((msk[:, 1:] == 0).copy())
+        usable_targets = ((len(toks) - 1) // self.ctx) * self.ctx
+        toks = toks[: usable_targets + 1].astype(np.int64)
+        msk = msk[: usable_targets + 1]
+        x = torch.from_numpy(toks[:-1].reshape(-1, self.ctx).copy())
+        y = torch.from_numpy(toks[1:].reshape(-1, self.ctx).copy())
+        keep = torch.from_numpy((msk[1:].reshape(-1, self.ctx) == 0).copy())
         y[~keep] = -100
         rows = keep.any(dim=1)
         if not rows.any():

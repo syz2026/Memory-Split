@@ -26,16 +26,24 @@ from collections import deque
 
 import torch
 
-logger = logging.getLogger(__name__)
+from corpusgen.records import QUERY_TOKEN_CAP
 
-QUERY_TOKEN_CAP = 32
+logger = logging.getLogger(__name__)
 
 _FREE = 0
 _IN_QUERY = 1
 
 
 class _Seq:
-    __slots__ = ("generated", "state", "query_ids", "force", "done")
+    __slots__ = (
+        "generated",
+        "state",
+        "query_ids",
+        "force",
+        "done",
+        "events",
+        "pending_event",
+    )
 
     def __init__(self) -> None:
         self.generated: list[int] = []
@@ -43,6 +51,8 @@ class _Seq:
         self.query_ids: list[int] = []
         self.force: deque[int] = deque()
         self.done = False
+        self.events: list[dict] = []
+        self.pending_event: int | None = None
 
 
 def _advance_state(s: _Seq, nid: int, tok, organizer, stats: dict) -> None:
@@ -59,15 +69,40 @@ def _advance_state(s: _Seq, nid: int, tok, organizer, stats: dict) -> None:
         value = organizer.lookup(query)
         if value is None:
             stats["n_misses"] += 1
+            s.events.append(
+                {
+                    "query": query,
+                    "hit": False,
+                    "completed": True,
+                    "end_offset": len(s.generated),
+                }
+            )
             logger.debug("lookup miss: %r", query)
         else:
             stats["n_hits"] += 1
+            s.events.append(
+                {
+                    "query": query,
+                    "hit": True,
+                    "completed": False,
+                    "start_offset": len(s.generated),
+                }
+            )
+            s.pending_event = len(s.events) - 1
             s.force.extend(tok.encode(" " + value) + [tok.DB_END])
         s.state = _FREE
     else:
         s.query_ids.append(nid)
         if len(s.query_ids) >= QUERY_TOKEN_CAP:
             stats["n_malformed"] += 1
+            s.events.append(
+                {
+                    "query": tok.decode(s.query_ids),
+                    "hit": False,
+                    "completed": False,
+                    "malformed": True,
+                }
+            )
             logger.debug(
                 "malformed lookup: no <|db_retrieve|> within %d tokens: %r",
                 QUERY_TOKEN_CAP,
@@ -84,7 +119,8 @@ def generate_batch_with_stats(
     organizer,
     device,
     stop_at_eot: bool = True,
-) -> tuple[list[str], dict]:
+    _include_events: bool = False,
+) -> tuple[list[str], dict] | tuple[list[str], dict, list[list[dict]]]:
     """Greedy-decode continuations for all prompts in one batch.
 
     Returns (texts, stats). Texts exclude the prompt and the stopping EOT
@@ -94,7 +130,7 @@ def generate_batch_with_stats(
     """
     stats = {"n_lookups": 0, "n_hits": 0, "n_misses": 0, "n_malformed": 0}
     if not prompts:
-        return [], stats
+        return ([], stats, []) if _include_events else ([], stats)
 
     prompt_ids = [tok.encode(p) for p in prompts]
     # Clamp to the model's context: leave room for generation, and truncate
@@ -136,6 +172,11 @@ def generate_batch_with_stats(
                         next_ids.append(tok.EOT)
                         continue
                 s.generated.append(nid)
+                if forced and nid == tok.DB_END and s.pending_event is not None:
+                    event = s.events[s.pending_event]
+                    event["completed"] = True
+                    event["end_offset"] = len(s.generated)
+                    s.pending_event = None
                 if not forced and organizer is not None:
                     _advance_state(s, nid, tok, organizer, stats)
                 if len(s.generated) >= max_new:
@@ -147,7 +188,40 @@ def generate_batch_with_stats(
             logits, cache = model.forward_step(x.unsqueeze(1), cache)
 
     texts = [tok.decode(s.generated) for s in seqs]
+    for s in seqs:
+        for event in s.events:
+            end_offset = event.get("end_offset")
+            event["before_answer"] = (
+                end_offset is not None
+                and "Answer:" not in tok.decode(s.generated[:end_offset])
+            )
+    if _include_events:
+        return texts, stats, [s.events for s in seqs]
     return texts, stats
+
+
+def generate_batch_with_events(
+    model,
+    tok,
+    prompts: list[str],
+    max_new: int,
+    organizer,
+    device,
+    stop_at_eot: bool = True,
+) -> tuple[list[str], dict, list[list[dict]]]:
+    """Generate while returning per-prompt organizer lookup events."""
+    result = generate_batch_with_stats(
+        model,
+        tok,
+        prompts,
+        max_new,
+        organizer,
+        device,
+        stop_at_eot=stop_at_eot,
+        _include_events=True,
+    )
+    assert len(result) == 3
+    return result
 
 
 def generate_batch(

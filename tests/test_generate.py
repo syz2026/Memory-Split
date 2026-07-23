@@ -15,7 +15,11 @@ Two stub flavors:
 
 import torch
 
-from evals.generate import generate_batch, generate_batch_with_stats
+from evals.generate import (
+    generate_batch,
+    generate_batch_with_events,
+    generate_batch_with_stats,
+)
 from organizer.store import Organizer
 from train.tokenizer import get_tok
 
@@ -195,6 +199,23 @@ def test_interception_hit_forces_value():
     assert stats == _stats(n_lookups=1, n_hits=1)
 
 
+def test_interception_exposes_per_sequence_query_events():
+    org = Organizer()
+    org.add("Kai Nakamura", "major", "Communications")
+    prompt = "Kai Nakamura majored in"
+    table, _, _, _ = _hit_table(prompt)
+    texts, stats, events = generate_batch_with_events(
+        TableStub([table]), TOK, [prompt], max_new=64, organizer=org, device=CPU
+    )
+    assert "Communications" in texts[0]
+    assert stats == _stats(n_lookups=1, n_hits=1)
+    event = events[0][0]
+    assert event["query"] == "Kai Nakamura, major"
+    assert event["hit"] is True
+    assert event["completed"] is True
+    assert event["before_answer"] is True
+
+
 def test_interception_miss_continues_model_program():
     org = Organizer()
     org.add("Someone Else", "major", "History")  # queried key absent
@@ -243,6 +264,20 @@ def test_forced_tokens_count_toward_max_new():
     )
     assert texts == [expected]
     assert "<|db_end|>" not in texts[0]  # truncated mid-force
+
+
+def test_truncated_forced_value_is_not_a_completed_lookup():
+    org = Organizer()
+    org.add("Kai Nakamura", "major", "Communications")
+    prompt = "Kai Nakamura majored in"
+    table, q_ids, _, _ = _hit_table(prompt)
+    max_new = 1 + len(q_ids) + 2
+    _, _, events = generate_batch_with_events(
+        TableStub([table]), TOK, [prompt], max_new=max_new, organizer=org, device=CPU
+    )
+    assert events[0][0]["hit"] is True
+    assert events[0][0]["completed"] is False
+    assert events[0][0]["before_answer"] is False
 
 
 # ---------------------------------------------------------------- batching

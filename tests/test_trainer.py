@@ -1,6 +1,7 @@
 import json
 
 import numpy as np
+import pytest
 
 from train.trainer import Trainer, cosine_lr
 
@@ -48,6 +49,8 @@ def test_loss_decreases_and_logs(tmp_path):
     assert last < first * 0.8, (first, last)
     assert any("loss_masked_values" in r for r in rows)
     assert (tr.out_dir / "ckpt.pt").exists()
+    assert (tr.out_dir / "model.pt").exists()
+    assert len((tr.out_dir / "model.pt.sha256").read_text().strip()) == 64
     snaps = list((tr.out_dir / "snapshots").glob("*.pt"))
     assert snaps
 
@@ -69,6 +72,46 @@ def test_checkpoint_resume_exact_batches(tmp_path):
     xb, _ = b.data.next_batch()
     xa, _ = a.data.next_batch()
     assert (xa == xb).all()
+
+
+def test_weights_only_initialization_resets_training_state(tmp_path):
+    bp, mp = write_corpus(tmp_path)
+    cfg = base_cfg(tmp_path, bp, mp)
+    cfg["max_steps"] = 3
+    source = Trainer(cfg)
+    source.train_steps(2)
+    source.save_ckpt()
+
+    destination_cfg = dict(cfg, out_dir=str(tmp_path / "continued"))
+    destination = Trainer(destination_cfg)
+    destination.load_weights(source.ckpt_path)
+
+    assert destination.step == 0
+    assert destination.data.state_dict()["cursor"] == 0
+    source_state = source.model.state_dict()
+    destination_state = destination.model.state_dict()
+    assert source_state.keys() == destination_state.keys()
+    assert all(
+        np.array_equal(source_state[key].detach().numpy(), destination_state[key].detach().numpy())
+        for key in source_state
+    )
+
+
+def test_resume_rejects_changed_data_fingerprint(tmp_path):
+    bp, mp = write_corpus(tmp_path)
+    cfg = base_cfg(tmp_path, bp, mp)
+    cfg.update(max_steps=1, data_fingerprint="first")
+    source = Trainer(cfg)
+    source.train_steps()
+
+    changed = dict(
+        cfg,
+        out_dir=str(tmp_path / "changed"),
+        data_fingerprint="different",
+    )
+    destination = Trainer(changed)
+    with pytest.raises(ValueError, match="data_fingerprint"):
+        destination.load_ckpt(source.ckpt_path)
 
 
 def test_cosine_schedule():

@@ -56,6 +56,19 @@ def test_wraparound_epoch(tmp_path):
     assert ds.epoch >= 1
 
 
+def test_wraparound_trains_tail_instead_of_skipping_it(tmp_path):
+    bp, _ = make_shards(tmp_path, n=70, masked_span=(70, 70))
+    ds = PackedShards(bp, None, ctx=16, batch_size=2, device="cpu")
+
+    trained_targets = set()
+    for _ in range(3):
+        _, y = ds.next_batch()
+        trained_targets.update(y.flatten().tolist())
+
+    assert trained_targets == set(range(70))
+    assert ds.epoch == 1
+
+
 def test_masked_value_probe(tmp_path):
     bp, mp = make_shards(tmp_path, masked_span=(5, 90))
     ds = PackedShards(bp, mp, ctx=32, batch_size=2, device="cpu")

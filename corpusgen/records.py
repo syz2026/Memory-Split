@@ -62,6 +62,7 @@ DB_START = "<|db_start|>"
 DB_RETRIEVE = "<|db_retrieve|>"
 DB_END = "<|db_end|>"
 EOT = "<|eot|>"
+QUERY_TOKEN_CAP = 32
 
 
 def lookup_segments(name: str, relation: str, value: str) -> list[Segment]:
