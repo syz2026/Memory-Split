@@ -284,3 +284,260 @@ The following are intentional scope gates, not completed lifecycle support:
 ## Report path
 
 `/Users/stephenzhang/Documents/MemorySplit/.worktrees/memorysplit-v3-aws-n10/.superpowers/sdd/task-2b2-report.md`
+
+## Review follow-up: verifier evidence and caller-supplied planning hours
+
+The Task 2B2 review identified two fail-closed gaps:
+
+1. `instantiate_run_manifest()` trusted the injected verifier's receipt mapping
+   without comparing it to the requested receipt bytes, and
+   `_dataset_file_identities()` assumed that the first pinned file was the
+   receipt.
+2. The v3 path manufactured a 24-hour duration and emitted 96.0 GPU-hours per
+   arm even though no planning/canary duration had been supplied.
+
+Both findings are fixed in:
+
+- `27cdfaeded859756078dd0cd6c7975db9659186d`
+  (`fix: bind Task 2B2 runtime evidence`)
+- This follow-up is committed separately in the commit containing this
+  appended section.
+
+The original report's statement that 96.0 GPU-hours is deterministic budgeting
+metadata is superseded. There is now no default duration and no guessed
+per-arm GPU-hour value.
+
+### Review TDD RED: verifier evidence binding
+
+Tests were added before the verifier-evidence production changes. The valid
+case calls the real
+`cluster.aws.p5.corpus_contract.verify_canonical_corpus`, then reverses its
+pinned-file tuple to prove order independence. Fault cases first obtain real
+canonical evidence and only then mutate the returned evidence, so injected
+test verifiers cannot bypass the corpus semantics being exercised.
+
+Command:
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 python -m pytest -q -p no:cacheprovider \
+  --basetemp=/tmp/memorysplit-v3-task2b2-review-evidence-red \
+  tests/test_run_manifest_v3.py::\
+test_v3_accepts_reordered_pins_from_real_canonical_verifier \
+  tests/test_run_manifest_v3.py::\
+test_v3_rejects_faulty_dataset_verifier_evidence
+```
+
+Output:
+
+```text
+FFFFF.                                                                   [100%]
+5 failed, 1 passed in 3.94s
+```
+
+The failures proved the reported gaps:
+
+- reversed real evidence was rejected because the final sidecar happened to
+  become `files[0]` and was incorrectly treated as the receipt root;
+- different `build_id` receipt content was accepted;
+- an integer receipt field replaced by an equal-valued float was accepted;
+- evidence with the requested receipt pin removed was accepted;
+- evidence whose receipt pin pointed to a different same-byte file was
+  accepted.
+
+The one pre-fix pass was the wrong-receipt-hash mutation: rehashing already
+rejected a pin whose reported digest differed from its bytes. It remains as an
+explicit regression case.
+
+A separate exact-type RED made non-object receipt evidence reach the wrong
+error boundary:
+
+```text
+1 failed in 0.86s
+E AssertionError: assert 'SCHEMA_INVALID' == 'DATASET_RECEIPT_INVALID'
+```
+
+### Verifier evidence implementation
+
+The v3 instantiator now:
+
+- takes the parsed requested receipt as the expected semantic object;
+- compares `evidence.receipt` with recursive `same_typed_value()`, rejecting
+  value changes, numeric aliases, shape changes, and non-object evidence as
+  `DATASET_RECEIPT_INVALID`;
+- supplies the exact requested receipt path and its independently computed
+  SHA-256 to pinned-file validation;
+- derives the publication root from that requested path, never from arbitrary
+  tuple position;
+- rehashes every pinned file and retains the regular-file, single-link,
+  before/after identity, digest, and in-root checks;
+- requires exactly one pin resolving to the requested receipt and requires
+  that pin's reported hash to equal the independently computed receipt hash;
+- rejects omitted receipts, alternate receipt paths, duplicate requested
+  receipt identities, and mismatched receipt hashes.
+
+The shared helper's historical no-argument caller remains source-compatible.
+That branch now discovers exactly one `receipt.json` pin by name instead of
+using `files[0]`; the Task 2B2 instantiator always uses the stronger explicit
+requested-path/hash binding.
+
+The unchanged evidence tests after the fix produced:
+
+```text
+.......                                                                  [100%]
+7 passed in 4.63s
+```
+
+### Review TDD RED: required planning hours
+
+Before production changes, the desired API, CLI option, exact derivation, and
+invalid-value tests were added. The selected tests produced:
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 python -m pytest -q -p no:cacheprovider \
+  --basetemp=/tmp/memorysplit-v3-task2b2-review-hours-red \
+  tests/test_run_manifest_v3.py::\
+test_real_v3_release_instantiates_exact_seed_zero_and_nine_manifests \
+  tests/test_run_manifest_v3.py::\
+test_v3_rejects_invalid_estimated_instance_hours \
+  tests/test_run_manifest_v3.py::\
+test_v3_cli_requires_and_forwards_instantiation_inputs
+```
+
+```text
+FFFFFFFFFFF                                                              [100%]
+11 failed in 6.38s
+```
+
+The direct calls failed because `estimated_instance_hours` did not exist, and
+the CLI missing-argument evidence contained only the sealed-evaluation hash,
+not `--estimated-instance-hours`.
+
+Self-review added a Python integer too large to convert to finite float. It
+first escaped as raw `OverflowError`:
+
+```text
+1 failed in 0.77s
+E OverflowError: int too large to convert to float
+```
+
+After the fix, all invalid planning-hour boundaries passed:
+
+```text
+..........                                                               [100%]
+10 passed in 5.42s
+```
+
+### Planning-hour implementation
+
+The v3 API now accepts `estimated_instance_hours` with no duration default.
+The v3 CLI exposes:
+
+```text
+--estimated-instance-hours <finite-positive-number>
+```
+
+Both `--estimated-instance-hours` and
+`--sealed-evaluation-release-sha256` are required at the v3 CLI boundary.
+Legacy instantiation remains on its existing contract.
+
+The API rejects missing values, booleans, strings, zero, negatives, NaN,
+positive and negative infinity, finite inputs whose four-GPU multiplication
+overflows, and integers that cannot be represented finitely. No output is
+published on rejection.
+
+For accepted input `H`, each Dense/Split90 row receives exactly:
+
+```text
+estimated_gpu_hours = 4 * H
+```
+
+The exact seed-0/seed-9 and CLI tests use `H = 2.5`, proving that each arm emits
+10.0 GPU-hours rather than retaining the previous 96.0 constant. The loaded
+pair totals 20.0 GPU-hours.
+
+The selected planning-hour tests after the implementation produced:
+
+```text
+...........                                                              [100%]
+11 passed in 7.54s
+```
+
+### Shared-helper regression and correction
+
+The first required-suite run exposed that the AWS backend imports the same
+private pinned-file helper with its historical one-argument call:
+
+```text
+2 failed, 365 passed in 136.14s (0:02:16)
+```
+
+Both failures were `TypeError` from the initially required helper keyword
+arguments. No remote lifecycle file was modified. The helper retained its old
+call shape while the v3 instantiator supplies the exact path/hash arguments.
+The two unchanged regression tests then passed:
+
+```text
+..                                                                       [100%]
+2 passed in 0.44s
+```
+
+The combined shared-helper and new evidence checks after removing all
+first-file ordering assumptions produced:
+
+```text
+.........                                                                [100%]
+9 passed in 4.34s
+```
+
+### Final required GREEN
+
+After all review fixes:
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 python -m pytest -q -p no:cacheprovider \
+  --basetemp=/tmp/memorysplit-v3-task2b2-review-final-2 \
+  tests/test_run_manifest_v3.py \
+  tests/test_aws_contract_roundtrip.py \
+  tests/test_cohort_assignment_v3.py \
+  tests/test_package_aws_p5_handoff.py \
+  tests/test_msctl.py
+```
+
+```text
+........................................................................ [ 19%]
+........................................................................ [ 39%]
+........................................................................ [ 58%]
+........................................................................ [ 78%]
+........................................................................ [ 97%]
+........                                                                 [100%]
+368 passed in 132.61s (0:02:12)
+```
+
+The following also produced no output and exited `0`:
+
+```bash
+git diff --check
+PYTHONDONTWRITEBYTECODE=1 python -m py_compile \
+  msctl/contracts.py \
+  msctl/operations.py \
+  msctl/cli.py \
+  tests/test_run_manifest_v3.py
+```
+
+### Review scope and remaining concerns
+
+The implementation commit modifies only:
+
+- `msctl/operations.py`
+- `msctl/cli.py`
+- `tests/test_run_manifest_v3.py`
+
+This appended report is the only additional file in the documentation commit.
+No state, checkpoint, remote AWS lifecycle, evaluation, IaC, verifier,
+runbook, packaging, launcher, v2 scientific asset, Illumina asset, or
+`corpusgen/` file changed.
+
+No known Task 2B2 review finding remains. The existing Task 3 gates still
+apply: the v3 manifest intentionally has no legacy `dataset_sha256` property,
+non-instantiation v3 AWS CLI paths remain unavailable, and sealed-evaluation
+artifact verification remains outside Task 2B2.
