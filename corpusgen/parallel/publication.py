@@ -8,8 +8,8 @@ import os
 import fcntl
 import stat
 from dataclasses import dataclass
-from pathlib import Path
-from typing import TYPE_CHECKING, Any, BinaryIO
+from pathlib import Path, PurePosixPath
+from typing import TYPE_CHECKING, Any
 
 from .canonical import canonical_json_bytes, sha256_hex
 from .catalog import InputCatalog
@@ -46,6 +46,8 @@ from .safeio import (
     open_directory_at,
     open_directory_path,
     open_parent_directory,
+    open_regular_file_at,
+    read_file_descriptor,
     read_regular_file,
     regular_file_digest,
     unlink_regular_if_matches,
@@ -191,22 +193,6 @@ def publication_staging_path(
     if not path.name:
         raise ValueError("destination must name a directory")
     return path.parent / f".{path.name}.parallel-work-{build_id[:16]}"
-
-
-def _sha256_file(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1 << 20), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
-def _artifact(root: Path, path: Path) -> dict[str, object]:
-    return {
-        "bytes": path.stat().st_size,
-        "path": path.relative_to(root).as_posix(),
-        "sha256": _sha256_file(path),
-    }
 
 
 class _ShardSink:
@@ -453,7 +439,6 @@ def _prepare_staging(
     shard_names: set[str],
 ) -> int:
     owner_payload = _stage_owner_bytes(build_id)
-    fcntl.flock(stage_fd, fcntl.LOCK_EX)
     if created:
         if list_entries(stage_fd):
             raise ValueError("new parallel corpus staging directory is not empty")
@@ -528,7 +513,6 @@ def _publish_staging(
     stage_fd: int,
     stage_name: str,
     output_name: str,
-    output_path: Path,
     build_id: str,
 ) -> dict[str, Any]:
     stage_metadata = os.fstat(stage_fd)
@@ -547,11 +531,22 @@ def _publish_staging(
             output_name,
         )
     except FileExistsError:
+        atomic_write_or_match(
+            stage_fd,
+            _STAGE_OWNER_NAME,
+            _stage_owner_bytes(build_id),
+            owner=build_id,
+        )
+        fsync_directory(stage_fd)
         try:
-            return verify_parallel_corpus(
-                output_path,
-                expected_build_id=build_id,
-            )
+            published_fd, _created = open_directory_at(parent_fd, output_name)
+            try:
+                return _verify_parallel_corpus_fd(
+                    published_fd,
+                    expected_build_id=build_id,
+                )
+            finally:
+                os.close(published_fd)
         except (OSError, ValueError) as error:
             raise ValueError(
                 f"conflicting parallel corpus output: {output_name}"
@@ -564,80 +559,25 @@ def _publish_staging(
             stage_metadata.st_ino,
         ):
             raise ValueError("published corpus directory identity changed")
+        fsync_directory(parent_fd)
+        return _verify_parallel_corpus_fd(
+            published_fd,
+            expected_build_id=build_id,
+        )
     finally:
         os.close(published_fd)
-    fsync_directory(parent_fd)
-    return verify_parallel_corpus(
-        output_path,
-        expected_build_id=build_id,
-    )
 
 
-class _PackedReader:
-    def __init__(self, paths: list[Path]) -> None:
-        self.paths = paths
-        self.index = 0
-        self.handle: BinaryIO | None = None
-        self.digest = hashlib.sha256()
-
-    def _next_handle(self) -> bool:
-        if self.handle is not None:
-            self.handle.close()
-        if self.index >= len(self.paths):
-            self.handle = None
-            return False
-        self.handle = self.paths[self.index].open("rb")
-        self.index += 1
-        return True
-
-    def consume(
-        self,
-        byte_count: int,
-        *,
-        local_digest: Any | None = None,
-        require_zero: bool = False,
-    ) -> None:
-        remaining = byte_count
-        while remaining:
-            if self.handle is None and not self._next_handle():
-                raise ValueError("packed shards end before their declared token stream")
-            assert self.handle is not None
-            chunk = self.handle.read(min(1 << 20, remaining))
-            if not chunk:
-                self.handle.close()
-                self.handle = None
-                continue
-            self.digest.update(chunk)
-            if local_digest is not None:
-                local_digest.update(chunk)
-            if require_zero and any(chunk):
-                raise ValueError("packed update padding is not zero")
-            remaining -= len(chunk)
-
-    def finish(self) -> str:
-        if self.handle is not None:
-            if self.handle.read(1):
-                raise ValueError("packed shards contain trailing bytes")
-            self.handle.close()
-            self.handle = None
-        while self.index < len(self.paths):
-            with self.paths[self.index].open("rb") as handle:
-                if handle.read(1):
-                    raise ValueError("packed shards contain trailing bytes")
-            self.index += 1
-        return self.digest.hexdigest()
-
-
-def _validate_artifacts(
-    root: Path,
+def _artifact_contract(
     receipt: dict[str, Any],
-    *,
-    allow_stage_owner: bool = False,
-) -> list[dict[str, Any]]:
+) -> tuple[dict[str, dict[str, Any]], set[tuple[str, ...]]]:
     artifacts = receipt["artifacts"]
     if not isinstance(artifacts, list) or not artifacts:
         raise ValueError("publication artifacts must be a non-empty list")
-    paths = []
+    artifact_by_path = {}
+    file_parts = set()
+    directory_parts = {()}
+    ordered_paths = []
     for artifact in artifacts:
         if not isinstance(artifact, dict) or set(artifact) != _ARTIFACT_FIELDS:
             raise ValueError("invalid publication artifact record")
@@ -648,52 +588,254 @@ def _validate_artifacts(
             or "\\" in relative_text
         ):
             raise ValueError("artifact path must be a safe relative POSIX path")
-        relative = Path(relative_text)
-        if relative.is_absolute() or ".." in relative.parts or relative == Path("."):
+        relative = PurePosixPath(relative_text)
+        parts = relative.parts
+        if (
+            relative.is_absolute()
+            or relative.as_posix() != relative_text
+            or not parts
+            or any(part in {"", ".", ".."} for part in parts)
+            or relative_text in {"receipt.json", _STAGE_OWNER_NAME}
+        ):
             raise ValueError("artifact path must be a safe relative POSIX path")
-        if relative.as_posix() != relative_text:
-            raise ValueError("artifact path is not canonical")
-        path = root / relative
-        if not path.is_file() or path.is_symlink():
-            raise ValueError(f"publication artifact is missing or unsafe: {relative_text}")
         if (
             isinstance(artifact["bytes"], bool)
             or not isinstance(artifact["bytes"], int)
             or artifact["bytes"] < 0
-            or path.stat().st_size != artifact["bytes"]
-            or _sha256_file(path) != artifact["sha256"]
+            or not isinstance(artifact["sha256"], str)
+            or len(artifact["sha256"]) != 64
+            or any(
+                character not in "0123456789abcdef"
+                for character in artifact["sha256"]
+            )
         ):
-            raise ValueError(f"publication artifact digest drift: {relative_text}")
-        paths.append(relative_text)
-    if paths != sorted(paths) or len(paths) != len(set(paths)):
+            raise ValueError("invalid publication artifact digest record")
+        ordered_paths.append(relative_text)
+        artifact_by_path[relative_text] = artifact
+        file_parts.add(parts)
+        for depth in range(1, len(parts)):
+            directory_parts.add(parts[:depth])
+    if ordered_paths != sorted(ordered_paths) or len(ordered_paths) != len(
+        set(ordered_paths)
+    ):
         raise ValueError("publication artifact paths must be sorted and unique")
-    actual_files = set()
-    for path in root.rglob("*"):
-        if path.is_symlink():
-            raise ValueError(f"publication contains a symlink: {path}")
-        if path.is_file():
-            actual_files.add(path.relative_to(root).as_posix())
-    expected_files = {*paths, "receipt.json"}
+    if file_parts & directory_parts:
+        raise ValueError("publication artifact path collides with a directory")
+    return artifact_by_path, directory_parts
+
+
+def _unexpected_namespace_entry(
+    directory_fd: int,
+    name: str,
+    relative: str,
+) -> ValueError:
+    metadata = entry_lstat(directory_fd, name)
+    if stat.S_ISLNK(metadata.st_mode):
+        kind = "symlink"
+    elif stat.S_ISDIR(metadata.st_mode):
+        kind = "unexpected directory"
+    elif stat.S_ISREG(metadata.st_mode):
+        kind = "unexpected file"
+    else:
+        kind = "special entry"
+    return ValueError(f"publication namespace contains {kind}: {relative}")
+
+
+def _open_artifact_namespace(
+    root_fd: int,
+    artifact_by_path: dict[str, dict[str, Any]],
+    directory_parts: set[tuple[str, ...]],
+    receipt_metadata: os.stat_result,
+    *,
+    allow_stage_owner: bool,
+) -> tuple[dict[str, tuple[int, os.stat_result]], bytes | None]:
+    file_parts = {
+        tuple(PurePosixPath(path).parts): path for path in artifact_by_path
+    }
+    reserved_files = {("receipt.json",): "receipt.json"}
     if allow_stage_owner:
-        expected_files.add(_STAGE_OWNER_NAME)
-    if actual_files != expected_files:
-        raise ValueError("publication receipt is not hash-complete")
-    return artifacts
+        reserved_files[(_STAGE_OWNER_NAME,)] = _STAGE_OWNER_NAME
+    expected_children: dict[tuple[str, ...], dict[str, str]] = {
+        directory: {} for directory in directory_parts
+    }
+    for directory in directory_parts:
+        if directory:
+            expected_children[directory[:-1]][directory[-1]] = "directory"
+    for parts, path in {**file_parts, **reserved_files}.items():
+        if parts[:-1] not in expected_children:
+            raise ValueError("publication artifact directory namespace is invalid")
+        expected_children[parts[:-1]][parts[-1]] = path
+
+    directory_fds = {(): root_fd}
+    opened_files: dict[str, tuple[int, os.stat_result]] = {}
+    owner_bytes = None
+    try:
+        for directory in sorted(directory_parts, key=lambda parts: (len(parts), parts)):
+            directory_fd = directory_fds[directory]
+            expected = expected_children[directory]
+            actual_names = set(list_entries(directory_fd))
+            expected_names = set(expected)
+            extras = sorted(actual_names - expected_names)
+            if extras:
+                name = extras[0]
+                relative = "/".join((*directory, name))
+                raise _unexpected_namespace_entry(directory_fd, name, relative)
+            missing = sorted(expected_names - actual_names)
+            if missing:
+                relative = "/".join((*directory, missing[0]))
+                raise ValueError(f"publication namespace is missing: {relative}")
+            for name, kind in sorted(expected.items()):
+                child_parts = (*directory, name)
+                if kind == "directory":
+                    child_fd, _created = open_directory_at(directory_fd, name)
+                    directory_fds[child_parts] = child_fd
+                    continue
+                if kind == "receipt.json":
+                    current = entry_lstat(directory_fd, name)
+                    if (
+                        not stat.S_ISREG(current.st_mode)
+                        or (current.st_dev, current.st_ino)
+                        != (receipt_metadata.st_dev, receipt_metadata.st_ino)
+                    ):
+                        raise ValueError("parallel corpus receipt identity changed")
+                    continue
+                descriptor, metadata = open_regular_file_at(directory_fd, name)
+                if kind == _STAGE_OWNER_NAME:
+                    try:
+                        owner_bytes = read_file_descriptor(descriptor)
+                    finally:
+                        os.close(descriptor)
+                else:
+                    opened_files[kind] = (descriptor, metadata)
+        return opened_files, owner_bytes
+    except BaseException:
+        for descriptor, _metadata in opened_files.values():
+            os.close(descriptor)
+        raise
+    finally:
+        for directory, descriptor in directory_fds.items():
+            if directory:
+                os.close(descriptor)
 
 
-def verify_parallel_corpus(
-    root: Path | str,
+def _read_opened_artifact(
+    opened_files: dict[str, tuple[int, os.stat_result]],
+    artifact_by_path: dict[str, dict[str, Any]],
+    relative: str,
+) -> bytes:
+    descriptor, metadata = opened_files.pop(relative)
+    artifact = artifact_by_path[relative]
+    try:
+        payload = read_file_descriptor(descriptor)
+    finally:
+        os.close(descriptor)
+    if (
+        metadata.st_size != artifact["bytes"]
+        or len(payload) != artifact["bytes"]
+        or sha256_hex(payload) != artifact["sha256"]
+    ):
+        raise ValueError(f"publication artifact digest drift: {relative}")
+    return payload
+
+
+class _PinnedPackedReader:
+    def __init__(
+        self,
+        entries: list[
+            tuple[str, int, os.stat_result, dict[str, Any]]
+        ],
+    ) -> None:
+        self.entries = entries
+        self.index = 0
+        self.remaining = 0
+        self.local_digest = hashlib.sha256()
+        self.global_digest = hashlib.sha256()
+        try:
+            self._begin_entry()
+        except BaseException:
+            self.close()
+            raise
+
+    def _begin_entry(self) -> None:
+        if self.index >= len(self.entries):
+            self.remaining = 0
+            return
+        relative, _descriptor, metadata, artifact = self.entries[self.index]
+        if metadata.st_size != artifact["bytes"]:
+            raise ValueError(f"publication artifact digest drift: {relative}")
+        self.remaining = metadata.st_size
+        self.local_digest = hashlib.sha256()
+
+    def _finish_empty_entries(self) -> None:
+        while self.index < len(self.entries) and self.remaining == 0:
+            relative, descriptor, _metadata, artifact = self.entries[self.index]
+            actual_digest = self.local_digest.hexdigest()
+            os.close(descriptor)
+            self.index += 1
+            self._begin_entry()
+            if actual_digest != artifact["sha256"]:
+                raise ValueError(f"publication artifact digest drift: {relative}")
+
+    def consume(
+        self,
+        byte_count: int,
+        *,
+        record_digest: Any | None = None,
+        require_zero: bool = False,
+    ) -> None:
+        remaining = byte_count
+        while remaining:
+            self._finish_empty_entries()
+            if self.index >= len(self.entries):
+                raise ValueError(
+                    "packed shards end before their declared token stream"
+                )
+            _relative, descriptor, _metadata, _artifact = self.entries[self.index]
+            chunk = os.read(descriptor, min(1 << 20, remaining, self.remaining))
+            if not chunk:
+                raise ValueError("packed shard ends before its declared size")
+            self.local_digest.update(chunk)
+            self.global_digest.update(chunk)
+            if record_digest is not None:
+                record_digest.update(chunk)
+            if require_zero and any(chunk):
+                raise ValueError("packed update padding is not zero")
+            self.remaining -= len(chunk)
+            remaining -= len(chunk)
+
+    def finish(self) -> str:
+        self._finish_empty_entries()
+        if self.index != len(self.entries):
+            raise ValueError("packed shards contain trailing bytes")
+        return self.global_digest.hexdigest()
+
+    def close(self) -> None:
+        for index in range(self.index, len(self.entries)):
+            descriptor = self.entries[index][1]
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+        self.index = len(self.entries)
+
+
+def _verify_parallel_corpus_fd(
+    publication_fd: int,
     *,
     expected_build_id: str | None = None,
-    _allow_stage_owner: bool = False,
+    allow_stage_owner: bool = False,
 ) -> dict[str, Any]:
-    publication = Path(root)
-    if not publication.is_dir() or publication.is_symlink():
-        raise ValueError("parallel corpus publication is missing or unsafe")
-    receipt_path = publication / "receipt.json"
-    if not receipt_path.is_file() or receipt_path.is_symlink():
-        raise ValueError("parallel corpus receipt is missing or unsafe")
-    receipt_bytes = receipt_path.read_bytes()
+    try:
+        receipt_fd, receipt_metadata = open_regular_file_at(
+            publication_fd,
+            "receipt.json",
+        )
+    except (OSError, ValueError) as error:
+        raise ValueError("parallel corpus receipt is missing or unsafe") from error
+    try:
+        receipt_bytes = read_file_descriptor(receipt_fd)
+    finally:
+        os.close(receipt_fd)
     try:
         receipt = json.loads(receipt_bytes)
     except (UnicodeDecodeError, json.JSONDecodeError) as error:
@@ -709,94 +851,197 @@ def verify_parallel_corpus(
         or receipt["compiler_version"] != _COMPILER_VERSION
     ):
         raise ValueError("parallel corpus format identity mismatch")
-    artifacts = _validate_artifacts(
-        publication,
-        receipt,
-        allow_stage_owner=_allow_stage_owner,
+    artifact_by_path, directory_parts = _artifact_contract(receipt)
+    opened_files, owner_bytes = _open_artifact_namespace(
+        publication_fd,
+        artifact_by_path,
+        directory_parts,
+        receipt_metadata,
+        allow_stage_owner=allow_stage_owner,
     )
-    artifact_by_path = {artifact["path"]: artifact for artifact in artifacts}
-    required_paths = {
-        "assignments.jsonl",
-        "catalog.jsonl",
-        "metadata.jsonl",
-        "schedule.jsonl",
-    }
-    if not required_paths <= set(artifact_by_path):
-        raise ValueError("parallel corpus is missing required foundation artifacts")
+    try:
+        required_paths = {
+            "assignments.jsonl",
+            "catalog.jsonl",
+            "metadata.jsonl",
+            "schedule.jsonl",
+        }
+        if not required_paths <= set(artifact_by_path):
+            raise ValueError(
+                "parallel corpus is missing required foundation artifacts"
+            )
+        config = ParallelBuildConfig.from_dict(receipt["config"])
+        renderer_id = receipt["renderer_id"]
+        if not isinstance(renderer_id, str) or not renderer_id:
+            raise ValueError("receipt renderer_id must be non-empty")
+        catalog_bytes = _read_opened_artifact(
+            opened_files,
+            artifact_by_path,
+            "catalog.jsonl",
+        )
+        metadata_bytes = _read_opened_artifact(
+            opened_files,
+            artifact_by_path,
+            "metadata.jsonl",
+        )
+        schedule_bytes = _read_opened_artifact(
+            opened_files,
+            artifact_by_path,
+            "schedule.jsonl",
+        )
+        assignment_bytes = _read_opened_artifact(
+            opened_files,
+            artifact_by_path,
+            "assignments.jsonl",
+        )
+        catalog = InputCatalog.from_bytes(catalog_bytes)
+        metadata = metadata_from_bytes(metadata_bytes)
+        schedule = schedule_from_bytes(schedule_bytes)
+        assignments = assignments_from_bytes(assignment_bytes)
+        reduced = reduce_metadata(
+            catalog,
+            metadata,
+            expected_renderer_id=renderer_id,
+        )
+        expected_schedule = largest_deficit_schedule(
+            reduced,
+            config.lane_weights,
+        )
+        if schedule != expected_schedule:
+            raise ValueError(
+                "published schedule is not the canonical deficit reduction"
+            )
+        expected_assignments = assign_update_aligned_shards(
+            total_tokens=schedule[-1].token_end,
+            update_tokens=config.update_tokens,
+            shard_count=config.shard_count,
+            allow_fewer=config.allow_fewer_shards,
+        )
+        if assignments != expected_assignments:
+            raise ValueError("published shard assignments are not canonical")
+        ordered_hash, merkle_root = ordered_stream_commitments(schedule, reduced)
+        build_id = parallel_build_id(catalog, renderer_id, config)
+        logical_tokens = schedule[-1].token_end
+        packed_tokens = assignments[-1].token_end
+        expected_scalars = {
+            "assignments_sha256": sha256_hex(assignment_bytes),
+            "build_id": build_id,
+            "catalog_sha256": catalog.sha256,
+            "logical_tokens": logical_tokens,
+            "merkle_root_sha256": merkle_root,
+            "metadata_sha256": sha256_hex(metadata_bytes),
+            "ordered_stream_sha256": ordered_hash,
+            "packed_tokens": packed_tokens,
+            "padding_tokens": packed_tokens - logical_tokens,
+            "record_count": len(metadata),
+            "schedule_sha256": sha256_hex(schedule_bytes),
+            "shard_count": len(assignments),
+        }
+        for field_name, expected in expected_scalars.items():
+            if receipt[field_name] != expected:
+                raise ValueError(f"parallel corpus receipt drift: {field_name}")
+        if expected_build_id is not None and build_id != expected_build_id:
+            raise ValueError("parallel corpus build id does not match expectation")
+        if allow_stage_owner:
+            if owner_bytes != _stage_owner_bytes(build_id):
+                raise ValueError("parallel corpus staging ownership marker drift")
+        elif owner_bytes is not None:
+            raise ValueError("published corpus contains a staging owner marker")
 
-    config = ParallelBuildConfig.from_dict(receipt["config"])
-    renderer_id = receipt["renderer_id"]
-    if not isinstance(renderer_id, str) or not renderer_id:
-        raise ValueError("receipt renderer_id must be non-empty")
-    catalog_bytes = (publication / "catalog.jsonl").read_bytes()
-    metadata_bytes = (publication / "metadata.jsonl").read_bytes()
-    schedule_bytes = (publication / "schedule.jsonl").read_bytes()
-    assignment_bytes = (publication / "assignments.jsonl").read_bytes()
-    catalog = InputCatalog.from_bytes(catalog_bytes)
-    metadata = metadata_from_bytes(metadata_bytes)
-    schedule = schedule_from_bytes(schedule_bytes)
-    assignments = assignments_from_bytes(assignment_bytes)
-    reduced = reduce_metadata(
-        catalog,
-        metadata,
-        expected_renderer_id=renderer_id,
-    )
-    expected_schedule = largest_deficit_schedule(reduced, config.lane_weights)
-    if schedule != expected_schedule:
-        raise ValueError("published schedule is not the canonical deficit reduction")
-    expected_assignments = assign_update_aligned_shards(
-        total_tokens=schedule[-1].token_end,
-        update_tokens=config.update_tokens,
-        shard_count=config.shard_count,
-        allow_fewer=config.allow_fewer_shards,
-    )
-    if assignments != expected_assignments:
-        raise ValueError("published shard assignments are not canonical")
-    ordered_hash, merkle_root = ordered_stream_commitments(schedule, reduced)
-    build_id = parallel_build_id(catalog, renderer_id, config)
-    logical_tokens = schedule[-1].token_end
-    packed_tokens = assignments[-1].token_end
-    expected_scalars = {
-        "assignments_sha256": sha256_hex(assignment_bytes),
-        "build_id": build_id,
-        "catalog_sha256": catalog.sha256,
-        "logical_tokens": logical_tokens,
-        "merkle_root_sha256": merkle_root,
-        "metadata_sha256": sha256_hex(metadata_bytes),
-        "ordered_stream_sha256": ordered_hash,
-        "packed_tokens": packed_tokens,
-        "padding_tokens": packed_tokens - logical_tokens,
-        "record_count": len(metadata),
-        "schedule_sha256": sha256_hex(schedule_bytes),
-        "shard_count": len(assignments),
-    }
-    for field_name, expected in expected_scalars.items():
-        if receipt[field_name] != expected:
-            raise ValueError(f"parallel corpus receipt drift: {field_name}")
-    if expected_build_id is not None and build_id != expected_build_id:
-        raise ValueError("parallel corpus build id does not match expectation")
+        shard_paths = [
+            f"shards/{assignment.shard_id}.bin" for assignment in assignments
+        ]
+        if set(artifact_by_path) - required_paths != set(shard_paths):
+            raise ValueError(
+                "parallel corpus shard namespace does not match assignments"
+            )
+        entries = []
+        for assignment, relative in zip(
+            assignments,
+            shard_paths,
+            strict=True,
+        ):
+            expected_bytes = (
+                assignment.token_end - assignment.token_start
+            ) * 2
+            if artifact_by_path[relative]["bytes"] != expected_bytes:
+                raise ValueError(f"parallel corpus shard size drift: {relative}")
+            descriptor, metadata_stat = opened_files.pop(relative)
+            entries.append(
+                (
+                    relative,
+                    descriptor,
+                    metadata_stat,
+                    artifact_by_path[relative],
+                )
+            )
+        reader = _PinnedPackedReader(entries)
+        try:
+            metadata_by_id = {record.record_id: record for record in metadata}
+            for entry in schedule:
+                digest = hashlib.sha256()
+                reader.consume(
+                    entry.token_length * 2,
+                    record_digest=digest,
+                )
+                if (
+                    digest.hexdigest()
+                    != metadata_by_id[entry.record_id].render_sha256
+                ):
+                    raise ValueError(
+                        f"packed record digest drift: {entry.record_id}"
+                    )
+            reader.consume(
+                (packed_tokens - logical_tokens) * 2,
+                require_zero=True,
+            )
+            packed_digest = reader.finish()
+        finally:
+            reader.close()
+        if receipt["packed_stream_sha256"] != packed_digest:
+            raise ValueError("packed stream digest drift")
+        return receipt
+    finally:
+        for descriptor, _metadata in opened_files.values():
+            os.close(descriptor)
 
-    shard_paths = [
-        f"shards/{assignment.shard_id}.bin" for assignment in assignments
-    ]
-    if set(artifact_by_path) - required_paths != set(shard_paths):
-        raise ValueError("parallel corpus shard namespace does not match assignments")
-    for assignment, relative in zip(assignments, shard_paths, strict=True):
-        expected_bytes = (assignment.token_end - assignment.token_start) * 2
-        if artifact_by_path[relative]["bytes"] != expected_bytes:
-            raise ValueError(f"parallel corpus shard size drift: {relative}")
-    reader = _PackedReader([publication / path for path in shard_paths])
-    metadata_by_id = {record.record_id: record for record in metadata}
-    for entry in schedule:
-        digest = hashlib.sha256()
-        reader.consume(entry.token_length * 2, local_digest=digest)
-        if digest.hexdigest() != metadata_by_id[entry.record_id].render_sha256:
-            raise ValueError(f"packed record digest drift: {entry.record_id}")
-    reader.consume((packed_tokens - logical_tokens) * 2, require_zero=True)
-    packed_digest = reader.finish()
-    if receipt["packed_stream_sha256"] != packed_digest:
-        raise ValueError("packed stream digest drift")
-    return receipt
+
+def verify_parallel_corpus(
+    root: Path | str,
+    *,
+    expected_build_id: str | None = None,
+    _allow_stage_owner: bool = False,
+) -> dict[str, Any]:
+    try:
+        publication_fd = open_directory_path(root)
+    except (OSError, ValueError) as error:
+        raise ValueError(
+            "parallel corpus publication is missing or unsafe"
+        ) from error
+    try:
+        return _verify_parallel_corpus_fd(
+            publication_fd,
+            expected_build_id=expected_build_id,
+            allow_stage_owner=_allow_stage_owner,
+        )
+    finally:
+        os.close(publication_fd)
+
+
+def _verify_parallel_corpus_at(
+    parent_fd: int,
+    name: str,
+    *,
+    expected_build_id: str,
+) -> dict[str, Any]:
+    publication_fd, _created = open_directory_at(parent_fd, name)
+    try:
+        return _verify_parallel_corpus_fd(
+            publication_fd,
+            expected_build_id=expected_build_id,
+        )
+    finally:
+        os.close(publication_fd)
 
 
 def build_parallel_corpus(
@@ -820,69 +1065,15 @@ def build_parallel_corpus(
     try:
         if entry_exists(parent_fd, output_name):
             try:
-                return verify_parallel_corpus(
-                    output,
+                return _verify_parallel_corpus_at(
+                    parent_fd,
+                    output_name,
                     expected_build_id=build_id,
                 )
             except (OSError, ValueError) as error:
                 raise ValueError(
                     f"conflicting parallel corpus output: {output}"
                 ) from error
-
-        if entry_exists(parent_fd, stage_name):
-            stage_metadata = entry_lstat(parent_fd, stage_name)
-            if not stat.S_ISDIR(stage_metadata.st_mode):
-                raise ValueError("parallel corpus staging path is unsafe")
-            existing_stage_fd, _created = open_directory_at(parent_fd, stage_name)
-            try:
-                fcntl.flock(existing_stage_fd, fcntl.LOCK_EX)
-                _validate_stage_namespace(existing_stage_fd, build_id)
-                if entry_exists(existing_stage_fd, "receipt.json"):
-                    has_owner = entry_exists(
-                        existing_stage_fd,
-                        _STAGE_OWNER_NAME,
-                    )
-                    if has_owner:
-                        actual_owner = read_regular_file(
-                            existing_stage_fd,
-                            _STAGE_OWNER_NAME,
-                        )
-                        if actual_owner != owner_payload:
-                            raise ValueError(
-                                "parallel corpus staging ownership marker drift"
-                            )
-                    verify_parallel_corpus(
-                        stage_path,
-                        expected_build_id=build_id,
-                        _allow_stage_owner=has_owner,
-                    )
-                    if has_owner:
-                        unlink_regular_if_matches(
-                            existing_stage_fd,
-                            _STAGE_OWNER_NAME,
-                            owner_payload,
-                        )
-                    return _publish_staging(
-                        parent_fd=parent_fd,
-                        stage_fd=existing_stage_fd,
-                        stage_name=stage_name,
-                        output_name=output_name,
-                        output_path=output,
-                        build_id=build_id,
-                    )
-                if not entry_exists(existing_stage_fd, _STAGE_OWNER_NAME):
-                    raise ValueError(
-                        "parallel corpus staging ownership marker is missing"
-                    )
-                if (
-                    read_regular_file(existing_stage_fd, _STAGE_OWNER_NAME)
-                    != owner_payload
-                ):
-                    raise ValueError(
-                        "parallel corpus staging ownership marker drift"
-                    )
-            finally:
-                os.close(existing_stage_fd)
 
         if (_materialized_metadata is None) != (_cached_payloads is None):
             raise ValueError(
@@ -911,6 +1102,71 @@ def build_parallel_corpus(
         metadata_bytes = metadata_to_bytes(metadata)
         schedule_bytes = schedule_to_bytes(schedule)
         assignment_bytes = assignments_to_bytes(assignments)
+
+        fcntl.flock(parent_fd, fcntl.LOCK_EX)
+        if entry_exists(parent_fd, output_name):
+            try:
+                return _verify_parallel_corpus_at(
+                    parent_fd,
+                    output_name,
+                    expected_build_id=build_id,
+                )
+            except (OSError, ValueError) as error:
+                raise ValueError(
+                    f"conflicting parallel corpus output: {output}"
+                ) from error
+        if entry_exists(parent_fd, stage_name):
+            stage_metadata = entry_lstat(parent_fd, stage_name)
+            if not stat.S_ISDIR(stage_metadata.st_mode):
+                raise ValueError("parallel corpus staging path is unsafe")
+            existing_stage_fd, _created = open_directory_at(parent_fd, stage_name)
+            try:
+                _validate_stage_namespace(existing_stage_fd, build_id)
+                if entry_exists(existing_stage_fd, "receipt.json"):
+                    has_owner = entry_exists(
+                        existing_stage_fd,
+                        _STAGE_OWNER_NAME,
+                    )
+                    if has_owner:
+                        actual_owner = read_regular_file(
+                            existing_stage_fd,
+                            _STAGE_OWNER_NAME,
+                        )
+                        if actual_owner != owner_payload:
+                            raise ValueError(
+                                "parallel corpus staging ownership marker drift"
+                            )
+                    _verify_parallel_corpus_fd(
+                        existing_stage_fd,
+                        expected_build_id=build_id,
+                        allow_stage_owner=has_owner,
+                    )
+                    if has_owner:
+                        unlink_regular_if_matches(
+                            existing_stage_fd,
+                            _STAGE_OWNER_NAME,
+                            owner_payload,
+                        )
+                    return _publish_staging(
+                        parent_fd=parent_fd,
+                        stage_fd=existing_stage_fd,
+                        stage_name=stage_name,
+                        output_name=output_name,
+                        build_id=build_id,
+                    )
+                if not entry_exists(existing_stage_fd, _STAGE_OWNER_NAME):
+                    raise ValueError(
+                        "parallel corpus staging ownership marker is missing"
+                    )
+                if (
+                    read_regular_file(existing_stage_fd, _STAGE_OWNER_NAME)
+                    != owner_payload
+                ):
+                    raise ValueError(
+                        "parallel corpus staging ownership marker drift"
+                    )
+            finally:
+                os.close(existing_stage_fd)
 
         stage_fd, created = open_directory_at(
             parent_fd,
@@ -1009,18 +1265,18 @@ def build_parallel_corpus(
             )
             fsync_directory(shards_fd)
             fsync_directory(stage_fd)
-            verify_parallel_corpus(
-                stage_path,
+            _verify_parallel_corpus_fd(
+                stage_fd,
                 expected_build_id=build_id,
-                _allow_stage_owner=True,
+                allow_stage_owner=True,
             )
             unlink_regular_if_matches(
                 stage_fd,
                 _STAGE_OWNER_NAME,
                 owner_payload,
             )
-            verify_parallel_corpus(
-                stage_path,
+            _verify_parallel_corpus_fd(
+                stage_fd,
                 expected_build_id=build_id,
             )
             return _publish_staging(
@@ -1028,7 +1284,6 @@ def build_parallel_corpus(
                 stage_fd=stage_fd,
                 stage_name=stage_name,
                 output_name=output_name,
-                output_path=output,
                 build_id=build_id,
             )
         finally:

@@ -7,7 +7,7 @@
 #SBATCH --export=NONE
 #SBATCH --output=v2-corpus-verify-%j.out
 #
-# Submit only the required values:
+# Command-line --export overrides the non-inheriting directive. Submit only:
 #   sbatch --export=MS_REPO=/shared/memorysplit,MS_PYTHON=/shared/venv/bin/python,MS_SHARED_ROOT=/shared/corpora,MS_BUILD_ID=<sha256> cluster/slurm/v2_corpus_verify.sbatch
 set -euo pipefail
 

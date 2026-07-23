@@ -3,15 +3,19 @@
 from __future__ import annotations
 
 import fcntl
+import json
 import os
 import re
+import secrets
 import stat
 from pathlib import Path
 
 from .canonical import canonical_json_bytes, sha256_hex
 from .safeio import (
+    atomic_rename_noreplace,
     atomic_write_or_match,
     clean_owned_temporaries,
+    entry_exists,
     entry_lstat,
     fsync_directory,
     is_owned_temporary,
@@ -31,6 +35,8 @@ from .tasks import (
 
 _WORKSPACE_ROOT = ".memorysplit-v2-builds"
 _OWNER_NAME = ".task-workspace-owner.json"
+_LOCAL_WORKSPACE_ROOT = ".memorysplit-v2-local-tasks"
+_LOCAL_OWNER_NAME = ".local-task-owner.json"
 _IDENTIFIER = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z")
 
 
@@ -94,6 +100,79 @@ def task_workspace_path(
         / _digest(build_id, "workspace build_id")
         / _workspace_name(scheduler_id, nonce)
     )
+
+
+def _local_identity_bytes(
+    build_id: str,
+    *,
+    scheduler_id: str,
+    job_id: str,
+    nonce: str,
+    task_index: int,
+) -> bytes:
+    if (
+        isinstance(task_index, bool)
+        or not isinstance(task_index, int)
+        or task_index < 0
+    ):
+        raise ValueError("task_index must be a non-negative integer")
+    return canonical_json_bytes(
+        {
+            "build_id": _digest(build_id, "local build_id"),
+            "job_id": _identifier(job_id, "job_id"),
+            "nonce": _identifier(nonce, "nonce"),
+            "scheduler_id": _identifier(scheduler_id, "scheduler_id"),
+            "task_index": task_index,
+        }
+    )
+
+
+def local_task_workspace_path(
+    local_root: Path | str,
+    build_id: str,
+    *,
+    scheduler_id: str,
+    job_id: str,
+    nonce: str,
+    task_index: int,
+) -> Path:
+    identity = _local_identity_bytes(
+        build_id,
+        scheduler_id=scheduler_id,
+        job_id=job_id,
+        nonce=nonce,
+        task_index=task_index,
+    )
+    return (
+        Path(local_root)
+        / _LOCAL_WORKSPACE_ROOT
+        / _digest(build_id, "local build_id")
+        / f"task-{task_index:05d}-{sha256_hex(identity)[:32]}"
+    )
+
+
+def _local_owner_bytes(
+    result: TaskResult,
+    *,
+    scheduler_id: str,
+    job_id: str,
+    nonce: str,
+) -> bytes:
+    identity = _local_identity_bytes(
+        result.build_id,
+        scheduler_id=scheduler_id,
+        job_id=job_id,
+        nonce=nonce,
+        task_index=result.task_index,
+    )
+    value = json.loads(identity)
+    value.update(
+        {
+            "kind": "parallel-task-node-local-cache",
+            "task_count": result.task_count,
+        }
+    )
+    return canonical_json_bytes(value)
 
 
 def _open_workspace(
@@ -238,6 +317,291 @@ def publish_task_result(
         os.close(workspace_fd)
 
 
+def _open_local_task_workspace(
+    local_root: Path | str,
+    result: TaskResult,
+    *,
+    scheduler_id: str,
+    job_id: str,
+    nonce: str,
+) -> tuple[int, int, Path, bytes, str]:
+    workspace = local_task_workspace_path(
+        local_root,
+        result.build_id,
+        scheduler_id=scheduler_id,
+        job_id=job_id,
+        nonce=nonce,
+        task_index=result.task_index,
+    )
+    root_fd = open_directory_path(local_root)
+    namespace_fd = -1
+    build_fd = -1
+    workspace_fd = -1
+    try:
+        namespace_fd, _created = open_directory_at(
+            root_fd,
+            _LOCAL_WORKSPACE_ROOT,
+            create=True,
+        )
+        build_fd, _created = open_directory_at(
+            namespace_fd,
+            result.build_id,
+            create=True,
+        )
+        workspace_fd, created = open_directory_at(
+            build_fd,
+            workspace.name,
+            create=True,
+        )
+    except BaseException:
+        if workspace_fd >= 0:
+            os.close(workspace_fd)
+        if build_fd >= 0:
+            os.close(build_fd)
+        raise
+    finally:
+        if namespace_fd >= 0:
+            os.close(namespace_fd)
+        os.close(root_fd)
+    owner_payload = _local_owner_bytes(
+        result,
+        scheduler_id=scheduler_id,
+        job_id=job_id,
+        nonce=nonce,
+    )
+    owner_token = sha256_hex(owner_payload)
+    try:
+        fcntl.flock(workspace_fd, fcntl.LOCK_EX)
+        if created:
+            if list_entries(workspace_fd):
+                raise ValueError("new local task workspace is not empty")
+            atomic_write_or_match(
+                workspace_fd,
+                _LOCAL_OWNER_NAME,
+                owner_payload,
+                owner=owner_token,
+            )
+        else:
+            actual_owner = read_regular_file(
+                workspace_fd,
+                _LOCAL_OWNER_NAME,
+            )
+            if actual_owner != owner_payload:
+                raise ValueError("local task workspace ownership marker mismatch")
+    except BaseException:
+        os.close(workspace_fd)
+        os.close(build_fd)
+        raise
+    return workspace_fd, build_fd, workspace, owner_payload, owner_token
+
+
+def _validate_local_task_workspace(
+    workspace_fd: int,
+    *,
+    result_name: str,
+    owner_token: str,
+) -> None:
+    final_names = {result_name}
+    for name in list_entries(workspace_fd):
+        metadata = entry_lstat(workspace_fd, name)
+        if name in {_LOCAL_OWNER_NAME, result_name}:
+            if not stat.S_ISREG(metadata.st_mode):
+                raise ValueError(f"local task workspace entry is unsafe: {name}")
+        elif is_owned_temporary(name, final_names, owner_token):
+            if not stat.S_ISREG(metadata.st_mode):
+                raise ValueError(f"local task temporary is unsafe: {name}")
+        else:
+            raise ValueError(f"foreign local task workspace entry: {name}")
+
+
+def _cleanup_local_task_workspace(
+    workspace_fd: int,
+    *,
+    result_name: str,
+    owner_token: str,
+) -> None:
+    _validate_local_task_workspace(
+        workspace_fd,
+        result_name=result_name,
+        owner_token=owner_token,
+    )
+    clean_owned_temporaries(
+        workspace_fd,
+        final_names={result_name},
+        owner=owner_token,
+    )
+    names = sorted(
+        list_entries(workspace_fd),
+        key=lambda name: name == _LOCAL_OWNER_NAME,
+    )
+    for name in names:
+        payload = read_regular_file(workspace_fd, name)
+        unlink_regular_if_matches(workspace_fd, name, payload)
+
+
+def _restore_quarantined_directory(
+    parent_fd: int,
+    quarantine_name: str,
+    original_name: str,
+) -> None:
+    try:
+        atomic_rename_noreplace(
+            parent_fd,
+            quarantine_name,
+            parent_fd,
+            original_name,
+        )
+    except FileExistsError:
+        pass
+    fsync_directory(parent_fd)
+
+
+def _remove_owned_empty_directory(
+    parent_fd: int,
+    name: str,
+    directory_fd: int,
+) -> None:
+    metadata = os.fstat(directory_fd)
+    identity = (metadata.st_dev, metadata.st_ino)
+    if list_entries(directory_fd):
+        raise ValueError(f"owned cleanup directory is not empty: {name}")
+    quarantine_name = ""
+    for _attempt in range(16):
+        candidate = f".{name}.cleanup-{secrets.token_hex(16)}"
+        try:
+            atomic_rename_noreplace(
+                parent_fd,
+                name,
+                parent_fd,
+                candidate,
+            )
+        except FileExistsError:
+            continue
+        quarantine_name = candidate
+        break
+    if not quarantine_name:
+        raise FileExistsError(
+            "could not allocate a unique directory quarantine entry"
+        )
+    fsync_directory(parent_fd)
+    quarantined_fd = -1
+    try:
+        quarantined_fd, _created = open_directory_at(
+            parent_fd,
+            quarantine_name,
+        )
+        quarantined = os.fstat(quarantined_fd)
+        current = entry_lstat(parent_fd, quarantine_name)
+        if (
+            (quarantined.st_dev, quarantined.st_ino) != identity
+            or (current.st_dev, current.st_ino) != identity
+            or list_entries(quarantined_fd)
+        ):
+            os.close(quarantined_fd)
+            quarantined_fd = -1
+            _restore_quarantined_directory(
+                parent_fd,
+                quarantine_name,
+                name,
+            )
+            raise ValueError(
+                f"owned cleanup directory identity changed: {name}"
+            )
+        os.rmdir(quarantine_name, dir_fd=parent_fd)
+        fsync_directory(parent_fd)
+    except BaseException:
+        if quarantined_fd >= 0:
+            os.close(quarantined_fd)
+            quarantined_fd = -1
+        if entry_exists(parent_fd, quarantine_name):
+            _restore_quarantined_directory(
+                parent_fd,
+                quarantine_name,
+                name,
+            )
+        raise
+    finally:
+        if quarantined_fd >= 0:
+            os.close(quarantined_fd)
+
+
+def publish_task_result_via_local_cache(
+    local_root: Path | str,
+    shared_root: Path | str,
+    result: TaskResult,
+    *,
+    scheduler_id: str,
+    job_id: str,
+    nonce: str,
+) -> Path:
+    """Validate a node-local task artifact before shared no-replace install."""
+
+    if not isinstance(result, TaskResult):
+        raise TypeError("result must be a TaskResult")
+    (
+        workspace_fd,
+        build_fd,
+        workspace,
+        _owner_payload,
+        owner_token,
+    ) = _open_local_task_workspace(
+        local_root,
+        result,
+        scheduler_id=scheduler_id,
+        job_id=job_id,
+        nonce=nonce,
+    )
+    result_name = task_result_filename(result)
+    workspace_open = True
+    try:
+        _validate_local_task_workspace(
+            workspace_fd,
+            result_name=result_name,
+            owner_token=owner_token,
+        )
+        clean_owned_temporaries(
+            workspace_fd,
+            final_names={result_name},
+            owner=owner_token,
+        )
+        payload = task_result_to_bytes(result)
+        atomic_write_or_match(
+            workspace_fd,
+            result_name,
+            payload,
+            owner=owner_token,
+        )
+        local_payload = read_regular_file(workspace_fd, result_name)
+        local_result = task_result_from_bytes(local_payload)
+        if local_result != result or task_result_filename(local_result) != result_name:
+            raise ValueError("node-local task result binding mismatch")
+        published = publish_task_result(
+            shared_root,
+            local_result,
+            scheduler_id=scheduler_id,
+            nonce=nonce,
+        )
+        return published
+    finally:
+        try:
+            _cleanup_local_task_workspace(
+                workspace_fd,
+                result_name=result_name,
+                owner_token=owner_token,
+            )
+            _remove_owned_empty_directory(
+                build_fd,
+                workspace.name,
+                workspace_fd,
+            )
+            os.close(workspace_fd)
+            workspace_open = False
+        finally:
+            if workspace_open:
+                os.close(workspace_fd)
+            os.close(build_fd)
+
+
 def load_task_results(
     shared_root: Path | str,
     build_id: str,
@@ -340,13 +704,16 @@ def cleanup_task_workspace(
                 and temporary_pattern.fullmatch(name) is None
             ):
                 raise ValueError(f"foreign task workspace cleanup entry: {name}")
-        for name in names:
+        for name in sorted(names, key=lambda name: name == _OWNER_NAME):
             payload = read_regular_file(workspace_fd, name)
             unlink_regular_if_matches(workspace_fd, name, payload)
+        _remove_owned_empty_directory(
+            parent_fd,
+            workspace_name,
+            workspace_fd,
+        )
         os.close(workspace_fd)
         workspace_fd = -1
-        os.rmdir(workspace_name, dir_fd=parent_fd)
-        fsync_directory(parent_fd)
     finally:
         if workspace_fd >= 0:
             os.close(workspace_fd)

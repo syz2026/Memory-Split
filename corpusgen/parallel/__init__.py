@@ -37,8 +37,10 @@ from .tasks import (
 from .workspace import (
     IncompleteTaskResults,
     cleanup_task_workspace,
+    local_task_workspace_path,
     load_task_results,
     publish_task_result,
+    publish_task_result_via_local_cache,
     task_workspace_path,
 )
 from .schedule import (
@@ -76,6 +78,7 @@ __all__ = [
     "cleanup_task_workspace",
     "fixture_catalog",
     "largest_deficit_schedule",
+    "local_task_workspace_path",
     "load_task_results",
     "metadata_from_bytes",
     "metadata_to_bytes",
@@ -84,6 +87,7 @@ __all__ = [
     "partition_ordinals",
     "publication_staging_path",
     "publish_task_result",
+    "publish_task_result_via_local_cache",
     "publish_verification_receipt",
     "reduce_metadata",
     "reduce_task_results",

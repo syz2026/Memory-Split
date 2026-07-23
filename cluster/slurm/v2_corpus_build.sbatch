@@ -5,9 +5,11 @@
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=16G
 #SBATCH --time=02:00:00
+#SBATCH --export=NONE
 #SBATCH --output=v2-corpus-%A_%a.out
 #
-# Submit with an explicit allowlist, for example:
+# Command-line --export overrides the non-inheriting directive. Submit with an
+# explicit allowlist, for example:
 #   sbatch --export=MS_REPO=/shared/memorysplit,MS_PYTHON=/shared/venv/bin/python,MS_SHARED_ROOT=/shared/corpora,MS_RUN_NONCE=20260723T0202Z-random cluster/slurm/v2_corpus_build.sbatch
 #
 # Each array task renders one disjoint ordinal partition. Every task then tries
@@ -25,6 +27,7 @@ set -euo pipefail
 : "${SLURM_ARRAY_TASK_COUNT:?Slurm must set SLURM_ARRAY_TASK_COUNT}"
 : "${SLURM_CPUS_PER_TASK:?Slurm must set SLURM_CPUS_PER_TASK}"
 : "${SLURM_JOB_ID:?Slurm must set SLURM_JOB_ID}"
+: "${SLURM_TMPDIR:?Slurm must provide node-local task storage}"
 
 run_python() {
     env -i \
@@ -52,6 +55,8 @@ fi
 run_python render-fixture-task \
     "${COMMON_ARGS[@]}" \
     --task-index "$SLURM_ARRAY_TASK_ID" \
+    --local-root "$SLURM_TMPDIR" \
+    --job-id "$SLURM_JOB_ID" \
     --workers "$SLURM_CPUS_PER_TASK"
 
 if run_python finalize-fixture-tasks \

@@ -24,7 +24,7 @@ from corpusgen.parallel import (  # noqa: E402
     fixture_catalog,
     load_task_results,
     parallel_build_id,
-    publish_task_result,
+    publish_task_result_via_local_cache,
     publish_verification_receipt,
     render_task_result,
     verify_parallel_corpus,
@@ -134,6 +134,8 @@ def _parser() -> argparse.ArgumentParser:
     )
     _add_fixture_task_options(render_task)
     render_task.add_argument("--task-index", type=_nonnegative, required=True)
+    render_task.add_argument("--local-root", type=Path, required=True)
+    render_task.add_argument("--job-id", required=True)
     render_task.add_argument(
         "--workers",
         type=_positive,
@@ -197,10 +199,12 @@ def main(argv: list[str] | None = None) -> int:
                 task_count=args.task_count,
                 workers=args.workers,
             )
-            result_path = publish_task_result(
+            result_path = publish_task_result_via_local_cache(
+                args.local_root,
                 args.shared_root,
                 result,
                 scheduler_id=args.scheduler_id,
+                job_id=args.job_id,
                 nonce=args.nonce,
             )
             _print_receipt(
