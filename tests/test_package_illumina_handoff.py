@@ -256,6 +256,11 @@ def test_zip_semantically_proves_exactly_seed_zero_dense_and_split90(
         (config["seed"], config["condition"]) for config in configs.values()
     } == {(0, "dense"), (0, "split90")}
     assert all(
+        config["snapshot_steps"] == [1_358, 3_396, 6_791, 10_187, 13_582]
+        and "snap_frac" not in config
+        for config in configs.values()
+    )
+    assert all(
         config["cohort_id"] == assignment["cohort_id"]
         for config in configs.values()
     )

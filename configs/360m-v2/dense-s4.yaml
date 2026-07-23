@@ -19,5 +19,5 @@ compile: true
 device: cuda
 log_every: 20
 eval_every: 250
-snap_frac: 0.1
+snapshot_steps: [1358, 3396, 6791, 10187, 13582]
 ckpt_minutes: 30

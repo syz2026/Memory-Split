@@ -17,6 +17,7 @@ ASSIGNMENT = REPO_ROOT / "configs" / "cohort-assignment-v2.json"
 CONFIG_DIR = REPO_ROOT / "configs" / "360m-v2"
 ARMS = ("dense", "split90")
 SEEDS = tuple(range(5))
+SNAPSHOT_STEPS = [1_358, 3_396, 6_791, 10_187, 13_582]
 CONFIG_FIELDS = {
     "schema_version",
     "cohort_id",
@@ -39,7 +40,7 @@ CONFIG_FIELDS = {
     "device",
     "log_every",
     "eval_every",
-    "snap_frac",
+    "snapshot_steps",
     "ckpt_minutes",
 }
 PAIR_VARIANT_FIELDS = {
@@ -87,6 +88,14 @@ def _write_yaml(path: Path, value: object) -> None:
     path.write_text(yaml.safe_dump(value, sort_keys=False))
 
 
+def _bind_fixture_snapshot_steps(root: Path) -> None:
+    for path in sorted((root / "configs" / "360m-v2").glob("*.yaml")):
+        value = _yaml_value(path)
+        value.pop("snap_frac", None)
+        value["snapshot_steps"] = SNAPSHOT_STEPS.copy()
+        _write_yaml(path, value)
+
+
 def test_frozen_cohort_is_disjoint_complete_and_hash_bound():
     cohort = load_cohort_assignment(ASSIGNMENT)
 
@@ -106,6 +115,9 @@ def test_frozen_cohort_is_disjoint_complete_and_hash_bound():
         (seed, arm) for seed in SEEDS for arm in ARMS
     }
     assert len(cohort.configs) == 10
+    assert {config.snapshot_steps for config in cohort.configs} == {
+        tuple(SNAPSHOT_STEPS)
+    }
     expected_paths = {
         f"configs/360m-v2/{arm}-s{seed}.yaml"
         for seed in SEEDS
@@ -133,6 +145,13 @@ def test_assignment_is_canonical_sorted_json_with_trailing_newline():
 
 def test_run_configs_are_exact_matched_pairs_with_logical_paths():
     cohort = load_cohort_assignment(ASSIGNMENT)
+    preregistration = _yaml_value(
+        REPO_ROOT / "configs" / "preregistration-v2.yaml"
+    )
+    preregistered_steps = preregistration["analysis"]["fixed_checkpoint_aulc"][
+        "optimizer_steps"
+    ]
+    assert preregistered_steps == SNAPSHOT_STEPS
 
     by_cell = {
         (config.seed, config.condition): config for config in cohort.configs
@@ -161,8 +180,84 @@ def test_run_configs_are_exact_matched_pairs_with_logical_paths():
             assert value["tokens_per_step"] == 524_288
             assert value["max_steps"] == 13_582
             assert value["total_tokens"] == 7_120_879_616
+            assert value["snapshot_steps"] == preregistered_steps
+            assert "snap_frac" not in value
             assert "$" not in str(value)
             assert ".." not in Path(str(value["out_dir"])).parts
+
+
+def test_assignment_rejects_snap_frac_in_v2_config(tmp_path):
+    root, assignment = _fixture_repo(tmp_path)
+    config_path = root / "configs" / "360m-v2" / "dense-s0.yaml"
+    value = _yaml_value(config_path)
+    value["snap_frac"] = 0.1
+    value.pop("snapshot_steps", None)
+    _write_yaml(config_path, value)
+
+    with pytest.raises(MsctlError):
+        load_cohort_assignment(assignment)
+
+
+@pytest.mark.parametrize(
+    "invalid_steps",
+    [
+        [1_358, 3_396, 6_791, 10_187],
+        [1_000, 1_358, 3_396, 6_791, 10_187, 13_582],
+        [3_396, 1_358, 6_791, 10_187, 13_582],
+        [True, 3_396, 6_791, 10_187, 13_582],
+        [1_358.0, 3_396, 6_791, 10_187, 13_582],
+        [1_358, 3_396, 6_791, 6_791, 10_187, 13_582],
+    ],
+    ids=["missing", "extra", "reordered", "bool", "float", "duplicate"],
+)
+def test_assignment_rejects_invalid_snapshot_steps(
+    tmp_path,
+    invalid_steps,
+):
+    root, assignment = _fixture_repo(tmp_path)
+    _bind_fixture_snapshot_steps(root)
+    config_path = root / "configs" / "360m-v2" / "dense-s0.yaml"
+    value = _yaml_value(config_path)
+    value["snapshot_steps"] = invalid_steps
+    _write_yaml(config_path, value)
+
+    with pytest.raises(MsctlError, match="snapshot_steps"):
+        load_cohort_assignment(assignment)
+
+
+@pytest.mark.parametrize(
+    "filename",
+    ["split90-s0.yaml", "dense-s1.yaml"],
+    ids=["cross-arm", "cross-provider"],
+)
+def test_assignment_rejects_snapshot_step_drift(tmp_path, filename):
+    root, assignment = _fixture_repo(tmp_path)
+    _bind_fixture_snapshot_steps(root)
+    config_path = root / "configs" / "360m-v2" / filename
+    value = _yaml_value(config_path)
+    value["snapshot_steps"] = [1_357, 3_396, 6_791, 10_187, 13_582]
+    _write_yaml(config_path, value)
+
+    with pytest.raises(MsctlError, match="snapshot_steps"):
+        load_cohort_assignment(assignment)
+
+
+def test_assignment_rejects_preregistration_snapshot_step_drift(tmp_path):
+    root, assignment = _fixture_repo(tmp_path)
+    _bind_fixture_snapshot_steps(root)
+    preregistration = root / "configs" / "preregistration-v2.yaml"
+    value = _yaml_value(preregistration)
+    value["analysis"]["fixed_checkpoint_aulc"]["optimizer_steps"] = [
+        1_357,
+        3_396,
+        6_791,
+        10_187,
+        13_582,
+    ]
+    _write_yaml(preregistration, value)
+
+    with pytest.raises(MsctlError, match="snapshot_steps"):
+        load_cohort_assignment(assignment)
 
 
 @pytest.mark.parametrize(

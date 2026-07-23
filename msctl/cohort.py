@@ -23,6 +23,7 @@ OPTIMIZER_STEPS = 13_582
 RAW_TARGET_TOKENS = 7_120_879_616
 SEEDS = tuple(range(5))
 ARMS = ("dense", "split90")
+SNAPSHOT_STEPS = (1_358, 3_396, 6_791, 10_187, 13_582)
 _RUN_CONFIG_PATHS = frozenset(
     f"configs/360m-v2/{arm}-s{seed}.yaml"
     for seed in SEEDS
@@ -59,7 +60,7 @@ _CONFIG_FIELDS = {
     "device",
     "log_every",
     "eval_every",
-    "snap_frac",
+    "snapshot_steps",
     "ckpt_minutes",
 }
 _INTEGER_CONFIG_FIELDS = {
@@ -75,7 +76,7 @@ _INTEGER_CONFIG_FIELDS = {
     "eval_every",
     "ckpt_minutes",
 }
-_FLOAT_CONFIG_FIELDS = {"lr", "weight_decay", "snap_frac"}
+_FLOAT_CONFIG_FIELDS = {"lr", "weight_decay"}
 _ENVIRONMENT_PLACEHOLDER = re.compile(r"\$|%\{|{{")
 
 
@@ -88,6 +89,7 @@ class CohortRunConfig:
     run_id: str
     condition: str
     seed: int
+    snapshot_steps: tuple[int, ...]
 
 
 @dataclass(frozen=True)
@@ -244,6 +246,28 @@ def _require_int(value: object, *, label: str) -> int:
     return value
 
 
+def _validate_snapshot_steps(
+    value: object,
+    *,
+    label: str,
+    max_steps: int,
+) -> tuple[int, ...]:
+    if not isinstance(value, list):
+        _fail(f"{label} must be a list")
+    steps = tuple(
+        _require_int(step, label=f"{label}[{index}]")
+        for index, step in enumerate(value)
+    )
+    if (
+        not steps
+        or tuple(sorted(steps)) != steps
+        or len(set(steps)) != len(steps)
+        or steps[-1] != max_steps
+    ):
+        _fail(f"{label} must be sorted, unique, and end at max_steps")
+    return steps
+
+
 def _portable_logical_path(value: object, *, label: str) -> str:
     if (
         not isinstance(value, str)
@@ -261,7 +285,7 @@ def _portable_logical_path(value: object, *, label: str) -> str:
     return path.as_posix()
 
 
-def _validate_preregistration(data: bytes) -> str:
+def _validate_preregistration(data: bytes) -> tuple[str, tuple[int, ...]]:
     value = _yaml_object(data, label="preregistration")
     protected = value.get("protected_cohort")
     if not isinstance(protected, dict):
@@ -269,6 +293,17 @@ def _validate_preregistration(data: bytes) -> str:
     training = protected.get("training")
     if not isinstance(training, dict):
         _fail("preregistration protected_cohort.training is missing")
+    analysis = value.get("analysis")
+    if not isinstance(analysis, dict):
+        _fail("preregistration analysis is missing")
+    fixed_checkpoint_aulc = analysis.get("fixed_checkpoint_aulc")
+    if not isinstance(fixed_checkpoint_aulc, dict):
+        _fail("preregistration snapshot_steps are missing")
+    snapshot_steps = _validate_snapshot_steps(
+        fixed_checkpoint_aulc.get("optimizer_steps"),
+        label="preregistration snapshot_steps",
+        max_steps=OPTIMIZER_STEPS,
+    )
     raw_seeds = protected.get("seeds")
     if not isinstance(raw_seeds, list):
         _fail("preregistration protected_cohort.seeds must be a list")
@@ -284,6 +319,10 @@ def _validate_preregistration(data: bytes) -> str:
         ("raw_target_tokens", training.get("raw_target_tokens")),
     ):
         _require_int(candidate, label=f"preregistration {label}")
+    if snapshot_steps != SNAPSHOT_STEPS:
+        _fail(
+            "preregistration snapshot_steps do not match the frozen AULC schedule"
+        )
     if (
         value.get("schema_version") != 2
         or protected.get("condition_pair") != list(ARMS)
@@ -295,7 +334,7 @@ def _validate_preregistration(data: bytes) -> str:
         or training.get("raw_target_tokens") != RAW_TARGET_TOKENS
     ):
         _fail("cohort assignment conflicts with preregistration")
-    return hashlib.sha256(data).hexdigest()
+    return hashlib.sha256(data).hexdigest(), snapshot_steps
 
 
 def _validate_assignment(
@@ -349,7 +388,11 @@ def _validate_assignment(
     return illumina, aws
 
 
-def _expected_config(seed: int, arm: str) -> dict[str, object]:
+def _expected_config(
+    seed: int,
+    arm: str,
+    snapshot_steps: tuple[int, ...],
+) -> dict[str, object]:
     return {
         "schema_version": 2,
         "cohort_id": COHORT_ID,
@@ -372,7 +415,7 @@ def _expected_config(seed: int, arm: str) -> dict[str, object]:
         "device": "cuda",
         "log_every": 20,
         "eval_every": 250,
-        "snap_frac": 0.1,
+        "snapshot_steps": list(snapshot_steps),
         "ckpt_minutes": 30,
     }
 
@@ -393,12 +436,17 @@ def _load_run_config(
             _fail(f"run config {relative}.{field} must be a float")
     if not isinstance(value["compile"], bool):
         _fail(f"run config {relative}.compile must be boolean")
+    snapshot_steps = _validate_snapshot_steps(
+        value["snapshot_steps"],
+        label=f"run config {relative}.snapshot_steps",
+        max_steps=value["max_steps"],
+    )
     _portable_logical_path(
         value["train_corpus"],
         label=f"run config {relative}.train_corpus",
     )
     _portable_logical_path(value["out_dir"], label=f"run config {relative}.out_dir")
-    if value != _expected_config(seed, arm):
+    if value != _expected_config(seed, arm, snapshot_steps):
         _fail(f"run config {relative} violates frozen Dense/Split90 invariants")
     return CohortRunConfig(
         path=relative,
@@ -406,6 +454,7 @@ def _load_run_config(
         run_id=str(value["run_id"]),
         condition=arm,
         seed=seed,
+        snapshot_steps=snapshot_steps,
     )
 
 
@@ -435,7 +484,9 @@ def load_cohort_assignment_bytes(
         )
     value = _json_object(assignment_data, label="cohort assignment")
     illumina, aws = _validate_assignment(value)
-    preregistration_sha256 = _validate_preregistration(preregistration_data)
+    preregistration_sha256, preregistered_snapshot_steps = (
+        _validate_preregistration(preregistration_data)
+    )
 
     parsed_configs = []
     for seed in SEEDS:
@@ -449,6 +500,14 @@ def load_cohort_assignment_bytes(
                     arm=arm,
                 )
             )
+    if any(
+        config.snapshot_steps != preregistered_snapshot_steps
+        for config in parsed_configs
+    ):
+        _fail(
+            "run config snapshot_steps must match the preregistered AULC "
+            "schedule across all arms and providers"
+        )
 
     return CohortAssignment(
         cohort_id=COHORT_ID,
