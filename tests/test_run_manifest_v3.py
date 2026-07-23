@@ -8,7 +8,11 @@ from pathlib import Path
 
 import pytest
 
-from cluster.aws.p5.corpus_contract import verify_canonical_corpus
+from cluster.aws.p5.corpus_contract import (
+    CorpusEvidence,
+    PinnedCorpusFile,
+    verify_canonical_corpus,
+)
 from cluster.aws.p5.profile import load_aws_p5_profile
 from msctl.aws_contracts import (
     COHORT_ASSIGNMENT_PATH,
@@ -34,6 +38,7 @@ from tests.test_package_aws_p5_handoff import (
 
 ROOT = Path(__file__).resolve().parents[1]
 SEALED_EVALUATION_RELEASE_SHA256 = "e" * 64
+ESTIMATED_INSTANCE_HOURS = 2.5
 V3_FIELDS = {
     "schema_version",
     "provider",
@@ -149,7 +154,12 @@ def v3_case(tmp_path: Path) -> dict[str, object]:
     }
 
 
-def _expected_manifest(case: dict[str, object], seed: int) -> dict[str, object]:
+def _expected_manifest(
+    case: dict[str, object],
+    seed: int,
+    *,
+    estimated_instance_hours: float = ESTIMATED_INSTANCE_HOURS,
+) -> dict[str, object]:
     source = Path(case["source"])
     packaged = case["packaged"]
     dataset = case["dataset"]
@@ -186,7 +196,7 @@ def _expected_manifest(case: dict[str, object], seed: int) -> dict[str, object]:
                 "config_sha256": _sha256(
                     source / CONFIG_ROOT / f"{arm}-s{seed}.yaml"
                 ),
-                "estimated_gpu_hours": 96.0,
+                "estimated_gpu_hours": 4 * estimated_instance_hours,
             }
             for arm in ("dense", "split90")
         ],
@@ -202,6 +212,8 @@ def _instantiate(
     sealed_evaluation_release_sha256: str | None = (
         SEALED_EVALUATION_RELEASE_SHA256
     ),
+    estimated_instance_hours: object = ESTIMATED_INSTANCE_HOURS,
+    dataset_verifier=None,
 ) -> dict[str, object]:
     packaged = case["packaged"]
     dataset = case["dataset"]
@@ -214,7 +226,12 @@ def _instantiate(
         repo_root=case["source"],
         apply=apply,
         sealed_evaluation_release_sha256=sealed_evaluation_release_sha256,
-        dataset_verifier=case["verifier"],
+        estimated_instance_hours=estimated_instance_hours,
+        dataset_verifier=(
+            case["verifier"]
+            if dataset_verifier is None
+            else dataset_verifier
+        ),
     )
 
 
@@ -271,7 +288,7 @@ def test_v3_load_reload_binding_and_no_replace_preserve_every_identity(
     ]
     assert manifest.dataset_build_id == expected["dataset_build_id"]
     assert manifest.ordered_stream_sha256 == expected["ordered_stream_sha256"]
-    assert manifest.gpu_hours == 192.0
+    assert manifest.gpu_hours == 8 * ESTIMATED_INSTANCE_HOURS
     assert not hasattr(manifest, "dataset_sha256")
     assert not hasattr(manifest, "study_lock_sha256")
 
@@ -303,7 +320,42 @@ def test_v3_missing_sealed_evaluation_hash_blocks_publication(v3_case, tmp_path)
     assert not out.exists()
 
 
-def test_v3_cli_requires_and_forwards_sealed_evaluation_hash(
+@pytest.mark.parametrize(
+    "estimated_instance_hours",
+    [
+        None,
+        True,
+        "2.5",
+        0,
+        -1,
+        float("nan"),
+        float("inf"),
+        float("-inf"),
+        1e308,
+        pytest.param(10**1000, id="overflowing-int"),
+    ],
+)
+def test_v3_rejects_invalid_estimated_instance_hours(
+    v3_case,
+    tmp_path,
+    estimated_instance_hours,
+):
+    out = tmp_path / "invalid-instance-hours.json"
+
+    with pytest.raises(MsctlError) as caught:
+        _instantiate(
+            v3_case,
+            seed=0,
+            out=out,
+            apply=True,
+            estimated_instance_hours=estimated_instance_hours,
+        )
+
+    assert caught.value.code == "RUN_MANIFEST_INVALID"
+    assert not out.exists()
+
+
+def test_v3_cli_requires_and_forwards_instantiation_inputs(
     v3_case,
     tmp_path,
     monkeypatch,
@@ -339,13 +391,31 @@ def test_v3_cli_requires_and_forwards_sealed_evaluation_hash(
     with pytest.raises(MsctlError) as caught:
         dispatch(missing)
     assert caught.value.code == "CLI_USAGE"
+    assert set(caught.value.details["missing"]) == {
+        "--estimated-instance-hours",
+        "--sealed-evaluation-release-sha256",
+    }
     assert not (tmp_path / "cli-runs.json").exists()
+
+    missing_hours = build_parser().parse_args(
+        [
+            *common,
+            "--sealed-evaluation-release-sha256",
+            SEALED_EVALUATION_RELEASE_SHA256,
+        ]
+    )
+    with pytest.raises(MsctlError) as caught:
+        dispatch(missing_hours)
+    assert caught.value.code == "CLI_USAGE"
+    assert caught.value.details["missing"] == ["--estimated-instance-hours"]
 
     supplied = build_parser().parse_args(
         [
             *common,
             "--sealed-evaluation-release-sha256",
             SEALED_EVALUATION_RELEASE_SHA256,
+            "--estimated-instance-hours",
+            str(ESTIMATED_INSTANCE_HOURS),
         ]
     )
     dry_run, result = dispatch(supplied)
@@ -354,6 +424,9 @@ def test_v3_cli_requires_and_forwards_sealed_evaluation_hash(
     assert result["manifest"]["sealed_evaluation_release_sha256"] == (
         SEALED_EVALUATION_RELEASE_SHA256
     )
+    assert {
+        run["estimated_gpu_hours"] for run in result["manifest"]["runs"]
+    } == {4 * ESTIMATED_INSTANCE_HOURS}
     assert result["published"] is False
 
 
@@ -403,6 +476,118 @@ def test_v3_instantiation_rejects_dataset_identity_mutations(
 
     with pytest.raises(MsctlError) as caught:
         _instantiate(v3_case, seed=0, out=out, apply=True)
+
+    assert caught.value.code == "DATASET_RECEIPT_INVALID"
+    assert not out.exists()
+
+
+def test_v3_accepts_reordered_pins_from_real_canonical_verifier(
+    v3_case,
+    tmp_path,
+):
+    dataset = v3_case["dataset"]
+    calls = 0
+
+    def verifier(
+        receipt_path: Path,
+        *,
+        expected_sha256: str,
+        expected_ordered_sha256: str,
+    ):
+        nonlocal calls
+        calls += 1
+        evidence = verify_canonical_corpus(
+            receipt_path,
+            expected_sha256=expected_sha256,
+            expected_ordered_sha256=expected_ordered_sha256,
+            semantic_verifier=lambda _root: dataset["corpus"],
+        )
+        return CorpusEvidence(
+            receipt=evidence.receipt,
+            files=tuple(reversed(evidence.files)),
+        )
+
+    result = _instantiate(
+        v3_case,
+        seed=0,
+        out=tmp_path / "reordered-pins.json",
+        dataset_verifier=verifier,
+    )
+
+    assert calls == 1
+    assert result["manifest"]["dataset_receipt_sha256"] == _sha256(
+        Path(dataset["corpus_path"])
+    )
+
+
+@pytest.mark.parametrize(
+    "fault",
+    [
+        "different-content",
+        "numeric-alias",
+        "non-object-content",
+        "missing-receipt",
+        "other-receipt",
+        "wrong-receipt-hash",
+    ],
+)
+def test_v3_rejects_faulty_dataset_verifier_evidence(
+    v3_case,
+    tmp_path,
+    fault,
+):
+    dataset = v3_case["dataset"]
+    requested_receipt = Path(dataset["corpus_path"]).resolve()
+
+    def verifier(
+        receipt_path: Path,
+        *,
+        expected_sha256: str,
+        expected_ordered_sha256: str,
+    ):
+        evidence = v3_case["verifier"](
+            receipt_path,
+            expected_sha256=expected_sha256,
+            expected_ordered_sha256=expected_ordered_sha256,
+        )
+        receipt = dict(evidence.receipt)
+        files = list(evidence.files)
+        receipt_index = next(
+            index
+            for index, pinned in enumerate(files)
+            if Path(pinned.path).resolve() == requested_receipt
+        )
+        if fault == "different-content":
+            receipt["build_id"] = _different_sha256(receipt["build_id"])
+        elif fault == "numeric-alias":
+            receipt["logical_tokens"] = float(receipt["logical_tokens"])
+        elif fault == "non-object-content":
+            receipt = []
+        elif fault == "missing-receipt":
+            files.pop(receipt_index)
+        elif fault == "other-receipt":
+            alternate = requested_receipt.with_name("alternate-receipt.json")
+            alternate.write_bytes(requested_receipt.read_bytes())
+            files[receipt_index] = PinnedCorpusFile(
+                path=alternate,
+                sha256=expected_sha256,
+            )
+        else:
+            files[receipt_index] = PinnedCorpusFile(
+                path=requested_receipt,
+                sha256=_different_sha256(expected_sha256),
+            )
+        return CorpusEvidence(receipt=receipt, files=tuple(files))
+
+    out = tmp_path / f"faulty-{fault}.json"
+    with pytest.raises(MsctlError) as caught:
+        _instantiate(
+            v3_case,
+            seed=0,
+            out=out,
+            apply=True,
+            dataset_verifier=verifier,
+        )
 
     assert caught.value.code == "DATASET_RECEIPT_INVALID"
     assert not out.exists()

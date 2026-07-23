@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+import math
 import os
 import secrets
 import stat
@@ -26,6 +27,7 @@ from .contracts import (
     load_release,
     load_run_manifest,
     read_release_member,
+    same_typed_value,
     verify_release_extraction,
     verify_release_member,
     verify_checkpoint_receipt,
@@ -66,7 +68,7 @@ from .state import StateStore
 
 
 _AWS_V3_PROFILE_ID = "aws-p5.48xlarge-v3"
-_AWS_V3_GPU_HOURS_PER_ARM = 4 * 24.0
+_AWS_V3_GPUS_PER_ARM = 4
 
 
 def _timestamp() -> str:
@@ -106,21 +108,56 @@ def _load_task4_dataset_verifier(
     )
 
 
-def _dataset_file_identities(evidence: object) -> list[dict[str, object]]:
+def _dataset_file_identities(
+    evidence: object,
+    *,
+    receipt_path: Path | str | None = None,
+    receipt_sha256: str | None = None,
+) -> list[dict[str, object]]:
     files = getattr(evidence, "files", None)
     if not isinstance(files, tuple) or not files:
         raise MsctlError(
             "DATASET_RECEIPT_INVALID",
             "dataset verifier returned no pinned files",
         )
-    receipt = Path(files[0].path)
-    root = receipt.parent.resolve(strict=True)
+    bind_requested_receipt = receipt_path is not None
+    if bind_requested_receipt != (receipt_sha256 is not None):
+        raise MsctlError(
+            "DATASET_RECEIPT_INVALID",
+            "requested receipt path and hash must be supplied together",
+        )
+    if bind_requested_receipt:
+        receipt_candidate = receipt_path
+    else:
+        receipt_candidates = []
+        for pinned in files:
+            candidate = getattr(pinned, "path", None)
+            if isinstance(candidate, (str, os.PathLike)) and (
+                Path(candidate).name == "receipt.json"
+            ):
+                receipt_candidates.append(candidate)
+        if len(receipt_candidates) != 1:
+            raise MsctlError(
+                "DATASET_RECEIPT_INVALID",
+                "dataset verifier must pin exactly one receipt.json",
+            )
+        receipt_candidate = receipt_candidates[0]
+    try:
+        requested_receipt = Path(receipt_candidate).resolve(strict=True)
+    except (OSError, TypeError) as error:
+        raise MsctlError(
+            "DATASET_RECEIPT_INVALID",
+            "requested dataset receipt is missing",
+        ) from error
+    root = requested_receipt.parent
     identities: list[dict[str, object]] = []
+    receipt_identities = 0
     for pinned in files:
         path = Path(getattr(pinned, "path", ""))
         expected = getattr(pinned, "sha256", None)
         try:
-            relative = path.resolve(strict=True).relative_to(root).as_posix()
+            resolved = path.resolve(strict=True)
+            relative = resolved.relative_to(root).as_posix()
             before = path.stat(follow_symlinks=False)
             digest = sha256_file(path)
             after = path.stat(follow_symlinks=False)
@@ -141,6 +178,13 @@ def _dataset_file_identities(evidence: object) -> list[dict[str, object]]:
                 "verified dataset file identity or content changed",
                 details={"path": relative},
             )
+        if bind_requested_receipt and resolved == requested_receipt:
+            receipt_identities += 1
+            if expected != receipt_sha256:
+                raise MsctlError(
+                    "DATASET_RECEIPT_INVALID",
+                    "dataset verifier returned the wrong receipt hash",
+                )
         identities.append(
             {
                 "path": relative,
@@ -149,6 +193,11 @@ def _dataset_file_identities(evidence: object) -> list[dict[str, object]]:
                 "device": before.st_dev,
                 "inode": before.st_ino,
             }
+        )
+    if bind_requested_receipt and receipt_identities != 1:
+        raise MsctlError(
+            "DATASET_RECEIPT_INVALID",
+            "dataset verifier did not pin exactly the requested receipt",
         )
     return identities
 
@@ -213,6 +262,7 @@ def instantiate_run_manifest(
     repo_root: Path | str,
     apply: bool,
     sealed_evaluation_release_sha256: str | None = None,
+    estimated_instance_hours: object = None,
     cohort_loader: Callable[[Path | str], object] | None = None,
     dataset_verifier: Callable[..., object] | None = None,
 ) -> dict[str, object]:
@@ -268,6 +318,34 @@ def instantiate_run_manifest(
                 "RUN_MANIFEST_INVALID",
                 "v3 AWS sealed evaluation release SHA-256 is invalid",
             ) from error
+    estimated_gpu_hours: float | None = None
+    if aws_v3:
+        if (
+            isinstance(estimated_instance_hours, bool)
+            or not isinstance(estimated_instance_hours, (int, float))
+        ):
+            raise MsctlError(
+                "RUN_MANIFEST_INVALID",
+                "v3 AWS instantiation requires estimated instance hours",
+            )
+        try:
+            instance_hours = float(estimated_instance_hours)
+        except OverflowError as error:
+            raise MsctlError(
+                "RUN_MANIFEST_INVALID",
+                "estimated instance hours cannot be represented finitely",
+            ) from error
+        estimated_gpu_hours = _AWS_V3_GPUS_PER_ARM * instance_hours
+        if (
+            not math.isfinite(instance_hours)
+            or instance_hours <= 0
+            or not math.isfinite(estimated_gpu_hours)
+            or estimated_gpu_hours <= 0
+        ):
+            raise MsctlError(
+                "RUN_MANIFEST_INVALID",
+                "estimated instance and per-arm GPU hours must be finite and positive",
+            )
     release = load_release(release_path)
     if release.provider != provider:
         raise MsctlError(
@@ -422,7 +500,8 @@ def instantiate_run_manifest(
             "config_sha256": digest,
         }
         if aws_v3:
-            row["estimated_gpu_hours"] = _AWS_V3_GPU_HOURS_PER_ARM
+            assert estimated_gpu_hours is not None
+            row["estimated_gpu_hours"] = estimated_gpu_hours
         run_rows.append(row)
 
     receipt_value = require_object(
@@ -442,10 +521,20 @@ def instantiate_run_manifest(
                 expected_sha256=dataset_sha256,
                 expected_ordered_sha256=ordered_sha256,
             )
-            identities = _dataset_file_identities(evidence)
+            raw_verified_receipt = getattr(evidence, "receipt", None)
+            if not same_typed_value(raw_verified_receipt, receipt_value):
+                raise MsctlError(
+                    "DATASET_RECEIPT_INVALID",
+                    "dataset verifier returned different receipt content",
+                )
             verified_receipt = require_object(
-                getattr(evidence, "receipt", None),
+                raw_verified_receipt,
                 label="verified dataset receipt",
+            )
+            identities = _dataset_file_identities(
+                evidence,
+                receipt_path=dataset_receipt,
+                receipt_sha256=dataset_sha256,
             )
             dataset_build_id = require_sha256(
                 verified_receipt.get("build_id"),

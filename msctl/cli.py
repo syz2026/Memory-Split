@@ -132,6 +132,7 @@ def build_parser() -> JsonArgumentParser:
     instantiate.add_argument("--release", required=True)
     instantiate.add_argument("--dataset-receipt", required=True)
     instantiate.add_argument("--sealed-evaluation-release-sha256")
+    instantiate.add_argument("--estimated-instance-hours", type=float)
     instantiate.add_argument("--seed", required=True, type=int)
     instantiate.add_argument("--out", required=True)
     instantiate.add_argument("--apply", action="store_true")
@@ -290,6 +291,7 @@ def dispatch(
             _require_cli_values(
                 args,
                 "sealed_evaluation_release_sha256",
+                "estimated_instance_hours",
             )
         return not args.apply, instantiate_run_manifest(
             profile=profile,
@@ -302,6 +304,7 @@ def dispatch(
             sealed_evaluation_release_sha256=(
                 args.sealed_evaluation_release_sha256
             ),
+            estimated_instance_hours=args.estimated_instance_hours,
             cohort_loader=cohort_loader,
         )
     if provider == AWS_P5_PROFILE:
