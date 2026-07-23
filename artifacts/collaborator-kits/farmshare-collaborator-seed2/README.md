@@ -3,6 +3,9 @@
 This kit owns exactly five protected 160M jobs: Dense/Split at `n50k`, and
 Dense/Split/Random at `n800k`, all with model seed 2 and data seed 10002.
 `assignment.json` is authoritative.
+This ZIP remains a frozen relational-v1 launcher. The included
+`2026-07-22-chinchilla-multisource-corpus-design.md` is review material only;
+do not substitute v2 data, budgets, or manifests for this assignment.
 
 ## Unpack and verify
 
