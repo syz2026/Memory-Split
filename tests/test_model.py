@@ -58,6 +58,15 @@ def test_presets_param_counts():
     assert 150e6 < n < 180e6, n
 
 
+def test_d135m_exact_geometry_and_param_count_without_allocating_weights():
+    cfg = PRESETS["d135m"]
+    assert (cfg.n_layer, cfg.d_model, cfg.n_head, cfg.ctx) == (10, 720, 12, 1024)
+    assert cfg.head_dim == 60
+    with torch.device("meta"):
+        model = GPT(cfg)
+    assert model.num_params() == 134_660_880
+
+
 def test_device_property():
     m = tiny()
     assert m.device.type == "cpu"

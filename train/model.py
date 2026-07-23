@@ -32,6 +32,7 @@ class GPTConfig:
 
 PRESETS: dict[str, GPTConfig] = {
     "toy": GPTConfig(n_layer=4, n_head=4, d_model=256),
+    "d135m": GPTConfig(n_layer=10, n_head=12, d_model=720, ctx=1024),
     "d160m": GPTConfig(n_layer=12, n_head=12, d_model=768),
     "d410m": GPTConfig(n_layer=24, n_head=16, d_model=1024),
     "d1b": GPTConfig(n_layer=22, n_head=14, d_model=1792),

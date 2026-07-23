@@ -1,0 +1,119 @@
+{
+  "arms": [
+    "dense",
+    "split90"
+  ],
+  "cohort_id": "memorysplit-confirmatory-v2-135m-n10",
+  "dataset_contract_id": "memorysplit-parallel-corpus-v2",
+  "model": "d135m",
+  "model_parameters": 134660880,
+  "operators": [
+    {
+      "config_paths": [
+        "configs/135m-v2/dense-s0.yaml",
+        "configs/135m-v2/split90-s0.yaml",
+        "configs/135m-v2/dense-s5.yaml",
+        "configs/135m-v2/split90-s5.yaml"
+      ],
+      "id": "farmshare-lead",
+      "platform": "farmshare",
+      "provider": "farmshare-l40s",
+      "seeds": [
+        0,
+        5
+      ]
+    },
+    {
+      "config_paths": [
+        "configs/135m-v2/dense-s1.yaml",
+        "configs/135m-v2/split90-s1.yaml",
+        "configs/135m-v2/dense-s6.yaml",
+        "configs/135m-v2/split90-s6.yaml"
+      ],
+      "id": "farmshare-collaborator-1",
+      "platform": "farmshare",
+      "provider": "farmshare-l40s",
+      "seeds": [
+        1,
+        6
+      ]
+    },
+    {
+      "config_paths": [
+        "configs/135m-v2/dense-s2.yaml",
+        "configs/135m-v2/split90-s2.yaml",
+        "configs/135m-v2/dense-s7.yaml",
+        "configs/135m-v2/split90-s7.yaml"
+      ],
+      "id": "farmshare-collaborator-2",
+      "platform": "farmshare",
+      "provider": "farmshare-l40s",
+      "seeds": [
+        2,
+        7
+      ]
+    },
+    {
+      "config_paths": [
+        "configs/135m-v2/dense-s3.yaml",
+        "configs/135m-v2/split90-s3.yaml",
+        "configs/135m-v2/dense-s8.yaml",
+        "configs/135m-v2/split90-s8.yaml"
+      ],
+      "id": "mit-collaborator-a",
+      "platform": "mit",
+      "provider": "mit-slurm",
+      "seeds": [
+        3,
+        8
+      ]
+    },
+    {
+      "config_paths": [
+        "configs/135m-v2/dense-s4.yaml",
+        "configs/135m-v2/split90-s4.yaml",
+        "configs/135m-v2/dense-s9.yaml",
+        "configs/135m-v2/split90-s9.yaml"
+      ],
+      "id": "mit-collaborator-b",
+      "platform": "mit",
+      "provider": "mit-slurm",
+      "seeds": [
+        4,
+        9
+      ]
+    }
+  ],
+  "provider_seeds": {
+    "farmshare-l40s": [
+      0,
+      1,
+      2,
+      5,
+      6,
+      7
+    ],
+    "mit-slurm": [
+      3,
+      4,
+      8,
+      9
+    ]
+  },
+  "raw_target_tokens": 7120879616,
+  "schema_version": 1,
+  "seeds": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9
+  ],
+  "targets_per_update": 524288,
+  "terminal_updates": 13582
+}
