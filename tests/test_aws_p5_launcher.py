@@ -49,17 +49,29 @@ from cluster.aws.p5.profile import (
     load_aws_p5_profile,
     validate_runtime_environment,
 )
+from msctl.aws_contracts import (
+    ARMS,
+    COHORT_ASSIGNMENT_PATH,
+    COHORT_ID,
+    CONFIG_ROOT,
+    DATASET_POINTER_PATH,
+    DATASET_RECEIPT_PATH,
+    PACKAGE_FORMAT_VERSION,
+    PROFILE_PATH as PROFILE_MEMBER_PATH,
+    SEEDS,
+    SNAPSHOT_STEPS,
+)
 
 
 ROOT = Path(__file__).resolve().parents[1]
-PROFILE_PATH = ROOT / "cluster" / "profiles" / "aws-p5.48xlarge.json"
+PROFILE_PATH = ROOT / PROFILE_MEMBER_PATH
 BOOTSTRAP_SH = ROOT / "cluster" / "aws" / "p5" / "bootstrap.sh"
 HEX = {
     "release": "1" * 64,
-    "cohort": "2" * 64,
     "ordered": "3" * 64,
 }
 CODE_COMMIT = "4" * 40
+CODE_TREE = "5" * 40
 CONTAINER_IMAGE = (
     "public.ecr.aws/pytorch/pytorch-training:2.4.0-gpu-py311"
     "@sha256:"
@@ -72,7 +84,7 @@ SAFE_ENVIRONMENT = {
     "AWS_REGION": "us-east-1",
     "LANG": "C.UTF-8",
     "LC_ALL": "C.UTF-8",
-    "MS_S3_ROOT": "s3://memorysplit-prod/cohort-v2",
+    "MS_S3_ROOT": "s3://memorysplit-prod/cohort-v3",
     "MS_AWS_AMI_ID": "ami-0123456789abcdef0",
     "MS_CONTAINER_DIGEST": "sha256:" + "a" * 64,
     "MS_CONTAINER_IMAGE": CONTAINER_IMAGE,
@@ -101,13 +113,13 @@ def _write_config(path: Path, *, seed: int, arm: str) -> Path:
     )
     value = {
         "schema_version": 2,
-        "cohort_id": "memorysplit-confirmatory-v2-360m-n5",
-        "run_id": f"memorysplit-v2-360m-s{seed}-{arm}",
+        "cohort_id": COHORT_ID,
+        "run_id": f"memorysplit-v3-360m-s{seed}-{arm}",
         "condition": arm,
         "seed": seed,
         "model": "d360m",
         "ctx": 1024,
-        "train_corpus": "dataset/corpus-receipt.json",
+        "train_corpus": DATASET_RECEIPT_PATH,
         "sidecar_name": sidecar,
         "out_dir": f"runs/seed-{seed}/{arm}",
         "micro_batch_size": 8,
@@ -121,7 +133,7 @@ def _write_config(path: Path, *, seed: int, arm: str) -> Path:
         "device": "cuda",
         "log_every": 20,
         "eval_every": 250,
-        "snap_frac": 0.1,
+        "snapshot_steps": list(SNAPSHOT_STEPS),
         "ckpt_minutes": 30,
     }
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -254,13 +266,10 @@ def _launcher_fixture(tmp_path: Path, seed: int = 1) -> dict[str, Path | dict]:
     }
     corpus_path = _write_json(dataset / "receipt.json", corpus)
 
-    configs = {}
-    for arm in ("dense", "split90"):
-        configs[arm] = _write_config(
-            repo_root / "configs" / "360m-v2" / f"{arm}-s{seed}.yaml",
-            seed=seed,
-            arm=arm,
-        )
+    configs = {
+        arm: repo_root / CONFIG_ROOT / f"{arm}-s{seed}.yaml"
+        for arm in ARMS
+    }
     release_sources = {
         "scripts/run_train.py": (
             "import argparse\n"
@@ -292,20 +301,28 @@ def _launcher_fixture(tmp_path: Path, seed: int = 1) -> dict[str, Path | dict]:
             "    signal.signal(signal.SIGUSR1, lambda *_: None)\n"
             "    return os.environ['MS_RANK_ZERO_PID_FILE']\n"
         ),
+        COHORT_ASSIGNMENT_PATH: (ROOT / COHORT_ASSIGNMENT_PATH).read_bytes(),
+        "configs/preregistration-v3.yaml": (
+            ROOT / "configs" / "preregistration-v3.yaml"
+        ).read_bytes(),
+        DATASET_POINTER_PATH: (ROOT / DATASET_POINTER_PATH).read_bytes(),
+        PROFILE_MEMBER_PATH: (ROOT / PROFILE_MEMBER_PATH).read_bytes(),
+        **{
+            f"{CONFIG_ROOT}/{arm}-s{config_seed}.yaml": (
+                ROOT / CONFIG_ROOT / f"{arm}-s{config_seed}.yaml"
+            ).read_bytes()
+            for config_seed in SEEDS
+            for arm in ARMS
+        },
     }
     for relative, content in release_sources.items():
         path = repo_root / relative
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(content, encoding="utf-8")
-    member_paths = sorted(
-        [
-            *release_sources,
-            *(
-                path.relative_to(repo_root).as_posix()
-                for path in configs.values()
-            ),
-        ]
-    )
+        if isinstance(content, bytes):
+            path.write_bytes(content)
+        else:
+            path.write_text(content, encoding="utf-8")
+    member_paths = sorted(release_sources)
     member_rows = [
         {
             "bytes": (repo_root / relative).stat().st_size,
@@ -316,18 +333,62 @@ def _launcher_fixture(tmp_path: Path, seed: int = 1) -> dict[str, Path | dict]:
         }
         for relative in member_paths
     ]
+    profile_sha256 = _sha256(repo_root / PROFILE_MEMBER_PATH)
+    cohort_sha256 = _sha256(repo_root / COHORT_ASSIGNMENT_PATH)
+    dataset_pointer_sha256 = _sha256(repo_root / DATASET_POINTER_PATH)
+    config_sha256 = {
+        f"{CONFIG_ROOT}/{arm}-s{config_seed}.yaml": _sha256(
+            repo_root / CONFIG_ROOT / f"{arm}-s{config_seed}.yaml"
+        )
+        for config_seed in SEEDS
+        for arm in ARMS
+    }
     release_metadata = {
+        "cohort_assignment": {
+            "path": COHORT_ASSIGNMENT_PATH,
+            "sha256": cohort_sha256,
+        },
+        "config_sha256": dict(sorted(config_sha256.items())),
+        "dataset_pointer": {
+            "path": DATASET_POINTER_PATH,
+            "sha256": dataset_pointer_sha256,
+        },
+        "environment": {
+            "mode": "runtime_attested",
+            "profile_sha256": profile_sha256,
+            "container_image_digest_env": "MS_CONTAINER_DIGEST",
+            "container_image_digest_pattern": "^sha256:[0-9a-f]{64}$",
+            "runtime_environment_receipt": {
+                "required_at_launch": True,
+                "authentication": "aws_instance_identity_document_pkcs7",
+                "required_fields": [
+                    "schema_version",
+                    "profile_sha256",
+                    "container_image_digest",
+                    "aws_instance_identity_document",
+                    "aws_instance_identity_pkcs7",
+                ],
+            },
+        },
         "members": member_rows,
-        "package_format_version": 1,
+        "package_format_version": PACKAGE_FORMAT_VERSION,
+        "profile": {
+            "path": PROFILE_MEMBER_PATH,
+            "sha256": profile_sha256,
+        },
         "provider": "aws-p5.48xlarge",
         "schema_version": 1,
         "seed_assignment": {
-            "arms": ["dense", "split90"],
-            "cohort_id": "memorysplit-confirmatory-v2-360m-n5",
+            "arms": list(ARMS),
+            "cohort_id": COHORT_ID,
             "provider": "aws-p5.48xlarge",
-            "seeds": [1, 2, 3, 4],
+            "seeds": list(SEEDS),
         },
-        "source": {"commit": CODE_COMMIT, "dirty": False},
+        "source": {
+            "commit": CODE_COMMIT,
+            "dirty": False,
+            "tree": CODE_TREE,
+        },
     }
     metadata_path = repo_root / "RELEASE-METADATA.json"
     metadata_path.write_text(
@@ -360,10 +421,11 @@ def _launcher_fixture(tmp_path: Path, seed: int = 1) -> dict[str, Path | dict]:
         "ami_id": SAFE_ENVIRONMENT["MS_AWS_AMI_ID"],
         "boot_id": BOOT_ID,
         "code_commit": CODE_COMMIT,
-        "cohort_assignment_sha256": HEX["cohort"],
+        "cohort_assignment_sha256": cohort_sha256,
         "container_image": CONTAINER_IMAGE,
         "container_digest": SAFE_ENVIRONMENT["MS_CONTAINER_DIGEST"],
         "corpus_build_id": corpus["build_id"],
+        "corpus_ordered_stream_sha256": corpus["ordered_stream_sha256"],
         "corpus_receipt_sha256": _sha256(corpus_path),
         "durable_upload_verified": True,
         "instance_id": "i-0123456789abcdef0",
@@ -420,9 +482,10 @@ def _launcher_fixture(tmp_path: Path, seed: int = 1) -> dict[str, Path | dict]:
             "sha256": _sha256(bootstrap_path),
         },
         "code_commit": CODE_COMMIT,
-        "cohort_assignment_sha256": HEX["cohort"],
-        "cohort_id": "memorysplit-confirmatory-v2-360m-n5",
+        "cohort_assignment_sha256": cohort_sha256,
+        "cohort_id": COHORT_ID,
         "corpus_receipt": {
+            "build_id": corpus["build_id"],
             "ordered_stream_sha256": HEX["ordered"],
             "path": corpus_path.relative_to(scratch_root).as_posix(),
             "sha256": _sha256(corpus_path),
@@ -489,7 +552,7 @@ def _refresh_corpus_bindings(fixture: dict) -> None:
     _write_json(fixture["manifest_path"], fixture["manifest"])
 
 
-@pytest.mark.parametrize("seed", [1, 2, 3, 4])
+@pytest.mark.parametrize("seed", list(SEEDS))
 def test_dry_run_renders_exact_symmetric_four_plus_four_commands(tmp_path, seed):
     fixture = _launcher_fixture(tmp_path, seed)
     report = render_plan(_load_fixture_plan(fixture))
@@ -590,7 +653,7 @@ def test_dry_run_renders_exact_symmetric_four_plus_four_commands(tmp_path, seed)
     )
 
 
-@pytest.mark.parametrize("seed", [0, 5])
+@pytest.mark.parametrize("seed", [-1, 10, True])
 def test_launcher_rejects_unassigned_seed(tmp_path, seed):
     fixture = _launcher_fixture(tmp_path)
 
@@ -606,6 +669,50 @@ def test_launcher_rejects_partial_pair(tmp_path):
 
     with pytest.raises(LaunchError, match="pair"):
         _load_fixture_plan(fixture)
+
+
+def test_launcher_rejects_v2_config_path(tmp_path):
+    fixture = _launcher_fixture(tmp_path)
+    manifest = deepcopy(fixture["manifest"])
+    manifest["runs"][0]["config"] = "configs/360m-v2/dense-s1.yaml"
+    _write_json(fixture["manifest_path"], manifest)
+
+    with pytest.raises(LaunchError, match="config"):
+        _load_fixture_plan(fixture)
+
+
+@pytest.mark.parametrize(
+    "replacement",
+    [
+        "snap_frac: 0.1",
+        "snapshot_steps: [1358, 3396, true, 10187, 13582]",
+        "snapshot_steps: [1358, 3396, 6791.0, 10187, 13582]",
+        "snapshot_steps: [1358, 3396, 6791, 6791, 13582]",
+        "snapshot_steps: [3396, 1358, 6791, 10187, 13582]",
+        "snapshot_steps: [1358, 3396, 6791, 13582]",
+        "snapshot_steps: [1358, 3396, 6791, 10187, 12000, 13582]",
+        "snapshot_steps: &steps [1358, 3396, 6791, 10187, 13582]",
+        "snapshot_steps: !!seq [1358, 3396, 6791, 10187, 13582]",
+        "snapshot_steps:\n  - 1358\n  - 3396\n  - 6791\n  - 10187\n  - 13582",
+    ],
+)
+def test_strict_config_reader_rejects_malformed_snapshot_schedule(
+    tmp_path,
+    replacement,
+):
+    original = (ROOT / CONFIG_ROOT / "dense-s0.yaml").read_text()
+    valid_line = "snapshot_steps: [1358, 3396, 6791, 10187, 13582]"
+    path = tmp_path / "config.yaml"
+    path.write_text(original.replace(valid_line, replacement))
+
+    with pytest.raises(LaunchError, match="snapshot|field|flat|scalar"):
+        launch_module._load_config(path)
+
+
+def test_strict_config_reader_accepts_exact_snapshot_schedule():
+    config = launch_module._load_config(ROOT / CONFIG_ROOT / "dense-s0.yaml")
+
+    assert config["snapshot_steps"] == list(SNAPSHOT_STEPS)
 
 
 def test_launcher_rejects_non_utf8_manifest(tmp_path):
@@ -700,6 +807,27 @@ def test_launcher_rejects_wrong_config_or_corpus_hash(tmp_path):
     manifest["corpus_receipt"]["sha256"] = "0" * 64
     _write_json(fixture["manifest_path"], manifest)
     with pytest.raises(LaunchError, match="corpus"):
+        _load_fixture_plan(fixture)
+
+
+@pytest.mark.parametrize(
+    ("field", "message"),
+    [
+        ("build_id", "build ID"),
+        ("ordered_stream_sha256", "ordered|stream"),
+    ],
+)
+def test_launcher_rejects_wrong_corpus_identity(
+    tmp_path,
+    field,
+    message,
+):
+    fixture = _launcher_fixture(tmp_path)
+    manifest = deepcopy(fixture["manifest"])
+    manifest["corpus_receipt"][field] = "0" * 64
+    _write_json(fixture["manifest_path"], manifest)
+
+    with pytest.raises(LaunchError, match=message):
         _load_fixture_plan(fixture)
 
 
@@ -2809,72 +2937,45 @@ def test_bootstrap_fails_closed_on_hardware_drift(
 
 
 def _task7_release_fixture(tmp_path: Path, *, corrupt_sum: bool = False):
-    member_payload = {
-        "scripts/run_train.py": b"print('verified release')\n",
-        "train/trainer.py": b"def train():\n    return None\n",
-    }
-    metadata = {
-        "members": [
-            {
-                "bytes": len(payload),
-                "git_blob": "5" * 40,
-                "git_mode": "100644",
-                "path": relative,
-                "sha256": hashlib.sha256(payload).hexdigest(),
-            }
-            for relative, payload in sorted(member_payload.items())
-        ],
-        "package_format_version": 1,
-        "provider": "aws-p5.48xlarge",
-        "schema_version": 1,
-        "seed_assignment": {
-            "arms": ["dense", "split90"],
-            "cohort_id": "memorysplit-confirmatory-v2-360m-n5",
-            "provider": "aws-p5.48xlarge",
-            "seeds": [1, 2, 3, 4],
-        },
-        "source": {"commit": CODE_COMMIT, "dirty": False},
-    }
-    metadata_bytes = (
-        json.dumps(metadata, indent=2, sort_keys=True) + "\n"
-    ).encode("ascii")
-    payload = {**member_payload, "RELEASE-METADATA.json": metadata_bytes}
-    sums = "".join(
-        (
-            ("0" * 64 if corrupt_sum and index == 0 else hashlib.sha256(data).hexdigest())
-            + f"  {relative}\n"
-        )
-        for index, (relative, data) in enumerate(sorted(payload.items()))
-    ).encode("ascii")
-    payload["SHA256SUMS"] = sums
-    archive = tmp_path / "ms-aws-p5-r1-fixture.zip"
-    with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_STORED) as output:
-        for relative, data in sorted(payload.items()):
-            info = zipfile.ZipInfo(relative)
-            info.create_system = 3
-            info.external_attr = 0o100444 << 16
-            output.writestr(info, data)
-    dataset_receipt = tmp_path / "receipt.json"
-    cohort = tmp_path / "cohort.json"
-    dataset_receipt.write_bytes(
-        ('{"build_id":"' + "b" * 64 + '"}\n').encode("ascii")
+    from tests.test_package_aws_p5_handoff import (
+        _build,
+        _load_module,
+        _minimal_repo,
     )
-    cohort.write_bytes(b'{"cohort":true}\n')
-    release_receipt = _write_json(
-        tmp_path / "RELEASE-AWS-P5.json",
+
+    source = _minimal_repo(tmp_path, name="bootstrap-source")
+    packaged = _build(
+        _load_module(),
+        source,
+        tmp_path / "bootstrap-package",
+    )
+    archive = packaged.archive
+    if corrupt_sum:
+        replacement = tmp_path / "corrupt-release.zip"
+        with zipfile.ZipFile(archive) as original, zipfile.ZipFile(
+            replacement,
+            "w",
+            compression=zipfile.ZIP_STORED,
+        ) as rewritten:
+            for info in original.infolist():
+                payload = original.read(info.filename)
+                if info.filename == "SHA256SUMS":
+                    payload = b"0" + payload[1:]
+                rewritten.writestr(info, payload)
+        os.replace(replacement, archive)
+        release_value = json.loads(packaged.release.read_text())
+        release_value["archive"]["bytes"] = archive.stat().st_size
+        release_value["archive"]["sha256"] = _sha256(archive)
+        _write_json(packaged.release, release_value)
+    dataset_receipt = _write_json(
+        tmp_path / "dataset" / "receipt.json",
         {
-            "archive": {
-                "bytes": archive.stat().st_size,
-                "path": archive.name,
-                "sha256": _sha256(archive),
-            },
-            "cohort_assignment_sha256": _sha256(cohort),
-            "dataset_receipt_sha256": _sha256(dataset_receipt),
-            "members_sha256": hashlib.sha256(sums).hexdigest(),
-            "source": {"commit": CODE_COMMIT, "dirty": False},
+            "build_id": "b" * 64,
+            "ordered_stream_sha256": "c" * 64,
         },
     )
-    return archive, release_receipt, dataset_receipt, cohort
+    cohort = source / COHORT_ASSIGNMENT_PATH
+    return archive, packaged.release, dataset_receipt, cohort
 
 
 def test_bootstrap_extracts_only_verified_task7_release_read_only(tmp_path):
@@ -2890,7 +2991,7 @@ def test_bootstrap_extracts_only_verified_task7_release_read_only(tmp_path):
         dataset_receipt_sha256=_sha256(dataset_receipt),
         cohort_assignment=cohort,
         cohort_assignment_sha256=_sha256(cohort),
-        code_commit=CODE_COMMIT,
+        code_commit=json.loads(release_receipt.read_text())["source"]["commit"],
     )
 
     prepared = bootstrap_module.extract_verified_release(
@@ -2908,7 +3009,7 @@ def test_bootstrap_extracts_only_verified_task7_release_read_only(tmp_path):
         (prepared.root / "SHA256SUMS").read_bytes()
     ).hexdigest()
     assert (prepared.root / "scripts" / "run_train.py").read_bytes() == (
-        b"print('verified release')\n"
+        b"#!/usr/bin/env python3\nraise SystemExit(0)\n"
     )
     assert all(
         path.stat().st_mode & 0o222 == 0
@@ -2934,7 +3035,9 @@ def test_bootstrap_rejects_hash_consistent_outer_archive_with_bad_inner_sum(
             dataset_receipt_sha256=_sha256(dataset_receipt),
             cohort_assignment=cohort,
             cohort_assignment_sha256=_sha256(cohort),
-            code_commit=CODE_COMMIT,
+            code_commit=json.loads(release_receipt.read_text())["source"][
+                "commit"
+            ],
         )
 
 
@@ -2958,7 +3061,7 @@ def test_bootstrap_verifies_all_hashes_and_publishes_canonical_receipt(tmp_path)
         dataset_receipt_sha256=_sha256(dataset_receipt),
         cohort_assignment=cohort,
         cohort_assignment_sha256=_sha256(cohort),
-        code_commit=CODE_COMMIT,
+        code_commit=json.loads(release_receipt.read_text())["source"]["commit"],
     )
     evidence = inspect_hardware(
         profile,
@@ -3013,6 +3116,7 @@ def test_bootstrap_verifies_all_hashes_and_publishes_canonical_receipt(tmp_path)
     assert receipt["release_members_sha256"] == artifacts.release_members_sha256
     assert receipt["corpus_receipt_sha256"] == _sha256(dataset_receipt)
     assert receipt["corpus_build_id"] == "b" * 64
+    assert receipt["corpus_ordered_stream_sha256"] == "c" * 64
     assert receipt["runtime_uid"] == RUNTIME_UID
     assert receipt["runtime_gid"] == RUNTIME_GID
     assert receipt["boot_id"] == BOOT_ID

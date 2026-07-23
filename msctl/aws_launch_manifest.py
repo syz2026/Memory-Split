@@ -15,6 +15,14 @@ from pathlib import Path
 if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from msctl.aws_contracts import (
+    ARMS,
+    COHORT_ID,
+    CONFIG_ROOT,
+    DATASET_RECEIPT_PATH,
+    PROVIDER,
+    SEEDS,
+)
 from msctl.jsonutil import canonical_json
 
 
@@ -103,7 +111,7 @@ def build_launcher_manifest(
 ) -> dict[str, object]:
     """Resolve dynamic receipt hashes into Task3/5's closed manifest schema."""
 
-    if type(seed) is not int or seed not in {1, 2, 3, 4}:
+    if type(seed) is not int or seed not in SEEDS:
         raise LaunchManifestError("seed must be assigned to AWS")
     for label, value in (
         ("profile", profile_sha256),
@@ -121,6 +129,10 @@ def build_launcher_manifest(
     )
     corpus_hash = _hash_regular(corpus_receipt, label="corpus receipt")
     corpus = _load_object(corpus_receipt, label="corpus receipt")
+    build_id = _sha256(
+        corpus.get("build_id"),
+        label="corpus build ID",
+    )
     ordered_sha256 = _sha256(
         corpus.get("ordered_stream_sha256"),
         label="corpus ordered stream",
@@ -134,7 +146,7 @@ def build_launcher_manifest(
         arm = row["arm"]
         config = row["config"]
         if (
-            arm not in {"dense", "split90"}
+            arm not in ARMS
             or arm in by_arm
             or not isinstance(config, str)
             or not config
@@ -143,10 +155,24 @@ def build_launcher_manifest(
             or any(part in {"", ".", ".."} for part in config.split("/"))
         ):
             raise LaunchManifestError("run binding identity is invalid")
+        expected_config = f"{CONFIG_ROOT}/{arm}-s{seed}.yaml"
+        if config != expected_config:
+            raise LaunchManifestError(
+                f"{arm} config must match the v3 assigned seed"
+            )
         _sha256(row["config_sha256"], label=f"{arm} config")
         by_arm[str(arm)] = row
-    if set(by_arm) != {"dense", "split90"}:
+    if set(by_arm) != set(ARMS):
         raise LaunchManifestError("launcher pair must contain Dense and Split90")
+    corpus_relative = _relative_inside(
+        corpus_receipt,
+        scratch,
+        label="corpus receipt",
+    )
+    if corpus_relative != DATASET_RECEIPT_PATH:
+        raise LaunchManifestError(
+            "corpus receipt must be dataset/receipt.json under scratch"
+        )
     base_port = 29_500 + seed * 2
     launch_runs = []
     for arm, port, affinity in (
@@ -179,18 +205,15 @@ def build_launcher_manifest(
         },
         "code_commit": code_commit,
         "cohort_assignment_sha256": cohort_assignment_sha256,
-        "cohort_id": "memorysplit-confirmatory-v2-360m-n5",
+        "cohort_id": COHORT_ID,
         "corpus_receipt": {
+            "build_id": build_id,
             "ordered_stream_sha256": ordered_sha256,
-            "path": _relative_inside(
-                corpus_receipt,
-                scratch,
-                label="corpus receipt",
-            ),
+            "path": corpus_relative,
             "sha256": corpus_hash,
         },
         "profile_sha256": profile_sha256,
-        "provider": "aws-p5.48xlarge",
+        "provider": PROVIDER,
         "release_members_sha256": release_members_sha256,
         "release_sha256": release_sha256,
         "runs": launch_runs,

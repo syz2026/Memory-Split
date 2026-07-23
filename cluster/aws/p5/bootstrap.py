@@ -33,6 +33,17 @@ from cluster.aws.p5.profile import (
     load_aws_p5_profile,
     validate_runtime_environment,
 )
+from msctl.aws_contracts import (
+    ARMS,
+    COHORT_ASSIGNMENT_PATH,
+    COHORT_ID,
+    DATASET_POINTER_PATH,
+    EXPECTED_CONFIG_PATHS,
+    PACKAGE_FORMAT_VERSION,
+    PROFILE_PATH,
+    PROVIDER,
+    SEEDS,
+)
 
 
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
@@ -70,8 +81,11 @@ class BootstrapArtifacts:
     release_members: tuple["ReleaseMember", ...]
     corpus_receipt_sha256: str
     corpus_build_id: str
+    corpus_ordered_stream_sha256: str
     cohort_assignment_sha256: str
+    profile_sha256: str
     code_commit: str
+    code_tree: str
 
 
 @dataclass(frozen=True)
@@ -630,6 +644,62 @@ def _canonical_pretty(value: object) -> bytes:
     ).encode("ascii")
 
 
+def _exact_fields(
+    value: Mapping[str, object],
+    expected: set[str],
+    *,
+    label: str,
+) -> None:
+    actual = set(value)
+    if actual != expected:
+        raise BootstrapError(
+            f"{label} fields do not match; "
+            f"missing={sorted(expected - actual)}, "
+            f"unknown={sorted(actual - expected)}"
+        )
+
+
+def _strict_json_object(data: bytes, *, label: str) -> dict[str, object]:
+    def unique_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+        value: dict[str, object] = {}
+        for key, item in pairs:
+            if key in value:
+                raise BootstrapError(f"{label} repeats field: {key}")
+            value[key] = item
+        return value
+
+    try:
+        value = json.loads(
+            data.decode("utf-8"),
+            object_pairs_hook=unique_object,
+            parse_constant=lambda constant: (_ for _ in ()).throw(
+                BootstrapError(f"{label} contains non-finite {constant}")
+            ),
+        )
+    except BootstrapError:
+        raise
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise BootstrapError(f"{label} must contain valid UTF-8 JSON") from error
+    if not isinstance(value, dict):
+        raise BootstrapError(f"{label} must contain a JSON object")
+    return value
+
+
+def _binding(
+    value: object,
+    *,
+    label: str,
+    expected_path: str,
+) -> str:
+    if not isinstance(value, dict):
+        raise BootstrapError(f"{label} must be an object")
+    _exact_fields(value, {"path", "sha256"}, label=label)
+    path = _release_member_path(value["path"], label=f"{label} path")
+    if path != expected_path:
+        raise BootstrapError(f"{label} path does not match v3")
+    return _required_sha256(value["sha256"], label=f"{label} SHA-256")
+
+
 def _release_member_path(value: object, *, label: str) -> str:
     if (
         not isinstance(value, str)
@@ -656,11 +726,25 @@ def _verify_release_archive(
     *,
     expected_members_sha256: str,
     code_commit: str,
+    code_tree: str,
+    release_value: Mapping[str, object] | None = None,
 ) -> tuple[ReleaseMember, ...]:
     _required_sha256(
         expected_members_sha256,
         label="release members manifest",
     )
+    if (
+        not isinstance(code_commit, str)
+        or _COMMIT_RE.fullmatch(code_commit) is None
+        or not isinstance(code_tree, str)
+        or _COMMIT_RE.fullmatch(code_tree) is None
+    ):
+        raise BootstrapError(
+            "release source commit and tree must be 40-character Git IDs"
+        )
+    from msctl.contracts import validate_runtime_attested_contract
+    from msctl.errors import MsctlError
+
     try:
         archive = zipfile.ZipFile(release_archive, "r")
     except (OSError, zipfile.BadZipFile) as error:
@@ -751,26 +835,53 @@ def _verify_release_archive(
                 )
 
         metadata_bytes = regular["RELEASE-METADATA.json"][1]
-        try:
-            metadata = json.loads(metadata_bytes.decode("utf-8"))
-        except (UnicodeDecodeError, json.JSONDecodeError) as error:
-            raise BootstrapError(
-                "release metadata must contain valid UTF-8 JSON"
-            ) from error
+        metadata = _strict_json_object(
+            metadata_bytes,
+            label="release metadata",
+        )
+        _exact_fields(
+            metadata,
+            {
+                "schema_version",
+                "package_format_version",
+                "provider",
+                "source",
+                "seed_assignment",
+                "cohort_assignment",
+                "profile",
+                "environment",
+                "dataset_pointer",
+                "config_sha256",
+                "members",
+            },
+            label="release metadata",
+        )
+        metadata_source = metadata["source"]
+        if not isinstance(metadata_source, dict):
+            raise BootstrapError("release metadata source must be an object")
+        _exact_fields(
+            metadata_source,
+            {"commit", "tree", "dirty"},
+            label="release metadata source",
+        )
         if (
-            not isinstance(metadata, dict)
-            or _canonical_pretty(metadata) != metadata_bytes
+            _canonical_pretty(metadata) != metadata_bytes
+            or type(metadata.get("schema_version")) is not int
             or metadata.get("schema_version") != 1
-            or metadata.get("package_format_version") != 1
-            or metadata.get("provider") != "aws-p5.48xlarge"
-            or metadata.get("source")
-            != {"commit": code_commit, "dirty": False}
+            or type(metadata.get("package_format_version")) is not int
+            or metadata.get("package_format_version") != PACKAGE_FORMAT_VERSION
+            or metadata.get("provider") != PROVIDER
+            or metadata_source["commit"] != code_commit
+            or metadata_source["dirty"] is not False
+            or metadata_source["tree"] != code_tree
+            or not isinstance(metadata_source["tree"], str)
+            or _COMMIT_RE.fullmatch(metadata_source["tree"]) is None
             or metadata.get("seed_assignment")
             != {
-                "arms": ["dense", "split90"],
-                "cohort_id": "memorysplit-confirmatory-v2-360m-n5",
-                "provider": "aws-p5.48xlarge",
-                "seeds": [1, 2, 3, 4],
+                "arms": list(ARMS),
+                "cohort_id": COHORT_ID,
+                "provider": PROVIDER,
+                "seeds": list(SEEDS),
             }
         ):
             raise BootstrapError("release metadata identity does not match")
@@ -818,6 +929,147 @@ def _verify_release_archive(
                 "release metadata does not bind every package member"
             )
 
+        member_sha256 = {
+            row["path"]: row["sha256"]
+            for row in rows
+        }
+        cohort_sha256 = _binding(
+            metadata["cohort_assignment"],
+            label="release cohort assignment",
+            expected_path=COHORT_ASSIGNMENT_PATH,
+        )
+        profile_sha256 = _binding(
+            metadata["profile"],
+            label="release profile",
+            expected_path=PROFILE_PATH,
+        )
+        dataset_pointer_sha256 = _binding(
+            metadata["dataset_pointer"],
+            label="release dataset pointer",
+            expected_path=DATASET_POINTER_PATH,
+        )
+        for path, digest, label in (
+            (COHORT_ASSIGNMENT_PATH, cohort_sha256, "cohort assignment"),
+            (PROFILE_PATH, profile_sha256, "profile"),
+            (DATASET_POINTER_PATH, dataset_pointer_sha256, "dataset pointer"),
+        ):
+            if member_sha256.get(path) != digest:
+                raise BootstrapError(
+                    f"release {label} is not bound to its exact member"
+                )
+        config_sha256 = metadata["config_sha256"]
+        if not isinstance(config_sha256, dict):
+            raise BootstrapError("release config SHA-256 map must be an object")
+        if set(config_sha256) != set(EXPECTED_CONFIG_PATHS):
+            raise BootstrapError(
+                "release config SHA-256 map must contain exact v3 configs"
+            )
+        for path, digest in config_sha256.items():
+            _required_sha256(digest, label=f"release config {path}")
+            if member_sha256.get(path) != digest:
+                raise BootstrapError(
+                    f"release config is not bound to its exact member: {path}"
+                )
+        try:
+            validate_runtime_attested_contract(
+                metadata["environment"],
+                profile_sha256=profile_sha256,
+            )
+        except MsctlError as error:
+            raise BootstrapError(
+                "release runtime-attestation contract is invalid"
+            ) from error
+
+        assignment = _strict_json_object(
+            regular[COHORT_ASSIGNMENT_PATH][1],
+            label="v3 cohort assignment",
+        )
+        _exact_fields(
+            assignment,
+            {
+                "schema_version",
+                "cohort_id",
+                "model_parameters",
+                "optimizer_steps",
+                "provider_seeds",
+                "raw_target_tokens",
+                "targets_per_update",
+            },
+            label="v3 cohort assignment",
+        )
+        provider_seeds = assignment["provider_seeds"]
+        if (
+            type(assignment["schema_version"]) is not int
+            or assignment["schema_version"] != 3
+            or assignment["cohort_id"] != COHORT_ID
+            or type(assignment["model_parameters"]) is not int
+            or assignment["model_parameters"] != 356_033_536
+            or type(assignment["optimizer_steps"]) is not int
+            or assignment["optimizer_steps"] != 13_582
+            or type(assignment["raw_target_tokens"]) is not int
+            or assignment["raw_target_tokens"] != 7_120_879_616
+            or type(assignment["targets_per_update"]) is not int
+            or assignment["targets_per_update"] != 524_288
+            or not isinstance(provider_seeds, dict)
+            or set(provider_seeds) != {PROVIDER}
+            or provider_seeds[PROVIDER] != list(SEEDS)
+            or any(type(seed) is not int for seed in provider_seeds[PROVIDER])
+        ):
+            raise BootstrapError(
+                "v3 cohort assignment must contain AWS-only seeds 0 through 9"
+            )
+        profile = _strict_json_object(
+            regular[PROFILE_PATH][1],
+            label="v3 profile",
+        )
+        if (
+            profile.get("schema_version") != 1
+            or profile.get("profile_id") != "aws-p5.48xlarge-v3"
+            or profile.get("provider") != PROVIDER
+            or profile.get("assigned_seeds") != list(SEEDS)
+            or any(
+                type(seed) is not int
+                for seed in profile.get("assigned_seeds", ())
+            )
+        ):
+            raise BootstrapError("release v3 profile identity is invalid")
+        pointer = _strict_json_object(
+            regular[DATASET_POINTER_PATH][1],
+            label="dataset pointer",
+        )
+        if (
+            pointer.get("provider") != PROVIDER
+            or pointer.get("required_receipt") != "dataset/receipt.json"
+            or pointer.get("full_corpus_in_release") is not False
+        ):
+            raise BootstrapError("release dataset pointer identity is invalid")
+
+        if release_value is not None:
+            for field in (
+                "cohort_assignment",
+                "profile",
+                "environment",
+                "dataset_pointer",
+                "config_sha256",
+                "seed_assignment",
+                "source",
+                "package_format_version",
+            ):
+                if release_value.get(field) != metadata[field]:
+                    raise BootstrapError(
+                        f"release receipt does not bind metadata field {field}"
+                    )
+            if (
+                release_value.get("cohort_assignment_sha256")
+                != cohort_sha256
+                or release_value.get("profile_sha256") != profile_sha256
+                or release_value.get("dataset_pointer_sha256")
+                != dataset_pointer_sha256
+            ):
+                raise BootstrapError(
+                    "release receipt flat hashes do not bind metadata"
+                )
+
         executable_paths = {
             row["path"] for row in rows if row["git_mode"] == "100755"
         }
@@ -856,26 +1108,31 @@ def verify_bootstrap_artifacts(
         expected=release_receipt_sha256,
         label="release receipt",
     )
+    release_value = _strict_json_object(
+        release_receipt.read_bytes(),
+        label="release receipt",
+    )
     corpus_digest = _regular_digest(
         dataset_receipt,
         expected=dataset_receipt_sha256,
         label="dataset receipt",
     )
+    corpus_value = _strict_json_object(
+        dataset_receipt.read_bytes(),
+        label="dataset receipt",
+    )
     try:
-        corpus_value = json.loads(
-            dataset_receipt.read_bytes().decode("utf-8")
-        )
         corpus_build_id = corpus_value["build_id"]
-    except (
-        UnicodeDecodeError,
-        json.JSONDecodeError,
-        KeyError,
-        TypeError,
-    ) as error:
+        corpus_ordered_stream_sha256 = corpus_value["ordered_stream_sha256"]
+    except KeyError as error:
         raise BootstrapError(
-            "dataset receipt is missing its canonical build ID"
+            "dataset receipt is missing build ID or ordered stream SHA-256"
         ) from error
     _required_sha256(corpus_build_id, label="dataset receipt build ID")
+    _required_sha256(
+        corpus_ordered_stream_sha256,
+        label="dataset receipt ordered stream SHA-256",
+    )
     cohort_digest = _regular_digest(
         cohort_assignment,
         expected=cohort_assignment_sha256,
@@ -883,33 +1140,148 @@ def verify_bootstrap_artifacts(
     )
     if not isinstance(code_commit, str) or _COMMIT_RE.fullmatch(code_commit) is None:
         raise BootstrapError("code commit must be 40 lowercase hex characters")
-    try:
-        release_text = release_receipt.read_bytes().decode("utf-8")
-        release_value = json.loads(release_text)
-    except (UnicodeDecodeError, json.JSONDecodeError) as error:
-        raise BootstrapError("release receipt must contain valid JSON") from error
-    try:
-        bound_archive = release_value["archive"]["sha256"]
-        bound_commit = release_value["source"]["commit"]
-        bound_cohort = release_value["cohort_assignment_sha256"]
-        bound_dataset = release_value["dataset_receipt_sha256"]
-        bound_members = release_value["members_sha256"]
-    except (KeyError, TypeError) as error:
-        raise BootstrapError("release receipt is missing artifact bindings") from error
+    _exact_fields(
+        release_value,
+        {
+            "schema_version",
+            "package_format_version",
+            "release_id",
+            "provider",
+            "archive",
+            "source",
+            "members_sha256",
+            "seed_assignment",
+            "cohort_assignment",
+            "profile",
+            "environment",
+            "dataset_pointer",
+            "cohort_assignment_sha256",
+            "profile_sha256",
+            "dataset_pointer_sha256",
+            "config_sha256",
+        },
+        label="release receipt",
+    )
     if (
-        bound_archive != release_digest
-        or bound_commit != code_commit
-        or bound_cohort != cohort_digest
-        or bound_dataset != corpus_digest
+        type(release_value["schema_version"]) is not int
+        or release_value["schema_version"] != 1
+        or type(release_value["package_format_version"]) is not int
+        or release_value["package_format_version"] != PACKAGE_FORMAT_VERSION
+        or release_value["provider"] != PROVIDER
+        or not isinstance(release_value["release_id"], str)
+        or re.fullmatch(
+            r"[a-z0-9][a-z0-9._-]{0,126}[a-z0-9]",
+            release_value["release_id"],
+        )
+        is None
     ):
-        raise BootstrapError("release receipt artifact bindings do not match")
+        raise BootstrapError("release receipt package format identity is invalid")
+    source = release_value["source"]
+    if not isinstance(source, dict):
+        raise BootstrapError("release source must be an object")
+    _exact_fields(source, {"commit", "tree", "dirty"}, label="release source")
+    code_tree = source["tree"]
+    if (
+        source["commit"] != code_commit
+        or source["dirty"] is not False
+        or not isinstance(code_tree, str)
+        or _COMMIT_RE.fullmatch(code_tree) is None
+    ):
+        raise BootstrapError(
+            "release source commit and tree must be clean 40-character Git IDs"
+        )
+    archive = release_value["archive"]
+    if not isinstance(archive, dict):
+        raise BootstrapError("release archive binding must be an object")
+    _exact_fields(archive, {"path", "sha256", "bytes"}, label="release archive")
+    archive_path = _release_member_path(
+        archive["path"],
+        label="release archive path",
+    )
+    bound_archive = _required_sha256(
+        archive["sha256"],
+        label="release archive",
+    )
+    if (
+        archive_path != release_archive.name
+        or type(archive["bytes"]) is not int
+        or archive["bytes"] != release_archive.stat().st_size
+        or bound_archive != release_digest
+    ):
+        raise BootstrapError("release receipt archive binding does not match")
+    bound_members = _required_sha256(
+        release_value["members_sha256"],
+        label="release receipt members",
+    )
+    seed_assignment = release_value["seed_assignment"]
+    if not isinstance(seed_assignment, dict):
+        raise BootstrapError("release seed assignment must be an object")
+    _exact_fields(
+        seed_assignment,
+        {"cohort_id", "provider", "seeds", "arms"},
+        label="release seed assignment",
+    )
+    if seed_assignment != {
+        "arms": list(ARMS),
+        "cohort_id": COHORT_ID,
+        "provider": PROVIDER,
+        "seeds": list(SEEDS),
+    } or any(type(seed) is not int for seed in seed_assignment["seeds"]):
+        raise BootstrapError(
+            "release seed assignment must contain AWS-only seeds 0 through 9"
+        )
+    bound_cohort = _binding(
+        release_value["cohort_assignment"],
+        label="release cohort assignment",
+        expected_path=COHORT_ASSIGNMENT_PATH,
+    )
+    profile_sha256 = _binding(
+        release_value["profile"],
+        label="release profile",
+        expected_path=PROFILE_PATH,
+    )
+    dataset_pointer_sha256 = _binding(
+        release_value["dataset_pointer"],
+        label="release dataset pointer",
+        expected_path=DATASET_POINTER_PATH,
+    )
+    if (
+        release_value["cohort_assignment_sha256"] != bound_cohort
+        or release_value["profile_sha256"] != profile_sha256
+        or release_value["dataset_pointer_sha256"] != dataset_pointer_sha256
+    ):
+        raise BootstrapError("release receipt flat hashes do not bind objects")
+    config_sha256 = release_value["config_sha256"]
+    if not isinstance(config_sha256, dict) or set(config_sha256) != set(
+        EXPECTED_CONFIG_PATHS
+    ):
+        raise BootstrapError("release receipt config namespace is not exact v3")
+    for path, digest in config_sha256.items():
+        _required_sha256(digest, label=f"release receipt config {path}")
+    from msctl.contracts import validate_runtime_attested_contract
+    from msctl.errors import MsctlError
+
+    try:
+        validate_runtime_attested_contract(
+            release_value["environment"],
+            profile_sha256=profile_sha256,
+        )
+    except MsctlError as error:
+        raise BootstrapError(
+            "release receipt runtime-attestation contract is invalid"
+        ) from error
+    if (
+        bound_cohort != cohort_digest
+    ):
+        raise BootstrapError(
+            "release receipt cohort assignment binding does not match"
+        )
     release_members = _verify_release_archive(
         release_archive,
-        expected_members_sha256=_required_sha256(
-            bound_members,
-            label="release receipt members",
-        ),
+        expected_members_sha256=bound_members,
         code_commit=code_commit,
+        code_tree=code_tree,
+        release_value=release_value,
     )
     return BootstrapArtifacts(
         release_sha256=release_digest,
@@ -918,8 +1290,11 @@ def verify_bootstrap_artifacts(
         release_members=release_members,
         corpus_receipt_sha256=corpus_digest,
         corpus_build_id=corpus_build_id,
+        corpus_ordered_stream_sha256=corpus_ordered_stream_sha256,
         cohort_assignment_sha256=cohort_digest,
+        profile_sha256=profile_sha256,
         code_commit=code_commit,
+        code_tree=code_tree,
     )
 
 
@@ -946,6 +1321,7 @@ def extract_verified_release(
         release_archive,
         expected_members_sha256=artifacts.release_members_sha256,
         code_commit=artifacts.code_commit,
+        code_tree=artifacts.code_tree,
     )
     if members != artifacts.release_members:
         raise BootstrapError("release member evidence changed before extraction")
@@ -1042,6 +1418,7 @@ def build_bootstrap_receipt(
         != Path(profile.scratch_root)
         / "releases"
         / artifacts.release_sha256
+        or profile.sha256 != artifacts.profile_sha256
     ):
         raise BootstrapError("prepared release evidence does not match bootstrap")
     return {
@@ -1053,6 +1430,9 @@ def build_bootstrap_receipt(
         "container_image": evidence.container_image,
         "container_digest": runtime.container_digest,
         "corpus_build_id": artifacts.corpus_build_id,
+        "corpus_ordered_stream_sha256": (
+            artifacts.corpus_ordered_stream_sha256
+        ),
         "corpus_receipt_sha256": artifacts.corpus_receipt_sha256,
         "durable_upload_verified": durable_upload_verified,
         "instance_id": evidence.instance_id,
@@ -1139,7 +1519,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--profile",
         type=Path,
-        default=root / "profiles" / "aws-p5.48xlarge.json",
+        default=root / "profiles" / "aws-p5.48xlarge-v3.json",
     )
     parser.add_argument("--container-image", required=True)
     parser.add_argument("--release-archive", type=Path, required=True)

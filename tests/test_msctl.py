@@ -1820,6 +1820,23 @@ def test_load_release_rejects_missing_archive_before_returning(tmp_path):
     assert caught.value.code == "RELEASE_ARCHIVE_INVALID"
 
 
+def test_load_release_keeps_legacy_source_shape_explicit_and_closed(tmp_path):
+    from msctl.contracts import load_release
+    from msctl.errors import MsctlError
+
+    release_path = _release(tmp_path)
+    release = load_release(release_path)
+
+    assert release.package_format_version is None
+    assert release.source_tree is None
+
+    value = json.loads(release_path.read_text())
+    value["source"]["tree"] = "3" * 40
+    _write_json(release_path, value)
+    with pytest.raises(MsctlError, match="source|field"):
+        load_release(release_path)
+
+
 @pytest.mark.parametrize(
     "mutation",
     ["archive_symlink", "archive_bytes", "external_symlink", "missing_member"],
@@ -3971,6 +3988,46 @@ def test_aws_post_bootstrap_builder_emits_exact_task3_launcher_manifest(
     )
 
     assert actual == expected
+
+
+def test_aws_post_bootstrap_builder_rejects_v2_config_and_preserves_output(
+    tmp_path,
+):
+    from msctl.aws_launch_manifest import (
+        LaunchManifestError,
+        build_launcher_manifest,
+    )
+    from tests.test_aws_p5_launcher import _launcher_fixture
+
+    fixture = _launcher_fixture(tmp_path / "task3-invalid")
+    expected = fixture["manifest"]
+    runs = [
+        {
+            "arm": row["arm"],
+            "config": row["config"],
+            "config_sha256": row["config_sha256"],
+        }
+        for row in expected["runs"]
+    ]
+    runs[0]["config"] = "configs/360m-v2/dense-s1.yaml"
+    out = fixture["scratch_root"] / "staging" / "must-not-exist.json"
+
+    with pytest.raises(LaunchManifestError, match="config"):
+        build_launcher_manifest(
+            out=out,
+            scratch_root=fixture["scratch_root"],
+            seed=expected["seed"],
+            profile_sha256=expected["profile_sha256"],
+            release_sha256=expected["release_sha256"],
+            release_members_sha256=expected["release_members_sha256"],
+            cohort_assignment_sha256=expected["cohort_assignment_sha256"],
+            code_commit=expected["code_commit"],
+            bootstrap_receipt=fixture["bootstrap_path"],
+            corpus_receipt=fixture["corpus_path"],
+            runs=runs,
+        )
+
+    assert not out.exists()
 
 
 def test_aws_submit_is_dry_run_by_default_and_approval_precedes_aws_calls(

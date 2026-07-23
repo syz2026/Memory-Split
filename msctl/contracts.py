@@ -12,6 +12,16 @@ import zipfile
 from dataclasses import dataclass
 from pathlib import Path
 
+from .aws_contracts import (
+    ARMS as AWS_ARMS,
+    COHORT_ASSIGNMENT_PATH as AWS_COHORT_ASSIGNMENT_PATH,
+    COHORT_ID as AWS_COHORT_ID,
+    DATASET_POINTER_PATH as AWS_DATASET_POINTER_PATH,
+    EXPECTED_CONFIG_PATHS as AWS_EXPECTED_CONFIG_PATHS,
+    PACKAGE_FORMAT_VERSION as AWS_PACKAGE_FORMAT_VERSION,
+    PROFILE_PATH as AWS_PROFILE_PATH,
+    SEEDS as AWS_SEEDS,
+)
 from .cohort import load_cohort_assignment as load_cohort_assignment
 from .errors import MsctlError
 from .fsutil import hash_fd, open_directory, open_regular_at, read_fd
@@ -41,6 +51,8 @@ class Release:
     archive_bytes: int
     archive_path: Path
     source_commit: str
+    source_tree: str | None
+    package_format_version: int | None
     members_sha256: str
     members: dict[str, dict[str, object]]
     archive_files: dict[str, str]
@@ -100,6 +112,7 @@ class CheckpointReceipt:
 
 
 _GIT_OBJECT_RE = re.compile(r"^[0-9a-f]{40}(?:[0-9a-f]{24})?$")
+_GIT_SHA1_RE = re.compile(r"^[0-9a-f]{40}$")
 _RUNTIME_RECEIPT_FIELDS = [
     "schema_version",
     "profile_sha256",
@@ -259,8 +272,30 @@ def _read_archive(
 
 
 def _parse_internal_json(data: bytes, *, label: str) -> dict[str, object]:
+    def unique_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+        value: dict[str, object] = {}
+        for key, item in pairs:
+            if key in value:
+                raise _release_error(
+                    "RELEASE_INTERNAL_INVALID",
+                    f"{label} contains a duplicate field",
+                )
+            value[key] = item
+        return value
+
     try:
-        value = json.loads(data.decode("utf-8"))
+        value = json.loads(
+            data.decode("utf-8"),
+            object_pairs_hook=unique_object,
+            parse_constant=lambda constant: (_ for _ in ()).throw(
+                _release_error(
+                    "RELEASE_INTERNAL_INVALID",
+                    f"{label} contains non-finite {constant}",
+                )
+            ),
+        )
+    except MsctlError:
+        raise
     except (UnicodeDecodeError, json.JSONDecodeError) as error:
         raise _release_error(
             "RELEASE_INTERNAL_INVALID",
@@ -385,10 +420,13 @@ def _verify_release_internals(
         payload["RELEASE-METADATA.json"],
         label="RELEASE-METADATA.json",
     )
-    aws_package = (
-        release_value["provider"] == AWS_P5_PROFILE
+    aws_package_version = (
+        release_value.get("package_format_version")
+        if release_value["provider"] == AWS_P5_PROFILE
         and "package_format_version" in metadata
+        else None
     )
+    aws_package = aws_package_version is not None
     if aws_package:
         metadata_fields = {
             "schema_version",
@@ -440,9 +478,37 @@ def _verify_release_internals(
             "RELEASE_INTERNAL_INVALID",
             "RELEASE-METADATA.json schema is unsupported",
         ) from error
+    metadata_source = require_object(
+        metadata["source"],
+        label="RELEASE-METADATA.json.source",
+    )
+    metadata_source_fields = {"commit", "dirty"}
+    if aws_package_version == AWS_PACKAGE_FORMAT_VERSION:
+        metadata_source_fields.add("tree")
+    require_exact_keys(
+        metadata_source,
+        metadata_source_fields,
+        label="RELEASE-METADATA.json.source",
+    )
+    if (
+        not isinstance(metadata_source["commit"], str)
+        or COMMIT_RE.fullmatch(metadata_source["commit"]) is None
+        or metadata_source["dirty"] is not False
+        or (
+            aws_package_version == AWS_PACKAGE_FORMAT_VERSION
+            and (
+                not isinstance(metadata_source["tree"], str)
+                or _GIT_SHA1_RE.fullmatch(metadata_source["tree"]) is None
+            )
+        )
+    ):
+        raise _release_error(
+            "RELEASE_INTERNAL_INVALID",
+            "internal release source identity is invalid",
+        )
     if (
         metadata["provider"] != release_value["provider"]
-        or metadata["source"] != release_value["source"]
+        or metadata_source != release_value["source"]
     ):
         raise _release_error(
             "RELEASE_INTERNAL_INVALID",
@@ -536,7 +602,11 @@ def _verify_release_internals(
     profile_member_path = (
         "cluster/profiles/illumina-usfc-prd.json"
         if release_value["provider"] == SUPPORTED_PROFILE
-        else "cluster/profiles/aws-p5.48xlarge.json"
+        else (
+            AWS_PROFILE_PATH
+            if aws_package_version == AWS_PACKAGE_FORMAT_VERSION
+            else "cluster/profiles/aws-p5.48xlarge.json"
+        )
     )
     profile_member = members.get(profile_member_path)
     if profile_member is None or profile_member["sha256"] != profile_hash:
@@ -546,8 +616,8 @@ def _verify_release_internals(
         )
     if aws_package:
         if (
-            not isinstance(metadata["package_format_version"], str)
-            or not metadata["package_format_version"]
+            type(metadata["package_format_version"]) is not int
+            or metadata["package_format_version"] not in {1, 2}
             or metadata["package_format_version"]
             != release_value["package_format_version"]
         ):
@@ -560,7 +630,18 @@ def _verify_release_internals(
                 "RELEASE_INTERNAL_INVALID",
                 "AWS release profile path is invalid",
             )
-        for label in ("cohort_assignment", "dataset_pointer"):
+        expected_binding_paths = (
+            {
+                "cohort_assignment": AWS_COHORT_ASSIGNMENT_PATH,
+                "dataset_pointer": AWS_DATASET_POINTER_PATH,
+            }
+            if aws_package_version == AWS_PACKAGE_FORMAT_VERSION
+            else {
+                "cohort_assignment": "configs/cohort-assignment-v2.json",
+                "dataset_pointer": AWS_DATASET_POINTER_PATH,
+            }
+        )
+        for label, expected_path in expected_binding_paths.items():
             binding = require_object(
                 metadata[label],
                 label=f"RELEASE-METADATA.json.{label}",
@@ -578,7 +659,11 @@ def _verify_release_internals(
                 binding["sha256"],
                 label=f"RELEASE-METADATA.json.{label}.sha256",
             )
-            if path not in members or members[path]["sha256"] != digest:
+            if (
+                path != expected_path
+                or path not in members
+                or members[path]["sha256"] != digest
+            ):
                 raise _release_error(
                     "RELEASE_INTERNAL_INVALID",
                     f"AWS {label} is not bound to a release member",
@@ -587,6 +672,20 @@ def _verify_release_internals(
             metadata["config_sha256"],
             label="RELEASE-METADATA.json.config_sha256",
         )
+        expected_config_paths = (
+            set(AWS_EXPECTED_CONFIG_PATHS)
+            if aws_package_version == AWS_PACKAGE_FORMAT_VERSION
+            else {
+                f"configs/360m-v2/{arm}-s{seed}.yaml"
+                for seed in (1, 2, 3, 4)
+                for arm in AWS_ARMS
+            }
+        )
+        if set(config_hashes) != expected_config_paths:
+            raise _release_error(
+                "RELEASE_INTERNAL_INVALID",
+                "AWS config hash namespace does not match the package format",
+            )
         for path, raw_digest in config_hashes.items():
             relative = portable_relative(path, label="AWS config path")
             digest = require_sha256(raw_digest, label="AWS config SHA-256")
@@ -594,6 +693,60 @@ def _verify_release_internals(
                 raise _release_error(
                     "RELEASE_INTERNAL_INVALID",
                     "AWS config hash is not bound to a release member",
+                )
+        if aws_package_version == AWS_PACKAGE_FORMAT_VERSION:
+            assignment_value = _parse_internal_json(
+                payload[AWS_COHORT_ASSIGNMENT_PATH],
+                label=AWS_COHORT_ASSIGNMENT_PATH,
+            )
+            require_exact_keys(
+                assignment_value,
+                {
+                    "schema_version",
+                    "cohort_id",
+                    "model_parameters",
+                    "optimizer_steps",
+                    "provider_seeds",
+                    "raw_target_tokens",
+                    "targets_per_update",
+                },
+                label=AWS_COHORT_ASSIGNMENT_PATH,
+            )
+            provider_seeds = require_object(
+                assignment_value["provider_seeds"],
+                label=f"{AWS_COHORT_ASSIGNMENT_PATH}.provider_seeds",
+            )
+            if (
+                type(assignment_value["schema_version"]) is not int
+                or assignment_value["schema_version"] != 3
+                or assignment_value["cohort_id"] != AWS_COHORT_ID
+                or assignment_value["model_parameters"] != 356_033_536
+                or assignment_value["optimizer_steps"] != 13_582
+                or assignment_value["raw_target_tokens"] != 7_120_879_616
+                or assignment_value["targets_per_update"] != 524_288
+                or set(provider_seeds) != {AWS_P5_PROFILE}
+                or provider_seeds[AWS_P5_PROFILE] != list(AWS_SEEDS)
+                or any(
+                    type(seed) is not int
+                    for seed in provider_seeds[AWS_P5_PROFILE]
+                )
+            ):
+                raise _release_error(
+                    "RELEASE_INTERNAL_INVALID",
+                    "AWS v3 cohort assignment identity is invalid",
+                )
+            pointer = _parse_internal_json(
+                payload[AWS_DATASET_POINTER_PATH],
+                label=AWS_DATASET_POINTER_PATH,
+            )
+            if (
+                pointer.get("provider") != AWS_P5_PROFILE
+                or pointer.get("required_receipt") != "dataset/receipt.json"
+                or pointer.get("full_corpus_in_release") is not False
+            ):
+                raise _release_error(
+                    "RELEASE_INTERNAL_INVALID",
+                    "AWS v3 dataset pointer identity is invalid",
                 )
     else:
         environment_hashes = require_object(
@@ -638,11 +791,19 @@ def _verify_release_internals(
         expected_seeds = (
             [0]
             if release_value["provider"] == SUPPORTED_PROFILE
-            else [1, 2, 3, 4]
+            else (
+                list(AWS_SEEDS)
+                if aws_package_version == AWS_PACKAGE_FORMAT_VERSION
+                else [1, 2, 3, 4]
+            )
+        )
+        expected_cohort_id = (
+            AWS_COHORT_ID
+            if aws_package_version == AWS_PACKAGE_FORMAT_VERSION
+            else "memorysplit-confirmatory-v2-360m-n5"
         )
         if (
-            not isinstance(assignment["cohort_id"], str)
-            or not assignment["cohort_id"]
+            assignment["cohort_id"] != expected_cohort_id
             or assignment["provider"] != release_value["provider"]
             or not isinstance(seeds, list)
             or any(isinstance(seed, bool) or not isinstance(seed, int) for seed in seeds)
@@ -665,6 +826,15 @@ def load_release(path: Path | str) -> Release:
         value.get("provider") == AWS_P5_PROFILE
         and "package_format_version" in value
     )
+    package_format_version: int | None = None
+    if aws_package:
+        raw_package_format = value["package_format_version"]
+        if type(raw_package_format) is not int or raw_package_format not in {1, 2}:
+            raise MsctlError(
+                "RELEASE_INVALID",
+                "AWS package format must be the integer 1 or 2",
+            )
+        package_format_version = raw_package_format
     release_fields = {
         "schema_version",
         "release_id",
@@ -730,8 +900,13 @@ def load_release(path: Path | str) -> Release:
     ):
         raise MsctlError("RELEASE_INVALID", "release archive bytes are invalid")
     source = require_object(value["source"], label="release.source")
+    if package_format_version == 1 and "tree" in source:
+        raise MsctlError(
+            "RELEASE_INVALID",
+            "AWS package format 1 cannot carry the v3 source tree",
+        )
     source_fields = {"commit", "dirty"}
-    if aws_package:
+    if package_format_version == AWS_PACKAGE_FORMAT_VERSION:
         source_fields.add("tree")
     require_exact_keys(source, source_fields, label="release.source")
     if (
@@ -739,10 +914,10 @@ def load_release(path: Path | str) -> Release:
         or COMMIT_RE.fullmatch(source["commit"]) is None
         or source["dirty"] is not False
         or (
-            aws_package
+            package_format_version == AWS_PACKAGE_FORMAT_VERSION
             and (
                 not isinstance(source["tree"], str)
-                or _GIT_OBJECT_RE.fullmatch(source["tree"]) is None
+                or _GIT_SHA1_RE.fullmatch(source["tree"]) is None
             )
         )
     ):
@@ -822,6 +997,12 @@ def load_release(path: Path | str) -> Release:
         archive_bytes=int(archive["bytes"]),
         archive_path=archive_path,
         source_commit=source["commit"],
+        source_tree=(
+            str(source["tree"])
+            if package_format_version == AWS_PACKAGE_FORMAT_VERSION
+            else None
+        ),
+        package_format_version=package_format_version,
         members_sha256=members_hash,
         members=members,
         archive_files=archive_files,

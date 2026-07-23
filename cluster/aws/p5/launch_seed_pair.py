@@ -43,11 +43,23 @@ from cluster.aws.p5.profile import (
     load_aws_p5_profile,
     validate_runtime_environment,
 )
+from msctl.aws_contracts import (
+    ARMS,
+    COHORT_ASSIGNMENT_PATH,
+    COHORT_ID,
+    CONFIG_ROOT,
+    DATASET_POINTER_PATH,
+    DATASET_RECEIPT_PATH,
+    EXPECTED_CONFIG_PATHS,
+    PACKAGE_FORMAT_VERSION,
+    PROFILE_PATH as PROFILE_MEMBER_PATH,
+    PROVIDER,
+    SEEDS,
+    SNAPSHOT_STEPS,
+)
 
 
-PROVIDER = "aws-p5.48xlarge"
-COHORT_ID = "memorysplit-confirmatory-v2-360m-n5"
-_ARMS = ("dense", "split90")
+_ARMS = ARMS
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
 _H100_RE = re.compile(r"^NVIDIA H100 80GB(?: HBM3)?$")
@@ -105,7 +117,7 @@ _CONFIG_FIELDS = frozenset(
         "device",
         "log_every",
         "eval_every",
-        "snap_frac",
+        "snapshot_steps",
         "ckpt_minutes",
     }
 )
@@ -129,6 +141,7 @@ _BOOTSTRAP_FIELDS = frozenset(
         "cohort_assignment_sha256",
         "corpus_receipt_sha256",
         "corpus_build_id",
+        "corpus_ordered_stream_sha256",
         "code_commit",
         "scratch_root",
         "runtime_uid",
@@ -307,6 +320,8 @@ def _validate_release_root(
     *,
     release_sha256: str,
     release_members_sha256: str,
+    profile_sha256: str,
+    cohort_sha256: str,
     code_commit: str,
 ) -> tuple[VerifiedFile, ...]:
     expected_root = scratch / "releases" / release_sha256
@@ -380,25 +395,52 @@ def _validate_release_root(
             raise LaunchError(f"release member SHA-256 mismatch: {relative}")
         verified.append(VerifiedFile(path=path, sha256=digest))
 
-    try:
-        metadata_bytes = metadata_path.read_bytes()
-        metadata = json.loads(metadata_bytes.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError) as error:
-        raise LaunchError("release metadata must contain UTF-8 JSON") from error
+    metadata_bytes = metadata_path.read_bytes()
+    metadata = _load_json(metadata_path, label="release metadata")
+    _exact_fields(
+        metadata,
+        frozenset(
+            {
+                "schema_version",
+                "package_format_version",
+                "provider",
+                "source",
+                "seed_assignment",
+                "cohort_assignment",
+                "profile",
+                "environment",
+                "dataset_pointer",
+                "config_sha256",
+                "members",
+            }
+        ),
+        label="release metadata",
+    )
+    source = metadata["source"]
+    if not isinstance(source, dict):
+        raise LaunchError("release metadata source must be an object")
+    _exact_fields(
+        source,
+        frozenset({"commit", "tree", "dirty"}),
+        label="release source",
+    )
     if (
-        not isinstance(metadata, dict)
-        or _canonical_pretty(metadata) != metadata_bytes
+        _canonical_pretty(metadata) != metadata_bytes
+        or type(metadata.get("schema_version")) is not int
         or metadata.get("schema_version") != 1
-        or metadata.get("package_format_version") != 1
+        or type(metadata.get("package_format_version")) is not int
+        or metadata.get("package_format_version") != PACKAGE_FORMAT_VERSION
         or metadata.get("provider") != PROVIDER
-        or metadata.get("source")
-        != {"commit": code_commit, "dirty": False}
+        or source["commit"] != code_commit
+        or source["dirty"] is not False
+        or not isinstance(source["tree"], str)
+        or _COMMIT_RE.fullmatch(source["tree"]) is None
         or metadata.get("seed_assignment")
         != {
-            "arms": ["dense", "split90"],
+            "arms": list(ARMS),
             "cohort_id": COHORT_ID,
             "provider": PROVIDER,
-            "seeds": [1, 2, 3, 4],
+            "seeds": list(SEEDS),
         }
     ):
         raise LaunchError("release metadata identity does not match")
@@ -440,6 +482,142 @@ def _validate_release_root(
         != set(checksums) - {"RELEASE-METADATA.json"}
     ):
         raise LaunchError("release metadata does not bind every member")
+
+    member_sha256 = {row["path"]: row["sha256"] for row in rows}
+
+    def metadata_binding(
+        name: str,
+        expected_path: str,
+    ) -> tuple[str, str]:
+        binding = metadata[name]
+        if not isinstance(binding, dict):
+            raise LaunchError(f"release {name} binding must be an object")
+        _exact_fields(
+            binding,
+            frozenset({"path", "sha256"}),
+            label=f"release {name} binding",
+        )
+        relative = _portable_relative(
+            binding["path"],
+            label=f"release {name} path",
+        )
+        digest = _sha256(
+            binding["sha256"],
+            label=f"release {name}",
+        )
+        if (
+            relative != expected_path
+            or member_sha256.get(relative) != digest
+        ):
+            raise LaunchError(f"release {name} member binding does not match")
+        return relative, digest
+
+    _cohort_path, metadata_cohort_sha256 = metadata_binding(
+        "cohort_assignment",
+        COHORT_ASSIGNMENT_PATH,
+    )
+    _profile_path, metadata_profile_sha256 = metadata_binding(
+        "profile",
+        PROFILE_MEMBER_PATH,
+    )
+    _pointer_path, metadata_pointer_sha256 = metadata_binding(
+        "dataset_pointer",
+        DATASET_POINTER_PATH,
+    )
+    if (
+        metadata_cohort_sha256 != cohort_sha256
+        or metadata_profile_sha256 != profile_sha256
+    ):
+        raise LaunchError(
+            "release profile or cohort binding does not match the manifest"
+        )
+    config_sha256 = metadata["config_sha256"]
+    if not isinstance(config_sha256, dict) or set(config_sha256) != set(
+        EXPECTED_CONFIG_PATHS
+    ):
+        raise LaunchError("release config namespace does not match exact v3")
+    for relative, digest in config_sha256.items():
+        expected_digest = _sha256(digest, label=f"release config {relative}")
+        if member_sha256.get(relative) != expected_digest:
+            raise LaunchError(
+                f"release config member binding does not match: {relative}"
+            )
+    from msctl.contracts import validate_runtime_attested_contract
+    from msctl.errors import MsctlError
+
+    try:
+        validate_runtime_attested_contract(
+            metadata["environment"],
+            profile_sha256=metadata_profile_sha256,
+        )
+    except MsctlError as error:
+        raise LaunchError(
+            "release runtime-attestation contract is invalid"
+        ) from error
+
+    assignment = _load_json(
+        _inside_existing(
+            repo,
+            COHORT_ASSIGNMENT_PATH,
+            label="cohort assignment",
+        ),
+        label="cohort assignment",
+    )
+    _exact_fields(
+        assignment,
+        frozenset(
+            {
+                "schema_version",
+                "cohort_id",
+                "model_parameters",
+                "optimizer_steps",
+                "provider_seeds",
+                "raw_target_tokens",
+                "targets_per_update",
+            }
+        ),
+        label="cohort assignment",
+    )
+    provider_seeds = assignment["provider_seeds"]
+    if (
+        type(assignment["schema_version"]) is not int
+        or assignment["schema_version"] != 3
+        or assignment["cohort_id"] != COHORT_ID
+        or type(assignment["model_parameters"]) is not int
+        or assignment["model_parameters"] != 356_033_536
+        or type(assignment["optimizer_steps"]) is not int
+        or assignment["optimizer_steps"] != 13_582
+        or type(assignment["raw_target_tokens"]) is not int
+        or assignment["raw_target_tokens"] != 7_120_879_616
+        or type(assignment["targets_per_update"]) is not int
+        or assignment["targets_per_update"] != 524_288
+        or not isinstance(provider_seeds, dict)
+        or set(provider_seeds) != {PROVIDER}
+        or provider_seeds[PROVIDER] != list(SEEDS)
+        or any(type(seed) is not int for seed in provider_seeds[PROVIDER])
+    ):
+        raise LaunchError(
+            "cohort assignment must contain AWS-only seeds 0 through 9"
+        )
+    pointer = _load_json(
+        _inside_existing(
+            repo,
+            DATASET_POINTER_PATH,
+            label="dataset pointer",
+        ),
+        label="dataset pointer",
+    )
+    if (
+        pointer.get("provider") != PROVIDER
+        or pointer.get("required_receipt") != DATASET_RECEIPT_PATH
+        or pointer.get("full_corpus_in_release") is not False
+        or _hash_regular(
+            repo / DATASET_POINTER_PATH,
+            label="dataset pointer",
+        )
+        != metadata_pointer_sha256
+    ):
+        raise LaunchError("release dataset pointer identity does not match")
     return tuple(verified)
 
 
@@ -495,7 +673,11 @@ def _load_config(path: Path) -> dict[str, object]:
     except UnicodeDecodeError as error:
         raise LaunchError("config must contain valid UTF-8 YAML") from error
     value: dict[str, object] = {}
-    for line in text.splitlines():
+    lines = text.splitlines()
+    line_index = 0
+    while line_index < len(lines):
+        line = lines[line_index]
+        line_index += 1
         if not line or line.isspace():
             continue
         if line.startswith((" ", "\t", "#", "---", "...")) or ":" not in line:
@@ -507,6 +689,28 @@ def _load_config(path: Path) -> dict[str, object]:
         ):
             raise LaunchError("config contains an invalid or duplicate key")
         scalar = raw_value.strip()
+        if key == "snapshot_steps":
+            if scalar == "[1358, 3396, 6791, 10187, 13582]":
+                value[key] = list(SNAPSHOT_STEPS)
+                continue
+            if scalar:
+                raise LaunchError(
+                    "config snapshot_steps must use the exact frozen "
+                    "integer list"
+                )
+            for expected_step in SNAPSHOT_STEPS:
+                expected_line = f"- {expected_step}"
+                if (
+                    line_index >= len(lines)
+                    or lines[line_index] != expected_line
+                ):
+                    raise LaunchError(
+                        "config snapshot_steps must use the exact frozen "
+                        "integer list"
+                    )
+                line_index += 1
+            value[key] = list(SNAPSHOT_STEPS)
+            continue
         if (
             not scalar
             or scalar[0] in "[{&*!|>@`"
@@ -558,7 +762,7 @@ def _validate_config(
     expected = {
         "schema_version": 2,
         "cohort_id": COHORT_ID,
-        "run_id": f"memorysplit-v2-360m-s{seed}-{arm}",
+        "run_id": f"memorysplit-v3-360m-s{seed}-{arm}",
         "condition": arm,
         "seed": seed,
         "model": "d360m",
@@ -581,7 +785,7 @@ def _validate_config(
         "device": "cuda",
         "log_every": 20,
         "eval_every": 250,
-        "snap_frac": 0.1,
+        "snapshot_steps": list(SNAPSHOT_STEPS),
         "ckpt_minutes": 30,
     }
     for name, expected_value in expected.items():
@@ -616,6 +820,7 @@ def _validate_bootstrap_receipt(
     cohort_sha256: str,
     corpus_sha256: str,
     corpus_build_id: str,
+    corpus_ordered_stream_sha256: str,
     code_commit: str,
     observed_instance_id: str,
     observed_boot_id: str,
@@ -640,6 +845,7 @@ def _validate_bootstrap_receipt(
         "cohort_assignment_sha256": cohort_sha256,
         "corpus_receipt_sha256": corpus_sha256,
         "corpus_build_id": corpus_build_id,
+        "corpus_ordered_stream_sha256": corpus_ordered_stream_sha256,
         "code_commit": code_commit,
         "instance_id": observed_instance_id,
         "boot_id": observed_boot_id,
@@ -805,12 +1011,17 @@ def load_launch_plan(
     """Validate all trust roots and return an immutable paired launch plan."""
 
     profile = load_aws_p5_profile(profile_path)
+    if (
+        profile.profile_id != "aws-p5.48xlarge-v3"
+        or profile.assigned_seeds != SEEDS
+    ):
+        raise LaunchError("launch requires the exact v3 AWS P5 profile")
     try:
         runtime = validate_runtime_environment(profile, environment)
     except ValueError as error:
         raise LaunchError(str(error)) from error
-    if type(seed) is not int or seed not in profile.assigned_seeds:
-        raise LaunchError("seed must be assigned to AWS: one of 1, 2, 3, 4")
+    if type(seed) is not int or seed not in SEEDS:
+        raise LaunchError("seed must be assigned to AWS: one of 0 through 9")
     actual_instance_type = (
         _default_instance_type()
         if observed_instance_type is None
@@ -896,14 +1107,24 @@ def load_launch_plan(
         raise LaunchError("manifest corpus receipt binding must be an object")
     _exact_fields(
         corpus_binding,
-        frozenset({"path", "sha256", "ordered_stream_sha256"}),
+        frozenset(
+            {"path", "sha256", "build_id", "ordered_stream_sha256"}
+        ),
         label="manifest corpus receipt binding",
     )
     corpus_relative = _portable_relative(
         corpus_binding["path"], label="manifest corpus receipt path"
     )
+    if corpus_relative != DATASET_RECEIPT_PATH:
+        raise LaunchError(
+            "manifest corpus receipt path must be dataset/receipt.json"
+        )
     corpus_sha256 = _sha256(
         corpus_binding["sha256"], label="manifest corpus receipt"
+    )
+    corpus_build_id = _sha256(
+        corpus_binding["build_id"],
+        label="manifest corpus build ID",
     )
     ordered_sha256 = _sha256(
         corpus_binding["ordered_stream_sha256"],
@@ -921,6 +1142,8 @@ def load_launch_plan(
         )
     except CorpusContractError as error:
         raise LaunchError(str(error)) from error
+    if corpus_evidence.receipt.get("build_id") != corpus_build_id:
+        raise LaunchError("manifest corpus build ID does not match receipt")
     verified_files = [
         VerifiedFile(path=manifest_file, sha256=manifest_digest),
         *(
@@ -954,7 +1177,8 @@ def load_launch_plan(
         release_members_sha256=release_members_sha256,
         cohort_sha256=cohort_sha256,
         corpus_sha256=corpus_sha256,
-        corpus_build_id=str(corpus_evidence.receipt["build_id"]),
+        corpus_build_id=corpus_build_id,
+        corpus_ordered_stream_sha256=ordered_sha256,
         code_commit=code_commit,
         observed_instance_id=actual_instance_id,
         observed_boot_id=actual_boot_id,
@@ -966,6 +1190,8 @@ def load_launch_plan(
             scratch,
             release_sha256=release_sha256,
             release_members_sha256=release_members_sha256,
+            profile_sha256=profile_sha256,
+            cohort_sha256=cohort_sha256,
             code_commit=code_commit,
         )
     )
@@ -979,7 +1205,7 @@ def load_launch_plan(
         ("split90", 1, (96, 191)),
     ):
         run = runs[arm]
-        expected_config = f"configs/360m-v2/{arm}-s{seed}.yaml"
+        expected_config = f"{CONFIG_ROOT}/{arm}-s{seed}.yaml"
         config_relative = _portable_relative(
             run["config"], label=f"{arm} config path"
         )
@@ -998,7 +1224,7 @@ def load_launch_plan(
             config,
             seed=seed,
             arm=arm,
-            corpus_path="dataset/corpus-receipt.json",
+            corpus_path=DATASET_RECEIPT_PATH,
         )
         out_dir = _inside_output(
             scratch, out_relative, label=f"{arm} output"
@@ -2098,7 +2324,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--profile",
         type=Path,
-        default=root / "cluster" / "profiles" / "aws-p5.48xlarge.json",
+        default=root / PROFILE_MEMBER_PATH,
     )
     parser.add_argument("--repo-root", type=Path, default=root)
     parser.add_argument("--scratch-root", type=Path, default=Path("/mnt/memorysplit"))
