@@ -1258,6 +1258,9 @@ def _validate_profile(data: bytes) -> None:
     if not isinstance(runtime, dict) or set(runtime) != {
         "ami_id_env",
         "container_digest_env",
+        "region_env",
+        "runtime_gid_env",
+        "runtime_uid_env",
     }:
         raise PackageError(
             "AWS P5 profile runtime must not claim a static environment identity"
@@ -1271,12 +1274,21 @@ def _validate_profile(data: bytes) -> None:
         ("gpu", "allocated"): 8,
         ("gpu", "seed_train_groups"): [4, 4],
         ("cpu", "vcpus"): 192,
-        ("storage", "instance_store_devices"): 8,
-        ("storage", "instance_store_device_bytes"): 3_840_000_000_000,
+        ("cpu", "memory_gib"): 2048,
+        ("storage", "instance_store", "devices"): 8,
+        ("storage", "instance_store", "device_bytes"): 3_840_000_000_000,
+        ("storage", "instance_store", "model"): (
+            "Amazon EC2 NVMe Instance Storage"
+        ),
+        ("storage", "instance_store", "raid_level"): "0",
         ("storage", "scratch_root"): "/mnt/memorysplit",
         ("storage", "durable_uri_env"): "MS_S3_ROOT",
         ("runtime", "ami_id_env"): "MS_AWS_AMI_ID",
         ("runtime", "container_digest_env"): "MS_CONTAINER_DIGEST",
+        ("runtime", "region_env"): "AWS_REGION",
+        ("runtime", "runtime_gid_env"): "MS_RUNTIME_GID",
+        ("runtime", "runtime_uid_env"): "MS_RUNTIME_UID",
+        ("process_env_allowlist",): ["AWS_REGION", "LANG", "LC_ALL"],
     }
     for path, expected in expected_values.items():
         actual = _nested_value(profile, path, label="AWS P5 profile")
