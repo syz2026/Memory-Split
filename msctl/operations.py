@@ -11,6 +11,15 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from .approval import verify_approval
+from .aws_contracts import (
+    COHORT_ASSIGNMENT_PATH as AWS_COHORT_ASSIGNMENT_PATH,
+    COHORT_ID as AWS_COHORT_ID,
+    DATASET_POINTER_PATH as AWS_DATASET_POINTER_PATH,
+    PACKAGE_FORMAT_VERSION as AWS_PACKAGE_FORMAT_VERSION,
+    PREREGISTRATION_PATH as AWS_PREREGISTRATION_PATH,
+    PROFILE_PATH as AWS_PROFILE_PATH,
+    SEEDS as AWS_SEEDS,
+)
 from .contracts import (
     RunManifest,
     bind_release,
@@ -30,6 +39,7 @@ from .jsonutil import (
     canonical_sha256,
     load_json,
     require_object,
+    require_sha256,
     sha256_file,
 )
 from .profile import AWS_P5_PROFILE, SUPPORTED_PROFILE, IlluminaProfile
@@ -53,6 +63,10 @@ from .slurm import (
     submit as slurm_submit,
 )
 from .state import StateStore
+
+
+_AWS_V3_PROFILE_ID = "aws-p5.48xlarge-v3"
+_AWS_V3_GPU_HOURS_PER_ARM = 4 * 24.0
 
 
 def _timestamp() -> str:
@@ -198,18 +212,38 @@ def instantiate_run_manifest(
     out: Path | str,
     repo_root: Path | str,
     apply: bool,
+    sealed_evaluation_release_sha256: str | None = None,
     cohort_loader: Callable[[Path | str], object] | None = None,
     dataset_verifier: Callable[..., object] | None = None,
 ) -> dict[str, object]:
     provider = getattr(profile, "provider", None)
-    owned_seeds = {
-        SUPPORTED_PROFILE: (0,),
-        AWS_P5_PROFILE: (1, 2, 3, 4),
-    }.get(provider)
+    aws_v3 = (
+        provider == AWS_P5_PROFILE
+        and getattr(profile, "profile_id", None) == _AWS_V3_PROFILE_ID
+    )
+    if aws_v3 and (
+        type(getattr(profile, "assigned_seeds", None)) is not tuple
+        or getattr(profile, "assigned_seeds") != tuple(AWS_SEEDS)
+        or any(
+            type(assigned_seed) is not int
+            for assigned_seed in getattr(profile, "assigned_seeds")
+        )
+    ):
+        raise MsctlError(
+            "SEED_OWNERSHIP_VIOLATION",
+            "the v3 AWS profile must own exactly integer seeds 0 through 9",
+        )
+    owned_seeds = (
+        tuple(AWS_SEEDS)
+        if aws_v3
+        else {
+            SUPPORTED_PROFILE: (0,),
+            AWS_P5_PROFILE: (1, 2, 3, 4),
+        }.get(provider)
+    )
     if (
         owned_seeds is None
-        or isinstance(seed, bool)
-        or not isinstance(seed, int)
+        or type(seed) is not int
         or seed not in owned_seeds
     ):
         raise MsctlError(
@@ -217,20 +251,54 @@ def instantiate_run_manifest(
             "seed is not owned by the selected provider",
             details={"provider": provider, "seed": seed},
         )
+    sealed_evaluation_hash: str | None = None
+    if aws_v3:
+        if sealed_evaluation_release_sha256 is None:
+            raise MsctlError(
+                "RUN_MANIFEST_INVALID",
+                "v3 AWS instantiation requires a sealed evaluation release SHA-256",
+            )
+        try:
+            sealed_evaluation_hash = require_sha256(
+                sealed_evaluation_release_sha256,
+                label="sealed evaluation release SHA-256",
+            )
+        except MsctlError as error:
+            raise MsctlError(
+                "RUN_MANIFEST_INVALID",
+                "v3 AWS sealed evaluation release SHA-256 is invalid",
+            ) from error
     release = load_release(release_path)
     if release.provider != provider:
         raise MsctlError(
             "RELEASE_PROVIDER_MISMATCH",
             "release and profile providers differ",
         )
+    if (
+        aws_v3
+        and release.package_format_version != AWS_PACKAGE_FORMAT_VERSION
+    ) or (
+        not aws_v3
+        and provider == AWS_P5_PROFILE
+        and release.package_format_version == AWS_PACKAGE_FORMAT_VERSION
+    ):
+        raise MsctlError(
+            "RELEASE_RUN_MISMATCH",
+            "release package version does not match the selected manifest contract",
+        )
     profile_sha256 = getattr(
         profile,
         "source_sha256" if provider == SUPPORTED_PROFILE else "sha256",
         None,
     )
+    release_profile_sha256 = (
+        release.value.get("profile_sha256")
+        if aws_v3
+        else release.metadata.get("profile_sha256")
+    )
     if (
         not isinstance(profile_sha256, str)
-        or release.metadata.get("profile_sha256") != profile_sha256
+        or release_profile_sha256 != profile_sha256
     ):
         raise MsctlError(
             "PROFILE_RELEASE_MISMATCH",
@@ -238,8 +306,18 @@ def instantiate_run_manifest(
         )
 
     root = Path(repo_root)
-    assignment_path = root / "configs" / "cohort-assignment-v2.json"
-    study_lock_path = root / "configs" / "preregistration-v2.yaml"
+    assignment_member = (
+        AWS_COHORT_ASSIGNMENT_PATH
+        if aws_v3
+        else "configs/cohort-assignment-v2.json"
+    )
+    preregistration_member = (
+        AWS_PREREGISTRATION_PATH
+        if aws_v3
+        else "configs/preregistration-v2.yaml"
+    )
+    assignment_path = root / assignment_member
+    preregistration_path = root / preregistration_member
     loader = cohort_loader or _load_cohort_adapter
     cohort = loader(assignment_path)
     assignment_sha256 = getattr(cohort, "assignment_sha256", None)
@@ -250,25 +328,51 @@ def instantiate_run_manifest(
         )
     verified_assignment_sha256 = verify_release_member(
         release,
-        member_path="configs/cohort-assignment-v2.json",
+        member_path=assignment_member,
         local_path=assignment_path,
         label="cohort assignment",
     )
-    study_lock_sha256 = verify_release_member(
+    preregistration_sha256 = verify_release_member(
         release,
-        member_path="configs/preregistration-v2.yaml",
-        local_path=study_lock_path,
-        label="study lock",
+        member_path=preregistration_member,
+        local_path=preregistration_path,
+        label="preregistration",
     )
     if (
         assignment_sha256 != verified_assignment_sha256
         or getattr(cohort, "preregistration_sha256", None)
-        != study_lock_sha256
+        != preregistration_sha256
     ):
         raise MsctlError(
             "RELEASE_COHORT_MISMATCH",
             "cohort adapter hashes differ from verified release members",
         )
+    dataset_pointer_sha256: str | None = None
+    if aws_v3:
+        verified_profile_sha256 = verify_release_member(
+            release,
+            member_path=AWS_PROFILE_PATH,
+            local_path=root / AWS_PROFILE_PATH,
+            label="AWS v3 profile",
+        )
+        dataset_pointer_sha256 = verify_release_member(
+            release,
+            member_path=AWS_DATASET_POINTER_PATH,
+            local_path=root / AWS_DATASET_POINTER_PATH,
+            label="AWS dataset pointer",
+        )
+        if (
+            verified_profile_sha256 != profile_sha256
+            or dataset_pointer_sha256
+            != release.value.get("dataset_pointer_sha256")
+            or assignment_sha256
+            != release.value.get("cohort_assignment_sha256")
+            or release.source_tree is None
+        ):
+            raise MsctlError(
+                "RELEASE_RUN_MISMATCH",
+                "v3 release identities differ from local canonical members",
+            )
     assignment = release.metadata.get("seed_assignment")
     if not isinstance(assignment, dict) or (
         assignment.get("cohort_id") != getattr(cohort, "cohort_id", None)
@@ -279,6 +383,11 @@ def instantiate_run_manifest(
         raise MsctlError(
             "RELEASE_COHORT_MISMATCH",
             "release does not bind the requested cohort seed pair",
+        )
+    if aws_v3 and getattr(cohort, "cohort_id", None) != AWS_COHORT_ID:
+        raise MsctlError(
+            "RELEASE_COHORT_MISMATCH",
+            "v3 cohort identity differs from the AWS manifest contract",
         )
 
     provider_configs = cohort.configs_for_provider(provider)
@@ -305,15 +414,16 @@ def instantiate_run_manifest(
                 "release config differs from the cohort assignment",
                 details={"config": config.path},
             )
-        run_rows.append(
-            {
-                "run_id": config.run_id,
-                "arm": config.condition,
-                "seed": seed,
-                "config": config.path,
-                "config_sha256": digest,
-            }
-        )
+        row = {
+            "run_id": config.run_id,
+            "arm": config.condition,
+            "seed": seed,
+            "config": config.path,
+            "config_sha256": digest,
+        }
+        if aws_v3:
+            row["estimated_gpu_hours"] = _AWS_V3_GPU_HOURS_PER_ARM
+        run_rows.append(row)
 
     receipt_value = require_object(
         load_json(dataset_receipt, label="dataset receipt"),
@@ -321,6 +431,8 @@ def instantiate_run_manifest(
     )
     dataset_sha256 = sha256_file(dataset_receipt)
     dataset_verification = None
+    dataset_build_id: str | None = None
+    ordered_stream_sha256: str | None = None
     if provider == AWS_P5_PROFILE:
         ordered_sha256 = receipt_value.get("ordered_stream_sha256")
         verifier = dataset_verifier or _load_task4_dataset_verifier
@@ -331,6 +443,18 @@ def instantiate_run_manifest(
                 expected_ordered_sha256=ordered_sha256,
             )
             identities = _dataset_file_identities(evidence)
+            verified_receipt = require_object(
+                getattr(evidence, "receipt", None),
+                label="verified dataset receipt",
+            )
+            dataset_build_id = require_sha256(
+                verified_receipt.get("build_id"),
+                label="verified dataset receipt.build_id",
+            )
+            ordered_stream_sha256 = require_sha256(
+                verified_receipt.get("ordered_stream_sha256"),
+                label="verified dataset receipt.ordered_stream_sha256",
+            )
         except MsctlError:
             raise
         except Exception as error:
@@ -340,7 +464,8 @@ def instantiate_run_manifest(
             ) from error
         dataset_verification = {
             "receipt_sha256": dataset_sha256,
-            "ordered_stream_sha256": ordered_sha256,
+            "build_id": dataset_build_id,
+            "ordered_stream_sha256": ordered_stream_sha256,
             "file_identities": identities,
         }
     else:
@@ -350,17 +475,43 @@ def instantiate_run_manifest(
                 "DATASET_RECEIPT_INVALID",
                 "dataset receipt schema version must be an integer",
             )
-    manifest = {
-        "schema_version": 2,
-        "provider": provider,
-        "seed": seed,
-        "release_sha256": release.archive_sha256,
-        "dataset_sha256": dataset_sha256,
-        "cohort_assignment_sha256": assignment_sha256,
-        "study_lock_sha256": study_lock_sha256,
-        "source_commit": release.source_commit,
-        "runs": run_rows,
-    }
+    if aws_v3:
+        assert dataset_pointer_sha256 is not None
+        assert dataset_build_id is not None
+        assert ordered_stream_sha256 is not None
+        assert sealed_evaluation_hash is not None
+        assert release.source_tree is not None
+        manifest = {
+            "schema_version": 3,
+            "provider": AWS_P5_PROFILE,
+            "cohort_id": AWS_COHORT_ID,
+            "seed": seed,
+            "release_sha256": release.archive_sha256,
+            "release_receipt_sha256": release.receipt_sha256,
+            "profile_sha256": profile_sha256,
+            "dataset_pointer_sha256": dataset_pointer_sha256,
+            "dataset_receipt_sha256": dataset_sha256,
+            "dataset_build_id": dataset_build_id,
+            "ordered_stream_sha256": ordered_stream_sha256,
+            "cohort_assignment_sha256": assignment_sha256,
+            "preregistration_sha256": preregistration_sha256,
+            "sealed_evaluation_release_sha256": sealed_evaluation_hash,
+            "source_commit": release.source_commit,
+            "source_tree": release.source_tree,
+            "runs": run_rows,
+        }
+    else:
+        manifest = {
+            "schema_version": 2,
+            "provider": provider,
+            "seed": seed,
+            "release_sha256": release.archive_sha256,
+            "dataset_sha256": dataset_sha256,
+            "cohort_assignment_sha256": assignment_sha256,
+            "study_lock_sha256": preregistration_sha256,
+            "source_commit": release.source_commit,
+            "runs": run_rows,
+        }
     result = {
         "manifest": manifest,
         "manifest_sha256": canonical_sha256(manifest),

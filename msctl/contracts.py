@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import math
 import os
 import re
 import stat
@@ -20,6 +21,7 @@ from .aws_contracts import (
     DATASET_RECEIPT_PATH as AWS_DATASET_RECEIPT_PATH,
     EXPECTED_CONFIG_PATHS as AWS_EXPECTED_CONFIG_PATHS,
     PACKAGE_FORMAT_VERSION as AWS_PACKAGE_FORMAT_VERSION,
+    PREREGISTRATION_PATH as AWS_PREREGISTRATION_PATH,
     PROFILE_PATH as AWS_PROFILE_PATH,
     SEEDS as AWS_SEEDS,
 )
@@ -37,6 +39,7 @@ from .jsonutil import (
     require_object,
     require_schema_version,
     require_sha256,
+    regular_file,
     resolve_inside,
     sha256_file,
 )
@@ -81,6 +84,33 @@ class RunManifest:
     cohort_assignment_sha256: str | None
     study_lock_sha256: str | None
     source_commit: str | None
+    runs: tuple[Run, ...]
+    sha256: str
+    value: dict[str, object]
+
+    @property
+    def gpu_hours(self) -> float:
+        return sum(run.estimated_gpu_hours for run in self.runs)
+
+
+@dataclass(frozen=True)
+class RunManifestV3:
+    schema_version: int
+    provider: str
+    cohort_id: str
+    seed: int
+    release_sha256: str
+    release_receipt_sha256: str
+    profile_sha256: str
+    dataset_pointer_sha256: str
+    dataset_receipt_sha256: str
+    dataset_build_id: str
+    ordered_stream_sha256: str
+    cohort_assignment_sha256: str
+    preregistration_sha256: str
+    sealed_evaluation_release_sha256: str
+    source_commit: str
+    source_tree: str
     runs: tuple[Run, ...]
     sha256: str
     value: dict[str, object]
@@ -1076,16 +1106,44 @@ def load_run_manifest(
     path: Path | str,
     *,
     repo_root: Path | str,
-) -> RunManifest:
-    value = require_object(
-        load_json(path, label="run manifest"),
-        label="run manifest",
-    )
+) -> RunManifest | RunManifestV3:
+    candidate = regular_file(path, label="run manifest")
+
+    def unique_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+        result: dict[str, object] = {}
+        for key, item in pairs:
+            if key in result:
+                raise MsctlError(
+                    "RUN_MANIFEST_INVALID",
+                    "run manifest contains a duplicate field",
+                )
+            result[key] = item
+        return result
+
+    try:
+        value = json.loads(
+            candidate.read_bytes().decode("utf-8"),
+            object_pairs_hook=unique_object,
+            parse_constant=lambda constant: (_ for _ in ()).throw(
+                MsctlError(
+                    "RUN_MANIFEST_INVALID",
+                    f"run manifest contains non-finite {constant}",
+                )
+            ),
+        )
+    except MsctlError:
+        raise
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise MsctlError(
+            "RUN_MANIFEST_INVALID",
+            "run manifest must contain one valid UTF-8 JSON value",
+        ) from error
+    value = require_object(value, label="run manifest")
     schema_version = value.get("schema_version")
     if (
         isinstance(schema_version, bool)
         or not isinstance(schema_version, int)
-        or schema_version not in {1, 2}
+        or schema_version not in {1, 2, 3}
     ):
         raise MsctlError(
             "RUN_MANIFEST_INVALID",
@@ -1105,10 +1163,39 @@ def load_run_manifest(
             "study_lock_sha256",
             "source_commit",
         }
+    elif schema_version == 3:
+        root_fields = {
+            "schema_version",
+            "provider",
+            "cohort_id",
+            "seed",
+            "release_sha256",
+            "release_receipt_sha256",
+            "profile_sha256",
+            "dataset_pointer_sha256",
+            "dataset_receipt_sha256",
+            "dataset_build_id",
+            "ordered_stream_sha256",
+            "cohort_assignment_sha256",
+            "preregistration_sha256",
+            "sealed_evaluation_release_sha256",
+            "source_commit",
+            "source_tree",
+            "runs",
+        }
     require_exact_keys(value, root_fields, label="run manifest")
     provider = value["provider"]
-    if provider not in {SUPPORTED_PROFILE, AWS_P5_PROFILE} or (
-        schema_version == 1 and provider != SUPPORTED_PROFILE
+    if (
+        not isinstance(provider, str)
+        or provider not in {SUPPORTED_PROFILE, AWS_P5_PROFILE}
+        or (schema_version == 1 and provider != SUPPORTED_PROFILE)
+        or (
+            schema_version == 3
+            and (
+                provider != AWS_P5_PROFILE
+                or value["cohort_id"] != AWS_COHORT_ID
+            )
+        )
     ):
         raise MsctlError(
             "RUN_MANIFEST_INVALID",
@@ -1116,7 +1203,9 @@ def load_run_manifest(
         )
     manifest_seed = 0 if schema_version == 1 else value["seed"]
     owned_seeds = (
-        (0,) if provider == SUPPORTED_PROFILE else (1, 2, 3, 4)
+        tuple(AWS_SEEDS)
+        if schema_version == 3
+        else ((0,) if provider == SUPPORTED_PROFILE else (1, 2, 3, 4))
     )
     if (
         isinstance(manifest_seed, bool)
@@ -1143,7 +1232,7 @@ def load_run_manifest(
             "config",
             "config_sha256",
         }
-        if schema_version == 1:
+        if schema_version in {1, 3}:
             run_fields.add("estimated_gpu_hours")
         require_exact_keys(row, run_fields, label=f"run manifest.runs[{index}]")
         run_id = row["run_id"]
@@ -1157,17 +1246,32 @@ def load_run_manifest(
                 details={"index": index},
             )
         if (
-            row["arm"] not in {"dense", "split90"}
-            or isinstance(row["seed"], bool)
+            not isinstance(row["arm"], str)
+            or row["arm"] not in {"dense", "split90"}
+            or type(row["seed"]) is not int
             or row["seed"] != manifest_seed
         ):
             raise MsctlError(
                 "RUN_MANIFEST_INVALID",
                 "paired runs must use the manifest seed and explicit arms",
             )
+        if schema_version == 3 and run_id != (
+            f"memorysplit-v3-360m-s{manifest_seed}-{row['arm']}"
+        ):
+            raise MsctlError(
+                "RUN_MANIFEST_INVALID",
+                "schema-3 run_id does not match its exact seed and arm",
+            )
         relative = portable_relative(
             row["config"], label=f"run manifest.runs[{index}].config"
         )
+        if schema_version == 3 and relative != (
+            f"configs/360m-v3/{row['arm']}-s{manifest_seed}.yaml"
+        ):
+            raise MsctlError(
+                "RUN_MANIFEST_INVALID",
+                "schema-3 config path does not match its exact seed and arm",
+            )
         expected_hash = require_sha256(
             row["config_sha256"],
             label=f"run manifest.runs[{index}].config_sha256",
@@ -1189,6 +1293,18 @@ def load_run_manifest(
                 "run config hash mismatch",
                 details={"config": relative},
             )
+        if schema_version == 3:
+            raw_gpu_hours = row["estimated_gpu_hours"]
+            if (
+                isinstance(raw_gpu_hours, bool)
+                or not isinstance(raw_gpu_hours, (int, float))
+                or not math.isfinite(raw_gpu_hours)
+                or raw_gpu_hours <= 0
+            ):
+                raise MsctlError(
+                    "RUN_MANIFEST_INVALID",
+                    "schema-3 estimated_gpu_hours must be finite and positive",
+                )
         runs.append(
             Run(
                 run_id=run_id,
@@ -1204,7 +1320,11 @@ def load_run_manifest(
                         ),
                     )
                     if schema_version == 1
-                    else 0.0
+                    else (
+                        float(row["estimated_gpu_hours"])
+                        if schema_version == 3
+                        else 0.0
+                    )
                 ),
             )
         )
@@ -1218,7 +1338,7 @@ def load_run_manifest(
             "run IDs, configs, and Dense/Split90 arms must be unique",
         )
     source_commit: str | None = None
-    if schema_version == 2:
+    if schema_version in {2, 3}:
         raw_commit = value["source_commit"]
         if (
             not isinstance(raw_commit, str)
@@ -1229,6 +1349,67 @@ def load_run_manifest(
                 "run manifest source commit is invalid",
             )
         source_commit = raw_commit
+    if schema_version == 3:
+        raw_tree = value["source_tree"]
+        if (
+            not isinstance(raw_tree, str)
+            or _GIT_SHA1_RE.fullmatch(raw_tree) is None
+        ):
+            raise MsctlError(
+                "RUN_MANIFEST_INVALID",
+                "run manifest source tree is invalid",
+            )
+        return RunManifestV3(
+            schema_version=3,
+            provider=AWS_P5_PROFILE,
+            cohort_id=AWS_COHORT_ID,
+            seed=manifest_seed,
+            release_sha256=require_sha256(
+                value["release_sha256"],
+                label="run manifest.release_sha256",
+            ),
+            release_receipt_sha256=require_sha256(
+                value["release_receipt_sha256"],
+                label="run manifest.release_receipt_sha256",
+            ),
+            profile_sha256=require_sha256(
+                value["profile_sha256"],
+                label="run manifest.profile_sha256",
+            ),
+            dataset_pointer_sha256=require_sha256(
+                value["dataset_pointer_sha256"],
+                label="run manifest.dataset_pointer_sha256",
+            ),
+            dataset_receipt_sha256=require_sha256(
+                value["dataset_receipt_sha256"],
+                label="run manifest.dataset_receipt_sha256",
+            ),
+            dataset_build_id=require_sha256(
+                value["dataset_build_id"],
+                label="run manifest.dataset_build_id",
+            ),
+            ordered_stream_sha256=require_sha256(
+                value["ordered_stream_sha256"],
+                label="run manifest.ordered_stream_sha256",
+            ),
+            cohort_assignment_sha256=require_sha256(
+                value["cohort_assignment_sha256"],
+                label="run manifest.cohort_assignment_sha256",
+            ),
+            preregistration_sha256=require_sha256(
+                value["preregistration_sha256"],
+                label="run manifest.preregistration_sha256",
+            ),
+            sealed_evaluation_release_sha256=require_sha256(
+                value["sealed_evaluation_release_sha256"],
+                label="run manifest.sealed_evaluation_release_sha256",
+            ),
+            source_commit=raw_commit,
+            source_tree=raw_tree,
+            runs=tuple(sorted(runs, key=lambda run: run.run_id)),
+            sha256=canonical_sha256(value),
+            value=value,
+        )
     return RunManifest(
         schema_version=schema_version,
         provider=str(provider),
@@ -1264,15 +1445,62 @@ def load_run_manifest(
     )
 
 
-def bind_release(release: Release, manifest: RunManifest) -> None:
-    if (
-        release.archive_sha256 != manifest.release_sha256
-        or release.provider != manifest.provider
-        or (
-            manifest.schema_version == 2
-            and release.source_commit != manifest.source_commit
+def bind_release(
+    release: Release,
+    manifest: RunManifest | RunManifestV3,
+) -> None:
+    mismatch = False
+    if isinstance(manifest, RunManifestV3):
+        preregistration = release.members.get(AWS_PREREGISTRATION_PATH)
+        config_hashes = release.value.get("config_sha256")
+        assignment = release.value.get("seed_assignment")
+        expected_assignment = {
+            "cohort_id": AWS_COHORT_ID,
+            "provider": AWS_P5_PROFILE,
+            "seeds": list(AWS_SEEDS),
+            "arms": ["dense", "split90"],
+        }
+        mismatch = (
+            release.package_format_version != AWS_PACKAGE_FORMAT_VERSION
+            or release.provider != AWS_P5_PROFILE
+            or release.archive_sha256 != manifest.release_sha256
+            or release.receipt_sha256 != manifest.release_receipt_sha256
+            or release.value.get("profile_sha256")
+            != manifest.profile_sha256
+            or release.value.get("dataset_pointer_sha256")
+            != manifest.dataset_pointer_sha256
+            or release.value.get("cohort_assignment_sha256")
+            != manifest.cohort_assignment_sha256
+            or preregistration is None
+            or preregistration.get("sha256")
+            != manifest.preregistration_sha256
+            or release.source_commit != manifest.source_commit
+            or release.source_tree != manifest.source_tree
+            or not same_typed_value(assignment, expected_assignment)
+            or not isinstance(config_hashes, dict)
+            or any(
+                run.config not in release.members
+                or release.members[run.config].get("sha256")
+                != run.config_sha256
+                or config_hashes.get(run.config) != run.config_sha256
+                for run in manifest.runs
+            )
         )
-    ):
+    else:
+        mismatch = (
+            release.archive_sha256 != manifest.release_sha256
+            or release.provider != manifest.provider
+            or (
+                manifest.schema_version == 2
+                and release.source_commit != manifest.source_commit
+            )
+            or (
+                manifest.provider == AWS_P5_PROFILE
+                and release.package_format_version
+                == AWS_PACKAGE_FORMAT_VERSION
+            )
+        )
+    if mismatch:
         raise MsctlError(
             "RELEASE_RUN_MISMATCH",
             "run manifest does not bind the supplied release",

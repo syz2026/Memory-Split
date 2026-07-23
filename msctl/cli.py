@@ -9,6 +9,8 @@ import sys
 from collections.abc import Callable
 from pathlib import Path
 
+from cluster.aws.p5.profile import load_aws_p5_profile
+
 from .aws_p5 import build_aws_backend
 from .cleanup import apply_cleanup, make_cleanup_plan
 from .collect import collect_evidence
@@ -20,7 +22,7 @@ from .dataset import (
 )
 from .environment import ensure_environment
 from .errors import MsctlError
-from .jsonutil import canonical_sha256
+from .jsonutil import canonical_sha256, load_json, require_object
 from .operations import (
     cancel_runs,
     check_capacity,
@@ -32,7 +34,11 @@ from .operations import (
     status_runs,
     submit_runs,
 )
-from .profile import AWS_P5_PROFILE, SUPPORTED_PROFILE, load_profile
+from .profile import (
+    AWS_P5_PROFILE,
+    SUPPORTED_PROFILE,
+    load_profile,
+)
 
 
 SCHEMA_VERSION = 1
@@ -125,6 +131,7 @@ def build_parser() -> JsonArgumentParser:
     )
     instantiate.add_argument("--release", required=True)
     instantiate.add_argument("--dataset-receipt", required=True)
+    instantiate.add_argument("--sealed-evaluation-release-sha256")
     instantiate.add_argument("--seed", required=True, type=int)
     instantiate.add_argument("--out", required=True)
     instantiate.add_argument("--apply", action="store_true")
@@ -209,6 +216,22 @@ def _require_cli_values(args: argparse.Namespace, *names: str) -> None:
         )
 
 
+def _load_cli_profile(path: Path | str) -> object:
+    value = require_object(load_json(path, label="profile"), label="profile")
+    if (
+        value.get("provider") == AWS_P5_PROFILE
+        and value.get("profile_id") == "aws-p5.48xlarge-v3"
+    ):
+        try:
+            return load_aws_p5_profile(path)
+        except (OSError, TypeError, ValueError) as error:
+            raise MsctlError(
+                "PROFILE_INVALID",
+                "AWS P5 v3 profile validation failed",
+            ) from error
+    return load_profile(path)
+
+
 def _auth_check(profile) -> dict[str, object]:
     value = os.environ.get(profile.shared_root_env)
     if not value:
@@ -245,8 +268,11 @@ def dispatch(
     aws_backend_factory: Callable[..., object] = build_aws_backend,
     environ: dict[str, str] | None = None,
 ) -> tuple[bool, dict[str, object]]:
-    profile = (profile_loader or load_profile)(args.profile)
     command = _command_name(args)
+    default_profile_loader = (
+        _load_cli_profile if command == "runs instantiate" else load_profile
+    )
+    profile = (profile_loader or default_profile_loader)(args.profile)
     environment = dict(os.environ if environ is None else environ)
     provider = getattr(profile, "provider", None)
     if provider not in {SUPPORTED_PROFILE, AWS_P5_PROFILE}:
@@ -256,6 +282,15 @@ def dispatch(
             details={"provider": provider},
         )
     if command == "runs instantiate":
+        if (
+            provider == AWS_P5_PROFILE
+            and getattr(profile, "profile_id", None)
+            == "aws-p5.48xlarge-v3"
+        ):
+            _require_cli_values(
+                args,
+                "sealed_evaluation_release_sha256",
+            )
         return not args.apply, instantiate_run_manifest(
             profile=profile,
             release_path=args.release,
@@ -264,6 +299,9 @@ def dispatch(
             out=args.out,
             repo_root=args.repo_root,
             apply=args.apply,
+            sealed_evaluation_release_sha256=(
+                args.sealed_evaluation_release_sha256
+            ),
             cohort_loader=cohort_loader,
         )
     if provider == AWS_P5_PROFILE:
