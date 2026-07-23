@@ -718,6 +718,32 @@ def test_packager_rejects_wrong_dataset_receipt_pointer(tmp_path):
 
 
 @pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("dataset_receipt_sha256", "a" * 64),
+        ("dataset_build_id", "dataset-build-001"),
+        ("ordered_stream_sha256", "b" * 64),
+        ("unexpected_field", "not-allowlisted"),
+    ],
+)
+def test_packager_rejects_extra_dataset_pointer_fields(tmp_path, field, value):
+    module = _load_module()
+    source = _minimal_repo(tmp_path)
+    path = source / "DATASET-POINTER-AWS.json"
+    pointer = json.loads(path.read_text())
+    pointer[field] = value
+    path.write_text(_canonical_json(pointer))
+    _commit(source, f"add noncanonical dataset pointer field: {field}")
+
+    with pytest.raises(module.PackageError, match="dataset pointer|field|invalid"):
+        module.build_handoff(
+            source_root=source,
+            out_dir=tmp_path / "out",
+            apply=True,
+        )
+
+
+@pytest.mark.parametrize(
     ("substitution", "source_relative", "target_relative"),
     [
         (

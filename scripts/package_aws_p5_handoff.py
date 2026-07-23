@@ -1341,18 +1341,23 @@ def _validate_dataset_pointer(data: bytes) -> None:
     pointer = _load_json_object(data, label="AWS dataset pointer")
     _reject_sensitive_fields(pointer, label="AWS dataset pointer")
     expected = {
-        "provider": PROVIDER,
+        "dataset_id": "memorysplit-v2-20x-reasoning-max-cohort",
         "durable_uri_env": "MS_S3_ROOT",
         "full_corpus_in_release": False,
+        "materialization": "s3",
+        "provider": PROVIDER,
+        "relative_path": "dataset",
         "required_receipt": DATASET_RECEIPT_PATH,
+        "required_sidecars": [
+            "dense_target_weights",
+            "split90_target_weights",
+        ],
+        "schema_version": 1,
+        "scratch_root": "/mnt/memorysplit",
+        "source_lock_manifest": "configs/reasoning-dataset-v2.json",
     }
-    for field, expected_value in expected.items():
-        if field not in pointer or not _same_typed_value(
-            pointer[field], expected_value
-        ):
-            raise PackageError(
-                f"AWS dataset pointer field {field} is invalid"
-            )
+    if not _same_typed_value(pointer, expected):
+        raise PackageError("AWS dataset pointer does not match the exact contract")
 
 
 def _validate_preregistration(data: bytes) -> None:

@@ -299,3 +299,77 @@ The repository-wide suite was not used as the acceptance gate because the brief
 identifies two pre-existing, out-of-scope failures in
 `tests/test_verify_cohort_releases.py`; the required focused v3/v2 and packaging
 suite is green.
+
+## Review follow-up: closed dataset pointer
+
+Review identified that `_validate_dataset_pointer` checked only four required
+values and did not reject additional fields. Consequently, a tracked pointer
+could add `dataset_receipt_sha256`, `dataset_build_id`,
+`ordered_stream_sha256`, or any unknown field and still be archived and
+hash-bound by the code release.
+
+### RED
+
+The mutation test was added before the production change:
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 python -m pytest -q -p no:cacheprovider \
+  --basetemp=/tmp/memorysplit-v3-task2a-review-red \
+  tests/test_package_aws_p5_handoff.py::\
+test_packager_rejects_extra_dataset_pointer_fields
+```
+
+Output:
+
+```text
+FFFF                                                                     [100%]
+...
+Failed: DID NOT RAISE ... PackageError
+4 failed in 2.04s
+```
+
+All four mutations reached package construction without rejection, confirming
+the review finding.
+
+### GREEN
+
+The validator now compares the parsed pointer against one exact typed object
+containing every canonical field and value from `DATASET-POINTER-AWS.json`.
+This closes the field allowlist while retaining the canonical pointer unchanged.
+
+Focused command:
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 python -m pytest -q -p no:cacheprovider \
+  --basetemp=/tmp/memorysplit-v3-task2a-review-green \
+  tests/test_package_aws_p5_handoff.py::\
+test_packager_rejects_extra_dataset_pointer_fields \
+  tests/test_package_aws_p5_handoff.py::\
+test_packager_rejects_wrong_dataset_receipt_pointer
+```
+
+Output:
+
+```text
+.....                                                                    [100%]
+5 passed in 2.19s
+```
+
+### Requested regression suite
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 python -m pytest -q -p no:cacheprovider \
+  --basetemp=/tmp/memorysplit-v3-task2a-review-final \
+  tests/test_package_aws_p5_handoff.py \
+  tests/test_aws_contracts.py
+```
+
+Output:
+
+```text
+........................................................................ [ 66%]
+.....................................                                    [100%]
+109 passed in 42.19s
+```
+
+`git diff --check` produced no output and exited `0`.
