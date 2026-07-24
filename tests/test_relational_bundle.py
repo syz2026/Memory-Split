@@ -19,6 +19,10 @@ TOKENIZER_ASSETS = {
     "vendor/tiktoken/6c7ea1a7e38e3a7f062df639a5b80947f075ffe6",
     "vendor/tiktoken/6d1cbeee0f20b3d9449abfede4726ed8212e3aee",
 }
+TASK3C_CHECKPOINT_TEST_MODULES = (
+    "tests/test_aws_checkpoint_mirror.py",
+    "tests/test_checkpoint_mirror_attempt_cleanup.py",
+)
 
 
 def _portable_inputs(tmp_path):
@@ -111,6 +115,8 @@ def test_bundle_is_deterministic_relative_and_hash_complete(tmp_path):
         or "ckpt" in name.lower()
         for name in names
     )
+    for module in TASK3C_CHECKPOINT_TEST_MODULES:
+        assert module not in names
 
     manifest = json.loads(files["manifest.json"])
     assert manifest["expected_run_counts"] == EXPECTED_COUNTS

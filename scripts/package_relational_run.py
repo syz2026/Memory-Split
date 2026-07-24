@@ -34,6 +34,7 @@ _SOURCE_PREFIXES = (
     "tests/",
     "train/",
 )
+_CHECKPOINT_SUFFIXES = (".bin", ".pt", ".pth")
 _TOKENIZER_ASSETS = {
     "vendor/tiktoken/6c7ea1a7e38e3a7f062df639a5b80947f075ffe6",
     "vendor/tiktoken/6d1cbeee0f20b3d9449abfede4726ed8212e3aee",
@@ -255,6 +256,17 @@ def production_inputs(input_root: Path | str = ".") -> dict:
     return {"configs": configs, "manifests": manifests}
 
 
+def _is_checkpoint_source(path: str) -> bool:
+    portable = PurePosixPath(path)
+    if portable.suffix.lower() in _CHECKPOINT_SUFFIXES:
+        return True
+    for part in portable.parts:
+        lower = part.lower()
+        if "checkpoint" in lower or "ckpt" in lower:
+            return True
+    return False
+
+
 def _tracked_source_paths(source_root: Path) -> list[str]:
     tracked = {
         line
@@ -272,10 +284,13 @@ def _tracked_source_paths(source_root: Path) -> list[str]:
     selected = {
         path
         for path in tracked | required_task_source
-        if path in required_task_source
-        or path == "requirements.txt"
-        or path.endswith(".py")
-        and path.startswith(_SOURCE_PREFIXES)
+        if (
+            path in required_task_source
+            or path == "requirements.txt"
+            or path.endswith(".py")
+            and path.startswith(_SOURCE_PREFIXES)
+        )
+        and not _is_checkpoint_source(path)
     }
     untracked_assets = sorted(_TOKENIZER_ASSETS - tracked)
     if untracked_assets:
