@@ -116,6 +116,27 @@ def test_provider_lifecycle_package_closure_is_explicit_and_fail_closed():
     assert module._classification("configs/29m-v3/unreviewed.yaml") == "unknown"
 
 
+def test_run_finalization_and_its_runtime_dependencies_are_required():
+    module = _load_module()
+
+    finalization_members = {
+        "cluster/aws/p5/run_finalization.py",
+        # Runtime dependencies imported by the finalization module.
+        "cluster/aws/p5/checkpoint_mirror.py",
+        "cluster/aws/qualification.py",
+        "msctl/aws_contracts.py",
+        "msctl/aws_lifecycle.py",
+        "msctl/contracts.py",
+        "msctl/errors.py",
+        "train/trainer.py",
+    }
+    assert finalization_members <= module.REQUIRED_MEMBERS
+    assert all(
+        module._classification(path) == "included"
+        for path in finalization_members
+    )
+
+
 def test_authenticated_package_metadata_comes_only_from_fixed_authority(
     tmp_path,
     monkeypatch,
@@ -499,6 +520,9 @@ def _minimal_repo(
             "#!/usr/bin/env python3\nraise SystemExit(0)\n"
         ),
         "cluster/aws/p5/interruption_checkpoint.py": (
+            "#!/usr/bin/env python3\nraise SystemExit(0)\n"
+        ),
+        "cluster/aws/p5/run_finalization.py": (
             "#!/usr/bin/env python3\nraise SystemExit(0)\n"
         ),
         # A shell library intentionally tracked as non-executable. Packaging

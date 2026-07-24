@@ -45,6 +45,7 @@ from cluster.aws.p5.checkpoint_mirror import (
     CheckpointMirrorScheduler,
     CheckpointStaleError,
     ForkedCheckpointMirrorAttempt,
+    PublishedCheckpointPair,
     S3VersionedObjectStore,
     cleanup_checkpoint_request_tokens,
     publish_paired_checkpoint,
@@ -266,6 +267,10 @@ class SupervisionResult:
     peer_terminated: bool = False
     resumable: bool = False
     interruption_receipt: str | None = None
+    finalization_receipt_uri: str | None = None
+    finalization_receipt_version_id: str | None = None
+    provider_selection_sha256: str | None = None
+    provider_selection_version_id: str | None = None
 
 
 class ProcessHandle(Protocol):
@@ -2499,6 +2504,8 @@ def supervise_pair(
         ],
     ]
     | None = None,
+    finalizer: Callable[[PublishedCheckpointPair | None], object]
+    | None = None,
 ) -> SupervisionResult:
     """Hold the host-wide lock while supervising exactly one seed pair."""
 
@@ -2514,6 +2521,7 @@ def supervise_pair(
             rank_zero_resolver=rank_zero_resolver,
             shutdown_source=shutdown_source,
             checkpoint_scheduler_factory=checkpoint_scheduler_factory,
+            finalizer=finalizer,
         )
     finally:
         fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
@@ -2546,6 +2554,8 @@ def _supervise_pair_locked(
             Callable[[str], CheckpointMirrorRequest],
         ],
     ]
+    | None = None,
+    finalizer: Callable[[PublishedCheckpointPair | None], object]
     | None = None,
 ) -> SupervisionResult:
     """Launch both arms, then accept only paired zero exit status."""
@@ -2791,10 +2801,51 @@ def _supervise_pair_locked(
                 )
             if all(status == 0 for status in statuses.values()):
                 _terminate_all(tuple(processes.values()))
+                if finalizer is None:
+                    return SupervisionResult(
+                        status="completed",
+                        returncode=0,
+                        child_pids=child_pids,
+                    )
+                # Clean finalization is the only publication that may run
+                # after the pair exits; no forked mirror attempt may stay
+                # alive beneath the bounded finalization attempt.
+                if checkpoint_scheduler is not None:
+                    checkpoint_scheduler.cancel_active()
+                latest_checkpoint = (
+                    checkpoint_scheduler.latest
+                    if checkpoint_scheduler is not None
+                    else None
+                )
+                try:
+                    outcome = finalizer(latest_checkpoint)
+                    references = (
+                        outcome.receipt.uri,
+                        outcome.receipt.version_id,
+                        outcome.provider_selection_sha256,
+                        outcome.provider_selection_version_id,
+                    )
+                    if any(
+                        not isinstance(value, str) or not value
+                        for value in references
+                    ):
+                        raise LaunchError(
+                            "finalization result references are incomplete"
+                        )
+                except Exception:
+                    return SupervisionResult(
+                        status="FINALIZATION_FAILED",
+                        returncode=76,
+                        child_pids=child_pids,
+                    )
                 return SupervisionResult(
                     status="completed",
                     returncode=0,
                     child_pids=child_pids,
+                    finalization_receipt_uri=references[0],
+                    finalization_receipt_version_id=references[1],
+                    provider_selection_sha256=references[2],
+                    provider_selection_version_id=references[3],
                 )
             sleep(0.25)
     except KeyboardInterrupt:
@@ -3118,16 +3169,19 @@ def main(argv: Sequence[str] | None = None) -> int:
             print(json.dumps(report, sort_keys=True, separators=(",", ":")))
             return 0
         client = ImdsV2Client()
+        # v3 mirror plans service interruption through the paired checkpoint
+        # scheduler; only schema-1 plans retain the legacy one-shot handler.
+        is_v3 = plan.run_manifest_sha256 is not None
         with installed_shutdown_handlers() as shutdown_source:
             result = supervise_pair(
                 plan,
                 notice_source=client.interruption_notice,
-                interruption_handler=_production_interruption_handler,
+                interruption_handler=(
+                    None if is_v3 else _production_interruption_handler
+                ),
                 shutdown_source=shutdown_source,
                 checkpoint_scheduler_factory=(
-                    _production_checkpoint_scheduler
-                    if plan.run_manifest_sha256 is not None
-                    else None
+                    _production_checkpoint_scheduler if is_v3 else None
                 ),
             )
         report = {

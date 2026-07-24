@@ -107,3 +107,92 @@ def test_sha256_validation_rejects_malformed_or_path_like_values(value):
     ):
         with pytest.raises(ValueError, match="SHA-256"):
             derive(value)
+
+
+def test_run_finalization_keys_are_exact_for_every_seed_arm_and_step():
+    contract = _contracts()
+    digest = "0123456789abcdef" * 4
+
+    for seed in contract.SEEDS:
+        for arm in contract.ARMS:
+            for step in contract.SNAPSHOT_STEPS:
+                assert contract.snapshot_object_key(seed, arm, step, digest) == (
+                    f"snapshots/seed-{seed}/{arm}/step-{step}"
+                    f"/sha256/{digest}.pt"
+                )
+            assert contract.log_object_key(seed, arm, digest) == (
+                f"logs/seed-{seed}/{arm}/sha256/{digest}.jsonl"
+            )
+        assert contract.run_receipt_key(seed, digest) == (
+            f"receipts/runs/seed-{seed}/sha256/{digest}.json"
+        )
+    assert "snapshot_object_key" in contract.__all__
+    assert "log_object_key" in contract.__all__
+    assert "run_receipt_key" in contract.__all__
+
+
+@pytest.mark.parametrize(
+    ("seed", "arm", "step"),
+    [
+        (10, "dense", 1_358),
+        (-1, "dense", 1_358),
+        (True, "dense", 1_358),
+        (1.0, "dense", 1_358),
+        ("1", "dense", 1_358),
+        (None, "dense", 1_358),
+        (1, "Dense", 1_358),
+        (1, "split", 1_358),
+        (1, None, 1_358),
+        (1, "dense", 1_359),
+        (1, "dense", 0),
+        (1, "dense", -1_358),
+        (1, "dense", True),
+        (1, "dense", "1358"),
+        (1, "dense", 13_582.0),
+    ],
+    ids=[
+        "seed-ten",
+        "seed-negative",
+        "seed-bool",
+        "seed-float",
+        "seed-text",
+        "seed-none",
+        "arm-case",
+        "arm-foreign",
+        "arm-none",
+        "step-off-schedule",
+        "step-zero",
+        "step-negative",
+        "step-bool",
+        "step-text",
+        "step-float",
+    ],
+)
+def test_run_finalization_keys_reject_foreign_seed_arm_or_step(seed, arm, step):
+    contract = _contracts()
+    digest = "a" * 64
+
+    with pytest.raises(ValueError):
+        contract.snapshot_object_key(seed, arm, step, digest)
+    if not (type(seed) is int and seed in contract.SEEDS and arm in contract.ARMS):
+        with pytest.raises(ValueError):
+            contract.log_object_key(seed, arm, digest)
+    if not (type(seed) is int and seed in contract.SEEDS):
+        with pytest.raises(ValueError):
+            contract.run_receipt_key(seed, digest)
+
+
+@pytest.mark.parametrize(
+    "value",
+    ["A" * 64, "a" * 63, "g" * 64, "sha256:" + "a" * 64, b"a" * 64, None],
+    ids=["uppercase", "short", "non-hex", "algorithm-prefix", "bytes", "none"],
+)
+def test_run_finalization_keys_reject_malformed_sha256(value):
+    contract = _contracts()
+
+    with pytest.raises(ValueError, match="SHA-256"):
+        contract.snapshot_object_key(0, "dense", 1_358, value)
+    with pytest.raises(ValueError, match="SHA-256"):
+        contract.log_object_key(0, "dense", value)
+    with pytest.raises(ValueError, match="SHA-256"):
+        contract.run_receipt_key(0, value)

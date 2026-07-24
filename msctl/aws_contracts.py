@@ -278,6 +278,44 @@ def checkpoint_receipt_key(seed: object, sha256: object) -> str:
     return f"receipts/checkpoints/seed-{seed}/sha256/{digest}.json"
 
 
+def snapshot_object_key(
+    seed: object,
+    arm: object,
+    step: object,
+    sha256: object,
+) -> str:
+    """Return one content-addressed frozen-schedule snapshot object key."""
+
+    if type(seed) is not int or seed not in SEEDS:
+        raise ValueError("snapshot seed must be an exact integer from 0 to 9")
+    if arm not in ARMS:
+        raise ValueError("snapshot arm must be dense or split90")
+    if type(step) is not int or step not in SNAPSHOT_STEPS:
+        raise ValueError("snapshot step must be in the frozen v3 schedule")
+    digest = validate_sha256(sha256)
+    return f"snapshots/seed-{seed}/{arm}/step-{step}/sha256/{digest}.pt"
+
+
+def log_object_key(seed: object, arm: object, sha256: object) -> str:
+    """Return one content-addressed training-log object key."""
+
+    if type(seed) is not int or seed not in SEEDS:
+        raise ValueError("log seed must be an exact integer from 0 to 9")
+    if arm not in ARMS:
+        raise ValueError("log arm must be dense or split90")
+    digest = validate_sha256(sha256)
+    return f"logs/seed-{seed}/{arm}/sha256/{digest}.jsonl"
+
+
+def run_receipt_key(seed: object, receipt_sha256: object) -> str:
+    """Return one content-addressed paired run-finalization receipt key."""
+
+    if type(seed) is not int or seed not in SEEDS:
+        raise ValueError("run receipt seed must be an exact integer from 0 to 9")
+    digest = validate_sha256(receipt_sha256)
+    return f"receipts/runs/seed-{seed}/sha256/{digest}.json"
+
+
 __all__ = [
     "ARMS",
     "AWS_ENVIRONMENT_RECEIPT_V2_FIELDS",
@@ -303,9 +341,12 @@ __all__ = [
     "dataset_receipt_key",
     "expected_config_paths",
     "allowed_gpu_product_names",
+    "log_object_key",
     "release_archive_key",
     "release_checksum_key",
     "release_receipt_key",
+    "run_receipt_key",
+    "snapshot_object_key",
     "validate_digest_pinned_oci_image",
     "validate_gpu_product_names",
     "validate_sha256",

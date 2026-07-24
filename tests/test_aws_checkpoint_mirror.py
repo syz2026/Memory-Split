@@ -2044,10 +2044,16 @@ def test_v3_resume_intent_version_pins_receipt_and_both_checkpoints(
     from msctl import aws_argv
     from msctl.jsonutil import canonical_json
 
+    # The envelope validator rejects expired deadlines against the real
+    # clock, so this fixture deadline must stay in the near future.
+    live_terminate_at = (
+        datetime.now(timezone.utc).replace(microsecond=0)
+        + timedelta(hours=1)
+    ).strftime("%Y-%m-%dT%H:%M:%SZ")
     envelope = backend._operation_envelope(
         intent,
         instance_id="i-0123456789abcdef0",
-        terminate_at="2026-07-24T12:00:00Z",
+        terminate_at=live_terminate_at,
     )
     payload = canonical_json(envelope)
     assert aws_argv._validate_intent(
@@ -2059,7 +2065,7 @@ def test_v3_resume_intent_version_pins_receipt_and_both_checkpoints(
     envelope = backend._operation_envelope(
         intent,
         instance_id="i-0123456789abcdef0",
-        terminate_at="2026-07-24T12:00:00Z",
+        terminate_at=live_terminate_at,
     )
     payload = _canonical_json(envelope)[:-1]
     assert _validate_intent(

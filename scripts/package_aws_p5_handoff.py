@@ -109,6 +109,7 @@ REQUIRED_MEMBERS = EXPECTED_CONFIGS | PROVIDER_BRIDGE_MEMBERS | {
     "cluster/aws/p5/interruption_checkpoint.py",
     "cluster/aws/p5/launch_seed_pair.py",
     "cluster/aws/p5/profile.py",
+    "cluster/aws/p5/run_finalization.py",
     "corpusgen/parallel/__init__.py",
     "evals/confirmatory/__init__.py",
     "msctl/__init__.py",

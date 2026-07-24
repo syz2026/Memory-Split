@@ -3715,3 +3715,151 @@ def test_p5_commands_start_from_outside_repository_without_pythonpath(
 
     assert completed.returncode == 0, completed.stderr
     assert completed.stdout.startswith("usage:")
+
+
+@pytest.mark.parametrize("schema", ["legacy-schema-1", "v3-mirror"])
+def test_main_wires_interruption_handling_by_manifest_schema(
+    tmp_path,
+    monkeypatch,
+    schema,
+):
+    fixture = (
+        _v3_mirror_fixture(tmp_path)
+        if schema == "v3-mirror"
+        else _launcher_fixture(tmp_path)
+    )
+    plan = _load_fixture_plan(fixture)
+    captured: dict[str, object] = {}
+
+    def fake_supervise(supervised_plan, **kwargs):
+        captured["plan"] = supervised_plan
+        captured.update(kwargs)
+        return launch_module.SupervisionResult(
+            status="completed",
+            returncode=0,
+            child_pids={"dense": 101, "split90": 202},
+        )
+
+    monkeypatch.setattr(
+        launch_module,
+        "load_launch_plan",
+        lambda **kwargs: plan,
+    )
+    monkeypatch.setattr(launch_module, "supervise_pair", fake_supervise)
+    monkeypatch.setattr(
+        launch_module,
+        "ImdsV2Client",
+        lambda: SimpleNamespace(interruption_notice=lambda: None),
+    )
+
+    code = launch_module.main(
+        [
+            "--seed",
+            "1",
+            "--manifest",
+            str(fixture["manifest_path"]),
+            "--apply",
+        ]
+    )
+
+    assert code == 0
+    assert captured["plan"] is plan
+    if schema == "v3-mirror":
+        assert captured["interruption_handler"] is None
+        assert captured["checkpoint_scheduler_factory"] is (
+            launch_module._production_checkpoint_scheduler
+        )
+    else:
+        assert captured["interruption_handler"] is (
+            launch_module._production_interruption_handler
+        )
+        assert captured["checkpoint_scheduler_factory"] is None
+
+
+def test_production_scheduler_requests_survive_resume_rebound(tmp_path):
+    from msctl.aws_resume_launch import bind_resume_checkpoints
+
+    fixture = _v3_mirror_fixture(tmp_path, seed=1)
+    plan = _load_fixture_plan(fixture)
+    rank_zero_pids = {"dense": 101, "split90": 102}
+    receipt_sha256 = "e" * 64
+    resume_root = (
+        fixture["scratch_root"] / "staging" / "resume" / receipt_sha256
+    )
+    resume_root.mkdir(parents=True)
+    bindings = []
+    for arm in ARMS:
+        payload = f"{arm}-resume-checkpoint".encode("ascii")
+        path = resume_root / f"{arm}.pt"
+        path.write_bytes(payload)
+        launch = next(item for item in plan.arms if item.arm == arm)
+        bindings.append(
+            {
+                "arm": arm,
+                "bytes": len(payload),
+                "config_fingerprint": "f" * 64,
+                "config_sha256": launch.config_sha256,
+                "resume_path": str(path),
+                "resume_sha256": hashlib.sha256(payload).hexdigest(),
+                "step": 1_358,
+                "uri": (
+                    f"s3://memorysplit-prod/cohort-v3/checkpoints/seed-1/"
+                    f"{arm}/sha256/{hashlib.sha256(payload).hexdigest()}.pt"
+                ),
+                "version_id": f"{arm}-resume-version",
+                "world_size": 4,
+            }
+        )
+
+    rebound = bind_resume_checkpoints(
+        plan,
+        checkpoint_receipt_sha256=receipt_sha256,
+        checkpoints=bindings,
+    )
+    assert rebound is not plan
+    assert any(
+        "/resume/checkpoint.pt" in value
+        for launch in rebound.arms
+        for value in launch.argv
+    )
+
+    _scheduler, baseline_factory = (
+        launch_module._production_checkpoint_scheduler(plan, rank_zero_pids)
+    )
+    _rebound_scheduler, rebound_factory = (
+        launch_module._production_checkpoint_scheduler(
+            rebound,
+            rank_zero_pids,
+        )
+    )
+    baseline = baseline_factory("periodic")
+    request = rebound_factory("periodic")
+
+    per_attempt = {"request_id", "requested_at", "deadline_at"}
+    for field in launch_module.CheckpointMirrorRequest.__dataclass_fields__:
+        if field in per_attempt:
+            continue
+        assert getattr(request, field) == getattr(baseline, field), field
+    launches = {launch.arm: launch for launch in rebound.arms}
+    assert request.seed == plan.seed
+    assert request.s3_root == plan.runtime.s3_root
+    assert request.run_manifest_sha256 == plan.run_manifest_sha256
+    assert request.dataset_receipt_sha256 == plan.dataset_receipt_sha256
+    assert request.dataset_build_id == plan.dataset_build_id
+    assert request.ordered_stream_sha256 == plan.ordered_stream_sha256
+    assert request.source_commit == plan.code_commit
+    assert request.source_tree == plan.source_tree
+    assert request.rank_zero_pids == rank_zero_pids
+    assert request.runtime_uid == plan.runtime_uid
+    assert request.runtime_gid == plan.runtime_gid
+    for arm in ARMS:
+        assert request.checkpoint_paths[arm] == (
+            launches[arm].checkpoint_path
+        )
+        assert request.request_token_paths[arm] == (
+            launches[arm].request_token_path
+        )
+        assert request.config_sha256[arm] == launches[arm].config_sha256
+        assert request.run_ids[arm] == (
+            launches[arm].runtime_config["run_id"]
+        )
