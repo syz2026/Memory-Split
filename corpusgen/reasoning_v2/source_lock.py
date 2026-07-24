@@ -61,6 +61,9 @@ _FINEMATH_SHARD_RE = re.compile(
     r"train-(?P<index>[0-9]{5})-of-(?P<count>[0-9]{5})\.parquet\Z"
 )
 _CLEANUP_QUARANTINE_PREFIX = ".memorysplit-source-cleanup-"
+_DUPLICATE_QUARANTINE_DIRECTORY = "duplicate-quarantines"
+_DUPLICATE_QUARANTINE_PREFIX = ".memorysplit-benign-duplicate-"
+_DUPLICATE_MARKER_FORMAT = "memorysplit-source-benign-duplicate-v1"
 _FINEWEB_FILES = (
     "sample/10BT/000_00000.parquet",
     "sample/10BT/001_00000.parquet",
@@ -2227,6 +2230,332 @@ def _remove_owned_directory_at(
         os.close(directory_fd)
 
 
+def _stage_publish_hook(
+    phase: str,
+    sources_fd: int,
+    stage_name: str,
+    final_name: str,
+    stage_fd: int,
+) -> None:
+    del phase, sources_fd, stage_name, final_name, stage_fd
+
+
+def _duplicate_quarantine_name(lock: SourceLock) -> str:
+    return (
+        f"{_DUPLICATE_QUARANTINE_PREFIX}{lock.sha256[:16]}-"
+        f"{secrets.token_hex(12)}"
+    )
+
+
+def _read_regular_at(
+    directory_fd: int,
+    name: str,
+    *,
+    description: str,
+) -> bytes:
+    named = entry_lstat(directory_fd, name)
+    _require_owned_mode(
+        named,
+        directory=False,
+        description=description,
+    )
+    descriptor, opened = open_regular_file_at(directory_fd, name)
+    chunks = []
+    try:
+        if _file_identity(opened) != _file_identity(named):
+            raise ValueError(f"{description} identity drift")
+        while True:
+            chunk = os.read(descriptor, 1 << 20)
+            if not chunk:
+                break
+            chunks.append(chunk)
+        after = os.fstat(descriptor)
+        named_after = entry_lstat(directory_fd, name)
+        if (
+            _file_identity(after) != _file_identity(opened)
+            or _file_identity(named_after) != _file_identity(opened)
+            or os.read(descriptor, 1)
+        ):
+            raise ValueError(f"{description} identity drift")
+    finally:
+        os.close(descriptor)
+    payload = b"".join(chunks)
+    if len(payload) != opened.st_size:
+        raise ValueError(f"{description} size drift")
+    return payload
+
+
+def _write_regular_at(
+    directory_fd: int,
+    name: str,
+    payload: bytes,
+    *,
+    description: str,
+) -> None:
+    descriptor = os.open(
+        name,
+        os.O_WRONLY
+        | os.O_CREAT
+        | os.O_EXCL
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0),
+        0o600,
+        dir_fd=directory_fd,
+    )
+    try:
+        opened = os.fstat(descriptor)
+        view = memoryview(payload)
+        while view:
+            written = os.write(descriptor, view)
+            view = view[written:]
+        os.fsync(descriptor)
+        after = os.fstat(descriptor)
+        named = entry_lstat(directory_fd, name)
+        _require_owned_mode(
+            after,
+            directory=False,
+            description=description,
+        )
+        if (
+            _regular_inode_identity(after)
+            != _regular_inode_identity(opened)
+            or _regular_inode_identity(named)
+            != _regular_inode_identity(opened)
+            or after.st_size != len(payload)
+        ):
+            raise ValueError(f"{description} identity drift")
+    finally:
+        os.close(descriptor)
+    fsync_directory(directory_fd)
+    if _read_regular_at(
+        directory_fd,
+        name,
+        description=description,
+    ) != payload:
+        raise ValueError(f"{description} content drift")
+
+
+def _duplicate_marker(
+    lock: SourceLock,
+    quarantine_name: str,
+    quarantine_metadata: os.stat_result,
+    verification: dict[str, object],
+) -> dict[str, object]:
+    return {
+        "directory_identity": list(_directory_identity(quarantine_metadata)),
+        "format": _DUPLICATE_MARKER_FORMAT,
+        "quarantine_name": quarantine_name,
+        "source_lock_sha256": lock.sha256,
+        "tree_verification": verification,
+        "winner_name": lock.sha256,
+    }
+
+
+def _verify_duplicate_quarantines(
+    lock: SourceLock,
+    canonical_fd: int,
+) -> int:
+    if not entry_exists(canonical_fd, _DUPLICATE_QUARANTINE_DIRECTORY):
+        return 0
+    duplicate_fd, duplicate_identity = _open_bound_directory(
+        canonical_fd,
+        _DUPLICATE_QUARANTINE_DIRECTORY,
+        description="duplicate quarantine directory",
+    )
+    try:
+        names = list_entries(duplicate_fd)
+        directories = {
+            name
+            for name in names
+            if name.startswith(_DUPLICATE_QUARANTINE_PREFIX)
+            and not name.endswith(".json")
+        }
+        markers = {
+            name[:-5]
+            for name in names
+            if name.startswith(_DUPLICATE_QUARANTINE_PREFIX)
+            and name.endswith(".json")
+        }
+        if (
+            directories != markers
+            or len(names) != len(directories) * 2
+        ):
+            raise ValueError(
+                "duplicate quarantine namespace is unexpected or conflicting"
+            )
+        for quarantine_name in sorted(directories, key=_byte_key):
+            marker_name = f"{quarantine_name}.json"
+            marker_bytes = _read_regular_at(
+                duplicate_fd,
+                marker_name,
+                description=f"duplicate quarantine marker {marker_name}",
+            )
+            marker = _strict_json_bytes(
+                marker_bytes,
+                f"duplicate quarantine marker {marker_name}",
+            )
+            if (
+                not isinstance(marker, dict)
+                or canonical_json_bytes(marker) != marker_bytes
+                or set(marker)
+                != {
+                    "directory_identity",
+                    "format",
+                    "quarantine_name",
+                    "source_lock_sha256",
+                    "tree_verification",
+                    "winner_name",
+                }
+                or marker["format"] != _DUPLICATE_MARKER_FORMAT
+                or marker["quarantine_name"] != quarantine_name
+                or marker["source_lock_sha256"] != lock.sha256
+                or marker["winner_name"] != lock.sha256
+            ):
+                raise ValueError(
+                    f"duplicate quarantine marker drift: {marker_name}"
+                )
+            quarantine_fd, quarantine_identity = _open_bound_directory(
+                duplicate_fd,
+                quarantine_name,
+                description=f"benign duplicate quarantine {quarantine_name}",
+            )
+            try:
+                verification = _verify_source_tree_fd(lock, quarantine_fd)
+                metadata = os.fstat(quarantine_fd)
+                if (
+                    marker["directory_identity"]
+                    != list(_directory_identity(metadata))
+                    or marker["tree_verification"] != verification
+                ):
+                    raise ValueError(
+                        f"duplicate quarantine binding drift: {quarantine_name}"
+                    )
+                _require_named_directory_identity(
+                    duplicate_fd,
+                    quarantine_name,
+                    quarantine_fd,
+                    quarantine_identity,
+                    description=(
+                        f"benign duplicate quarantine {quarantine_name}"
+                    ),
+                )
+            finally:
+                os.close(quarantine_fd)
+        _require_named_directory_identity(
+            canonical_fd,
+            _DUPLICATE_QUARANTINE_DIRECTORY,
+            duplicate_fd,
+            duplicate_identity,
+            description="duplicate quarantine directory",
+        )
+        return len(directories)
+    finally:
+        os.close(duplicate_fd)
+
+
+def _require_no_orphan_duplicate_quarantine(canonical_fd: int) -> None:
+    if not entry_exists(canonical_fd, _DUPLICATE_QUARANTINE_DIRECTORY):
+        return
+    duplicate_fd, _identity = _open_bound_directory(
+        canonical_fd,
+        _DUPLICATE_QUARANTINE_DIRECTORY,
+        description="duplicate quarantine directory",
+    )
+    try:
+        if list_entries(duplicate_fd):
+            raise ValueError(
+                "duplicate quarantine exists without a verified winner"
+            )
+    finally:
+        os.close(duplicate_fd)
+
+
+def _preserve_benign_duplicate(
+    lock: SourceLock,
+    canonical_fd: int,
+    sources_fd: int,
+    stage_name: str,
+    stage_fd: int,
+    stage_identity: tuple[int, int, int, int],
+) -> str:
+    duplicate_fd, _duplicate_identity = _open_bound_directory(
+        canonical_fd,
+        _DUPLICATE_QUARANTINE_DIRECTORY,
+        description="duplicate quarantine directory",
+        create=True,
+        mode=0o700,
+    )
+    quarantine_name = _duplicate_quarantine_name(lock)
+    try:
+        _verify_duplicate_quarantines(lock, canonical_fd)
+        _require_named_directory_identity(
+            sources_fd,
+            stage_name,
+            stage_fd,
+            stage_identity,
+            description="losing source stage",
+        )
+        atomic_rename_noreplace(
+            sources_fd,
+            stage_name,
+            duplicate_fd,
+            quarantine_name,
+        )
+        fsync_directory(sources_fd)
+        fsync_directory(duplicate_fd)
+        quarantine_fd = -1
+        try:
+            quarantine_fd, quarantine_identity = _open_bound_directory(
+                duplicate_fd,
+                quarantine_name,
+                description="benign duplicate quarantine",
+            )
+            stage_metadata = os.fstat(stage_fd)
+            quarantine_metadata = os.fstat(quarantine_fd)
+            if (
+                _namespace_identity(quarantine_metadata) != stage_identity
+                or _directory_identity(quarantine_metadata)
+                != _directory_identity(stage_metadata)
+            ):
+                try:
+                    atomic_rename_noreplace(
+                        duplicate_fd,
+                        quarantine_name,
+                        sources_fd,
+                        stage_name,
+                    )
+                    fsync_directory(duplicate_fd)
+                    fsync_directory(sources_fd)
+                except FileExistsError as error:
+                    raise ValueError(
+                        "losing duplicate stage identity is uncertain and "
+                        "restore is blocked"
+                    ) from error
+                raise ValueError("losing duplicate stage identity is uncertain")
+            verification = _verify_source_tree_fd(lock, quarantine_fd)
+            marker = canonical_json_bytes(
+                _duplicate_marker(
+                    lock,
+                    quarantine_name,
+                    os.fstat(quarantine_fd),
+                    verification,
+                )
+            )
+            _write_regular_at(
+                duplicate_fd,
+                f"{quarantine_name}.json",
+                marker,
+                description="benign duplicate marker",
+            )
+        finally:
+            if quarantine_fd >= 0:
+                os.close(quarantine_fd)
+        _verify_duplicate_quarantines(lock, canonical_fd)
+        return quarantine_name
+    finally:
+        os.close(duplicate_fd)
+
+
 def stage_source_lock(
     lock: SourceLock,
     download_root: Path,
@@ -2319,6 +2648,7 @@ def stage_source_lock(
                 raise ValueError(
                     f"conflicting source stage: {final_path}"
                 ) from error
+            _verify_duplicate_quarantines(lock, canonical_fd)
             _require_named_directory_identity(
                 canonical_fd,
                 "sources",
@@ -2334,6 +2664,7 @@ def stage_source_lock(
                 description="canonical directory",
             )
             return final_path
+        _require_no_orphan_duplicate_quarantine(canonical_fd)
 
         stage_name = (
             f".{final_name}.tmp-{os.getpid()}-{secrets.token_hex(8)}"
@@ -2424,6 +2755,13 @@ def stage_source_lock(
             description="canonical sources directory",
         )
 
+        _stage_publish_hook(
+            "before_publish",
+            sources_fd,
+            stage_name,
+            final_name,
+            stage_fd,
+        )
         try:
             atomic_rename_noreplace(
                 sources_fd,
@@ -2452,17 +2790,15 @@ def stage_source_lock(
                 ) from error
             finally:
                 os.close(final_fd)
-            quarantine_name = _remove_owned_directory_at(
+            _preserve_benign_duplicate(
+                lock,
+                canonical_fd,
                 sources_fd,
                 stage_name,
+                stage_fd,
                 stage_identity,
-                description="private source stage",
             )
             stage_name = ""
-            raise ValueError(
-                "source stage race retained a quarantine for offline cleanup: "
-                f"{quarantine_name}"
-            )
         else:
             fsync_directory(sources_fd)
             final_fd, final_identity = _open_bound_directory(

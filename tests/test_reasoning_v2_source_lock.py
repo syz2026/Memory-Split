@@ -4,6 +4,7 @@ import copy
 import hashlib
 import json
 import os
+import shutil
 import subprocess
 from dataclasses import replace
 from pathlib import Path
@@ -741,6 +742,189 @@ def test_stage_reuse_detects_canonical_namespace_replacement(
             canonical,
         )
     assert list((canonical / "sources").iterdir()) == []
+
+
+def _copy_concurrent_winner(canonical, stage_name, final_name, *, conflict):
+    source = canonical / "sources" / stage_name
+    winner = canonical / "sources" / final_name
+    shutil.copytree(source, winner, copy_function=shutil.copy2)
+    if conflict:
+        victim = next(path for path in winner.rglob("*") if path.is_file())
+        victim.write_bytes(victim.read_bytes() + b"conflict")
+
+
+def test_matching_concurrent_winner_succeeds_and_preserves_loser(
+    tmp_path,
+    fixture_source_lock,
+    monkeypatch,
+):
+    canonical = tmp_path / "canonical"
+    installed = False
+
+    def install_winner(
+        phase,
+        _sources_fd,
+        stage_name,
+        final_name,
+        _stage_fd,
+    ):
+        nonlocal installed
+        if phase == "before_publish" and not installed:
+            installed = True
+            _copy_concurrent_winner(
+                canonical,
+                stage_name,
+                final_name,
+                conflict=False,
+            )
+
+    monkeypatch.setattr(
+        source_lock_module,
+        "_stage_publish_hook",
+        install_winner,
+        raising=False,
+    )
+    winner = stage_source_lock(
+        fixture_source_lock.lock,
+        fixture_source_lock.download_root,
+        canonical,
+    )
+    assert winner == canonical / "sources" / fixture_source_lock.lock.sha256
+    duplicate_root = canonical / "duplicate-quarantines"
+    quarantines = tuple(
+        path
+        for path in duplicate_root.iterdir()
+        if path.is_dir()
+    )
+    markers = tuple(duplicate_root.glob("*.json"))
+    assert len(quarantines) == 1
+    assert len(markers) == 1
+    assert verify_source_tree(
+        fixture_source_lock.lock,
+        quarantines[0],
+    )["passed"]
+    assert not any(
+        path.name.startswith(".memorysplit-source-cleanup-")
+        for path in (canonical / "sources").iterdir()
+    )
+    assert (
+        stage_source_lock(
+            fixture_source_lock.lock,
+            fixture_source_lock.download_root,
+            canonical,
+        )
+        == winner
+    )
+
+
+def test_conflicting_concurrent_winner_fails_closed(
+    tmp_path,
+    fixture_source_lock,
+    monkeypatch,
+):
+    canonical = tmp_path / "canonical"
+    installed = False
+
+    def install_winner(
+        phase,
+        _sources_fd,
+        stage_name,
+        final_name,
+        _stage_fd,
+    ):
+        nonlocal installed
+        if phase == "before_publish" and not installed:
+            installed = True
+            _copy_concurrent_winner(
+                canonical,
+                stage_name,
+                final_name,
+                conflict=True,
+            )
+
+    monkeypatch.setattr(
+        source_lock_module,
+        "_stage_publish_hook",
+        install_winner,
+        raising=False,
+    )
+    with pytest.raises(ValueError, match="conflicting source stage"):
+        stage_source_lock(
+            fixture_source_lock.lock,
+            fixture_source_lock.download_root,
+            canonical,
+        )
+    assert (canonical / "sources" / fixture_source_lock.lock.sha256).is_dir()
+    assert any(
+        path.name.startswith(".memorysplit-source-cleanup-")
+        for path in (canonical / "sources").iterdir()
+    )
+
+
+def _write_forged_duplicate(canonical, lock, *, mutate_final=False):
+    winner = canonical / "sources" / lock.sha256
+    if mutate_final:
+        victim = next(path for path in winner.rglob("*") if path.is_file())
+        victim.write_bytes(victim.read_bytes() + b"drift")
+    duplicate_root = canonical / "duplicate-quarantines"
+    duplicate_root.mkdir(mode=0o700)
+    quarantine_name = ".memorysplit-benign-duplicate-forged"
+    shutil.copytree(winner, duplicate_root / quarantine_name)
+    (duplicate_root / f"{quarantine_name}.json").write_bytes(
+        canonical_json_bytes(
+            {
+                "format": "memorysplit-source-benign-duplicate-v1",
+                "quarantine_name": quarantine_name,
+                "source_lock_sha256": "f" * 64,
+                "winner_name": lock.sha256,
+            }
+        )
+    )
+
+
+def test_forged_duplicate_quarantine_never_bypasses_final_validation(
+    tmp_path,
+    fixture_source_lock,
+):
+    canonical = tmp_path / "canonical"
+    stage_source_lock(
+        fixture_source_lock.lock,
+        fixture_source_lock.download_root,
+        canonical,
+    )
+    _write_forged_duplicate(
+        canonical,
+        fixture_source_lock.lock,
+        mutate_final=True,
+    )
+    with pytest.raises(ValueError, match="conflicting source stage"):
+        stage_source_lock(
+            fixture_source_lock.lock,
+            fixture_source_lock.download_root,
+            canonical,
+        )
+
+
+def test_forged_duplicate_quarantine_fails_after_valid_final(
+    tmp_path,
+    fixture_source_lock,
+):
+    canonical = tmp_path / "canonical"
+    stage_source_lock(
+        fixture_source_lock.lock,
+        fixture_source_lock.download_root,
+        canonical,
+    )
+    _write_forged_duplicate(
+        canonical,
+        fixture_source_lock.lock,
+    )
+    with pytest.raises(ValueError, match="duplicate quarantine"):
+        stage_source_lock(
+            fixture_source_lock.lock,
+            fixture_source_lock.download_root,
+            canonical,
+        )
 
 
 def _offline_finemath_selection(
