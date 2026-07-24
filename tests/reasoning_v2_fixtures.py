@@ -185,6 +185,17 @@ def fixed_contract_environment(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
             "sha256": _sha256(b"transductive"),
         },
     }
+    fineweb_files = {
+        path: {
+            "bytes": len(payload),
+            "sha256": _sha256(payload),
+        }
+        for path, payload in {
+            "sample/10BT/000_00000.parquet": b"fineweb zero",
+            "sample/10BT/001_00000.parquet": b"fineweb one",
+            "sample/10BT/002_00000.parquet": b"fineweb two",
+        }.items()
+    }
     wikidata_path = contract_root / "wikidata5m.lock.json"
     wikidata_path.write_bytes(
         canonical_json_bytes(
@@ -206,6 +217,11 @@ def fixed_contract_environment(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
         source_lock_module,
         "FIXED_WIKIDATA_FILES",
         copy.deepcopy(wikidata_files),
+    )
+    monkeypatch.setattr(
+        source_lock_module,
+        "FIXED_FINEWEB_FILES",
+        copy.deepcopy(fineweb_files),
     )
     return contract_root
 

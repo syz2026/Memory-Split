@@ -15,6 +15,7 @@ import tarfile
 import tempfile
 import unicodedata
 import urllib.request
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any, Literal, Protocol
@@ -24,10 +25,13 @@ from huggingface_hub import HfApi, hf_hub_download
 from corpusgen.parallel.canonical import canonical_json_bytes, sha256_hex
 from corpusgen.parallel.safeio import (
     atomic_rename_noreplace,
+    entry_lstat,
     entry_exists,
     fsync_directory,
+    list_entries,
     open_directory_at,
-    open_directory_path,
+    open_parent_directory,
+    open_regular_file_at,
 )
 
 
@@ -77,6 +81,20 @@ FIXED_WIKIDATA_FILES: dict[str, dict[str, object]] = {
         "sha256": "383160990b41c0905fc03f4a8afbb9b12be1ca3591e026bde6cdc94a59542597",
     },
 }
+FIXED_FINEWEB_FILES: dict[str, dict[str, object]] = {
+    "sample/10BT/000_00000.parquet": {
+        "bytes": 2_152_819_114,
+        "sha256": "b1ba7b2ce4cb5ea6ef42dca40263eabb85f37700d01693a68e9b30a31d78e871",
+    },
+    "sample/10BT/001_00000.parquet": {
+        "bytes": 2_152_222_432,
+        "sha256": "3fcf2dc69cd52503986276d3d2d26a8c356d0f2ea28a0de4fdbda8cf87755693",
+    },
+    "sample/10BT/002_00000.parquet": {
+        "bytes": 2_151_796_315,
+        "sha256": "547ae182d132c9f06b6ce63149567208ea9f57630bfd9b1a2938e504f0c9ebd7",
+    },
+}
 
 _FIXED_IDENTITIES: dict[str, tuple[str, str, str, str]] = {
     "fineweb_edu": (
@@ -109,6 +127,19 @@ _FIXED_IDENTITIES: dict[str, tuple[str, str, str, str]] = {
         "0e67da6af879e4bad3d7cd3c196e8d551b445725",
         "MIT",
     ),
+}
+_REVIEWED_LICENSES = {
+    "fineweb_edu": "ODC-By-1.0",
+    "finemath": "ODC-By-1.0",
+    "wikidata5m": "CC0-1.0",
+    "clrs_text": "Apache-2.0",
+    "ruletaker": "Apache-2.0",
+    "prontoqa": "Apache-2.0",
+    "reasoning_gym_exact_answer": "Apache-2.0",
+    "deepmind_mathematics_generator": "Apache-2.0",
+    "arc_agi_1": "Apache-2.0",
+    "arc_agi_2": "Apache-2.0",
+    "conceptarc": "MIT",
 }
 
 
@@ -174,6 +205,7 @@ class SourceRequest:
     repository: str
     required_license_paths: tuple[str, ...] = ()
     required_data_prefixes: tuple[str, ...] = ()
+    required_data_paths: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         _safe_source_id(self.source_id)
@@ -185,7 +217,11 @@ class SourceRequest:
             or "\x00" in self.repository
         ):
             raise ValueError("source request repository must be nonempty")
-        for field_name in ("required_license_paths", "required_data_prefixes"):
+        for field_name in (
+            "required_license_paths",
+            "required_data_paths",
+            "required_data_prefixes",
+        ):
             values = getattr(self, field_name)
             if not isinstance(values, tuple):
                 raise ValueError(f"{field_name} must be a tuple")
@@ -196,6 +232,16 @@ class SourceRequest:
             if values != tuple(sorted(values, key=_byte_key)):
                 raise ValueError(f"{field_name} paths must use bytewise order")
 
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "repository": self.repository,
+            "required_data_paths": list(self.required_data_paths),
+            "required_data_prefixes": list(self.required_data_prefixes),
+            "required_license_paths": list(self.required_license_paths),
+            "source_id": self.source_id,
+            "transport": self.transport,
+        }
+
 
 @dataclass(frozen=True)
 class SourceFile:
@@ -205,8 +251,8 @@ class SourceFile:
 
     def __post_init__(self) -> None:
         _safe_relative_path(self.path, "source file path")
-        if type(self.bytes) is not int or self.bytes <= 0:
-            raise ValueError("source file bytes must be a positive integer")
+        if type(self.bytes) is not int or self.bytes < 0:
+            raise ValueError("source file bytes must be a non-negative integer")
         _validate_digest(self.sha256, "source file sha256")
 
     def as_dict(self) -> dict[str, object]:
@@ -362,6 +408,7 @@ class SourceLock:
     dataset_id: str
     dataset_contract_sha256: str
     generator_commit: str
+    source_catalog_sha256: str
     sources: tuple[SourceEntry, ...]
 
     def __post_init__(self) -> None:
@@ -376,6 +423,7 @@ class SourceLock:
             "dataset_contract_sha256",
         )
         _validate_commit(self.generator_commit, "generator_commit")
+        _validate_digest(self.source_catalog_sha256, "source_catalog_sha256")
         if not isinstance(self.sources, tuple) or not self.sources:
             raise ValueError("source lock sources must be a nonempty tuple")
         if not all(isinstance(entry, SourceEntry) for entry in self.sources):
@@ -410,6 +458,7 @@ class SourceLock:
             "format": self.format,
             "generator_commit": self.generator_commit,
             "schema_version": self.schema_version,
+            "source_catalog_sha256": self.source_catalog_sha256,
             "sources": [entry.as_dict() for entry in self.sources],
         }
 
@@ -424,6 +473,7 @@ class SourceLock:
             "format",
             "generator_commit",
             "schema_version",
+            "source_catalog_sha256",
             "sources",
         }
         if not isinstance(value, dict) or set(value) != expected:
@@ -437,6 +487,7 @@ class SourceLock:
             dataset_id=value["dataset_id"],
             dataset_contract_sha256=value["dataset_contract_sha256"],
             generator_commit=value["generator_commit"],
+            source_catalog_sha256=value["source_catalog_sha256"],
             sources=tuple(SourceEntry.from_dict(row) for row in raw_sources),
         )
 
@@ -469,14 +520,14 @@ FIXED_REQUESTS = (
         "huggingface_dataset",
         "HuggingFaceFW/fineweb-edu",
         required_license_paths=("README.md",),
-        required_data_prefixes=_FINEWEB_FILES,
+        required_data_paths=_FINEWEB_FILES,
     ),
     SourceRequest(
         "wikidata5m",
         "huggingface_dataset",
         "intfloat/wikidata5m",
         required_license_paths=("Wikidata-CC0-1.0.txt",),
-        required_data_prefixes=_WIKIDATA_FILES,
+        required_data_paths=_WIKIDATA_FILES,
     ),
     SourceRequest(
         "arc_agi_1",
@@ -517,6 +568,69 @@ _RESOLUTION_ORDER = (
     "arc_agi_2",
     "conceptarc",
 )
+
+
+def _reviewed_license_paths(request: SourceRequest) -> tuple[str, ...]:
+    if request.required_license_paths:
+        return request.required_license_paths
+    if request.source_id == "finemath":
+        return ("README.md",)
+    return ("LICENSE",)
+
+
+def _reviewed_fixed_files(source_id: str) -> dict[str, dict[str, object]]:
+    if source_id == "fineweb_edu":
+        return FIXED_FINEWEB_FILES
+    if source_id == "wikidata5m":
+        return FIXED_WIKIDATA_FILES
+    return {}
+
+
+def _reviewed_catalog_dict() -> dict[str, object]:
+    sources = []
+    for source_id in sorted(_REQUESTS_BY_ID, key=_byte_key):
+        request = _REQUESTS_BY_ID[source_id]
+        fixed = _FIXED_IDENTITIES.get(source_id)
+        sources.append(
+            {
+                "fixed_files": [
+                    {
+                        "bytes": row["bytes"],
+                        "path": path,
+                        "sha256": row["sha256"],
+                    }
+                    for path, row in sorted(
+                        _reviewed_fixed_files(source_id).items(),
+                        key=lambda item: _byte_key(item[0]),
+                    )
+                ],
+                "fixed_revision": None if fixed is None else fixed[2],
+                "license_files": list(_reviewed_license_paths(request)),
+                "license_spdx": _REVIEWED_LICENSES[source_id],
+                "materialized_path": source_id,
+                "request": request.as_dict(),
+                "revision_kind": "git_commit",
+                "source_id": source_id,
+            }
+        )
+    return {
+        "dataset_id": DATASET_ID,
+        "format": "memorysplit-reasoning-v2-reviewed-source-catalog-v1",
+        "sources": sources,
+    }
+
+
+def reviewed_source_catalog_sha256() -> str:
+    return sha256_hex(canonical_json_bytes(_reviewed_catalog_dict()))
+
+
+def _require_reviewed_request(request: SourceRequest) -> None:
+    expected = _REQUESTS_BY_ID.get(request.source_id)
+    if expected is None or request != expected:
+        raise ValueError(
+            f"source request is not in the reviewed source catalog: "
+            f"{request.source_id}"
+        )
 
 
 def _unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
@@ -591,12 +705,20 @@ def _read_regular_bytes(path: Path, description: str) -> bytes:
     return payload
 
 
-def load_source_lock(path: Path) -> SourceLock:
+def load_source_lock(
+    path: Path,
+    *,
+    expected_generator_commit: str,
+) -> SourceLock:
     payload = _read_regular_bytes(Path(path), "source lock")
     value = _strict_json_bytes(payload, "source lock")
     lock = SourceLock.from_dict(value)
     if lock.to_bytes() != payload:
         raise ValueError("source lock JSON is not canonical")
+    _authorize_source_lock(
+        lock,
+        expected_generator_commit=expected_generator_commit,
+    )
     return lock
 
 
@@ -678,24 +800,51 @@ def _validate_fixed_contracts() -> None:
 
 
 def _prefix_present(prefix: str, paths: set[str]) -> bool:
-    return any(path == prefix or path.startswith(prefix + "/") for path in paths)
+    return any(path.startswith(prefix + "/") for path in paths)
+
+
+def _is_finemath_train_file(path: str, subset: str) -> bool:
+    relative = PurePosixPath(path)
+    return (
+        relative.parent.as_posix() == subset
+        and relative.name.startswith("train-")
+        and relative.name.endswith(".parquet")
+    )
 
 
 def _validate_resolved_entry(
     request: SourceRequest,
     entry: SourceEntry,
 ) -> None:
+    _require_reviewed_request(request)
     if (
         entry.source_id != request.source_id
         or entry.transport != request.transport
         or entry.repository != request.repository
     ):
-        raise ValueError(f"resolved source request identity drift: {request.source_id}")
+        raise ValueError(
+            f"reviewed source catalog identity drift: {request.source_id}"
+        )
+    if (
+        entry.revision_kind != "git_commit"
+        or entry.license_spdx != _REVIEWED_LICENSES[request.source_id]
+        or entry.license_files != _reviewed_license_paths(request)
+        or entry.materialized_path != request.source_id
+    ):
+        raise ValueError(
+            f"reviewed source catalog semantics drift: {request.source_id}"
+        )
     paths = {row.path for row in entry.files}
     for path in request.required_license_paths:
         if path not in entry.license_files:
             raise ValueError(
                 f"resolved source is missing required license file: "
+                f"{request.source_id}:{path}"
+            )
+    for path in request.required_data_paths:
+        if path not in paths:
+            raise ValueError(
+                f"resolved source is missing required data file: "
                 f"{request.source_id}:{path}"
             )
     for prefix in request.required_data_prefixes:
@@ -717,20 +866,21 @@ def _validate_resolved_entry(
             raise ValueError(
                 f"fixed source identity drift: {request.source_id}"
             )
-    if request.source_id == "wikidata5m":
-        by_path = {row.path: row for row in entry.files}
-        for path, expected in FIXED_WIKIDATA_FILES.items():
-            row = by_path.get(path)
-            if (
-                row is None
-                or row.bytes != expected["bytes"]
-                or row.sha256 != expected["sha256"]
-            ):
-                raise ValueError(f"fixed source identity drift: wikidata5m:{path}")
+    by_path = {row.path: row for row in entry.files}
+    for path, expected in _reviewed_fixed_files(request.source_id).items():
+        row = by_path.get(path)
+        if (
+            row is None
+            or row.bytes != expected["bytes"]
+            or row.sha256 != expected["sha256"]
+        ):
+            raise ValueError(
+                f"fixed source file identity drift: "
+                f"{request.source_id}:{path}"
+            )
     if request.source_id == "finemath":
         if "README.md" not in entry.license_files or not any(
-            row.path.startswith("finemath-4plus/train-")
-            and row.path.endswith(".parquet")
+            _is_finemath_train_file(row.path, "finemath-4plus")
             for row in entry.files
         ):
             raise ValueError("FineMath source does not prove an ODC-By data snapshot")
@@ -743,6 +893,35 @@ def _validate_resolved_entry(
             raise ValueError(
                 "RuleTaker archive URL has no downloaded content digest"
             )
+
+
+def _authorize_source_lock(
+    lock: SourceLock,
+    *,
+    expected_generator_commit: str,
+) -> None:
+    if not isinstance(lock, SourceLock):
+        raise TypeError("lock must be a SourceLock")
+    _validate_commit(expected_generator_commit, "expected generator commit")
+    _validate_fixed_contracts()
+    expected_contract_sha256 = sha256_hex(
+        _read_regular_bytes(
+            DATASET_CONTRACT_PATH,
+            "reasoning dataset contract",
+        )
+    )
+    if lock.dataset_contract_sha256 != expected_contract_sha256:
+        raise ValueError("source lock dataset contract digest drift")
+    if lock.generator_commit != expected_generator_commit:
+        raise ValueError("source lock generator commit does not match expectation")
+    if lock.source_catalog_sha256 != reviewed_source_catalog_sha256():
+        raise ValueError("source lock reviewed source catalog commitment drift")
+    by_id = {entry.source_id: entry for entry in lock.sources}
+    for source_id in _RESOLUTION_ORDER:
+        _validate_resolved_entry(
+            _REQUESTS_BY_ID[source_id],
+            by_id[source_id],
+        )
 
 
 def _expected_paths(
@@ -835,65 +1014,154 @@ def _license_from_bytes(payloads: tuple[bytes, ...]) -> str:
     return matches[0]
 
 
-def _verify_license_files(
-    lock: SourceLock,
-    source_root: Path,
+def _namespace_identity(metadata: os.stat_result) -> tuple[int, int, int, int]:
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_uid,
+        stat.S_IMODE(metadata.st_mode),
+    )
+
+
+def _file_identity(
+    metadata: os.stat_result,
+) -> tuple[int, int, int, int, int, int, int | None, int | None]:
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_uid,
+        stat.S_IMODE(metadata.st_mode),
+        metadata.st_nlink,
+        metadata.st_size,
+        getattr(metadata, "st_mtime_ns", None),
+        getattr(metadata, "st_ctime_ns", None),
+    )
+
+
+def _regular_inode_identity(
+    metadata: os.stat_result,
+) -> tuple[int, int, int, int, int]:
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_uid,
+        stat.S_IMODE(metadata.st_mode),
+        metadata.st_nlink,
+    )
+
+
+def _require_owned_mode(
+    metadata: os.stat_result,
+    *,
+    directory: bool,
+    description: str,
 ) -> None:
-    for entry in lock.sources:
-        payloads = []
-        for relative in entry.license_files:
-            path = source_root / entry.materialized_path / relative
-            metadata = path.lstat()
-            if metadata.st_size > 1 << 20:
-                raise ValueError(
-                    f"license file is unexpectedly large: {entry.source_id}:{relative}"
-                )
-            payloads.append(
-                _read_regular_bytes(
-                    path,
-                    f"license file {entry.source_id}:{relative}",
-                )
-            )
-        if _license_from_bytes(tuple(payloads)) != entry.license_spdx:
-            raise ValueError(f"license file SPDX drift: {entry.source_id}")
+    expected_kind = stat.S_ISDIR if directory else stat.S_ISREG
+    if not expected_kind(metadata.st_mode):
+        kind = "directory" if directory else "regular file"
+        raise ValueError(f"{description} is not a {kind}")
+    if metadata.st_uid != os.geteuid():
+        raise ValueError(f"{description} owner drift")
+    if stat.S_IMODE(metadata.st_mode) & 0o022:
+        raise ValueError(f"{description} mode is group/world writable")
+    if not directory and metadata.st_nlink != 1:
+        raise ValueError(f"{description} is a hardlink")
 
 
-def verify_source_tree(
-    lock: SourceLock,
-    source_root: Path,
-) -> dict[str, object]:
-    if not isinstance(lock, SourceLock):
-        raise TypeError("lock must be a SourceLock")
-    root = Path(source_root)
+def _open_bound_directory(
+    parent_fd: int,
+    name: str,
+    *,
+    description: str,
+    create: bool = False,
+    mode: int = 0o700,
+) -> tuple[int, tuple[int, int, int, int]]:
     try:
-        root_metadata = root.lstat()
-    except OSError as error:
-        raise ValueError("source root is missing") from error
-    if stat.S_ISLNK(root_metadata.st_mode):
-        raise ValueError("source root is a symlink")
-    if not stat.S_ISDIR(root_metadata.st_mode):
-        raise ValueError("source root is not a directory")
-    expected_files, expected_directories, _licenses = _expected_paths(lock)
+        named_before = entry_lstat(parent_fd, name)
+    except FileNotFoundError:
+        if not create:
+            raise
+        named_before = None
+    directory_fd, _created = open_directory_at(
+        parent_fd,
+        name,
+        create=create,
+        mode=mode,
+    )
+    try:
+        opened = os.fstat(directory_fd)
+        named_after = entry_lstat(parent_fd, name)
+        _require_owned_mode(
+            opened,
+            directory=True,
+            description=description,
+        )
+        identity = _namespace_identity(opened)
+        if (
+            (named_before is not None and not stat.S_ISDIR(named_before.st_mode))
+            or _namespace_identity(named_after) != identity
+            or (
+                named_before is not None
+                and _namespace_identity(named_before) != identity
+            )
+        ):
+            raise ValueError(f"{description} identity drift")
+        return directory_fd, identity
+    except BaseException:
+        os.close(directory_fd)
+        raise
+
+
+def _require_named_directory_identity(
+    parent_fd: int,
+    name: str,
+    directory_fd: int,
+    expected: tuple[int, int, int, int],
+    *,
+    description: str,
+) -> None:
+    opened = os.fstat(directory_fd)
+    named = entry_lstat(parent_fd, name)
+    _require_owned_mode(opened, directory=True, description=description)
+    if (
+        _namespace_identity(opened) != expected
+        or not stat.S_ISDIR(named.st_mode)
+        or _namespace_identity(named) != expected
+    ):
+        raise ValueError(f"{description} identity drift")
+
+
+def _verify_source_tree_fd(
+    lock: SourceLock,
+    root_fd: int,
+) -> dict[str, object]:
+    root_metadata = os.fstat(root_fd)
+    _require_owned_mode(
+        root_metadata,
+        directory=True,
+        description="source root",
+    )
+    root_identity = _namespace_identity(root_metadata)
+    expected_files, expected_directories, license_bindings = _expected_paths(lock)
     actual_files: set[str] = set()
     actual_directories = {""}
+    license_payloads: dict[str, bytes] = {}
     total_bytes = 0
 
-    def visit(directory: Path, prefix: tuple[str, ...]) -> None:
+    def visit(directory_fd: int, prefix: tuple[str, ...]) -> None:
         nonlocal total_bytes
-        try:
-            with os.scandir(directory) as iterator:
-                entries = sorted(
-                    iterator,
-                    key=lambda entry: _byte_key(entry.name),
-                )
-        except OSError as error:
-            raise ValueError(
-                f"source directory cannot be read: {'/'.join(prefix)}"
-            ) from error
-        for item in entries:
-            relative_parts = (*prefix, item.name)
+        directory_before = os.fstat(directory_fd)
+        description = "source root" if not prefix else "/".join(prefix)
+        _require_owned_mode(
+            directory_before,
+            directory=True,
+            description=description,
+        )
+        directory_identity = _namespace_identity(directory_before)
+        for name in list_entries(directory_fd):
+            metadata = entry_lstat(directory_fd, name)
+            relative_parts = (*prefix, name)
             relative = "/".join(relative_parts)
-            metadata = item.stat(follow_symlinks=False)
             if stat.S_ISLNK(metadata.st_mode):
                 raise ValueError(f"source tree contains symlink: {relative}")
             if stat.S_ISDIR(metadata.st_mode):
@@ -901,31 +1169,83 @@ def verify_source_tree(
                     raise ValueError(
                         f"source tree contains unlisted directory: {relative}"
                     )
-                actual_directories.add(relative)
-                visit(Path(item.path), relative_parts)
-                continue
-            if stat.S_ISREG(metadata.st_mode):
-                if relative not in expected_files:
-                    raise ValueError(
-                        f"source tree contains unlisted file: {relative}"
-                    )
-                if metadata.st_nlink != 1:
-                    raise ValueError(
-                        f"source tree contains hardlink: {relative}"
-                    )
-                expected = expected_files[relative]
-                byte_count, digest = _read_and_hash_source_file(
-                    Path(item.path),
-                    relative,
+                child_fd, child_identity = _open_bound_directory(
+                    directory_fd,
+                    name,
+                    description=f"source directory {relative}",
                 )
-                if byte_count != expected.bytes or digest != expected.sha256:
-                    raise ValueError(f"source byte drift: {relative}")
-                actual_files.add(relative)
-                total_bytes += byte_count
+                try:
+                    actual_directories.add(relative)
+                    visit(child_fd, relative_parts)
+                    _require_named_directory_identity(
+                        directory_fd,
+                        name,
+                        child_fd,
+                        child_identity,
+                        description=f"source directory {relative}",
+                    )
+                finally:
+                    os.close(child_fd)
                 continue
-            raise ValueError(f"source tree contains special file: {relative}")
+            if not stat.S_ISREG(metadata.st_mode):
+                raise ValueError(f"source tree contains special file: {relative}")
+            if relative not in expected_files:
+                raise ValueError(f"source tree contains unlisted file: {relative}")
+            _require_owned_mode(
+                metadata,
+                directory=False,
+                description=f"source file {relative}",
+            )
+            descriptor, opened = open_regular_file_at(directory_fd, name)
+            digest = hashlib.sha256()
+            byte_count = 0
+            payload_chunks: list[bytes] | None = (
+                [] if relative in license_bindings else None
+            )
+            try:
+                _require_owned_mode(
+                    opened,
+                    directory=False,
+                    description=f"source file {relative}",
+                )
+                if _file_identity(opened) != _file_identity(metadata):
+                    raise ValueError(f"source file identity drift: {relative}")
+                while True:
+                    chunk = os.read(descriptor, 1 << 20)
+                    if not chunk:
+                        break
+                    digest.update(chunk)
+                    byte_count += len(chunk)
+                    if payload_chunks is not None:
+                        payload_chunks.append(chunk)
+                after = os.fstat(descriptor)
+                named_after = entry_lstat(directory_fd, name)
+                if (
+                    _file_identity(after) != _file_identity(opened)
+                    or _file_identity(named_after) != _file_identity(opened)
+                    or os.read(descriptor, 1)
+                ):
+                    raise ValueError(f"source file identity drift: {relative}")
+            finally:
+                os.close(descriptor)
+            expected = expected_files[relative]
+            if byte_count != expected.bytes or digest.hexdigest() != expected.sha256:
+                raise ValueError(f"source byte drift: {relative}")
+            if payload_chunks is not None:
+                if byte_count > 1 << 20:
+                    raise ValueError(
+                        f"license file is unexpectedly large: {relative}"
+                    )
+                license_payloads[relative] = b"".join(payload_chunks)
+            actual_files.add(relative)
+            total_bytes += byte_count
+        directory_after = os.fstat(directory_fd)
+        if _namespace_identity(directory_after) != directory_identity:
+            raise ValueError(f"{description} identity drift")
 
-    visit(root, ())
+    visit(root_fd, ())
+    if _namespace_identity(os.fstat(root_fd)) != root_identity:
+        raise ValueError("source root identity drift")
     missing_files = sorted(set(expected_files) - actual_files, key=_byte_key)
     if missing_files:
         raise ValueError(f"source tree is missing listed file: {missing_files[0]}")
@@ -937,7 +1257,15 @@ def verify_source_tree(
         raise ValueError(
             f"source tree is missing listed directory: {missing_directories[0]}"
         )
-    _verify_license_files(lock, root)
+    for entry in lock.sources:
+        payloads = tuple(
+            license_payloads[
+                (PurePosixPath(entry.materialized_path) / relative).as_posix()
+            ]
+            for relative in entry.license_files
+        )
+        if _license_from_bytes(payloads) != entry.license_spdx:
+            raise ValueError(f"license file SPDX drift: {entry.source_id}")
     return {
         "bytes": total_bytes,
         "dataset_id": lock.dataset_id,
@@ -945,6 +1273,45 @@ def verify_source_tree(
         "passed": True,
         "source_lock_sha256": lock.sha256,
     }
+
+
+def verify_source_tree(
+    lock: SourceLock,
+    source_root: Path,
+    *,
+    expected_generator_commit: str,
+) -> dict[str, object]:
+    _authorize_source_lock(
+        lock,
+        expected_generator_commit=expected_generator_commit,
+    )
+    parent_fd = -1
+    root_fd = -1
+    try:
+        parent_fd, root_name = open_parent_directory(Path(source_root))
+        root_fd, root_identity = _open_bound_directory(
+            parent_fd,
+            root_name,
+            description="source root",
+        )
+        result = _verify_source_tree_fd(lock, root_fd)
+        _require_named_directory_identity(
+            parent_fd,
+            root_name,
+            root_fd,
+            root_identity,
+            description="source root",
+        )
+        return result
+    except (OSError, ValueError) as error:
+        if isinstance(error, ValueError):
+            raise
+        raise ValueError("source root is missing or unsafe") from error
+    finally:
+        if root_fd >= 0:
+            os.close(root_fd)
+        if parent_fd >= 0:
+            os.close(parent_fd)
 
 
 def _validate_recipe(recipe: object) -> None:
@@ -996,38 +1363,104 @@ def resolve_source_lock(
         dataset_id=DATASET_ID,
         dataset_contract_sha256=sha256_hex(dataset_contract),
         generator_commit=generator_commit,
+        source_catalog_sha256=reviewed_source_catalog_sha256(),
         sources=tuple(sorted(entries, key=lambda entry: _byte_key(entry.source_id))),
     )
-    verify_source_tree(lock, root)
+    verify_source_tree(
+        lock,
+        root,
+        expected_generator_commit=generator_commit,
+    )
     return lock
 
 
-def _copy_verified_file(source: Path, destination: Path, expected: SourceFile) -> None:
-    source_fd = os.open(
-        source,
-        os.O_RDONLY
-        | getattr(os, "O_CLOEXEC", 0)
-        | getattr(os, "O_NOFOLLOW", 0)
-        | getattr(os, "O_NONBLOCK", 0),
+def _open_directory_map(
+    root_fd: int,
+    directories: set[str],
+    *,
+    create: bool,
+    description: str,
+) -> dict[str, int]:
+    descriptors = {"": root_fd}
+    opened: dict[str, int] = {}
+    try:
+        for relative in sorted(
+            directories - {""},
+            key=lambda value: (
+                len(PurePosixPath(value).parts),
+                _byte_key(value),
+            ),
+        ):
+            path = PurePosixPath(relative)
+            parent = path.parent.as_posix()
+            if parent == ".":
+                parent = ""
+            parent_fd = descriptors[parent]
+            if create:
+                os.mkdir(path.name, mode=0o700, dir_fd=parent_fd)
+            child_fd, _identity = _open_bound_directory(
+                parent_fd,
+                path.name,
+                description=f"{description} {relative}",
+            )
+            descriptors[relative] = child_fd
+            opened[relative] = child_fd
+        return descriptors
+    except BaseException:
+        for descriptor in opened.values():
+            os.close(descriptor)
+        raise
+
+
+def _close_directory_map(descriptors: dict[str, int]) -> None:
+    for relative, descriptor in descriptors.items():
+        if relative:
+            os.close(descriptor)
+
+
+def _copy_verified_file_at(
+    source_parent_fd: int,
+    source_name: str,
+    destination_parent_fd: int,
+    destination_name: str,
+    expected: SourceFile,
+) -> None:
+    source_named = entry_lstat(source_parent_fd, source_name)
+    _require_owned_mode(
+        source_named,
+        directory=False,
+        description=f"source staging input {expected.path}",
+    )
+    source_fd, source_opened = open_regular_file_at(
+        source_parent_fd,
+        source_name,
     )
     destination_fd = -1
     digest = hashlib.sha256()
     byte_count = 0
     try:
-        source_metadata = os.fstat(source_fd)
-        if (
-            not stat.S_ISREG(source_metadata.st_mode)
-            or source_metadata.st_nlink != 1
-        ):
-            raise ValueError(f"source staging input is unsafe: {expected.path}")
+        _require_owned_mode(
+            source_opened,
+            directory=False,
+            description=f"source staging input {expected.path}",
+        )
+        if _file_identity(source_named) != _file_identity(source_opened):
+            raise ValueError(f"source staging input identity drift: {expected.path}")
         destination_fd = os.open(
-            destination,
+            destination_name,
             os.O_WRONLY
             | os.O_CREAT
             | os.O_EXCL
             | getattr(os, "O_CLOEXEC", 0)
             | getattr(os, "O_NOFOLLOW", 0),
             0o600,
+            dir_fd=destination_parent_fd,
+        )
+        destination_opened = os.fstat(destination_fd)
+        _require_owned_mode(
+            destination_opened,
+            directory=False,
+            description=f"staged source file {expected.path}",
         )
         while True:
             chunk = os.read(source_fd, 1 << 20)
@@ -1040,129 +1473,407 @@ def _copy_verified_file(source: Path, destination: Path, expected: SourceFile) -
                 written = os.write(destination_fd, view)
                 view = view[written:]
         os.fsync(destination_fd)
-        final_source = os.fstat(source_fd)
+        source_after = os.fstat(source_fd)
+        source_named_after = entry_lstat(source_parent_fd, source_name)
+        destination_after = os.fstat(destination_fd)
+        destination_named = entry_lstat(
+            destination_parent_fd,
+            destination_name,
+        )
+        _require_owned_mode(
+            destination_after,
+            directory=False,
+            description=f"staged source file {expected.path}",
+        )
+        _require_owned_mode(
+            destination_named,
+            directory=False,
+            description=f"staged source file {expected.path}",
+        )
+        if (
+            _file_identity(source_after) != _file_identity(source_opened)
+            or _file_identity(source_named_after) != _file_identity(source_opened)
+            or _regular_inode_identity(destination_after)
+            != _regular_inode_identity(destination_opened)
+            or _regular_inode_identity(destination_named)
+            != _regular_inode_identity(destination_opened)
+            or os.read(source_fd, 1)
+        ):
+            raise ValueError(f"source staging identity drift: {expected.path}")
     finally:
         if destination_fd >= 0:
             os.close(destination_fd)
         os.close(source_fd)
-    if (
-        byte_count != expected.bytes
-        or digest.hexdigest() != expected.sha256
-        or (
-            final_source.st_dev,
-            final_source.st_ino,
-            final_source.st_size,
-            final_source.st_nlink,
-        )
-        != (
-            source_metadata.st_dev,
-            source_metadata.st_ino,
-            source_metadata.st_size,
-            source_metadata.st_nlink,
-        )
-    ):
+    if byte_count != expected.bytes or digest.hexdigest() != expected.sha256:
         raise ValueError(f"source byte drift while staging: {expected.path}")
 
 
-def _fsync_tree_directories(root: Path, directories: set[str]) -> None:
-    flags = (
-        os.O_RDONLY
-        | getattr(os, "O_CLOEXEC", 0)
-        | getattr(os, "O_DIRECTORY", 0)
-        | getattr(os, "O_NOFOLLOW", 0)
-    )
+def _fsync_directory_map(descriptors: dict[str, int]) -> None:
     for relative in sorted(
-        directories,
-        key=lambda value: (-len(PurePosixPath(value).parts), _byte_key(value)),
+        descriptors,
+        key=lambda value: (
+            -len(PurePosixPath(value).parts),
+            _byte_key(value),
+        ),
     ):
-        path = root if not relative else root / relative
-        descriptor = os.open(path, flags)
-        try:
-            os.fsync(descriptor)
-        finally:
-            os.close(descriptor)
+        fsync_directory(descriptors[relative])
+
+
+def _remove_owned_directory_at(
+    parent_fd: int,
+    name: str,
+    expected_identity: tuple[int, int, int, int],
+    *,
+    description: str,
+) -> None:
+    directory_fd, actual_identity = _open_bound_directory(
+        parent_fd,
+        name,
+        description=description,
+    )
+    try:
+        if actual_identity != expected_identity:
+            raise ValueError(f"{description} identity drift during cleanup")
+        for child_name in list_entries(directory_fd):
+            metadata = entry_lstat(directory_fd, child_name)
+            child_description = f"{description}/{child_name}"
+            if stat.S_ISDIR(metadata.st_mode):
+                _require_owned_mode(
+                    metadata,
+                    directory=True,
+                    description=child_description,
+                )
+                _remove_owned_directory_at(
+                    directory_fd,
+                    child_name,
+                    _namespace_identity(metadata),
+                    description=child_description,
+                )
+            elif stat.S_ISREG(metadata.st_mode):
+                _require_owned_mode(
+                    metadata,
+                    directory=False,
+                    description=child_description,
+                )
+                child_fd, opened = open_regular_file_at(
+                    directory_fd,
+                    child_name,
+                )
+                try:
+                    if _file_identity(opened) != _file_identity(metadata):
+                        raise ValueError(
+                            f"{child_description} identity drift during cleanup"
+                        )
+                finally:
+                    os.close(child_fd)
+                os.unlink(child_name, dir_fd=directory_fd)
+                fsync_directory(directory_fd)
+            elif stat.S_ISLNK(metadata.st_mode):
+                raise ValueError(
+                    f"{child_description} is a symlink during cleanup"
+                )
+            else:
+                raise ValueError(
+                    f"{child_description} is special during cleanup"
+                )
+        _require_named_directory_identity(
+            parent_fd,
+            name,
+            directory_fd,
+            expected_identity,
+            description=description,
+        )
+    finally:
+        os.close(directory_fd)
+    os.rmdir(name, dir_fd=parent_fd)
+    fsync_directory(parent_fd)
 
 
 def stage_source_lock(
     lock: SourceLock,
     download_root: Path,
     canonical_root: Path,
+    *,
+    expected_generator_commit: str,
 ) -> Path:
-    verify_source_tree(lock, Path(download_root))
+    _authorize_source_lock(
+        lock,
+        expected_generator_commit=expected_generator_commit,
+    )
     canonical = Path(canonical_root)
-    canonical_fd = open_directory_path(canonical, create=True, mode=0o700)
+    final_name = lock.sha256
+    final_path = canonical / "sources" / final_name
+    source_parent_fd = -1
+    source_fd = -1
+    canonical_parent_fd = -1
+    canonical_fd = -1
     sources_fd = -1
+    stage_fd = -1
+    stage_name = ""
+    stage_identity: tuple[int, int, int, int] | None = None
     try:
-        sources_fd, _created = open_directory_at(
-            canonical_fd,
-            "sources",
+        source_parent_fd, source_name = open_parent_directory(
+            Path(download_root)
+        )
+        source_fd, source_identity = _open_bound_directory(
+            source_parent_fd,
+            source_name,
+            description="source root",
+        )
+        _verify_source_tree_fd(lock, source_fd)
+
+        canonical_parent_fd, canonical_name = open_parent_directory(
+            canonical,
             create=True,
             mode=0o700,
         )
-        final_name = lock.sha256
-        final_path = canonical / "sources" / final_name
+        canonical_fd, canonical_identity = _open_bound_directory(
+            canonical_parent_fd,
+            canonical_name,
+            description="canonical directory",
+            create=True,
+            mode=0o700,
+        )
+        sources_fd, sources_identity = _open_bound_directory(
+            canonical_fd,
+            "sources",
+            description="canonical sources directory",
+            create=True,
+            mode=0o700,
+        )
+        _require_named_directory_identity(
+            canonical_parent_fd,
+            canonical_name,
+            canonical_fd,
+            canonical_identity,
+            description="canonical directory",
+        )
+
         if entry_exists(sources_fd, final_name):
             try:
-                verify_source_tree(lock, final_path)
-            except ValueError as error:
+                final_fd, final_identity = _open_bound_directory(
+                    sources_fd,
+                    final_name,
+                    description="published source stage",
+                )
+                try:
+                    _verify_source_tree_fd(lock, final_fd)
+                    _require_named_directory_identity(
+                        sources_fd,
+                        final_name,
+                        final_fd,
+                        final_identity,
+                        description="published source stage",
+                    )
+                finally:
+                    os.close(final_fd)
+            except (OSError, ValueError) as error:
                 raise ValueError(
                     f"conflicting source stage: {final_path}"
                 ) from error
+            _require_named_directory_identity(
+                canonical_fd,
+                "sources",
+                sources_fd,
+                sources_identity,
+                description="canonical sources directory",
+            )
+            _require_named_directory_identity(
+                canonical_parent_fd,
+                canonical_name,
+                canonical_fd,
+                canonical_identity,
+                description="canonical directory",
+            )
             return final_path
 
         stage_name = (
             f".{final_name}.tmp-{os.getpid()}-{secrets.token_hex(8)}"
         )
         os.mkdir(stage_name, mode=0o700, dir_fd=sources_fd)
-        stage_path = canonical / "sources" / stage_name
+        stage_fd, stage_identity = _open_bound_directory(
+            sources_fd,
+            stage_name,
+            description="private source stage",
+        )
         expected_files, directories, _licenses = _expected_paths(lock)
+
+        _require_named_directory_identity(
+            canonical_parent_fd,
+            canonical_name,
+            canonical_fd,
+            canonical_identity,
+            description="canonical directory",
+        )
+        _require_named_directory_identity(
+            canonical_fd,
+            "sources",
+            sources_fd,
+            sources_identity,
+            description="canonical sources directory",
+        )
+        source_directories = _open_directory_map(
+            source_fd,
+            directories,
+            create=False,
+            description="source directory",
+        )
+        destination_directories = _open_directory_map(
+            stage_fd,
+            directories,
+            create=True,
+            description="staged source directory",
+        )
         try:
-            for relative in sorted(
-                directories - {""},
-                key=lambda value: (
-                    len(PurePosixPath(value).parts),
-                    _byte_key(value),
-                ),
-            ):
-                (stage_path / relative).mkdir(mode=0o700)
             for relative, expected in sorted(
                 expected_files.items(),
                 key=lambda item: _byte_key(item[0]),
             ):
-                _copy_verified_file(
-                    Path(download_root) / relative,
-                    stage_path / relative,
+                path = PurePosixPath(relative)
+                parent = path.parent.as_posix()
+                if parent == ".":
+                    parent = ""
+                _copy_verified_file_at(
+                    source_directories[parent],
+                    path.name,
+                    destination_directories[parent],
+                    path.name,
                     expected,
                 )
-            _fsync_tree_directories(stage_path, directories)
-            verify_source_tree(lock, stage_path)
+            _fsync_directory_map(destination_directories)
+        finally:
+            _close_directory_map(destination_directories)
+            _close_directory_map(source_directories)
+
+        _verify_source_tree_fd(lock, source_fd)
+        _require_named_directory_identity(
+            source_parent_fd,
+            source_name,
+            source_fd,
+            source_identity,
+            description="source root",
+        )
+        _verify_source_tree_fd(lock, stage_fd)
+        _require_named_directory_identity(
+            sources_fd,
+            stage_name,
+            stage_fd,
+            stage_identity,
+            description="private source stage",
+        )
+        _require_named_directory_identity(
+            canonical_parent_fd,
+            canonical_name,
+            canonical_fd,
+            canonical_identity,
+            description="canonical directory",
+        )
+        _require_named_directory_identity(
+            canonical_fd,
+            "sources",
+            sources_fd,
+            sources_identity,
+            description="canonical sources directory",
+        )
+
+        try:
+            atomic_rename_noreplace(
+                sources_fd,
+                stage_name,
+                sources_fd,
+                final_name,
+            )
+        except FileExistsError:
+            final_fd, final_identity = _open_bound_directory(
+                sources_fd,
+                final_name,
+                description="published source stage",
+            )
             try:
-                atomic_rename_noreplace(
-                    sources_fd,
-                    stage_name,
+                _verify_source_tree_fd(lock, final_fd)
+                _require_named_directory_identity(
                     sources_fd,
                     final_name,
+                    final_fd,
+                    final_identity,
+                    description="published source stage",
                 )
-            except FileExistsError:
-                try:
-                    verify_source_tree(lock, final_path)
-                except ValueError as error:
-                    raise ValueError(
-                        f"conflicting source stage: {final_path}"
-                    ) from error
-                shutil.rmtree(stage_path)
-            else:
-                fsync_directory(sources_fd)
-            verify_source_tree(lock, final_path)
-            return final_path
-        except BaseException:
-            if stage_path.exists() and not stage_path.is_symlink():
-                shutil.rmtree(stage_path)
-            raise
+            except (OSError, ValueError) as error:
+                raise ValueError(
+                    f"conflicting source stage: {final_path}"
+                ) from error
+            finally:
+                os.close(final_fd)
+            _remove_owned_directory_at(
+                sources_fd,
+                stage_name,
+                stage_identity,
+                description="private source stage",
+            )
+            stage_name = ""
+        else:
+            fsync_directory(sources_fd)
+            final_fd, final_identity = _open_bound_directory(
+                sources_fd,
+                final_name,
+                description="published source stage",
+            )
+            try:
+                if final_identity != stage_identity:
+                    raise ValueError("published source stage identity drift")
+                _verify_source_tree_fd(lock, final_fd)
+                _require_named_directory_identity(
+                    sources_fd,
+                    final_name,
+                    final_fd,
+                    final_identity,
+                    description="published source stage",
+                )
+            finally:
+                os.close(final_fd)
+            stage_name = ""
+        _require_named_directory_identity(
+            canonical_parent_fd,
+            canonical_name,
+            canonical_fd,
+            canonical_identity,
+            description="canonical directory",
+        )
+        _require_named_directory_identity(
+            canonical_fd,
+            "sources",
+            sources_fd,
+            sources_identity,
+            description="canonical sources directory",
+        )
+        return final_path
+    except BaseException:
+        if (
+            sources_fd >= 0
+            and stage_name
+            and stage_identity is not None
+            and entry_exists(sources_fd, stage_name)
+        ):
+            _remove_owned_directory_at(
+                sources_fd,
+                stage_name,
+                stage_identity,
+                description="private source stage",
+            )
+        raise
     finally:
+        if stage_fd >= 0:
+            os.close(stage_fd)
         if sources_fd >= 0:
             os.close(sources_fd)
-        os.close(canonical_fd)
+        if canonical_fd >= 0:
+            os.close(canonical_fd)
+        if canonical_parent_fd >= 0:
+            os.close(canonical_parent_fd)
+        if source_fd >= 0:
+            os.close(source_fd)
+        if source_parent_fd >= 0:
+            os.close(source_parent_fd)
 
 
 def _inventory_directory(root: Path) -> tuple[SourceFile, ...]:
@@ -1186,8 +1897,6 @@ def _inventory_directory(root: Path) -> tuple[SourceFile, ...]:
             path = Path(directory) / name
             relative = path.relative_to(root).as_posix()
             byte_count, digest = _read_and_hash_source_file(path, relative)
-            if byte_count <= 0:
-                raise ValueError(f"resolved source contains an empty file: {relative}")
             rows.append(SourceFile(relative, byte_count, digest))
     return tuple(sorted(rows, key=lambda row: _byte_key(row.path)))
 
@@ -1214,8 +1923,6 @@ def _safe_extract_git_archive(archive_path: Path, destination: Path) -> None:
                 continue
             if not member.isreg():
                 raise ValueError(f"git archive contains link or special file: {relative}")
-            if member.size == 0:
-                continue
             target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
             source = archive.extractfile(member)
             if source is None:
@@ -1286,6 +1993,129 @@ def _download_url(url: str, destination: Path) -> None:
         raise ValueError("RuleTaker dataset archive is empty")
 
 
+@dataclass(frozen=True)
+class _FineMathSelection:
+    selected_paths: tuple[str, ...]
+    usable_targets: int
+    fineweb_duplicate_rows: int
+
+
+def _validated_finemath_paths(info: Any) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    card_data = getattr(info, "card_data", None)
+    card_license = card_data.get("license") if card_data is not None else None
+    if card_license not in {"odc-by", "ODC-By-1.0"}:
+        raise ValueError("FineMath metadata does not prove ODC-By-1.0")
+    raw_paths = tuple(
+        getattr(sibling, "rfilename", "")
+        for sibling in getattr(info, "siblings", ())
+    )
+    if (
+        any(not isinstance(path, str) or not path for path in raw_paths)
+        or len(raw_paths) != len(set(raw_paths))
+    ):
+        raise ValueError("FineMath repository inventory is invalid")
+    for path in raw_paths:
+        _safe_relative_path(path, "FineMath repository path")
+    sibling_paths = tuple(sorted(raw_paths, key=_byte_key))
+
+    four_plus = tuple(
+        path
+        for path in sibling_paths
+        if _is_finemath_train_file(path, "finemath-4plus")
+    )
+    three_plus = tuple(
+        path
+        for path in sibling_paths
+        if _is_finemath_train_file(path, "finemath-3plus")
+    )
+    if "README.md" not in sibling_paths or not four_plus:
+        raise ValueError("FineMath repository inventory is incomplete")
+    return four_plus, three_plus
+
+
+def _select_finemath_files(
+    *,
+    four_plus: tuple[str, ...],
+    three_plus: tuple[str, ...],
+    fineweb_paths: tuple[Path, ...],
+    materialize: Callable[[str], Path],
+    iter_texts: Callable[[Path], Iterable[str]],
+    encode: Callable[[str], list[int]],
+    quota: int,
+    database_path: Path,
+) -> _FineMathSelection:
+    if type(quota) is not int or quota < 0:
+        raise ValueError("FineMath quota must be a non-negative integer")
+    if len(fineweb_paths) != len(_FINEWEB_FILES):
+        raise ValueError("FineMath selection requires all reviewed FineWeb files")
+    ordered_four = tuple(sorted(four_plus, key=_byte_key))
+    ordered_three = tuple(sorted(three_plus, key=_byte_key))
+    if (
+        not ordered_four
+        or len(ordered_four) != len(set(ordered_four))
+        or len(ordered_three) != len(set(ordered_three))
+        or set(ordered_four) & set(ordered_three)
+    ):
+        raise ValueError("FineMath selection inventory is invalid")
+    database = sqlite3.connect(str(database_path))
+    try:
+        database.execute("PRAGMA journal_mode=OFF")
+        database.execute("PRAGMA synchronous=OFF")
+        database.execute(
+            "CREATE TABLE fineweb ("
+            "digest BLOB NOT NULL, text TEXT NOT NULL, "
+            "PRIMARY KEY (digest, text)"
+            ") WITHOUT ROWID"
+        )
+        for path in fineweb_paths:
+            for text in iter_texts(path):
+                if not isinstance(text, str):
+                    raise ValueError(f"FineWeb text is not a string: {path}")
+                normalized = unicodedata.normalize("NFC", text)
+                database.execute(
+                    "INSERT OR IGNORE INTO fineweb(digest, text) VALUES (?, ?)",
+                    (
+                        hashlib.sha256(normalized.encode("utf-8")).digest(),
+                        normalized,
+                    ),
+                )
+            database.commit()
+
+        selected = []
+        token_count = 0
+        duplicate_rows = 0
+        for relative in (*ordered_four, *ordered_three):
+            path = materialize(relative)
+            selected.append(relative)
+            for text in iter_texts(path):
+                if not isinstance(text, str):
+                    raise ValueError(
+                        f"FineMath text is not a string: {relative}"
+                    )
+                normalized = unicodedata.normalize("NFC", text)
+                digest = hashlib.sha256(normalized.encode("utf-8")).digest()
+                duplicate = database.execute(
+                    "SELECT 1 FROM fineweb WHERE digest=? AND text=?",
+                    (digest, normalized),
+                ).fetchone()
+                if duplicate is not None:
+                    duplicate_rows += 1
+                    continue
+                token_count += len(encode(normalized)) + 1
+            if token_count > quota:
+                return _FineMathSelection(
+                    selected_paths=tuple(selected),
+                    usable_targets=token_count,
+                    fineweb_duplicate_rows=duplicate_rows,
+                )
+        raise ValueError(
+            "FineMath bytes do not prove more than the frozen quota "
+            "after exact FineWeb cross-deduplication"
+        )
+    finally:
+        database.close()
+
+
 class PublicSourceResolver:
     """Resolve only the reviewed public catalog, never ambient HF credentials."""
 
@@ -1295,6 +2125,7 @@ class PublicSourceResolver:
     def resolve(self, request: SourceRequest, download_root: Path) -> SourceEntry:
         if not isinstance(request, SourceRequest):
             raise TypeError("request must be a SourceRequest")
+        _require_reviewed_request(request)
         root = Path(download_root)
         root.mkdir(parents=True, exist_ok=True)
         materialized = root / request.source_id
@@ -1490,7 +2321,10 @@ class PublicSourceResolver:
                 license_paths = ("README.md",)
                 license_spdx = "ODC-By-1.0"
             else:
-                selected = list(request.required_data_prefixes)
+                selected = [
+                    *request.required_data_paths,
+                    *request.required_data_prefixes,
+                ]
                 if request.source_id == "fineweb_edu":
                     selected.insert(0, "README.md")
                     license_paths = ("README.md",)
@@ -1535,32 +2369,8 @@ class PublicSourceResolver:
         download_root: Path,
         materialized: Path,
         cache: Path,
-    ) -> None:
-        card_data = getattr(info, "card_data", None)
-        card_license = card_data.get("license") if card_data is not None else None
-        if card_license not in {"odc-by", "ODC-By-1.0"}:
-            raise ValueError("FineMath metadata does not prove ODC-By-1.0")
-        sibling_paths = sorted(
-            {
-                getattr(sibling, "rfilename", "")
-                for sibling in getattr(info, "siblings", ())
-            },
-            key=_byte_key,
-        )
-        four_plus = [
-            path
-            for path in sibling_paths
-            if path.startswith("finemath-4plus/train-")
-            and path.endswith(".parquet")
-        ]
-        three_plus = [
-            path
-            for path in sibling_paths
-            if path.startswith("finemath-3plus/train-")
-            and path.endswith(".parquet")
-        ]
-        if "README.md" not in sibling_paths or not four_plus:
-            raise ValueError("FineMath repository inventory is incomplete")
+    ) -> _FineMathSelection:
+        four_plus, three_plus = _validated_finemath_paths(info)
         self._download_hf_file(
             request,
             revision,
@@ -1589,65 +2399,30 @@ class PublicSourceResolver:
             prefix=".finemath-proof-",
             dir=download_root.parent,
         ) as proof_directory:
-            database = sqlite3.connect(
-                str(Path(proof_directory) / "fineweb.sqlite3")
-            )
-            try:
-                database.execute("PRAGMA journal_mode=OFF")
-                database.execute("PRAGMA synchronous=OFF")
-                database.execute(
-                    "CREATE TABLE fineweb ("
-                    "digest BLOB NOT NULL, text TEXT NOT NULL, "
-                    "PRIMARY KEY (digest, text)"
-                    ") WITHOUT ROWID"
+            tokenizer = get_tok()
+
+            def materialize(relative: str) -> Path:
+                self._download_hf_file(
+                    request,
+                    revision,
+                    relative,
+                    materialized,
+                    cache,
                 )
-                for relative in _FINEWEB_FILES:
-                    for text in _iter_parquet_texts(
-                        parquet,
-                        fineweb_root / relative,
-                    ):
-                        normalized = unicodedata.normalize("NFC", text)
-                        database.execute(
-                            "INSERT OR IGNORE INTO fineweb(digest, text) VALUES (?, ?)",
-                            (
-                                hashlib.sha256(normalized.encode("utf-8")).digest(),
-                                normalized,
-                            ),
-                        )
-                    database.commit()
-                tokenizer = get_tok()
-                token_count = 0
-                for relative in [*four_plus, *three_plus]:
-                    self._download_hf_file(
-                        request,
-                        revision,
-                        relative,
-                        materialized,
-                        cache,
-                    )
-                    for text in _iter_parquet_texts(
-                        parquet,
-                        materialized / relative,
-                    ):
-                        normalized = unicodedata.normalize("NFC", text)
-                        digest = hashlib.sha256(
-                            normalized.encode("utf-8")
-                        ).digest()
-                        duplicate = database.execute(
-                            "SELECT 1 FROM fineweb WHERE digest=? AND text=?",
-                            (digest, normalized),
-                        ).fetchone()
-                        if duplicate is None:
-                            token_count += len(tokenizer.encode(normalized)) + 1
-                    if token_count > _FINEMATH_TARGETS:
-                        break
-                if token_count <= _FINEMATH_TARGETS:
-                    raise ValueError(
-                        "FineMath bytes do not prove more than the frozen quota "
-                        "after exact FineWeb cross-deduplication"
-                    )
-            finally:
-                database.close()
+                return materialized / relative
+
+            return _select_finemath_files(
+                four_plus=four_plus,
+                three_plus=three_plus,
+                fineweb_paths=tuple(
+                    fineweb_root / relative for relative in _FINEWEB_FILES
+                ),
+                materialize=materialize,
+                iter_texts=lambda path: _iter_parquet_texts(parquet, path),
+                encode=tokenizer.encode,
+                quota=_FINEMATH_TARGETS,
+                database_path=Path(proof_directory) / "fineweb.sqlite3",
+            )
 
 
 def _iter_parquet_texts(parquet_module: Any, path: Path):
