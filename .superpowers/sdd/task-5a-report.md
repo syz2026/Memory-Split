@@ -206,3 +206,57 @@ unallowlisted `infra/**` and every future `runtime/**` path now fail closed.
 No deployment, AWS API mutation, change set, cleanup-code edit, runtime
 Dockerfile, or profile-neutral P6 work was performed. The operator must still
 select an AZ where the separately executed p5.48xlarge offering check passes.
+
+## Exact S3 role-separation addendum
+
+Commit `2f6b4f9` (`fix: separate AWS artifact role prefixes`) closes the final
+Important Task 5A review gap.
+
+- Train list/read/write permissions now enumerate only release and dataset
+  inputs, operation intents and instance-owned operation receipts, canary
+  round trips, checkpoints, snapshots, logs, and the bootstrap, canary,
+  checkpoint, interruption, and run receipt namespaces. Train has no evaluator,
+  evaluation-receipt, or sealed namespace.
+- Evaluator remains read-only on sealed, checkpoint, and checkpoint-receipt
+  inputs. Its only writable namespaces are `evaluations/**` and
+  `receipts/evaluations/**`.
+- Controller read permissions enumerate immutable/lifecycle inputs needed by
+  the current release, dataset, canary, environment, checkpoint/resume,
+  operation reconciliation, evaluation collection, log/snapshot collection,
+  and collection-receipt paths. Its writes are limited to operation intents,
+  canary/environment receipts, dataset publication, and the current
+  controller-owned checkpoint staging paths. It cannot write evaluator
+  evidence or evaluator receipts and has no sealed read/write permission.
+- Every role has an exact `s3:prefix` ListBucket condition. The S3 endpoint also
+  enumerates named object namespaces instead of allowing the artifact-root
+  wildcard.
+- cfn-guard validates the named statements and all S3 read/write/list
+  statements, so an extra statement cannot bypass the named-policy checks.
+
+RED evidence:
+
+- Exact Train/Controller tests produced `2 failed, 1 passed`: Train still listed
+  broad `operations/**` and `receipts/**`, while Controller had no scoped list
+  statement and retained `${ArtifactRootPrefix}/*`. Evaluator was already
+  compliant.
+- Endpoint RED observed the broad root resource where an enumerated list was
+  required.
+- Guard mutation RED showed both an injected broad Train statement and an
+  injected Controller evaluator-write statement returning success before the
+  all-statement queries were added.
+
+GREEN and final evidence:
+
+- Focused pytest: `154 passed in 115.29s`.
+- Safe YAML parse: 33 resources.
+- cfn-lint 1.53.2: passed with no findings.
+- cfn-guard 3.2.0: all 22 rules passed.
+- cfn-guard rejected 11 required-resource deletion mutants and 11 S3 policy
+  mutants, including injected statements, artifact-root wildcards, Train
+  evaluator access, Evaluator checkpoint writes, Controller evaluator writes,
+  Controller sealed reads, broad list prefixes, and a broad endpoint resource.
+- The actual omitted IaC files passed secret scanning; `py_compile` and
+  `git diff --check` passed.
+
+No deployment, AWS API mutation, change set, runtime implementation, cleanup
+change, or profile-neutral P6 work was performed.
