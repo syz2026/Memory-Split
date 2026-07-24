@@ -393,11 +393,10 @@ def test_objective_prefetch_preserves_serial_record_and_cursor_order():
     providers = tuple(f"provider-{index}" for index in range(5))
 
     class _Client:
-        runtime = {"python": "fixture"}
-
         def __init__(self, provider):
             self.provider = provider
             self.calls = []
+            self.runtime = {"python": "fixture"}
 
         def generate(self, index):
             self.calls.append(index)
