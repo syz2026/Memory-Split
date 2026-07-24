@@ -1238,6 +1238,44 @@ def _publish_outputs(record: dict[str, object]):
     return _put, _head
 
 
+def test_inherited_dry_run_provider_returns_are_profile_bound(
+    tmp_path,
+    monkeypatch,
+):
+    """Both inherited collect/_s3_head dry-run NameErrors stay closed."""
+
+    for profile_path, provider in (
+        (P5_PROFILE, "aws-p5.48xlarge"),
+        (P6_PROFILE, "aws-p6-b300.48xlarge"),
+    ):
+        fixture = _collect_fixture(
+            tmp_path / provider.replace(".", "-"),
+            monkeypatch,
+            seed=1,
+            profile_path=profile_path,
+        )
+
+        head = fixture.backend._s3_head(
+            "dataset/receipt.json",
+            operation="probe dataset receipt",
+            apply=False,
+        )
+        assert head["provider"] == provider
+        assert head["verified"] is False
+        assert "head-object" in head["commands"][0]
+
+        collected = fixture.backend.collect(
+            source="results/seed-1.json",
+            out=tmp_path / provider.replace(".", "-") / "legacy-out.json",
+            apply=False,
+        )
+        assert collected["provider"] == provider
+        assert collected["collected"] == 0
+        assert "get-object" in collected["commands"][0]
+        assert fixture.runner.calls == []
+        assert fixture.downloads.calls == []
+
+
 def test_collect_seed_evidence_dry_run_renders_first_get_only(
     tmp_path,
     monkeypatch,
