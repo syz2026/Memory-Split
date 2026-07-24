@@ -90,12 +90,15 @@ AWS_V3_BINDING_KEYS = {
     "preregistration_sha256",
     "hardware_amendment_sha256",
     "provider_selection_sha256",
-    "sealed_evaluation_sha256",
-    "study_lock_sha256",
+    "sealed_fixture_sha256",
     "fleet_plan_sha256",
     "fleet_wave",
     "launch_readiness_sha256",
     "control_bundle_sha256",
+}
+AWS_V3_FINAL_EVALUATION_KEYS = {
+    "sealed_evaluation_sha256",
+    "study_lock_sha256",
 }
 AWS_V3_RUN_STATE_KEYS = (
     AWS_RUN_STATE_KEYS - {"study_lock_sha256"}
@@ -155,6 +158,7 @@ AWS_EVALUATION_STATE_KEYS = {
 AWS_V3_EVALUATION_STATE_KEYS = AWS_EVALUATION_STATE_KEYS | {
     "cohort_assignment_sha256",
     *AWS_V3_BINDING_KEYS,
+    *AWS_V3_FINAL_EVALUATION_KEYS,
 }
 AWS_PAIR_INTENT_KEYS = {
     "schema_version",
@@ -408,8 +412,7 @@ def _validate_aws_run_state(value: dict[str, object], run_id: str) -> None:
                 "preregistration_sha256",
                 "hardware_amendment_sha256",
                 "provider_selection_sha256",
-                "sealed_evaluation_sha256",
-                "study_lock_sha256",
+                "sealed_fixture_sha256",
                 "fleet_plan_sha256",
                 "launch_readiness_sha256",
                 "control_bundle_sha256",
@@ -515,6 +518,7 @@ def _validate_evaluation_state(
                     "preregistration_sha256",
                     "hardware_amendment_sha256",
                     "provider_selection_sha256",
+                    "sealed_fixture_sha256",
                     "sealed_evaluation_sha256",
                     "study_lock_sha256",
                     "fleet_plan_sha256",
@@ -976,11 +980,10 @@ class StateStore:
                 "preregistration_sha256",
                 "hardware_amendment_sha256",
                 "provider_selection_sha256",
-                "sealed_evaluation_sha256",
-                "study_lock_sha256",
+                "sealed_fixture_sha256",
                 "fleet_plan_sha256",
                 "launch_readiness_sha256",
-                    "control_bundle_sha256",
+                "control_bundle_sha256",
             ):
                 require_sha256(
                     value[field],
@@ -1016,8 +1019,7 @@ class StateStore:
                             "preregistration_sha256",
                             "hardware_amendment_sha256",
                             "provider_selection_sha256",
-                            "sealed_evaluation_sha256",
-                            "study_lock_sha256",
+                            "sealed_fixture_sha256",
                             "fleet_plan_sha256",
                             "fleet_wave",
                             "launch_readiness_sha256",

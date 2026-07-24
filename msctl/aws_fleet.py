@@ -53,8 +53,7 @@ _PLAN_FIELDS = {
     "capacity_block_offering_id",
     "release_sha256",
     "dataset_sha256",
-    "sealed_evaluation_sha256",
-    "study_lock_sha256",
+    "sealed_fixture_sha256",
     "source_commit",
     "mixed_profiles",
     "protected_outcomes_inspected",
@@ -140,8 +139,7 @@ class FleetPlan:
     capacity_block_offering_id: str | None
     release_sha256: str
     dataset_sha256: str
-    sealed_evaluation_sha256: str
-    study_lock_sha256: str
+    sealed_fixture_sha256: str
     source_commit: str
     manifests: tuple[FleetManifestBinding, ...]
     instances: tuple[FleetInstance, ...]
@@ -366,8 +364,7 @@ def _load_manifests(
             manifest.hardware_amendment_sha256,
             manifest.provider_selection_sha256,
             manifest.profile_sha256,
-            manifest.sealed_evaluation_sha256,
-            manifest.study_lock_sha256,
+            manifest.sealed_fixture_sha256,
         )
         if (
             manifest.schema_version != 3
@@ -465,8 +462,7 @@ def create_fleet_plan(
         "capacity_block_offering_id": selection.capacity_block_offering_id,
         "release_sha256": first.release_sha256,
         "dataset_sha256": first.dataset_sha256,
-        "sealed_evaluation_sha256": first.sealed_evaluation_sha256,
-        "study_lock_sha256": first.study_lock_sha256,
+        "sealed_fixture_sha256": first.sealed_fixture_sha256,
         "source_commit": first.source_commit,
         "mixed_profiles": False,
         "protected_outcomes_inspected": False,
@@ -549,8 +545,7 @@ def _validate_structure(
         "preregistration_sha256",
         "release_sha256",
         "dataset_sha256",
-        "sealed_evaluation_sha256",
-        "study_lock_sha256",
+        "sealed_fixture_sha256",
     ):
         _sha256(plan[field], label=f"fleet plan.{field}")
     if (
@@ -659,8 +654,7 @@ def _validate_structure(
         capacity_block_offering_id=selection.capacity_block_offering_id,
         release_sha256=str(plan["release_sha256"]),
         dataset_sha256=str(plan["dataset_sha256"]),
-        sealed_evaluation_sha256=str(plan["sealed_evaluation_sha256"]),
-        study_lock_sha256=str(plan["study_lock_sha256"]),
+        sealed_fixture_sha256=str(plan["sealed_fixture_sha256"]),
         source_commit=str(plan["source_commit"]),
         manifests=tuple(bindings),
         instances=tuple(instances),
@@ -727,9 +721,7 @@ def validate_fleet_manifest(
         or manifest.preregistration_sha256 != plan.preregistration_sha256
         or manifest.release_sha256 != plan.release_sha256
         or manifest.dataset_sha256 != plan.dataset_sha256
-        or manifest.sealed_evaluation_sha256
-        != plan.sealed_evaluation_sha256
-        or manifest.study_lock_sha256 != plan.study_lock_sha256
+        or manifest.sealed_fixture_sha256 != plan.sealed_fixture_sha256
         or manifest.source_commit != plan.source_commit
         or (instance_id is not None and instance_id != binding.instance_id)
     ):

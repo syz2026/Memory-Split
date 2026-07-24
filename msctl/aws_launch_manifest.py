@@ -33,8 +33,7 @@ _V3_BINDING_FIELDS = (
     "preregistration_sha256",
     "hardware_amendment_sha256",
     "provider_selection_sha256",
-    "sealed_evaluation_sha256",
-    "study_lock_sha256",
+    "sealed_fixture_sha256",
     "fleet_plan_sha256",
     "launch_readiness_sha256",
     "control_bundle_sha256",
@@ -123,8 +122,7 @@ def build_launcher_manifest(
     preregistration_sha256: str | None = None,
     hardware_amendment_sha256: str | None = None,
     provider_selection_sha256: str | None = None,
-    sealed_evaluation_sha256: str | None = None,
-    study_lock_sha256: str | None = None,
+    sealed_fixture_sha256: str | None = None,
     fleet_plan_sha256: str | None = None,
     launch_readiness_sha256: str | None = None,
     control_bundle_sha256: str | None = None,
@@ -176,8 +174,7 @@ def build_launcher_manifest(
         "preregistration_sha256": preregistration_sha256,
         "hardware_amendment_sha256": hardware_amendment_sha256,
         "provider_selection_sha256": provider_selection_sha256,
-        "sealed_evaluation_sha256": sealed_evaluation_sha256,
-        "study_lock_sha256": study_lock_sha256,
+        "sealed_fixture_sha256": sealed_fixture_sha256,
         "fleet_plan_sha256": fleet_plan_sha256,
         "launch_readiness_sha256": launch_readiness_sha256,
         "control_bundle_sha256": control_bundle_sha256,
@@ -343,8 +340,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--preregistration-sha256")
     parser.add_argument("--hardware-amendment-sha256")
     parser.add_argument("--provider-selection-sha256")
-    parser.add_argument("--sealed-evaluation-sha256")
-    parser.add_argument("--study-lock-sha256")
+    parser.add_argument("--sealed-fixture-sha256")
     parser.add_argument("--fleet-plan-sha256")
     parser.add_argument("--launch-readiness-sha256")
     parser.add_argument("--control-bundle-sha256")
@@ -381,8 +377,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             preregistration_sha256=arguments.preregistration_sha256,
             hardware_amendment_sha256=arguments.hardware_amendment_sha256,
             provider_selection_sha256=arguments.provider_selection_sha256,
-            sealed_evaluation_sha256=arguments.sealed_evaluation_sha256,
-            study_lock_sha256=arguments.study_lock_sha256,
+            sealed_fixture_sha256=arguments.sealed_fixture_sha256,
             fleet_plan_sha256=arguments.fleet_plan_sha256,
             launch_readiness_sha256=arguments.launch_readiness_sha256,
             control_bundle_sha256=arguments.control_bundle_sha256,

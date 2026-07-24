@@ -39,6 +39,20 @@ APPROVAL_OPERATIONS = {
     "fleet-advance",
 }
 KEY_ENV = "MSCTL_APPROVAL_KEY"
+_V3_RESOURCE_FIELDS = {
+    "cohort_assignment_sha256",
+    "preregistration_sha256",
+    "hardware_amendment_sha256",
+    "provider_selection_sha256",
+    "sealed_fixture_sha256",
+    "fleet_plan_sha256",
+    "fleet_wave",
+    "control_bundle_sha256",
+}
+_V3_FINAL_EVALUATION_RESOURCE_FIELDS = {
+    "sealed_evaluation_sha256",
+    "study_lock_sha256",
+}
 
 
 def _parse_expiry(value: object) -> datetime:
@@ -252,17 +266,9 @@ def verify_scope_approval(
         if operation == "resume":
             expected_resource_fields.add("checkpoint_receipt_sha256")
         if v3_aws:
-            expected_resource_fields |= {
-                "cohort_assignment_sha256",
-                "preregistration_sha256",
-                "hardware_amendment_sha256",
-                "provider_selection_sha256",
-                "sealed_evaluation_sha256",
-                "study_lock_sha256",
-                "fleet_plan_sha256",
-                "fleet_wave",
-                "control_bundle_sha256",
-            }
+            expected_resource_fields |= _V3_RESOURCE_FIELDS
+            if operation == "evaluate":
+                expected_resource_fields |= _V3_FINAL_EVALUATION_RESOURCE_FIELDS
             if operation in {"submit", "resume", "evaluate"}:
                 expected_resource_fields.add("launch_readiness_sha256")
     require_exact_keys(
@@ -308,8 +314,7 @@ def verify_scope_approval(
                     "preregistration_sha256",
                     "hardware_amendment_sha256",
                     "provider_selection_sha256",
-                    "sealed_evaluation_sha256",
-                    "study_lock_sha256",
+                    "sealed_fixture_sha256",
                     "fleet_plan_sha256",
                     "control_bundle_sha256",
                 ):
@@ -317,6 +322,12 @@ def verify_scope_approval(
                         resources.get(field),
                         label=f"resource request.{field}",
                     )
+                if operation == "evaluate":
+                    for field in _V3_FINAL_EVALUATION_RESOURCE_FIELDS:
+                        require_sha256(
+                            resources.get(field),
+                            label=f"resource request.{field}",
+                        )
                 require_nonnegative_int(
                     resources.get("fleet_wave"),
                     label="resource request.fleet_wave",

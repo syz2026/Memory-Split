@@ -6,12 +6,32 @@ from pathlib import Path
 import pytest
 
 from msctl.aws_sealed_evaluation import (
+    REQUIRED_SEALED_FIXTURE_MEMBERS,
     REQUIRED_SEALED_MEMBERS,
+    load_sealed_evaluation_fixture,
     load_sealed_evaluation_release,
     main,
 )
 from msctl.errors import MsctlError
-from tests.test_v3_hardware_amendment import _sealed_release
+from tests.test_v3_hardware_amendment import _sealed_fixture, _sealed_release
+
+
+def test_prelaunch_fixture_is_closed_and_checkpoint_independent(tmp_path):
+    fixture_root = _sealed_fixture(tmp_path)
+    fixture = load_sealed_evaluation_fixture(fixture_root)
+
+    assert set(fixture.members) == set(REQUIRED_SEALED_FIXTURE_MEMBERS)
+    assert fixture.sha256
+    assert not (fixture_root / "checkpoints.jsonl").exists()
+    assert not (fixture_root / "study-lock.json").exists()
+    load_sealed_evaluation_fixture(
+        fixture_root,
+        expected_fixture_sha256=fixture.sha256,
+    )
+
+    (fixture_root / "unexpected.json").write_text("{}\n", encoding="ascii")
+    with pytest.raises(MsctlError, match="inventory"):
+        load_sealed_evaluation_fixture(fixture_root)
 
 
 def test_external_sealed_release_binds_actual_study_lock_and_exact_inventory(

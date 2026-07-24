@@ -79,7 +79,7 @@ class RunManifest:
     hardware_amendment_sha256: str | None
     provider_selection_sha256: str | None
     profile_sha256: str | None
-    sealed_evaluation_sha256: str | None
+    sealed_fixture_sha256: str | None
     estimated_instance_hours: float
     estimated_gpu_hours: float
     runs: tuple[Run, ...]
@@ -118,7 +118,7 @@ class CheckpointReceipt:
     provider_selection_sha256: str | None = None
     profile_sha256: str | None = None
     preregistration_sha256: str | None = None
-    sealed_evaluation_sha256: str | None = None
+    sealed_fixture_sha256: str | None = None
 
 
 _GIT_OBJECT_RE = re.compile(r"^[0-9a-f]{40}(?:[0-9a-f]{24})?$")
@@ -1091,8 +1091,7 @@ def load_run_manifest(
             "hardware_amendment_sha256",
             "provider_selection_sha256",
             "profile_sha256",
-            "sealed_evaluation_sha256",
-            "study_lock_sha256",
+            "sealed_fixture_sha256",
             "source_commit",
             "estimated_instance_hours",
             "estimated_gpu_hours",
@@ -1294,7 +1293,7 @@ def load_run_manifest(
                 value["study_lock_sha256"],
                 label="run manifest.study_lock_sha256",
             )
-            if schema_version in {2, 3}
+            if schema_version == 2
             else None
         ),
         source_commit=source_commit,
@@ -1323,10 +1322,10 @@ def load_run_manifest(
             if schema_version == 3
             else None
         ),
-        sealed_evaluation_sha256=(
+        sealed_fixture_sha256=(
             require_sha256(
-                value["sealed_evaluation_sha256"],
-                label="run manifest.sealed_evaluation_sha256",
+                value["sealed_fixture_sha256"],
+                label="run manifest.sealed_fixture_sha256",
             )
             if schema_version == 3
             else None
@@ -1550,7 +1549,7 @@ def verify_checkpoint_receipt(
             "hardware_amendment_sha256",
             "provider_selection_sha256",
             "profile_sha256",
-            "sealed_evaluation_sha256",
+            "sealed_fixture_sha256",
         }
     require_exact_keys(value, receipt_fields, label="checkpoint receipt")
     if schema_version == 3:
@@ -1587,8 +1586,8 @@ def verify_checkpoint_receipt(
                 or value["provider_selection_sha256"]
                 != manifest.provider_selection_sha256
                 or value["profile_sha256"] != manifest.profile_sha256
-                or value["sealed_evaluation_sha256"]
-                != manifest.sealed_evaluation_sha256
+                or value["sealed_fixture_sha256"]
+                != manifest.sealed_fixture_sha256
             )
         )
     ):
@@ -1732,9 +1731,9 @@ def verify_checkpoint_receipt(
             "preregistration_sha256",
             None,
         ),
-        sealed_evaluation_sha256=getattr(
+        sealed_fixture_sha256=getattr(
             manifest,
-            "sealed_evaluation_sha256",
+            "sealed_fixture_sha256",
             None,
         ),
     )

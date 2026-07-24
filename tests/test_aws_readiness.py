@@ -21,7 +21,7 @@ from msctl.jsonutil import canonical_json
 from tests.test_aws_gpu_canary import _v3_receipt
 from tests.test_v3_hardware_amendment import (
     P5,
-    _sealed_release,
+    _sealed_fixture,
     _selection,
 )
 
@@ -103,7 +103,7 @@ def _readiness_inputs(tmp_path: Path) -> dict[str, object]:
         "environment_receipt": environment_path,
         "qualification_receipt": qualification_path,
         "diagnostic_receipts": diagnostic_paths,
-        "sealed_evaluation_release": _sealed_release(tmp_path),
+        "sealed_evaluation_fixture": _sealed_fixture(tmp_path),
         "reviewer": "launch-reviewer",
         "reviewed_at": "2026-07-24T02:00:00Z",
     }
@@ -136,7 +136,7 @@ def test_readiness_cli_contract_binds_every_gate_and_is_exclusive(tmp_path):
         environment_receipt=inputs["environment_receipt"],
         qualification_receipt=inputs["qualification_receipt"],
         diagnostic_receipts=inputs["diagnostic_receipts"],
-        sealed_evaluation_release=inputs["sealed_evaluation_release"],
+        sealed_evaluation_fixture=inputs["sealed_evaluation_fixture"],
         expected_instance_id="i-0123456789abcdef0",
     )
     assert loaded.sha256 == applied["receipt_sha256"]
@@ -144,9 +144,9 @@ def test_readiness_cli_contract_binds_every_gate_and_is_exclusive(tmp_path):
     assert set(loaded.bindings["diagnostic_receipt_sha256"]) == set(
         DIAGNOSTIC_IDS
     )
-    assert loaded.bindings["study_lock_sha256"] != (
-        loaded.bindings["preregistration_sha256"]
-    )
+    assert "sealed_evaluation_sha256" not in loaded.bindings
+    assert "study_lock_sha256" not in loaded.bindings
+    assert loaded.bindings["sealed_fixture_sha256"]
 
     with pytest.raises(MsctlError, match="replace"):
         plan_launch_readiness(out=destination, apply=True, **inputs)

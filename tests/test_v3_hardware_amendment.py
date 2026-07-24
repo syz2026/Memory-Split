@@ -14,6 +14,7 @@ from msctl.aws_selection import (
     load_hardware_amendment,
     validate_provider_selection,
 )
+from msctl.aws_sealed_evaluation import load_sealed_evaluation_fixture
 from msctl.cohort import load_cohort_assignment
 from msctl.contracts import load_run_manifest
 from msctl.jsonutil import canonical_json
@@ -145,6 +146,18 @@ def _sealed_release(root: Path) -> Path:
     return release
 
 
+def _sealed_fixture(root: Path) -> Path:
+    from evals.confirmatory.fixtures import positive_fixture
+    from evals.confirmatory.sealing import SEALED_FIXTURE_MEMBERS
+
+    fixture = root / "sealed-fixture"
+    fixture.mkdir()
+    artifacts = positive_fixture().artifacts
+    for name in SEALED_FIXTURE_MEMBERS:
+        (fixture / name).write_bytes(artifacts[name])
+    return fixture
+
+
 def _manifests(
     tmp_path: Path,
     *,
@@ -177,8 +190,7 @@ def _manifests(
             "hardware_amendment_sha256": amendment.sha256,
             "provider_selection_sha256": selection.sha256,
             "profile_sha256": profile.sha256,
-            "sealed_evaluation_sha256": "4" * 64,
-            "study_lock_sha256": "5" * 64,
+            "sealed_fixture_sha256": "4" * 64,
             "estimated_instance_hours": 24.0,
             "estimated_gpu_hours": 192.0,
             "runs": runs,
@@ -272,7 +284,7 @@ def test_v3_manifest_instantiation_binds_selected_profile(
         "verify_release_member",
         lambda _release, *, local_path, **_kwargs: _sha256(Path(local_path)),
     )
-    sealed_release = _sealed_release(tmp_path)
+    sealed_fixture = _sealed_fixture(tmp_path)
     evidence = SimpleNamespace(
         files=(
             SimpleNamespace(
@@ -292,7 +304,7 @@ def test_v3_manifest_instantiation_binds_selected_profile(
         "dataset_verifier": lambda *_args, **_kwargs: evidence,
         "hardware_amendment": AMENDMENT,
         "provider_selection": selection_path,
-        "sealed_evaluation": sealed_release,
+        "sealed_evaluation_fixture": sealed_fixture,
     }
     rendered = operations.instantiate_run_manifest(
         apply=False,
@@ -313,10 +325,10 @@ def test_v3_manifest_instantiation_binds_selected_profile(
     assert manifest.provider_selection_sha256 == selection.sha256
     assert manifest.profile_sha256 == profile.sha256
     assert manifest.hardware_amendment_sha256 == selection.amendment_sha256
-    assert manifest.preregistration_sha256 != manifest.study_lock_sha256
-    assert manifest.study_lock_sha256 == _sha256(
-        sealed_release / "study-lock.json"
-    )
+    assert manifest.study_lock_sha256 is None
+    assert manifest.sealed_fixture_sha256 == load_sealed_evaluation_fixture(
+        sealed_fixture
+    ).sha256
     assert manifest.estimated_instance_hours == 24.0
     assert manifest.estimated_gpu_hours == 192.0
 
@@ -857,8 +869,7 @@ def test_fleet_advance_dry_run_then_apply_verifies_and_unbinds_exact_tags(
         "preregistration_sha256": previous.preregistration_sha256,
         "hardware_amendment_sha256": previous.hardware_amendment_sha256,
         "provider_selection_sha256": previous.provider_selection_sha256,
-        "sealed_evaluation_sha256": previous.sealed_evaluation_sha256,
-        "study_lock_sha256": previous.study_lock_sha256,
+        "sealed_fixture_sha256": previous.sealed_fixture_sha256,
         "fleet_plan_sha256": plan.sha256,
         "fleet_wave": 0,
         "control_bundle_sha256": backend.control_bundle.sha256,
@@ -981,7 +992,10 @@ def test_v3_profiles_support_full_dry_run_lifecycle(
     )
     from msctl.aws_p5 import AwsP5Backend, V3LifecycleContext
     from msctl.aws_readiness import LaunchReadiness
-    from msctl.aws_sealed_evaluation import SealedEvaluationRelease
+    from msctl.aws_sealed_evaluation import (
+        SealedEvaluationFixture,
+        SealedEvaluationRelease,
+    )
     from msctl.aws_selection import write_provider_selection
     from msctl.aws_argv import _receipt, _validate_intent, _validate_receipt
     from msctl.contracts import verify_checkpoint_receipt
@@ -1036,10 +1050,16 @@ def test_v3_profiles_support_full_dry_run_lifecycle(
         ),
     )
     amendment = load_hardware_amendment(AMENDMENT)
+    sealed_fixture = SealedEvaluationFixture(
+        root=tmp_path / "sealed-fixture",
+        sha256=manifest.sealed_fixture_sha256,
+        members={},
+    )
     sealed = SealedEvaluationRelease(
         root=tmp_path / "sealed-evaluation",
-        sha256=manifest.sealed_evaluation_sha256,
-        study_lock_sha256=manifest.study_lock_sha256,
+        sha256="9" * 64,
+        fixture_sha256=manifest.sealed_fixture_sha256,
+        study_lock_sha256="a" * 64,
         preregistration_sha256=manifest.preregistration_sha256,
         members={},
     )
@@ -1050,14 +1070,21 @@ def test_v3_profiles_support_full_dry_run_lifecycle(
             "release_sha256": manifest.release_sha256,
             "provider_selection_sha256": selection.sha256,
             "hardware_amendment_sha256": amendment.sha256,
-            "sealed_evaluation_release_sha256": sealed.sha256,
-            "study_lock_sha256": sealed.study_lock_sha256,
+            "sealed_fixture_sha256": manifest.sealed_fixture_sha256,
         },
         decision={"protected_launch_allowed": True},
         path=None,
         value={},
     )
     context = V3LifecycleContext(
+        amendment=amendment,
+        selection=selection,
+        fleet_plan=plan,
+        fleet_binding=plan.binding_for_seed(manifest.seed),
+        readiness=readiness,
+        sealed_fixture=sealed_fixture,
+    )
+    evaluation_context = V3LifecycleContext(
         amendment=amendment,
         selection=selection,
         fleet_plan=plan,
@@ -1122,7 +1149,7 @@ def test_v3_profiles_support_full_dry_run_lifecycle(
         "hardware_amendment_sha256": manifest.hardware_amendment_sha256,
         "provider_selection_sha256": manifest.provider_selection_sha256,
         "profile_sha256": manifest.profile_sha256,
-        "sealed_evaluation_sha256": manifest.sealed_evaluation_sha256,
+        "sealed_fixture_sha256": manifest.sealed_fixture_sha256,
         "checkpoints": checkpoint_rows,
     }
     checkpoint_path = tmp_path / "checkpoint-receipt.json"
@@ -1171,7 +1198,7 @@ def test_v3_profiles_support_full_dry_run_lifecycle(
         approval_path=None,
         apply=False,
         evidence=evidence,
-        context=context,
+        context=evaluation_context,
     )
     cleaned = backend.cleanup(
         release=release,
@@ -1269,8 +1296,7 @@ def test_v3_profiles_support_full_dry_run_lifecycle(
         "hardware_amendment_sha256": manifest.hardware_amendment_sha256,
         "provider_selection_sha256": manifest.provider_selection_sha256,
         "profile_sha256": manifest.profile_sha256,
-        "sealed_evaluation_sha256": manifest.sealed_evaluation_sha256,
-        "study_lock_sha256": manifest.study_lock_sha256,
+        "sealed_fixture_sha256": manifest.sealed_fixture_sha256,
         "fleet_plan_sha256": plan.sha256,
         "fleet_wave": context.fleet_binding.wave,
         "launch_readiness_sha256": readiness.sha256,
@@ -1280,12 +1306,20 @@ def test_v3_profiles_support_full_dry_run_lifecycle(
         rendered["operation_intent"],
         submitted["operation_intent"],
         resumed["operation_intent"],
-        evaluated["operation_intent"],
     ):
         assert lifecycle_intent["schema_version"] == 3
         assert {
             key: lifecycle_intent[key] for key in expected_bindings
         } == expected_bindings
+        assert "sealed_evaluation_sha256" not in lifecycle_intent
+        assert "study_lock_sha256" not in lifecycle_intent
+    assert {
+        key: evaluated["operation_intent"][key] for key in expected_bindings
+    } == expected_bindings
+    assert evaluated["operation_intent"]["sealed_evaluation_sha256"] == sealed.sha256
+    assert evaluated["operation_intent"]["study_lock_sha256"] == (
+        sealed.study_lock_sha256
+    )
     for result in (cancelled, cleaned):
         assert {key: result[key] for key in expected_bindings} == expected_bindings
     assert submitted["instance_id"] == instance_id
@@ -1581,8 +1615,7 @@ def test_v3_launcher_manifest_is_consumable_by_remote_dry_run(
         "preregistration_sha256": "b" * 64,
         "hardware_amendment_sha256": "c" * 64,
         "provider_selection_sha256": "d" * 64,
-        "sealed_evaluation_sha256": "e" * 64,
-        "study_lock_sha256": "1" * 64,
+        "sealed_fixture_sha256": "e" * 64,
         "fleet_plan_sha256": "f" * 64,
         "launch_readiness_sha256": "2" * 64,
         "control_bundle_sha256": "3" * 64,

@@ -20,8 +20,8 @@ from cluster.aws.p5.canary import (
 from cluster.aws.p5.profile import AwsGpuRuntime
 
 from .aws_sealed_evaluation import (
-    SealedEvaluationRelease,
-    load_sealed_evaluation_release,
+    SealedEvaluationFixture,
+    load_sealed_evaluation_fixture,
 )
 from .aws_selection import HardwareAmendment, ProviderSelection
 from .errors import MsctlError
@@ -53,8 +53,7 @@ _BINDING_FIELDS = {
     "environment_receipt_sha256",
     "qualification_receipt_sha256",
     "diagnostic_receipt_sha256",
-    "sealed_evaluation_release_sha256",
-    "study_lock_sha256",
+    "sealed_fixture_sha256",
     "profile_sha256",
     "release_sha256",
     "cohort_assignment_sha256",
@@ -369,7 +368,7 @@ def create_launch_readiness(
     environment_receipt: Path | str,
     qualification_receipt: Path | str,
     diagnostic_receipts: Mapping[str, Path | str],
-    sealed_evaluation_release: Path | str,
+    sealed_evaluation_fixture: Path | str,
     reviewer: str,
     reviewed_at: str,
 ) -> dict[str, object]:
@@ -419,10 +418,9 @@ def create_launch_readiness(
         )
         for diagnostic_id in DIAGNOSTIC_IDS
     }
-    # The evaluator's study lock has its own frozen preregistration.  The
-    # training preregistration and the actual study-lock bytes are independent
-    # readiness bindings and must not be forced to share a digest.
-    sealed = load_sealed_evaluation_release(sealed_evaluation_release)
+    sealed_fixture = load_sealed_evaluation_fixture(
+        sealed_evaluation_fixture
+    )
     profile_id = getattr(profile, "profile_id", None)
     profile_sha256 = getattr(profile, "sha256", None)
     release_sha256 = getattr(release, "archive_sha256", None)
@@ -448,8 +446,7 @@ def create_launch_readiness(
             "environment_receipt_sha256": environment_sha256,
             "qualification_receipt_sha256": qualification_sha256,
             "diagnostic_receipt_sha256": diagnostic_hashes,
-            "sealed_evaluation_release_sha256": sealed.sha256,
-            "study_lock_sha256": sealed.study_lock_sha256,
+            "sealed_fixture_sha256": sealed_fixture.sha256,
             "profile_sha256": profile_sha256,
             "release_sha256": release_sha256,
             "cohort_assignment_sha256": amendment.cohort_assignment_sha256,
@@ -478,7 +475,7 @@ def validate_launch_readiness(
     environment_receipt: Path | str | None = None,
     qualification_receipt: Path | str | None = None,
     diagnostic_receipts: Mapping[str, Path | str] | None = None,
-    sealed_evaluation_release: Path | str | None = None,
+    sealed_evaluation_fixture: Path | str | None = None,
     expected_instance_id: str | None = None,
     path: Path | None = None,
     sha256: str | None = None,
@@ -539,10 +536,8 @@ def validate_launch_readiness(
         != bindings["hardware_amendment_sha256"]
         or getattr(manifest, "provider_selection_sha256", None)
         != bindings["provider_selection_sha256"]
-        or getattr(manifest, "sealed_evaluation_sha256", None)
-        != bindings["sealed_evaluation_release_sha256"]
-        or getattr(manifest, "study_lock_sha256", None)
-        != bindings["study_lock_sha256"]
+        or getattr(manifest, "sealed_fixture_sha256", None)
+        != bindings["sealed_fixture_sha256"]
     ):
         _fail("launch readiness does not bind this run manifest")
     environment_instance_id = None
@@ -618,13 +613,10 @@ def validate_launch_readiness(
                 _fail(
                     f"launch readiness diagnostic {diagnostic_id} binding is stale"
                 )
-    if sealed_evaluation_release is not None:
-        load_sealed_evaluation_release(
-            sealed_evaluation_release,
-            expected_release_sha256=str(
-                bindings["sealed_evaluation_release_sha256"]
-            ),
-            expected_study_lock_sha256=str(bindings["study_lock_sha256"]),
+    if sealed_evaluation_fixture is not None:
+        load_sealed_evaluation_fixture(
+            sealed_evaluation_fixture,
+            expected_fixture_sha256=str(bindings["sealed_fixture_sha256"]),
         )
     digest = sha256 or hashlib.sha256(canonical_json(receipt) + b"\n").hexdigest()
     require_sha256(digest, label="launch readiness receipt")
@@ -724,7 +716,7 @@ def plan_launch_readiness(
         environment_receipt=kwargs["environment_receipt"],
         qualification_receipt=kwargs["qualification_receipt"],
         diagnostic_receipts=kwargs["diagnostic_receipts"],
-        sealed_evaluation_release=kwargs["sealed_evaluation_release"],
+        sealed_evaluation_fixture=kwargs["sealed_evaluation_fixture"],
     )
     result = {
         "receipt": receipt,

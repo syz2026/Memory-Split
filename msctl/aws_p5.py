@@ -54,7 +54,9 @@ from .aws_readiness import (
 )
 from .aws_sealed_evaluation import (
     REQUIRED_SEALED_MEMBERS,
+    SealedEvaluationFixture,
     SealedEvaluationRelease,
+    load_sealed_evaluation_fixture,
     load_sealed_evaluation_release,
 )
 from .contracts import (
@@ -113,8 +115,7 @@ _V3_PROVENANCE_FIELDS = (
     "hardware_amendment_sha256",
     "provider_selection_sha256",
     "profile_sha256",
-    "sealed_evaluation_sha256",
-    "study_lock_sha256",
+    "sealed_fixture_sha256",
 )
 _INSTANCE_ID_RE = re.compile(r"^i-[0-9a-f]{8,17}$")
 _COMMAND_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9-]{7,127}$")
@@ -162,8 +163,7 @@ _V3_INSTANCE_FIELDS = {
     "preregistration_sha256",
     "hardware_amendment_sha256",
     "provider_selection_sha256",
-    "sealed_evaluation_sha256",
-    "study_lock_sha256",
+    "sealed_fixture_sha256",
     "fleet_plan_sha256",
     "fleet_wave",
     "launch_readiness_sha256",
@@ -209,6 +209,7 @@ class V3LifecycleContext:
     fleet_plan: FleetPlan
     fleet_binding: FleetManifestBinding
     readiness: LaunchReadiness | None = None
+    sealed_fixture: SealedEvaluationFixture | None = None
     sealed_evaluation: SealedEvaluationRelease | None = None
 
     @property
@@ -766,6 +767,15 @@ class AwsP5Backend:
             )
         selection = context.selection
         plan = context.fleet_plan
+        fixture_sha256 = (
+            context.sealed_fixture.sha256
+            if context.sealed_fixture is not None
+            else (
+                context.sealed_evaluation.fixture_sha256
+                if context.sealed_evaluation is not None
+                else None
+            )
+        )
         binding = validate_fleet_manifest(
             plan,
             manifest,
@@ -784,19 +794,18 @@ class AwsP5Backend:
             or selection.container_image != self.runtime.container_image
             or selection.container_digest != self.runtime.container_digest
             or (
+                fixture_sha256 is not None
+                and fixture_sha256
+                != getattr(manifest, "sealed_fixture_sha256", None)
+            )
+            or (
                 context.readiness is not None
                 and (
-                    context.sealed_evaluation is None
+                    fixture_sha256 is None
                     or context.readiness.bindings[
-                        "sealed_evaluation_release_sha256"
+                        "sealed_fixture_sha256"
                     ]
-                    != context.sealed_evaluation.sha256
-                    or context.readiness.bindings["study_lock_sha256"]
-                    != context.sealed_evaluation.study_lock_sha256
-                    or context.sealed_evaluation.sha256
-                    != getattr(manifest, "sealed_evaluation_sha256", None)
-                    or context.sealed_evaluation.study_lock_sha256
-                    != getattr(manifest, "study_lock_sha256", None)
+                    != fixture_sha256
                 )
             )
         ):
@@ -817,7 +826,10 @@ class AwsP5Backend:
         if (
             validated is None
             or validated.readiness is None
-            or validated.sealed_evaluation is None
+            or (
+                validated.sealed_fixture is None
+                and validated.sealed_evaluation is None
+            )
             or validated.readiness.bindings.get("release_sha256")
             != getattr(manifest, "release_sha256", None)
             or validated.readiness.bindings.get(
@@ -881,8 +893,12 @@ class AwsP5Backend:
         environment_receipt_path: Path | str | None,
         qualification_receipt_path: Path | str | None,
         diagnostic_receipts: Mapping[str, Path | str] | None,
+        sealed_evaluation_fixture_path: Path | str | None,
         sealed_evaluation_release_path: Path | str | None,
+        expected_sealed_evaluation_sha256: str | None,
+        expected_study_lock_sha256: str | None,
         require_readiness: bool,
+        require_finalized_evaluation: bool,
         instance_id: str | None = None,
     ) -> V3LifecycleContext | None:
         if not _is_v3_manifest(manifest):
@@ -895,7 +911,10 @@ class AwsP5Backend:
                     readiness_path,
                     qualification_receipt_path,
                     diagnostic_receipts,
+                    sealed_evaluation_fixture_path,
                     sealed_evaluation_release_path,
+                    expected_sealed_evaluation_sha256,
+                    expected_study_lock_sha256,
                 )
             ):
                 raise MsctlError(
@@ -914,7 +933,18 @@ class AwsP5Backend:
                     or environment_receipt_path is None
                     or qualification_receipt_path is None
                     or diagnostic_receipts is None
-                    or sealed_evaluation_release_path is None
+                    or (
+                        require_finalized_evaluation
+                        and (
+                            sealed_evaluation_release_path is None
+                            or expected_sealed_evaluation_sha256 is None
+                            or expected_study_lock_sha256 is None
+                        )
+                    )
+                    or (
+                        not require_finalized_evaluation
+                        and sealed_evaluation_fixture_path is None
+                    )
                 )
             )
         ):
@@ -923,7 +953,7 @@ class AwsP5Backend:
                 "v3 lifecycle requires --hardware-amendment, "
                 "--provider-selection, --fleet-plan, --launch-readiness, "
                 "--qualification-receipt, six --diagnostic-receipt values, "
-                "and --sealed-evaluation-release",
+                "and the operation's sealed evaluator fixture/release bindings",
             )
         amendment = load_hardware_amendment(amendment_path)
         selection = load_provider_selection(
@@ -941,19 +971,30 @@ class AwsP5Backend:
             manifest,
             instance_id=instance_id,
         )
+        sealed_fixture = None
         sealed_evaluation = None
         readiness = None
         if require_readiness:
-            assert sealed_evaluation_release_path is not None
             assert readiness_path is not None
             assert environment_receipt_path is not None
             assert qualification_receipt_path is not None
             assert diagnostic_receipts is not None
-            sealed_evaluation = load_sealed_evaluation_release(
-                sealed_evaluation_release_path,
-                expected_release_sha256=str(manifest.sealed_evaluation_sha256),
-                expected_study_lock_sha256=str(manifest.study_lock_sha256),
-            )
+            if require_finalized_evaluation:
+                assert sealed_evaluation_release_path is not None
+                sealed_evaluation = load_sealed_evaluation_release(
+                    sealed_evaluation_release_path,
+                    expected_release_sha256=expected_sealed_evaluation_sha256,
+                    expected_study_lock_sha256=expected_study_lock_sha256,
+                    expected_preregistration_sha256=(
+                        manifest.preregistration_sha256
+                    ),
+                )
+            else:
+                assert sealed_evaluation_fixture_path is not None
+                sealed_fixture = load_sealed_evaluation_fixture(
+                    sealed_evaluation_fixture_path,
+                    expected_fixture_sha256=manifest.sealed_fixture_sha256,
+                )
             readiness = load_launch_readiness(
                 readiness_path,
                 profile=self.profile,
@@ -964,7 +1005,11 @@ class AwsP5Backend:
                 environment_receipt=environment_receipt_path,
                 qualification_receipt=qualification_receipt_path,
                 diagnostic_receipts=diagnostic_receipts,
-                sealed_evaluation_release=sealed_evaluation_release_path,
+                sealed_evaluation_fixture=(
+                    sealed_evaluation_fixture_path
+                    if sealed_fixture is not None
+                    else None
+                ),
                 expected_instance_id=binding.instance_id,
             )
         context = V3LifecycleContext(
@@ -973,6 +1018,7 @@ class AwsP5Backend:
             fleet_plan=plan,
             fleet_binding=binding,
             readiness=readiness,
+            sealed_fixture=sealed_fixture,
             sealed_evaluation=sealed_evaluation,
         )
         return self._validate_v3_context(
@@ -1001,6 +1047,30 @@ class AwsP5Backend:
         if validated.readiness is not None:
             bindings["launch_readiness_sha256"] = validated.readiness.sha256
         return bindings
+
+    def _v3_evaluation_bindings(
+        self,
+        manifest: object,
+        context: V3LifecycleContext | None,
+    ) -> dict[str, object]:
+        if not _is_v3_manifest(manifest):
+            return {}
+        validated = self._validate_v3_context(manifest, context)
+        if validated is None or validated.sealed_evaluation is None:
+            raise MsctlError(
+                "SEALED_EVALUATION_REQUIRED",
+                "v3 evaluation requires a finalized externally hash-bound release",
+            )
+        final = validated.sealed_evaluation
+        if final.fixture_sha256 != manifest.sealed_fixture_sha256:
+            raise MsctlError(
+                "SEALED_EVALUATION_INVALID",
+                "finalized evaluation release changes the launch fixture",
+            )
+        return {
+            "sealed_evaluation_sha256": final.sha256,
+            "study_lock_sha256": final.study_lock_sha256,
+        }
 
     def _validate_release(self, release: object, manifest: object) -> None:
         if (
@@ -1294,12 +1364,8 @@ class AwsP5Backend:
                                     "--provider-selection-sha256",
                                 ),
                                 (
-                                    "sealed_evaluation_sha256",
-                                    "--sealed-evaluation-sha256",
-                                ),
-                                (
-                                    "study_lock_sha256",
-                                    "--study-lock-sha256",
+                                    "sealed_fixture_sha256",
+                                    "--sealed-fixture-sha256",
                                 ),
                                 (
                                     "fleet_plan_sha256",
@@ -2100,10 +2166,8 @@ class AwsP5Backend:
             "Tags[?Key=='MemorySplitHardwareAmendmentSHA256']|[0].Value,"
             "provider_selection_sha256:"
             "Tags[?Key=='MemorySplitProviderSelectionSHA256']|[0].Value,"
-            "sealed_evaluation_sha256:"
-            "Tags[?Key=='MemorySplitSealedEvaluationSHA256']|[0].Value,"
-            "study_lock_sha256:"
-            "Tags[?Key=='MemorySplitStudyLockSHA256']|[0].Value,"
+            "sealed_fixture_sha256:"
+            "Tags[?Key=='MemorySplitSealedFixtureSHA256']|[0].Value,"
             "fleet_plan_sha256:"
             "Tags[?Key=='MemorySplitFleetPlanSHA256']|[0].Value,"
             "fleet_wave:to_number(Tags[?Key=='MemorySplitFleetWave']|[0].Value),"
@@ -2155,10 +2219,8 @@ class AwsP5Backend:
             "Tags[?Key=='MemorySplitHardwareAmendmentSHA256']|[0].Value,"
             "provider_selection_sha256:"
             "Tags[?Key=='MemorySplitProviderSelectionSHA256']|[0].Value,"
-            "sealed_evaluation_sha256:"
-            "Tags[?Key=='MemorySplitSealedEvaluationSHA256']|[0].Value,"
-            "study_lock_sha256:"
-            "Tags[?Key=='MemorySplitStudyLockSHA256']|[0].Value,"
+            "sealed_fixture_sha256:"
+            "Tags[?Key=='MemorySplitSealedFixtureSHA256']|[0].Value,"
             "fleet_plan_sha256:"
             "Tags[?Key=='MemorySplitFleetPlanSHA256']|[0].Value,"
             "fleet_wave:to_number(Tags[?Key=='MemorySplitFleetWave']|[0].Value),"
@@ -2347,10 +2409,9 @@ class AwsP5Backend:
                     "provider_selection_sha256": (
                         "MemorySplitProviderSelectionSHA256"
                     ),
-                    "sealed_evaluation_sha256": (
-                        "MemorySplitSealedEvaluationSHA256"
+                    "sealed_fixture_sha256": (
+                        "MemorySplitSealedFixtureSHA256"
                     ),
-                    "study_lock_sha256": "MemorySplitStudyLockSHA256",
                     "fleet_plan_sha256": "MemorySplitFleetPlanSHA256",
                     "fleet_wave": "MemorySplitFleetWave",
                     "launch_readiness_sha256": (
@@ -2952,12 +3013,15 @@ class AwsP5Backend:
         return aws_resource_request(
             "evaluate",
             profile=self.profile,
-            bindings=self._execution_bindings(
-                release=release,
-                manifest=manifest,
-                instance_id=instance_id,
-                terminate_at=terminate_at,
-                context=context,
+            bindings=(
+                self._execution_bindings(
+                    release=release,
+                    manifest=manifest,
+                    instance_id=instance_id,
+                    terminate_at=terminate_at,
+                    context=context,
+                )
+                | self._v3_evaluation_bindings(manifest, context)
             ),
         )
 
@@ -4444,8 +4508,7 @@ class AwsP5Backend:
                         "preregistration_sha256",
                         "hardware_amendment_sha256",
                         "provider_selection_sha256",
-                        "sealed_evaluation_sha256",
-                        "study_lock_sha256",
+                        "sealed_fixture_sha256",
                         "fleet_plan_sha256",
                         "fleet_wave",
                         "launch_readiness_sha256",
@@ -5474,7 +5537,7 @@ class AwsP5Backend:
                 "provider_selection_sha256",
                 "profile_sha256",
                 "preregistration_sha256",
-                "sealed_evaluation_sha256",
+                "sealed_fixture_sha256",
             )
         ):
             raise MsctlError(
@@ -6007,8 +6070,10 @@ class AwsP5Backend:
         scratch_root = getattr(self.profile, "scratch_root", "/mnt/memorysplit")
         run_root = f"{scratch_root}/runs/seed-{manifest.seed}"
         evaluation_root = f"{scratch_root}/evaluations"
+        final_bindings = self._v3_evaluation_bindings(manifest, context)
         sealed_root = (
-            f"{scratch_root}/sealed-evaluation/{manifest.sealed_evaluation_sha256}"
+            f"{scratch_root}/sealed-evaluation/"
+            f"{final_bindings['sealed_evaluation_sha256']}"
             if _is_v3_manifest(manifest)
             else release_root
         )
@@ -6061,7 +6126,7 @@ class AwsP5Backend:
                 "/sealed",
                 "--expected-study-lock-sha256",
                 (
-                    manifest.study_lock_sha256
+                    final_bindings["study_lock_sha256"]
                     if _is_v3_manifest(manifest)
                     else manifest.study_lock_sha256
                 ),
@@ -6081,6 +6146,7 @@ class AwsP5Backend:
         context: V3LifecycleContext | None = None,
     ) -> dict[str, object]:
         v3_bindings = self._v3_bindings(manifest, context)
+        final_bindings = self._v3_evaluation_bindings(manifest, context)
         remote_argv = self._evaluation_argv(release, manifest, context)
         sealed_materialization: list[dict[str, object]] = []
         if _is_v3_manifest(manifest):
@@ -6091,12 +6157,12 @@ class AwsP5Backend:
             )
             sealed_root = (
                 f"{scratch_root}/sealed-evaluation/"
-                f"{manifest.sealed_evaluation_sha256}"
+                f"{final_bindings['sealed_evaluation_sha256']}"
             )
             for member in sorted(REQUIRED_SEALED_MEMBERS):
                 bucket, key = self._s3_location(
                     "sealed-evaluation/"
-                    f"{manifest.sealed_evaluation_sha256}/{member}"
+                    f"{final_bindings['sealed_evaluation_sha256']}/{member}"
                 )
                 sealed_materialization.append(
                     {
@@ -6144,6 +6210,7 @@ class AwsP5Backend:
             "run_manifest_sha256": manifest.sha256,
             "dataset_sha256": manifest.dataset_sha256,
             **v3_bindings,
+            **final_bindings,
             **lifecycle_evidence,
             "runtime_sha256": self._runtime_sha256(),
             "environment": {
@@ -6172,7 +6239,7 @@ class AwsP5Backend:
                                 (
                                     f"{getattr(self.profile, 'scratch_root', '/mnt/memorysplit')}"
                                     "/sealed-evaluation/"
-                                    f"{manifest.sealed_evaluation_sha256}"
+                                    f"{final_bindings['sealed_evaluation_sha256']}"
                                 ),
                             ],
                         },
@@ -6225,7 +6292,7 @@ class AwsP5Backend:
                                     "type=bind,src="
                                     f"{getattr(self.profile, 'scratch_root', '/mnt/memorysplit')}"
                                     "/sealed-evaluation/"
-                                    f"{manifest.sealed_evaluation_sha256},"
+                                    f"{final_bindings['sealed_evaluation_sha256']},"
                                     "dst=/sealed,readonly"
                                 ),
                                 "--workdir",
@@ -6237,9 +6304,9 @@ class AwsP5Backend:
                                 "--root",
                                 "/sealed",
                                 "--expected-release-sha256",
-                                manifest.sealed_evaluation_sha256,
+                                final_bindings["sealed_evaluation_sha256"],
                                 "--expected-study-lock-sha256",
-                                manifest.study_lock_sha256,
+                                final_bindings["study_lock_sha256"],
                             ],
                         },
                     ]
@@ -6412,9 +6479,12 @@ class AwsP5Backend:
                         _is_v3_manifest(manifest)
                         and any(
                             existing.get(field) != expected
-                            for field, expected in self._v3_bindings(
-                                manifest,
-                                context,
+                            for field, expected in (
+                                self._v3_bindings(manifest, context)
+                                | self._v3_evaluation_bindings(
+                                    manifest,
+                                    context,
+                                )
                             ).items()
                         )
                     )
@@ -6541,6 +6611,9 @@ class AwsP5Backend:
                 }
             if _is_v3_manifest(manifest):
                 evaluation_state.update(self._v3_bindings(manifest, context))
+                evaluation_state.update(
+                    self._v3_evaluation_bindings(manifest, context)
+                )
             store.write_evaluation(manifest.sha256, evaluation_state)
             state = store.read_evaluation(manifest.sha256)
             assert state is not None
@@ -6864,12 +6937,28 @@ class AwsP5Backend:
                 diagnostic_receipts=_diagnostic_receipt_map(
                     getattr(args, "diagnostic_receipt", None)
                 ),
+                sealed_evaluation_fixture_path=getattr(
+                    args,
+                    "sealed_evaluation_fixture",
+                    None,
+                ),
                 sealed_evaluation_release_path=getattr(
                     args,
                     "sealed_evaluation_release",
                     None,
                 ),
+                expected_sealed_evaluation_sha256=getattr(
+                    args,
+                    "expected_sealed_evaluation_sha256",
+                    None,
+                ),
+                expected_study_lock_sha256=getattr(
+                    args,
+                    "expected_study_lock_sha256",
+                    None,
+                ),
                 require_readiness=command in {"submit", "resume", "evaluate"},
+                require_finalized_evaluation=command == "evaluate",
                 instance_id=requested_instance_id,
             )
             if command == "submit" and context is not None:

@@ -45,7 +45,7 @@ _V3_PROVENANCE_FIELDS = {
     "hardware_amendment_sha256",
     "provider_selection_sha256",
     "profile_sha256",
-    "sealed_evaluation_sha256",
+    "sealed_fixture_sha256",
 }
 _RECEIPT_CHECKPOINT_FIELDS = {
     "run_id",

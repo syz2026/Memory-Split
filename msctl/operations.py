@@ -12,7 +12,7 @@ from pathlib import Path
 
 from .approval import verify_approval
 from .aws_selection import load_hardware_amendment, load_provider_selection
-from .aws_sealed_evaluation import load_sealed_evaluation_release
+from .aws_sealed_evaluation import load_sealed_evaluation_fixture
 from .contracts import (
     RunManifest,
     bind_release,
@@ -211,7 +211,7 @@ def instantiate_run_manifest(
     dataset_verifier: Callable[..., object] | None = None,
     hardware_amendment: Path | str | None = None,
     provider_selection: Path | str | None = None,
-    sealed_evaluation: Path | str | None = None,
+    sealed_evaluation_fixture: Path | str | None = None,
 ) -> dict[str, object]:
     provider = getattr(profile, "provider", None)
     owned_seeds = {
@@ -385,12 +385,12 @@ def instantiate_run_manifest(
         if (
             hardware_amendment is None
             or provider_selection is None
-            or sealed_evaluation is None
+            or sealed_evaluation_fixture is None
         ):
             raise MsctlError(
                 "RUN_MANIFEST_INVALID",
                 "v3 instantiation requires amendment, provider selection, "
-                "and sealed evaluation",
+                "and sealed evaluation fixture",
             )
         amendment = load_hardware_amendment(hardware_amendment)
         verified_amendment_sha256 = verify_release_member(
@@ -424,10 +424,11 @@ def instantiate_run_manifest(
                 "PROVIDER_SELECTION_MISMATCH",
                 "provider selection does not bind the requested seed manifest",
             )
-        # The training preregistration and evaluator study lock are separate,
-        # independently frozen contracts.  The manifest binds both hashes;
-        # neither contract is rewritten to impersonate the other.
-        sealed = load_sealed_evaluation_release(sealed_evaluation)
+        # The pre-launch fixture is independent of post-training checkpoints
+        # and the finalized evaluator study lock.
+        sealed_fixture = load_sealed_evaluation_fixture(
+            sealed_evaluation_fixture
+        )
         allocated_gpus = getattr(profile, "allocated_gpus", None)
         if allocated_gpus != 8:
             raise MsctlError(
@@ -448,8 +449,7 @@ def instantiate_run_manifest(
             "hardware_amendment_sha256": amendment.sha256,
             "provider_selection_sha256": selection.sha256,
             "profile_sha256": profile_sha256,
-            "sealed_evaluation_sha256": sealed.sha256,
-            "study_lock_sha256": sealed.study_lock_sha256,
+            "sealed_fixture_sha256": sealed_fixture.sha256,
             "estimated_instance_hours": estimated_instance_hours,
             "estimated_gpu_hours": estimated_gpu_hours,
             "runs": run_rows,

@@ -10,8 +10,10 @@ authorization by itself.
 Before protected work, record evidence that all of the following are true:
 
 1. The frozen cohort, preregistration, hardware amendment, release, dataset,
-   provider selection, environment, sealed evaluation, and run manifests are
-   hash-bound.
+   provider selection, environment, pre-launch sealed fixture, and run
+   manifests are hash-bound. The fixture contains only `items.jsonl`,
+   `stores.jsonl`, and `sealed-gold.jsonl`; checkpoint and study-lock hashes do
+   not exist yet.
 2. The six 29M diagnostics completed: full-corpus Dense/Split90, no-ARC and
    no-ConceptARC Dense/Split90, and no-refinement Dense/Split90. Review all six
    receipts together; do not drop a failed or inconvenient arm.
@@ -19,6 +21,11 @@ Before protected work, record evidence that all of the following are true:
    training, checkpoint/resume, and NVMe qualification.
 4. `protected_launch_allowed` can be changed from false only through the
    separately reviewed gate process. This runbook does not change it.
+
+After all twenty terminal checkpoints are durable, a separate finalization
+step binds those checkpoint records into the N=10 study lock and complete
+sealed-evaluation release. Those final hashes authorize evaluation, not
+training launch.
 
 The 29M diagnostic jobs are paid work. Their owning manifest must first be
 rendered in dry-run mode, reviewed as one six-run set, and only then submitted
@@ -550,40 +557,41 @@ aws s3 cp configs/cohort-assignment-v3.json \
   --sse-kms-key-id "$MS_S3_KMS_KEY_ID"
 ```
 
-Stage the separately controlled evaluator release under its own content root,
-not inside the training archive. It must contain exactly `study-lock.json`,
-`validity.json`, `items.jsonl`, `stores.jsonl`, `sealed-gold.jsonl`, and
-`checkpoints.jsonl`. Compute the release root and the actual study-lock byte
-hash by loading the closed contract:
+Stage the separately controlled pre-launch evaluator fixture under its own
+content root, not inside the training archive. It contains exactly
+`items.jsonl`, `stores.jsonl`, and `sealed-gold.jsonl`; adding
+`checkpoints.jsonl`, `study-lock.json`, or any other file is an error. Compute
+its checkpoint-independent root by loading the closed contract:
+
+The separately controlled evaluator release is not created until the
+post-training finalization step in section 12.
 
 ```bash
 set -euo pipefail
-SEALED_EVALUATION_ROOT=REPLACE_WITH_EXTERNAL_SEALED_RELEASE_DIRECTORY
-SEALED_REPORT="$REVIEW_ROOT/sealed-evaluation.json"
-python - "$SEALED_EVALUATION_ROOT" > "$SEALED_REPORT" <<'PY'
+SEALED_FIXTURE_ROOT=REPLACE_WITH_EXTERNAL_SEALED_FIXTURE_DIRECTORY
+SEALED_FIXTURE_REPORT="$REVIEW_ROOT/sealed-fixture.json"
+python - "$SEALED_FIXTURE_ROOT" > "$SEALED_FIXTURE_REPORT" <<'PY'
 import json
 import sys
-from msctl.aws_sealed_evaluation import load_sealed_evaluation_release
+from msctl.aws_sealed_evaluation import load_sealed_evaluation_fixture
 
-release = load_sealed_evaluation_release(sys.argv[1])
+fixture = load_sealed_evaluation_fixture(sys.argv[1])
 print(json.dumps({
-    "sealed_evaluation_release_sha256": release.sha256,
-    "study_lock_sha256": release.study_lock_sha256,
-    "members": dict(release.members),
+    "sealed_fixture_sha256": fixture.sha256,
+    "members": dict(fixture.members),
 }, sort_keys=True, separators=(",", ":")))
 PY
-SEALED_EVALUATION_SHA256="$(python -c 'import json,sys; print(json.load(open(sys.argv[1]))["sealed_evaluation_release_sha256"])' "$SEALED_REPORT")"
-STUDY_LOCK_SHA256="$(python -c 'import json,sys; print(json.load(open(sys.argv[1]))["study_lock_sha256"])' "$SEALED_REPORT")"
-SEALED_S3_URI="${MS_S3_ROOT}/sealed-evaluation/${SEALED_EVALUATION_SHA256}"
+SEALED_FIXTURE_SHA256="$(python -c 'import json,sys; print(json.load(open(sys.argv[1]))["sealed_fixture_sha256"])' "$SEALED_FIXTURE_REPORT")"
+SEALED_FIXTURE_S3_URI="${MS_S3_ROOT}/sealed-fixture/${SEALED_FIXTURE_SHA256}"
 
 # DRY RUN, then APPLY with the same exact external root and KMS key.
-aws s3 sync "$SEALED_EVALUATION_ROOT" "$SEALED_S3_URI" \
+aws s3 sync "$SEALED_FIXTURE_ROOT" "$SEALED_FIXTURE_S3_URI" \
   --region "$REGION" \
   --sse aws:kms \
   --sse-kms-key-id "$MS_S3_KMS_KEY_ID" \
   --no-follow-symlinks \
   --dryrun
-aws s3 sync "$SEALED_EVALUATION_ROOT" "$SEALED_S3_URI" \
+aws s3 sync "$SEALED_FIXTURE_ROOT" "$SEALED_FIXTURE_S3_URI" \
   --region "$REGION" \
   --sse aws:kms \
   --sse-kms-key-id "$MS_S3_KMS_KEY_ID" \
@@ -837,7 +845,7 @@ python -m msctl --profile "$PROFILE" --repo-root . \
   --environment-receipt "$ENVIRONMENT_RECEIPT" \
   --qualification-receipt "$QUALIFICATION_RECEIPT" \
   "${DIAGNOSTIC_ARGS[@]}" \
-  --sealed-evaluation-release "$SEALED_EVALUATION_ROOT" \
+  --sealed-evaluation-fixture "$SEALED_FIXTURE_ROOT" \
   --reviewer "$READINESS_REVIEWER" \
   --reviewed-at "$READINESS_REVIEWED_AT" \
   --out "$READINESS" \
@@ -852,7 +860,7 @@ python -m msctl --profile "$PROFILE" --repo-root . \
   --environment-receipt "$ENVIRONMENT_RECEIPT" \
   --qualification-receipt "$QUALIFICATION_RECEIPT" \
   "${DIAGNOSTIC_ARGS[@]}" \
-  --sealed-evaluation-release "$SEALED_EVALUATION_ROOT" \
+  --sealed-evaluation-fixture "$SEALED_FIXTURE_ROOT" \
   --reviewer "$READINESS_REVIEWER" \
   --reviewed-at "$READINESS_REVIEWED_AT" \
   --out "$READINESS" \
@@ -860,10 +868,11 @@ python -m msctl --profile "$PROFILE" --repo-root . \
 ```
 
 The receipt always contains `protected_launch_allowed: true`; the CLI has no
-flag that can bypass validation to manufacture that decision. Do not edit the
-frozen preregistration, study lock, receipt, or any bound artifact after review.
-Missing, false, stale, cross-profile, cross-instance, or cross-boot evidence
-must fail locally before any paid lifecycle AWS call.
+flag that can bypass validation to manufacture that decision. It binds
+`sealed_fixture_sha256`, never a not-yet-created checkpoint or study-lock hash.
+Do not edit the frozen preregistration, fixture, receipt, or any bound artifact
+after review. Missing, false, stale, cross-profile, cross-instance, or
+cross-boot evidence must fail locally before any paid lifecycle AWS call.
 
 ## 10. Instantiate manifests and make the explicit fleet plan
 
@@ -875,8 +884,8 @@ SEED=0
 MANIFEST="$OPERATOR_ROOT/manifests/seed-${SEED}.json"
 DATASET_RECEIPT="$OPERATOR_ROOT/receipts/dataset-receipt.json"
 
-# DRY RUN: validates release, dataset, amendment, selection, and the complete
-# external sealed-evaluation release without writing a manifest.
+# DRY RUN: validates release, dataset, amendment, selection, and the
+# checkpoint-independent sealed fixture without writing a manifest.
 python -m msctl \
   --profile "$PROFILE" \
   --repo-root . \
@@ -886,7 +895,7 @@ python -m msctl \
   --seed "$SEED" \
   --hardware-amendment configs/hardware-amendment-v3.json \
   --provider-selection "$SELECTION" \
-  --sealed-evaluation "$SEALED_EVALUATION_ROOT" \
+  --sealed-evaluation-fixture "$SEALED_FIXTURE_ROOT" \
   --out "$MANIFEST" \
   > "$REVIEW_ROOT/manifest-plan-seed-${SEED}.json"
 
@@ -900,10 +909,14 @@ python -m msctl \
   --seed "$SEED" \
   --hardware-amendment configs/hardware-amendment-v3.json \
   --provider-selection "$SELECTION" \
-  --sealed-evaluation "$SEALED_EVALUATION_ROOT" \
+  --sealed-evaluation-fixture "$SEALED_FIXTURE_ROOT" \
   --out "$MANIFEST" \
   --apply > "$REVIEW_ROOT/manifest-result-seed-${SEED}.json"
 ```
+
+Each schema-3 manifest contains `sealed_fixture_sha256` and no
+`sealed_evaluation_sha256` or `study_lock_sha256`. The latter two identities
+are created only by post-training finalization.
 
 Build the fleet command from all ten explicit manifest paths and the reviewed
 instance IDs. Run it once without `--apply`, review, then repeat with `--apply`:
@@ -944,9 +957,10 @@ order between review and publication.
 
 Every lifecycle command binds the amendment, provider selection, fleet plan,
 manifest, explicit instance ID, dataset evidence, environment receipt, release,
-external sealed-evaluation release, qualification, six diagnostics, affirmative
-readiness, and approval. `msctl` sends work to an existing instance through
-SSM; it cannot provision one.
+sealed fixture, qualification, six diagnostics, affirmative readiness, and
+approval. Training does not require or accept a finalized checkpoint seal.
+`msctl` sends work to an existing instance through SSM; it cannot provision
+one.
 
 For each fleet wave, render before submit:
 
@@ -966,7 +980,10 @@ V3_GATE_ARGS=(
   --launch-readiness "$READINESS"
   --qualification-receipt "$QUALIFICATION_RECEIPT"
   "${DIAGNOSTIC_ARGS[@]}"
-  --sealed-evaluation-release "$SEALED_EVALUATION_ROOT"
+)
+TRAINING_GATE_ARGS=(
+  "${V3_GATE_ARGS[@]}"
+  --sealed-evaluation-fixture "$SEALED_FIXTURE_ROOT"
 )
 
 # DRY RUN: no SSM command is sent.
@@ -980,7 +997,7 @@ python -m msctl \
   --dataset-pointer DATASET-POINTER-AWS.json \
   --dataset-verification "$DATASET_VERIFICATION" \
   --environment-receipt "$ENVIRONMENT_RECEIPT" \
-  "${V3_GATE_ARGS[@]}" \
+  "${TRAINING_GATE_ARGS[@]}" \
   --instance-id "$INSTANCE_ID" \
   --terminate-at "$TERMINATE_AT" \
   --approval "$OPERATOR_ROOT/approvals/submit-seed-0.json" \
@@ -997,7 +1014,7 @@ python -m msctl \
   --dataset-pointer DATASET-POINTER-AWS.json \
   --dataset-verification "$DATASET_VERIFICATION" \
   --environment-receipt "$ENVIRONMENT_RECEIPT" \
-  "${V3_GATE_ARGS[@]}" \
+  "${TRAINING_GATE_ARGS[@]}" \
   --instance-id "$INSTANCE_ID" \
   --terminate-at "$TERMINATE_AT" \
   --approval "$OPERATOR_ROOT/approvals/submit-seed-0.json" \
@@ -1035,7 +1052,7 @@ python -m msctl \
   --dataset-pointer DATASET-POINTER-AWS.json \
   --dataset-verification "$DATASET_VERIFICATION" \
   --environment-receipt "$ENVIRONMENT_RECEIPT" \
-  "${V3_GATE_ARGS[@]}" \
+  "${TRAINING_GATE_ARGS[@]}" \
   --approval "$OPERATOR_ROOT/approvals/resume-seed-0.json" \
   > "$REVIEW_ROOT/resume-plan-seed-0.json"
 
@@ -1051,17 +1068,102 @@ python -m msctl \
   --dataset-pointer DATASET-POINTER-AWS.json \
   --dataset-verification "$DATASET_VERIFICATION" \
   --environment-receipt "$ENVIRONMENT_RECEIPT" \
-  "${V3_GATE_ARGS[@]}" \
+  "${TRAINING_GATE_ARGS[@]}" \
   --approval "$OPERATOR_ROOT/approvals/resume-seed-0.json" \
   --apply > "$REVIEW_ROOT/resume-result-seed-0.json"
 ```
 
 The v3 checkpoint receipt must be canonical schema 3 and bind the same
 cohort-assignment, preregistration, hardware-amendment, provider-selection,
-profile, and sealed-evaluation hashes as the manifest. Schema-2 receipts remain
+profile, and sealed-fixture hashes as the manifest. Schema-2 receipts remain
 valid only for legacy v2 manifests.
 
-Evaluate only after both terminal checkpoints are durable and verified:
+Completion publication must create one evaluator `run.json` per arm from the
+actual terminal checkpoint and configuration bytes. Use
+`evals.confirmatory.run_binding.build_run_binding(...)`, then
+`write_run_binding(<run-root>/run.json, value)`. The helper hashes the files,
+enforces the evaluator's closed field set and relative paths, and refuses to
+replace existing evidence. The same publication step emits one canonical
+`CheckpointRecord` for each arm; do not synthesize these records from mutable
+“latest” pointers.
+
+After all twenty checkpoint records and every registered passing validity
+receipt are durable, build the complete release. The two inventory files below
+must list reviewed, explicit paths in canonical seed/condition and receipt
+order; no glob or directory scan is accepted:
+
+```bash
+set -euo pipefail
+mapfile -t CHECKPOINT_RECORDS < "$REVIEW_ROOT/checkpoint-record-paths.txt"
+mapfile -t VALIDITY_RECEIPTS < "$REVIEW_ROOT/validity-receipt-paths.txt"
+test "${#CHECKPOINT_RECORDS[@]}" -eq 20
+test "${#VALIDITY_RECEIPTS[@]}" -eq 21
+CHECKPOINT_RECORD_ARGS=()
+for path in "${CHECKPOINT_RECORDS[@]}"; do
+  CHECKPOINT_RECORD_ARGS+=(--checkpoint-record "$path")
+done
+VALIDITY_RECEIPT_ARGS=()
+for path in "${VALIDITY_RECEIPTS[@]}"; do
+  VALIDITY_RECEIPT_ARGS+=(--validity-receipt "$path")
+done
+
+PREREGISTRATION_SHA256=REPLACE_WITH_V3_PREREGISTRATION_SHA256
+SEALED_EVALUATION_ROOT="$OPERATOR_ROOT/sealed-evaluation-v3"
+SEALED_FINALIZATION_PLAN="$REVIEW_ROOT/sealed-finalization-plan.json"
+SEALED_FINALIZATION_RESULT="$REVIEW_ROOT/sealed-finalization-result.json"
+
+# DRY RUN: validates the exact N=10 panel and renders all content roots.
+python -m msctl --profile "$PROFILE" --repo-root . \
+  sealed-evaluation finalize \
+  --fixture "$SEALED_FIXTURE_ROOT" \
+  "${CHECKPOINT_RECORD_ARGS[@]}" \
+  "${VALIDITY_RECEIPT_ARGS[@]}" \
+  --preregistration-sha256 "$PREREGISTRATION_SHA256" \
+  --out "$SEALED_EVALUATION_ROOT" > "$SEALED_FINALIZATION_PLAN"
+
+# APPLY: exclusively publishes the same six-member release.
+python -m msctl --profile "$PROFILE" --repo-root . \
+  sealed-evaluation finalize \
+  --fixture "$SEALED_FIXTURE_ROOT" \
+  "${CHECKPOINT_RECORD_ARGS[@]}" \
+  "${VALIDITY_RECEIPT_ARGS[@]}" \
+  --preregistration-sha256 "$PREREGISTRATION_SHA256" \
+  --out "$SEALED_EVALUATION_ROOT" \
+  --apply > "$SEALED_FINALIZATION_RESULT"
+
+SEALED_EVALUATION_SHA256="$(python -c 'import json,sys; print(json.load(open(sys.argv[1]))["result"]["sealed_evaluation_sha256"])' "$SEALED_FINALIZATION_RESULT")"
+STUDY_LOCK_SHA256="$(python -c 'import json,sys; print(json.load(open(sys.argv[1]))["result"]["study_lock_sha256"])' "$SEALED_FINALIZATION_RESULT")"
+test "$(python -c 'import json,sys; print(json.load(open(sys.argv[1]))["result"]["sealed_fixture_sha256"])' "$SEALED_FINALIZATION_RESULT")" = "$SEALED_FIXTURE_SHA256"
+SEALED_S3_URI="${MS_S3_ROOT}/sealed-evaluation/${SEALED_EVALUATION_SHA256}"
+
+SEALED_MEMBERS=(
+  checkpoints.jsonl items.jsonl sealed-gold.jsonl stores.jsonl
+  study-lock.json validity.json
+)
+for member in "${SEALED_MEMBERS[@]}"; do
+  aws s3 cp "$SEALED_EVALUATION_ROOT/$member" "$SEALED_S3_URI/$member" \
+    --region "$REGION" --sse aws:kms \
+    --sse-kms-key-id "$MS_S3_KMS_KEY_ID" --dryrun
+done
+for member in "${SEALED_MEMBERS[@]}"; do
+  aws s3 cp "$SEALED_EVALUATION_ROOT/$member" "$SEALED_S3_URI/$member" \
+    --region "$REGION" --sse aws:kms \
+    --sse-kms-key-id "$MS_S3_KMS_KEY_ID"
+done
+
+EVALUATION_GATE_ARGS=(
+  "${V3_GATE_ARGS[@]}"
+  --sealed-evaluation-release "$SEALED_EVALUATION_ROOT"
+  --expected-sealed-evaluation-sha256 "$SEALED_EVALUATION_SHA256"
+  --expected-study-lock-sha256 "$STUDY_LOCK_SHA256"
+)
+```
+
+Finalization rejects missing, duplicate, random-arm, out-of-range, noncanonical,
+or schema-drifted records. It produces exactly Dense/Split90 for seeds 0–9 and
+proves that the finalized release retains the launch fixture root.
+
+Evaluate only after the complete finalized release is durable and verified:
 
 ```bash
 # DRY RUN: validates sealed-evaluation and lifecycle bindings.
@@ -1075,7 +1177,7 @@ python -m msctl \
   --dataset-pointer DATASET-POINTER-AWS.json \
   --dataset-verification "$DATASET_VERIFICATION" \
   --environment-receipt "$ENVIRONMENT_RECEIPT" \
-  "${V3_GATE_ARGS[@]}" \
+  "${EVALUATION_GATE_ARGS[@]}" \
   --approval "$OPERATOR_ROOT/approvals/evaluate-seed-0.json" \
   > "$REVIEW_ROOT/evaluate-plan-seed-0.json"
 
@@ -1090,7 +1192,7 @@ python -m msctl \
   --dataset-pointer DATASET-POINTER-AWS.json \
   --dataset-verification "$DATASET_VERIFICATION" \
   --environment-receipt "$ENVIRONMENT_RECEIPT" \
-  "${V3_GATE_ARGS[@]}" \
+  "${EVALUATION_GATE_ARGS[@]}" \
   --approval "$OPERATOR_ROOT/approvals/evaluate-seed-0.json" \
   --apply > "$REVIEW_ROOT/evaluate-result-seed-0.json"
 ```

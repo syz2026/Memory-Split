@@ -191,12 +191,15 @@ _V3_PROVENANCE_FIELDS = {
     "preregistration_sha256",
     "hardware_amendment_sha256",
     "provider_selection_sha256",
-    "sealed_evaluation_sha256",
-    "study_lock_sha256",
+    "sealed_fixture_sha256",
     "fleet_plan_sha256",
     "fleet_wave",
     "launch_readiness_sha256",
     "control_bundle_sha256",
+}
+_V3_FINAL_EVALUATION_FIELDS = {
+    "sealed_evaluation_sha256",
+    "study_lock_sha256",
 }
 _ENVIRONMENT_FIELDS = {
     "AWS_REGION",
@@ -226,6 +229,13 @@ _FORBIDDEN_ENVIRONMENT = {
 
 class RemoteIntentError(ValueError):
     """A remote intent or its execution boundary is invalid."""
+
+
+def _v3_provenance_fields(value: Mapping[str, object]) -> set[str]:
+    fields = set(_V3_PROVENANCE_FIELDS)
+    if value.get("operation") == "evaluate":
+        fields |= _V3_FINAL_EVALUATION_FIELDS
+    return fields
 
 
 class ImmutableObjectStore(Protocol):
@@ -367,7 +377,7 @@ def _validate_intent(
     intent = _decode_object(payload, label="operation intent")
     schema_version = intent.get("schema_version")
     expected_fields = (
-        _BASE_FIELDS | _V3_PROVENANCE_FIELDS
+        _BASE_FIELDS | _v3_provenance_fields(intent)
         if schema_version == 3
         else _BASE_FIELDS
     )
@@ -442,7 +452,8 @@ def _validate_intent(
             raise RemoteIntentError(
                 "schema-v3 operation intent requires one v3 AWS profile"
             )
-        for field in _V3_PROVENANCE_FIELDS - {"fleet_wave"}:
+        provenance_fields = _v3_provenance_fields(intent)
+        for field in provenance_fields - {"fleet_wave"}:
             _sha256(intent[field], label=f"operation intent {field}")
         if type(intent["fleet_wave"]) is not int or intent["fleet_wave"] < 0:
             raise RemoteIntentError("operation intent fleet wave is invalid")
@@ -570,7 +581,7 @@ def _receipt(
         value.update(
             {
                 field: intent[field]
-                for field in _V3_PROVENANCE_FIELDS
+                for field in _v3_provenance_fields(intent)
             }
         )
     if returncode is not None:
@@ -602,7 +613,7 @@ def _validate_receipt(
     }
     schema_version = 3 if intent.get("schema_version") == 3 else 1
     if schema_version == 3:
-        fields |= _V3_PROVENANCE_FIELDS
+        fields |= _v3_provenance_fields(intent)
     if kind == "terminal":
         fields |= {"returncode", "status"}
     if set(value) != fields:
@@ -628,7 +639,7 @@ def _validate_receipt(
             schema_version == 3
             and any(
                 value[field] != intent[field]
-                for field in _V3_PROVENANCE_FIELDS
+                for field in _v3_provenance_fields(intent)
             )
         )
         or not isinstance(nonce, str)

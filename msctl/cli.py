@@ -13,6 +13,7 @@ from .aws_control_bundle import plan_control_bundle
 from .aws_fleet import plan_fleet
 from .aws_p5 import build_aws_backend
 from .aws_readiness import DIAGNOSTIC_IDS, plan_launch_readiness
+from .aws_sealed_finalization import finalize_sealed_evaluation
 from .aws_selection import (
     load_hardware_amendment,
     load_provider_selection,
@@ -162,11 +163,40 @@ def build_parser() -> JsonArgumentParser:
         action="append",
         required=True,
     )
-    readiness_create.add_argument("--sealed-evaluation-release", required=True)
+    readiness_create.add_argument("--sealed-evaluation-fixture", required=True)
     readiness_create.add_argument("--reviewer", required=True)
     readiness_create.add_argument("--reviewed-at", required=True)
     readiness_create.add_argument("--out", required=True)
     readiness_create.add_argument("--apply", action="store_true")
+
+    sealed_evaluation = _leaf(
+        commands,
+        "sealed-evaluation",
+        help_text="sealed evaluator release lifecycle",
+    )
+    sealed_evaluation_sub = sealed_evaluation.add_subparsers(
+        dest="action",
+        required=True,
+    )
+    sealed_finalize = _leaf(
+        sealed_evaluation_sub,
+        "finalize",
+        help_text="build the post-training N=10 evaluator release",
+    )
+    sealed_finalize.add_argument("--fixture", required=True)
+    sealed_finalize.add_argument(
+        "--checkpoint-record",
+        action="append",
+        required=True,
+    )
+    sealed_finalize.add_argument(
+        "--validity-receipt",
+        action="append",
+        required=True,
+    )
+    sealed_finalize.add_argument("--preregistration-sha256", required=True)
+    sealed_finalize.add_argument("--out", required=True)
+    sealed_finalize.add_argument("--apply", action="store_true")
 
     fleet = _leaf(commands, "fleet", help_text="explicit AWS fleet planning")
     fleet_sub = fleet.add_subparsers(dest="action", required=True)
@@ -252,7 +282,7 @@ def build_parser() -> JsonArgumentParser:
     instantiate.add_argument("--out", required=True)
     instantiate.add_argument("--hardware-amendment")
     instantiate.add_argument("--provider-selection")
-    instantiate.add_argument("--sealed-evaluation")
+    instantiate.add_argument("--sealed-evaluation-fixture")
     instantiate.add_argument("--apply", action="store_true")
     render = _leaf(runs_sub, "render", help_text="render deterministic Slurm argv")
     render.add_argument("--release", required=True)
@@ -280,8 +310,13 @@ def build_parser() -> JsonArgumentParser:
             leaf.add_argument("--environment-receipt")
             leaf.add_argument("--launch-readiness")
             leaf.add_argument("--qualification-receipt")
-            leaf.add_argument("--sealed-evaluation-release")
             leaf.add_argument("--diagnostic-receipt", action="append")
+            if name in {"submit", "resume"}:
+                leaf.add_argument("--sealed-evaluation-fixture")
+            if name == "evaluate":
+                leaf.add_argument("--sealed-evaluation-release")
+                leaf.add_argument("--expected-sealed-evaluation-sha256")
+                leaf.add_argument("--expected-study-lock-sha256")
         leaf.add_argument("--approval")
         leaf.add_argument("--hardware-amendment")
         leaf.add_argument("--provider-selection")
@@ -414,9 +449,18 @@ def dispatch(
     aws_backend_factory: Callable[..., object] = build_aws_backend,
     environ: dict[str, str] | None = None,
 ) -> tuple[bool, dict[str, object]]:
-    profile = (profile_loader or load_profile)(args.profile)
     command = _command_name(args)
     environment = dict(os.environ if environ is None else environ)
+    if command == "sealed-evaluation finalize":
+        return not args.apply, finalize_sealed_evaluation(
+            fixture_root=args.fixture,
+            checkpoint_records=args.checkpoint_record,
+            validity_receipts=args.validity_receipt,
+            preregistration_sha256=args.preregistration_sha256,
+            out=args.out,
+            apply=args.apply,
+        )
+    profile = (profile_loader or load_profile)(args.profile)
     provider = getattr(profile, "provider", None)
     if provider != SUPPORTED_PROFILE and provider not in AWS_GPU_PROFILES:
         raise MsctlError(
@@ -436,7 +480,7 @@ def dispatch(
             cohort_loader=cohort_loader,
             hardware_amendment=args.hardware_amendment,
             provider_selection=args.provider_selection,
-            sealed_evaluation=args.sealed_evaluation,
+            sealed_evaluation_fixture=args.sealed_evaluation_fixture,
         )
     if command == "control bundle":
         return not args.apply, plan_control_bundle(
@@ -480,7 +524,7 @@ def dispatch(
             diagnostic_receipts=_diagnostic_receipts(
                 args.diagnostic_receipt
             ),
-            sealed_evaluation_release=args.sealed_evaluation_release,
+            sealed_evaluation_fixture=args.sealed_evaluation_fixture,
             reviewer=args.reviewer,
             reviewed_at=args.reviewed_at,
         )

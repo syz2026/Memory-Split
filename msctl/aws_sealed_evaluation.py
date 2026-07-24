@@ -23,7 +23,12 @@ from evals.confirmatory.reporting import (
     _parse_gold,
     _parse_items,
     _parse_stores,
+    _validate_fixture,
     _validate_release,
+)
+from evals.confirmatory.sealing import (
+    SEALED_FIXTURE_MEMBERS,
+    sealed_fixture_sha256,
 )
 from evals.confirmatory.study_lock import (
     StudyLock,
@@ -45,7 +50,15 @@ REQUIRED_SEALED_MEMBERS = frozenset(
         "validity.json",
     }
 )
+REQUIRED_SEALED_FIXTURE_MEMBERS = frozenset(SEALED_FIXTURE_MEMBERS)
 _MAX_MEMBER_BYTES = 1 << 30
+
+
+@dataclass(frozen=True)
+class SealedEvaluationFixture:
+    root: Path
+    sha256: str
+    members: Mapping[str, str]
 
 
 @dataclass(frozen=True)
@@ -55,6 +68,7 @@ class SealedEvaluationRelease:
     study_lock_sha256: str
     preregistration_sha256: str
     members: Mapping[str, str]
+    fixture_sha256: str | None = None
 
 
 def _fail(message: str) -> None:
@@ -139,6 +153,87 @@ def _json_object(data: bytes, *, label: str) -> dict[str, object]:
     return value
 
 
+def _load_inventory(
+    root: Path | str,
+    *,
+    required_members: frozenset[str],
+    label: str,
+) -> tuple[Path, dict[str, str], dict[str, bytes]]:
+    candidate = Path(root)
+    try:
+        root_status = candidate.stat(follow_symlinks=False)
+        resolved = candidate.resolve(strict=True)
+    except OSError as error:
+        raise MsctlError(
+            "SEALED_EVALUATION_INVALID",
+            f"{label} root is unavailable",
+        ) from error
+    if candidate.is_symlink() or not stat.S_ISDIR(root_status.st_mode):
+        _fail(f"{label} root must be a real directory")
+
+    inventory: dict[str, str] = {}
+    content: dict[str, bytes] = {}
+    for path in sorted(resolved.rglob("*")):
+        relative = path.relative_to(resolved).as_posix()
+        status = path.stat(follow_symlinks=False)
+        if path.is_symlink():
+            _fail(f"{label} must not contain symlinks")
+        if stat.S_ISDIR(status.st_mode):
+            continue
+        if not stat.S_ISREG(status.st_mode):
+            _fail(f"{label} contains a special member")
+        payload = _read_regular(path, label=f"sealed member {relative}")
+        content[relative] = payload
+        inventory[relative] = hashlib.sha256(payload).hexdigest()
+    if set(inventory) != set(required_members):
+        _fail(
+            f"{label} member inventory is not exact; "
+            f"missing={sorted(required_members - set(inventory))}, "
+            f"unknown={sorted(set(inventory) - required_members)}"
+        )
+    return resolved, inventory, content
+
+
+def load_sealed_evaluation_fixture(
+    root: Path | str,
+    *,
+    expected_fixture_sha256: str | None = None,
+) -> SealedEvaluationFixture:
+    """Verify the checkpoint-independent three-file launch fixture."""
+
+    resolved, inventory, content = _load_inventory(
+        root,
+        required_members=REQUIRED_SEALED_FIXTURE_MEMBERS,
+        label="sealed-evaluation fixture",
+    )
+    fixture_sha256 = sealed_fixture_sha256(inventory)
+    if (
+        expected_fixture_sha256 is not None
+        and fixture_sha256
+        != require_sha256(
+            expected_fixture_sha256,
+            label="sealed-evaluation fixture SHA-256",
+        )
+    ):
+        _fail("sealed-evaluation fixture root hash does not match")
+    try:
+        _validate_fixture(
+            items=_parse_items(content["items.jsonl"]),
+            gold_records=_parse_gold(content["sealed-gold.jsonl"]),
+            stores=_parse_stores(content["stores.jsonl"]),
+        )
+    except (KeyError, TypeError, ValueError) as error:
+        raise MsctlError(
+            "SEALED_EVALUATION_INVALID",
+            "sealed evaluator fixture does not satisfy its exact contract",
+        ) from error
+    return SealedEvaluationFixture(
+        root=resolved,
+        sha256=fixture_sha256,
+        members=dict(sorted(inventory.items())),
+    )
+
+
 def load_sealed_evaluation_release(
     root: Path | str,
     *,
@@ -148,41 +243,20 @@ def load_sealed_evaluation_release(
 ) -> SealedEvaluationRelease:
     """Verify every release member and the evaluator's exact sealed contract."""
 
-    candidate = Path(root)
-    try:
-        root_status = candidate.stat(follow_symlinks=False)
-        resolved = candidate.resolve(strict=True)
-    except OSError as error:
-        raise MsctlError(
-            "SEALED_EVALUATION_INVALID",
-            "sealed-evaluation release root is unavailable",
-        ) from error
-    if candidate.is_symlink() or not stat.S_ISDIR(root_status.st_mode):
-        _fail("sealed-evaluation release root must be a real directory")
-
-    inventory: dict[str, str] = {}
-    content: dict[str, bytes] = {}
-    for path in sorted(resolved.rglob("*")):
-        relative = path.relative_to(resolved).as_posix()
-        status = path.stat(follow_symlinks=False)
-        if path.is_symlink():
-            _fail("sealed-evaluation release must not contain symlinks")
-        if stat.S_ISDIR(status.st_mode):
-            continue
-        if not stat.S_ISREG(status.st_mode):
-            _fail("sealed-evaluation release contains a special member")
-        payload = _read_regular(path, label=f"sealed member {relative}")
-        content[relative] = payload
-        inventory[relative] = hashlib.sha256(payload).hexdigest()
-    if set(inventory) != set(REQUIRED_SEALED_MEMBERS):
-        _fail(
-            "sealed-evaluation release member inventory is not exact; "
-            f"missing={sorted(REQUIRED_SEALED_MEMBERS - set(inventory))}, "
-            f"unknown={sorted(set(inventory) - REQUIRED_SEALED_MEMBERS)}"
-        )
+    resolved, inventory, content = _load_inventory(
+        root,
+        required_members=REQUIRED_SEALED_MEMBERS,
+        label="sealed-evaluation release",
+    )
 
     release_sha256 = canonical_sha256(
         {"schema_version": 1, "members": inventory}
+    )
+    fixture_sha256 = sealed_fixture_sha256(
+        {
+            name: inventory[name]
+            for name in SEALED_FIXTURE_MEMBERS
+        }
     )
     study_lock_sha256 = inventory["study-lock.json"]
     if (
@@ -221,7 +295,10 @@ def load_sealed_evaluation_release(
         items = _parse_items(content["items.jsonl"])
         gold = _parse_gold(content["sealed-gold.jsonl"])
         stores = _parse_stores(content["stores.jsonl"])
-        checkpoints = _parse_checkpoints(content["checkpoints.jsonl"])
+        checkpoints = _parse_checkpoints(
+            content["checkpoints.jsonl"],
+            allowed_seeds=lock.confirmatory_seeds,
+        )
         _validate_release(
             content=content,
             lock=lock,
@@ -245,6 +322,11 @@ def load_sealed_evaluation_release(
     }
     if any(inventory[name] != digest for name, digest in bound.items()):
         _fail("sealed members disagree with study-lock commitments")
+    if (
+        lock.is_v3
+        and lock.release.sealed_fixture_sha256 != fixture_sha256
+    ):
+        _fail("sealed fixture root disagrees with study-lock commitment")
     if canonical_json_bytes(lock.to_dict()) != content["study-lock.json"]:
         _fail("study-lock bytes are not canonical")
     if canonical_json_bytes(validity.to_dict()) != content["validity.json"]:
@@ -262,6 +344,7 @@ def load_sealed_evaluation_release(
     return SealedEvaluationRelease(
         root=resolved,
         sha256=release_sha256,
+        fixture_sha256=fixture_sha256,
         study_lock_sha256=study_lock_sha256,
         preregistration_sha256=lock.preregistration_sha256,
         members=dict(sorted(inventory.items())),
