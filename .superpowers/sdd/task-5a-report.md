@@ -308,3 +308,58 @@ GREEN and final evidence:
 
 No deployment, AWS API mutation, change set, runtime implementation, cleanup
 change, or profile-neutral P6 work was performed.
+
+## Whole-template policy-container addendum
+
+Commit `f1c82db` (`fix: close whole-template policy bypasses`) closes the final
+policy-container bypass.
+
+- The IAM resource set is now exactly four roles and one train instance
+  profile. Each role has exactly one named inline policy. Train alone retains
+  the reviewed `AmazonSSMManagedInstanceCore` ARN; Evaluator, Controller, and
+  Signer have no managed-policy attachments or permission boundary.
+- `ControllerOperations` moved inline, eliminating all
+  `AWS::IAM::Policy`/`AWS::IAM::ManagedPolicy` resources. The controller inline
+  document is 8,338 compact characters, below the 10,240-character role quota.
+- Data-key policy access is still role-separated without a dependency cycle:
+  the account principal is constrained by
+  `aws:PrincipalTag/memorysplit:role=controller`, and EBS grants still require
+  `kms:GrantIsForAWSResource`.
+- The bucket transport deny now enumerates only reviewed S3 actions; no
+  `s3:*` remains.
+- Python recursively inventories every `PolicyDocument`,
+  `AssumeRolePolicyDocument`, and KMS `KeyPolicy` anywhere under Resources.
+  Policy paths and IAM container topology must match the reviewed template;
+  every S3-capable statement must be an exact reviewed statement.
+- cfn-guard fixes total/IAM/role/profile/policy counts, inline policy names and
+  counts, managed attachments, bucket-policy count, and nested policy-container
+  count. It rejects standalone/managed IAM policies, extra IAM resources,
+  appended managed policies, extra policy resources, nested policy documents,
+  and S3 statements in trust/KMS/signer containers.
+
+RED evidence:
+
+- Exact IAM and canonical whole-policy tests failed on the external
+  `ControllerOperationsPolicy` and bucket-policy `s3:*`.
+- Initial Python container mutations exposed five unobserved attachment/IAM
+  topology cases (managed-policy ARNs, extra profile, and IAM user) before the
+  exact IAM inventory was incorporated.
+- Guard development confirmed that unconstrained property traversal was
+  insufficient; final enforcement uses exact resource counts plus explicit
+  reviewed direct, inline, trust, key, and nested policy containers.
+
+GREEN and final evidence:
+
+- Focused pytest: `190 passed in 179.03s`.
+- Safe YAML parse: 32 resources.
+- cfn-lint 1.53.2: passed with no findings and no dependency cycle.
+- cfn-guard 3.2.0: all 24 rules passed.
+- Python rejected all 15 policy-container mutants plus all prior S3 bypass
+  forms.
+- cfn-guard rejected 15 policy-container mutants, 11 required-resource
+  deletion mutants, and 30 S3 enforcement mutants.
+- The actual omitted IaC files passed secret scanning; `py_compile` and
+  `git diff --check` passed.
+
+No deployment, AWS API mutation, change set, runtime implementation, cleanup
+change, or profile-neutral P6 work was performed.
