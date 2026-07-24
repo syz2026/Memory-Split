@@ -1188,9 +1188,21 @@ def test_no_replace_publication_reuses_only_a_fully_verified_winner(
 
     assert reused.root == first.root
     assert reused.root.stat().st_ino == first_identity
-    assert tuple(path.name for path in (output_root / "wikidata").iterdir()) == (
+    namespace_entries = tuple((output_root / "wikidata").iterdir())
+    assert tuple(
+        path.name
+        for path in namespace_entries
+        if not path.name.startswith(".orphan-marker-")
+    ) == (
         first.receipt_sha256,
     )
+    retained_markers = tuple(
+        path
+        for path in namespace_entries
+        if path.name.startswith(".orphan-marker-")
+    )
+    assert len(retained_markers) == 2
+    assert all(path.stat().st_mode & 0o777 == 0o700 for path in retained_markers)
 
     index_path = first.root / "indexes/aliases.bin"
     attacked = bytearray(index_path.read_bytes())
@@ -2256,10 +2268,13 @@ def test_quarantine_exchange_race_restores_substituted_winner(
     winner = namespace / final_name
     assert winner.is_dir()
     assert winner.stat().st_ino == winner_inode
-    assert all(
-        path.stat().st_ino != marker_inode
+    retained_markers = tuple(
+        path
         for path in namespace.iterdir()
+        if path.name.startswith(".orphan-marker-")
+        and path.stat().st_ino == marker_inode
     )
+    assert len(retained_markers) == 1
     assert not tuple(
         path
         for path in namespace.iterdir()
@@ -2772,10 +2787,13 @@ def test_two_name_preswap_retries_until_candidate_is_quarantined(
         and path.stat().st_ino == candidate_inode
     )
     assert len(quarantined_candidates) == 1
-    assert all(
-        path.stat().st_ino != marker_inode
+    retained_markers = tuple(
+        path
         for path in namespace.iterdir()
+        if path.name.startswith(".orphan-marker-")
+        and path.stat().st_ino == marker_inode
     )
+    assert len(retained_markers) == 1
 
 
 def test_repeated_original_state_exhaustion_refreshes_marker(
@@ -2792,8 +2810,12 @@ def test_repeated_original_state_exhaustion_refreshes_marker(
     original_allocate = wikidata_source_module._allocate_quarantine_marker
     original_exchange = wikidata_source_module._atomic_exchange_directories
 
-    def record_marker(namespace_fd, published_name):
-        marker = original_allocate(namespace_fd, published_name)
+    def record_marker(namespace_fd, published_name, orphan_budget=None):
+        marker = original_allocate(
+            namespace_fd,
+            published_name,
+            orphan_budget,
+        )
         allocated_markers.append(marker.name)
         return marker
 
@@ -2868,10 +2890,12 @@ def test_repeated_fresh_marker_bind_failures_keep_resources_bounded(
         wikidata_source_module._CreationIdentity,
     ] = {}
     observations: list[tuple[int, int]] = []
+    marker_rmdir_seen = False
     original_allocate = wikidata_source_module._allocate_quarantine_marker
     original_check = wikidata_source_module._check_named_derived_directory
     original_exchange = wikidata_source_module._atomic_exchange_directories
     real_close = os.close
+    real_rmdir = os.rmdir
 
     def marker_is_open(
         descriptor: int,
@@ -2886,8 +2910,12 @@ def test_repeated_fresh_marker_bind_failures_keep_resources_bounded(
             == identity
         )
 
-    def record_allocation(namespace_fd, published_name):
-        marker = original_allocate(namespace_fd, published_name)
+    def record_allocation(namespace_fd, published_name, orphan_budget=None):
+        marker = original_allocate(
+            namespace_fd,
+            published_name,
+            orphan_budget,
+        )
         allocation_records.append((marker.descriptor, marker.identity))
         return marker
 
@@ -2956,6 +2984,17 @@ def test_repeated_fresh_marker_bind_failures_keep_resources_bounded(
         ).stat().st_ino
         raise RuntimeError("forced fresh-marker stress failure")
 
+    def record_marker_rmdir(name, *args, **kwargs):
+        nonlocal marker_rmdir_seen
+        marker_name = os.fsdecode(name)
+        if (
+            marker_name.startswith(".quarantine-")
+            or marker_name.startswith(".orphan-marker-")
+            or marker_name == final_name
+        ):
+            marker_rmdir_seen = True
+        return real_rmdir(name, *args, **kwargs)
+
     monkeypatch.setattr(
         wikidata_source_module,
         "_allocate_quarantine_marker",
@@ -2981,6 +3020,11 @@ def test_repeated_fresh_marker_bind_failures_keep_resources_bounded(
         "_derived_view_build_hook",
         fail_after_publish,
     )
+    monkeypatch.setattr(
+        wikidata_source_module.os,
+        "rmdir",
+        record_marker_rmdir,
+    )
 
     with pytest.raises(
         RuntimeError,
@@ -3001,6 +3045,7 @@ def test_repeated_fresh_marker_bind_failures_keep_resources_bounded(
         "fresh marker close failure" not in note
         for note in notes
     )
+    assert not marker_rmdir_seen
     assert not any(
         marker_is_open(descriptor, identity)
         for descriptor, identity in allocation_records
@@ -3016,3 +3061,250 @@ def test_repeated_fresh_marker_bind_failures_keep_resources_bounded(
     )
     assert len(quarantines) == 1
     assert quarantines[0].stat().st_ino == candidate_inode
+    orphans = tuple(
+        path
+        for path in namespace.iterdir()
+        if path.name.startswith(".orphan-marker-")
+    )
+    assert 1 <= len(orphans) <= 8
+
+
+def test_quarantine_allocation_failures_share_orphan_budget(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    namespace = tmp_path / "wikidata"
+    namespace.mkdir(mode=0o700)
+    namespace_fd = os.open(
+        namespace,
+        os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+    )
+    budget = wikidata_source_module._QuarantineOrphanBudget()
+    created: list[
+        tuple[int, wikidata_source_module._CreationIdentity]
+    ] = []
+    original_create = wikidata_source_module._create_private_directory
+    original_list = wikidata_source_module.list_entries
+
+    def marker_is_open(
+        descriptor: int,
+        identity: wikidata_source_module._CreationIdentity,
+    ) -> bool:
+        try:
+            metadata = os.fstat(descriptor)
+        except OSError:
+            return False
+        return wikidata_source_module._creation_identity(metadata) == identity
+
+    def record_marker_create(parent_fd, name):
+        descriptor, identity = original_create(parent_fd, name)
+        if name.startswith(".quarantine-"):
+            created.append((descriptor, identity))
+        return descriptor, identity
+
+    def fail_marker_inventory(descriptor):
+        if any(
+            candidate == descriptor
+            and wikidata_source_module._creation_identity(
+                os.fstat(descriptor)
+            )
+            == identity
+            for candidate, identity in created
+        ):
+            raise ValueError("injected marker allocation validation failure")
+        return original_list(descriptor)
+
+    monkeypatch.setattr(
+        wikidata_source_module,
+        "_create_private_directory",
+        record_marker_create,
+    )
+    monkeypatch.setattr(
+        wikidata_source_module,
+        "list_entries",
+        fail_marker_inventory,
+    )
+
+    try:
+        for _attempt in range(12):
+            with pytest.raises(
+                ValueError,
+                match="allocation validation failure|orphan budget exhausted",
+            ):
+                wikidata_source_module._allocate_quarantine_marker(
+                    namespace_fd,
+                    "a" * 64,
+                    budget,
+                )
+            assert not any(
+                marker_is_open(descriptor, identity)
+                for descriptor, identity in created
+            )
+            assert len(
+                tuple(
+                    path
+                    for path in namespace.iterdir()
+                    if path.name.startswith(".orphan-marker-")
+                )
+            ) <= 7
+            assert not tuple(
+                path
+                for path in namespace.iterdir()
+                if path.name.startswith(".quarantine-")
+            )
+    finally:
+        os.close(namespace_fd)
+
+    assert len(created) == 7
+    assert len(
+        tuple(
+            path
+            for path in namespace.iterdir()
+            if path.name.startswith(".orphan-marker-")
+        )
+    ) == 7
+
+
+def test_marker_detach_restores_substitute_without_rmdir(
+    archive_authority: _AuthorityFixture,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    output_root = tmp_path / "derived"
+    final_name: str | None = None
+    candidate_inode: int | None = None
+    marker_inode: int | None = None
+    replacement_inode: int | None = None
+    raced = False
+    marker_rmdir_seen = False
+    allocation_records: list[
+        tuple[int, wikidata_source_module._CreationIdentity]
+    ] = []
+    original_allocate = wikidata_source_module._allocate_quarantine_marker
+    original_rename_noreplace = wikidata_source_module.atomic_rename_noreplace
+    real_rmdir = os.rmdir
+
+    def marker_is_open(
+        descriptor: int,
+        identity: wikidata_source_module._CreationIdentity,
+    ) -> bool:
+        try:
+            metadata = os.fstat(descriptor)
+        except OSError:
+            return False
+        return wikidata_source_module._creation_identity(metadata) == identity
+
+    def record_allocation(namespace_fd, published_name, orphan_budget=None):
+        marker = original_allocate(
+            namespace_fd,
+            published_name,
+            orphan_budget,
+        )
+        allocation_records.append((marker.descriptor, marker.identity))
+        return marker
+
+    def fail_after_publish(phase, _authority, receipt_sha256):
+        nonlocal final_name, candidate_inode
+        if phase != "before_postpublish_verify":
+            return
+        final_name = receipt_sha256
+        candidate_inode = (
+            output_root / "wikidata" / receipt_sha256
+        ).stat().st_ino
+        raise RuntimeError("forced marker-detach failure")
+
+    def substitute_before_detach(
+        source_directory_fd,
+        source_name,
+        destination_directory_fd,
+        destination_name,
+    ):
+        nonlocal raced, marker_inode, replacement_inode
+        if (
+            not raced
+            and final_name is not None
+            and source_name == final_name
+            and destination_name.startswith(".orphan-marker-")
+        ):
+            raced = True
+            namespace = output_root / "wikidata"
+            final = namespace / final_name
+            displaced = namespace / "retained-marker-detach-race"
+            marker_inode = final.stat().st_ino
+            final.rename(displaced)
+            final.mkdir(mode=0o700)
+            replacement_inode = final.stat().st_ino
+        return original_rename_noreplace(
+            source_directory_fd,
+            source_name,
+            destination_directory_fd,
+            destination_name,
+        )
+
+    def record_marker_rmdir(name, *args, **kwargs):
+        nonlocal marker_rmdir_seen
+        marker_name = os.fsdecode(name)
+        if (
+            marker_name.startswith(".quarantine-")
+            or marker_name.startswith(".orphan-marker-")
+            or marker_name == final_name
+        ):
+            marker_rmdir_seen = True
+        return real_rmdir(name, *args, **kwargs)
+
+    monkeypatch.setattr(
+        wikidata_source_module,
+        "_allocate_quarantine_marker",
+        record_allocation,
+    )
+    monkeypatch.setattr(
+        wikidata_source_module,
+        "_derived_view_build_hook",
+        fail_after_publish,
+    )
+    monkeypatch.setattr(
+        wikidata_source_module,
+        "atomic_rename_noreplace",
+        substitute_before_detach,
+    )
+    monkeypatch.setattr(
+        wikidata_source_module.os,
+        "rmdir",
+        record_marker_rmdir,
+    )
+
+    with pytest.raises(RuntimeError, match="forced marker-detach failure"):
+        _build_view(archive_authority, output_root)
+
+    assert raced
+    assert not marker_rmdir_seen
+    assert final_name is not None
+    assert candidate_inode is not None
+    assert marker_inode is not None
+    assert replacement_inode is not None
+    namespace = output_root / "wikidata"
+    final = namespace / final_name
+    assert final.is_dir()
+    assert final.stat().st_ino == replacement_inode
+    assert final.stat().st_ino != candidate_inode
+    displaced = namespace / "retained-marker-detach-race"
+    assert displaced.is_dir()
+    assert displaced.stat().st_ino == marker_inode
+    quarantined_candidates = tuple(
+        path
+        for path in namespace.iterdir()
+        if path.name.startswith(".quarantine-")
+        and path.stat().st_ino == candidate_inode
+    )
+    assert len(quarantined_candidates) == 1
+    assert len(
+        tuple(
+            path
+            for path in namespace.iterdir()
+            if path.name.startswith(".orphan-marker-")
+        )
+    ) <= 8
+    assert not any(
+        marker_is_open(descriptor, identity)
+        for descriptor, identity in allocation_records
+    )

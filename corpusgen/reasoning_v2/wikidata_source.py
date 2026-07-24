@@ -4628,6 +4628,17 @@ def _verify_sealed_private_build(
             )
 
 
+_QUARANTINE_SAME_STATE_RETRIES = 1
+_QUARANTINE_DETACH_ATTEMPTS = 4
+_QUARANTINE_ORPHAN_LIMIT = 8
+_QUARANTINE_ORPHAN_PREFIX = ".orphan-marker-"
+
+
+@dataclass
+class _QuarantineOrphanBudget:
+    retained: int = 0
+
+
 @dataclass
 class _QuarantineMarker:
     namespace_fd: int
@@ -4635,9 +4646,9 @@ class _QuarantineMarker:
     descriptor: int
     identity: _CreationIdentity
     entry_name: str | None
-
-
-_QUARANTINE_SAME_STATE_RETRIES = 1
+    orphan_budget: _QuarantineOrphanBudget = field(
+        default_factory=_QuarantineOrphanBudget
+    )
 
 
 @dataclass(frozen=True)
@@ -4651,7 +4662,13 @@ class _QuarantineExchangeState:
 def _allocate_quarantine_marker(
     namespace_fd: int,
     published_name: str,
+    orphan_budget: _QuarantineOrphanBudget | None = None,
 ) -> _QuarantineMarker:
+    if (
+        orphan_budget is not None
+        and orphan_budget.retained >= _QUARANTINE_ORPHAN_LIMIT - 1
+    ):
+        raise ValueError("quarantine marker orphan budget exhausted")
     prefix = f".quarantine-{published_name[:16]}-"
     for _attempt in range(32):
         name = prefix + secrets.token_hex(8)
@@ -4668,6 +4685,11 @@ def _allocate_quarantine_marker(
             descriptor=descriptor,
             identity=identity,
             entry_name=name,
+            orphan_budget=(
+                orphan_budget
+                if orphan_budget is not None
+                else _QuarantineOrphanBudget()
+            ),
         )
         try:
             if list_entries(descriptor):
@@ -4675,7 +4697,7 @@ def _allocate_quarantine_marker(
         except BaseException as error:
             cleanup_error = _release_owned_quarantine_marker(
                 marker,
-                remove_entry=True,
+                detach_entry=True,
             )
             if cleanup_error is not None:
                 error.add_note(
@@ -4687,40 +4709,136 @@ def _allocate_quarantine_marker(
     raise FileExistsError("could not allocate quarantine marker")
 
 
-def _remove_quarantine_marker(
+def _detach_quarantine_marker(
     marker: _QuarantineMarker,
     *,
-    sync_parent: bool,
-) -> None:
+    reserve_final_orphan: bool,
+) -> str | None:
     if marker.entry_name is None:
-        return
-    name = marker.entry_name
-    _check_named_derived_directory(
-        marker.namespace_fd,
-        name,
-        marker.descriptor,
-        marker.identity,
-        "quarantine marker before removal",
+        return None
+    orphan_ceiling = _QUARANTINE_ORPHAN_LIMIT - int(
+        reserve_final_orphan
     )
-    if list_entries(marker.descriptor):
-        raise ValueError("quarantine marker is not empty")
-    os.rmdir(name, dir_fd=marker.namespace_fd)
-    marker.entry_name = None
-    if sync_parent:
-        fsync_directory(marker.namespace_fd)
+    if marker.orphan_budget.retained >= orphan_ceiling:
+        return None
+
+    source_name = marker.entry_name
+    inode_token = f"{marker.identity[1]:x}"
+    for _attempt in range(_QUARANTINE_DETACH_ATTEMPTS):
+        orphan_name = (
+            f"{_QUARANTINE_ORPHAN_PREFIX}{inode_token}-"
+            f"{secrets.token_hex(8)}"
+        )
+        try:
+            atomic_rename_noreplace(
+                marker.namespace_fd,
+                source_name,
+                marker.namespace_fd,
+                orphan_name,
+            )
+        except FileExistsError:
+            continue
+
+        if _named_derived_directory_matches(
+            marker.namespace_fd,
+            orphan_name,
+            marker.descriptor,
+            marker.identity,
+            "detached quarantine marker",
+        ):
+            marker.entry_name = None
+            marker.orphan_budget.retained += 1
+            fsync_directory(marker.namespace_fd)
+            _check_named_derived_directory(
+                marker.namespace_fd,
+                orphan_name,
+                marker.descriptor,
+                marker.identity,
+                "retained detached quarantine marker",
+            )
+            return orphan_name
+
+        moved_fd = -1
+        primary_error: BaseException | None = None
+        try:
+            moved_named = entry_lstat(
+                marker.namespace_fd,
+                orphan_name,
+            )
+            _require_derived_mode(
+                moved_named,
+                directory=True,
+                description="detached substituted marker entry",
+            )
+            moved_fd, _created = open_directory_at(
+                marker.namespace_fd,
+                orphan_name,
+            )
+            moved_opened = os.fstat(moved_fd)
+            _require_derived_mode(
+                moved_opened,
+                directory=True,
+                description="detached substituted marker entry",
+            )
+            moved_identity = _creation_identity(moved_opened)
+            if _creation_identity(moved_named) != moved_identity:
+                raise ValueError(
+                    "detached substituted marker entry identity drift"
+                )
+            _check_named_derived_directory(
+                marker.namespace_fd,
+                orphan_name,
+                moved_fd,
+                moved_identity,
+                "detached substituted marker entry",
+            )
+            atomic_rename_noreplace(
+                marker.namespace_fd,
+                orphan_name,
+                marker.namespace_fd,
+                source_name,
+            )
+            _check_named_derived_directory(
+                marker.namespace_fd,
+                source_name,
+                moved_fd,
+                moved_identity,
+                "restored substituted marker entry",
+            )
+            fsync_directory(marker.namespace_fd)
+            _check_named_derived_directory(
+                marker.namespace_fd,
+                source_name,
+                moved_fd,
+                moved_identity,
+                "restored substituted marker entry after sync",
+            )
+        except BaseException as error:
+            primary_error = error
+            raise
+        finally:
+            close_error = _close_descriptors_exhaustively((moved_fd,))
+            if close_error is not None:
+                if primary_error is None:
+                    raise close_error
+                primary_error.add_note(
+                    "detached substitute descriptor close also failed: "
+                    f"{close_error!r}"
+                )
+    return None
 
 
 def _release_owned_quarantine_marker(
     marker: _QuarantineMarker,
     *,
-    remove_entry: bool,
+    detach_entry: bool,
 ) -> BaseException | None:
     cleanup_error: BaseException | None = None
-    if remove_entry:
+    if detach_entry:
         try:
-            _remove_quarantine_marker(
+            _detach_quarantine_marker(
                 marker,
-                sync_parent=True,
+                reserve_final_orphan=True,
             )
         except BaseException as error:
             cleanup_error = error
@@ -4886,6 +5004,11 @@ def _refresh_quarantine_marker(
     published_name: str,
     state: _QuarantineExchangeState,
 ) -> BaseException | None:
+    if (
+        marker.orphan_budget.retained
+        >= _QUARANTINE_ORPHAN_LIMIT - 1
+    ):
+        raise ValueError("quarantine marker orphan budget exhausted")
     fresh: _QuarantineMarker | None = None
     ownership_transferred = False
     primary_error: BaseException | None = None
@@ -4893,6 +5016,7 @@ def _refresh_quarantine_marker(
         fresh = _allocate_quarantine_marker(
             marker.namespace_fd,
             published_name,
+            marker.orphan_budget,
         )
         _check_named_derived_directory(
             fresh.namespace_fd,
@@ -4907,6 +5031,7 @@ def _refresh_quarantine_marker(
             descriptor=marker.descriptor,
             identity=marker.identity,
             entry_name=marker.name if state.marker_at_marker else None,
+            orphan_budget=marker.orphan_budget,
         )
         marker.namespace_fd = fresh.namespace_fd
         marker.name = fresh.name
@@ -4916,7 +5041,7 @@ def _refresh_quarantine_marker(
         ownership_transferred = True
         return _release_owned_quarantine_marker(
             retired,
-            remove_entry=retired.entry_name is not None,
+            detach_entry=retired.entry_name is not None,
         )
     except BaseException as error:
         primary_error = error
@@ -4925,7 +5050,7 @@ def _refresh_quarantine_marker(
         if fresh is not None and not ownership_transferred:
             cleanup_error = _release_owned_quarantine_marker(
                 fresh,
-                remove_entry=True,
+                detach_entry=True,
             )
             if cleanup_error is not None:
                 if primary_error is None:
@@ -5055,9 +5180,9 @@ def _exchange_quarantine_published_candidate(
         if state.candidate_at_marker and state.marker_at_final:
             marker.entry_name = published_name
             try:
-                _remove_quarantine_marker(
+                _detach_quarantine_marker(
                     marker,
-                    sync_parent=False,
+                    reserve_final_orphan=False,
                 )
             except BaseException as error:
                 if secondary_error is None:
@@ -5523,9 +5648,9 @@ def build_wikidata_derived_view(
                 root_name=receipt_sha256,
                 expected_root_identity=postrename_root_identity,
             )
-            _remove_quarantine_marker(
+            _detach_quarantine_marker(
                 quarantine_marker,
-                sync_parent=False,
+                reserve_final_orphan=False,
             )
             published = True
             return winner
@@ -5568,9 +5693,9 @@ def build_wikidata_derived_view(
             and quarantine_marker.entry_name is not None
         ):
             try:
-                _remove_quarantine_marker(
+                _detach_quarantine_marker(
                     quarantine_marker,
-                    sync_parent=True,
+                    reserve_final_orphan=False,
                 )
             except BaseException as error:
                 secondary_error = _append_secondary_error(
