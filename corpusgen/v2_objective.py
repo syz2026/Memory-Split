@@ -471,59 +471,93 @@ class _ReasoningGym:
 
     def generate(self, index: int) -> dict[str, Any]:
         dataset_name = self._DATASETS[index % len(self._DATASETS)]
-        seed = _seed("reasoning_gym_exact_answer", index)
-        dataset = self._factory.create_dataset(dataset_name, seed=seed, size=1)
-        row = dataset[0]
-        question = row.get("question")
-        answer = row.get("answer")
-        oracle_field = "answer"
-        if answer is None and dataset_name == "propositional_logic":
-            metadata = row.get("metadata")
-            if not isinstance(metadata, dict):
+        attempts = (
+            range(_SEED_ATTEMPTS)
+            if dataset_name == "propositional_logic"
+            else range(1)
+        )
+        for attempt in attempts:
+            seed = _seed("reasoning_gym_exact_answer", index, attempt)
+            dataset = self._factory.create_dataset(dataset_name, seed=seed, size=1)
+            row = dataset[0]
+            question = row.get("question")
+            answer = row.get("answer")
+            oracle_field = "answer"
+            if answer is None and dataset_name == "propositional_logic":
+                metadata = row.get("metadata")
+                if not isinstance(metadata, dict):
+                    raise RuntimeError(
+                        "Reasoning Gym propositional_logic returned no "
+                        "metadata oracle"
+                    )
+                answer = metadata.get("example_answer")
+                premises = metadata.get("premises")
+                module = self._dataset_modules[dataset_name]
+                if (
+                    not isinstance(answer, str)
+                    or not answer
+                    or not isinstance(premises, list)
+                    or any(not isinstance(item, str) for item in premises)
+                ):
+                    raise RuntimeError(
+                        "Reasoning Gym propositional_logic metadata oracle is invalid"
+                    )
+                parsed_answer = module.Expression.from_string(answer)
+                parsed_premises = [
+                    module.Expression.from_string(item) for item in premises
+                ]
+                if (
+                    not dataset._is_valid_conclusion(
+                        parsed_premises,
+                        parsed_answer,
+                    )
+                    or dataset._is_trivial(parsed_answer)
+                    or dataset.score_answer(answer, row) != 1.0
+                ):
+                    # Pinned upstream falls back to its first variable when its
+                    # bounded search finds no valid nontrivial conclusion.  A
+                    # complete fresh native row is the only admissible retry;
+                    # never repair, hardcode, or emit the rejected answer.
+                    continue
+                oracle_field = "metadata.example_answer"
+            if not isinstance(question, str) or not question or answer is None:
                 raise RuntimeError(
-                    "Reasoning Gym propositional_logic returned no metadata oracle"
+                    f"Reasoning Gym {dataset_name} returned no exact "
+                    "question/answer"
                 )
-            answer = metadata.get("example_answer")
-            premises = metadata.get("premises")
-            module = self._dataset_modules[dataset_name]
+            # The native scorer must accept its own oracle answer exactly.
             if (
-                not isinstance(answer, str)
-                or not answer
-                or not isinstance(premises, list)
-                or any(not isinstance(item, str) for item in premises)
+                oracle_field == "answer"
+                and dataset.score_answer(str(answer), row) != 1.0
             ):
                 raise RuntimeError(
-                    "Reasoning Gym propositional_logic metadata oracle is invalid"
+                    f"Reasoning Gym {dataset_name} rejected its oracle answer"
                 )
-            parsed_answer = module.Expression.from_string(answer)
-            parsed_premises = [module.Expression.from_string(item) for item in premises]
-            if not dataset._is_valid_conclusion(
-                parsed_premises, parsed_answer
-            ) or dataset._is_trivial(parsed_answer):
-                raise RuntimeError(
-                    "Reasoning Gym propositional_logic metadata oracle "
-                    "failed native truth-table validation"
-                )
-            oracle_field = "metadata.example_answer"
-        if not isinstance(question, str) or not question or answer is None:
-            raise RuntimeError(
-                f"Reasoning Gym {dataset_name} returned no exact question/answer"
-            )
-        # The native scorer must accept its own oracle answer exactly.
-        if oracle_field == "answer" and dataset.score_answer(str(answer), row) != 1.0:
-            raise RuntimeError(
-                f"Reasoning Gym {dataset_name} rejected its oracle answer"
-            )
-        return {
-            "answer": str(answer),
-            "metadata": {
+            output_metadata = {
                 "dataset": dataset_name,
                 "native_metadata": row.get("metadata", {}),
                 "oracle_field": oracle_field,
                 "seed": seed,
-            },
-            "question": question,
-        }
+            }
+            if attempt:
+                output_metadata.update(
+                    {
+                        "attempt": attempt,
+                        "rejected_native_samples": attempt,
+                        "rejection_policy": (
+                            "invalid_or_trivial_metadata_oracle"
+                        ),
+                    }
+                )
+            return {
+                "answer": str(answer),
+                "metadata": output_metadata,
+                "question": question,
+            }
+        raise RuntimeError(
+            "Reasoning Gym propositional_logic produced no valid nontrivial "
+            f"native oracle for record {index} after {_SEED_ATTEMPTS} attempts"
+        )
 
 
 _PROVIDER_TYPES = {
