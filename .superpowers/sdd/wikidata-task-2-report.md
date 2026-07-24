@@ -742,6 +742,163 @@ The unrelated pre-existing full-suite failures recorded earlier remain outside
 this task's ownership. All requested focused, source-lock, compilation, and
 diff gates are green.
 
+## Deterministic reusable marker-pool closure
+
+Status: `DONE`
+
+Implementation commit:
+`7e4ad91fc9fb484371afcc2f57a12293afe33abb` —
+`fix: bound Wikidata marker pool reuse`.
+
+### Resource-bound behavior
+
+1. Every publication operation now has exactly eight deterministic names:
+   `.wikidata-marker-<full-receipt-sha256>-0` through `-7`. Production no
+   longer creates random quarantine/orphan marker names.
+2. A slot index is charged to the operation before its create/open attempt.
+   Failed validation, unsafe entries, nonempty candidates, close failures, and
+   markers whose pathname binding is later lost cannot make that slot
+   available to another allocation or refresh in the same operation.
+3. Existing slots are reusable only after no-follow descriptor binding,
+   exact owner/mode/kind checks, empty inventory checks, and full
+   device/inode/owner/mode/link-count/size/mtime/ctime identity checks before
+   and after those inventory checks. Same-inode mutate/restore ABA therefore
+   consumes the attempted slot and advances to the next deterministic slot.
+4. Successful publication and verified-winner reuse leave the same empty
+   marker in its slot. Repeated builds reuse its descriptor-pinned shape and
+   do not grow the namespace inventory.
+5. Before the no-replace publication, the builder proves an unattempted pool
+   slot is absent, performs the final sealed-candidate verification, proves
+   detach capacity again, and then publishes without an intervening namespace
+   mutation.
+6. Failed candidates remain as nonreusable evidence in their pool slot. The
+   exact marker exchanged into final is moved, with the reviewed
+   no-replace/inspect/restore protocol, into another deterministic slot.
+   Seven failed candidates therefore leave seven evidence slots plus one
+   reusable empty marker. An eighth failure attempt is rejected before
+   publication, with final absent and all descriptors closed.
+
+### TDD evidence
+
+The reusable-inventory, lost-attempt, and seven-plus-one capacity tests were
+added before the pool implementation.
+
+Direct RED command:
+
+```bash
+python -m pytest -q \
+  tests/test_reasoning_v2_wikidata_source.py::test_no_replace_publication_reuses_only_a_fully_verified_winner \
+  tests/test_reasoning_v2_wikidata_source.py::test_lost_marker_attempts_exhaust_deterministic_pool \
+  tests/test_reasoning_v2_wikidata_source.py::test_seven_failed_candidates_block_eighth_before_publication
+```
+
+Exact RED result:
+
+```text
+FFF                                                                      [100%]
+3 failed in 1.39s
+```
+
+The failures showed no deterministic slot after normal success, no retained
+pool authority on an allocated marker, and no bounded pool inventory after the
+first forced quarantine.
+
+The same selection after implementation:
+
+```text
+...                                                                      [100%]
+3 passed in 0.61s
+```
+
+Self-review then added a same-inode marker-shape ABA test before strengthening
+the reusable-slot identity checks.
+
+```bash
+python -m pytest -q \
+  tests/test_reasoning_v2_wikidata_source.py::test_reusable_marker_slot_rejects_same_inode_aba
+```
+
+Exact RED result:
+
+```text
+F                                                                        [100%]
+1 failed in 0.53s
+```
+
+The old shape checks reused slot zero after a temporary child was created and
+removed through the pinned directory descriptor.
+
+The same test after identity hardening:
+
+```text
+.                                                                        [100%]
+1 passed in 0.32s
+```
+
+### Final verification
+
+```bash
+python -m pytest -q tests/test_reasoning_v2_wikidata_source.py
+```
+
+```text
+........................................................................ [ 88%]
+.........                                                                [100%]
+81 passed in 2.83s
+```
+
+```bash
+python -m pytest -q \
+  tests/test_reasoning_v2_source_lock.py \
+  tests/test_current_sources.py
+```
+
+```text
+........................................................................ [ 64%]
+.......................................                                  [100%]
+111 passed in 15.07s
+```
+
+The regression fixtures were run outside the filesystem sandbox because they
+create temporary Git repositories. No network or AWS access was enabled or
+used.
+
+```bash
+python -m py_compile \
+  corpusgen/reasoning_v2/wikidata_source.py \
+  tests/test_reasoning_v2_wikidata_source.py
+git diff --check
+```
+
+Both static checks were silent with exit code zero.
+
+### Changed files and self-review
+
+- `corpusgen/reasoning_v2/wikidata_source.py`
+- `tests/test_reasoning_v2_wikidata_source.py`
+- `.superpowers/sdd/wikidata-task-2-report.md` (this appendix only)
+- The allocation-failure test proves all eight failed slot descriptors close
+  and a second call creates no additional entry. The lost-authority test moves
+  all eight exact markers out of their names and proves the operation still
+  cannot allocate a ninth marker.
+- The capacity test performs seven independent postpublication failures,
+  proves after each that no failed candidate occupies final, observes exactly
+  one reusable empty marker, proves every returned marker descriptor closes,
+  then proves attempt eight fails before the postpublication hook.
+- All prior exchange pre-swap, marker substitution, concurrent-winner,
+  final-detach substitution, close-failure, candidate-authority,
+  external-sort boundedness, and deterministic-byte tests remain green.
+- Marker state is bounded by eight slot indices and constant-size authority
+  records; no corpus-sized read or collection was added. Task 1 interfaces and
+  schema/format v1 are unchanged.
+- The implementation commit contains exactly the authorized module/test
+  files. This report is committed separately. No amend, push, source mutation,
+  AWS operation, network operation, or other worktree edit occurred.
+
+### Concerns
+
+None.
+
 ## Identity-aware quarantine-marker detach closure
 
 Status: `DONE_WITH_CONCERNS`
@@ -1152,3 +1309,11 @@ Both static checks were silent with exit code zero.
 The unrelated pre-existing full-suite failures recorded earlier remain outside
 this task's ownership. All requested focused, source-lock, compilation, and
 diff gates are green.
+
+## Final report supersession
+
+The deterministic reusable marker-pool closure is the latest appendix in this
+report. It supersedes older descriptions of random `.quarantine-*`,
+`.orphan-marker-*`, exact-removal, and `rmdir` behavior above. The current
+implementation uses only the fixed eight-slot `.wikidata-marker-*` pool:
+seven retained failed candidates plus one reusable empty marker.
