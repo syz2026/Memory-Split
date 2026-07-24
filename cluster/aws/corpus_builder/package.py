@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 import gzip
 import hashlib
 import io
@@ -35,7 +36,6 @@ REQUIRED_PREFIXES = (
     "vendor/tiktoken/",
 )
 REQUIRED_FILES = (
-    "pyproject.toml",
     "requirements.txt",
     "scripts/build_parallel_corpus.py",
     "scripts/package_aws_corpus_builder.py",
@@ -51,8 +51,11 @@ _REQUIRED_PACKAGE_PATHS = frozenset(
         "corpusgen/parallel/adapters.py",
         "corpusgen/parallel/catalog.py",
         "corpusgen/parallel/publication.py",
+        "corpusgen/reasoning_v2/renderers.py",
         "corpusgen/reasoning_v2/catalog.py",
         "corpusgen/reasoning_v2/source_lock.py",
+        "corpusgen/reasoning_v2/wikidata_source.py",
+        "corpusgen/wikidata5m.py",
         "requirements.txt",
         "scripts/build_parallel_corpus.py",
         "scripts/package_aws_corpus_builder.py",
@@ -68,7 +71,136 @@ _REQUIRED_TEST_PATHS = frozenset(
         "tests/test_aws_corpus_builder_contracts.py",
         "tests/test_parallel_corpus.py",
         "tests/test_reasoning_v2_catalog.py",
+        "tests/test_reasoning_v2_renderers.py",
         "tests/test_reasoning_v2_source_lock.py",
+        "tests/test_reasoning_v2_wikidata_source.py",
+    }
+)
+_PRODUCTION_COMPLETION_SYMBOLS = {
+    "corpusgen/reasoning_v2/catalog.py": frozenset(
+        {"WikidataGraphCatalogSource"}
+    ),
+    "corpusgen/reasoning_v2/renderers.py": frozenset(
+        {"WikidataGraphRenderer"}
+    ),
+    "corpusgen/reasoning_v2/wikidata_source.py": frozenset(
+        {
+            "WikidataDerivedView",
+            "WikidataDerivedViewReceipt",
+            "build_wikidata_derived_view",
+            "iter_distinct_training_edges",
+            "iter_v2_aliases",
+            "iter_v2_training_triples",
+            "lookup_alias",
+            "lookup_training_triple",
+            "verify_wikidata_derived_view",
+        }
+    ),
+}
+_UNSUPPORTED_RENDERER_MARKER = b"Unsupported" b"ProductionRenderer"
+
+_REVIEWED_MEMBER_INVENTORY = frozenset(
+    {
+        "cluster/aws/corpus_builder/__init__.py",
+        "cluster/aws/corpus_builder/contracts.py",
+        "cluster/aws/corpus_builder/package.py",
+        "cluster/profiles/aws-i4i.16xlarge-corpus-v1.json",
+        "cluster/profiles/aws-p5.48xlarge.json",
+        "cluster/profiles/illumina-usfc-prd.json",
+        "configs/160m.tsv",
+        "configs/160m/d160m_dense_n50k_s0.yaml",
+        "configs/160m/d160m_dense_n50k_s1.yaml",
+        "configs/160m/d160m_dense_n50k_s2.yaml",
+        "configs/160m/d160m_dense_n800k_s0.yaml",
+        "configs/160m/d160m_dense_n800k_s1.yaml",
+        "configs/160m/d160m_dense_n800k_s2.yaml",
+        "configs/160m/d160m_random_n800k_s0.yaml",
+        "configs/160m/d160m_random_n800k_s1.yaml",
+        "configs/160m/d160m_random_n800k_s2.yaml",
+        "configs/160m/d160m_split_n50k_s0.yaml",
+        "configs/160m/d160m_split_n50k_s1.yaml",
+        "configs/160m/d160m_split_n50k_s2.yaml",
+        "configs/160m/d160m_split_n800k_s0.yaml",
+        "configs/160m/d160m_split_n800k_s1.yaml",
+        "configs/160m/d160m_split_n800k_s2.yaml",
+        "configs/29m.tsv",
+        "configs/29m/toy_dense_gate_s0.yaml",
+        "configs/29m/toy_split_gate_s0.yaml",
+        "configs/360m-v2/dense-s0.yaml",
+        "configs/360m-v2/dense-s1.yaml",
+        "configs/360m-v2/dense-s2.yaml",
+        "configs/360m-v2/dense-s3.yaml",
+        "configs/360m-v2/dense-s4.yaml",
+        "configs/360m-v2/split90-s0.yaml",
+        "configs/360m-v2/split90-s1.yaml",
+        "configs/360m-v2/split90-s2.yaml",
+        "configs/360m-v2/split90-s3.yaml",
+        "configs/360m-v2/split90-s4.yaml",
+        "configs/360m.tsv",
+        "configs/360m/d360m_dense_n1p8m_s0.yaml",
+        "configs/360m/d360m_dense_n1p8m_s1.yaml",
+        "configs/360m/d360m_dense_n1p8m_s2.yaml",
+        "configs/360m/d360m_split_n1p8m_s0.yaml",
+        "configs/360m/d360m_split_n1p8m_s1.yaml",
+        "configs/360m/d360m_split_n1p8m_s2.yaml",
+        "configs/cohort-assignment-v2.json",
+        "configs/current-dataset-lock.json",
+        "configs/preregistration-v2.yaml",
+        "configs/reasoning-dataset-v2.json",
+        "configs/route-policy.json",
+        "corpusgen/parallel/__init__.py",
+        "corpusgen/parallel/adapters.py",
+        "corpusgen/parallel/canonical.py",
+        "corpusgen/parallel/catalog.py",
+        "corpusgen/parallel/integrity.py",
+        "corpusgen/parallel/metadata.py",
+        "corpusgen/parallel/publication.py",
+        "corpusgen/parallel/safeio.py",
+        "corpusgen/parallel/schedule.py",
+        "corpusgen/parallel/tasks.py",
+        "corpusgen/parallel/workspace.py",
+        "corpusgen/reasoning_v2/__init__.py",
+        "corpusgen/reasoning_v2/catalog.py",
+        "corpusgen/reasoning_v2/contracts.py",
+        "corpusgen/reasoning_v2/renderers.py",
+        "corpusgen/reasoning_v2/semantic.py",
+        "corpusgen/reasoning_v2/source_lock.py",
+        "corpusgen/reasoning_v2/wikidata_source.py",
+        "corpusgen/wikidata5m.py",
+        "requirements.txt",
+        "scripts/analyze.py",
+        "scripts/analyze_keyguess_policy.py",
+        "scripts/analyze_relational.py",
+        "scripts/build_corpus.py",
+        "scripts/build_current_dataset.py",
+        "scripts/build_current_smoke.py",
+        "scripts/build_parallel_corpus.py",
+        "scripts/build_relational_corpus.py",
+        "scripts/fetch_realfacts.py",
+        "scripts/local_gate_check.py",
+        "scripts/make_manifest.py",
+        "scripts/make_relational_manifest.py",
+        "scripts/package_aws_corpus_builder.py",
+        "scripts/package_aws_p5_handoff.py",
+        "scripts/package_illumina_handoff.py",
+        "scripts/package_relational_run.py",
+        "scripts/platform_preflight.py",
+        "scripts/probe_local.py",
+        "scripts/relational_smoke_test.py",
+        "scripts/run_evals.py",
+        "scripts/run_keyguess_local.py",
+        "scripts/run_local_gpus.py",
+        "scripts/run_relational_evals.py",
+        "scripts/run_train.py",
+        "scripts/smoke_test.py",
+        "scripts/stage_current_sources.py",
+        "scripts/verify_cohort_releases.py",
+        "scripts/verify_v2_readiness.py",
+        "sources/Wikidata-CC0-1.0.txt",
+        "sources/current-dataset-licenses.json",
+        "sources/wikidata5m.lock.json",
+        "vendor/tiktoken/6c7ea1a7e38e3a7f062df639a5b80947f075ffe6",
+        "vendor/tiktoken/6d1cbeee0f20b3d9449abfede4726ed8212e3aee",
     }
 )
 
@@ -90,6 +222,11 @@ _DISPOSABLE_COMPONENTS = frozenset(
         "pilot-artifact",
         "pilot-artifacts",
     }
+)
+_DISPOSABLE_COMPONENT_PREFIX = re.compile(
+    r"(?:artifact|artifacts|cache|caches|checkpoint|checkpoints|"
+    r"output|outputs|pilot)(?:$|[-_.0-9])",
+    flags=re.IGNORECASE,
 )
 _PRIVATE_KEY_PATTERN = re.compile(
     rb"-----BEGIN (?:RSA |EC |DSA |OPENSSH |PGP )?PRIVATE KEY"
@@ -172,6 +309,11 @@ _OBJECT_ID_PATTERN = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})\Z")
 class PackageError(ValueError):
     """A fail-closed corpus builder packaging error."""
 
+    def __init__(self, message: str, *, code: str = "PACKAGE_ERROR") -> None:
+        rendered = f"{code}: {message}" if code != "PACKAGE_ERROR" else message
+        super().__init__(rendered)
+        self.code = code
+
 
 @dataclass(frozen=True)
 class BuilderPackage:
@@ -223,6 +365,7 @@ def _sanitized_git_environment() -> dict[str, str]:
             "GIT_CONFIG_GLOBAL": os.devnull,
             "GIT_CONFIG_NOSYSTEM": "1",
             "GIT_CONFIG_SYSTEM": os.devnull,
+            "GIT_NO_LAZY_FETCH": "1",
             "GIT_NO_REPLACE_OBJECTS": "1",
             "GIT_OPTIONAL_LOCKS": "0",
             "GIT_PAGER": "cat",
@@ -356,16 +499,24 @@ def _portable_path(encoded: bytes) -> str:
 
 def _is_disposable(path: str) -> bool:
     return any(
-        component.lower() in _DISPOSABLE_COMPONENTS
+        component.casefold() in _DISPOSABLE_COMPONENTS
+        or _DISPOSABLE_COMPONENT_PREFIX.match(component) is not None
         for component in PurePosixPath(path).parts
     )
 
 
 def _is_allowlisted(path: str) -> bool:
-    return path in REQUIRED_FILES or path.startswith(REQUIRED_PREFIXES)
+    return (
+        path in _REVIEWED_MEMBER_INVENTORY
+        or path in REQUIRED_FILES
+        or path.startswith(REQUIRED_PREFIXES)
+    )
 
 
-def _tracked_files(source_root: Path, revision: str) -> tuple[list[_Tracked], set[str]]:
+def _tracked_files(
+    source_root: Path,
+    revision: str,
+) -> tuple[list[_Tracked], set[str], list[str], list[_Tracked]]:
     try:
         tree_id = (
             _run_git(
@@ -390,6 +541,8 @@ def _tracked_files(source_root: Path, revision: str) -> tuple[list[_Tracked], se
         tree_id,
     )
     selected: list[_Tracked] = []
+    production_sources: list[_Tracked] = []
+    unreviewed: list[str] = []
     all_paths: set[str] = set()
     for raw in output.split(b"\0"):
         if not raw:
@@ -406,7 +559,12 @@ def _tracked_files(source_root: Path, revision: str) -> tuple[list[_Tracked], se
         if path in all_paths:
             raise PackageError(f"Git tree repeats path: {path}")
         all_paths.add(path)
-        if not _is_allowlisted(path) or _is_disposable(path):
+        package_candidate = _is_allowlisted(path)
+        production_source = (
+            PurePosixPath(path).suffix == ".py"
+            and path.startswith(("cluster/", "corpusgen/", "scripts/"))
+        )
+        if (not package_candidate and not production_source) or _is_disposable(path):
             continue
         if git_mode == "120000":
             raise PackageError(f"tracked symlink is forbidden: {path}")
@@ -414,11 +572,73 @@ def _tracked_files(source_root: Path, revision: str) -> tuple[list[_Tracked], se
             raise PackageError(f"package member is not a regular file: {path}")
         if _OBJECT_ID_PATTERN.fullmatch(object_id) is None:
             raise PackageError(f"package member has an invalid object ID: {path}")
-        selected.append(
-            _Tracked(path=path, git_mode=git_mode, object_id=object_id)
-        )
+        item = _Tracked(path=path, git_mode=git_mode, object_id=object_id)
+        if production_source:
+            production_sources.append(item)
+        if package_candidate:
+            if path in _REVIEWED_MEMBER_INVENTORY:
+                selected.append(item)
+            else:
+                unreviewed.append(path)
     selected.sort(key=lambda item: item.path.encode("utf-8"))
-    return selected, all_paths
+    production_sources.sort(key=lambda item: item.path.encode("utf-8"))
+    unreviewed.sort(key=lambda path: path.encode("utf-8"))
+    return selected, all_paths, unreviewed, production_sources
+
+
+def _declared_public_symbols(path: str, data: bytes) -> frozenset[str]:
+    try:
+        text = data.decode("utf-8", errors="strict")
+        tree = ast.parse(text, filename=path)
+    except (SyntaxError, UnicodeDecodeError) as error:
+        raise PackageError(
+            f"required production module is not valid UTF-8 Python: {path}",
+            code="INCOMPLETE_PRODUCTION_PIPELINE",
+        ) from error
+
+    symbols: set[str] = set()
+    for node in tree.body:
+        if isinstance(node, (ast.AsyncFunctionDef, ast.ClassDef, ast.FunctionDef)):
+            symbols.add(node.name)
+        elif isinstance(node, (ast.Import, ast.ImportFrom)):
+            symbols.update(alias.asname or alias.name.rsplit(".", 1)[-1] for alias in node.names)
+        elif isinstance(node, ast.Assign):
+            symbols.update(
+                target.id for target in node.targets if isinstance(target, ast.Name)
+            )
+        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+            symbols.add(node.target.id)
+    return frozenset(symbols)
+
+
+def _require_production_pipeline(
+    all_paths: set[str],
+    package_blobs: dict[str, bytes],
+    production_blobs: dict[str, bytes],
+) -> None:
+    if any(
+        _UNSUPPORTED_RENDERER_MARKER in data
+        for data in production_blobs.values()
+    ):
+        raise PackageError(
+            "required production pipeline still exposes the unsupported renderer",
+            code="INCOMPLETE_PRODUCTION_PIPELINE",
+        )
+
+    for path, required_symbols in _PRODUCTION_COMPLETION_SYMBOLS.items():
+        if path not in all_paths or path not in package_blobs:
+            raise PackageError(
+                f"required production pipeline module is missing: {path}",
+                code="INCOMPLETE_PRODUCTION_PIPELINE",
+            )
+        declared = _declared_public_symbols(path, package_blobs[path])
+        missing = sorted(required_symbols - declared)
+        if missing:
+            raise PackageError(
+                f"required production pipeline symbol is missing: "
+                f"{path}:{missing[0]}",
+                code="INCOMPLETE_PRODUCTION_PIPELINE",
+            )
 
 
 def _require_authorities(
@@ -625,16 +845,33 @@ def _verify_archive(
 
 
 def _external_output(source_root: Path, output_dir: Path) -> Path:
-    output = Path(os.path.abspath(os.fspath(output_dir)))
+    requested = Path(os.path.abspath(os.fspath(output_dir)))
+    if requested.is_symlink():
+        raise PackageError("package output must be a real directory")
     try:
-        within_source = os.path.commonpath((str(source_root), str(output))) == str(
-            source_root
+        output = requested.resolve(strict=False)
+    except OSError as error:
+        raise PackageError("package output parent cannot be resolved") from error
+    if (
+        output == source_root
+        or output in source_root.parents
+        or source_root in output.parents
+    ):
+        raise PackageError(
+            "package output and source must be physically disjoint "
+            "(output outside source)"
         )
-    except ValueError:
-        within_source = False
-    if within_source:
-        raise PackageError("package output must be outside the source worktree")
     return output
+
+
+def _recheck_external_output(source_root: Path, output_dir: Path) -> Path:
+    try:
+        resolved = output_dir.resolve(strict=True)
+    except OSError as error:
+        raise PackageError("package output directory cannot be resolved") from error
+    if resolved != output_dir:
+        raise PackageError("package output path changed through a symlink alias")
+    return _external_output(source_root, resolved)
 
 
 def _write_atomic(path: Path, data: bytes) -> None:
@@ -685,9 +922,19 @@ def build_corpus_builder_package(
     source = _repository_root(Path(source_root))
     output = _external_output(source, Path(output_dir))
     revision = _require_clean(source)
-    tracked, all_paths = _tracked_files(source, revision)
-    _require_authorities(tracked, all_paths)
+    tracked, all_paths, unreviewed, production_sources = _tracked_files(
+        source,
+        revision,
+    )
     blobs = _read_git_blobs(source, tracked)
+    production_blobs = _read_git_blobs(source, production_sources)
+    _require_production_pipeline(all_paths, blobs, production_blobs)
+    if unreviewed:
+        raise PackageError(
+            f"path is not in reviewed member inventory: {unreviewed[0]}",
+            code="UNREVIEWED_PACKAGE_MEMBER",
+        )
+    _require_authorities(tracked, all_paths)
     for item in tracked:
         _scan_secret(item.path, blobs[item.path])
     archive_payload = _archive_bytes(tracked, blobs)
@@ -725,12 +972,15 @@ def build_corpus_builder_package(
         raise PackageError("package output directory cannot be created") from error
     if output.is_symlink() or not output.is_dir():
         raise PackageError("package output must be a real directory")
+    output = _recheck_external_output(source, output)
     archive = output / ARCHIVE_NAME
     manifest = output / MANIFEST_NAME
     sha256_file = output / SHA256_NAME
     _write_atomic(archive, archive_payload)
     _write_atomic(manifest, manifest_payload)
     _write_atomic(sha256_file, checksum_payload)
+    output = _recheck_external_output(source, output)
+    _assert_unchanged(source, revision)
     return BuilderPackage(
         archive=archive,
         manifest=manifest,
