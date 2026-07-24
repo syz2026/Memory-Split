@@ -449,6 +449,55 @@ def test_frozen_flat_mirror_rejects_tampering_and_symlinks(tiny_task4, tmp_path)
         )
 
 
+def test_frozen_flat_mirror_rejects_invalid_target_weights(tiny_task4, tmp_path):
+    dataset = tmp_path / "dataset"
+    bridge.materialize_135m_layout(
+        tiny_task4["publication"],
+        dataset,
+        source_lock_path=tiny_task4["recipe"],
+        expected_source_lock_sha256=tiny_task4["recipe_sha"],
+        expected_source_receipt_sha256=tiny_task4["receipt_sha"],
+        expected_ordered_sha256=tiny_task4["ordered_sha"],
+    )
+    template = _write_pointer_template(
+        tmp_path / "template.json",
+        tiny_task4["recipe_sha"],
+    )
+    pointer = bridge.freeze_dataset_pointer(
+        tiny_task4["publication"],
+        dataset,
+        template_path=template,
+        output_path=tmp_path / "frozen.json",
+        expected_source_receipt_sha256=tiny_task4["receipt_sha"],
+        expected_ordered_sha256=tiny_task4["ordered_sha"],
+        source_lock_path=tiny_task4["recipe"],
+    )
+
+    dense = dataset / "sidecars" / "dense_target_weights.bin"
+    dense_payload = bytearray(dense.read_bytes())
+    dense_payload[len(dense_payload) // 2] = 0
+    dense.write_bytes(dense_payload)
+    with pytest.raises(bridge.CorpusContractError, match="must be one"):
+        bridge.verify_dataset_root(
+            dataset,
+            pointer_path=pointer,
+            source_lock_path=tiny_task4["recipe"],
+        )
+
+    dense_payload[len(dense_payload) // 2] = 1
+    dense.write_bytes(dense_payload)
+    split = dataset / "sidecars" / "split90_target_weights.bin"
+    split_payload = bytearray(split.read_bytes())
+    split_payload[len(split_payload) // 2] = 2
+    split.write_bytes(split_payload)
+    with pytest.raises(bridge.CorpusContractError, match="non-binary"):
+        bridge.verify_dataset_root(
+            dataset,
+            pointer_path=pointer,
+            source_lock_path=tiny_task4["recipe"],
+        )
+
+
 def test_unfrozen_pointer_rejects_speculative_dynamic_hash(tmp_path):
     raw = json.loads(
         (ROOT / "DATASET-POINTER-SLURM-135M.json").read_text(encoding="utf-8")

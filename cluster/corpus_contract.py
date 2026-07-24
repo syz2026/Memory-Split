@@ -1189,14 +1189,20 @@ def _verify_flat_layout(
         require_one = name == "dense_target_weights"
         require_binary = name in SIDECAR_NAMES
 
-        def validate(chunk: bytes) -> None:
-            if require_binary and any(value not in (0, 1) for value in chunk):
-                raise CorpusContractError(
-                    f"{name} contains non-binary target weights"
-                )
-            if require_one and any(value != 1 for value in chunk):
+        def validate(
+            chunk: bytes,
+            *,
+            stream_name: str = name,
+            binary: bool = require_binary,
+            one: bool = require_one,
+        ) -> None:
+            if one and chunk.strip(b"\x01"):
                 raise CorpusContractError(
                     "dense_target_weights must be one at every target"
+                )
+            if binary and not one and chunk.translate(None, b"\x00\x01"):
+                raise CorpusContractError(
+                    f"{stream_name} contains non-binary target weights"
                 )
 
         size, digest = _stream_regular(
