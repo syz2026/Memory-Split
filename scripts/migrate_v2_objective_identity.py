@@ -23,6 +23,8 @@ from corpusgen.v2_materialize import (
 )
 
 _OBJECTIVE_ARTIFACT = "corpusgen/v2_objective.py"
+_DEEPMIND_PROVIDER = "deepmind_mathematics_generator"
+_DEEPMIND_REPAIRED_INDEX = 295_194
 _PRONTOQA_PROVIDER = "prontoqa"
 _REASONING_GYM_PROVIDER = "reasoning_gym_exact_answer"
 
@@ -244,6 +246,84 @@ def _audit_prontoqa(
         client.close()
 
 
+def _audit_deepmind(
+    *,
+    identity: dict[str, Any],
+    objective_python: Path,
+    deepmind_root: Path,
+    log_root: Path,
+) -> dict[str, Any]:
+    client = _ObjectiveWorkerClient(
+        _DEEPMIND_PROVIDER,
+        deepmind_root,
+        python=objective_python,
+        log_root=log_root,
+    )
+    try:
+        expected_runtime = identity["objective_runtime"][_DEEPMIND_PROVIDER]
+        if client.runtime != expected_runtime["versions"]:
+            raise MigrationError(
+                "DeepMind Mathematics runtime changed during objective migration"
+            )
+        expected_hashes = expected_runtime["probe_record_sha256s"]
+        observed_hashes = [
+            _sha256(canonical_json_bytes(client.generate(index)))
+            for index in expected_runtime["probe_indices"]
+        ]
+        if observed_hashes != expected_hashes:
+            mismatches = [
+                index
+                for index, (observed, expected) in enumerate(
+                    zip(observed_hashes, expected_hashes)
+                )
+                if observed != expected
+            ]
+            raise MigrationError(
+                f"frozen DeepMind Mathematics probes changed: {mismatches}"
+            )
+        repaired = client.generate(_DEEPMIND_REPAIRED_INDEX)
+        metadata = repaired.get("metadata", {})
+        repaired_sha256 = _sha256(canonical_json_bytes(repaired))
+        if (
+            repaired.get("answer") != "-36"
+            or metadata.get("attempt") != 2
+            or metadata.get("module") != "calculus__differentiate_composed"
+            or metadata.get("native_assertion_rejections") != 1
+            or metadata.get("rejected_native_samples") != 2
+            or metadata.get("rejection_policy")
+            != "zero_term_nonzero_entropy_assertion"
+            or metadata.get("seed") != 686_967_019
+            or repaired_sha256
+            != "5715213e3d22650e7561973d716f00726493482c6d630f1f5ca4d20da215e4c8"
+        ):
+            raise MigrationError(
+                "DeepMind Mathematics record 295194 did not use the reviewed "
+                "native retry"
+            )
+        repeated = client.generate(_DEEPMIND_REPAIRED_INDEX)
+        if canonical_json_bytes(repaired) != canonical_json_bytes(repeated):
+            raise MigrationError(
+                "DeepMind Mathematics record 295194 is not deterministic"
+            )
+        return {
+            "record_295194_sha256": repaired_sha256,
+            "record_295194_validation": {
+                "answer": repaired["answer"],
+                "attempt": metadata["attempt"],
+                "module": metadata["module"],
+                "native_assertion_rejections": (
+                    metadata["native_assertion_rejections"]
+                ),
+                "rejected_native_samples": metadata["rejected_native_samples"],
+                "rejection_policy": metadata["rejection_policy"],
+                "seed": metadata["seed"],
+            },
+            "unchanged_probe_count": len(observed_hashes),
+        }
+    finally:
+        client.close()
+
+
 def migrate_identity(
     work_root: Path,
     *,
@@ -251,6 +331,7 @@ def migrate_identity(
     expected_old_objective_sha256: str,
     old_revision: str,
     objective_python: Path,
+    deepmind_root: Path | None,
     reasoning_gym_root: Path | None,
     prontoqa_root: Path | None,
 ) -> dict[str, Any]:
@@ -282,7 +363,27 @@ def migrate_identity(
 
         checkpoints = _checkpoint_evidence(work_root)
         objective = checkpoints.get("objective_auxiliary", {}).get("checkpoint")
-        if (
+        if migration == "deepmind-zero-term-entropy":
+            cursor = objective.get("cursor", {}) if isinstance(objective, dict) else {}
+            indices = cursor.get("indices", {}) if isinstance(cursor, dict) else {}
+            next_deepmind = (
+                indices.get(_DEEPMIND_PROVIDER)
+                if isinstance(indices, dict)
+                else None
+            )
+            if (
+                not isinstance(objective, dict)
+                or objective.get("complete") is not False
+                or isinstance(next_deepmind, bool)
+                or not isinstance(next_deepmind, int)
+                or next_deepmind < 0
+                or next_deepmind > _DEEPMIND_REPAIRED_INDEX
+            ):
+                raise MigrationError(
+                    "objective checkpoint crossed the first rejected DeepMind "
+                    "Mathematics ordinal"
+                )
+        elif (
             not isinstance(objective, dict)
             or objective.get("complete") is not False
             or objective.get("tokens") != 0
@@ -293,7 +394,25 @@ def migrate_identity(
                 "objective lane has durable output; use a fresh work root"
             )
 
-        if migration == "reasoning-gym-invalid-oracle":
+        if migration == "deepmind-zero-term-entropy":
+            if deepmind_root is None:
+                raise MigrationError("DeepMind Mathematics root is required")
+            audit = _audit_deepmind(
+                identity=old_identity,
+                objective_python=objective_python,
+                deepmind_root=deepmind_root,
+                log_root=work_root / "logs" / "objective-migration",
+            )
+            audit["durable_checkpoint_next_deepmind_index"] = next_deepmind
+            reason = (
+                "reject one pinned DeepMind Mathematics zero-term positive-entropy "
+                "assertion and retry the next native seed"
+            )
+            semantic_scope = (
+                "objective_auxiliary.deepmind_mathematics."
+                "zero_term_entropy_rejection"
+            )
+        elif migration == "reasoning-gym-invalid-oracle":
             if reasoning_gym_root is None:
                 raise MigrationError("Reasoning Gym root is required")
             audit = _audit_reasoning_gym(
@@ -379,6 +498,7 @@ def main() -> int:
     parser.add_argument(
         "--migration",
         choices=(
+            "deepmind-zero-term-entropy",
             "prontoqa-depth-rotation",
             "reasoning-gym-invalid-oracle",
         ),
@@ -387,6 +507,7 @@ def main() -> int:
     parser.add_argument("--expected-old-objective-sha256", required=True)
     parser.add_argument("--old-revision", required=True)
     parser.add_argument("--objective-python", required=True, type=Path)
+    parser.add_argument("--deepmind-root", type=Path)
     parser.add_argument("--reasoning-gym-root", type=Path)
     parser.add_argument("--prontoqa-root", type=Path)
     args = parser.parse_args()
@@ -397,6 +518,9 @@ def main() -> int:
         old_revision=args.old_revision,
         objective_python=Path(
             os.path.abspath(os.path.expanduser(str(args.objective_python)))
+        ),
+        deepmind_root=(
+            None if args.deepmind_root is None else args.deepmind_root.resolve()
         ),
         reasoning_gym_root=(
             None

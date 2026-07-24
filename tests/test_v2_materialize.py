@@ -495,6 +495,54 @@ def test_deepmind_adapter_removes_object_hash_order_before_seeded_shuffle(
         objective_module._deepmind_randint(1.5, 2.5)
 
 
+def test_deepmind_retries_only_the_zero_term_entropy_assertion():
+    calls = 0
+
+    def integers_with_sum(value, count, entropy):
+        assert count > 0 or value != 0 or entropy <= 0
+
+    class _SympyRandom:
+        @staticmethod
+        def seed(_value):
+            return None
+
+    class _Problem:
+        answer = "-36"
+        question = "Differentiate the fixture polynomial."
+
+    def module():
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            integers_with_sum(0, 0, 1.0)
+        return _Problem()
+
+    generator = object.__new__(objective_module._DeepMindMathematics)
+    generator._integers_with_sum = integers_with_sum
+    generator._modules = (("calculus__fixture", module),)
+    generator._sympy_random = _SympyRandom()
+
+    record = generator.generate(295_194)
+
+    assert calls == 2
+    assert record["answer"] == "-36"
+    assert record["metadata"] == {
+        "attempt": 1,
+        "module": "calculus__fixture",
+        "native_assertion_rejections": 1,
+        "rejected_native_samples": 1,
+        "rejection_policy": "zero_term_nonzero_entropy_assertion",
+        "seed": _seed("deepmind_mathematics_generator", 295_194, 1),
+    }
+
+    def unrelated_assertion():
+        raise AssertionError("unrelated")
+
+    generator._modules = (("calculus__fixture", unrelated_assertion),)
+    with pytest.raises(AssertionError, match="unrelated"):
+        generator.generate(295_194)
+
+
 def test_lane_checkpoint_resumes_and_rejects_verified_record_reuse(tmp_path):
     tok = get_tok()
     records = (

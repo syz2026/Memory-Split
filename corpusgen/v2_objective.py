@@ -129,6 +129,26 @@ def _deepmind_randint(lower, upper):
     return _STDLIB_RANDINT(lower, upper)
 
 
+def _deepmind_zero_term_entropy_assertion(
+    error: AssertionError,
+    integers_with_sum: Any,
+) -> bool:
+    """Recognize one pinned upstream rejection bug without hiding assertions."""
+
+    traceback = error.__traceback__
+    if traceback is None:
+        return False
+    while traceback.tb_next is not None:
+        traceback = traceback.tb_next
+    frame = traceback.tb_frame
+    return (
+        frame.f_code is integers_with_sum.__code__
+        and frame.f_locals.get("count") == 0
+        and frame.f_locals.get("value") == 0
+        and frame.f_locals.get("entropy", 0) > 0
+    )
+
+
 class _DeepMindMathematics:
     distributions = ("absl-py", "numpy", "six", "sympy")
 
@@ -157,11 +177,13 @@ class _DeepMindMathematics:
             _deepmind_expand_entities(composition, context, **kwargs)
         )
         from mathematics_dataset.modules import modules
+        from mathematics_dataset.sample import polynomials as sample_polynomials
 
         def full_entropy(bounds):
             return bounds
 
         self._modules = tuple(_flatten_modules(modules.train(full_entropy)))
+        self._integers_with_sum = sample_polynomials.integers_with_sum
         if not self._modules:
             raise RuntimeError("DeepMind mathematics exposed no train modules")
 
@@ -169,6 +191,7 @@ class _DeepMindMathematics:
         import numpy as np
 
         module_name, module = self._modules[index % len(self._modules)]
+        native_assertion_rejections = 0
         for attempt in range(128):
             seed = _seed("deepmind_mathematics_generator", index, attempt)
             random.seed(seed)
@@ -177,19 +200,41 @@ class _DeepMindMathematics:
             native_randint = random.randint
             random.randint = _deepmind_randint
             try:
-                problem = module()
+                try:
+                    problem = module()
+                except AssertionError as error:
+                    if not _deepmind_zero_term_entropy_assertion(
+                        error,
+                        self._integers_with_sum,
+                    ):
+                        raise
+                    native_assertion_rejections += 1
+                    continue
             finally:
                 random.randint = native_randint
             question = str(problem.question)
             answer = str(problem.answer)
             if question and answer and len(question) <= 160 and len(answer) <= 30:
+                metadata = {
+                    "attempt": attempt,
+                    "module": module_name,
+                    "seed": seed,
+                }
+                if native_assertion_rejections:
+                    metadata.update(
+                        {
+                            "native_assertion_rejections": (
+                                native_assertion_rejections
+                            ),
+                            "rejected_native_samples": attempt,
+                            "rejection_policy": (
+                                "zero_term_nonzero_entropy_assertion"
+                            ),
+                        }
+                    )
                 return {
                     "answer": answer,
-                    "metadata": {
-                        "attempt": attempt,
-                        "module": module_name,
-                        "seed": seed,
-                    },
+                    "metadata": metadata,
                     "question": question,
                 }
         raise RuntimeError(
