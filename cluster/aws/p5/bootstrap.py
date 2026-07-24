@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Verify and stage one immutable AWS P5 execution environment."""
+"""Verify and stage one immutable profile-selected AWS GPU environment."""
 
 from __future__ import annotations
 
@@ -28,8 +28,8 @@ from cluster.aws.p5.interruption_checkpoint import (
     S3ObjectStore,
 )
 from cluster.aws.p5.profile import (
-    AwsP5Profile,
-    AwsP5Runtime,
+    AwsGpuProfile,
+    AwsGpuRuntime,
     load_aws_p5_profile,
     validate_runtime_environment,
 )
@@ -37,7 +37,6 @@ from cluster.aws.p5.profile import (
 
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
-_H100_RE = re.compile(r"^NVIDIA H100 80GB(?: HBM3)?$")
 _CONTAINER_IMAGE_RE = re.compile(
     r"^[A-Za-z0-9][A-Za-z0-9./:_-]*@sha256:[0-9a-f]{64}$"
 )
@@ -157,8 +156,8 @@ def _default_boot_id() -> str:
 
 
 def inspect_hardware(
-    profile: AwsP5Profile,
-    runtime: AwsP5Runtime,
+    profile: AwsGpuProfile,
+    runtime: AwsGpuRuntime,
     *,
     metadata_get: Callable[[str], str | None],
     runner: Callable[
@@ -168,14 +167,16 @@ def inspect_hardware(
     container_image: str,
     boot_id_get: Callable[[], str] = _default_boot_id,
 ) -> BootstrapEvidence:
-    """Verify actual P5 identity, accelerators, Fabric Manager, NVMe, and image."""
+    """Verify actual AWS GPU identity, accelerators, NVMe, and image."""
 
     instance_id = _metadata_value(metadata_get, "meta-data/instance-id")
     if re.fullmatch(r"i-[0-9a-f]{8,17}", instance_id) is None:
         raise BootstrapError("IMDSv2 instance ID is invalid")
     instance_type = _metadata_value(metadata_get, "meta-data/instance-type")
     if instance_type != profile.instance_type:
-        raise BootstrapError("instance must be exactly p5.48xlarge")
+        raise BootstrapError(
+            f"instance must be exactly {profile.instance_type}"
+        )
     ami_id = _metadata_value(metadata_get, "meta-data/ami-id")
     if ami_id != runtime.ami_id:
         raise BootstrapError("running AMI does not match MS_AWS_AMI_ID")
@@ -269,9 +270,13 @@ def inspect_hardware(
         line.strip() for line in gpu_result.stdout.splitlines() if line.strip()
     )
     if len(gpu_names) != profile.allocated_gpus:
-        raise BootstrapError("exactly eight H100 devices are required")
-    if any(_H100_RE.fullmatch(name) is None for name in gpu_names):
-        raise BootstrapError("every accelerator must be an NVIDIA H100 80GB")
+        raise BootstrapError(
+            "exactly eight profile accelerator devices are required"
+        )
+    if any(not profile.matches_gpu_name(name) for name in gpu_names):
+        raise BootstrapError(
+            f"every accelerator must match {profile.gpu_model}"
+        )
 
     fabric = _bounded_result(
         runner,
@@ -474,8 +479,8 @@ def inspect_hardware(
 
 
 def build_aws_command_environment(
-    profile: AwsP5Profile,
-    runtime: AwsP5Runtime,
+    profile: AwsGpuProfile,
+    runtime: AwsGpuRuntime,
     *,
     private_home: Path,
 ) -> dict[str, str]:
@@ -504,8 +509,8 @@ def build_aws_command_environment(
 
 
 def render_bootstrap_commands(
-    profile: AwsP5Profile,
-    runtime: AwsP5Runtime,
+    profile: AwsGpuProfile,
+    runtime: AwsGpuRuntime,
     evidence: BootstrapEvidence,
     *,
     owner_uid: int,
@@ -1026,8 +1031,8 @@ def extract_verified_release(
 
 def build_bootstrap_receipt(
     *,
-    profile: AwsP5Profile,
-    runtime: AwsP5Runtime,
+    profile: AwsGpuProfile,
+    runtime: AwsGpuRuntime,
     evidence: BootstrapEvidence,
     artifacts: BootstrapArtifacts,
     prepared_release: PreparedRelease,
@@ -1065,7 +1070,7 @@ def build_bootstrap_receipt(
         "instance_type": evidence.instance_type,
         "profile_sha256": profile.sha256,
         "provider": profile.provider,
-        "receipt_type": "aws-p5-bootstrap",
+        "receipt_type": profile.bootstrap_receipt_type,
         "region": runtime.region,
         "release_members_sha256": prepared_release.members_sha256,
         "release_root": (
@@ -1166,6 +1171,8 @@ def _parser() -> argparse.ArgumentParser:
 def main(argv: Sequence[str] | None = None) -> int:
     try:
         arguments = _parser().parse_args(argv)
+        # Compatibility names are deliberate patch points for the legacy P5
+        # harness; both aliases dispatch through the neutral closed contract.
         profile = load_aws_p5_profile(arguments.profile)
         runtime = validate_runtime_environment(profile, os.environ)
         if (

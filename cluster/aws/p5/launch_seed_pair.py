@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Render and supervise one symmetric Dense/Split90 P5 seed pair."""
+"""Render and supervise one profile-selected symmetric AWS GPU seed pair."""
 
 from __future__ import annotations
 
@@ -38,19 +38,19 @@ from cluster.aws.p5.corpus_contract import (
     verify_canonical_corpus,
 )
 from cluster.aws.p5.profile import (
-    AwsP5Profile,
-    AwsP5Runtime,
-    load_aws_p5_profile,
-    validate_runtime_environment,
+    AwsGpuProfile,
+    AwsGpuRuntime,
+    load_aws_gpu_profile,
+    validate_aws_gpu_runtime_environment,
 )
 
 
+# Historical module constant retained for legacy receipt/import compatibility.
 PROVIDER = "aws-p5.48xlarge"
 COHORT_ID = "memorysplit-confirmatory-v2-360m-n5"
 _ARMS = ("dense", "split90")
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
-_H100_RE = re.compile(r"^NVIDIA H100 80GB(?: HBM3)?$")
 _CONTAINER_IMAGE_RE = re.compile(
     r"^[A-Za-z0-9][A-Za-z0-9./:_-]*@sha256:[0-9a-f]{64}$"
 )
@@ -177,8 +177,8 @@ class ArmLaunch:
 @dataclass(frozen=True)
 class LaunchPlan:
     seed: int
-    profile: AwsP5Profile
-    runtime: AwsP5Runtime
+    profile: AwsGpuProfile
+    runtime: AwsGpuRuntime
     repo_root: Path
     scratch_root: Path
     manifest_path: Path
@@ -305,6 +305,7 @@ def _validate_release_root(
     repo: Path,
     scratch: Path,
     *,
+    profile: AwsGpuProfile,
     release_sha256: str,
     release_members_sha256: str,
     code_commit: str,
@@ -390,15 +391,15 @@ def _validate_release_root(
         or _canonical_pretty(metadata) != metadata_bytes
         or metadata.get("schema_version") != 1
         or metadata.get("package_format_version") != 1
-        or metadata.get("provider") != PROVIDER
+        or metadata.get("provider") != profile.provider
         or metadata.get("source")
         != {"commit": code_commit, "dirty": False}
         or metadata.get("seed_assignment")
         != {
             "arms": ["dense", "split90"],
             "cohort_id": COHORT_ID,
-            "provider": PROVIDER,
-            "seeds": [1, 2, 3, 4],
+            "provider": profile.provider,
+            "seeds": list(profile.assigned_seeds),
         }
     ):
         raise LaunchError("release metadata identity does not match")
@@ -609,8 +610,8 @@ def _validate_bootstrap_receipt(
     path: Path,
     *,
     expected_sha256: str,
-    profile: AwsP5Profile,
-    runtime: AwsP5Runtime,
+    profile: AwsGpuProfile,
+    runtime: AwsGpuRuntime,
     release_sha256: str,
     release_members_sha256: str,
     cohort_sha256: str,
@@ -627,9 +628,9 @@ def _validate_bootstrap_receipt(
     _exact_fields(receipt, _BOOTSTRAP_FIELDS, label="bootstrap receipt")
     expected = {
         "schema_version": 2,
-        "receipt_type": "aws-p5-bootstrap",
-        "provider": PROVIDER,
-        "instance_type": "p5.48xlarge",
+        "receipt_type": profile.bootstrap_receipt_type,
+        "provider": profile.provider,
+        "instance_type": profile.instance_type,
         "region": runtime.region,
         "ami_id": runtime.ami_id,
         "container_digest": runtime.container_digest,
@@ -804,20 +805,23 @@ def load_launch_plan(
 ) -> LaunchPlan:
     """Validate all trust roots and return an immutable paired launch plan."""
 
-    profile = load_aws_p5_profile(profile_path)
+    profile = load_aws_gpu_profile(profile_path)
     try:
-        runtime = validate_runtime_environment(profile, environment)
+        runtime = validate_aws_gpu_runtime_environment(profile, environment)
     except ValueError as error:
         raise LaunchError(str(error)) from error
     if type(seed) is not int or seed not in profile.assigned_seeds:
-        raise LaunchError("seed must be assigned to AWS: one of 1, 2, 3, 4")
+        choices = ", ".join(str(item) for item in profile.assigned_seeds)
+        raise LaunchError(f"seed must be assigned to AWS: one of {choices}")
     actual_instance_type = (
         _default_instance_type()
         if observed_instance_type is None
         else observed_instance_type
     )
-    if actual_instance_type != "p5.48xlarge":
-        raise LaunchError("launch requires an actual p5.48xlarge instance")
+    if actual_instance_type != profile.instance_type:
+        raise LaunchError(
+            f"launch requires an actual {profile.instance_type} instance"
+        )
     actual_instance_id = (
         _default_instance_id()
         if observed_instance_id is None
@@ -847,10 +851,12 @@ def load_launch_plan(
         if gpu_names is None
         else tuple(gpu_names)
     )
-    if len(actual_gpu_names) != 8:
-        raise LaunchError("launch requires exactly eight H100 devices")
-    if any(_H100_RE.fullmatch(name) is None for name in actual_gpu_names):
-        raise LaunchError("launch requires eight NVIDIA H100 80GB devices")
+    if len(actual_gpu_names) != profile.allocated_gpus:
+        raise LaunchError("launch requires exactly eight profile GPU devices")
+    if any(not profile.matches_gpu_name(name) for name in actual_gpu_names):
+        raise LaunchError(
+            f"launch requires eight {profile.gpu_model} devices"
+        )
 
     repo = Path(repo_root).resolve(strict=True)
     scratch = Path(scratch_root).resolve(strict=True)
@@ -860,15 +866,17 @@ def load_launch_plan(
         os.path.abspath(profile.scratch_root)
     ):
         raise LaunchError(
-            "scratch root must be exactly the profile /mnt/memorysplit path"
+            f"scratch root must be exactly {profile.scratch_root}"
         )
     manifest_file = Path(manifest_path)
     manifest_digest = _hash_regular(manifest_file, label="run manifest")
     manifest = _load_json(manifest_file, label="run manifest")
     _exact_fields(manifest, _MANIFEST_FIELDS, label="run manifest")
     _exact_int(manifest["schema_version"], 1, label="manifest schema version")
-    if manifest["provider"] != PROVIDER:
-        raise LaunchError("run manifest provider must be aws-p5.48xlarge")
+    if manifest["provider"] != profile.provider:
+        raise LaunchError(
+            f"run manifest provider must be {profile.provider}"
+        )
     if manifest["cohort_id"] != COHORT_ID:
         raise LaunchError("run manifest cohort ID does not match")
     if type(manifest["seed"]) is not int or manifest["seed"] != seed:
@@ -964,6 +972,7 @@ def load_launch_plan(
         _validate_release_root(
             repo,
             scratch,
+            profile=profile,
             release_sha256=release_sha256,
             release_members_sha256=release_members_sha256,
             code_commit=code_commit,
@@ -974,9 +983,27 @@ def load_launch_plan(
     parsed_runs = []
     ports = []
     worker_budgets = []
-    for arm, expected_port_offset, expected_affinity in (
-        ("dense", 0, (0, 95)),
-        ("split90", 1, (96, 191)),
+    for (
+        arm,
+        expected_port_offset,
+        expected_affinity,
+        gpu_offset,
+        group_size,
+    ) in (
+        (
+            "dense",
+            0,
+            profile.cpu_affinity_halves[0],
+            0,
+            profile.train_groups[0],
+        ),
+        (
+            "split90",
+            1,
+            profile.cpu_affinity_halves[1],
+            profile.train_groups[0],
+            profile.train_groups[1],
+        ),
     ):
         run = runs[arm]
         expected_config = f"configs/360m-v2/{arm}-s{seed}.yaml"
@@ -1021,7 +1048,9 @@ def load_launch_plan(
             or any(type(item) is not int for item in affinity)
             or tuple(affinity) != expected_affinity
         ):
-            raise LaunchError(f"{arm} CPU affinity must use one P5 CPU half")
+            raise LaunchError(
+                f"{arm} CPU affinity must use its profile CPU half"
+            )
         workers = run["data_loader_workers"]
         if type(workers) is not int or workers <= 0 or workers > 48:
             raise LaunchError(f"{arm} data-loader worker budget is invalid")
@@ -1091,7 +1120,9 @@ def load_launch_plan(
             / f"seed-{seed}"
             / f"{arm}.json"
         )
-        gpu_ids = "0,1,2,3" if arm == "dense" else "4,5,6,7"
+        gpu_ids = ",".join(
+            str(index) for index in range(gpu_offset, gpu_offset + group_size)
+        )
         container_name = f"memorysplit-s{seed}-{arm}"
         cidfile_path = (
             scratch
@@ -1169,7 +1200,7 @@ def load_launch_plan(
             "-m",
             "torch.distributed.run",
             "--nnodes=1",
-            "--nproc_per_node=4",
+            f"--nproc_per_node={group_size}",
             "--rdzv_backend=c10d",
             f"--rdzv_endpoint=127.0.0.1:{port}",
             "/workspace/scripts/run_train.py",
@@ -1252,8 +1283,9 @@ def render_plan(plan: LaunchPlan) -> dict[str, object]:
             for launch in plan.arms
         ],
         "dry_run": True,
+        "gres": plan.profile.gres,
         "ok": True,
-        "provider": PROVIDER,
+        "provider": plan.profile.provider,
         "schema_version": 1,
         "seed": plan.seed,
     }
@@ -1338,7 +1370,7 @@ def preflight_trainer_contract(
     ] = _run_trainer_preflight,
     timeout_seconds: float = 120.0,
 ) -> None:
-    """Fail before launch unless the integrated trainer exposes every P5 hook."""
+    """Fail unless the integrated trainer exposes every AWS launcher hook."""
 
     if (
         isinstance(timeout_seconds, bool)
@@ -1751,17 +1783,21 @@ def _acquire_host_lock(scratch_root: Path):
     try:
         descriptor = os.open(lock_path, flags, 0o600)
     except OSError as error:
-        raise LaunchError("P5 seed-pair lock is unsafe or unavailable") from error
+        raise LaunchError(
+            "AWS GPU seed-pair lock is unsafe or unavailable"
+        ) from error
     handle = os.fdopen(descriptor, "r+b", buffering=0)
     try:
         if not stat.S_ISREG(os.fstat(descriptor).st_mode):
-            raise LaunchError("P5 seed-pair lock must be a regular file")
+            raise LaunchError(
+                "AWS GPU seed-pair lock must be a regular file"
+            )
         os.fchmod(descriptor, 0o600)
         fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError as error:
         handle.close()
         raise LaunchError(
-            "another seed pair is already active on this P5"
+            "another seed pair is already active on this AWS GPU host"
         ) from error
     except BaseException:
         handle.close()

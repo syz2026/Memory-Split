@@ -1,0 +1,15 @@
+{
+  "base": {
+    "digest": "sha256:3bfc0b4c9561561b4cd578cb78611ec6258e1791854000b58a279d5880afc7d6",
+    "image": "public.ecr.aws/deep-learning-containers/pytorch:2.12.1-cu130-amzn2023"
+  },
+  "runtime": {
+    "cuda": "13.0",
+    "gid": 10001,
+    "operating_system": "Amazon Linux 2023",
+    "pytorch": "2.12.1",
+    "uid": 10001,
+    "user": "memorysplit"
+  },
+  "schema_version": 1
+}

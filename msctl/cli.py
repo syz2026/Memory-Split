@@ -32,7 +32,7 @@ from .operations import (
     status_runs,
     submit_runs,
 )
-from .profile import AWS_P5_PROFILE, SUPPORTED_PROFILE, load_profile
+from .profile import AWS_GPU_PROFILES, SUPPORTED_PROFILE, load_profile
 
 
 SCHEMA_VERSION = 1
@@ -249,7 +249,7 @@ def dispatch(
     command = _command_name(args)
     environment = dict(os.environ if environ is None else environ)
     provider = getattr(profile, "provider", None)
-    if provider not in {SUPPORTED_PROFILE, AWS_P5_PROFILE}:
+    if provider != SUPPORTED_PROFILE and provider not in AWS_GPU_PROFILES:
         raise MsctlError(
             "PROVIDER_UNSUPPORTED",
             "profile provider is not supported",
@@ -266,7 +266,7 @@ def dispatch(
             apply=args.apply,
             cohort_loader=cohort_loader,
         )
-    if provider == AWS_P5_PROFILE:
+    if provider in AWS_GPU_PROFILES:
         if command == "submit":
             _require_cli_values(args, "instance_id", "terminate_at")
         if command in {"runs render", "submit", "resume", "evaluate"}:

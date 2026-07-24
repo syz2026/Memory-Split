@@ -1,4 +1,4 @@
-"""Strict, dry-run-first AWS P5 lifecycle backend."""
+"""Strict, dry-run-first backend shared by closed AWS GPU profiles."""
 
 from __future__ import annotations
 
@@ -41,11 +41,21 @@ from .jsonutil import (
     require_sha256,
     sha256_file,
 )
-from .profile import AWS_P5_PROFILE
+from .profile import AWS_GPU_PROFILES, AWS_P5_PROFILE
 from .state import StateStore
 
 
 INSTANCE_TYPE = "p5.48xlarge"
+_PROFILE_INSTANCE_TYPES = {
+    "aws-p5.48xlarge": "p5.48xlarge",
+    "aws-p5.48xlarge-v3": "p5.48xlarge",
+    "aws-p6-b300.48xlarge-v3": "p6-b300.48xlarge",
+}
+_PROFILE_SEEDS = {
+    "aws-p5.48xlarge": (1, 2, 3, 4),
+    "aws-p5.48xlarge-v3": tuple(range(10)),
+    "aws-p6-b300.48xlarge-v3": tuple(range(10)),
+}
 _INSTANCE_ID_RE = re.compile(r"^i-[0-9a-f]{8,17}$")
 _COMMAND_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9-]{7,127}$")
 _REGION_RE = re.compile(r"^[a-z]{2}(?:-[a-z0-9]+)+-[0-9]+$")
@@ -261,18 +271,34 @@ def _aws_output_list(value: object, *, label: str) -> list[object]:
 
 
 def _validate_profile(profile: object) -> None:
+    provider = getattr(profile, "provider", None)
+    expected_instance_type = _PROFILE_INSTANCE_TYPES.get(provider)
     if (
-        getattr(profile, "provider", None) != AWS_P5_PROFILE
-        or getattr(profile, "profile_id", None) != AWS_P5_PROFILE
-        or getattr(profile, "instance_type", None) != INSTANCE_TYPE
+        provider not in AWS_GPU_PROFILES
+        or getattr(profile, "profile_id", None) != provider
+        or getattr(profile, "instance_type", None) != expected_instance_type
         or getattr(profile, "purchase_model", None) != "on_demand"
         or getattr(profile, "allocated_gpus", None) != 8
         or getattr(profile, "train_groups", None) != (4, 4)
-        or getattr(profile, "assigned_seeds", None) != (1, 2, 3, 4)
+        or getattr(profile, "assigned_seeds", None)
+        != _PROFILE_SEEDS.get(provider)
+        or (
+            hasattr(profile, "vcpus")
+            and getattr(profile, "vcpus") != 192
+        )
+        or (
+            hasattr(profile, "memory_gib")
+            and getattr(profile, "memory_gib")
+            != (
+                4096
+                if provider == "aws-p6-b300.48xlarge-v3"
+                else 2048
+            )
+        )
     ):
         raise MsctlError(
             "PROFILE_INVALID",
-            "AWS backend requires the exact P5 4+4 provider profile",
+            "AWS backend requires one exact known 4+4 GPU provider profile",
         )
 
 
@@ -328,6 +354,7 @@ def aws_resource_request(
     operation: str,
     *,
     bindings: Mapping[str, object] | None = None,
+    profile: object | None = None,
 ) -> dict[str, object]:
     policy = {
         "submit": (1, 8, 1440, "scripts/run_train.py"),
@@ -341,7 +368,23 @@ def aws_resource_request(
             "APPROVAL_INVALID",
             "AWS operation has no approval resource policy",
         )
-    jobs, gpus, wall_minutes, script = policy[operation]
+    jobs, requested_gpus, wall_minutes, script = policy[operation]
+    gpus = (
+        int(getattr(profile, "allocated_gpus", requested_gpus))
+        if requested_gpus
+        else 0
+    )
+    gres = getattr(profile, "gres", "gpu:h100:8") if gpus else "none"
+    if (
+        type(gpus) is not int
+        or gpus != requested_gpus
+        or not isinstance(gres, str)
+        or (gpus and not gres.endswith(f":{gpus}"))
+    ):
+        raise MsctlError(
+            "PROFILE_INVALID",
+            "AWS GPU resource identity does not match the lifecycle policy",
+        )
     request: dict[str, object] = {
         "schema_version": 1,
         "operation": operation,
@@ -349,7 +392,7 @@ def aws_resource_request(
         "allocated_gpus": gpus,
         "wall_minutes": wall_minutes,
         "gpu_hours": gpus * wall_minutes / 60.0,
-        "gres": "gpu:h100:8" if gpus else "none",
+        "gres": gres,
         "script": script,
     }
     if bindings is not None:
@@ -358,7 +401,7 @@ def aws_resource_request(
 
 
 class AwsP5Backend:
-    """Provider backend whose only process boundary is an injected JSON runner."""
+    """Compatibility-named backend with one injected JSON process boundary."""
 
     def __init__(
         self,
@@ -450,12 +493,17 @@ class AwsP5Backend:
                 "AWS caller identity fields must be non-empty strings",
             )
         return {
-            "provider": AWS_P5_PROFILE,
+            "provider": self.profile.provider,
             "region": self.runtime.region,
             **output,
         }
 
     def _validate_manifest(self, manifest: object) -> None:
+        if self.profile.provider != AWS_P5_PROFILE:
+            raise MsctlError(
+                "RUN_MANIFEST_INVALID",
+                "v2 run manifests remain bound to the legacy AWS P5 profile",
+            )
         runs = getattr(manifest, "runs", ())
         if (
             getattr(manifest, "provider", None) != AWS_P5_PROFILE
@@ -557,6 +605,7 @@ class AwsP5Backend:
             require_sha256(digest, label=field)
         release_root = self._release_root(release)
         staging = "/mnt/memorysplit/staging"
+        profile_name = f"{self.profile.profile_id}.json"
         steps: list[dict[str, object]] = []
         if operation == "submit":
             assert terminate_at is not None
@@ -700,7 +749,7 @@ class AwsP5Backend:
                         "/usr/bin/python3",
                         "/opt/memorysplit/cluster/aws/p5/bootstrap.py",
                         "--profile",
-                        "/opt/memorysplit/cluster/profiles/aws-p5.48xlarge.json",
+                        f"/opt/memorysplit/cluster/profiles/{profile_name}",
                         "--container-image",
                         self.runtime.container_image,
                         "--release-archive",
@@ -883,7 +932,7 @@ class AwsP5Backend:
                 "--manifest",
                 f"{staging}/launcher-manifest-{manifest.sha256}.json",
                 "--profile",
-                f"{release_root}/cluster/profiles/aws-p5.48xlarge.json",
+                f"{release_root}/cluster/profiles/{profile_name}",
                 "--repo-root",
                 release_root,
                 "--scratch-root",
@@ -915,7 +964,7 @@ class AwsP5Backend:
                 "--manifest",
                 f"{staging}/launcher-manifest-{manifest.sha256}.json",
                 "--profile",
-                f"{release_root}/cluster/profiles/aws-p5.48xlarge.json",
+                f"{release_root}/cluster/profiles/{profile_name}",
                 "--repo-root",
                 release_root,
                 "--scratch-root",
@@ -1205,7 +1254,10 @@ class AwsP5Backend:
             arguments.extend(
                 [
                     "--filters",
-                    "Name=tag:MemorySplitProvider,Values=aws-p5.48xlarge",
+                    (
+                        "Name=tag:MemorySplitProvider,"
+                        f"Values={self.profile.provider}"
+                    ),
                     f"Name=tag:MemorySplitSeed,Values={manifest.seed}",
                     "Name=instance-state-name,Values=pending,running,stopping",
                 ]
@@ -1268,7 +1320,7 @@ class AwsP5Backend:
         terminate_at: str,
     ) -> dict[str, object]:
         return {
-            "provider": AWS_P5_PROFILE,
+            "provider": self.profile.provider,
             "seed": manifest.seed,
             "cohort_sha256": manifest.cohort_assignment_sha256,
             "release_sha256": manifest.release_sha256,
@@ -1310,7 +1362,7 @@ class AwsP5Backend:
         )
         if (
             row["instance_id"] != instance_id
-            or row["instance_type"] != INSTANCE_TYPE
+            or row["instance_type"] != self.profile.instance_type
             or row["state"] != "running"
             or row["instance_profile_arn"] != self.instance_profile_arn
             or row["ami_id"] != self.runtime.ami_id
@@ -1524,10 +1576,10 @@ class AwsP5Backend:
             if (
                 not isinstance(row["instance_id"], str)
                 or _INSTANCE_ID_RE.fullmatch(row["instance_id"]) is None
-                or row["instance_type"] != INSTANCE_TYPE
+                or row["instance_type"] != self.profile.instance_type
                 or row["state"] not in _ACTIVE_INSTANCE_STATES
                 or row["instance_profile_arn"] != self.instance_profile_arn
-                or row["provider"] != AWS_P5_PROFILE
+                or row["provider"] != self.profile.provider
                 or row["seed"] != manifest.seed
                 or row["cohort_sha256"]
                 != manifest.cohort_assignment_sha256
@@ -1686,7 +1738,8 @@ class AwsP5Backend:
             operation=operation,
             release_sha256=release.archive_sha256,
             scope_sha256=manifest.sha256,
-            resources=resources or aws_resource_request(operation),
+            resources=resources
+            or aws_resource_request(operation, profile=self.profile),
             profile=self.profile,
             environ=self.environ,
         )
@@ -1809,6 +1862,7 @@ class AwsP5Backend:
     ) -> dict[str, object]:
         return aws_resource_request(
             "submit",
+            profile=self.profile,
             bindings=self._execution_bindings(
                 release=release,
                 manifest=manifest,
@@ -1848,6 +1902,7 @@ class AwsP5Backend:
     ) -> dict[str, object]:
         return aws_resource_request(
             "cleanup",
+            profile=self.profile,
             bindings=self._execution_bindings(
                 release=release,
                 manifest=manifest,
@@ -1866,6 +1921,7 @@ class AwsP5Backend:
     ) -> dict[str, object]:
         return aws_resource_request(
             "evaluate",
+            profile=self.profile,
             bindings=self._execution_bindings(
                 release=release,
                 manifest=manifest,
@@ -1885,6 +1941,7 @@ class AwsP5Backend:
     ) -> dict[str, object]:
         return aws_resource_request(
             "resume",
+            profile=self.profile,
             bindings={
                 **self._execution_bindings(
                     release=release,
@@ -1938,13 +1995,14 @@ class AwsP5Backend:
             )
 
     def capacity_check(self) -> dict[str, object]:
+        instance_type = self.profile.instance_type
         argv = self._aws_argv(
             "ec2",
             "describe-instance-type-offerings",
             "--location-type",
             "region",
             "--filters",
-            f"Name=instance-type,Values={INSTANCE_TYPE}",
+            f"Name=instance-type,Values={instance_type}",
             query=(
                 "{offerings:InstanceTypeOfferings[]."
                 "{instance_type:InstanceType,location:Location,"
@@ -1966,7 +2024,7 @@ class AwsP5Backend:
                 label=f"EC2 offering[{index}]",
             )
             if (
-                row["instance_type"] != INSTANCE_TYPE
+                row["instance_type"] != instance_type
                 or row["location"] != self.runtime.region
                 or row["location_type"] != "region"
             ):
@@ -1978,16 +2036,16 @@ class AwsP5Backend:
         if not offerings:
             raise MsctlError(
                 "CAPACITY_INSUFFICIENT",
-                "P5 is not offered in the selected region",
+                "AWS GPU instance type is not offered in the selected region",
                 details={
                     "region": self.runtime.region,
-                    "instance_type": INSTANCE_TYPE,
+                    "instance_type": instance_type,
                 },
             )
         return {
-            "provider": AWS_P5_PROFILE,
+            "provider": self.profile.provider,
             "region": self.runtime.region,
-            "instance_type": INSTANCE_TYPE,
+            "instance_type": instance_type,
             "offered": True,
             "offerings": offerings,
         }
@@ -4546,6 +4604,15 @@ class AwsP5Backend:
             return False, self.auth_check()
         if command == "capacity check":
             return False, self.capacity_check()
+        if self.profile.provider != AWS_P5_PROFILE:
+            raise MsctlError(
+                "EXTERNAL_OPERATION_UNSUPPORTED",
+                "v3 AWS GPU lifecycle awaits a profile-bound manifest contract",
+                details={
+                    "operation": command,
+                    "provider": self.profile.provider,
+                },
+            )
         if command == "env ensure":
             apply = bool(getattr(args, "apply", False))
             lock_value = getattr(args, "lock", None)
@@ -4723,14 +4790,18 @@ def build_aws_backend(
     except (ImportError, ModuleNotFoundError) as error:
         raise MsctlError(
             "PROVIDER_ADAPTER_UNAVAILABLE",
-            "the AWS P5 runtime adapter is not installed",
+            "the AWS GPU runtime adapter is not installed",
             details={"adapter": module_name},
         ) from error
-    validator = getattr(module, "validate_runtime_environment", None)
+    validator = getattr(
+        module,
+        "validate_aws_gpu_runtime_environment",
+        getattr(module, "validate_runtime_environment", None),
+    )
     if not callable(validator):
         raise MsctlError(
             "PROVIDER_ADAPTER_UNAVAILABLE",
-            "the AWS P5 runtime adapter has no validator",
+            "the AWS GPU runtime adapter has no validator",
             details={"adapter": module_name},
         )
     try:
@@ -4757,3 +4828,7 @@ def build_aws_backend(
         approval_verifier=approval_verifier,
         environ=environment,
     )
+
+
+AwsGpuBackend = AwsP5Backend
+build_aws_gpu_backend = build_aws_backend
