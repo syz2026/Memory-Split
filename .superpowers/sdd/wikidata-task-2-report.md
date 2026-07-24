@@ -1317,3 +1317,152 @@ report. It supersedes older descriptions of random `.quarantine-*`,
 `.orphan-marker-*`, exact-removal, and `rmdir` behavior above. The current
 implementation uses only the fixed eight-slot `.wikidata-marker-*` pool:
 seven retained failed candidates plus one reusable empty marker.
+
+## Emergency marker-slot closure
+
+Status: `DONE`
+
+Implementation commit:
+`8d6f28697d072cdffadf755a86194a02de47690e` —
+`fix: reserve Wikidata emergency quarantine slot`.
+
+This appendix supersedes the prior statement that all eight slots participate
+in regular allocation. The fixed eight-name pool now has seven regular slots
+and one explicit emergency slot.
+
+### Root cause and implementation
+
+- Regular allocation and refresh previously consumed slot 7. If a retained
+  marker lost pathname authority after publication, refresh exhaustion could
+  leave the failed candidate at final and repeat the state-machine loop
+  indefinitely.
+- Regular marker allocation, refresh, and marker detach now use only slots
+  `0..6`. Slot `7` is never allocated as a marker and is never a regular
+  detach destination.
+- Both prepublication capacity checks prove slot 7 name-absent. The second
+  proof follows the final sealed-candidate verification and immediately
+  precedes the no-replace publication.
+- If no regular detach slot remains, the candidate is moved directly from
+  final to slot 7 rather than first exchanging it with the regular marker.
+  Thus the seventh failed candidate occupies the emergency slot while the
+  regular marker remains reusable.
+- If marker refresh fails or loses authority while the exact retained
+  candidate remains at final, the state machine stops marker retries and uses
+  the same emergency path. The original publication error remains primary and
+  the refresh error remains attached as quarantine evidence.
+- Emergency quarantine uses at most four descriptor-relative no-replace
+  rename attempts. It verifies that the entry moved to slot 7 is the retained
+  candidate, fsyncs the namespace, postchecks the candidate binding, and
+  requires final to be absent.
+- If a source race moves a wrong directory, that entry is opened and
+  name-bound to its descriptor/creation identity, no-replace restored to
+  final, postchecked, fsynced, and closed exhaustively. Transient destination
+  occupation is retried only inside the same four-attempt bound.
+- Once slot 7 contains an emergency-quarantined candidate, the next build
+  fails its prepublication check. The final content-addressed name remains
+  absent and the fixed namespace contains at most seven failed candidates plus
+  one reusable regular marker.
+- Marker-slot emptiness no longer calls the sorting/materializing
+  `list_entries`. A descriptor-based `os.scandir` probe requests at most one
+  entry and closes the iterator on empty, nonempty, iterator-error, and
+  close-error paths while preserving a primary body error.
+
+### TDD evidence
+
+The first pre-fix run exposed the liveness defect directly: the first test
+failed and the following occupied-emergency test entered the old unbounded
+detach loop. The 120-second bounded command was terminated rather than left
+running. Test-side classification guards were then added so the full RED
+selection terminated deterministically.
+
+```bash
+python -m pytest -q \
+  tests/test_reasoning_v2_wikidata_source.py::test_marker_loss_exhaustion_uses_emergency_quarantine \
+  tests/test_reasoning_v2_wikidata_source.py::test_transient_occupied_emergency_slot_retries_boundedly \
+  tests/test_reasoning_v2_wikidata_source.py::test_emergency_quarantine_restores_substituted_source \
+  tests/test_reasoning_v2_wikidata_source.py::test_marker_slot_inventory_probe_is_one_entry_bounded
+```
+
+Exact bounded RED result:
+
+```text
+FFFF                                                                     [100%]
+4 failed in 0.88s
+```
+
+The failures proved that normal refresh still consumed all eight slots,
+transient emergency occupation was not retried, a source race displaced the
+marker rather than the retained candidate, and marker inventory still called
+the materializing `list_entries`.
+
+The same selection after implementation:
+
+```text
+....                                                                     [100%]
+4 passed in 0.66s
+```
+
+### Final verification
+
+```bash
+python -m pytest -q tests/test_reasoning_v2_wikidata_source.py
+```
+
+```text
+........................................................................ [ 84%]
+.............                                                            [100%]
+85 passed in 3.88s
+```
+
+```bash
+python -m pytest -q \
+  tests/test_reasoning_v2_source_lock.py \
+  tests/test_current_sources.py
+```
+
+```text
+........................................................................ [ 64%]
+.......................................                                  [100%]
+111 passed in 14.96s
+```
+
+The regression fixtures were run outside the filesystem sandbox because they
+create temporary Git repositories. No network or AWS access was enabled or
+used.
+
+```bash
+python -m py_compile \
+  corpusgen/reasoning_v2/wikidata_source.py \
+  tests/test_reasoning_v2_wikidata_source.py
+git diff --check
+```
+
+Both static checks were silent with exit code zero.
+
+### Changed files and self-review
+
+- `corpusgen/reasoning_v2/wikidata_source.py`
+- `tests/test_reasoning_v2_wikidata_source.py`
+- `.superpowers/sdd/wikidata-task-2-report.md` (this appendix only)
+- The finite-loss test displaces the initial marker, then loses one refresh
+  marker. It proves immediate emergency fallback, exact candidate inode at
+  slot 7, final absence, finite classification count, and closure of every
+  recorded marker descriptor.
+- The occupied-slot test forces one no-replace collision and proves the second
+  bounded attempt moves the exact candidate. The substituted-source test
+  proves the wrong source returns to final while the retained candidate is not
+  left there.
+- The seven-failure test proves slot 7 contains the seventh candidate and that
+  the eighth attempt does not reach postpublication verification.
+- The adversarial inventory test supplies a conceptually unbounded iterator
+  that fails if read twice; production performs one `next`, closes it once,
+  never calls `list_entries`, and closes the slot descriptor.
+- External-sort bounds, deterministic bytes, Task 1 interfaces, schema/format
+  v1, and all prior authority/race tests remain unchanged and green.
+- The implementation commit contains exactly the authorized module/test
+  files. This report is committed separately. No amend, push, source mutation,
+  AWS operation, network operation, or other worktree edit occurred.
+
+### Concerns
+
+None.
