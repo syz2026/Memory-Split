@@ -46,6 +46,7 @@ HOST_CANDIDATE = {
         "kernel": "6.17",
         "efa": "1.47.0",
         "ofi_nccl": "1.18.0",
+        "nvlsm": "595.71.05",
     },
     "minimum_versions": {
         "cuda": "13.0",
@@ -53,6 +54,7 @@ HOST_CANDIDATE = {
         "kernel": "6.1",
         "efa": "1.44.0",
         "ofi_nccl": "1.17.1",
+        "nvlsm": "580.0",
     },
 }
 _SPEC_FIELDS = {

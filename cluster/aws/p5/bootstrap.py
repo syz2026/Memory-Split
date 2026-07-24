@@ -27,6 +27,7 @@ from cluster.aws.p5.interruption_checkpoint import (
     ImdsV2Client,
     S3ObjectStore,
 )
+from cluster.aws.gpu_profile import read_secure_regular_file
 from cluster.aws.p5.profile import (
     AwsP5Profile,
     AwsP5Runtime,
@@ -34,8 +35,9 @@ from cluster.aws.p5.profile import (
     validate_runtime_environment,
 )
 from cluster.aws.qualification import (
-    build_selected_bootstrap_receipt,
-    build_selected_environment_receipt,
+    _build_selected_bootstrap_receipt,
+    _build_selected_environment_receipt,
+    admit_cohort_provider_selection,
 )
 from msctl.aws_contracts import (
     ARMS,
@@ -1483,22 +1485,48 @@ def build_bootstrap_receipt(
 
 def bootstrap_authenticated_gpu_environment(
     *,
-    selected_profile: object,
-    selection_binding: object,
-    runtime_lock_data: bytes,
-    runtime_sbom_data: bytes,
-    environment_receipt: Mapping[str, object],
+    authority_root: Path | str,
+    repo_root: Path | str,
+    runtime_lock_path: Path | str,
+    runtime_evidence_path: Path | str,
+    runtime_sbom_path: Path | str,
+    environment_receipt_path: Path | str,
+    store: object,
+    account_id: str,
+    instance_id: str,
+    boot_id: str,
+    seed: int,
+    expected_selection_version_id: str,
+    identity_verifier: object,
+    approval_verifier: object,
+    trusted_public_key_sha256: str,
     hardware_reader: object,
 ) -> dict[str, object]:
     """Measure through an injected reader and bind selected bootstrap facts."""
 
+    authority = admit_cohort_provider_selection(
+        authority_root=authority_root,
+        repo_root=repo_root,
+        runtime_lock_path=runtime_lock_path,
+        runtime_evidence_path=runtime_evidence_path,
+        store=store,
+        account_id=account_id,
+        instance_id=instance_id,
+        boot_id=boot_id,
+        seed=seed,
+        expected_selection_version_id=expected_selection_version_id,
+        identity_verifier=identity_verifier,
+        approval_verifier=approval_verifier,
+        trusted_public_key_sha256=trusted_public_key_sha256,
+    )
+    selected_profile = authority.profile
     measure = getattr(hardware_reader, "measure", None)
     if not callable(measure):
         raise BootstrapError("selected hardware reader is unavailable")
     try:
         evidence = measure(
             selected_profile=selected_profile,
-            selection_binding=selection_binding,
+            selection_binding=authority.bindings["dense"],
         )
     except BootstrapError:
         raise
@@ -1507,9 +1535,26 @@ def bootstrap_authenticated_gpu_environment(
     if not isinstance(evidence, Mapping):
         raise BootstrapError("selected hardware measurement is not an object")
     try:
-        return build_selected_bootstrap_receipt(
-            selected_profile=selected_profile,
-            selection_binding=selection_binding,
+        runtime_lock_data = read_secure_regular_file(
+            runtime_lock_path,
+            label="selected runtime lock",
+            max_bytes=1024 * 1024,
+        )
+        runtime_sbom_data = read_secure_regular_file(
+            runtime_sbom_path,
+            label="selected runtime SBOM",
+            max_bytes=512 * 1024 * 1024,
+        )
+        environment_data = read_secure_regular_file(
+            environment_receipt_path,
+            label="selected environment receipt",
+            max_bytes=16 * 1024 * 1024,
+        )
+        environment_receipt = json.loads(environment_data)
+        if not isinstance(environment_receipt, dict):
+            raise BootstrapError("selected environment receipt is not an object")
+        return _build_selected_bootstrap_receipt(
+            selection_authority=authority,
             runtime_lock_data=runtime_lock_data,
             runtime_sbom_data=runtime_sbom_data,
             environment_receipt=environment_receipt,

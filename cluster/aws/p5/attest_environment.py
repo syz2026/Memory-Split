@@ -27,7 +27,8 @@ from cluster.aws.p5.profile import (
     parse_aws_p5_profile_bytes,
 )
 from cluster.aws.qualification import (
-    build_selected_environment_receipt,
+    _build_selected_environment_receipt,
+    admit_cohort_provider_selection,
     canonical_qualification_json,
 )
 from msctl.aws_contracts import (
@@ -1599,10 +1600,20 @@ def attest_selected_gpu_environment(
 
 def attest_authenticated_gpu_environment(
     *,
-    selected_profile: object,
-    selection_binding: object,
+    authority_root: Path | str,
+    repo_root: Path | str,
     runtime_lock_path: Path | str,
+    runtime_evidence_path: Path | str,
     runtime_sbom_path: Path | str,
+    store: object,
+    account_id: str,
+    instance_id: str,
+    boot_id: str,
+    seed: int,
+    expected_selection_version_id: str,
+    identity_verifier: object,
+    approval_verifier: object,
+    trusted_public_key_sha256: str,
     control_bundle_path: Path | str,
     output_path: Path | str,
     apply: bool,
@@ -1617,6 +1628,22 @@ def attest_authenticated_gpu_environment(
     measurements and publishes a distinct closed receipt.
     """
 
+    authority = admit_cohort_provider_selection(
+        authority_root=authority_root,
+        repo_root=repo_root,
+        runtime_lock_path=runtime_lock_path,
+        runtime_evidence_path=runtime_evidence_path,
+        store=store,
+        account_id=account_id,
+        instance_id=instance_id,
+        boot_id=boot_id,
+        seed=seed,
+        expected_selection_version_id=expected_selection_version_id,
+        identity_verifier=identity_verifier,
+        approval_verifier=approval_verifier,
+        trusted_public_key_sha256=trusted_public_key_sha256,
+    )
+    selected_profile = authority.profile
     evidence = attest_selected_gpu_environment(
         selected_profile=selected_profile,
         runtime_lock_path=runtime_lock_path,
@@ -1633,9 +1660,8 @@ def attest_authenticated_gpu_environment(
         label="runtime SBOM",
         maximum_bytes=512 * 1024 * 1024,
     )
-    receipt = build_selected_environment_receipt(
-        selected_profile=selected_profile,
-        selection_binding=selection_binding,
+    receipt = _build_selected_environment_receipt(
+        selection_authority=authority,
         runtime_lock_data=lock_data,
         runtime_sbom_data=sbom_data,
         attestation_evidence=evidence,

@@ -20,11 +20,10 @@ manual resolution.
 
 ## Delivered
 
-- Added a side-effect-free selected-profile contract that requires an
-  `AwsGpuProfile` and `AuthenticatedSelectionBinding`, then binds the hardware
-  amendment, provider-selection hash and exact version, profile, runtime lock,
-  runtime SBOM, prior qualification/approval evidence, account, instance,
-  boot, region, availability zone, AMI, image, and measured facts.
+- Added selected-profile contracts that re-enter fixed provider-selection
+  authority and derive the authenticated profile and both arm scopes before
+  binding hardware amendment, provider-selection version, runtime, account,
+  instance, boot, AMI, image, and measured facts.
 - Added closed canonical parsers for the selected environment, bootstrap, and
   qualification receipts. Profile, runtime, selection, placement, open-field,
   and P5/P6 cross-authorization drift fail closed.
@@ -77,3 +76,50 @@ No live Docker, AWS, S3, EC2, or paid-capacity action was run; tests use only
 injected command, object-store, time, identity, and hardware fixtures. Corpus,
 evaluation, scientific 360M configs, provisioning, shared Task 3C checkpoint
 mirroring, and interruption-journal files are unchanged.
+
+## Critical/Important review remediation
+
+This section supersedes the initial caller-binding, shallow-SBOM, concurrency,
+toy-throughput, and checkpoint claims above.
+
+- Public selected environment, bootstrap, and canary APIs no longer accept an
+  `AuthenticatedSelectionBinding` or selected profile. They take fixed
+  authority/runtime/evidence paths and production store/crypto verifiers, call
+  `admit_provider_selection` independently for Dense and Split90, require one
+  cohort selection, and bind the exact seed plus both arm scopes. Caller-made
+  bindings are reachable only through private testable helpers.
+- Runtime SBOM admission now invokes the exact closed parser in the reviewed
+  runtime module. Complete dependency, inherited-base, dpkg, Python package,
+  host, image, lock, and command/input provenance is mandatory. NVLSM is a
+  closed host fact/floor, and `qualification_worker_sha256` must equal the
+  worker copied into the digest-pinned image.
+- The controller starts both four-rank processes before polling either. It
+  records PID, monotonic start/end, rendezvous, GPUs, CPUs, port, and exit
+  status; requires positive measured overlap and disjoint resources; and
+  derives `simultaneous_groups` from that evidence. A production `Popen`
+  launcher and selected dry-run/apply CLI are included; tests inject fakes.
+- The worker loads the exact frozen d360m config for each seed/arm: context
+  1024, micro-batch 8, 524,288 tokens/update, 13,582 steps, compile enabled,
+  and the named Dense/Split90 sidecar. It runs the repository Trainer against
+  the bound corpus, derives throughput from real step token counts/timings,
+  and requires distinct measured sidecar streams and target-weight statistics.
+- Each group measures finite BF16 model output/loss, SDPA forward/backward,
+  gradients, compiled-model execution, and fused AdamW. After 100 real updates
+  it checkpoints model, optimizer, data cursor, and Python/NumPy/Torch/CUDA
+  RNG, compares the next uninterrupted and resumed updates, and enforces model,
+  optimizer, loss, step, and cursor equivalence at frozen `1e-6` tolerance.
+
+### Remediation RED/GREEN evidence
+
+- Authority re-entry/scope: missing cohort API, unsafe public signatures,
+  exposed forged-binding builders, and dropped arm scope each failed before
+  implementation; six focused authority tests passed after correction.
+- Closed SBOM: eight shallow/open/missing provenance mutations were accepted
+  or unsupported in RED; all eight fail closed in GREEN.
+- Process concurrency/telemetry: six absent/sequential/overlap/resource cases
+  failed in RED; measured overlap and telemetry tests pass in GREEN.
+- Worker/CLI: reviewed geometry, non-toy group evidence, sidecar distinction,
+  and production CLI arguments each failed before implementation.
+- Hardened qualification/runtime suite: **87 passed**.
+- Full requested regression superset: **479 passed** (the prior 454 plus 25
+  review-remediation tests).

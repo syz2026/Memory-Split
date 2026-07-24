@@ -9,13 +9,16 @@ contains the live probe implementation but does not execute at import time.
 from __future__ import annotations
 
 import argparse
+import copy
 import hashlib
 import io
 import json
 import math
 import os
 import platform
+import random
 import re
+import shutil
 import statistics
 import subprocess
 import sys
@@ -23,9 +26,93 @@ import time
 from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 
+import numpy as np
+
 
 class QualificationWorkerError(ValueError):
     """A measured worker fact or capability failed closed."""
+
+
+def load_reviewed_geometry(
+    config_path: Path | str,
+    *,
+    arm: str,
+) -> dict[str, object]:
+    """Load the exact frozen d360m qualification geometry for one arm."""
+
+    import yaml
+
+    if arm not in {"dense", "split90"}:
+        raise QualificationWorkerError("reviewed qualification arm is invalid")
+    path = Path(config_path)
+    try:
+        value = yaml.safe_load(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, ValueError) as error:
+        raise QualificationWorkerError(
+            "reviewed qualification config cannot be loaded"
+        ) from error
+    expected_sidecar = (
+        "dense_target_weights"
+        if arm == "dense"
+        else "split90_target_weights"
+    )
+    expected = {
+        "schema_version": 2,
+        "cohort_id": "memorysplit-confirmatory-v3-360m-n10-aws",
+        "condition": arm,
+        "model": "d360m",
+        "ctx": 1024,
+        "train_corpus": "dataset/receipt.json",
+        "sidecar_name": expected_sidecar,
+        "micro_batch_size": 8,
+        "tokens_per_step": 524_288,
+        "max_steps": 13_582,
+        "total_tokens": 7_120_879_616,
+        "lr": 0.001,
+        "warmup_steps": 300,
+        "weight_decay": 0.1,
+        "compile": True,
+        "device": "cuda",
+        "log_every": 20,
+        "eval_every": 250,
+        "snapshot_steps": [1_358, 3_396, 6_791, 10_187, 13_582],
+        "ckpt_minutes": 30,
+    }
+    if not isinstance(value, dict):
+        raise QualificationWorkerError("reviewed qualification config is not an object")
+    for field, expected_value in expected.items():
+        if type(value.get(field)) is not type(expected_value) or value.get(
+            field
+        ) != expected_value:
+            raise QualificationWorkerError(
+                f"reviewed qualification config {field} differs"
+            )
+    seed = value.get("seed")
+    run_id = value.get("run_id")
+    out_dir = value.get("out_dir")
+    if (
+        type(seed) is not int
+        or seed not in range(10)
+        or run_id != f"memorysplit-v3-360m-s{seed}-{arm}"
+        or out_dir != f"runs/seed-{seed}/{arm}"
+        or set(value) != {*expected, "seed", "run_id", "out_dir"}
+        or value["max_steps"] * value["tokens_per_step"]
+        != value["total_tokens"]
+    ):
+        raise QualificationWorkerError(
+            "reviewed qualification config identity or token geometry differs"
+        )
+    return {
+        "arm": arm,
+        "model": value["model"],
+        "ctx": value["ctx"],
+        "micro_batch_size": value["micro_batch_size"],
+        "tokens_per_step": value["tokens_per_step"],
+        "total_tokens": value["total_tokens"],
+        "max_steps": value["max_steps"],
+        "sidecar_name": value["sidecar_name"],
+        "compile": value["compile"],
+    }
 
 
 def _canonical(value: object) -> bytes:
@@ -342,15 +429,41 @@ def _torch_versions(torch) -> dict[str, str]:
 
 
 def _one_step_resume(torch, device) -> tuple[bool, str]:
+    random.seed(1731)
+    np.random.seed(1731)
     torch.manual_seed(1731)
+    torch.cuda.manual_seed_all(1731)
     model = torch.nn.Linear(32, 32, bias=True, device=device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3, fused=True)
+
+    def step(candidate, selected_optimizer):
+        selected_optimizer.zero_grad(set_to_none=True)
+        scale = random.random() + float(np.random.random())
+        inputs = torch.rand(
+            (32, 32),
+            device=device,
+            dtype=torch.float32,
+        ) * scale
+        loss = candidate(inputs).square().mean()
+        loss.backward()
+        selected_optimizer.step()
+        return loss.detach()
+
+    first_progress_loss = step(model, optimizer)
+    if not torch.isfinite(first_progress_loss):
+        raise QualificationWorkerError("checkpoint progress loss is not finite")
     checkpoint = io.BytesIO()
     torch.save(
         {
             "model": model.state_dict(),
             "optimizer": optimizer.state_dict(),
-            "rng": torch.get_rng_state(),
+            "progress_step": 1,
+            "rng": {
+                "python": random.getstate(),
+                "numpy": np.random.get_state(),
+                "torch": torch.get_rng_state(),
+                "cuda": torch.cuda.get_rng_state(device),
+            },
         },
         checkpoint,
     )
@@ -370,16 +483,18 @@ def _one_step_resume(torch, device) -> tuple[bool, str]:
     )
     resumed.load_state_dict(state["model"])
     resumed_optimizer.load_state_dict(state["optimizer"])
-    inputs = torch.arange(1024, device=device, dtype=torch.float32).reshape(32, 32)
-
-    def step(candidate, selected_optimizer):
-        selected_optimizer.zero_grad(set_to_none=True)
-        loss = candidate(inputs).square().mean()
-        loss.backward()
-        selected_optimizer.step()
-        return loss.detach()
-
+    if state.get("progress_step") != 1 or set(state.get("rng", {})) != {
+        "python",
+        "numpy",
+        "torch",
+        "cuda",
+    }:
+        raise QualificationWorkerError("checkpoint RNG/progress state is invalid")
     first_loss = step(model, optimizer)
+    random.setstate(state["rng"]["python"])
+    np.random.set_state(state["rng"]["numpy"])
+    torch.set_rng_state(state["rng"]["torch"])
+    torch.cuda.set_rng_state(state["rng"]["cuda"], device=device)
     resumed_loss = step(resumed, resumed_optimizer)
     torch.cuda.synchronize(device)
     exact = torch.equal(first_loss, resumed_loss) and all(
@@ -456,18 +571,181 @@ def _parse_affinity(value: str) -> list[int]:
     return [start, end]
 
 
+def _trainer_tree_equivalent(
+    torch,
+    left: object,
+    right: object,
+    *,
+    tolerance: float,
+) -> bool:
+    if isinstance(left, torch.Tensor):
+        return (
+            isinstance(right, torch.Tensor)
+            and left.shape == right.shape
+            and left.dtype == right.dtype
+            and torch.allclose(
+                left.detach().cpu(),
+                right.detach().cpu(),
+                rtol=0.0,
+                atol=tolerance,
+                equal_nan=False,
+            )
+        )
+    if type(left) is not type(right):
+        return False
+    if isinstance(left, dict):
+        return tuple(left) == tuple(right) and all(
+            _trainer_tree_equivalent(
+                torch,
+                left[key],
+                right[key],
+                tolerance=tolerance,
+            )
+            for key in left
+        )
+    if isinstance(left, (list, tuple)):
+        return len(left) == len(right) and all(
+            _trainer_tree_equivalent(torch, a, b, tolerance=tolerance)
+            for a, b in zip(left, right, strict=True)
+        )
+    if isinstance(left, float):
+        return (
+            math.isfinite(left)
+            and math.isfinite(right)
+            and abs(left - right) <= tolerance
+        )
+    return left == right
+
+
+def _trainer_state(torch, trainer) -> dict[str, object]:
+    return {
+        "model": {
+            name: tensor.detach().cpu().clone()
+            for name, tensor in trainer._raw_model().state_dict().items()
+        },
+        "optimizer": copy.deepcopy(trainer.opt.state_dict()),
+        "data": copy.deepcopy(trainer.data.state_dict()),
+        "step": trainer.step,
+    }
+
+
+def _measure_trainer_capabilities(torch, trainer) -> dict[str, bool]:
+    from train.data import synchronized_rank_batch_plan
+
+    plan = synchronized_rank_batch_plan(
+        global_cursor=trainer.data.global_cursor,
+        total_sequences=trainer.sequences_per_step,
+        ctx=trainer.data.ctx,
+        micro_batch_size=trainer.micro_bs,
+        rank=trainer.rank,
+        world_size=trainer.world_size,
+    )
+    batch_slice = next(item for item in plan if item is not None)
+    x, y, weights = trainer.data.weighted_batch_from_slice(batch_slice)
+    trainer.opt.zero_grad(set_to_none=True)
+    with trainer._autocast():
+        logits, loss = trainer.model(
+            x,
+            y,
+            target_weights=weights,
+            loss_reduction="mean",
+        )
+    if loss is None:
+        raise QualificationWorkerError("reviewed model returned no qualification loss")
+    loss.backward()
+    gradient_finite = all(
+        parameter.grad is None or torch.isfinite(parameter.grad).all().item()
+        for parameter in trainer.model.parameters()
+    )
+    compiled = trainer.model
+    if isinstance(compiled, torch.nn.parallel.DistributedDataParallel):
+        compiled = compiled.module
+    result = {
+        "bf16_output_finite": (
+            logits.dtype is torch.bfloat16
+            and torch.isfinite(logits).all().item()
+            and torch.isfinite(loss).item()
+        ),
+        "sdpa_forward_finite": torch.isfinite(logits).all().item(),
+        "sdpa_backward_finite": gradient_finite,
+        "compiled_model": bool(
+            trainer.cfg.get("compile") and hasattr(compiled, "_orig_mod")
+        ),
+        "fused_adamw": trainer.opt.defaults.get("fused") is True,
+        "gradient_finite": gradient_finite,
+    }
+    trainer.opt.zero_grad(set_to_none=True)
+    return {name: bool(value) for name, value in result.items()}
+
+
+def _sidecar_evidence(torch, trainer) -> dict[str, object]:
+    from train.data import synchronized_rank_batch_plan
+
+    plan = synchronized_rank_batch_plan(
+        global_cursor=trainer.data.global_cursor,
+        total_sequences=trainer.sequences_per_step,
+        ctx=trainer.data.ctx,
+        micro_batch_size=trainer.micro_bs,
+        rank=trainer.rank,
+        world_size=trainer.world_size,
+    )
+    local_sum = 0.0
+    local_nonzero = 0
+    local_items = 0
+    for batch_slice in plan:
+        if batch_slice is None:
+            continue
+        _x, _y, weights = trainer.data.weighted_batch_from_slice(batch_slice)
+        local_sum += float(weights.sum().item())
+        local_nonzero += int(weights.ne(0).sum().item())
+        local_items += weights.numel()
+    measured = torch.tensor(
+        [local_sum, float(local_nonzero), float(local_items)],
+        dtype=torch.float64,
+        device=trainer.device,
+    )
+    torch.distributed.all_reduce(measured)
+    weights = trainer.data.provenance.get("weights")
+    if not isinstance(weights, dict):
+        raise QualificationWorkerError("reviewed sidecar provenance is missing")
+    return {
+        "name": trainer.data.provenance.get("sidecar_name"),
+        "stream_sha256": weights.get("sha256"),
+        "items": int(measured[2].item()),
+        "nonzero_targets": int(measured[1].item()),
+        "target_weight_sum": float(measured[0].item()),
+    }
+
+
 def run_nccl_train(
     *,
     arm: str,
+    config: str,
+    qualification_root: str,
     gpu_ids: str,
     cpu_affinity: str,
     master_port: int,
     updates: int,
     warmup_updates: int,
 ) -> dict[str, object] | None:
-    """Run one independent four-rank NCCL/training group."""
+    """Run one exact reviewed four-rank arm and prove deterministic resume."""
 
     import torch
+    import yaml
+
+    root = Path(qualification_root).resolve(strict=True)
+    config_path = Path(config).resolve(strict=True)
+    try:
+        config_path.relative_to(root)
+    except ValueError as error:
+        raise QualificationWorkerError(
+            "reviewed qualification config escapes its root"
+        ) from error
+    geometry = load_reviewed_geometry(config_path, arm=arm)
+    if str(root) not in sys.path:
+        sys.path.insert(0, str(root))
+    os.chdir(root)
+    from train.trainer import Trainer
 
     if arm not in {"dense", "split90"}:
         raise QualificationWorkerError("qualification arm is invalid")
@@ -496,50 +774,183 @@ def run_nccl_train(
     all_reduce_seconds = time.perf_counter() - started
     if reduced.item() != 10.0 or not math.isfinite(all_reduce_seconds):
         raise QualificationWorkerError("NCCL all-reduce evidence is invalid")
+    try:
+        with config_path.open("r", encoding="utf-8") as stream:
+            cfg = yaml.safe_load(stream)
+        if not isinstance(cfg, dict):
+            raise QualificationWorkerError("reviewed training config is not an object")
+        output_root = Path(f"/tmp/memorysplit-qualification-{arm}")
+        resume_root = Path(f"/tmp/memorysplit-qualification-{arm}-resumed")
+        checkpoint_copy = Path(f"/tmp/memorysplit-qualification-{arm}-step.pt")
+        if rank == 0:
+            for candidate in (output_root, resume_root):
+                if candidate.exists():
+                    shutil.rmtree(candidate)
+            checkpoint_copy.unlink(missing_ok=True)
+        torch.distributed.barrier()
+        cfg = copy.deepcopy(cfg)
+        cfg["out_dir"] = str(output_root)
+        torch.cuda.reset_peak_memory_stats(device)
+        trainer = Trainer(cfg, resume="none")
+        resumed = None
+        try:
+            capabilities = _measure_trainer_capabilities(torch, trainer)
+            sidecar = _sidecar_evidence(torch, trainer)
+            trainer._capture_operational_metrics = True
+            trainer.operational_start_step = trainer.step
+            trainer.train_steps(updates)
+            if trainer.step != updates or trainer.data.global_cursor != (
+                updates * trainer.tokens_per_step
+            ):
+                raise QualificationWorkerError(
+                    "reviewed training did not make exact progress"
+                )
+            checkpoint_step = trainer.step
+            rates = list(trainer.operational_step_tok_s)
+            if rank == 0:
+                checkpoint_bytes = trainer.ckpt_path.read_bytes()
+                checkpoint_copy.write_bytes(checkpoint_bytes)
+            torch.distributed.barrier()
+            checkpoint_bytes = checkpoint_copy.read_bytes()
+            checkpoint_sha256 = hashlib.sha256(checkpoint_bytes).hexdigest()
+            checkpoint_hashes: list[str | None] = [None] * world_size
+            torch.distributed.all_gather_object(
+                checkpoint_hashes,
+                checkpoint_sha256,
+            )
+            checkpoint_sha256 = str(checkpoint_hashes[0])
+            if (
+                not checkpoint_sha256
+                or any(item != checkpoint_sha256 for item in checkpoint_hashes)
+            ):
+                raise QualificationWorkerError(
+                    "ranks disagree on progressed checkpoint"
+                )
+            checkpoint_state = torch.load(
+                checkpoint_copy,
+                map_location=device,
+                weights_only=False,
+            )
+            rng_by_rank = checkpoint_state.get("rng_by_rank")
+            if (
+                checkpoint_state.get("step") != checkpoint_step
+                or checkpoint_step < 1
+                or not isinstance(rng_by_rank, list)
+                or len(rng_by_rank) != world_size
+                or any(
+                    not isinstance(record, dict)
+                    or set(record) != {"python", "numpy", "torch", "cuda"}
+                    for record in rng_by_rank
+                )
+            ):
+                raise QualificationWorkerError(
+                    "progressed checkpoint RNG/state closure is invalid"
+                )
+            uninterrupted_loss = trainer.train_steps(1)
+            uninterrupted = _trainer_state(torch, trainer)
+            if trainer.step != checkpoint_step + 1:
+                raise QualificationWorkerError(
+                    "uninterrupted matched step did not advance"
+                )
 
-    torch.cuda.reset_peak_memory_stats(device)
-    parameter = torch.nn.Parameter(
-        torch.randn((512, 512), dtype=torch.bfloat16, device=device)
-    )
-    optimizer = torch.optim.AdamW([parameter], lr=1e-3, fused=True)
-    samples: list[float] = []
-    tokens = 16_384
-    for _ in range(updates):
-        optimizer.zero_grad(set_to_none=True)
-        batch_started = time.perf_counter()
-        loss = (parameter @ parameter).float().square().mean()
-        loss.backward()
-        optimizer.step()
-        torch.cuda.synchronize(device)
-        elapsed = time.perf_counter() - batch_started
-        if elapsed <= 0 or not math.isfinite(elapsed):
-            raise QualificationWorkerError("training timer is invalid")
-        samples.append(tokens / elapsed)
-    checkpoint_resume_exact, checkpoint_sha256 = _one_step_resume(torch, device)
-    peak_memory_bytes = int(torch.cuda.max_memory_allocated(device))
-    retained = samples[warmup_updates:]
-    if not retained or peak_memory_bytes <= 0 or not checkpoint_resume_exact:
-        raise QualificationWorkerError("training/checkpoint evidence is invalid")
-    result = {
-        "arm": arm,
-        "world_size": world_size,
-        "gpu_ids": selected_gpus,
-        "cpu_affinity": selected_affinity,
-        "master_port": master_port,
-        "all_reduce_sum": float(reduced.item()),
-        "all_reduce_latency_seconds": float(all_reduce_seconds),
-        "updates": updates,
-        "warmup_updates": warmup_updates,
-        "median_tok_s": float(statistics.median(retained)),
-        "peak_memory_bytes": peak_memory_bytes,
-        "one_step_train": True,
-        "checkpoint_resume_exact": checkpoint_resume_exact,
-        "checkpoint_sha256": checkpoint_sha256,
-        "resumed_checkpoint_sha256": checkpoint_sha256,
-    }
-    torch.distributed.barrier()
-    torch.distributed.destroy_process_group()
-    return result if rank == 0 else None
+            resumed_cfg = copy.deepcopy(cfg)
+            resumed_cfg["out_dir"] = str(resume_root)
+            resumed = Trainer(
+                resumed_cfg,
+                resume="auto",
+                resume_path=checkpoint_copy,
+                resume_sha256=checkpoint_sha256,
+            )
+            if resumed.step != checkpoint_step:
+                raise QualificationWorkerError(
+                    "resume did not restore progressed checkpoint step"
+                )
+            resumed_loss = resumed.train_steps(1)
+            resumed_state = _trainer_state(torch, resumed)
+            tolerance = 1e-6
+            model_equivalent = _trainer_tree_equivalent(
+                torch,
+                uninterrupted["model"],
+                resumed_state["model"],
+                tolerance=tolerance,
+            )
+            optimizer_equivalent = _trainer_tree_equivalent(
+                torch,
+                uninterrupted["optimizer"],
+                resumed_state["optimizer"],
+                tolerance=tolerance,
+            )
+            loss_delta = abs(float(uninterrupted_loss) - float(resumed_loss))
+            cursor_before = checkpoint_state["data"]["global_cursor"]
+            cursor_after = uninterrupted["data"]["global_cursor"]
+            resumed_cursor_after = resumed_state["data"]["global_cursor"]
+            if (
+                not model_equivalent
+                or not optimizer_equivalent
+                or not math.isfinite(loss_delta)
+                or loss_delta > tolerance
+                or cursor_before != checkpoint_step * trainer.tokens_per_step
+                or cursor_after != (checkpoint_step + 1) * trainer.tokens_per_step
+                or resumed_cursor_after != cursor_after
+            ):
+                raise QualificationWorkerError(
+                    "matched uninterrupted/resumed step is not equivalent"
+                )
+            if (
+                len(rates) != updates
+                or any(
+                    not math.isfinite(rate) or rate <= 0
+                    for rate in rates
+                )
+            ):
+                raise QualificationWorkerError(
+                    "reviewed throughput samples are incomplete"
+                )
+            step_seconds = [
+                trainer.tokens_per_step / rate
+                for rate in rates
+            ]
+            peak_memory_bytes = int(torch.cuda.max_memory_allocated(device))
+            result = {
+                "arm": arm,
+                "world_size": world_size,
+                "gpu_ids": selected_gpus,
+                "cpu_affinity": selected_affinity,
+                "master_port": master_port,
+                "all_reduce_sum": float(reduced.item()),
+                "all_reduce_latency_seconds": float(all_reduce_seconds),
+                "updates": updates,
+                "warmup_updates": warmup_updates,
+                "step_seconds": step_seconds,
+                "step_tokens": [trainer.tokens_per_step] * updates,
+                "peak_memory_bytes": peak_memory_bytes,
+                "geometry": geometry,
+                "sidecar": sidecar,
+                "capabilities": capabilities,
+                "resume": {
+                    "checkpoint_sha256": checkpoint_sha256,
+                    "checkpoint_step": checkpoint_step,
+                    "next_step": checkpoint_step + 1,
+                    "model_equivalent": model_equivalent,
+                    "optimizer_equivalent": optimizer_equivalent,
+                    "loss_delta": loss_delta,
+                    "cursor_before": cursor_before,
+                    "cursor_after": cursor_after,
+                    "resumed_cursor_after": resumed_cursor_after,
+                    "rng_restored": ["python", "numpy", "torch", "cuda"],
+                    "tolerance": tolerance,
+                },
+            }
+        finally:
+            if resumed is not None:
+                resumed.close()
+            if "trainer" in locals():
+                trainer.close()
+        torch.distributed.barrier()
+        return result if rank == 0 else None
+    finally:
+        if torch.distributed.is_initialized():
+            torch.distributed.destroy_process_group()
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -551,6 +962,8 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--profile-id")
     parser.add_argument("--region")
     parser.add_argument("--arm")
+    parser.add_argument("--config")
+    parser.add_argument("--qualification-root")
     parser.add_argument("--gpu-ids")
     parser.add_argument("--cpu-affinity")
     parser.add_argument("--master-port", type=int)
@@ -576,6 +989,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         else:
             required: Mapping[str, object] = {
                 "arm": arguments.arm,
+                "config": arguments.config,
+                "qualification_root": arguments.qualification_root,
                 "gpu_ids": arguments.gpu_ids,
                 "cpu_affinity": arguments.cpu_affinity,
                 "master_port": arguments.master_port,
