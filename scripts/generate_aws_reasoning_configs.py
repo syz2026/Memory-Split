@@ -10,12 +10,11 @@ from pathlib import Path
 
 import yaml
 
-
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from msctl.reasoning_cohort import (  # noqa: E402
+from msctl.reasoning_cohort import (
     ARMS,
     CHECKPOINT_UPDATES,
     COHORT_ID,

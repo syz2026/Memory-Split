@@ -8,13 +8,12 @@ import json
 import sys
 from pathlib import Path
 
-
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from msctl.preflight import build_preflight_receipt  # noqa: E402
-from msctl.profile import load_profile  # noqa: E402
+from msctl.preflight import build_preflight_receipt
+from msctl.profile import load_profile
 
 
 def main(argv: list[str] | None = None) -> int:

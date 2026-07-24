@@ -25,7 +25,6 @@ from msctl.reasoning_cohort import (
     run_id as reasoning_run_id,
 )
 
-
 TRAIN_SCRIPT = "cluster/slurm/v2_pair_train.sbatch"
 EVALUATE_SCRIPT = "cluster/slurm/v2_pair_evaluate.sbatch"
 MODES = ("functional", "resume", "throughput", "protected")
@@ -77,7 +76,7 @@ def load_pair_manifest(path: Path | str) -> dict[str, Any]:
         raise ValueError("pair manifest fields do not match the protected schema")
     seed = raw["seed"]
     if isinstance(seed, bool) or not isinstance(seed, int):
-        raise ValueError("pair manifest identity is invalid")
+        raise ValueError("pair manifest identity is invalid")  # noqa: TRY004
     try:
         expected_pair, _, _ = _cell_identity(raw["cohort_id"], ARMS[0], seed)
     except ValueError as error:

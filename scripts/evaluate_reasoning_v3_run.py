@@ -14,21 +14,20 @@ from pathlib import Path
 import torch
 import yaml
 
-
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from msctl.reasoning_cohort import (  # noqa: E402
+from msctl.reasoning_cohort import (
     DATASET_CONTRACT_ID,
     RAW_TARGETS,
     TARGETS_PER_UPDATE,
     TERMINAL_UPDATES,
     VIRTUAL_RECEIPT_SHA256,
 )
-from train.data import PackedShards  # noqa: E402
-from train.model import GPT, GPTConfig, PRESETS  # noqa: E402
-from train.trainer import pick_device  # noqa: E402
+from train.data import PackedShards
+from train.model import GPT, PRESETS, GPTConfig
+from train.trainer import pick_device
 
 
 def _sha256(path: Path) -> str:

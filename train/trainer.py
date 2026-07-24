@@ -16,8 +16,7 @@ from pathlib import Path
 import torch
 
 from train.data import PackedShards
-from train.model import GPT, GPTConfig, PRESETS
-
+from train.model import GPT, PRESETS, GPTConfig
 
 PARALLEL_CORPUS_V2 = "memorysplit-parallel-corpus-v2"
 REASONING_CORPUS_V3 = "memorysplit-reasoning-dataset-v3"

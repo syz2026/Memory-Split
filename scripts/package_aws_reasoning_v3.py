@@ -11,19 +11,18 @@ import zipfile
 from collections.abc import Mapping
 from pathlib import Path, PurePosixPath
 
-
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from msctl.reasoning_cohort import (  # noqa: E402
+from msctl.reasoning_cohort import (
     COHORT_ID,
     SEEDS,
     TRANSFER_MANIFEST_SHA256,
     VIRTUAL_RECEIPT_SHA256,
     role_config_paths,
 )
-from scripts.package_135m_slurm_cohort import (  # noqa: E402
+from scripts.package_135m_slurm_cohort import (
     _git,
     _identity,
     _json_bytes,
@@ -32,7 +31,6 @@ from scripts.package_135m_slurm_cohort import (  # noqa: E402
     _write_zip,
     source_revision,
 )
-
 
 ARCHIVE_NAME = "memorysplit-135m-reasoning-v3-aws.zip"
 PYTHON_PREFIXES = (

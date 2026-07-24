@@ -12,7 +12,7 @@ import torch
 import yaml
 
 import cluster.aws.reasoning_v3 as corpus
-import msctl.aws_operations as aws_operations
+from cluster.aws.readiness import inspect_aws_readiness
 from cluster.aws.reasoning_v3 import (
     AwsCorpusError,
     StagedCorpus,
@@ -22,7 +22,7 @@ from cluster.aws.reasoning_v3 import (
     upload_to_s3,
     verify_staged_corpus,
 )
-from cluster.aws.readiness import inspect_aws_readiness
+from msctl import aws_operations
 from msctl.adapters.slurm import load_pair_manifest, plan_sbatch
 from msctl.operations import collect, resume, status, submit
 from msctl.profile import load_profile
@@ -41,7 +41,6 @@ from scripts.evaluate_reasoning_v3_run import evaluate_run
 from scripts.generate_aws_reasoning_configs import generate
 from scripts.package_aws_reasoning_v3 import build_package, verify_package
 from train.model import GPT, GPTConfig
-
 
 ROOT = Path(__file__).resolve().parents[1]
 MANIFEST = ROOT / "cluster" / "aws" / "reasoning-v3-corpus-manifest.json"

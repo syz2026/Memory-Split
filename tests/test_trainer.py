@@ -44,7 +44,8 @@ def test_loss_decreases_and_logs(tmp_path):
     bp, mp = write_corpus(tmp_path)
     tr = Trainer(base_cfg(tmp_path, bp, mp))
     tr.train_steps()
-    rows = [json.loads(l) for l in open(tr.log_path)]
+    with tr.log_path.open() as handle:
+        rows = [json.loads(line) for line in handle]
     first, last = rows[0]["loss"], rows[-1]["loss_ema"]
     assert last < first * 0.8, (first, last)
     assert any("loss_masked_values" in r for r in rows)
@@ -110,6 +111,8 @@ def test_reasoning_v3_segmented_training_uses_direct_weights(tmp_path):
     first_bin, first_mask = write_corpus(first_root, n=20_000)
     second_bin, second_mask = write_corpus(second_root, n=20_000, seed=1)
     cfg = base_cfg(tmp_path, [first_bin, second_bin], [first_mask, second_mask])
+    cfg["train_bin"] = [str(first_bin), str(second_bin)]
+    cfg["train_mask"] = [str(first_mask), str(second_mask)]
     cfg["max_steps"] = 1
     cfg["dataset"] = {"contract_id": "memorysplit-reasoning-dataset-v3"}
     trainer = Trainer(cfg)

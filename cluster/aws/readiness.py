@@ -8,7 +8,6 @@ import subprocess
 from collections.abc import Callable, Sequence
 from typing import Any
 
-
 INSTANCE_TYPES = ("p5.48xlarge", "p5en.48xlarge", "p6-b200.48xlarge")
 _REGION_RE = re.compile(r"^[a-z]{2}(?:-gov)?-[a-z]+-\d$")
 
@@ -28,7 +27,7 @@ def _json_command(
     runner: Callable[[Sequence[str]], object],
 ) -> Any:
     result = runner(command)
-    returncode = int(getattr(result, "returncode"))
+    returncode = int(result.returncode)
     stdout = str(getattr(result, "stdout", "") or "")
     stderr = str(getattr(result, "stderr", "") or "")
     if returncode:
@@ -94,7 +93,9 @@ def inspect_aws_readiness(
         raise RuntimeError("AWS identity response is malformed")
     values = offerings.get("InstanceTypeOfferings") if isinstance(offerings, dict) else None
     if not isinstance(values, list) or not isinstance(quotas, list):
-        raise RuntimeError("AWS offering or quota response is malformed")
+        raise RuntimeError(  # noqa: TRY004
+            "AWS offering or quota response is malformed"
+        )
     by_type = {instance_type: [] for instance_type in INSTANCE_TYPES}
     for value in values:
         if (

@@ -114,7 +114,7 @@ def test_masked_value_probe(tmp_path):
     ds = PackedShards(bp, mp, ctx=32, batch_size=2, device="cpu")
     probe = ds.masked_value_batch()
     assert probe is not None
-    x, y = probe
+    _, y = probe
     live = int((y != -100).sum())
     assert 0 < live <= 85  # only the masked span (5..90 shifted) carries labels
 

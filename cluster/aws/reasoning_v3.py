@@ -16,7 +16,6 @@ from urllib.parse import urlsplit
 
 from cluster.aws.safeio import atomic_rename_noreplace
 
-
 TRANSFER_FORMAT = "memorysplit-aws-corpus-transfer-v1"
 CONTRACT_ID = "memorysplit-reasoning-dataset-v3"
 RAW_TARGET_TOKENS = 8_169_455_616
@@ -484,7 +483,7 @@ def _default_runner(command: Sequence[str]):
 
 def _result(result: object) -> tuple[int, str, str]:
     return (
-        int(getattr(result, "returncode")),
+        int(result.returncode),
         str(getattr(result, "stdout", "") or ""),
         str(getattr(result, "stderr", "") or ""),
     )

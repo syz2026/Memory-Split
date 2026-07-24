@@ -9,7 +9,6 @@ from typing import Any
 
 import yaml
 
-
 COHORT_ID = "memorysplit-exploratory-v3-135m-aws-n10"
 DATASET_CONTRACT_ID = "memorysplit-reasoning-dataset-v3"
 MODEL_PARAMETERS = 134_660_880
@@ -303,7 +302,7 @@ def validate_run_config(
         raise ValueError("micro_batch_size must be a positive integer")
     for field in ("lr", "snap_frac"):
         if isinstance(cfg[field], bool) or not isinstance(cfg[field], (int, float)):
-            raise ValueError(f"{field} must be numeric")
+            raise ValueError(f"{field} must be numeric")  # noqa: TRY004
     for field in ("log_every", "eval_every", "ckpt_minutes"):
         if (
             isinstance(cfg[field], bool)

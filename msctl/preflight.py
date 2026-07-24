@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import os
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
@@ -13,7 +12,6 @@ from msctl.cohort import COHORT_ID
 from msctl.manifest import write_json_no_replace
 from msctl.profile import SlurmProfile
 from msctl.reasoning_cohort import COHORT_ID as REASONING_COHORT_ID
-
 
 CANARY_NAMES = (
     "one_update_functional",
@@ -38,7 +36,7 @@ def load_preflight(path: Path | str) -> dict[str, Any]:
     except (UnicodeDecodeError, json.JSONDecodeError) as error:
         raise ValueError("preflight receipt must be valid UTF-8 JSON") from error
     if not isinstance(raw, dict):
-        raise ValueError("preflight receipt must be an object")
+        raise ValueError("preflight receipt must be an object")  # noqa: TRY004
     return raw
 
 

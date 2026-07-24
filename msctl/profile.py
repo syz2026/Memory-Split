@@ -9,7 +9,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-
 SCHEMA_VERSION = 1
 PYTHON_TEMPLATE = "${MS135_VENV}/bin/python"
 REQUIRED_FIELDS = frozenset(
@@ -128,7 +127,7 @@ def validate_profile(
     source_path: Path | str = Path("<memory>"),
 ) -> SlurmProfile:
     if not isinstance(raw, dict):
-        raise ValueError("profile must contain a JSON object")
+        raise ValueError("profile must contain a JSON object")  # noqa: TRY004
     missing = sorted(REQUIRED_FIELDS - set(raw))
     unknown = sorted(set(raw) - REQUIRED_FIELDS)
     if missing or unknown:

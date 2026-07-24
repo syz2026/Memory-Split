@@ -12,15 +12,14 @@ from pathlib import Path
 
 import yaml
 
-
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from msctl.adapters.slurm import load_pair_manifest  # noqa: E402
-from msctl.profile import load_profile  # noqa: E402
-from msctl.reasoning_cohort import DATASET_CONTRACT_ID as REASONING_V3  # noqa: E402
-from cluster.corpus_contract import sha256_file  # noqa: E402
+from cluster.corpus_contract import sha256_file
+from msctl.adapters.slurm import load_pair_manifest
+from msctl.profile import load_profile
+from msctl.reasoning_cohort import DATASET_CONTRACT_ID as REASONING_V3
 
 
 def _atomic_json(path: Path, value: object) -> None:
@@ -39,8 +38,8 @@ def _gpu_name() -> str:
 
         if torch.cuda.is_available():
             return str(torch.cuda.get_device_name(0))
-    except Exception:
-        pass
+    except Exception:  # noqa: BLE001
+        return "unavailable"
     return "unavailable"
 
 

@@ -7,7 +7,6 @@ import errno
 import os
 import sys
 
-
 _RENAME_NOREPLACE = 1
 
 
