@@ -493,3 +493,136 @@ Intentionally unchanged:
 Report path:
 
 `/Users/stephenzhang/Documents/MemorySplit/.worktrees/memorysplit-v3-aws-n10/.superpowers/sdd/task-3c-report.md`
+
+## Failed-review remediation from `b3471e0`
+
+Status: complete for the four requested Task 3C findings.
+
+Implementation commit:
+
+- `9e76a88` — `fix: harden Task 3C checkpoint supervision`
+
+No Task 3D, dual-profile, scientific-config, timing-constant, receipt-schema,
+or legacy-write behavior was added.
+
+### Fixes
+
+1. V3 resume now accepts exact integer seeds 0 through 9, rejects `bool` and
+   10, installs the production paired checkpoint scheduler/request factory,
+   and does not expose the legacy interruption publisher as a V3 fallback.
+   The production request factory also imports and uses `secrets.token_hex`.
+2. Baseline capture now obtains its generation identity from the same
+   descriptor-pinned metadata read that validates the bound checkpoint
+   descriptor. A pre-signal generation published during baseline validation
+   is therefore recorded as the baseline rather than admitted as fresh.
+3. `CheckpointMirrorScheduler.poll()` checks the existing 1200-second
+   durability deadline before polling or accepting a completed attempt, so a
+   late result cannot update `latest` or reset `fresh_at`.
+4. Paired supervision owns scheduler cleanup in an unconditional `finally`.
+   Success, child failure, requested shutdown, polling failure, stale
+   fail-stop, interruption, and `KeyboardInterrupt` all cancel an active
+   forked attempt. Scheduler polling exceptions also stop both training arms.
+
+### RED evidence
+
+Each focused test was added before its corresponding production change and
+was observed failing for the intended reason:
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 python -m pytest -q -p no:cacheprovider \
+  --basetemp=/tmp/memorysplit-v3-task3c-review-red-resume \
+  tests/test_aws_checkpoint_mirror.py::test_v3_resume_output_archival_accepts_seed_bounds \
+  tests/test_aws_checkpoint_mirror.py::test_v3_resume_output_archival_rejects_non_exact_seed \
+  tests/test_aws_checkpoint_mirror.py::test_v3_resume_installs_paired_checkpoint_scheduler_without_legacy_fallback
+```
+
+Observed: `3 failed, 2 passed`; seeds 0 and 9 were rejected and no
+`checkpoint_scheduler_factory` reached supervision.
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 python -m pytest -q -p no:cacheprovider \
+  --basetemp=/tmp/memorysplit-v3-task3c-review-red-baseline-3 \
+  tests/test_aws_checkpoint_mirror.py::test_baseline_pins_the_generation_validated_before_signal
+```
+
+Observed: `DID NOT RAISE TimeoutError`; the pre-signal replacement was
+incorrectly treated as post-signal. The test's fixed `staged_at` was added
+before production code so the RED exercised this race rather than wall time.
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 python -m pytest -q -p no:cacheprovider \
+  --basetemp=/tmp/memorysplit-v3-task3c-review-red-deadline \
+  tests/test_aws_checkpoint_mirror.py::test_scheduler_rejects_completed_attempt_at_durability_deadline
+```
+
+Observed: `DID NOT RAISE CheckpointStaleError`; the late pair was accepted.
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 python -m pytest -q -p no:cacheprovider \
+  --basetemp=/tmp/memorysplit-v3-task3c-review-red-cleanup \
+  tests/test_aws_p5_launcher.py::test_scheduler_poll_exit_cancels_attempt_and_terminates_pair
+```
+
+Observed: `1 failed, 1 passed`; a scheduler polling exception left both arm
+processes alive.
+
+The final regression files were also applied without production changes to an
+isolated detached worktree at exact `b3471e0`. The combined seed, scheduler
+factory, baseline race, late deadline, success/failure/shutdown cleanup,
+polling exception, and keyboard-interrupt selection produced `13 failed`.
+
+### GREEN evidence
+
+```text
+V3 resume/factory focus:             6 passed
+Descriptor-pinned baseline focus:    6 passed
+Durability-deadline focus:           3 passed
+Supervisor cleanup focus:           10 passed
+```
+
+An isolated worktree containing only the staged `9e76a88` patch then passed:
+
+```text
+tests/test_aws_checkpoint_mirror.py   57 passed
+tests/test_aws_p5_launcher.py         146 passed
+changed-file py_compile               passed
+git diff --check                      passed
+```
+
+### Final disk-bounded verification
+
+All commands used `PYTHONDONTWRITEBYTECODE=1`, `-p no:cacheprovider`, and an
+explicit `/tmp/memorysplit-v3-task3c-*` `--basetemp`:
+
+```text
+tests/test_aws_checkpoint_mirror.py                         64 passed
+tests/test_aws_p5_launcher.py                               146 passed
+tests/test_trainer.py tests/test_ddp_trainer.py             90 passed
+tests/test_aws_contract_roundtrip.py                        26 passed
+tests/test_aws_argv.py                                      19 passed
+tests/test_aws_environment_receipt.py tests/test_aws_canary.py
+                                                             114 passed
+tests/test_msctl.py                                         157 passed
+tests/test_run_manifest_v3.py tests/test_package_aws_p5_handoff.py
+                                                             172 passed
+```
+
+Non-overlapping total: **788 passed**.
+
+Changed-file `python -m py_compile` and `git diff --check` both passed.
+Launcher and mirror aggregates were rerun outside the sandbox after sandbox
+policy denied fixture-created `.git/hooks` operations and cleanup; those
+permission-only attempts were not product failures.
+
+### Remediation concerns
+
+- No paid AWS, versioned S3 bucket, P5, Docker, NCCL, or IMDS operation was
+  performed.
+- Independent pre-existing/concurrent Task 3C edits remained unstaged in
+  `cluster/aws/p5/checkpoint_mirror.py`, `msctl/aws_p5.py`, and
+  `tests/test_aws_checkpoint_mirror.py`; `9e76a88` deliberately excluded
+  their content-addressed metadata, replay-state, fork-pipe, and associated
+  test hunks.
+- A first mirror aggregate overlapped one of those controller edits and
+  observed one replay-state assertion failure. The immediate focused rerun
+  and the stable full rerun passed; the isolated staged snapshot also passed.
