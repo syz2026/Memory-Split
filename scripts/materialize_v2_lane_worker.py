@@ -264,7 +264,11 @@ def main() -> int:
         args.lane,
         stage_root=args.stage_root.resolve(),
         work_root=args.work_root.resolve(),
-        objective_python=args.objective_python.resolve(),
+        # Preserve the virtual-environment launcher. Resolving its symlink
+        # would silently select the base interpreter and lose pinned packages.
+        objective_python=Path(
+            os.path.abspath(os.path.expanduser(str(args.objective_python)))
+        ),
         source_lock_path=args.source_lock.resolve(),
         recipe_path=args.recipe.resolve(),
     )
