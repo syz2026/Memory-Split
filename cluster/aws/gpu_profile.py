@@ -21,6 +21,10 @@ from msctl.fsutil import open_directory
 P5_PROFILE_ID = "aws-p5.48xlarge"
 P5_PROFILE_ID_V3 = "aws-p5.48xlarge-v3"
 P6_PROFILE_ID_V3 = "aws-p6-b300.48xlarge-v3"
+P6_SOFTWARE_FLOOR_PROVENANCE = (
+    "official AWS P6-B300 requirements: CUDA 13.0, NVIDIA driver R580, "
+    "NVLINK 5 R580, kernel 6.1, EFA 1.44.0, and OFI-NCCL 1.17.1"
+)
 _MAX_PROFILE_BYTES = 65_536
 _AMI_RE = re.compile(r"^ami-[0-9a-f]{8,17}$")
 _REGION_RE = re.compile(r"^[a-z]{2}(?:-[a-z0-9]+)+-[0-9]+$")
@@ -717,6 +721,7 @@ __all__ = [
     "P5_PROFILE_ID",
     "P5_PROFILE_ID_V3",
     "P6_PROFILE_ID_V3",
+    "P6_SOFTWARE_FLOOR_PROVENANCE",
     "load_aws_gpu_profile",
     "parse_aws_gpu_profile_bytes",
     "read_secure_regular_file",

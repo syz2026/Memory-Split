@@ -163,3 +163,122 @@ tests/test_aws_p5_launcher.py
 
 No live AWS API, S3, EC2, Capacity Block, or paid-capacity mutation was
 performed; versioned-store behavior used only the injected in-memory fake.
+
+## Second re-review remediation (2026-07-24)
+
+This section supersedes the prior self-asserted runtime-evidence and
+test-only-store integration statements. All previously closed P5/P6 profile,
+On-Demand, secure-read, fixed-key, and constructor findings remain closed.
+
+### Production authority integration
+
+- `AwsCliVersionedSelectionStore` is the production AWS CLI adapter. It uses
+  the repository's injected `(argv, environment, timeout)` runner pattern and
+  never creates an ambient boto client.
+- Before PUT, the adapter calls `list-object-versions` for the sole fixed key.
+  Any historical object version or delete marker blocks publication, including
+  delete/recreate cases where current HEAD is absent.
+- PUT always uses `If-None-Match: *` and checksum SHA-256. Publication then
+  HEADs the exact returned version and requires exact key, checksum, byte
+  count, and non-null version ID.
+- The selected version ID is persisted at
+  `memorysplit-confirmatory-v3-360m-n10-aws/provider-selection-version.json`.
+  Replay/admission performs `get-object --version-id` and independently checks
+  returned version, checksum, byte count, remote bytes, and fixed local bytes.
+- `AuthenticatedSelectionBinding` is the sole launch/resume admission output.
+  `admit_provider_selection` and the hardened
+  `validate_resume_hardware_binding` re-verify exact remote version,
+  environment/canary qualification, account, instance, boot, profile,
+  runtime, seed, and arm without accepting caller-constructed authority
+  objects.
+
+### Authenticated qualification evidence
+
+- Selection no longer trusts a JSON map because its hash matches. The
+  qualification-evidence document embeds canonical environment and canary
+  receipts plus an approval that signs their exact identity/fact scope.
+- The environment receipt binds account, instance, boot, profile, AMI, image
+  digest, runtime-lock hash, source, and measured container facts. Its AWS
+  instance identity PKCS7 is verified through the repository's pinned AWS
+  identity-certificate verifier.
+- The passed qualification canary binds the same instance/boot/profile/runtime
+  tuple, all six canary phases, measured host facts, and the environment
+  receipt hash.
+- The approval scope commits the environment/canary hashes, host/container
+  fact hashes, account, instance, boot, profile, runtime, AMI, and image. A
+  separately trusted public-key SHA-256 must match before an injected
+  cryptographic verifier can accept the signature.
+- `OpenSslQualificationApprovalVerifier` is the production local verifier for
+  `RSASSA_PSS_SHA_256`; tests inject deterministic cryptographic-verifier
+  fixtures. Forged, unsigned, wrong-key, wrong-instance, wrong-boot,
+  wrong-profile, wrong-runtime, wrong-AMI, and wrong-image evidence fails.
+- The P6 `nvlink: R580` floor is retained. Its code provenance states the
+  official AWS P6-B300 requirements, including `NVLINK 5 R580` alongside CUDA
+  13.0, driver R580, kernel 6.1, EFA 1.44.0, and OFI-NCCL 1.17.1.
+
+### Executable dry-run/apply path
+
+The standalone CLI is executable without touching the shared Task 3C
+`msctl/aws_p5.py` lifecycle:
+
+```text
+python -m msctl.aws_hardware publish \
+  --repo-root <release-root> \
+  --authority-root <private-authority-root> \
+  --runtime-lock <runtime-lock.json> \
+  --qualification-evidence <qualified-runtime-v2.json> \
+  --selection <provider-selection.json> \
+  --bucket <versioned-authority-bucket> \
+  --region us-east-1 \
+  --approval-public-key <approval-public-key.pem> \
+  --approval-public-key-sha256 <trusted-sha256>
+```
+
+The command is dry-run by default: it parses and cryptographically verifies all
+anchored bytes but performs no AWS or local authority mutation. Add `--apply`
+explicitly to list history, PUT/HEAD the fixed key, and install the fixed local
+selection/version authorities.
+
+The exact later controller integration call is
+`admit_provider_selection(...)` with the fixed authority/release roots, runtime
+lock and qualification-evidence paths, `AwsCliVersionedSelectionStore`, target
+account/instance/boot/seed/arm, persisted selection version ID,
+`verify_aws_instance_identity_pkcs7`,
+`OpenSslQualificationApprovalVerifier`, and the separately trusted public-key
+SHA-256. It returns only `AuthenticatedSelectionBinding`.
+
+### Second re-review RED/GREEN evidence
+
+- Production S3 adapter/history/version replay: RED had four missing or
+  non-blocking authority failures; GREEN passed exact CLI argv, historical
+  version, delete-marker, persisted-version, and exact-GET cases.
+- Authenticated qualification: RED had twelve missing provenance/verifier
+  failures; GREEN passed PKCS7/approval verification and every forged identity,
+  runtime, image, key, and signature mutation.
+- CLI/admission: RED had seven missing executable/admission failures; GREEN
+  passed dry-run/apply, production outputs, exact-version admission, wrong
+  identity/version rejection, and OpenSSL commitment checks.
+- Resume admission then produced one RED for accepting no exact store/version;
+  GREEN now routes resume validation through exact authenticated admission.
+
+### Second re-review verification
+
+```text
+tests/test_aws_hardware.py tests/test_aws_p5_profile.py
+tests/test_cohort_assignment_v3.py
+=> 205 passed
+
+tests/test_aws_contract_roundtrip.py tests/test_run_manifest_v3.py
+tests/test_aws_environment_receipt.py tests/test_aws_canary.py
+tests/test_aws_p5_launcher.py
+=> 347 passed
+
+python -m py_compile cluster/aws/gpu_profile.py cluster/aws/p5/profile.py
+  msctl/aws_hardware.py tests/test_aws_hardware.py
+git diff --check
+frozen scientific/profile/amendment diff assertions
+=> passed
+```
+
+No live AWS command or paid-capacity mutation was performed. AWS behavior was
+exercised only through injected runners and in-memory versioned stores.

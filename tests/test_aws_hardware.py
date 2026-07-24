@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import os
 from copy import deepcopy
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -36,6 +38,7 @@ P6_SOFTWARE_FLOORS = {
     "nvlink": "R580",
     "ofi_nccl": "1.17.1",
 }
+TRUSTED_APPROVAL_PUBLIC_KEY_SHA256 = "9" * 64
 SELECTION_LOCAL_PATH = (
     "memorysplit-confirmatory-v3-360m-n10-aws/provider-selection.json"
 )
@@ -271,6 +274,16 @@ def test_closed_p6_profile_freezes_b300_hardware_and_one_cohort():
         }
     ]
     assert raw["software_floors"] == P6_SOFTWARE_FLOORS
+
+
+def test_p6_nvlink_floor_retains_official_aws_requirement_provenance():
+    from cluster.aws.gpu_profile import P6_SOFTWARE_FLOOR_PROVENANCE
+
+    assert P6_SOFTWARE_FLOORS["nvlink"] == "R580"
+    assert "official AWS P6-B300 requirements" in (
+        P6_SOFTWARE_FLOOR_PROVENANCE
+    )
+    assert "NVLINK 5 R580" in P6_SOFTWARE_FLOOR_PROVENANCE
 
 
 def test_hardware_profiles_delegate_ami_and_image_identity_to_runtime_lock():
@@ -605,33 +618,11 @@ def _runtime_lock_value(profile_id: str) -> dict[str, object]:
     }
 
 
-def _runtime_evidence_value(
-    profile_id: str,
-    runtime_lock_data: bytes,
-) -> dict[str, object]:
-    _, profile_sha256 = _profile_path_and_hash(profile_id)
-    versions = P6_SOFTWARE_FLOORS if profile_id.startswith("aws-p6") else {}
-    return {
-        "account_id": "123456789012",
-        "availability_zone": (
-            "us-east-1d" if profile_id.startswith("aws-p6") else "us-east-1c"
-        ),
-        "profile_sha256": profile_sha256,
-        "receipt_type": "memorysplit-aws-runtime-evidence-v1",
-        "region": "us-east-1",
-        "runtime_lock_sha256": hashlib.sha256(runtime_lock_data).hexdigest(),
-        "schema_version": 1,
-        "versions": dict(versions),
-    }
-
-
 def _verified_selection_fixture(
     profile_id: str = "aws-p6-b300.48xlarge-v3",
 ) -> tuple[dict[str, object], bytes, bytes]:
-    lock_data = _canonical_json(_runtime_lock_value(profile_id))
-    evidence_data = _canonical_json(
-        _runtime_evidence_value(profile_id, lock_data)
-    )
+    evidence, lock_data = _qualification_evidence_value(profile_id)
+    evidence_data = _canonical_json(evidence)
     selection = _selection_value(profile_id)
     selection["runtime"] = {
         "ami_id": "ami-0123456789abcdef0",
@@ -659,6 +650,7 @@ def test_verified_selection_parses_exact_runtime_and_attestation_bytes(
         profile_data=profile_path.read_bytes(),
         runtime_lock_data=lock_data,
         runtime_evidence_data=evidence_data,
+        **_qualification_verification_kwargs(),
     )
 
     assert receipt.profile.sha256 == profile_sha256
@@ -704,11 +696,13 @@ def test_verified_selection_rejects_runtime_or_floor_drift(mutation):
             + lock["container_image_digest"]
         )
     elif mutation == "evidence-profile":
-        evidence["profile_sha256"] = P5_PROFILE_SHA256
+        evidence["canary_receipt"]["profile_sha256"] = P5_PROFILE_SHA256
     elif mutation == "evidence-runtime":
-        evidence["runtime_lock_sha256"] = "0" * 64
+        evidence["canary_receipt"]["runtime_lock_sha256"] = "0" * 64
     elif mutation == "evidence-placement":
-        evidence["availability_zone"] = "us-east-1c"
+        evidence["environment_receipt"]["aws_instance_identity_document"][
+            "availabilityZone"
+        ] = "us-east-1c"
     else:
         field, value = {
             "cuda-floor": ("cuda", "12.9"),
@@ -718,14 +712,11 @@ def test_verified_selection_rejects_runtime_or_floor_drift(mutation):
             "nvlink-floor": ("nvlink", "R570"),
             "ofi-nccl-floor": ("ofi_nccl", "1.16.9"),
         }[mutation]
-        evidence["versions"][field] = value
+        evidence["canary_receipt"]["hardware"]["runtime_facts"][
+            field
+        ] = value
 
     lock_data = _canonical_json(lock)
-    evidence["runtime_lock_sha256"] = (
-        "0" * 64
-        if mutation == "evidence-runtime"
-        else hashlib.sha256(lock_data).hexdigest()
-    )
     evidence_data = _canonical_json(evidence)
     selection["runtime"]["runtime_lock_sha256"] = hashlib.sha256(
         lock_data
@@ -741,6 +732,7 @@ def test_verified_selection_rejects_runtime_or_floor_drift(mutation):
             profile_data=P6_PROFILE.read_bytes(),
             runtime_lock_data=lock_data,
             runtime_evidence_data=evidence_data,
+            **_qualification_verification_kwargs(),
         )
 
 
@@ -762,6 +754,293 @@ def test_verified_selection_rejects_noncanonical_runtime_lock_bytes():
             profile_data=P6_PROFILE.read_bytes(),
             runtime_lock_data=pretty_lock,
             runtime_evidence_data=evidence_data,
+            **_qualification_verification_kwargs(),
+        )
+
+
+class _QualificationIdentityVerifier:
+    def __init__(self, valid: bool = True) -> None:
+        self.valid = valid
+        self.calls: list[tuple[dict[str, object], str, str]] = []
+
+    def __call__(self, identity, pkcs7, region):
+        self.calls.append((dict(identity), str(pkcs7), str(region)))
+        return self.valid
+
+
+class _QualificationApprovalVerifier:
+    def __init__(self, valid: bool = True) -> None:
+        self.valid = valid
+        self.calls: list[dict[str, object]] = []
+
+    def verify(
+        self,
+        *,
+        payload: bytes,
+        signature: str,
+        algorithm: str,
+        public_key_sha256: str,
+    ) -> bool:
+        self.calls.append(
+            {
+                "algorithm": algorithm,
+                "payload": payload,
+                "public_key_sha256": public_key_sha256,
+                "signature": signature,
+            }
+        )
+        return self.valid
+
+
+def _qualification_verification_kwargs() -> dict[str, object]:
+    return {
+        "approval_verifier": _QualificationApprovalVerifier(),
+        "identity_verifier": _QualificationIdentityVerifier(),
+        "trusted_public_key_sha256": TRUSTED_APPROVAL_PUBLIC_KEY_SHA256,
+    }
+
+
+def _qualification_evidence_value(
+    profile_id: str = "aws-p6-b300.48xlarge-v3",
+) -> tuple[dict[str, object], bytes]:
+    lock_data = _canonical_json(
+        _runtime_lock_value(profile_id)
+    )
+    lock = json.loads(lock_data)
+    is_p6 = profile_id.startswith("aws-p6")
+    identity = {
+        "accountId": "123456789012",
+        "architecture": "x86_64",
+        "availabilityZone": "us-east-1d" if is_p6 else "us-east-1c",
+        "imageId": lock["ami_id"],
+        "instanceId": "i-0123456789abcdef0",
+        "instanceType": "p6-b300.48xlarge" if is_p6 else "p5.48xlarge",
+        "privateIp": "10.1.2.3",
+        "region": "us-east-1",
+    }
+    environment = {
+        "account_id": identity["accountId"],
+        "ami_id": identity["imageId"],
+        "aws_instance_identity_document": identity,
+        "aws_instance_identity_pkcs7": base64.b64encode(
+            b"synthetic-signed-instance-identity"
+        ).decode("ascii"),
+        "boot_id": "12345678-1234-4abc-8def-1234567890ab",
+        "container_image": lock["container_image"],
+        "container_image_digest": lock["container_image_digest"],
+        "control_bundle_sha256": lock["control_bundle_sha256"],
+        "instance_id": identity["instanceId"],
+        "profile_sha256": lock["profile_sha256"],
+        "provider": (
+            "aws-p6-b300.48xlarge" if is_p6 else "aws-p5.48xlarge"
+        ),
+        "receipt_type": "memorysplit-aws-environment-v2",
+        "region": identity["region"],
+        "runtime_facts": dict(lock["versions"]),
+        "runtime_lock_sha256": hashlib.sha256(lock_data).hexdigest(),
+        "schema_version": 2,
+        "source_commit": lock["source_commit"],
+        "source_tree": lock["source_tree"],
+    }
+    environment_data = _canonical_json(environment)
+    hardware = {
+        "gpu_count": 8,
+        "runtime_facts": dict(P6_SOFTWARE_FLOORS) if is_p6 else {},
+    }
+    phases = [
+        {"name": name, "passed": True, "seconds": 1.0}
+        for name in (
+            "hardware",
+            "nccl_all_reduce",
+            "functional",
+            "resume",
+            "throughput_4x4",
+            "s3_roundtrip",
+        )
+    ]
+    canary = {
+        "boot_id": environment["boot_id"],
+        "container_image": environment["container_image"],
+        "container_image_digest": environment["container_image_digest"],
+        "dataset_build_id": "1" * 64,
+        "dataset_receipt_sha256": "2" * 64,
+        "ended_at": "2026-07-24T06:30:00Z",
+        "environment_receipt_sha256": hashlib.sha256(
+            environment_data
+        ).hexdigest(),
+        "functional": {"passed": True},
+        "hardware": hardware,
+        "instance_id": environment["instance_id"],
+        "ordered_stream_sha256": "3" * 64,
+        "passed": True,
+        "phases": phases,
+        "profile_sha256": environment["profile_sha256"],
+        "provider": environment["provider"],
+        "receipt_type": "memorysplit-aws-gpu-qualification-v1",
+        "release_receipt_sha256": "4" * 64,
+        "release_sha256": "5" * 64,
+        "resume": {"passed": True},
+        "run_manifest_sha256": "6" * 64,
+        "runtime_lock_sha256": environment["runtime_lock_sha256"],
+        "s3_roundtrip": {"passed": True},
+        "schema_version": 1,
+        "seed": 0,
+        "source_commit": lock["source_commit"],
+        "source_tree": lock["source_tree"],
+        "started_at": "2026-07-24T06:00:00Z",
+        "throughput_4x4": {"passed": True},
+        "total_seconds": 1800.0,
+    }
+    canary_data = _canonical_json(canary)
+    scope = {
+        "account_id": environment["account_id"],
+        "ami_id": environment["ami_id"],
+        "boot_id": environment["boot_id"],
+        "canary_receipt_sha256": hashlib.sha256(canary_data).hexdigest(),
+        "container_facts_sha256": hashlib.sha256(
+            _canonical_json(environment["runtime_facts"])
+        ).hexdigest(),
+        "container_image_digest": environment["container_image_digest"],
+        "environment_receipt_sha256": hashlib.sha256(
+            environment_data
+        ).hexdigest(),
+        "host_facts_sha256": hashlib.sha256(
+            _canonical_json(hardware)
+        ).hexdigest(),
+        "instance_id": environment["instance_id"],
+        "profile_sha256": environment["profile_sha256"],
+        "runtime_lock_sha256": environment["runtime_lock_sha256"],
+    }
+    approval = {
+        "algorithm": "RSASSA_PSS_SHA_256",
+        "public_key_sha256": TRUSTED_APPROVAL_PUBLIC_KEY_SHA256,
+        "scope": scope,
+        "scope_sha256": hashlib.sha256(_canonical_json(scope)).hexdigest(),
+        "signature": base64.b64encode(b"signed-qualification-scope").decode(
+            "ascii"
+        ),
+    }
+    return {
+        "approval": approval,
+        "canary_receipt": canary,
+        "environment_receipt": environment,
+        "receipt_type": "memorysplit-aws-qualified-runtime-v2",
+        "schema_version": 2,
+    }, lock_data
+
+
+def test_qualification_evidence_requires_identity_and_approval_verification():
+    from msctl.aws_hardware import (
+        parse_authenticated_qualification_evidence_bytes,
+    )
+
+    value, lock_data = _qualification_evidence_value()
+    identity_verifier = _QualificationIdentityVerifier()
+    approval_verifier = _QualificationApprovalVerifier()
+    evidence = parse_authenticated_qualification_evidence_bytes(
+        _canonical_json(value),
+        profile_data=P6_PROFILE.read_bytes(),
+        runtime_lock_data=lock_data,
+        identity_verifier=identity_verifier,
+        approval_verifier=approval_verifier,
+        trusted_public_key_sha256=TRUSTED_APPROVAL_PUBLIC_KEY_SHA256,
+    )
+
+    assert evidence.account_id == "123456789012"
+    assert evidence.instance_id == "i-0123456789abcdef0"
+    assert evidence.boot_id == "12345678-1234-4abc-8def-1234567890ab"
+    assert evidence.profile_sha256 == _sha256(P6_PROFILE)
+    assert evidence.runtime_lock_sha256 == hashlib.sha256(lock_data).hexdigest()
+    assert evidence.approval_public_key_sha256 == (
+        TRUSTED_APPROVAL_PUBLIC_KEY_SHA256
+    )
+    assert evidence.identity_verified is True
+    assert evidence.approval_verified is True
+    assert len(identity_verifier.calls) == 1
+    assert len(approval_verifier.calls) == 1
+    assert approval_verifier.calls[0]["payload"] == _canonical_json(
+        value["approval"]["scope"]
+    )
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "unsigned",
+        "wrong-public-key",
+        "wrong-instance",
+        "wrong-boot",
+        "wrong-profile",
+        "wrong-runtime",
+        "wrong-ami",
+        "wrong-image",
+    ],
+)
+def test_qualification_evidence_rejects_forgery_or_identity_drift(mutation):
+    from msctl.aws_hardware import (
+        parse_authenticated_qualification_evidence_bytes,
+    )
+
+    value, lock_data = _qualification_evidence_value()
+    if mutation == "unsigned":
+        value["approval"]["signature"] = ""
+    elif mutation == "wrong-public-key":
+        value["approval"]["public_key_sha256"] = "8" * 64
+    elif mutation == "wrong-instance":
+        value["canary_receipt"]["instance_id"] = "i-0fedcba9876543210"
+    elif mutation == "wrong-boot":
+        value["canary_receipt"]["boot_id"] = (
+            "87654321-4321-4abc-8def-1234567890ab"
+        )
+    elif mutation == "wrong-profile":
+        value["canary_receipt"]["profile_sha256"] = P5_PROFILE_SHA256
+    elif mutation == "wrong-runtime":
+        value["canary_receipt"]["runtime_lock_sha256"] = "7" * 64
+    elif mutation == "wrong-ami":
+        value["environment_receipt"]["ami_id"] = "ami-0fedcba9876543210"
+        value["environment_receipt"]["aws_instance_identity_document"][
+            "imageId"
+        ] = "ami-0fedcba9876543210"
+    elif mutation == "wrong-image":
+        value["environment_receipt"]["container_image_digest"] = (
+            "sha256:" + "7" * 64
+        )
+    else:  # pragma: no cover - parameter guard
+        raise AssertionError(mutation)
+
+    with pytest.raises(ValueError):
+        parse_authenticated_qualification_evidence_bytes(
+            _canonical_json(value),
+            profile_data=P6_PROFILE.read_bytes(),
+            runtime_lock_data=lock_data,
+            identity_verifier=_QualificationIdentityVerifier(),
+            approval_verifier=_QualificationApprovalVerifier(),
+            trusted_public_key_sha256=TRUSTED_APPROVAL_PUBLIC_KEY_SHA256,
+        )
+
+
+@pytest.mark.parametrize(
+    ("identity_valid", "approval_valid"),
+    [(False, True), (True, False)],
+    ids=["forged-instance-signature", "forged-approval-signature"],
+)
+def test_qualification_evidence_rejects_failed_crypto_verifier(
+    identity_valid,
+    approval_valid,
+):
+    from msctl.aws_hardware import (
+        parse_authenticated_qualification_evidence_bytes,
+    )
+
+    value, lock_data = _qualification_evidence_value()
+    with pytest.raises(ValueError, match="signature|verification|approval"):
+        parse_authenticated_qualification_evidence_bytes(
+            _canonical_json(value),
+            profile_data=P6_PROFILE.read_bytes(),
+            runtime_lock_data=lock_data,
+            identity_verifier=_QualificationIdentityVerifier(identity_valid),
+            approval_verifier=_QualificationApprovalVerifier(approval_valid),
+            trusted_public_key_sha256=TRUSTED_APPROVAL_PUBLIC_KEY_SHA256,
         )
 
 
@@ -796,10 +1075,10 @@ def _selection_value(
         }
     else:  # pragma: no cover - test helper guard
         raise AssertionError(profile_id)
-    runtime_lock_data = _canonical_json(_runtime_lock_value(profile_id))
-    runtime_evidence_data = _canonical_json(
-        _runtime_evidence_value(profile_id, runtime_lock_data)
+    runtime_evidence, runtime_lock_data = _qualification_evidence_value(
+        profile_id
     )
+    runtime_evidence_data = _canonical_json(runtime_evidence)
     return {
         "amendment": {
             "path": "configs/aws-hardware-amendment-v3.json",
@@ -860,7 +1139,8 @@ def test_canonical_selection_receipt_binds_one_profile_and_entire_cohort(
 ):
     from msctl.aws_hardware import parse_provider_selection_receipt_bytes
 
-    data = _canonical_json(_selection_value(profile_id))
+    selection, lock_data, evidence_data = _verified_selection_fixture(profile_id)
+    data = _canonical_json(selection)
     receipt = parse_provider_selection_receipt_bytes(
         data,
         amendment_data=AMENDMENT.read_bytes(),
@@ -880,7 +1160,6 @@ def test_canonical_selection_receipt_binds_one_profile_and_entire_cohort(
     assert receipt.train_groups == (4, 4)
     assert receipt.preregistration_sha256 == PREREGISTRATION_SHA256
     assert receipt.cohort_assignment_sha256 == COHORT_ASSIGNMENT_SHA256
-    _, lock_data, evidence_data = _verified_selection_fixture(profile_id)
     assert receipt.runtime_lock_sha256 == hashlib.sha256(lock_data).hexdigest()
     assert receipt.runtime_evidence_sha256 == hashlib.sha256(
         evidence_data
@@ -1028,18 +1307,25 @@ def test_resume_binding_rejects_cross_profile_or_runtime_tuple_mixing(tmp_path):
         tmp_path
     )
     authority_root = tmp_path / "authority"
-    receipt = publish_provider_selection(
+    store = _MemorySelectionStore()
+    published = publish_provider_selection(
         authority_root=authority_root,
         repo_root=ROOT,
         runtime_lock_path=runtime_lock,
         runtime_evidence_path=runtime_evidence,
         selection_data=selection_data,
-        store=_MemorySelectionStore(),
-    ).selection
+        store=store,
+        **_qualification_verification_kwargs(),
+    )
+    receipt = published.selection
     binding = {
+        "account_id": receipt.account_id,
         "amendment_sha256": receipt.amendment.sha256,
         "arm": "split90",
         "authority_root": authority_root,
+        "boot_id": receipt.qualification_boot_id,
+        "expected_selection_version_id": published.remote.version_id,
+        "instance_id": receipt.qualification_instance_id,
         "profile_sha256": receipt.profile.sha256,
         "provider_selection_sha256": receipt.sha256,
         "repo_root": ROOT,
@@ -1048,6 +1334,8 @@ def test_resume_binding_rejects_cross_profile_or_runtime_tuple_mixing(tmp_path):
         "runtime_lock_path": runtime_lock,
         "runtime_lock_sha256": receipt.runtime_lock_sha256,
         "seed": 9,
+        "store": store,
+        **_qualification_verification_kwargs(),
     }
 
     validate_resume_hardware_binding(**binding)
@@ -1088,18 +1376,25 @@ def test_resume_binding_rejects_cohort_or_placement_mixing(
         tmp_path
     )
     authority_root = tmp_path / "authority"
-    receipt = publish_provider_selection(
+    store = _MemorySelectionStore()
+    published = publish_provider_selection(
         authority_root=authority_root,
         repo_root=ROOT,
         runtime_lock_path=runtime_lock,
         runtime_evidence_path=runtime_evidence,
         selection_data=selection_data,
-        store=_MemorySelectionStore(),
-    ).selection
+        store=store,
+        **_qualification_verification_kwargs(),
+    )
+    receipt = published.selection
     binding = {
+        "account_id": receipt.account_id,
         "amendment_sha256": receipt.amendment.sha256,
         "arm": "dense",
         "authority_root": authority_root,
+        "boot_id": receipt.qualification_boot_id,
+        "expected_selection_version_id": published.remote.version_id,
+        "instance_id": receipt.qualification_instance_id,
         "profile_sha256": receipt.profile.sha256,
         "provider_selection_sha256": receipt.sha256,
         "repo_root": ROOT,
@@ -1108,6 +1403,8 @@ def test_resume_binding_rejects_cohort_or_placement_mixing(
         "runtime_lock_path": runtime_lock,
         "runtime_lock_sha256": receipt.runtime_lock_sha256,
         "seed": 0,
+        "store": store,
+        **_qualification_verification_kwargs(),
     }
     binding[field] = changed
 
@@ -1121,12 +1418,28 @@ class _MemorySelectionStore:
         *,
         lost_put: bool = False,
         corrupt_head: str | None = None,
+        history_versions: tuple[str, ...] = (),
+        delete_markers: tuple[str, ...] = (),
     ) -> None:
         self.lost_put = lost_put
         self.corrupt_head = corrupt_head
+        self.history_versions = list(history_versions)
+        self.delete_markers = list(delete_markers)
         self.objects: dict[str, tuple[bytes, str]] = {}
+        self.list_calls: list[str] = []
         self.put_calls: list[dict[str, object]] = []
         self.head_calls: list[dict[str, object]] = []
+        self.get_calls: list[dict[str, str]] = []
+
+    def list_versions(self, *, key: str):
+        from msctl.aws_hardware import VersionedSelectionHistory
+
+        self.list_calls.append(key)
+        return VersionedSelectionHistory(
+            key=key,
+            versions=tuple(self.history_versions),
+            delete_markers=tuple(self.delete_markers),
+        )
 
     def put_if_none_match(
         self,
@@ -1149,6 +1462,7 @@ class _MemorySelectionStore:
             return None
         version_id = "version-1"
         self.objects[key] = (data, version_id)
+        self.history_versions.append(version_id)
         if self.lost_put:
             return None
         return VersionedSelectionObject(
@@ -1182,6 +1496,239 @@ class _MemorySelectionStore:
             sha256=sha256,
             bytes=byte_count,
             version_id=result_version,
+        )
+
+    def get_exact(self, *, key: str, version_id: str):
+        from msctl.aws_hardware import (
+            VersionedSelectionObject,
+            VersionedSelectionRead,
+        )
+
+        self.get_calls.append({"key": key, "version_id": version_id})
+        stored = self.objects.get(key)
+        if stored is None or stored[1] != version_id:
+            return None
+        data, stored_version = stored
+        return VersionedSelectionRead(
+            data=data,
+            object=VersionedSelectionObject(
+                key=key,
+                sha256=hashlib.sha256(data).hexdigest(),
+                bytes=len(data),
+                version_id=stored_version,
+            ),
+        )
+
+
+class _AwsSelectionRunner:
+    def __init__(self, payload: bytes) -> None:
+        self.payload = payload
+        self.calls: list[tuple[list[str], dict[str, str], float]] = []
+
+    def __call__(self, argv, environment, timeout_seconds):
+        rendered = list(argv)
+        self.calls.append(
+            (rendered, dict(environment), float(timeout_seconds))
+        )
+        operation = rendered[rendered.index("s3api") + 1]
+        checksum = base64.b64encode(
+            hashlib.sha256(self.payload).digest()
+        ).decode("ascii")
+        if operation == "list-object-versions":
+            value = {"history": {"delete_markers": [], "versions": []}}
+        elif operation == "put-object":
+            body = Path(rendered[rendered.index("--body") + 1])
+            assert body.read_bytes() == self.payload
+            value = {
+                "object": {
+                    "checksum_sha256": checksum,
+                    "version_id": "version-7",
+                }
+            }
+        elif operation == "head-object":
+            value = {
+                "object": {
+                    "checksum_sha256": checksum,
+                    "content_length": len(self.payload),
+                    "version_id": "version-7",
+                }
+            }
+        elif operation == "get-object":
+            destination = Path(rendered[rendered.index("--output") - 1])
+            destination.write_bytes(self.payload)
+            value = {
+                "object": {
+                    "checksum_sha256": checksum,
+                    "content_length": len(self.payload),
+                    "version_id": "version-7",
+                }
+            }
+        else:  # pragma: no cover - fake guard
+            raise AssertionError(operation)
+        return SimpleNamespace(
+            returncode=0,
+            stdout=json.dumps(value, separators=(",", ":")),
+            stderr="",
+        )
+
+
+def test_aws_cli_versioned_selection_store_uses_exact_fixed_key_commands(
+    tmp_path,
+):
+    from msctl.aws_hardware import (
+        AwsCliVersionedSelectionStore,
+        PROVIDER_SELECTION_S3_KEY,
+    )
+
+    payload = _canonical_json(_selection_value())
+    runner = _AwsSelectionRunner(payload)
+    store = AwsCliVersionedSelectionStore(
+        bucket="memorysplit-authority",
+        region="us-east-1",
+        environment={"AWS_REGION": "us-east-1", "LANG": "C"},
+        staging_root=tmp_path,
+        runner=runner,
+        timeout_seconds=17,
+    )
+    history = store.list_versions(key=PROVIDER_SELECTION_S3_KEY)
+    uploaded = store.put_if_none_match(
+        key=PROVIDER_SELECTION_S3_KEY,
+        data=payload,
+        if_none_match="*",
+        checksum_sha256=hashlib.sha256(payload).hexdigest(),
+    )
+    assert uploaded is not None
+    headed = store.head(
+        key=PROVIDER_SELECTION_S3_KEY,
+        version_id=uploaded.version_id,
+    )
+    downloaded = store.get_exact(
+        key=PROVIDER_SELECTION_S3_KEY,
+        version_id=uploaded.version_id,
+    )
+
+    assert history.versions == ()
+    assert history.delete_markers == ()
+    assert headed == uploaded
+    assert downloaded is not None
+    assert downloaded.data == payload
+    assert downloaded.object == uploaded
+    commands = [argv for argv, _environment, _timeout in runner.calls]
+    assert [
+        argv[argv.index("s3api") + 1] for argv in commands
+    ] == [
+        "list-object-versions",
+        "put-object",
+        "head-object",
+        "get-object",
+    ]
+    assert all(
+        argv[argv.index("--bucket") + 1] == "memorysplit-authority"
+        and argv[argv.index("--key") + 1] == PROVIDER_SELECTION_S3_KEY
+        for argv in commands[1:]
+    )
+    assert commands[1][commands[1].index("--if-none-match") + 1] == "*"
+    assert commands[2][commands[2].index("--version-id") + 1] == "version-7"
+    assert commands[3][commands[3].index("--version-id") + 1] == "version-7"
+    assert all(timeout == 17 for _argv, _environment, timeout in runner.calls)
+
+
+@pytest.mark.parametrize(
+    ("history_versions", "delete_markers"),
+    [(("old-version",), ()), ((), ("delete-marker-1",))],
+    ids=["historical-version", "delete-marker"],
+)
+def test_selection_publication_blocks_any_fixed_key_history(
+    tmp_path,
+    history_versions,
+    delete_markers,
+):
+    from msctl.aws_hardware import (
+        PROVIDER_SELECTION_LOCAL_PATH,
+        publish_provider_selection,
+    )
+
+    selection_data, runtime_lock, runtime_evidence = _write_authority_inputs(
+        tmp_path
+    )
+    store = _MemorySelectionStore(
+        history_versions=history_versions,
+        delete_markers=delete_markers,
+    )
+
+    with pytest.raises(ValueError, match="history|version|delete"):
+        publish_provider_selection(
+            authority_root=tmp_path / "authority",
+            repo_root=ROOT,
+            runtime_lock_path=runtime_lock,
+            runtime_evidence_path=runtime_evidence,
+            selection_data=selection_data,
+            store=store,
+            **_qualification_verification_kwargs(),
+        )
+    assert store.put_calls == []
+    assert not (
+        tmp_path / "authority" / PROVIDER_SELECTION_LOCAL_PATH
+    ).exists()
+
+
+def test_published_version_is_persisted_and_required_for_exact_replay(tmp_path):
+    from msctl.aws_hardware import (
+        PROVIDER_SELECTION_VERSION_LOCAL_PATH,
+        load_versioned_provider_selection_authority,
+        publish_provider_selection,
+    )
+
+    selection_data, runtime_lock, runtime_evidence = _write_authority_inputs(
+        tmp_path
+    )
+    authority_root = tmp_path / "authority"
+    store = _MemorySelectionStore()
+    published = publish_provider_selection(
+        authority_root=authority_root,
+        repo_root=ROOT,
+        runtime_lock_path=runtime_lock,
+        runtime_evidence_path=runtime_evidence,
+        selection_data=selection_data,
+        store=store,
+        **_qualification_verification_kwargs(),
+    )
+    version_path = authority_root / PROVIDER_SELECTION_VERSION_LOCAL_PATH
+    version_receipt = json.loads(version_path.read_bytes())
+
+    assert version_receipt == {
+        "schema_version": 1,
+        "selection_sha256": published.selection.sha256,
+        "s3_key": published.remote.key,
+        "version_id": published.remote.version_id,
+    }
+    replayed = load_versioned_provider_selection_authority(
+        authority_root=authority_root,
+        repo_root=ROOT,
+        runtime_lock_path=runtime_lock,
+        runtime_evidence_path=runtime_evidence,
+        store=store,
+        **_qualification_verification_kwargs(),
+    )
+    assert replayed == published.selection
+    assert store.get_calls == [
+        {
+            "key": published.remote.key,
+            "version_id": published.remote.version_id,
+        }
+    ]
+
+    version_receipt["version_id"] = "other-version"
+    version_path.write_bytes(_canonical_json(version_receipt))
+    version_path.chmod(0o600)
+    with pytest.raises(ValueError, match="version|GET|replay"):
+        load_versioned_provider_selection_authority(
+            authority_root=authority_root,
+            repo_root=ROOT,
+            runtime_lock_path=runtime_lock,
+            runtime_evidence_path=runtime_evidence,
+            store=store,
+            **_qualification_verification_kwargs(),
         )
 
 
@@ -1219,6 +1766,7 @@ def test_selection_authority_paths_are_fixed_and_cohort_specific():
 
 def test_public_contract_dataclasses_are_data_only():
     from msctl.aws_hardware import (
+        AuthenticatedSelectionBinding,
         ArtifactBinding,
         AwsHardwareAmendment,
         AwsProviderSelectionReceipt,
@@ -1227,9 +1775,12 @@ def test_public_contract_dataclasses_are_data_only():
         HardwareProfileBinding,
         PublishedProviderSelection,
         VersionedSelectionObject,
+        VersionedSelectionHistory,
+        VersionedSelectionRead,
     )
 
     for contract in (
+        AuthenticatedSelectionBinding,
         ArtifactBinding,
         AwsHardwareAmendment,
         AwsProviderSelectionReceipt,
@@ -1238,6 +1789,8 @@ def test_public_contract_dataclasses_are_data_only():
         HardwareProfileBinding,
         PublishedProviderSelection,
         VersionedSelectionObject,
+        VersionedSelectionHistory,
+        VersionedSelectionRead,
     ):
         authority_methods = [
             name
@@ -1266,6 +1819,7 @@ def test_fixed_authority_publishes_local_and_versioned_store_once(tmp_path):
         runtime_evidence_path=runtime_evidence,
         selection_data=selection_data,
         store=store,
+        **_qualification_verification_kwargs(),
     )
     local_path = authority_root / PROVIDER_SELECTION_LOCAL_PATH
 
@@ -1294,6 +1848,7 @@ def test_fixed_authority_publishes_local_and_versioned_store_once(tmp_path):
             selection_data=selection_data,
             store=store,
             path=tmp_path / "alternative.json",
+            **_qualification_verification_kwargs(),
         )
 
 
@@ -1313,6 +1868,7 @@ def test_fixed_authority_rejects_conflicting_local_profile_selection(tmp_path):
         runtime_evidence_path=p6_evidence,
         selection_data=p6_data,
         store=store,
+        **_qualification_verification_kwargs(),
     )
     p5_data, p5_lock, p5_evidence = _write_authority_inputs(tmp_path, "aws-p5.48xlarge-v3")
 
@@ -1324,6 +1880,7 @@ def test_fixed_authority_rejects_conflicting_local_profile_selection(tmp_path):
             runtime_evidence_path=p5_evidence,
             selection_data=p5_data,
             store=store,
+            **_qualification_verification_kwargs(),
         )
     assert (authority_root / PROVIDER_SELECTION_LOCAL_PATH).read_bytes() == p6_data
 
@@ -1345,6 +1902,7 @@ def test_local_conflict_blocks_publication_to_an_empty_remote_store(tmp_path):
         runtime_evidence_path=p6_evidence,
         selection_data=p6_data,
         store=_MemorySelectionStore(),
+        **_qualification_verification_kwargs(),
     )
     p5_data, p5_lock, p5_evidence = _write_authority_inputs(
         tmp_path, "aws-p5.48xlarge-v3"
@@ -1359,6 +1917,7 @@ def test_local_conflict_blocks_publication_to_an_empty_remote_store(tmp_path):
             runtime_evidence_path=p5_evidence,
             selection_data=p5_data,
             store=empty_store,
+            **_qualification_verification_kwargs(),
         )
     assert PROVIDER_SELECTION_S3_KEY not in empty_store.objects
 
@@ -1380,6 +1939,7 @@ def test_fixed_store_recovers_only_exact_lost_put(tmp_path):
         runtime_evidence_path=runtime_evidence,
         selection_data=selection_data,
         store=store,
+        **_qualification_verification_kwargs(),
     )
 
     assert published.remote.version_id == "version-1"
@@ -1405,6 +1965,7 @@ def test_fixed_store_rejects_inexact_head_recovery(tmp_path, corrupt_head):
             runtime_evidence_path=runtime_evidence,
             selection_data=selection_data,
             store=store,
+            **_qualification_verification_kwargs(),
         )
 
 
@@ -1432,6 +1993,7 @@ def test_fixed_store_rejects_conflicting_existing_selection(tmp_path):
             runtime_evidence_path=p6_evidence,
             selection_data=p6_data,
             store=store,
+            **_qualification_verification_kwargs(),
         )
     assert set(store.objects) == {PROVIDER_SELECTION_S3_KEY}
     assert not (
@@ -1450,25 +2012,33 @@ def test_authority_load_and_resume_reparse_anchored_bytes(tmp_path):
         tmp_path
     )
     authority_root = tmp_path / "authority"
+    store = _MemorySelectionStore()
     published = publish_provider_selection(
         authority_root=authority_root,
         repo_root=ROOT,
         runtime_lock_path=runtime_lock,
         runtime_evidence_path=runtime_evidence,
         selection_data=selection_data,
-        store=_MemorySelectionStore(),
+        store=store,
+        **_qualification_verification_kwargs(),
     )
     loaded = load_local_provider_selection_authority(
         authority_root=authority_root,
         repo_root=ROOT,
         runtime_lock_path=runtime_lock,
         runtime_evidence_path=runtime_evidence,
+        **_qualification_verification_kwargs(),
     )
     resumed = validate_resume_hardware_binding(
         authority_root=authority_root,
         repo_root=ROOT,
         runtime_lock_path=runtime_lock,
         runtime_evidence_path=runtime_evidence,
+        store=store,
+        account_id=loaded.account_id,
+        instance_id=loaded.qualification_instance_id,
+        boot_id=loaded.qualification_boot_id,
+        expected_selection_version_id=published.remote.version_id,
         amendment_sha256=loaded.amendment.sha256,
         provider_selection_sha256=loaded.sha256,
         profile_sha256=loaded.profile.sha256,
@@ -1476,10 +2046,11 @@ def test_authority_load_and_resume_reparse_anchored_bytes(tmp_path):
         runtime_evidence_sha256=loaded.runtime_evidence_sha256,
         seed=9,
         arm="split90",
+        **_qualification_verification_kwargs(),
     )
 
     assert loaded == published.selection
-    assert resumed == loaded
+    assert resumed.selection_sha256 == loaded.sha256
 
     with pytest.raises(ValueError, match="profile"):
         validate_resume_hardware_binding(
@@ -1487,6 +2058,11 @@ def test_authority_load_and_resume_reparse_anchored_bytes(tmp_path):
             repo_root=ROOT,
             runtime_lock_path=runtime_lock,
             runtime_evidence_path=runtime_evidence,
+            store=store,
+            account_id=loaded.account_id,
+            instance_id=loaded.qualification_instance_id,
+            boot_id=loaded.qualification_boot_id,
+            expected_selection_version_id=published.remote.version_id,
             amendment_sha256=loaded.amendment.sha256,
             provider_selection_sha256=loaded.sha256,
             profile_sha256=P5_PROFILE_SHA256,
@@ -1494,6 +2070,7 @@ def test_authority_load_and_resume_reparse_anchored_bytes(tmp_path):
             runtime_evidence_sha256=loaded.runtime_evidence_sha256,
             seed=9,
             arm="split90",
+            **_qualification_verification_kwargs(),
         )
 
 
@@ -1513,6 +2090,7 @@ def test_forged_dataclasses_cannot_enter_authority_apis(tmp_path):
         profile_data=P6_PROFILE.read_bytes(),
         runtime_lock_data=lock_data,
         runtime_evidence_data=evidence_data,
+        **_qualification_verification_kwargs(),
     )
     forged_receipt = replace(
         receipt,
@@ -1575,6 +2153,7 @@ def test_authority_private_files_reject_mode_and_hardlink_drift(tmp_path):
             runtime_evidence_path=runtime_evidence,
             selection_data=selection_data,
             store=_MemorySelectionStore(),
+            **_qualification_verification_kwargs(),
         )
 
     runtime_lock.chmod(0o600)
@@ -1586,6 +2165,7 @@ def test_authority_private_files_reject_mode_and_hardlink_drift(tmp_path):
         runtime_evidence_path=runtime_evidence,
         selection_data=selection_data,
         store=_MemorySelectionStore(),
+        **_qualification_verification_kwargs(),
     )
     local_path = authority_root / PROVIDER_SELECTION_LOCAL_PATH
     local_path.chmod(0o644)
@@ -1595,6 +2175,7 @@ def test_authority_private_files_reject_mode_and_hardlink_drift(tmp_path):
             repo_root=ROOT,
             runtime_lock_path=runtime_lock,
             runtime_evidence_path=runtime_evidence,
+            **_qualification_verification_kwargs(),
         )
 
     local_path.chmod(0o600)
@@ -1606,4 +2187,256 @@ def test_authority_private_files_reject_mode_and_hardlink_drift(tmp_path):
             repo_root=ROOT,
             runtime_lock_path=runtime_lock,
             runtime_evidence_path=runtime_evidence,
+            **_qualification_verification_kwargs(),
         )
+
+
+def _write_cli_authority_inputs(tmp_path: Path) -> dict[str, Path]:
+    selection_data, runtime_lock, runtime_evidence = _write_authority_inputs(
+        tmp_path
+    )
+    selection = tmp_path / "selection.json"
+    selection.write_bytes(selection_data)
+    selection.chmod(0o600)
+    public_key = tmp_path / "approval-public-key.pem"
+    public_key.write_bytes(b"synthetic public key for injected verifier\n")
+    public_key.chmod(0o600)
+    return {
+        "authority_root": tmp_path / "authority-cli",
+        "public_key": public_key,
+        "runtime_evidence": runtime_evidence,
+        "runtime_lock": runtime_lock,
+        "selection": selection,
+    }
+
+
+def _publish_cli_argv(paths: dict[str, Path], *, apply: bool) -> list[str]:
+    argv = [
+        "publish",
+        "--repo-root",
+        str(ROOT),
+        "--authority-root",
+        str(paths["authority_root"]),
+        "--runtime-lock",
+        str(paths["runtime_lock"]),
+        "--qualification-evidence",
+        str(paths["runtime_evidence"]),
+        "--selection",
+        str(paths["selection"]),
+        "--bucket",
+        "memorysplit-authority",
+        "--region",
+        "us-east-1",
+        "--approval-public-key",
+        str(paths["public_key"]),
+        "--approval-public-key-sha256",
+        TRUSTED_APPROVAL_PUBLIC_KEY_SHA256,
+    ]
+    if apply:
+        argv.append("--apply")
+    return argv
+
+
+def test_authority_cli_is_dry_run_by_default_and_apply_is_explicit(tmp_path):
+    from msctl.aws_hardware import run_hardware_authority_cli
+
+    paths = _write_cli_authority_inputs(tmp_path)
+    store = _MemorySelectionStore()
+    dry_run, planned = run_hardware_authority_cli(
+        _publish_cli_argv(paths, apply=False),
+        store=store,
+        **_qualification_verification_kwargs(),
+    )
+
+    assert dry_run is True
+    assert planned["operation"] == "publish-provider-selection"
+    assert planned["apply"] is False
+    assert planned["s3_key"] == SELECTION_S3_KEY
+    assert store.list_calls == []
+    assert not paths["authority_root"].exists()
+
+    dry_run, applied = run_hardware_authority_cli(
+        _publish_cli_argv(paths, apply=True),
+        store=store,
+        **_qualification_verification_kwargs(),
+    )
+    assert dry_run is False
+    assert applied["apply"] is True
+    assert applied["selection_version_id"] == "version-1"
+    assert applied["selection_sha256"] == hashlib.sha256(
+        paths["selection"].read_bytes()
+    ).hexdigest()
+    assert store.list_calls == [SELECTION_S3_KEY]
+
+
+def test_exact_admission_returns_only_authenticated_selection_binding(tmp_path):
+    from msctl.aws_hardware import (
+        AuthenticatedSelectionBinding,
+        admit_provider_selection,
+        publish_provider_selection,
+        validate_resume_hardware_binding,
+    )
+
+    selection_data, runtime_lock, runtime_evidence = _write_authority_inputs(
+        tmp_path
+    )
+    authority_root = tmp_path / "authority-admit"
+    store = _MemorySelectionStore()
+    published = publish_provider_selection(
+        authority_root=authority_root,
+        repo_root=ROOT,
+        runtime_lock_path=runtime_lock,
+        runtime_evidence_path=runtime_evidence,
+        selection_data=selection_data,
+        store=store,
+        **_qualification_verification_kwargs(),
+    )
+    binding = admit_provider_selection(
+        authority_root=authority_root,
+        repo_root=ROOT,
+        runtime_lock_path=runtime_lock,
+        runtime_evidence_path=runtime_evidence,
+        store=store,
+        account_id="123456789012",
+        instance_id="i-0123456789abcdef0",
+        boot_id="12345678-1234-4abc-8def-1234567890ab",
+        seed=0,
+        arm="dense",
+        expected_selection_version_id=published.remote.version_id,
+        **_qualification_verification_kwargs(),
+    )
+
+    assert isinstance(binding, AuthenticatedSelectionBinding)
+    assert binding.selection_sha256 == published.selection.sha256
+    assert binding.selection_version_id == published.remote.version_id
+    assert binding.profile_id == "aws-p6-b300.48xlarge-v3"
+    assert binding.runtime_lock_sha256 == published.selection.runtime_lock_sha256
+    assert binding.qualification_evidence_sha256 == (
+        published.selection.runtime_evidence_sha256
+    )
+    assert binding.account_id == "123456789012"
+    assert binding.instance_id == "i-0123456789abcdef0"
+    assert binding.boot_id == "12345678-1234-4abc-8def-1234567890ab"
+    assert binding.seed == 0
+    assert binding.arm == "dense"
+    assert not hasattr(binding, "selection")
+    validated = validate_resume_hardware_binding(
+        authority_root=authority_root,
+        repo_root=ROOT,
+        runtime_lock_path=runtime_lock,
+        runtime_evidence_path=runtime_evidence,
+        store=store,
+        account_id=binding.account_id,
+        instance_id=binding.instance_id,
+        boot_id=binding.boot_id,
+        expected_selection_version_id=binding.selection_version_id,
+        amendment_sha256=binding.amendment_sha256,
+        provider_selection_sha256=binding.selection_sha256,
+        profile_sha256=binding.profile_sha256,
+        runtime_lock_sha256=binding.runtime_lock_sha256,
+        runtime_evidence_sha256=binding.qualification_evidence_sha256,
+        seed=0,
+        arm="dense",
+        **_qualification_verification_kwargs(),
+    )
+    assert validated == binding
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("instance_id", "i-0fedcba9876543210"),
+        ("boot_id", "87654321-4321-4abc-8def-1234567890ab"),
+        ("account_id", "210987654321"),
+        ("expected_selection_version_id", "wrong-version"),
+    ],
+)
+def test_exact_admission_rejects_wrong_authority_identity(
+    tmp_path,
+    field,
+    value,
+):
+    from msctl.aws_hardware import (
+        admit_provider_selection,
+        publish_provider_selection,
+    )
+
+    selection_data, runtime_lock, runtime_evidence = _write_authority_inputs(
+        tmp_path
+    )
+    authority_root = tmp_path / "authority-admit"
+    store = _MemorySelectionStore()
+    published = publish_provider_selection(
+        authority_root=authority_root,
+        repo_root=ROOT,
+        runtime_lock_path=runtime_lock,
+        runtime_evidence_path=runtime_evidence,
+        selection_data=selection_data,
+        store=store,
+        **_qualification_verification_kwargs(),
+    )
+    values = {
+        "account_id": "123456789012",
+        "arm": "split90",
+        "boot_id": "12345678-1234-4abc-8def-1234567890ab",
+        "expected_selection_version_id": published.remote.version_id,
+        "instance_id": "i-0123456789abcdef0",
+        "seed": 9,
+    }
+    values[field] = value
+
+    with pytest.raises(ValueError, match="identity|version|authority"):
+        admit_provider_selection(
+            authority_root=authority_root,
+            repo_root=ROOT,
+            runtime_lock_path=runtime_lock,
+            runtime_evidence_path=runtime_evidence,
+            store=store,
+            **values,
+            **_qualification_verification_kwargs(),
+        )
+
+
+def test_openssl_approval_verifier_checks_public_key_commitment_and_signature(
+    tmp_path,
+):
+    from msctl.aws_hardware import OpenSslQualificationApprovalVerifier
+
+    key = tmp_path / "approval-public-key.pem"
+    key.write_bytes(b"synthetic-pem-public-key\n")
+    key.chmod(0o600)
+    calls = []
+
+    def runner(argv, environment, timeout_seconds):
+        calls.append((list(argv), dict(environment), timeout_seconds))
+        return SimpleNamespace(
+            returncode=0,
+            stdout="Verified OK\n",
+            stderr="",
+        )
+
+    verifier = OpenSslQualificationApprovalVerifier(
+        public_key_path=key,
+        environment={"LANG": "C"},
+        runner=runner,
+    )
+    signature = base64.b64encode(b"synthetic signature").decode("ascii")
+    assert verifier.verify(
+        payload=b'{"scope":"exact"}\n',
+        signature=signature,
+        algorithm="RSASSA_PSS_SHA_256",
+        public_key_sha256=hashlib.sha256(key.read_bytes()).hexdigest(),
+    )
+    assert not verifier.verify(
+        payload=b'{"scope":"exact"}\n',
+        signature=signature,
+        algorithm="RSASSA_PSS_SHA_256",
+        public_key_sha256="0" * 64,
+    )
+    assert len(calls) == 1
+    assert calls[0][0][:4] == [
+        "/usr/bin/openssl",
+        "dgst",
+        "-sha256",
+        "-sigopt",
+    ]

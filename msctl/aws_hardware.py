@@ -2,15 +2,22 @@
 
 from __future__ import annotations
 
+import base64
+import argparse
 import hashlib
+import ipaddress
 import json
+import math
 import os
 import re
 import secrets
-from dataclasses import dataclass
+import subprocess
+import sys
+import tempfile
+from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
-from typing import Protocol
+from typing import Callable, Mapping, Protocol, Sequence
 
 from cluster.aws.gpu_profile import (
     load_aws_gpu_profile,
@@ -18,6 +25,7 @@ from cluster.aws.gpu_profile import (
     read_secure_regular_file,
 )
 from msctl.aws_contracts import (
+    AWS_ENVIRONMENT_RECEIPT_V2_FIELDS,
     AWS_RUNTIME_LOCK_FIELDS,
     AWS_RUNTIME_VERSION_FIELDS,
     validate_digest_pinned_oci_image,
@@ -37,6 +45,9 @@ PROVIDER_SELECTION_LOCAL_PATH = (
 PROVIDER_SELECTION_S3_KEY = (
     "cohorts/memorysplit-confirmatory-v3-360m-n10-aws/provider-selection.json"
 )
+PROVIDER_SELECTION_VERSION_LOCAL_PATH = (
+    "memorysplit-confirmatory-v3-360m-n10-aws/provider-selection-version.json"
+)
 AWS_HARDWARE_AMENDMENT_SHA256 = (
     "d4cf13b587c751d27756ad7881e538facb7ea79305a098990a568a7b28b6fb14"
 )
@@ -47,6 +58,15 @@ _COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
 _OCI_DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 _AMI_RE = re.compile(r"^ami-[0-9a-f]{8,17}$")
 _ACCOUNT_RE = re.compile(r"^[0-9]{12}$")
+_INSTANCE_RE = re.compile(r"^i-[0-9a-f]{8,17}$")
+_BOOT_RE = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-"
+    r"[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+)
+_S3_BUCKET_RE = re.compile(
+    r"^(?![0-9]+(?:\.[0-9]+){3}$)(?!-)(?!.*\.\.)(?!.*\.-)(?!.*-\.)"
+    r"[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$"
+)
 _REGION_RE = re.compile(r"^[a-z]{2}(?:-[a-z0-9]+)+-[0-9]+$")
 _AVAILABILITY_ZONE_RE = re.compile(
     r"^(?P<region>[a-z]{2}(?:-[a-z0-9]+)+-[0-9]+)[a-z]$"
@@ -105,6 +125,47 @@ _EXPECTED_AMENDMENT = {
     "schema_version": 1,
     "supersedes_only": ["provider_assignment", "hardware_topology"],
 }
+_CANARY_PHASE_ORDER = (
+    "hardware",
+    "nccl_all_reduce",
+    "functional",
+    "resume",
+    "throughput_4x4",
+    "s3_roundtrip",
+)
+_CANARY_RECEIPT_FIELDS = frozenset(
+    {
+        "schema_version",
+        "receipt_type",
+        "provider",
+        "instance_id",
+        "boot_id",
+        "profile_sha256",
+        "runtime_lock_sha256",
+        "environment_receipt_sha256",
+        "release_sha256",
+        "release_receipt_sha256",
+        "run_manifest_sha256",
+        "dataset_receipt_sha256",
+        "dataset_build_id",
+        "ordered_stream_sha256",
+        "source_commit",
+        "source_tree",
+        "container_image",
+        "container_image_digest",
+        "seed",
+        "phases",
+        "hardware",
+        "functional",
+        "resume",
+        "throughput_4x4",
+        "s3_roundtrip",
+        "passed",
+        "started_at",
+        "ended_at",
+        "total_seconds",
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -171,6 +232,14 @@ class AwsProviderSelectionReceipt:
     replacement_policy: str
     protected_outcomes_inspected: tuple[str, ...]
     sha256: str
+    qualification_instance_id: str = ""
+    qualification_boot_id: str = ""
+    environment_receipt_sha256: str = ""
+    canary_receipt_sha256: str = ""
+    approval_receipt_sha256: str = ""
+    approval_public_key_sha256: str = ""
+    identity_verified: bool = False
+    approval_verified: bool = False
 
 
 @dataclass(frozen=True)
@@ -199,6 +268,18 @@ class AwsRuntimeEvidence:
     availability_zone: str
     versions: tuple[tuple[str, str], ...]
     sha256: str
+    instance_id: str = ""
+    boot_id: str = ""
+    ami_id: str = ""
+    container_image_digest: str = ""
+    environment_receipt_sha256: str = ""
+    canary_receipt_sha256: str = ""
+    approval_receipt_sha256: str = ""
+    approval_public_key_sha256: str = ""
+    host_facts_sha256: str = ""
+    container_facts_sha256: str = ""
+    identity_verified: bool = False
+    approval_verified: bool = False
 
 
 @dataclass(frozen=True)
@@ -214,9 +295,50 @@ class PublishedProviderSelection:
     selection: AwsProviderSelectionReceipt
     local_path: Path
     remote: VersionedSelectionObject
+    version_path: Path
+
+
+@dataclass(frozen=True)
+class VersionedSelectionHistory:
+    key: str
+    versions: tuple[str, ...]
+    delete_markers: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class VersionedSelectionRead:
+    data: bytes
+    object: VersionedSelectionObject
+
+
+@dataclass(frozen=True)
+class AuthenticatedSelectionBinding:
+    cohort_id: str
+    amendment_sha256: str
+    selection_sha256: str
+    selection_version_id: str
+    profile_id: str
+    provider: str
+    profile_sha256: str
+    runtime_lock_sha256: str
+    qualification_evidence_sha256: str
+    environment_receipt_sha256: str
+    canary_receipt_sha256: str
+    approval_receipt_sha256: str
+    approval_public_key_sha256: str
+    account_id: str
+    instance_id: str
+    boot_id: str
+    region: str
+    availability_zone: str
+    purchase_model: str
+    seed: int
+    arm: str
 
 
 class VersionedProviderSelectionStore(Protocol):
+    def list_versions(self, *, key: str) -> VersionedSelectionHistory: ...
+
     def put_if_none_match(
         self,
         *,
@@ -232,6 +354,545 @@ class VersionedProviderSelectionStore(Protocol):
         key: str,
         version_id: str | None,
     ) -> VersionedSelectionObject | None: ...
+
+    def get_exact(
+        self,
+        *,
+        key: str,
+        version_id: str,
+    ) -> VersionedSelectionRead | None: ...
+
+
+class QualificationApprovalVerifier(Protocol):
+    def verify(
+        self,
+        *,
+        payload: bytes,
+        signature: str,
+        algorithm: str,
+        public_key_sha256: str,
+    ) -> bool: ...
+
+
+def verify_aws_instance_identity_pkcs7(
+    identity: Mapping[str, object],
+    pkcs7: str,
+    region: str,
+) -> bool:
+    """Use the repository's pinned AWS identity-certificate verifier."""
+
+    from msctl.aws_p5 import _verify_instance_identity_pkcs7
+
+    return _verify_instance_identity_pkcs7(identity, pkcs7, region)
+
+
+class OpenSslQualificationApprovalVerifier:
+    """Verify qualification approval signatures against a pinned public key."""
+
+    def __init__(
+        self,
+        *,
+        public_key_path: Path | str,
+        environment: Mapping[str, str],
+        runner: Callable[
+            [Sequence[str], Mapping[str, str], float], object
+        ]
+        | None = None,
+        timeout_seconds: float = 30.0,
+    ) -> None:
+        if (
+            isinstance(timeout_seconds, bool)
+            or not isinstance(timeout_seconds, (int, float))
+            or timeout_seconds <= 0
+        ):
+            raise ValueError("qualification signature timeout must be positive")
+        self.public_key_data = read_secure_regular_file(
+            public_key_path,
+            label="qualification approval public key",
+            max_bytes=64 * 1024,
+        )
+        self.public_key_sha256 = hashlib.sha256(
+            self.public_key_data
+        ).hexdigest()
+        self.environment = dict(environment)
+        self.runner = runner or _default_aws_runner
+        self.timeout_seconds = float(timeout_seconds)
+
+    def verify(
+        self,
+        *,
+        payload: bytes,
+        signature: str,
+        algorithm: str,
+        public_key_sha256: str,
+    ) -> bool:
+        if (
+            not isinstance(payload, bytes)
+            or not payload
+            or algorithm != "RSASSA_PSS_SHA_256"
+            or public_key_sha256 != self.public_key_sha256
+        ):
+            return False
+        try:
+            signature_data = base64.b64decode(signature, validate=True)
+        except (TypeError, ValueError):
+            return False
+        if not signature_data:
+            return False
+        with tempfile.TemporaryDirectory(
+            prefix="memorysplit-qualification-signature-"
+        ) as directory:
+            root = Path(directory)
+            root.chmod(0o700)
+            public_key = root / "approval-public-key.pem"
+            message = root / "approval-scope.json"
+            signature_path = root / "approval-signature.bin"
+            for path, value in (
+                (public_key, self.public_key_data),
+                (message, payload),
+                (signature_path, signature_data),
+            ):
+                path.write_bytes(value)
+                path.chmod(0o600)
+            result = self.runner(
+                [
+                    "/usr/bin/openssl",
+                    "dgst",
+                    "-sha256",
+                    "-sigopt",
+                    "rsa_padding_mode:pss",
+                    "-verify",
+                    str(public_key),
+                    "-signature",
+                    str(signature_path),
+                    str(message),
+                ],
+                self.environment,
+                self.timeout_seconds,
+            )
+        return (
+            getattr(result, "returncode", None) == 0
+            and getattr(result, "stdout", None) == "Verified OK\n"
+            and getattr(result, "stderr", None) == ""
+        )
+
+
+def _default_aws_runner(
+    argv: Sequence[str],
+    environment: Mapping[str, str],
+    timeout_seconds: float,
+):
+    return subprocess.run(
+        list(argv),
+        env=dict(environment),
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=timeout_seconds,
+    )
+
+
+def _aws_command_json(
+    result: object,
+    *,
+    fields: frozenset[str],
+    label: str,
+) -> dict[str, object]:
+    if (
+        getattr(result, "returncode", None) != 0
+        or getattr(result, "stderr", None) != ""
+        or not isinstance(getattr(result, "stdout", None), str)
+    ):
+        raise ValueError(f"{label} AWS command failed")
+    try:
+        value = json.loads(
+            result.stdout,
+            object_pairs_hook=_unique_object,
+            parse_constant=lambda constant: (_ for _ in ()).throw(
+                ValueError(f"{label} contains non-finite value: {constant}")
+            ),
+        )
+    except json.JSONDecodeError as error:
+        raise ValueError(f"{label} AWS output is not JSON") from error
+    if not isinstance(value, dict) or set(value) != fields:
+        raise ValueError(f"{label} AWS output fields do not match")
+    return value
+
+
+def _checksum_hex(value: object, *, label: str) -> str:
+    if not isinstance(value, str):
+        raise ValueError(f"{label} checksum is missing")
+    try:
+        decoded = base64.b64decode(value, validate=True)
+    except ValueError as error:
+        raise ValueError(f"{label} checksum is not canonical base64") from error
+    if (
+        len(decoded) != 32
+        or base64.b64encode(decoded).decode("ascii") != value
+    ):
+        raise ValueError(f"{label} checksum is not SHA-256")
+    return decoded.hex()
+
+
+class AwsCliVersionedSelectionStore:
+    """AWS CLI adapter for the sole versioned provider-selection key."""
+
+    def __init__(
+        self,
+        *,
+        bucket: str,
+        region: str,
+        environment: Mapping[str, str],
+        staging_root: Path | str,
+        runner: Callable[
+            [Sequence[str], Mapping[str, str], float], object
+        ] = _default_aws_runner,
+        timeout_seconds: float = 120.0,
+    ) -> None:
+        if (
+            not isinstance(bucket, str)
+            or _S3_BUCKET_RE.fullmatch(bucket) is None
+        ):
+            raise ValueError("selection S3 bucket is invalid")
+        if not isinstance(region, str) or _REGION_RE.fullmatch(region) is None:
+            raise ValueError("selection AWS region is invalid")
+        if (
+            isinstance(timeout_seconds, bool)
+            or not isinstance(timeout_seconds, (int, float))
+            or timeout_seconds <= 0
+        ):
+            raise ValueError("selection AWS timeout must be positive")
+        root = Path(staging_root)
+        root.mkdir(parents=True, mode=0o700, exist_ok=True)
+        metadata = root.stat(follow_symlinks=False)
+        if (
+            root.is_symlink()
+            or not root.is_dir()
+            or metadata.st_uid != os.geteuid()
+            or metadata.st_mode & 0o077
+        ):
+            raise ValueError("selection staging root must be private and owned")
+        self.bucket = bucket
+        self.region = region
+        self.environment = dict(environment)
+        self.staging_root = root
+        self.runner = runner
+        self.timeout_seconds = float(timeout_seconds)
+
+    def _argv(self, *arguments: str, query: str) -> list[str]:
+        return [
+            "aws",
+            "--no-cli-pager",
+            "--region",
+            self.region,
+            *arguments,
+            "--output",
+            "json",
+            "--query",
+            query,
+        ]
+
+    @staticmethod
+    def _fixed_key(key: str) -> None:
+        if key != PROVIDER_SELECTION_S3_KEY:
+            raise ValueError("selection store only permits the fixed cohort key")
+
+    def list_versions(self, *, key: str) -> VersionedSelectionHistory:
+        self._fixed_key(key)
+        result = self.runner(
+            self._argv(
+                "s3api",
+                "list-object-versions",
+                "--bucket",
+                self.bucket,
+                "--prefix",
+                key,
+                query=(
+                    "{history:{versions:Versions[].{key:Key,"
+                    "version_id:VersionId},delete_markers:"
+                    "DeleteMarkers[].{key:Key,version_id:VersionId}}}"
+                ),
+            ),
+            self.environment,
+            self.timeout_seconds,
+        )
+        root = _aws_command_json(
+            result,
+            fields=frozenset({"history"}),
+            label="selection version history",
+        )
+        history = _object(
+            root["history"],
+            fields=frozenset({"versions", "delete_markers"}),
+            label="selection version history",
+        )
+
+        def identities(value: object, *, label: str) -> tuple[str, ...]:
+            if value is None:
+                return ()
+            if not isinstance(value, list):
+                raise ValueError(f"{label} must be a list")
+            found: list[str] = []
+            for row in value:
+                item = _object(
+                    row,
+                    fields=frozenset({"key", "version_id"}),
+                    label=label,
+                )
+                version_id = item["version_id"]
+                if (
+                    item["key"] != key
+                    or not isinstance(version_id, str)
+                    or version_id in {"", "null"}
+                ):
+                    raise ValueError(f"{label} contains an invalid identity")
+                found.append(version_id)
+            return tuple(found)
+
+        return VersionedSelectionHistory(
+            key=key,
+            versions=identities(history["versions"], label="selection versions"),
+            delete_markers=identities(
+                history["delete_markers"],
+                label="selection delete markers",
+            ),
+        )
+
+    def put_if_none_match(
+        self,
+        *,
+        key: str,
+        data: bytes,
+        if_none_match: str,
+        checksum_sha256: str,
+    ) -> VersionedSelectionObject | None:
+        self._fixed_key(key)
+        if (
+            not isinstance(data, bytes)
+            or not data
+            or if_none_match != "*"
+            or _sha256(checksum_sha256, label="selection PUT SHA-256")
+            != hashlib.sha256(data).hexdigest()
+        ):
+            raise ValueError("selection PUT identity is invalid")
+        checksum = base64.b64encode(bytes.fromhex(checksum_sha256)).decode(
+            "ascii"
+        )
+        with tempfile.NamedTemporaryFile(
+            prefix="provider-selection-",
+            suffix=".json",
+            dir=self.staging_root,
+            delete=False,
+        ) as handle:
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+            os.fchmod(handle.fileno(), 0o600)
+            body = Path(handle.name)
+        try:
+            result = self.runner(
+                self._argv(
+                    "s3api",
+                    "put-object",
+                    "--bucket",
+                    self.bucket,
+                    "--key",
+                    key,
+                    "--body",
+                    str(body),
+                    "--content-length",
+                    str(len(data)),
+                    "--checksum-algorithm",
+                    "SHA256",
+                    "--checksum-sha256",
+                    checksum,
+                    "--if-none-match",
+                    "*",
+                    query=(
+                        "{object:{checksum_sha256:ChecksumSHA256,"
+                        "version_id:VersionId}}"
+                    ),
+                ),
+                self.environment,
+                self.timeout_seconds,
+            )
+        finally:
+            body.unlink(missing_ok=True)
+        if getattr(result, "returncode", None) != 0:
+            return None
+        root = _aws_command_json(
+            result,
+            fields=frozenset({"object"}),
+            label="selection PUT",
+        )
+        row = _object(
+            root["object"],
+            fields=frozenset({"checksum_sha256", "version_id"}),
+            label="selection PUT",
+        )
+        version_id = row["version_id"]
+        if (
+            _checksum_hex(
+                row["checksum_sha256"],
+                label="selection PUT",
+            )
+            != checksum_sha256
+            or not isinstance(version_id, str)
+            or version_id in {"", "null"}
+        ):
+            raise ValueError("selection PUT response identity differs")
+        return VersionedSelectionObject(
+            key=key,
+            sha256=checksum_sha256,
+            bytes=len(data),
+            version_id=version_id,
+        )
+
+    def head(
+        self,
+        *,
+        key: str,
+        version_id: str | None,
+    ) -> VersionedSelectionObject | None:
+        self._fixed_key(key)
+        arguments = [
+            "s3api",
+            "head-object",
+            "--bucket",
+            self.bucket,
+            "--key",
+            key,
+        ]
+        if version_id is not None:
+            if not isinstance(version_id, str) or version_id in {"", "null"}:
+                return None
+            arguments.extend(["--version-id", version_id])
+        arguments.extend(["--checksum-mode", "ENABLED"])
+        result = self.runner(
+            self._argv(
+                *arguments,
+                query=(
+                    "{object:{checksum_sha256:ChecksumSHA256,"
+                    "content_length:ContentLength,version_id:VersionId}}"
+                ),
+            ),
+            self.environment,
+            self.timeout_seconds,
+        )
+        if getattr(result, "returncode", None) != 0:
+            return None
+        root = _aws_command_json(
+            result,
+            fields=frozenset({"object"}),
+            label="selection HEAD",
+        )
+        row = _object(
+            root["object"],
+            fields=frozenset(
+                {"checksum_sha256", "content_length", "version_id"}
+            ),
+            label="selection HEAD",
+        )
+        returned_version = row["version_id"]
+        if (
+            type(row["content_length"]) is not int
+            or row["content_length"] <= 0
+            or not isinstance(returned_version, str)
+            or returned_version in {"", "null"}
+            or (
+                version_id is not None
+                and returned_version != version_id
+            )
+        ):
+            return None
+        return VersionedSelectionObject(
+            key=key,
+            sha256=_checksum_hex(
+                row["checksum_sha256"],
+                label="selection HEAD",
+            ),
+            bytes=row["content_length"],
+            version_id=returned_version,
+        )
+
+    def get_exact(
+        self,
+        *,
+        key: str,
+        version_id: str,
+    ) -> VersionedSelectionRead | None:
+        self._fixed_key(key)
+        if not isinstance(version_id, str) or version_id in {"", "null"}:
+            return None
+        destination = self.staging_root / (
+            f"provider-selection-get-{secrets.token_hex(12)}.json"
+        )
+        try:
+            result = self.runner(
+                self._argv(
+                    "s3api",
+                    "get-object",
+                    "--bucket",
+                    self.bucket,
+                    "--key",
+                    key,
+                    "--version-id",
+                    version_id,
+                    "--checksum-mode",
+                    "ENABLED",
+                    str(destination),
+                    query=(
+                        "{object:{checksum_sha256:ChecksumSHA256,"
+                        "content_length:ContentLength,version_id:VersionId}}"
+                    ),
+                ),
+                self.environment,
+                self.timeout_seconds,
+            )
+            if getattr(result, "returncode", None) != 0:
+                return None
+            root = _aws_command_json(
+                result,
+                fields=frozenset({"object"}),
+                label="selection GET",
+            )
+            row = _object(
+                root["object"],
+                fields=frozenset(
+                    {"checksum_sha256", "content_length", "version_id"}
+                ),
+                label="selection GET",
+            )
+            data = read_secure_regular_file(
+                destination,
+                label="selection GET body",
+                max_bytes=_MAX_JSON_BYTES,
+            )
+        finally:
+            destination.unlink(missing_ok=True)
+        returned_version = row["version_id"]
+        digest = hashlib.sha256(data).hexdigest()
+        if (
+            type(row["content_length"]) is not int
+            or row["content_length"] != len(data)
+            or _checksum_hex(
+                row["checksum_sha256"],
+                label="selection GET",
+            )
+            != digest
+            or returned_version != version_id
+        ):
+            return None
+        return VersionedSelectionRead(
+            data=data,
+            object=VersionedSelectionObject(
+                key=key,
+                sha256=digest,
+                bytes=len(data),
+                version_id=version_id,
+            ),
+        )
 
 
 def _unique_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
@@ -851,91 +1512,341 @@ def _version_at_least(value: str, floor: str, *, label: str) -> None:
         raise ValueError(f"{label} is below the selected profile floor")
 
 
-def _parse_runtime_evidence_bytes(
+def _canonical_base64(value: object, *, label: str) -> str:
+    if not isinstance(value, str) or not value:
+        raise ValueError(f"{label} must be non-empty canonical base64")
+    try:
+        decoded = base64.b64decode(value, validate=True)
+    except ValueError as error:
+        raise ValueError(f"{label} must be canonical base64") from error
+    if (
+        not decoded
+        or base64.b64encode(decoded).decode("ascii") != value
+    ):
+        raise ValueError(f"{label} must be canonical base64")
+    return value
+
+
+def parse_authenticated_qualification_evidence_bytes(
     data: bytes,
     *,
-    profile: object,
+    profile_data: bytes,
+    runtime_lock_data: bytes,
+    identity_verifier: Callable[
+        [Mapping[str, object], str, str], bool
+    ],
+    approval_verifier: QualificationApprovalVerifier,
+    trusted_public_key_sha256: str,
 ) -> AwsRuntimeEvidence:
-    value = _json_object(data, label="runtime evidence")
+    """Verify signed environment and canary qualification evidence."""
+
+    profile = parse_aws_gpu_profile_bytes(profile_data)
+    runtime_lock = parse_aws_runtime_lock_bytes(runtime_lock_data)
+    if runtime_lock.profile_sha256 != profile.sha256:
+        raise ValueError("qualification runtime lock does not bind profile")
+    trusted_key = _sha256(
+        trusted_public_key_sha256,
+        label="trusted qualification public key",
+    )
+    value = _json_object(data, label="qualification evidence")
     if data != _canonical_json(value):
-        raise ValueError("runtime evidence must use canonical JSON bytes")
-    evidence = _object(
+        raise ValueError("qualification evidence must use canonical JSON bytes")
+    root = _object(
         value,
         fields=frozenset(
             {
-                "account_id",
-                "availability_zone",
-                "profile_sha256",
+                "approval",
+                "canary_receipt",
+                "environment_receipt",
                 "receipt_type",
-                "region",
-                "runtime_lock_sha256",
                 "schema_version",
-                "versions",
             }
         ),
-        label="runtime evidence",
+        label="qualification evidence",
     )
     if (
-        type(evidence["schema_version"]) is not int
-        or evidence["schema_version"] != 1
+        type(root["schema_version"]) is not int
+        or root["schema_version"] != 2
+        or root["receipt_type"] != "memorysplit-aws-qualified-runtime-v2"
     ):
-        raise ValueError("runtime evidence schema_version must be integer 1")
-    receipt_type = _exact_string(
-        evidence["receipt_type"],
-        "memorysplit-aws-runtime-evidence-v1",
-        label="runtime evidence receipt_type",
+        raise ValueError("qualification evidence identity is invalid")
+
+    environment = _object(
+        root["environment_receipt"],
+        fields=frozenset(AWS_ENVIRONMENT_RECEIPT_V2_FIELDS),
+        label="qualification environment receipt",
     )
-    profile_sha256 = _sha256(
-        evidence["profile_sha256"],
-        label="runtime evidence profile SHA-256",
-    )
-    runtime_lock_sha256 = _sha256(
-        evidence["runtime_lock_sha256"],
-        label="runtime evidence runtime-lock SHA-256",
-    )
-    account_id = evidence["account_id"]
     if (
-        not isinstance(account_id, str)
-        or _ACCOUNT_RE.fullmatch(account_id) is None
+        type(environment["schema_version"]) is not int
+        or environment["schema_version"] != 2
+        or environment["receipt_type"] != "memorysplit-aws-environment-v2"
+        or environment["provider"] != profile.provider
     ):
-        raise ValueError("runtime evidence account ID is invalid")
-    region = evidence["region"]
-    availability_zone = evidence["availability_zone"]
-    if not isinstance(region, str) or _REGION_RE.fullmatch(region) is None:
-        raise ValueError("runtime evidence region is invalid")
+        raise ValueError("qualification environment receipt identity is invalid")
+    environment_profile = _sha256(
+        environment["profile_sha256"],
+        label="qualification environment profile",
+    )
+    environment_runtime = _sha256(
+        environment["runtime_lock_sha256"],
+        label="qualification environment runtime lock",
+    )
     if (
-        not isinstance(availability_zone, str)
-        or (match := _AVAILABILITY_ZONE_RE.fullmatch(availability_zone)) is None
-        or match.group("region") != region
+        environment_profile != profile.sha256
+        or environment_runtime != runtime_lock.sha256
+        or environment["control_bundle_sha256"]
+        != runtime_lock.control_bundle_sha256
+        or environment["source_commit"] != runtime_lock.source_commit
+        or environment["source_tree"] != runtime_lock.source_tree
+        or environment["ami_id"] != runtime_lock.ami_id
+        or environment["container_image"] != runtime_lock.container_image
+        or environment["container_image_digest"]
+        != runtime_lock.container_image_digest
     ):
-        raise ValueError("runtime evidence availability zone is invalid")
-    floors = tuple(getattr(profile, "software_floors"))
-    versions = _object(
-        evidence["versions"],
-        fields=frozenset(dict(floors)),
-        label="runtime evidence versions",
+        raise ValueError("qualification environment differs from runtime lock")
+    identity = environment["aws_instance_identity_document"]
+    if not isinstance(identity, dict):
+        raise ValueError("qualification instance identity must be an object")
+    required_identity = {
+        "accountId",
+        "architecture",
+        "availabilityZone",
+        "imageId",
+        "instanceId",
+        "instanceType",
+        "privateIp",
+        "region",
+    }
+    if (
+        set(identity) != required_identity
+        or not all(isinstance(identity[field], str) for field in required_identity)
+        or _ACCOUNT_RE.fullmatch(identity["accountId"]) is None
+        or _INSTANCE_RE.fullmatch(identity["instanceId"]) is None
+        or _REGION_RE.fullmatch(identity["region"]) is None
+        or _AVAILABILITY_ZONE_RE.fullmatch(identity["availabilityZone"]) is None
+        or identity["architecture"] != profile.architecture
+        or identity["instanceType"] != profile.instance_type
+        or identity["imageId"] != runtime_lock.ami_id
+    ):
+        raise ValueError("qualification instance identity is invalid")
+    try:
+        address = ipaddress.ip_address(identity["privateIp"])
+    except ValueError as error:
+        raise ValueError("qualification private IP is invalid") from error
+    if not address.is_private or address.version != 4:
+        raise ValueError("qualification private IP must be private IPv4")
+    account_id = environment["account_id"]
+    instance_id = environment["instance_id"]
+    region = environment["region"]
+    ami_id = environment["ami_id"]
+    boot_id = environment["boot_id"]
+    availability_zone = identity["availabilityZone"]
+    if (
+        account_id != identity["accountId"]
+        or instance_id != identity["instanceId"]
+        or region != identity["region"]
+        or ami_id != identity["imageId"]
+        or _BOOT_RE.fullmatch(str(boot_id)) is None
+        or region not in profile.allowed_regions
+        or (
+            profile.allowed_availability_zones
+            and availability_zone not in profile.allowed_availability_zones
+        )
+    ):
+        raise ValueError("qualification environment identity duplicates differ")
+    pkcs7 = _canonical_base64(
+        environment["aws_instance_identity_pkcs7"],
+        label="qualification instance identity signature",
+    )
+    if not callable(identity_verifier):
+        raise TypeError("qualification identity verifier is required")
+    try:
+        identity_verified = identity_verifier(identity, pkcs7, region)
+    except Exception as error:
+        raise ValueError(
+            "qualification instance signature verification failed"
+        ) from error
+    if identity_verified is not True:
+        raise ValueError("qualification instance signature is invalid")
+    container_facts = _object(
+        environment["runtime_facts"],
+        fields=frozenset(AWS_RUNTIME_VERSION_FIELDS),
+        label="qualification container facts",
+    )
+    if container_facts != dict(runtime_lock.versions):
+        raise ValueError("qualification container facts differ from runtime lock")
+    environment_data = _canonical_json(environment)
+    environment_sha256 = hashlib.sha256(environment_data).hexdigest()
+
+    canary = _object(
+        root["canary_receipt"],
+        fields=_CANARY_RECEIPT_FIELDS,
+        label="qualification canary receipt",
+    )
+    if (
+        type(canary["schema_version"]) is not int
+        or canary["schema_version"] != 1
+        or canary["receipt_type"]
+        not in {
+            "memorysplit-aws-p5-qualification-v1",
+            "memorysplit-aws-gpu-qualification-v1",
+        }
+        or canary["provider"] != profile.provider
+        or canary["passed"] is not True
+        or canary["instance_id"] != instance_id
+        or canary["boot_id"] != boot_id
+        or canary["profile_sha256"] != profile.sha256
+        or canary["runtime_lock_sha256"] != runtime_lock.sha256
+        or canary["environment_receipt_sha256"] != environment_sha256
+        or canary["container_image"] != runtime_lock.container_image
+        or canary["container_image_digest"]
+        != runtime_lock.container_image_digest
+        or canary["source_commit"] != runtime_lock.source_commit
+        or canary["source_tree"] != runtime_lock.source_tree
+    ):
+        raise ValueError("qualification canary identity is invalid")
+    for field in (
+        "release_sha256",
+        "release_receipt_sha256",
+        "run_manifest_sha256",
+        "dataset_receipt_sha256",
+        "dataset_build_id",
+        "ordered_stream_sha256",
+    ):
+        _sha256(canary[field], label=f"qualification canary {field}")
+    phases = canary["phases"]
+    if (
+        not isinstance(phases, list)
+        or [phase.get("name") for phase in phases if isinstance(phase, dict)]
+        != list(_CANARY_PHASE_ORDER)
+        or any(
+            set(phase) != {"name", "passed", "seconds"}
+            or phase["passed"] is not True
+            or isinstance(phase["seconds"], bool)
+            or not isinstance(phase["seconds"], (int, float))
+            or not math.isfinite(float(phase["seconds"]))
+            or float(phase["seconds"]) < 0
+            for phase in phases
+            if isinstance(phase, dict)
+        )
+        or any(not isinstance(phase, dict) for phase in phases)
+    ):
+        raise ValueError("qualification canary phases are invalid")
+    hardware = canary["hardware"]
+    if not isinstance(hardware, dict):
+        raise ValueError("qualification canary hardware must be an object")
+    host_versions = _object(
+        hardware.get("runtime_facts"),
+        fields=frozenset(dict(profile.software_floors)),
+        label="qualification host facts",
     )
     normalized_versions: list[tuple[str, str]] = []
-    for field, floor in floors:
-        version = versions[field]
+    for field, floor in profile.software_floors:
+        version = host_versions[field]
         if not isinstance(version, str):
-            raise ValueError(f"runtime evidence versions.{field} must be a string")
+            raise ValueError(f"qualification host {field} must be a string")
         _version_at_least(
             version,
             floor,
-            label=f"runtime evidence versions.{field}",
+            label=f"qualification host {field}",
         )
         normalized_versions.append((field, version))
+    canary_data = _canonical_json(canary)
+    canary_sha256 = hashlib.sha256(canary_data).hexdigest()
+    host_facts_sha256 = hashlib.sha256(
+        _canonical_json(hardware)
+    ).hexdigest()
+    container_facts_sha256 = hashlib.sha256(
+        _canonical_json(container_facts)
+    ).hexdigest()
+
+    expected_scope = {
+        "account_id": account_id,
+        "ami_id": ami_id,
+        "boot_id": boot_id,
+        "canary_receipt_sha256": canary_sha256,
+        "container_facts_sha256": container_facts_sha256,
+        "container_image_digest": runtime_lock.container_image_digest,
+        "environment_receipt_sha256": environment_sha256,
+        "host_facts_sha256": host_facts_sha256,
+        "instance_id": instance_id,
+        "profile_sha256": profile.sha256,
+        "runtime_lock_sha256": runtime_lock.sha256,
+    }
+    approval = _object(
+        root["approval"],
+        fields=frozenset(
+            {
+                "algorithm",
+                "public_key_sha256",
+                "scope",
+                "scope_sha256",
+                "signature",
+            }
+        ),
+        label="qualification approval",
+    )
+    if approval["algorithm"] != "RSASSA_PSS_SHA_256":
+        raise ValueError("qualification approval algorithm is invalid")
+    approval_key = _sha256(
+        approval["public_key_sha256"],
+        label="qualification approval public key",
+    )
+    if approval_key != trusted_key:
+        raise ValueError("qualification approval public key is not trusted")
+    _closed_equal(
+        approval["scope"],
+        expected_scope,
+        label="qualification approval scope",
+    )
+    scope_data = _canonical_json(expected_scope)
+    scope_sha256 = _sha256(
+        approval["scope_sha256"],
+        label="qualification approval scope SHA-256",
+    )
+    if scope_sha256 != hashlib.sha256(scope_data).hexdigest():
+        raise ValueError("qualification approval scope hash differs")
+    signature = _canonical_base64(
+        approval["signature"],
+        label="qualification approval signature",
+    )
+    verify = getattr(approval_verifier, "verify", None)
+    if not callable(verify):
+        raise TypeError("qualification approval verifier is required")
+    try:
+        approval_verified = verify(
+            payload=scope_data,
+            signature=signature,
+            algorithm=approval["algorithm"],
+            public_key_sha256=approval_key,
+        )
+    except Exception as error:
+        raise ValueError("qualification approval verification failed") from error
+    if approval_verified is not True:
+        raise ValueError("qualification approval signature is invalid")
+    approval_data = _canonical_json(approval)
     return AwsRuntimeEvidence(
-        schema_version=1,
-        receipt_type=receipt_type,
-        profile_sha256=profile_sha256,
-        runtime_lock_sha256=runtime_lock_sha256,
+        schema_version=2,
+        receipt_type=root["receipt_type"],
+        profile_sha256=profile.sha256,
+        runtime_lock_sha256=runtime_lock.sha256,
         account_id=account_id,
         region=region,
         availability_zone=availability_zone,
         versions=tuple(normalized_versions),
         sha256=hashlib.sha256(data).hexdigest(),
+        instance_id=instance_id,
+        boot_id=boot_id,
+        ami_id=ami_id,
+        container_image_digest=runtime_lock.container_image_digest,
+        environment_receipt_sha256=environment_sha256,
+        canary_receipt_sha256=canary_sha256,
+        approval_receipt_sha256=hashlib.sha256(approval_data).hexdigest(),
+        approval_public_key_sha256=approval_key,
+        host_facts_sha256=host_facts_sha256,
+        container_facts_sha256=container_facts_sha256,
+        identity_verified=True,
+        approval_verified=True,
     )
 
 
@@ -946,6 +1857,11 @@ def parse_verified_provider_selection_bytes(
     profile_data: bytes,
     runtime_lock_data: bytes,
     runtime_evidence_data: bytes,
+    identity_verifier: Callable[
+        [Mapping[str, object], str, str], bool
+    ],
+    approval_verifier: QualificationApprovalVerifier,
+    trusted_public_key_sha256: str,
 ) -> AwsProviderSelectionReceipt:
     """Verify selection authority from anchored profile and runtime bytes."""
 
@@ -977,9 +1893,13 @@ def parse_verified_provider_selection_bytes(
     if runtime_lock.container_image_digest != receipt.container_image_digest:
         raise ValueError("selection image digest does not match the runtime lock")
 
-    evidence = _parse_runtime_evidence_bytes(
+    evidence = parse_authenticated_qualification_evidence_bytes(
         runtime_evidence_data,
-        profile=profile,
+        profile_data=profile_data,
+        runtime_lock_data=runtime_lock_data,
+        identity_verifier=identity_verifier,
+        approval_verifier=approval_verifier,
+        trusted_public_key_sha256=trusted_public_key_sha256,
     )
     if evidence.sha256 != receipt.runtime_evidence_sha256:
         raise ValueError("selection runtime-evidence hash does not match its bytes")
@@ -1001,7 +1921,17 @@ def parse_verified_provider_selection_bytes(
                 floor,
                 label=f"runtime lock versions.{field}",
             )
-    return receipt
+    return replace(
+        receipt,
+        qualification_instance_id=evidence.instance_id,
+        qualification_boot_id=evidence.boot_id,
+        environment_receipt_sha256=evidence.environment_receipt_sha256,
+        canary_receipt_sha256=evidence.canary_receipt_sha256,
+        approval_receipt_sha256=evidence.approval_receipt_sha256,
+        approval_public_key_sha256=evidence.approval_public_key_sha256,
+        identity_verified=evidence.identity_verified,
+        approval_verified=evidence.approval_verified,
+    )
 
 
 parse_aws_provider_selection_receipt_bytes = (
@@ -1016,6 +1946,11 @@ def canonical_provider_selection_receipt_bytes(
     profile_data: bytes,
     runtime_lock_data: bytes,
     runtime_evidence_data: bytes,
+    identity_verifier: Callable[
+        [Mapping[str, object], str, str], bool
+    ],
+    approval_verifier: QualificationApprovalVerifier,
+    trusted_public_key_sha256: str,
 ) -> bytes:
     """Encode and verify one provider selection from anchored bytes."""
 
@@ -1026,6 +1961,9 @@ def canonical_provider_selection_receipt_bytes(
         profile_data=profile_data,
         runtime_lock_data=runtime_lock_data,
         runtime_evidence_data=runtime_evidence_data,
+        identity_verifier=identity_verifier,
+        approval_verifier=approval_verifier,
+        trusted_public_key_sha256=trusted_public_key_sha256,
     )
     return data
 
@@ -1036,6 +1974,11 @@ def _load_verified_selection_from_paths(
     repo_root: Path | str,
     runtime_lock_path: Path | str,
     runtime_evidence_path: Path | str,
+    identity_verifier: Callable[
+        [Mapping[str, object], str, str], bool
+    ],
+    approval_verifier: QualificationApprovalVerifier,
+    trusted_public_key_sha256: str,
 ) -> AwsProviderSelectionReceipt:
     amendment_data = _regular_bytes(
         Path(repo_root).joinpath(*AWS_HARDWARE_AMENDMENT_PATH.split("/")),
@@ -1066,6 +2009,9 @@ def _load_verified_selection_from_paths(
         profile_data=profile_data,
         runtime_lock_data=runtime_lock_data,
         runtime_evidence_data=runtime_evidence_data,
+        identity_verifier=identity_verifier,
+        approval_verifier=approval_verifier,
+        trusted_public_key_sha256=trusted_public_key_sha256,
     )
 
 
@@ -1210,6 +2156,17 @@ def _publish_remote_selection(
     store: VersionedProviderSelectionStore,
 ) -> VersionedSelectionObject:
     digest = hashlib.sha256(data).hexdigest()
+    history = store.list_versions(key=PROVIDER_SELECTION_S3_KEY)
+    if (
+        not isinstance(history, VersionedSelectionHistory)
+        or history.key != PROVIDER_SELECTION_S3_KEY
+    ):
+        raise ValueError("fixed-key selection version history is invalid")
+    if history.versions or history.delete_markers:
+        raise ValueError(
+            "fixed-key selection history conflicts with new publication; "
+            "prior versions or delete markers are forbidden"
+        )
     put = store.put_if_none_match(
         key=PROVIDER_SELECTION_S3_KEY,
         data=data,
@@ -1243,6 +2200,37 @@ def _publish_remote_selection(
         ) from error
 
 
+def _publish_version_binding(
+    *,
+    authority_root: Path | str,
+    selection: AwsProviderSelectionReceipt,
+    remote: VersionedSelectionObject,
+) -> Path:
+    value = {
+        "schema_version": 1,
+        "selection_sha256": selection.sha256,
+        "s3_key": PROVIDER_SELECTION_S3_KEY,
+        "version_id": remote.version_id,
+    }
+    data = _canonical_json(value)
+    destination = Path(authority_root).joinpath(
+        *PROVIDER_SELECTION_VERSION_LOCAL_PATH.split("/")
+    )
+    try:
+        _write_selection_noreplace(destination, data)
+    except FileExistsError as error:
+        existing = _regular_bytes(
+            destination,
+            label="provider selection version authority",
+            private=True,
+        )
+        if existing != data:
+            raise ValueError(
+                "fixed provider-selection version authority conflicts"
+            ) from error
+    return destination
+
+
 def publish_provider_selection(
     *,
     authority_root: Path | str,
@@ -1251,6 +2239,11 @@ def publish_provider_selection(
     runtime_evidence_path: Path | str,
     selection_data: bytes,
     store: VersionedProviderSelectionStore,
+    identity_verifier: Callable[
+        [Mapping[str, object], str, str], bool
+    ],
+    approval_verifier: QualificationApprovalVerifier,
+    trusted_public_key_sha256: str,
 ) -> PublishedProviderSelection:
     """Publish the sole local and versioned-S3 cohort selection authority."""
 
@@ -1259,6 +2252,9 @@ def publish_provider_selection(
         repo_root=repo_root,
         runtime_lock_path=runtime_lock_path,
         runtime_evidence_path=runtime_evidence_path,
+        identity_verifier=identity_verifier,
+        approval_verifier=approval_verifier,
+        trusted_public_key_sha256=trusted_public_key_sha256,
     )
     _preflight_local_selection(
         authority_root=authority_root,
@@ -1269,10 +2265,16 @@ def publish_provider_selection(
         authority_root=authority_root,
         data=selection_data,
     )
+    version_path = _publish_version_binding(
+        authority_root=authority_root,
+        selection=selection,
+        remote=remote,
+    )
     return PublishedProviderSelection(
         selection=selection,
         local_path=local_path,
         remote=remote,
+        version_path=version_path,
     )
 
 
@@ -1282,6 +2284,11 @@ def load_local_provider_selection_authority(
     repo_root: Path | str,
     runtime_lock_path: Path | str,
     runtime_evidence_path: Path | str,
+    identity_verifier: Callable[
+        [Mapping[str, object], str, str], bool
+    ],
+    approval_verifier: QualificationApprovalVerifier,
+    trusted_public_key_sha256: str,
 ) -> AwsProviderSelectionReceipt:
     """Load and re-verify the sole fixed local selection authority."""
 
@@ -1295,6 +2302,168 @@ def load_local_provider_selection_authority(
         repo_root=repo_root,
         runtime_lock_path=runtime_lock_path,
         runtime_evidence_path=runtime_evidence_path,
+        identity_verifier=identity_verifier,
+        approval_verifier=approval_verifier,
+        trusted_public_key_sha256=trusted_public_key_sha256,
+    )
+
+
+def load_versioned_provider_selection_authority(
+    *,
+    authority_root: Path | str,
+    repo_root: Path | str,
+    runtime_lock_path: Path | str,
+    runtime_evidence_path: Path | str,
+    store: VersionedProviderSelectionStore,
+    identity_verifier: Callable[
+        [Mapping[str, object], str, str], bool
+    ],
+    approval_verifier: QualificationApprovalVerifier,
+    trusted_public_key_sha256: str,
+) -> AwsProviderSelectionReceipt:
+    """GET and verify the persisted exact S3 selection version."""
+
+    root = Path(authority_root)
+    local_data = _regular_bytes(
+        root.joinpath(*PROVIDER_SELECTION_LOCAL_PATH.split("/")),
+        label="provider selection authority",
+        private=True,
+    )
+    version_data = _regular_bytes(
+        root.joinpath(*PROVIDER_SELECTION_VERSION_LOCAL_PATH.split("/")),
+        label="provider selection version authority",
+        private=True,
+    )
+    value = _json_object(version_data, label="provider selection version")
+    if version_data != _canonical_json(value):
+        raise ValueError("provider selection version must be canonical")
+    version = _object(
+        value,
+        fields=frozenset(
+            {"schema_version", "selection_sha256", "s3_key", "version_id"}
+        ),
+        label="provider selection version",
+    )
+    if type(version["schema_version"]) is not int or version["schema_version"] != 1:
+        raise ValueError("provider selection version schema is invalid")
+    selection_sha256 = _sha256(
+        version["selection_sha256"],
+        label="provider selection version selection SHA-256",
+    )
+    if (
+        version["s3_key"] != PROVIDER_SELECTION_S3_KEY
+        or not isinstance(version["version_id"], str)
+        or version["version_id"] in {"", "null"}
+        or selection_sha256 != hashlib.sha256(local_data).hexdigest()
+    ):
+        raise ValueError("provider selection version identity is invalid")
+    fetched = store.get_exact(
+        key=PROVIDER_SELECTION_S3_KEY,
+        version_id=version["version_id"],
+    )
+    if (
+        not isinstance(fetched, VersionedSelectionRead)
+        or fetched.data != local_data
+        or fetched.object.key != PROVIDER_SELECTION_S3_KEY
+        or fetched.object.sha256 != selection_sha256
+        or fetched.object.bytes != len(local_data)
+        or fetched.object.version_id != version["version_id"]
+    ):
+        raise ValueError("provider selection exact-version GET replay failed")
+    return _load_verified_selection_from_paths(
+        fetched.data,
+        repo_root=repo_root,
+        runtime_lock_path=runtime_lock_path,
+        runtime_evidence_path=runtime_evidence_path,
+        identity_verifier=identity_verifier,
+        approval_verifier=approval_verifier,
+        trusted_public_key_sha256=trusted_public_key_sha256,
+    )
+
+
+def admit_provider_selection(
+    *,
+    authority_root: Path | str,
+    repo_root: Path | str,
+    runtime_lock_path: Path | str,
+    runtime_evidence_path: Path | str,
+    store: VersionedProviderSelectionStore,
+    account_id: str,
+    instance_id: str,
+    boot_id: str,
+    seed: int,
+    arm: str,
+    expected_selection_version_id: str,
+    identity_verifier: Callable[
+        [Mapping[str, object], str, str], bool
+    ],
+    approval_verifier: QualificationApprovalVerifier,
+    trusted_public_key_sha256: str,
+) -> AuthenticatedSelectionBinding:
+    """Admit one launch/resume cell from exact authenticated authority."""
+
+    receipt = load_versioned_provider_selection_authority(
+        authority_root=authority_root,
+        repo_root=repo_root,
+        runtime_lock_path=runtime_lock_path,
+        runtime_evidence_path=runtime_evidence_path,
+        store=store,
+        identity_verifier=identity_verifier,
+        approval_verifier=approval_verifier,
+        trusted_public_key_sha256=trusted_public_key_sha256,
+    )
+    version_data = _regular_bytes(
+        Path(authority_root).joinpath(
+            *PROVIDER_SELECTION_VERSION_LOCAL_PATH.split("/")
+        ),
+        label="provider selection version authority",
+        private=True,
+    )
+    version = _json_object(
+        version_data,
+        label="provider selection version authority",
+    )
+    persisted_version = version.get("version_id")
+    if (
+        not isinstance(expected_selection_version_id, str)
+        or expected_selection_version_id in {"", "null"}
+        or persisted_version != expected_selection_version_id
+    ):
+        raise ValueError("selection version authority differs from admission")
+    if (
+        account_id != receipt.account_id
+        or instance_id != receipt.qualification_instance_id
+        or boot_id != receipt.qualification_boot_id
+        or receipt.identity_verified is not True
+        or receipt.approval_verified is not True
+    ):
+        raise ValueError("selection authority identity differs from admission")
+    if type(seed) is not int or seed not in receipt.seeds:
+        raise ValueError("selection authority seed differs from admission")
+    if arm not in receipt.arms:
+        raise ValueError("selection authority arm differs from admission")
+    return AuthenticatedSelectionBinding(
+        cohort_id=receipt.cohort_id,
+        amendment_sha256=receipt.amendment.sha256,
+        selection_sha256=receipt.sha256,
+        selection_version_id=expected_selection_version_id,
+        profile_id=receipt.profile.profile_id,
+        provider=receipt.profile.provider,
+        profile_sha256=receipt.profile.sha256,
+        runtime_lock_sha256=receipt.runtime_lock_sha256,
+        qualification_evidence_sha256=receipt.runtime_evidence_sha256,
+        environment_receipt_sha256=receipt.environment_receipt_sha256,
+        canary_receipt_sha256=receipt.canary_receipt_sha256,
+        approval_receipt_sha256=receipt.approval_receipt_sha256,
+        approval_public_key_sha256=receipt.approval_public_key_sha256,
+        account_id=receipt.account_id,
+        instance_id=receipt.qualification_instance_id,
+        boot_id=receipt.qualification_boot_id,
+        region=receipt.region,
+        availability_zone=receipt.availability_zone,
+        purchase_model=receipt.purchase_model,
+        seed=seed,
+        arm=arm,
     )
 
 
@@ -1304,6 +2473,16 @@ def validate_resume_hardware_binding(
     repo_root: Path | str,
     runtime_lock_path: Path | str,
     runtime_evidence_path: Path | str,
+    store: VersionedProviderSelectionStore,
+    account_id: str,
+    instance_id: str,
+    boot_id: str,
+    expected_selection_version_id: str,
+    identity_verifier: Callable[
+        [Mapping[str, object], str, str], bool
+    ],
+    approval_verifier: QualificationApprovalVerifier,
+    trusted_public_key_sha256: str,
     amendment_sha256: str,
     provider_selection_sha256: str,
     profile_sha256: str,
@@ -1311,30 +2490,36 @@ def validate_resume_hardware_binding(
     runtime_evidence_sha256: str,
     seed: int,
     arm: str,
-) -> AwsProviderSelectionReceipt:
-    """Reload fixed authority bytes before checking one resume binding."""
+) -> AuthenticatedSelectionBinding:
+    """Require exact remote version and qualification for resume binding."""
 
-    receipt = load_local_provider_selection_authority(
+    binding = admit_provider_selection(
         authority_root=authority_root,
         repo_root=repo_root,
         runtime_lock_path=runtime_lock_path,
         runtime_evidence_path=runtime_evidence_path,
+        store=store,
+        account_id=account_id,
+        instance_id=instance_id,
+        boot_id=boot_id,
+        expected_selection_version_id=expected_selection_version_id,
+        seed=seed,
+        arm=arm,
+        identity_verifier=identity_verifier,
+        approval_verifier=approval_verifier,
+        trusted_public_key_sha256=trusted_public_key_sha256,
     )
-    if amendment_sha256 != receipt.amendment.sha256:
+    if amendment_sha256 != binding.amendment_sha256:
         raise ValueError("hardware amendment binding differs from selection")
-    if provider_selection_sha256 != receipt.sha256:
+    if provider_selection_sha256 != binding.selection_sha256:
         raise ValueError("provider-selection receipt binding differs")
-    if profile_sha256 != receipt.profile.sha256:
+    if profile_sha256 != binding.profile_sha256:
         raise ValueError("hardware profile differs from cohort selection")
-    if runtime_lock_sha256 != receipt.runtime_lock_sha256:
+    if runtime_lock_sha256 != binding.runtime_lock_sha256:
         raise ValueError("runtime-lock binding differs from cohort selection")
-    if runtime_evidence_sha256 != receipt.runtime_evidence_sha256:
+    if runtime_evidence_sha256 != binding.qualification_evidence_sha256:
         raise ValueError("runtime-evidence binding differs from cohort selection")
-    if type(seed) is not int or seed not in receipt.seeds:
-        raise ValueError("seed is outside the selected protected cohort")
-    if arm not in receipt.arms:
-        raise ValueError("arm is outside the selected protected cohort")
-    return receipt
+    return binding
 
 
 validate_provider_selection_binding = validate_resume_hardware_binding
@@ -1342,10 +2527,150 @@ load_provider_selection_receipt = load_local_provider_selection_authority
 load_aws_provider_selection_receipt = load_local_provider_selection_authority
 
 
+def _hardware_authority_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="python -m msctl.aws_hardware",
+        description="Dry-run-first AWS GPU provider-selection authority.",
+    )
+    commands = parser.add_subparsers(dest="command", required=True)
+    publish = commands.add_parser(
+        "publish",
+        help="verify or publish the sole cohort provider selection",
+    )
+    publish.add_argument("--repo-root", required=True)
+    publish.add_argument("--authority-root", required=True)
+    publish.add_argument("--runtime-lock", required=True)
+    publish.add_argument("--qualification-evidence", required=True)
+    publish.add_argument("--selection", required=True)
+    publish.add_argument("--bucket", required=True)
+    publish.add_argument("--region", required=True)
+    publish.add_argument("--approval-public-key", required=True)
+    publish.add_argument("--approval-public-key-sha256", required=True)
+    publish.add_argument("--apply", action="store_true")
+    return parser
+
+
+def run_hardware_authority_cli(
+    argv: Sequence[str] | None = None,
+    *,
+    store: VersionedProviderSelectionStore | None = None,
+    identity_verifier: Callable[
+        [Mapping[str, object], str, str], bool
+    ] = verify_aws_instance_identity_pkcs7,
+    approval_verifier: QualificationApprovalVerifier | None = None,
+    trusted_public_key_sha256: str | None = None,
+    environ: Mapping[str, str] | None = None,
+) -> tuple[bool, dict[str, object]]:
+    """Execute the standalone dry-run/apply selection authority CLI."""
+
+    arguments = _hardware_authority_parser().parse_args(argv)
+    if arguments.command != "publish":
+        raise ValueError("unsupported hardware authority command")
+    argument_key = _sha256(
+        arguments.approval_public_key_sha256,
+        label="CLI trusted approval public key",
+    )
+    if (
+        trusted_public_key_sha256 is not None
+        and trusted_public_key_sha256 != argument_key
+    ):
+        raise ValueError("CLI approval public-key commitment differs")
+    trusted_key = argument_key
+    environment = dict(os.environ if environ is None else environ)
+    command_environment = {
+        name: environment[name]
+        for name in ("HOME", "LANG", "LC_ALL", "PATH")
+        if name in environment
+    }
+    command_environment["AWS_REGION"] = arguments.region
+    verifier = approval_verifier or OpenSslQualificationApprovalVerifier(
+        public_key_path=arguments.approval_public_key,
+        environment=command_environment,
+    )
+    selection_data = _regular_bytes(
+        Path(arguments.selection),
+        label="provider selection candidate",
+        private=True,
+    )
+    verified = _load_verified_selection_from_paths(
+        selection_data,
+        repo_root=arguments.repo_root,
+        runtime_lock_path=arguments.runtime_lock,
+        runtime_evidence_path=arguments.qualification_evidence,
+        identity_verifier=identity_verifier,
+        approval_verifier=verifier,
+        trusted_public_key_sha256=trusted_key,
+    )
+    result: dict[str, object] = {
+        "operation": "publish-provider-selection",
+        "apply": bool(arguments.apply),
+        "cohort_id": verified.cohort_id,
+        "profile_id": verified.profile.profile_id,
+        "selection_sha256": verified.sha256,
+        "s3_bucket": arguments.bucket,
+        "s3_key": PROVIDER_SELECTION_S3_KEY,
+        "local_path": str(
+            Path(arguments.authority_root).joinpath(
+                *PROVIDER_SELECTION_LOCAL_PATH.split("/")
+            )
+        ),
+        "qualification_evidence_sha256": verified.runtime_evidence_sha256,
+        "approval_public_key_sha256": verified.approval_public_key_sha256,
+    }
+    if not arguments.apply:
+        return True, result
+    selected_store = store or AwsCliVersionedSelectionStore(
+        bucket=arguments.bucket,
+        region=arguments.region,
+        environment=command_environment,
+        staging_root=Path(arguments.authority_root) / ".selection-s3-staging",
+    )
+    published = publish_provider_selection(
+        authority_root=arguments.authority_root,
+        repo_root=arguments.repo_root,
+        runtime_lock_path=arguments.runtime_lock,
+        runtime_evidence_path=arguments.qualification_evidence,
+        selection_data=selection_data,
+        store=selected_store,
+        identity_verifier=identity_verifier,
+        approval_verifier=verifier,
+        trusted_public_key_sha256=trusted_key,
+    )
+    return False, {
+        **result,
+        "selection_version_id": published.remote.version_id,
+        "version_path": str(published.version_path),
+    }
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    try:
+        dry_run, result = run_hardware_authority_cli(argv)
+        report = {
+            "schema_version": 1,
+            "ok": True,
+            "dry_run": dry_run,
+            "result": result,
+        }
+        exit_code = 0
+    except (OSError, TypeError, ValueError) as error:
+        report = {
+            "schema_version": 1,
+            "ok": False,
+            "dry_run": True,
+            "error": str(error),
+        }
+        exit_code = 2
+    sys.stdout.buffer.write(_canonical_json(report))
+    return exit_code
+
+
 __all__ = [
     "AWS_HARDWARE_AMENDMENT_PATH",
     "AWS_HARDWARE_AMENDMENT_SHA256",
+    "AuthenticatedSelectionBinding",
     "ArtifactBinding",
+    "AwsCliVersionedSelectionStore",
     "AwsHardwareAmendment",
     "AwsProviderSelectionReceipt",
     "AwsRuntimeEvidence",
@@ -1354,24 +2679,38 @@ __all__ = [
     "HardwareProfileBinding",
     "P5_PROFILE_PATH",
     "P6_PROFILE_PATH",
+    "OpenSslQualificationApprovalVerifier",
     "PREREGISTRATION_PATH",
     "PROVIDER_SELECTION_LOCAL_PATH",
     "PROVIDER_SELECTION_S3_KEY",
+    "PROVIDER_SELECTION_VERSION_LOCAL_PATH",
     "PublishedProviderSelection",
+    "QualificationApprovalVerifier",
     "VersionedProviderSelectionStore",
+    "VersionedSelectionHistory",
     "VersionedSelectionObject",
+    "VersionedSelectionRead",
     "canonical_provider_selection_receipt_bytes",
+    "admit_provider_selection",
     "load_aws_hardware_amendment",
     "load_aws_provider_selection_receipt",
     "load_local_provider_selection_authority",
     "load_provider_selection_receipt",
+    "load_versioned_provider_selection_authority",
     "parse_aws_provider_selection_receipt_bytes",
     "parse_aws_hardware_amendment_bytes",
     "parse_aws_runtime_lock_bytes",
+    "parse_authenticated_qualification_evidence_bytes",
     "parse_provider_selection_receipt_bytes",
     "parse_verified_provider_selection_bytes",
     "publish_provider_selection",
+    "run_hardware_authority_cli",
     "validate_aws_hardware_amendment_files",
     "validate_provider_selection_binding",
     "validate_resume_hardware_binding",
+    "verify_aws_instance_identity_pkcs7",
 ]
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
