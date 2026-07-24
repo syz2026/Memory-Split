@@ -339,6 +339,7 @@ def _request(tmp_path: Path) -> CheckpointMirrorRequest:
     }
     for arm, path in checkpoint_paths.items():
         path.parent.mkdir()
+        os.chown(path.parent, -1, os.getegid())
         path.write_bytes(f"baseline-{arm}".encode("ascii"))
         _write_metadata(
             path,

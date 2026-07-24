@@ -425,6 +425,7 @@ def _write_run_evidence(plan, *, log_steps=(20, 1_358, 6_791, TERMINAL_STEP)):
             with snapshot_path.open("wb") as handle:
                 torch.save(_snapshot_state(plan, launch, step), handle)
             snapshot_path.chmod(0o600)
+            os.chown(snapshot_path, -1, os.getgid())
         log_path = run_dir / "log.jsonl"
         log_path.write_bytes(
             b"".join(
@@ -433,6 +434,7 @@ def _write_run_evidence(plan, *, log_steps=(20, 1_358, 6_791, TERMINAL_STEP)):
             )
         )
         log_path.chmod(0o600)
+        os.chown(log_path, -1, os.getgid())
 
 
 def _checkpoint_pair(

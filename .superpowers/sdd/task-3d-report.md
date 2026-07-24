@@ -256,3 +256,45 @@ Changed-file `python -m py_compile` and `git diff --check` passed.
   qualification operation was performed.
 - The audited 120-second real checkpoint-mirror feasibility risk remains a
   required later qualification gate; Task 3D does not claim to close it.
+
+## Review correction: literal verification roots
+
+The task reviewer reproduced a Darwin-only fixture ownership failure when the
+brief's literal `/tmp` basetemps were used. BSD group inheritance made pytest
+fixture directories and their files GID `0` while the fixtures declared runtime
+GID `20`; the production owner check correctly rejected them.
+
+Strict RED:
+
+```text
+test_clean_pair_publishes_twelve_objects_and_one_verified_receipt[p5-seed0]
+=> FinalizationError: snapshot owner or mode is not the runtime identity
+
+literal Task 3D package group
+=> 33 checkpoint mirror fixture failures at the token-parent GID check
+```
+
+The fixtures now explicitly set their generated evidence files and checkpoint
+token parent directories to `os.getgid()`. Production UID/GID/mode enforcement
+is unchanged.
+
+Exact GREEN using the brief's literal basetemp roots:
+
+```text
+PYTHONDONTWRITEBYTECODE=1 python -m pytest -q -p no:cacheprovider \
+  --basetemp=/tmp/memorysplit-v3-task3d-finalization \
+  tests/test_aws_run_finalization.py tests/test_aws_p5_launcher.py \
+  tests/test_aws_hardware.py tests/test_objective_controls_v3.py \
+  tests/test_aws_p6_qualification.py
+=> 493 passed
+
+PYTHONDONTWRITEBYTECODE=1 python -m pytest -q -p no:cacheprovider \
+  --basetemp=/tmp/memorysplit-v3-task3d-package \
+  tests/test_package_aws_p5_handoff.py tests/test_trainer.py \
+  tests/test_aws_checkpoint_mirror.py tests/test_aws_paired_state.py
+=> 337 passed, 6 pre-existing macOS fork deprecation warnings
+```
+
+These post-implementation runs supersede the earlier verification wording for
+the mandated command forms. The production finalization code is unchanged by
+this portability correction.
