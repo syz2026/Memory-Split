@@ -1,0 +1,1197 @@
+{
+  "deduplication": {
+    "digest": "sha256",
+    "encoding": "utf-8",
+    "field": "text",
+    "identity": "exact_text_bytes",
+    "priority": [
+      "fineweb_edu",
+      "finemath-4plus",
+      "finemath-3plus"
+    ],
+    "sidecar_encoding": "one_unsigned_byte_per_source_row_1_keep_0_drop"
+  },
+  "files": [
+    {
+      "bytes": 507607173,
+      "git_blob_sha1": "d4adeb3c91bbdb3710a44c077871766a19384553",
+      "path": "finemath-3plus/train-00000-of-00128.parquet",
+      "sha256": "a4f0e7e96b4f6af4a1b597c2fc4a42ec9a997c64ab7da96760c40582a0ac27a5"
+    },
+    {
+      "bytes": 508028702,
+      "git_blob_sha1": "af7ae749d08be03982c8dfee108ffdedb6d0f6d0",
+      "path": "finemath-3plus/train-00001-of-00128.parquet",
+      "sha256": "bd85f5ae60cb8bcb2860cadf4e5b91098c6507ea2c38bbee6600f068f2b912ab"
+    },
+    {
+      "bytes": 510782025,
+      "git_blob_sha1": "c3a0c3ae01f9848c51551e76b2a7b2d6b8cb3a2e",
+      "path": "finemath-3plus/train-00002-of-00128.parquet",
+      "sha256": "16b5f961b88bc250d813f6f90d5db604e4956130087653b720550020ad48a7d3"
+    },
+    {
+      "bytes": 510710993,
+      "git_blob_sha1": "90d6bc538eb7bb63c81e9ce37dec11968c26ab28",
+      "path": "finemath-3plus/train-00003-of-00128.parquet",
+      "sha256": "db1c6a70847bd76a926073260d047abf768c908bec4123321333c44e58c4c6ba"
+    },
+    {
+      "bytes": 506975908,
+      "git_blob_sha1": "c6914680f3c47ce7f3284d592f0252e09d2d0b59",
+      "path": "finemath-3plus/train-00004-of-00128.parquet",
+      "sha256": "a778005c8e1f1f0bc476ea1129b4eb4bb21c56aed9d7d30e8b6bfb9445d35f95"
+    },
+    {
+      "bytes": 506751723,
+      "git_blob_sha1": "4ebaa86fbe9c90d09008306e1ea3aa2ae73914ef",
+      "path": "finemath-3plus/train-00005-of-00128.parquet",
+      "sha256": "56cc1b3f4545c831298923982d7cea915bc968f726fa202d2c456b06f0566b54"
+    },
+    {
+      "bytes": 511957204,
+      "git_blob_sha1": "a587907b362796f95cba00f031c6953f23ae79bd",
+      "path": "finemath-3plus/train-00006-of-00128.parquet",
+      "sha256": "32573c77791d2cccf86efff9b1aec0c5e52a7b7492bbb7fec5fd08fef119b075"
+    },
+    {
+      "bytes": 506421083,
+      "git_blob_sha1": "bd25733ee669b680da34b6b344d941782f825ee0",
+      "path": "finemath-3plus/train-00007-of-00128.parquet",
+      "sha256": "705076af7adc07231bc3d0417a75e15c54a7a7b39a62d1c4c9989d5c7e1ec999"
+    },
+    {
+      "bytes": 506115361,
+      "git_blob_sha1": "f72652a5f11f8c5a7c93690360b52b683439ad4b",
+      "path": "finemath-3plus/train-00008-of-00128.parquet",
+      "sha256": "1dd5d9b57c83e5afe3cb038a8a1842c0913dd67cd806ca92338a4153548f4b35"
+    },
+    {
+      "bytes": 509655554,
+      "git_blob_sha1": "78640488fc207462eaae126d7303e21ef754b931",
+      "path": "finemath-3plus/train-00009-of-00128.parquet",
+      "sha256": "9ff2002c93e1c4014690d2301d77786f06b4c56b1a47dc2a2e5eeb6d642e0bc2"
+    },
+    {
+      "bytes": 506226925,
+      "git_blob_sha1": "4e62ad3e48f86dc8318db4de91775721e92b2cb1",
+      "path": "finemath-3plus/train-00010-of-00128.parquet",
+      "sha256": "a214ccf700ca2de0f5d51320bc1398636c4cc84b46274a0b765c725a868b78df"
+    },
+    {
+      "bytes": 510112231,
+      "git_blob_sha1": "872d885dc53f5e5f6e783ef5e999f369a0eccfd7",
+      "path": "finemath-3plus/train-00011-of-00128.parquet",
+      "sha256": "1e8b7cfa2ef37e0b00fb68222267f4ae1adb84bc7bcc811d0761ee3d039086ba"
+    },
+    {
+      "bytes": 509502362,
+      "git_blob_sha1": "50eb974d561c1a61e03334d9ca7779e61551f8ae",
+      "path": "finemath-3plus/train-00012-of-00128.parquet",
+      "sha256": "ad9f9e812e710a856620455bd75a06d5f26af634b48c3cf5b174aea13f0955e7"
+    },
+    {
+      "bytes": 514287322,
+      "git_blob_sha1": "4d00459b7c941e8fd9f271cc060239ed56fda07a",
+      "path": "finemath-3plus/train-00013-of-00128.parquet",
+      "sha256": "625bf144f38818b28d16005222d9f61a130107c6c5656f1e87ff098d4b925968"
+    },
+    {
+      "bytes": 507521347,
+      "git_blob_sha1": "ed8beb5076746ca5deafa51a5e7e2c43fefe93f7",
+      "path": "finemath-3plus/train-00014-of-00128.parquet",
+      "sha256": "86d39b4d8068ca77be32a677ef9e6a71294c0a083544cc661f4ab0a80e0fa902"
+    },
+    {
+      "bytes": 506164566,
+      "git_blob_sha1": "b9304a927f6bb9a4953eefaedfa2b9093a512791",
+      "path": "finemath-3plus/train-00015-of-00128.parquet",
+      "sha256": "33ae19c0aaa7470ed074722dad6544dd9ac2e75acb0f48e7084ad2757e0fde51"
+    },
+    {
+      "bytes": 511761680,
+      "git_blob_sha1": "0cbd28f940efd996a33e96bcc063362a0fcf5857",
+      "path": "finemath-3plus/train-00016-of-00128.parquet",
+      "sha256": "92e1227ddb5e6755fd77c514cc50af83fed0cd773c8132fc3e8a42763cf5a2a6"
+    },
+    {
+      "bytes": 510687478,
+      "git_blob_sha1": "d4cd983e90620342800453e12417d919717c2873",
+      "path": "finemath-3plus/train-00017-of-00128.parquet",
+      "sha256": "2b6367495804969d38055d1c19390250d1d5bb45b761802ee2bc621a077f04b9"
+    },
+    {
+      "bytes": 506371948,
+      "git_blob_sha1": "05a5f1919d1bca62f544242f3a9892cf9f32f326",
+      "path": "finemath-3plus/train-00018-of-00128.parquet",
+      "sha256": "37acddedfdf4719ca26e0975514e78cb56c1faabfa5a1658afc3645136c10279"
+    },
+    {
+      "bytes": 504981890,
+      "git_blob_sha1": "7e271ff6c495b7a027b25ba97f6564ae35d139d4",
+      "path": "finemath-3plus/train-00019-of-00128.parquet",
+      "sha256": "d8aa9d91aba04776d7a860db4d0f086e86b5431454a5a3a7977ecb2ebd0a1e49"
+    },
+    {
+      "bytes": 507447794,
+      "git_blob_sha1": "706c9ff369646de27b4b699e0624739c84bca38f",
+      "path": "finemath-3plus/train-00020-of-00128.parquet",
+      "sha256": "544d655084dc638fa37fbaeb695297b8f51b30358b8ea174de0583c231e1cf8e"
+    },
+    {
+      "bytes": 505634882,
+      "git_blob_sha1": "58a56fabd0af2fefd0c05e9c74eb39a95b0e897c",
+      "path": "finemath-3plus/train-00021-of-00128.parquet",
+      "sha256": "cc991c82a2adf3da84087f2af4e653e85e73be9082ad9e3e69ceaf8b958031f5"
+    },
+    {
+      "bytes": 508625085,
+      "git_blob_sha1": "c33486d43a0143f4b3dfdae52ea45b6809b88087",
+      "path": "finemath-3plus/train-00022-of-00128.parquet",
+      "sha256": "f5844a9cade60b07b757e096c6a93854a115bac92f294d7218ddb1dffe42018e"
+    },
+    {
+      "bytes": 510162971,
+      "git_blob_sha1": "ee888e4020a0b8c3777896833b19b074f7b50397",
+      "path": "finemath-3plus/train-00023-of-00128.parquet",
+      "sha256": "292129b953df9692100d4cbba39ba06463df25ecd7c626e9a80c66734fbf3fdb"
+    },
+    {
+      "bytes": 507761712,
+      "git_blob_sha1": "ecce2960b56c6c2d27dbdd95a2f4717e435b8cf8",
+      "path": "finemath-3plus/train-00024-of-00128.parquet",
+      "sha256": "5f4108775b92cfd3a6335138be84f009ab72ba95f75c49e1d43c135070f97629"
+    },
+    {
+      "bytes": 508388654,
+      "git_blob_sha1": "406a553d4ca53aa9b2c60a75f3c66b4b87e4ff0c",
+      "path": "finemath-3plus/train-00025-of-00128.parquet",
+      "sha256": "3a34f11cf685740d09f7615c224ed9ad221f72ed8db8e6b1f09879853817a561"
+    },
+    {
+      "bytes": 508135460,
+      "git_blob_sha1": "f78801e3406b0a2a67bc393233d11265e71a2c79",
+      "path": "finemath-3plus/train-00026-of-00128.parquet",
+      "sha256": "8b831bd7e672ae0ab87fb919bb97f33130e1e36bba5d2210096926277b97f083"
+    },
+    {
+      "bytes": 505409240,
+      "git_blob_sha1": "a0bccb9fe1a0697cc3e1130aea14a2278e2a4a6b",
+      "path": "finemath-3plus/train-00027-of-00128.parquet",
+      "sha256": "4a39b4c8eb017149c26fede2924b6feff4139760c52860eecd8486a2a7052007"
+    },
+    {
+      "bytes": 503053872,
+      "git_blob_sha1": "058bce259085801b1ef3f0e933388e83e0b028be",
+      "path": "finemath-3plus/train-00028-of-00128.parquet",
+      "sha256": "4d4794392e512671cf2d385dcd552fa33099ed8d7f9d047daf8d84b6b9ae73ce"
+    },
+    {
+      "bytes": 505575767,
+      "git_blob_sha1": "f438723c376a5165119b73a13e2c8b49b1c354c8",
+      "path": "finemath-3plus/train-00029-of-00128.parquet",
+      "sha256": "26f5aa2bf3b8e067659fcf6d4efa314b524a03a36d8af66d76efd109380b5382"
+    },
+    {
+      "bytes": 506996627,
+      "git_blob_sha1": "144ef114866d7f20a93d82ba902dee525cfa22f7",
+      "path": "finemath-3plus/train-00030-of-00128.parquet",
+      "sha256": "1d31fe6d522120f444f865545e81547131d15dc6c1c570e5d5a15e1cefa06096"
+    },
+    {
+      "bytes": 512322023,
+      "git_blob_sha1": "95717a228520eaff0917a27a6b1425dd566144e0",
+      "path": "finemath-3plus/train-00031-of-00128.parquet",
+      "sha256": "637ed12accf2446ad3eeed15a7702cac789fcbbfb92745d52a0b756fd542d40d"
+    },
+    {
+      "bytes": 503115333,
+      "git_blob_sha1": "28a99bbeab534a00e661afb9a8df77b60454b96b",
+      "path": "finemath-3plus/train-00032-of-00128.parquet",
+      "sha256": "ccee4ee43f1c8acffd7bafdf1cf4a887d1bda923fa68eec2f34bc82fc69e0a99"
+    },
+    {
+      "bytes": 505174522,
+      "git_blob_sha1": "ae76eeaa3a01e00bef12c0a697810b1153534876",
+      "path": "finemath-3plus/train-00033-of-00128.parquet",
+      "sha256": "d9caf9858931584795b88716a788aae17a5a1b652f500077dc0aae64d6790a8e"
+    },
+    {
+      "bytes": 508205092,
+      "git_blob_sha1": "0d53db04285ab2f67888d40151b2a5c2fe7252b6",
+      "path": "finemath-3plus/train-00034-of-00128.parquet",
+      "sha256": "ecf55534d36547198210d584f623eb0ef1a0ce5cf494d138b547ddf571c8838c"
+    },
+    {
+      "bytes": 505640974,
+      "git_blob_sha1": "cceae9885abe3deb5b65c663fd5cbd81afe8806c",
+      "path": "finemath-3plus/train-00035-of-00128.parquet",
+      "sha256": "433f22f011af63d5e149439ac322bf6a975a436e73c481521e883be0bb8c8739"
+    },
+    {
+      "bytes": 509331460,
+      "git_blob_sha1": "295e2735b802620724b123b80784b96754981c3d",
+      "path": "finemath-3plus/train-00036-of-00128.parquet",
+      "sha256": "4cd53ba6787553666a48541d0c0a157e6aaf3f06b9335cf76675b4ca1c998fd8"
+    },
+    {
+      "bytes": 513958236,
+      "git_blob_sha1": "470aaa66cff85e6cb2d4b84eb26237c16f43ca6d",
+      "path": "finemath-3plus/train-00037-of-00128.parquet",
+      "sha256": "9f3e3e696b5a022e3bda4fa38041adbbd1752cd618c7a23ddb6cf05f6affde5c"
+    },
+    {
+      "bytes": 501844842,
+      "git_blob_sha1": "c121eb053d1a2e695444125d730c545025828a80",
+      "path": "finemath-3plus/train-00038-of-00128.parquet",
+      "sha256": "f0ad8dc33b9842e606b3fddf2c5307178b80872ae261a693974c7d9f88b5ab30"
+    },
+    {
+      "bytes": 508982152,
+      "git_blob_sha1": "13f8624531f99be852eb5d7c15c15799ded8f2f0",
+      "path": "finemath-3plus/train-00039-of-00128.parquet",
+      "sha256": "eb885afe1b2ab1c580ca862d9507476603788ab1ebadf1de4cb491ef31473bda"
+    },
+    {
+      "bytes": 513922008,
+      "git_blob_sha1": "c1054d6a6d12fdc363408d603f6c193513073c48",
+      "path": "finemath-3plus/train-00040-of-00128.parquet",
+      "sha256": "ed975e742c3bc1cbdad2492ecadc52f810d259889a481c4abb9550ec795bd0ed"
+    },
+    {
+      "bytes": 511723118,
+      "git_blob_sha1": "57d47aeaadb46dbd8c5040a5bea4169992c4b499",
+      "path": "finemath-3plus/train-00041-of-00128.parquet",
+      "sha256": "1bfa0fd346fcb1af7a07489e1fd9412cee3645c2e47686c19540c9073b9cda43"
+    },
+    {
+      "bytes": 508901026,
+      "git_blob_sha1": "d651ac3883163e2dfac8577b8365ee2b1d914ad6",
+      "path": "finemath-3plus/train-00042-of-00128.parquet",
+      "sha256": "53de6cab2f3c8712997bf599bc21b469ad43c949b5fb10720c9690abd1897e27"
+    },
+    {
+      "bytes": 506058299,
+      "git_blob_sha1": "f4a5d9f39ba830858fa51911ff8ff81a9687e071",
+      "path": "finemath-3plus/train-00043-of-00128.parquet",
+      "sha256": "fd1c551de35630132d997d5efa29ee6be563f1e07554997800106db13f3f8453"
+    },
+    {
+      "bytes": 504587829,
+      "git_blob_sha1": "496e38c25579c6eb51dc10a739bc58e31029599b",
+      "path": "finemath-3plus/train-00044-of-00128.parquet",
+      "sha256": "05f78dc6f840c8e361cedc0f255c496d85ca7f9237a8da4b9932bea9026cdf3a"
+    },
+    {
+      "bytes": 502367259,
+      "git_blob_sha1": "66605b691e3dd851b0b9c58a9ccca0f585bbf37d",
+      "path": "finemath-3plus/train-00045-of-00128.parquet",
+      "sha256": "9a913da418db11a8e821b588e0e2a28ed8370db79ce9beaae1865a26db806e20"
+    },
+    {
+      "bytes": 502737277,
+      "git_blob_sha1": "7d9186b8bad02d6582e7faeb1314d80b0957e488",
+      "path": "finemath-3plus/train-00046-of-00128.parquet",
+      "sha256": "8a8d70ebc3c965146fbc1c965936ce5068eb22844de624fd74e8b95b9df04dc5"
+    },
+    {
+      "bytes": 510788265,
+      "git_blob_sha1": "47df407f752a21c77f9d80557bd5a74c88a5e114",
+      "path": "finemath-3plus/train-00047-of-00128.parquet",
+      "sha256": "b7ccb99130ae6fa225523fcafc0fe9e83604aac982698a9b484a8b4004de699c"
+    },
+    {
+      "bytes": 501754465,
+      "git_blob_sha1": "d2883f88b49eb6744762958f752a352351a2f4f7",
+      "path": "finemath-3plus/train-00048-of-00128.parquet",
+      "sha256": "d8b872f4d38cbdb42215fc46ca7be23a7f5f684beab0592d6677df7aa4a2774f"
+    },
+    {
+      "bytes": 512828261,
+      "git_blob_sha1": "66797e28213aa1cfe555975cbc6516f5751f9014",
+      "path": "finemath-3plus/train-00049-of-00128.parquet",
+      "sha256": "e4988be706b71d2eea81a21ba7d54892245f1b230fbce6f036856a75ad9e319d"
+    },
+    {
+      "bytes": 506698065,
+      "git_blob_sha1": "cd709e2d542d450c6e01708ca780fab522f83763",
+      "path": "finemath-3plus/train-00050-of-00128.parquet",
+      "sha256": "fb5ecb9b18fdc88404743e1d51ddec8d273d13387de9569f1affad2d91c85229"
+    },
+    {
+      "bytes": 504921224,
+      "git_blob_sha1": "07206137e2eb67ea872ceea5e6cb43fe5c6ffd72",
+      "path": "finemath-3plus/train-00051-of-00128.parquet",
+      "sha256": "97bea439b5baeebad17dd4e8c5cade5d9c31db8333245b2a7aa576017b01866d"
+    },
+    {
+      "bytes": 504832807,
+      "git_blob_sha1": "e7dfa4b7df9af00f6ff39bfc5c184b73f1e3ac3c",
+      "path": "finemath-3plus/train-00052-of-00128.parquet",
+      "sha256": "37c31adba65520626ceb261270ba190771f2bebc581d01c9b12379d4eb8d3648"
+    },
+    {
+      "bytes": 509227959,
+      "git_blob_sha1": "73708a9e758f4aec8e69b613ac2d8b90c163d6ba",
+      "path": "finemath-3plus/train-00053-of-00128.parquet",
+      "sha256": "36c469a7a4d1944d51f6dd33e7d21f82fe90498d4420bc867f4cd44e0561cd9e"
+    },
+    {
+      "bytes": 511579268,
+      "git_blob_sha1": "914ecfef346aad72aedb5bfcf036949084ddcb70",
+      "path": "finemath-3plus/train-00054-of-00128.parquet",
+      "sha256": "7890c1c5dc33948f5bd9586743fab8dd9856734416fe661abfbf19ba70e9842e"
+    },
+    {
+      "bytes": 513804618,
+      "git_blob_sha1": "fd693da25732e1f7d36cddce94a639b69c75768d",
+      "path": "finemath-3plus/train-00055-of-00128.parquet",
+      "sha256": "15133978f7a45f015558af514eaecb25ea3a5734a06b98022349ee179f9c7ed6"
+    },
+    {
+      "bytes": 501920872,
+      "git_blob_sha1": "64744cad6f28d0892bfbe13789bebd00b0e75ff5",
+      "path": "finemath-3plus/train-00056-of-00128.parquet",
+      "sha256": "aba90176482dd762756db58adf08f2230597398d659b83bd74e9ea31104e6d5d"
+    },
+    {
+      "bytes": 508597553,
+      "git_blob_sha1": "026d52e1af8a0850be93741958f8dabdc493230c",
+      "path": "finemath-3plus/train-00057-of-00128.parquet",
+      "sha256": "5b37162b4f5627141525150bc4f53347fdc9b60b49b3b8793b4b5adf41e72996"
+    },
+    {
+      "bytes": 502823598,
+      "git_blob_sha1": "15f01b28ccc57a6d50e76e02920f8887a1856f21",
+      "path": "finemath-3plus/train-00058-of-00128.parquet",
+      "sha256": "e043bfb39ccf15a16072900d06b0d136eff5c2b9240982a9f492cae601d44b85"
+    },
+    {
+      "bytes": 508517860,
+      "git_blob_sha1": "799d7c8d62ce9637d46ce0209241d95950187b4c",
+      "path": "finemath-3plus/train-00059-of-00128.parquet",
+      "sha256": "b8c8181c5eb90c8990fdf6ae750be48c825f8275e8bdbaf964f0d52f9b5496b6"
+    },
+    {
+      "bytes": 509875747,
+      "git_blob_sha1": "834afb3c80a02697ffc6ebc2d2924cf45e872a9b",
+      "path": "finemath-3plus/train-00060-of-00128.parquet",
+      "sha256": "bd3cd83485035de35b23e98c75937794c74d3cbaeddfee4bf4c1d1a065b05f53"
+    },
+    {
+      "bytes": 503219567,
+      "git_blob_sha1": "ed4f58b0396aa4af2963607c2ca08888404e15cb",
+      "path": "finemath-3plus/train-00061-of-00128.parquet",
+      "sha256": "c75dc53a48b038ab0249f4ec5b785e08fd14ea0bcfa1de21b06a029253b2a2ab"
+    },
+    {
+      "bytes": 506852545,
+      "git_blob_sha1": "1e9e3b5a310921791096342afb2a752fe9b0f9ae",
+      "path": "finemath-3plus/train-00062-of-00128.parquet",
+      "sha256": "9a22f9379c48c8c0629eaa904fe9e4ee3c2fe24b870965029343a0e67f548852"
+    },
+    {
+      "bytes": 512129742,
+      "git_blob_sha1": "f6e3f022fe482611a5234e4446f2e2b31c4a6570",
+      "path": "finemath-3plus/train-00063-of-00128.parquet",
+      "sha256": "0fbd7645a555edb15126fc11121665483491dc2fb5ff55e678fc03282d65077a"
+    },
+    {
+      "bytes": 515986744,
+      "git_blob_sha1": "e40496a222096a72acc630be2302e2d7694e6806",
+      "path": "finemath-3plus/train-00064-of-00128.parquet",
+      "sha256": "ada28972e0beb1d04f46db5b89ebfd077f0bdb573e1ae212aa4b8f78f90e94e1"
+    },
+    {
+      "bytes": 515380586,
+      "git_blob_sha1": "c2af13fa9267dc42905efd29b765df859ef9c4a5",
+      "path": "finemath-3plus/train-00065-of-00128.parquet",
+      "sha256": "3d1d961daa969cf0c823deec5cd4b44f10f7e3b9f17465d7ff7869896baf07b6"
+    },
+    {
+      "bytes": 504012139,
+      "git_blob_sha1": "e61acd61b1565e49403dc60e13a729090495596e",
+      "path": "finemath-3plus/train-00066-of-00128.parquet",
+      "sha256": "ac271f45a4468cb3d239303bdc13dd0c4735e1550d0d5ae7648bcbe4ee486d4f"
+    },
+    {
+      "bytes": 508158044,
+      "git_blob_sha1": "9d2d12242eb149e24a3333b73e81c76d467a0158",
+      "path": "finemath-3plus/train-00067-of-00128.parquet",
+      "sha256": "b5a3336c1a9b05beac4a4603d844b4350a90ed59635d51ee806ff60aea2b705f"
+    },
+    {
+      "bytes": 501780032,
+      "git_blob_sha1": "9db7d297e03dc6bd9aea60f47a02595473310949",
+      "path": "finemath-3plus/train-00068-of-00128.parquet",
+      "sha256": "e8c1a50fa3f8270c831198d75e338d5170764bd9089e3e34bc9ea743082200de"
+    },
+    {
+      "bytes": 510801064,
+      "git_blob_sha1": "52aa133ed49b0fec23175a6215fb5ce1d51feabf",
+      "path": "finemath-3plus/train-00069-of-00128.parquet",
+      "sha256": "d31a18ff4f7383c9c50cc0c5ebe7b92b6382ac2006b90679e174115aad5655cc"
+    },
+    {
+      "bytes": 507144150,
+      "git_blob_sha1": "cc0fd42c7594441c76ae5a164773238d415c560c",
+      "path": "finemath-3plus/train-00070-of-00128.parquet",
+      "sha256": "b11ee199cbfbb335a997d3f8557d03badbfb61780f9009c0dca674dfca923363"
+    },
+    {
+      "bytes": 508001215,
+      "git_blob_sha1": "1eb0e2f0e56ef829f0390ca27bd3d6fb33f6adfd",
+      "path": "finemath-3plus/train-00071-of-00128.parquet",
+      "sha256": "969e92df1aabe9d3de27e6f6a523e3285d3f4888452e0552e874bdef35dfc328"
+    },
+    {
+      "bytes": 510737678,
+      "git_blob_sha1": "2af0376596bf015033cabd146efe85bc0fbf7f48",
+      "path": "finemath-3plus/train-00072-of-00128.parquet",
+      "sha256": "7cf6f01586beaacfe052d7a3bf46d95389d18d855969af0fb430faafed8c103a"
+    },
+    {
+      "bytes": 504529200,
+      "git_blob_sha1": "3c53abe2e5b88fd72c7be8d0045387ceb5e3f063",
+      "path": "finemath-3plus/train-00073-of-00128.parquet",
+      "sha256": "5197868634d389430109377e5ba4267164850705c2f134bfeba069edfd1f35f4"
+    },
+    {
+      "bytes": 511759554,
+      "git_blob_sha1": "e43b7c0ebd6ecbd134513e513c2b4fb9c3eec4a4",
+      "path": "finemath-3plus/train-00074-of-00128.parquet",
+      "sha256": "404eeb678736be10855b98914bfcc0343f8ddcfb3ca1570246b4a82eefe3e4c4"
+    },
+    {
+      "bytes": 508783841,
+      "git_blob_sha1": "5e61f6a00ff34bdfc3b2dd7ded84d6d10bf98a93",
+      "path": "finemath-3plus/train-00075-of-00128.parquet",
+      "sha256": "ae7eaf03062cbf9302718e8875882928cb2cb6bc17e247ef708e439a5b910908"
+    },
+    {
+      "bytes": 503424134,
+      "git_blob_sha1": "7c497d36f0bcadaeee6a982efe0decc139bc0853",
+      "path": "finemath-3plus/train-00076-of-00128.parquet",
+      "sha256": "03d33b84787967448c8ec3e8e0139d9b8d045d0b8dc62027e05c2536c0e477aa"
+    },
+    {
+      "bytes": 510663476,
+      "git_blob_sha1": "87d344a3116b953f220a1012c02cccf5e8b96666",
+      "path": "finemath-3plus/train-00077-of-00128.parquet",
+      "sha256": "d9c80c60875b2452514e55f41ee8ffccc635b819fe96c58c9516140672d022a7"
+    },
+    {
+      "bytes": 506203867,
+      "git_blob_sha1": "91911f1e7680b213c547b7b1b1eead93e245d417",
+      "path": "finemath-3plus/train-00078-of-00128.parquet",
+      "sha256": "8f705b4c5d065385dd9944e8d7d8beb735b160c7c7308eef1e4b13688b9c447b"
+    },
+    {
+      "bytes": 503565837,
+      "git_blob_sha1": "c1691da2ce97cb216aa0dd27603166761ecf8933",
+      "path": "finemath-3plus/train-00079-of-00128.parquet",
+      "sha256": "d32acfcaf9f2760c0ebd3198a9912010fa5790a2e7b475172ea0602dc30fbd6e"
+    },
+    {
+      "bytes": 508428148,
+      "git_blob_sha1": "029604969e5cbf50bb42451cbeeb162992c25f8e",
+      "path": "finemath-3plus/train-00080-of-00128.parquet",
+      "sha256": "089528d7caf1a1037ba4eb000a591c3b2b959c201a56cb8ab91853a035a63af4"
+    },
+    {
+      "bytes": 511094374,
+      "git_blob_sha1": "7afa2aa35b92d828c5e647e3f748e0ea052d439c",
+      "path": "finemath-3plus/train-00081-of-00128.parquet",
+      "sha256": "32014ae0d4d2321900eaf950e111d7a2749b422f2f34e9c86b234096674717c2"
+    },
+    {
+      "bytes": 509319346,
+      "git_blob_sha1": "d2f824f991d5fc3743668c4fb9c0051cd252d56f",
+      "path": "finemath-3plus/train-00082-of-00128.parquet",
+      "sha256": "17ae2d39e024f29c0f153f91c4c0a7b623f9a8a84b11f75c1b5385d568e611f4"
+    },
+    {
+      "bytes": 500161843,
+      "git_blob_sha1": "897bddcbb9ebad8eeb774413eebed5f7cb19d8e7",
+      "path": "finemath-3plus/train-00083-of-00128.parquet",
+      "sha256": "a8c9826aa8e2cd5442e639d927fdfde11c80aafa0b75a5c0edd5d06e39c14d96"
+    },
+    {
+      "bytes": 509391921,
+      "git_blob_sha1": "9c74bb72607f4c0912f92194f18366449ea9c3fb",
+      "path": "finemath-3plus/train-00084-of-00128.parquet",
+      "sha256": "71d1d0412cefce7633140708b990f75b303e5dcd4265e7205282e13ee09241a0"
+    },
+    {
+      "bytes": 509058220,
+      "git_blob_sha1": "5391a08f09d4fbb7ef4f457e0cbf00157305e00b",
+      "path": "finemath-3plus/train-00085-of-00128.parquet",
+      "sha256": "06bf698810ce884eb203680461cd9ce0917ae1a083bbaea93b24c2aee15af461"
+    },
+    {
+      "bytes": 506580183,
+      "git_blob_sha1": "9f0e4005c5f653f1051aaf156b85c46c55e7267d",
+      "path": "finemath-3plus/train-00086-of-00128.parquet",
+      "sha256": "bacc506102ff523a4f55816a704b6ba586c8988da914895195ee17c856d8c561"
+    },
+    {
+      "bytes": 510713692,
+      "git_blob_sha1": "77e6e41537b6bcac9ea9673f17ed14b4701a656a",
+      "path": "finemath-3plus/train-00087-of-00128.parquet",
+      "sha256": "d16528ad10dd6a19ac69e98224a5391ac5f3552ee3308463e378f9307213b2a9"
+    },
+    {
+      "bytes": 509308150,
+      "git_blob_sha1": "80c8e171ea2b0d4f1d39105f51b144d7d4909626",
+      "path": "finemath-3plus/train-00088-of-00128.parquet",
+      "sha256": "6b9d8e3871b62c65e34e71ea2467d0f5671c7764246032440e9e0e3c2e9ced0b"
+    },
+    {
+      "bytes": 511595850,
+      "git_blob_sha1": "e6e18ada0d2bcb6e19560addaf445531e27edef2",
+      "path": "finemath-3plus/train-00089-of-00128.parquet",
+      "sha256": "5077f33c77637ff38e1858eb39160d45a1ee97918ad63d7323a54b952bae04f6"
+    },
+    {
+      "bytes": 508250699,
+      "git_blob_sha1": "993e2f6b1851de46996239b2579f5d0ae610d5f2",
+      "path": "finemath-3plus/train-00090-of-00128.parquet",
+      "sha256": "8cd8261ed4f442e95b5b6b7bd56de190cbab8d569a91d69dcf9069c3c1132278"
+    },
+    {
+      "bytes": 510783581,
+      "git_blob_sha1": "4f6cc7281f4e98182945d061477c9324f60310e7",
+      "path": "finemath-3plus/train-00091-of-00128.parquet",
+      "sha256": "70fd17f66ae66bf4f18febc8ffb575518611f5cbed5680afd9d401e95ede35aa"
+    },
+    {
+      "bytes": 512255244,
+      "git_blob_sha1": "f45db387fc7e0951ff819bfb34d4a02b8866743a",
+      "path": "finemath-3plus/train-00092-of-00128.parquet",
+      "sha256": "d617ee1857455d8abcb4339c9afc86a4311dfc0b33a72dd46a2e89c30561bf2f"
+    },
+    {
+      "bytes": 504347740,
+      "git_blob_sha1": "876a84a032d777744389d6f37ad0235cd8d392f7",
+      "path": "finemath-3plus/train-00093-of-00128.parquet",
+      "sha256": "80f64bb341970b23a09f78b732386afe8b51df38654abb1b3eec063179ae3729"
+    },
+    {
+      "bytes": 507545798,
+      "git_blob_sha1": "9e1822994fd792daa4b4864d534698420504a928",
+      "path": "finemath-3plus/train-00094-of-00128.parquet",
+      "sha256": "9fdf8eb59cdfbcd65b96af5bc435a8bf3ac140d05680629ecede587192c04cff"
+    },
+    {
+      "bytes": 508994780,
+      "git_blob_sha1": "d53f048a25d0621b2e84b4d79b7a07e03309ce30",
+      "path": "finemath-3plus/train-00095-of-00128.parquet",
+      "sha256": "3cb954b8021270c4e849b99ef2069ae5831b3b1c2d738439a74990eb5c515a77"
+    },
+    {
+      "bytes": 509062125,
+      "git_blob_sha1": "e69bb9c0ed0d751ace0d3837ad20a09ec2273169",
+      "path": "finemath-3plus/train-00096-of-00128.parquet",
+      "sha256": "41ee6bacc8e3a46a9f6c49e5800fcba541f0d89752f3887be5019661065ec512"
+    },
+    {
+      "bytes": 509798272,
+      "git_blob_sha1": "df88839ec2f4d9a55169716a8b77a8bfce86e649",
+      "path": "finemath-3plus/train-00097-of-00128.parquet",
+      "sha256": "ffc1b5e24c8aead4c1f0b705dbbd8a9b0da2619003ab9cd8aca7017ef99b2729"
+    },
+    {
+      "bytes": 509974819,
+      "git_blob_sha1": "e9a6dee1f4c57b4ecf3706d7cc522bc9c020a1a6",
+      "path": "finemath-3plus/train-00098-of-00128.parquet",
+      "sha256": "e377267221920f5f2c567a29944930b05e26ccf3a7c16d09313f6b3ef6fe75cc"
+    },
+    {
+      "bytes": 511955659,
+      "git_blob_sha1": "12d551a1bb26ebf73baf148b19a0ab177a243ecb",
+      "path": "finemath-3plus/train-00099-of-00128.parquet",
+      "sha256": "74146cfd7f78b8b519c31e281f58d9a3fdb1525d6405bb38a90773009d2e9110"
+    },
+    {
+      "bytes": 506978894,
+      "git_blob_sha1": "340921bd28239e0f2887b0c7586090e9dd86eddd",
+      "path": "finemath-3plus/train-00100-of-00128.parquet",
+      "sha256": "98d8da23b07ae067bdabaf7a7940ed08ed62d9312bcbcb86f1e085050990b83e"
+    },
+    {
+      "bytes": 499795078,
+      "git_blob_sha1": "151a299ddccf01ef3ea0a5d9ea269795c3767649",
+      "path": "finemath-3plus/train-00101-of-00128.parquet",
+      "sha256": "cc5b19e50e172c5fd95b748c851c9ab794deff89d86d244da2046832c0bca1ed"
+    },
+    {
+      "bytes": 506113144,
+      "git_blob_sha1": "78400287bd86fffe2f940ba4418373f56c36c8e8",
+      "path": "finemath-3plus/train-00102-of-00128.parquet",
+      "sha256": "f7f8950b98e849f6e4592838a5a3cf699d632e49e11714f8bc2ca746190f1e55"
+    },
+    {
+      "bytes": 515186720,
+      "git_blob_sha1": "ae7fb8049001bab9491e805cd41c83060eff2311",
+      "path": "finemath-3plus/train-00103-of-00128.parquet",
+      "sha256": "8fddb46be4491a9bb81af548b69ae121912df8989d82e6def34d593aaa42e4d6"
+    },
+    {
+      "bytes": 508878479,
+      "git_blob_sha1": "6698c6ee2255540d66192559917e85086597ea8c",
+      "path": "finemath-3plus/train-00104-of-00128.parquet",
+      "sha256": "ac7ca6df68047fc87542911908e57741eaa3eb18245a9ae946271beb09b30d0b"
+    },
+    {
+      "bytes": 508605161,
+      "git_blob_sha1": "78ff91ec8820d92296290b7cd9a89470ef2142a6",
+      "path": "finemath-3plus/train-00105-of-00128.parquet",
+      "sha256": "e7df50b3935049246df780871ee6ebdbca8fdd80cd32b908f8cbbfa9ad361eb3"
+    },
+    {
+      "bytes": 505567778,
+      "git_blob_sha1": "7bdaf623ecae94cd979cb0fe88841d1eef4680ca",
+      "path": "finemath-3plus/train-00106-of-00128.parquet",
+      "sha256": "1eb3e16ecf24358b3f242a2295e08fdbba7bef2e5c12510871e7df6e85c1e91f"
+    },
+    {
+      "bytes": 503679176,
+      "git_blob_sha1": "23492315dfaa73c31c016990ec11fcda835aca3c",
+      "path": "finemath-3plus/train-00107-of-00128.parquet",
+      "sha256": "51db0cb1f91c74af39c02716b73b573afe668b1608fd3f9a143082980f7a9b14"
+    },
+    {
+      "bytes": 507940948,
+      "git_blob_sha1": "07c16164806713e24e622100161f1f69aea88911",
+      "path": "finemath-3plus/train-00108-of-00128.parquet",
+      "sha256": "60369a74900a99d3f8f27673937b8a1e7cde416fcb9293dad85c041df8a2556e"
+    },
+    {
+      "bytes": 514443995,
+      "git_blob_sha1": "e75b665b702abc344bb0157266c00ead18d64fa7",
+      "path": "finemath-3plus/train-00109-of-00128.parquet",
+      "sha256": "dbb2fbf8d3127edeff8837e815724c365a93b1d28c2b3d1ab3a58d68dd8ac774"
+    },
+    {
+      "bytes": 509537692,
+      "git_blob_sha1": "6a0d58c2ee67ab82f1ca52f1433ae43ec2c6a993",
+      "path": "finemath-3plus/train-00110-of-00128.parquet",
+      "sha256": "c8e268deeab45f752b45af93caac02adc55cc55d1e54f1313c7c9075d521efd5"
+    },
+    {
+      "bytes": 510344870,
+      "git_blob_sha1": "77bbc6a208063310776bb98cb8989268a7283a7c",
+      "path": "finemath-3plus/train-00111-of-00128.parquet",
+      "sha256": "b134679adb7cd05f627e4714384231fdb7aeecc36018dfb2cfe6df2889609af3"
+    },
+    {
+      "bytes": 508740642,
+      "git_blob_sha1": "2b0e35623e2f8c0620b1f09f4f661e0cf40d1dc6",
+      "path": "finemath-3plus/train-00112-of-00128.parquet",
+      "sha256": "eb215104378c275be3ef650d98b813829a02cfb6f71e906ed326fc325f75af7a"
+    },
+    {
+      "bytes": 509608209,
+      "git_blob_sha1": "d4726caf8e36df4951936d5c83b25c5da0f7d713",
+      "path": "finemath-3plus/train-00113-of-00128.parquet",
+      "sha256": "bc3a5fbafc40a62eea2937e8820fa1a446b7d11f3b8cba195c9ba97df461b9a3"
+    },
+    {
+      "bytes": 508335929,
+      "git_blob_sha1": "4e2f7e3179c4ae0e6d5b1f3c0e4b01c526d7129a",
+      "path": "finemath-3plus/train-00114-of-00128.parquet",
+      "sha256": "cdad81ed40c2fcb4ea5a63d1e4bb11035d2730c42ab1312e6eeebbfed288c920"
+    },
+    {
+      "bytes": 511250364,
+      "git_blob_sha1": "e056302706f6ad27dcefb101bdb081de2077d8f7",
+      "path": "finemath-3plus/train-00115-of-00128.parquet",
+      "sha256": "3d82fb7e61034748a913972366892335909fe16fc84735c0e013172986d37d38"
+    },
+    {
+      "bytes": 505136089,
+      "git_blob_sha1": "cbb31ff2789889cf283fdfd84683c055e2d77e2d",
+      "path": "finemath-3plus/train-00116-of-00128.parquet",
+      "sha256": "7e355b5e5cee5b31f10ef810d3d5bcf31991cde068960c2bb7359f52b13251b8"
+    },
+    {
+      "bytes": 507893216,
+      "git_blob_sha1": "cf42210a0f892fa7d4b2a7cb56dd8d7fbb8850b7",
+      "path": "finemath-3plus/train-00117-of-00128.parquet",
+      "sha256": "83c85fde5ce75e168359b3d3212418bf4bb9c23e3c87208b600d24ac5ad2bb6c"
+    },
+    {
+      "bytes": 504148254,
+      "git_blob_sha1": "ced874af8c224b12dbc86a98f181adc0e71f7e6e",
+      "path": "finemath-3plus/train-00118-of-00128.parquet",
+      "sha256": "f6935dcf321481a3bb9267bf07232bfcf2e7bff16d2c591064f2291b2f5c0896"
+    },
+    {
+      "bytes": 507688128,
+      "git_blob_sha1": "620a9012f349033345e17e4926236e8fc94ff3c1",
+      "path": "finemath-3plus/train-00119-of-00128.parquet",
+      "sha256": "14ebd9a607b998da170c6d8088a2564673a06ec82bd1b3840fe616b4388a2d80"
+    },
+    {
+      "bytes": 507811337,
+      "git_blob_sha1": "6fe43e3d5c775c1058ecb0277e6d6e89314430b9",
+      "path": "finemath-3plus/train-00120-of-00128.parquet",
+      "sha256": "6e581cc979cf1d687c9ba6c627320b11755f47c993d7395d0494cda892364846"
+    },
+    {
+      "bytes": 508581927,
+      "git_blob_sha1": "6a8a137c040fb09a03518c15ff02a97b386be066",
+      "path": "finemath-3plus/train-00121-of-00128.parquet",
+      "sha256": "f33f1e601bf819d237abc20266540320a7cf0a8360fda2b071c4acac2abf11b7"
+    },
+    {
+      "bytes": 506184632,
+      "git_blob_sha1": "c0d7e5d74a54f02417a89096b639e754be0ad19e",
+      "path": "finemath-3plus/train-00122-of-00128.parquet",
+      "sha256": "3c5edcd7581c04351c2da94b392ca1c9987104ea2a50f5fbca27ad4b90c325b8"
+    },
+    {
+      "bytes": 512022565,
+      "git_blob_sha1": "34350f4b7445d705981ebfad263e606712daab73",
+      "path": "finemath-3plus/train-00123-of-00128.parquet",
+      "sha256": "28a4605cd624e2a8707c5e3acc7dca0e6ab27367615be2fa82ffa38a9b1cd5e0"
+    },
+    {
+      "bytes": 510783212,
+      "git_blob_sha1": "474a65e7502c615fd35fed0d15876633350741f4",
+      "path": "finemath-3plus/train-00124-of-00128.parquet",
+      "sha256": "50a062052d098c6cf73e7b45129336302472d6249ccbaaee46f5a350c07ebac3"
+    },
+    {
+      "bytes": 507403399,
+      "git_blob_sha1": "c45c4543e24d5ef82356d1ca3364719acccd9e4e",
+      "path": "finemath-3plus/train-00125-of-00128.parquet",
+      "sha256": "7d010cc8ddc3faf0aca4611043312f2701c63dacf0b485509801a31f38dacba9"
+    },
+    {
+      "bytes": 508991175,
+      "git_blob_sha1": "5d5e7dafd114c31c5f7996a9e843c2e467967d98",
+      "path": "finemath-3plus/train-00126-of-00128.parquet",
+      "sha256": "dd3cf8479ae53a23728d9e3ec5d49faa649be2ec54a7b1fecca1dbb82d2b0333"
+    },
+    {
+      "bytes": 508934522,
+      "git_blob_sha1": "6747cb4e679656e4c7de49395ae945508f6d3eee",
+      "path": "finemath-3plus/train-00127-of-00128.parquet",
+      "sha256": "c5542b7ae0ce5309c757a733586d5e507f4d1dc2e8ea461073d3a0385d027a30"
+    },
+    {
+      "bytes": 286267316,
+      "git_blob_sha1": "053df10b28d11c998e68b1f31b12e02702276436",
+      "path": "finemath-4plus/train-00000-of-00064.parquet",
+      "sha256": "5d0b26114b4cf309c82a4ba8f6f45857480b27812e23a46b61b45e8bbed61fe5"
+    },
+    {
+      "bytes": 288474354,
+      "git_blob_sha1": "ba26e442bc9c79d24054fbe09ecf8c9a42eaffb4",
+      "path": "finemath-4plus/train-00001-of-00064.parquet",
+      "sha256": "4f38efdb251638c1a71be4ed380119bdd9966b1d6f200f6ff637e4768cc3930c"
+    },
+    {
+      "bytes": 287634720,
+      "git_blob_sha1": "dd607b253787aaa150318c0157e01782aa773143",
+      "path": "finemath-4plus/train-00002-of-00064.parquet",
+      "sha256": "aed5a2aed72e2683c6c967f669b12214c3a2370738a75b83fb92f6194217ab04"
+    },
+    {
+      "bytes": 284689405,
+      "git_blob_sha1": "c0e06c1d49864cfb373cf0b96e2209ae0eb26d48",
+      "path": "finemath-4plus/train-00003-of-00064.parquet",
+      "sha256": "b20b6da635493e3c7e151880db612bdf1bab2e6bc2fe87ed5cd21910f590aada"
+    },
+    {
+      "bytes": 284684820,
+      "git_blob_sha1": "ffcfdbee586b7298f5af7d155480e37e70c0a341",
+      "path": "finemath-4plus/train-00004-of-00064.parquet",
+      "sha256": "9644be6589159f9ab85a147f71a48b4ea40ed712cb7c7b5b42bf91b1bb844973"
+    },
+    {
+      "bytes": 284773965,
+      "git_blob_sha1": "63b3ceec55134c63bcbb9f7e32c84573fb4a501b",
+      "path": "finemath-4plus/train-00005-of-00064.parquet",
+      "sha256": "bc0e109357245f5bf91c956ec98e7d8f88e6356c08b25196e8760fe5839b2f99"
+    },
+    {
+      "bytes": 286407909,
+      "git_blob_sha1": "bee7a66799e506da6b1e1307f08eafdb7316bec4",
+      "path": "finemath-4plus/train-00006-of-00064.parquet",
+      "sha256": "7afa1e173e27a492e0527fc82eb8859ff0040b79eae9aa39851c9b57aad0c95d"
+    },
+    {
+      "bytes": 286615349,
+      "git_blob_sha1": "d1db27cc07420070937d620b97c20b859c945e46",
+      "path": "finemath-4plus/train-00007-of-00064.parquet",
+      "sha256": "b63045b1d32f7b10664e5e8cea9a4dfcd972cbc92e3d6eb9aa56c677ea9863b7"
+    },
+    {
+      "bytes": 287847133,
+      "git_blob_sha1": "72e7b3c1d6aaebac01bfe9ea7fe0146c1b180e05",
+      "path": "finemath-4plus/train-00008-of-00064.parquet",
+      "sha256": "39224cfcc751afbc04671bc9491266a90d58c30c27fd58f93551db8766ca96c6"
+    },
+    {
+      "bytes": 288931475,
+      "git_blob_sha1": "7d189e0c239deebdd33a4cef089bfd71eaa48f89",
+      "path": "finemath-4plus/train-00009-of-00064.parquet",
+      "sha256": "5e2b8db60462621ac0e45dd9865103f685915b09eee577f505b35f95ff601ea5"
+    },
+    {
+      "bytes": 285916752,
+      "git_blob_sha1": "2003ffa518625c8f9d05e1897400a6e2024674cf",
+      "path": "finemath-4plus/train-00010-of-00064.parquet",
+      "sha256": "9d9b4481659d3b24cc9913f2025f323bafb0d19c0e2f33f6eeb0fd82a230a018"
+    },
+    {
+      "bytes": 287613757,
+      "git_blob_sha1": "35324f3a1044c9877054ac6f3bb72cf396b340cd",
+      "path": "finemath-4plus/train-00011-of-00064.parquet",
+      "sha256": "cc1f03a25f744f3595bc808a93b40ed5aa0f2b4976c0eebbadf693fe1ae9f7c9"
+    },
+    {
+      "bytes": 286861763,
+      "git_blob_sha1": "c723a50d50264c629d24856c89d8e7072bddb230",
+      "path": "finemath-4plus/train-00012-of-00064.parquet",
+      "sha256": "8357ab429ac19c08290ae78ee8280d75140a3d82c4f18b1e747607b70eeece93"
+    },
+    {
+      "bytes": 287269661,
+      "git_blob_sha1": "c17462b2d1228d3c48aa18c8171bfadde8d12c41",
+      "path": "finemath-4plus/train-00013-of-00064.parquet",
+      "sha256": "2188e377ec460f443a169d22cd44672282e5a5ea10b70ef67b66733d3e897ff2"
+    },
+    {
+      "bytes": 285892807,
+      "git_blob_sha1": "d96b9d04a7c3bbbeb3041b085a24f08723af0539",
+      "path": "finemath-4plus/train-00014-of-00064.parquet",
+      "sha256": "7418045311f2bac739b79175654fa97b394645d42548d7cf52ed7787ffd9883f"
+    },
+    {
+      "bytes": 284854630,
+      "git_blob_sha1": "918c64e13cefb977996365241684cea722631243",
+      "path": "finemath-4plus/train-00015-of-00064.parquet",
+      "sha256": "7af8c5bcd8728514ec8bb4dd4aeeeec3cc0778818b8be6878d6a84e6b0c2c6eb"
+    },
+    {
+      "bytes": 285230750,
+      "git_blob_sha1": "0e3eaf48f997aa809668bc236834cb0a48e2ec4c",
+      "path": "finemath-4plus/train-00016-of-00064.parquet",
+      "sha256": "4d086cac2cd42a82979903d532d39c7e87ad0088f86409f6a7c2f9e8e290e3af"
+    },
+    {
+      "bytes": 285105883,
+      "git_blob_sha1": "9f12e7910efa0ab5bc2db31dbcfaebe017f215f6",
+      "path": "finemath-4plus/train-00017-of-00064.parquet",
+      "sha256": "7188aa08c9a3a9e6f217fad9bd752a170282a3b029c158eab0e68df1927b83f1"
+    },
+    {
+      "bytes": 286388383,
+      "git_blob_sha1": "134025fe82faf763b7d1a900abd03cc06a44cef8",
+      "path": "finemath-4plus/train-00018-of-00064.parquet",
+      "sha256": "6234f2ef80ca281d8b3818e22269ab5b5a0cc72c38083b608d115d807440e2ff"
+    },
+    {
+      "bytes": 287300048,
+      "git_blob_sha1": "c77a39b678727edb98d88baac827c821fbec7087",
+      "path": "finemath-4plus/train-00019-of-00064.parquet",
+      "sha256": "a6f24a84c01f792ca02c5bdbc2eff17749331be49b442a9428b916860ae8b60a"
+    },
+    {
+      "bytes": 288418140,
+      "git_blob_sha1": "9b22fd52e8742f64bf460632f61fcb96a11e4cfd",
+      "path": "finemath-4plus/train-00020-of-00064.parquet",
+      "sha256": "938e6ffcf290d7925df11239d67fc953791c361f1d3db37527fcb5468a371a95"
+    },
+    {
+      "bytes": 289304294,
+      "git_blob_sha1": "1152b2660ab2deb7d0e134a6520eb9da29a1ef14",
+      "path": "finemath-4plus/train-00021-of-00064.parquet",
+      "sha256": "38a5262c389a1b04cdebe2eaf7654c2c0a03e894e2a0b35e26a450682cf3651b"
+    },
+    {
+      "bytes": 285625844,
+      "git_blob_sha1": "4725666fbc0a1868f0337b27ce416f1f61e44953",
+      "path": "finemath-4plus/train-00022-of-00064.parquet",
+      "sha256": "d8f0548f5e73166ff60535ba2f219d85ab96eba23dff659411ea2876a66bd058"
+    },
+    {
+      "bytes": 286320892,
+      "git_blob_sha1": "5f2e6a3fb72bbff040bb217aeb7f72fa10c5d6a6",
+      "path": "finemath-4plus/train-00023-of-00064.parquet",
+      "sha256": "661164ca586963621968df1ed20bb2f103ab4c5c4bd32c9a53ea020694b92ed3"
+    },
+    {
+      "bytes": 287841727,
+      "git_blob_sha1": "88d5fc232f0bb8282352a63f9e2939a4d9ffaba5",
+      "path": "finemath-4plus/train-00024-of-00064.parquet",
+      "sha256": "d1042d40e62790e2e265e9986ee2e88359e2e294d0e3e7b31fa2b1562edc3cb4"
+    },
+    {
+      "bytes": 287597422,
+      "git_blob_sha1": "642a4f40e29dcc4018991f22cb92183491e55bde",
+      "path": "finemath-4plus/train-00025-of-00064.parquet",
+      "sha256": "d50e43d1c4523c72a1e578c0b5aeb0a52ad7da2fa2cca6184da9c359a68bbae8"
+    },
+    {
+      "bytes": 288787284,
+      "git_blob_sha1": "935f45a97f706ba7edb6c6d63a68d829bb38a077",
+      "path": "finemath-4plus/train-00026-of-00064.parquet",
+      "sha256": "993f12c563bb3ad4eb6c7313434227a6df316ebb763c56e242000613316b71f3"
+    },
+    {
+      "bytes": 287696956,
+      "git_blob_sha1": "61b009b7b48ab93213232f87c9869a5c941277c9",
+      "path": "finemath-4plus/train-00027-of-00064.parquet",
+      "sha256": "52df8a5db9e19df1b66c4db22bcffa27976c896db7f599a595e28359833bcd16"
+    },
+    {
+      "bytes": 285140740,
+      "git_blob_sha1": "f0ead6f0c655ed873b6ba3d69736cec7f746d92b",
+      "path": "finemath-4plus/train-00028-of-00064.parquet",
+      "sha256": "e2fcc0241110c215bb69291d5acc3a36cb963a4421547065341372989196d87e"
+    },
+    {
+      "bytes": 284671899,
+      "git_blob_sha1": "5aab999eda85412f8bf6718c23e4a05898e91467",
+      "path": "finemath-4plus/train-00029-of-00064.parquet",
+      "sha256": "33af174dbce679c11a11210e314c1da8bb0c905f352173d7a4f9c1e253752792"
+    },
+    {
+      "bytes": 287047408,
+      "git_blob_sha1": "71d98f7a6d9444ee0402885ca22dec30ed29a0d1",
+      "path": "finemath-4plus/train-00030-of-00064.parquet",
+      "sha256": "eebf8fa736b3d01a39ffdc527f237b97515508d1d0f891c37b4b7b66e881f8ad"
+    },
+    {
+      "bytes": 286853079,
+      "git_blob_sha1": "fae849c86b0ea69c8605cd5958b38142241d19df",
+      "path": "finemath-4plus/train-00031-of-00064.parquet",
+      "sha256": "173378335be37fecc53badf18b8d9e3751b36deca83192d656e46d283a0b790b"
+    },
+    {
+      "bytes": 290228916,
+      "git_blob_sha1": "61f8ae27259c9cb701f09085f158cfb1d756118a",
+      "path": "finemath-4plus/train-00032-of-00064.parquet",
+      "sha256": "3908b3a7770116230dc9b33fb8cdedf7e2e201bddf91c85dd67d604ef042cbeb"
+    },
+    {
+      "bytes": 287898199,
+      "git_blob_sha1": "7d0e1f286642617ce1061b565b914f7f133fefa3",
+      "path": "finemath-4plus/train-00033-of-00064.parquet",
+      "sha256": "59c396794e2a3beaf424cd38a300054f70e81f5241dabca1833d0ae8774a94bf"
+    },
+    {
+      "bytes": 289810386,
+      "git_blob_sha1": "122fef1f9c386af26d031f83878e6c98e40a91ca",
+      "path": "finemath-4plus/train-00034-of-00064.parquet",
+      "sha256": "82b84eec9e9ef34dce9161c0309038b26ed44269a8bd1d0e0b03702cccfbbbe5"
+    },
+    {
+      "bytes": 284461159,
+      "git_blob_sha1": "afc430b52e487e4bff17402c3f82f660a8f58326",
+      "path": "finemath-4plus/train-00035-of-00064.parquet",
+      "sha256": "460fb500ce95a04c649a5defa26465fd202dac8be102c93ad008a4ff413c9125"
+    },
+    {
+      "bytes": 288088785,
+      "git_blob_sha1": "45d377e18320391148259c6f8ad8d4d3d003dc73",
+      "path": "finemath-4plus/train-00036-of-00064.parquet",
+      "sha256": "210ed04eef3f67f69e8b33af70169ffa675ead7040fda5ff752dcfd53cb3f3c0"
+    },
+    {
+      "bytes": 288490473,
+      "git_blob_sha1": "8ea86cc9ff3726323e6d926764b5c04a4d4d6287",
+      "path": "finemath-4plus/train-00037-of-00064.parquet",
+      "sha256": "3f1f800ad82dbd58f76d8bf614132e021c0966cd474563458758f4f4ff8ef431"
+    },
+    {
+      "bytes": 286826637,
+      "git_blob_sha1": "478bab6b1d227eb89bccac8a593b9a6772a77dee",
+      "path": "finemath-4plus/train-00038-of-00064.parquet",
+      "sha256": "79ec06e3c4178bbe530bcf513787cf983c8194cd71ef68a059190d1e88cd09d8"
+    },
+    {
+      "bytes": 287576805,
+      "git_blob_sha1": "7e5eb9f3c5ba396e99d0ef5b95de2dfe548f63e4",
+      "path": "finemath-4plus/train-00039-of-00064.parquet",
+      "sha256": "2b893fdc56c818f601f100d4e7b4ee5183ab337b97e041f870ede9ff434b0d91"
+    },
+    {
+      "bytes": 286200864,
+      "git_blob_sha1": "89278e165971437feb1cc60d747a257d5edfe959",
+      "path": "finemath-4plus/train-00040-of-00064.parquet",
+      "sha256": "84eef483837d4d4cdf68512eac5b18eb8f2b19dc98c9518c31454fc96daa48a0"
+    },
+    {
+      "bytes": 287168422,
+      "git_blob_sha1": "dd88bf671ad3d21e538c0d2760f289a7a4ce01b0",
+      "path": "finemath-4plus/train-00041-of-00064.parquet",
+      "sha256": "a80a637295c6ca4084d508615f68e40fa7d5d99653014a049132a4067b96a17f"
+    },
+    {
+      "bytes": 285668052,
+      "git_blob_sha1": "faf2b0c341909e7e19ade6591de666c9c2799987",
+      "path": "finemath-4plus/train-00042-of-00064.parquet",
+      "sha256": "209b4839e8324cd849e58355092d12884a32f049201aaa1fb5072d6ea8232afe"
+    },
+    {
+      "bytes": 286461543,
+      "git_blob_sha1": "a6c427fa685ce7d52f368a6256a0aeb68dab351a",
+      "path": "finemath-4plus/train-00043-of-00064.parquet",
+      "sha256": "d6e5706cc53f79015065308877cedf33e82c17197cbf1be0b937c3a47270d391"
+    },
+    {
+      "bytes": 287724326,
+      "git_blob_sha1": "c82dd7cc1f7987c2d34e5f435b3d3f8896f73389",
+      "path": "finemath-4plus/train-00044-of-00064.parquet",
+      "sha256": "aeb894d1d5c9fe7b7f92bc3a90d0bade32987846ec56ffccedf1588f8634f0b5"
+    },
+    {
+      "bytes": 285137076,
+      "git_blob_sha1": "6f4c3060298f3e235a203f421afeebe5b13cc14c",
+      "path": "finemath-4plus/train-00045-of-00064.parquet",
+      "sha256": "2c3e25eccc80c71af05c1c27a260fb25d5743169dbace5e3ecdd18e6b96c277e"
+    },
+    {
+      "bytes": 287466256,
+      "git_blob_sha1": "51833dd136d5fcd8c6bd0a5b9fbba0818858af4b",
+      "path": "finemath-4plus/train-00046-of-00064.parquet",
+      "sha256": "2d0803166fa42fbe1237bbc36d7348c6ab210a2958684b6ad2b1a1e2fffb0960"
+    },
+    {
+      "bytes": 286816750,
+      "git_blob_sha1": "c47cadc575cb7d1e228352bc06a65a6c1e7b34a0",
+      "path": "finemath-4plus/train-00047-of-00064.parquet",
+      "sha256": "072dd4aee4e5f09e647109b0155edeed9364417f891f64b60ae9453a8f57543f"
+    },
+    {
+      "bytes": 286142969,
+      "git_blob_sha1": "6e2bf3e5f62565f00d2545a9f121abde92c61879",
+      "path": "finemath-4plus/train-00048-of-00064.parquet",
+      "sha256": "d30c8f3681b94bb799d4c64feea211ef2e85a398f3cd0d7ae2802468653d0231"
+    },
+    {
+      "bytes": 287762910,
+      "git_blob_sha1": "4c2c1bac06372ea77e56f18bcd274c9d54eeab38",
+      "path": "finemath-4plus/train-00049-of-00064.parquet",
+      "sha256": "844b6c543e8493b8570fc83f5f152ebaa4a324f36f86ded5c8b22158242f5976"
+    },
+    {
+      "bytes": 288979859,
+      "git_blob_sha1": "a924d6b54dc81c7c08fc317b587b7ec834441801",
+      "path": "finemath-4plus/train-00050-of-00064.parquet",
+      "sha256": "493e3155e54f0b43e350cbd732f2733949d9237b6e65025f473d8aec81bb631b"
+    },
+    {
+      "bytes": 288516393,
+      "git_blob_sha1": "99db93a01c52dfabaf0d4ae81ce05211e468b506",
+      "path": "finemath-4plus/train-00051-of-00064.parquet",
+      "sha256": "79e67c3d2bea7331f5c0d0def3aded21a2101852e26feddcda2f87491119e6d8"
+    },
+    {
+      "bytes": 286603913,
+      "git_blob_sha1": "5d41f7df7c0e7d9fba268c242fad996dd0033b70",
+      "path": "finemath-4plus/train-00052-of-00064.parquet",
+      "sha256": "f43826fecf00f41cdf78f3c4d1b17bd80b8c816f5b53414ee2bf0fd51c55a0f0"
+    },
+    {
+      "bytes": 288438678,
+      "git_blob_sha1": "6bc6bf5422156e19a97835ed6d4aee775c1ea9a4",
+      "path": "finemath-4plus/train-00053-of-00064.parquet",
+      "sha256": "e91ed59b94cab8cd1a763c6e768eca1fe52183c4029a9f81896836cf8df8332c"
+    },
+    {
+      "bytes": 287848798,
+      "git_blob_sha1": "f9529c73d5249c56c1b6d72e751aaec8ca158e58",
+      "path": "finemath-4plus/train-00054-of-00064.parquet",
+      "sha256": "fbe428def745237f8c4d7c175ed07700bfd043018b4ffb72f52f6308e737b3e9"
+    },
+    {
+      "bytes": 284921841,
+      "git_blob_sha1": "b165a1bf76efe7f7da38617fdf174926b4f202ec",
+      "path": "finemath-4plus/train-00055-of-00064.parquet",
+      "sha256": "a097663e3e928e36c2713aedfa1b48c6784e6874ebd57570c1b591c9cf2a4247"
+    },
+    {
+      "bytes": 285402320,
+      "git_blob_sha1": "1964816b12ff9def042f60c019207f1f8a1cbbd0",
+      "path": "finemath-4plus/train-00056-of-00064.parquet",
+      "sha256": "e06d3ada6b375560cff610049221a23df5cd881cd8463d5b18841d09daf420c3"
+    },
+    {
+      "bytes": 285845878,
+      "git_blob_sha1": "b2f92ed4f5cb29882d8baf975ddf2fc907bb3242",
+      "path": "finemath-4plus/train-00057-of-00064.parquet",
+      "sha256": "2c4652d889bfb0ae24464c05c9d77cd2cff4e69f8f6ade0062acc67eac35ab2f"
+    },
+    {
+      "bytes": 288566069,
+      "git_blob_sha1": "d08fddef9dd73c8ebcdb6211b4a6c1a847df1b1d",
+      "path": "finemath-4plus/train-00058-of-00064.parquet",
+      "sha256": "2a66a63e3f1a431bc08b67cdd3a4e3bf74c21efadf5632df8a0179968bedc8cd"
+    },
+    {
+      "bytes": 286510764,
+      "git_blob_sha1": "20c767d90e6bfd9dafabbc468c69f69dac30c169",
+      "path": "finemath-4plus/train-00059-of-00064.parquet",
+      "sha256": "db590431963f0915340b87a00ef011e0c837b088b7b15e992bc22fb7c3b85c95"
+    },
+    {
+      "bytes": 284239808,
+      "git_blob_sha1": "e2ff003609406951fcaf73a3879d369d382d805a",
+      "path": "finemath-4plus/train-00060-of-00064.parquet",
+      "sha256": "d8ee743cf9f6eaa336b99c50b556c6aea1fa34a8209bbd3220716444485aa27f"
+    },
+    {
+      "bytes": 288814138,
+      "git_blob_sha1": "e7055bd40da4c705bb3036bfb951653b3d9c9b39",
+      "path": "finemath-4plus/train-00061-of-00064.parquet",
+      "sha256": "c78473e2f04cefe953ebe26c8d5fdee1b1a4b70c4b95a0210314304a9ba175e7"
+    },
+    {
+      "bytes": 287258638,
+      "git_blob_sha1": "b7c567836c05bc45e9e10b4858674eba3a97e47e",
+      "path": "finemath-4plus/train-00062-of-00064.parquet",
+      "sha256": "0ac3a1f547029023ddc36661cc334fd67c220b0863808d589f23bd9b724fefd3"
+    },
+    {
+      "bytes": 289240443,
+      "git_blob_sha1": "47c1919bd4736cde21100c1444842afcdca0111d",
+      "path": "finemath-4plus/train-00063-of-00064.parquet",
+      "sha256": "ca21ff1b4127b1da10243f7e675f752c5c6cb9b6f7e57448ba01bb1a1824dfee"
+    }
+  ],
+  "format": "memorysplit-v2-huggingface-source-lock",
+  "license": "ODC-By-1.0",
+  "license_evidence": {
+    "dataset_card_value": "odc-by",
+    "terms_url": "https://commoncrawl.org/terms-of-use"
+  },
+  "repo_type": "dataset",
+  "repository": "HuggingFaceTB/finemath",
+  "revision": "e92b25a616738fe95dc186b64dfb19f9c8525594",
+  "schema_version": 1,
+  "selection": {
+    "file_order": "lexicographic_path_within_subset",
+    "subsets_in_order": [
+      "finemath-4plus",
+      "finemath-3plus-cross-deduplicated-remainder"
+    ]
+  },
+  "source_id": "finemath",
+  "subset_metadata": {
+    "finemath-3plus": {
+      "download_bytes": 65039196945,
+      "rows": 21405610
+    },
+    "finemath-4plus": {
+      "download_bytes": 18365184633,
+      "rows": 6699493
+    }
+  },
+  "total_bytes": 83404381578
+}
