@@ -260,3 +260,51 @@ GREEN and final evidence:
 
 No deployment, AWS API mutation, change set, runtime implementation, cleanup
 change, or profile-neutral P6 work was performed.
+
+## Final endpoint-enforcement addendum
+
+Commit `e4f8dd3` (`fix: close S3 endpoint policy bypasses`) closes the final two
+Important foundation enforcement findings.
+
+- The S3 gateway endpoint now separates unconditional
+  `GetBucketLocation` from `ListBucket`/`ListBucketVersions`. Listing requires
+  one of the exact named `ArtifactRootPrefix` namespaces and rejects the root,
+  root wildcard, missing prefix, and unrelated prefixes.
+- Python invariants iterate every Train, Evaluator, Controller, and S3 endpoint
+  statement. They reject wildcard actions (including `*`, `s3:*`, and
+  `s3:Get*`), case variants, `NotAction`, `NotResource`, `Resource: "*"`,
+  plain or unknown resource shapes, artifact-root wildcards, unexpected
+  actions/Sids, malformed conditions, and extra S3 statements.
+- cfn-guard now uses case-insensitive all-S3 selectors plus whole-policy
+  statement checks. Every statement must use a non-wildcard string/list
+  action, no `NotAction`/`NotResource`, an allowlisted Sid/action, and only
+  reviewed `Fn::Sub` or exact artifact-bucket `Fn::GetAtt` resources.
+- Endpoint listing and object resources are independently allowlisted; action-
+  filtered or `Fn::Sub`-only projections can no longer hide an injected
+  statement or malformed resource.
+
+RED evidence:
+
+- Endpoint listing test failed because `MemorySplitBucketLocation` and
+  conditioned `MemorySplitBucketListing` did not exist.
+- Guard coverage test failed because the all-statement rejection rule was
+  absent.
+- Python mutation tests exposed case-insensitive `S3:GetObject` and an injected
+  `Action: "*"` statement as unobserved before selectors were hardened.
+- Expanded cfn-guard mutants exposed an unknown resource mapping as accepted
+  before exact resource-key shape checks were added.
+
+GREEN and final evidence:
+
+- Focused pytest: `173 passed in 88.03s`.
+- Safe YAML parse: 33 resources.
+- cfn-lint 1.53.2: passed with no findings.
+- cfn-guard 3.2.0: all 23 rules passed.
+- Python accepted the canonical policy and rejected all 17 bypass forms.
+- cfn-guard rejected 11 required-resource deletion mutants and 26 endpoint/S3
+  enforcement mutants.
+- The actual omitted IaC files passed secret scanning; `py_compile` and
+  `git diff --check` passed.
+
+No deployment, AWS API mutation, change set, runtime implementation, cleanup
+change, or profile-neutral P6 work was performed.
