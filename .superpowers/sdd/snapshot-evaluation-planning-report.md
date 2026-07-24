@@ -88,3 +88,92 @@ produce a final scientific conclusion.
 ## Concerns
 
 None.
+
+## Critical/Important review remediation
+
+Review-remediation status: `DONE_WITH_CONCERNS`.
+
+Review base: `f290819cd26218c69ae44c44ea3eab5cef4942f5`.
+
+Remediation commit:
+`5269bb4733698f92476f830492866b6dc81f62c4`.
+
+This addendum supersedes the original report's `checkpoint.pt`, marker-based
+dispatch, path-read, and unqualified-output claims.
+
+### Findings closed
+
+1. **Production model snapshots.** `Trainer.save_snapshot` now emits an
+   additive, model-only study snapshot v2 for the frozen v3 cohort. It contains
+   exactly model weights, optimizer step, `model_cfg`, world size, data
+   provenance, config fingerprint, and explicit seed/arm/run/model/data
+   commitments. Historical snapshot writes and reads retain their prior exact
+   schema. Planning binds `snapshots/stepNNNNNNN.pt` and content-addressed
+   `snapshots/.../step-NNNNNNN/...` object keys. Evaluation uses
+   descriptor-pinned bytes and `torch.load(..., weights_only=True)`, constructs
+   the model directly from `model_cfg`, and rejects `cfg`, optimizer, data
+   cursor, or RNG-bearing full checkpoints.
+2. **Evaluator execution identity.** Provider-selection locks and run bindings
+   now carry the approved environment, canary, approval, and public-key
+   commitments plus fixed evaluator profile/runtime/environment inputs.
+   Provider-qualified publication requires the real repository adapter,
+   requested and observed CUDA, the exact selected GPU profile/count/name,
+   exact PyTorch/CUDA runtime versions, and a PKCS7-authenticated AWS
+   environment receipt. The complete evidence is re-read and re-authenticated
+   before inference and after submissions, before gold opens. `output.json`
+   binds both observations. CPU, MPS, and injected adapters publish only
+   `test_only` evidence with `production_qualified: false`.
+3. **Pinned input and output authority.** V3 run bindings, study locks, model
+   snapshots, evaluator profiles, runtime locks, and environment receipts use
+   bounded `O_NOFOLLOW` descriptor reads with owner, writable-mode, link,
+   pre/post descriptor, and final-name checks. The output parent is
+   descriptor-pinned; staging writes and atomic no-replace installation are
+   directory-relative. Parent replacement fails, and a post-install authority
+   failure atomically quarantines the intact output tree.
+4. **Contract-driven dispatch.** Dispatch parses canonical `run.json` and its
+   exact record type/schema before choosing v2 or v3. V3 remains v3 even when a
+   release marker is missing or renamed, while unrelated or dual marker files
+   cannot redirect an explicit v2 run. Duplicate keys, crossed schemas, and
+   unknown identity fields fail closed.
+
+The exact 100-slot order, cohort-wide provider selection, sealed-gold timing,
+atomic output, cohort-only/no-conclusion inference, hardware authority commits,
+and historical v2 runner behavior remain intact.
+
+### Strict RED to GREEN evidence
+
+- Trainer snapshot RED lacked version/config/study provenance; GREEN round
+  tripped a real `Trainer.save_snapshot` artifact and preserved legacy writes.
+- Evaluator RED rejected the production snapshot because it expected invented
+  `cfg`; GREEN loads only exact `model_cfg` and rejects full checkpoints plus
+  crossed step/arm/config/model/data/world identities.
+- Input hardlink, unsafe-mode, same-byte replacement, and oversized-run RED
+  cases were accepted or reached JSON parsing; all now fail at pinned reads.
+- Marker RED cases routed v2/v3 by filenames; canonical contract identity now
+  controls dispatch and rejects forged/ambiguous records.
+- Provider-qualified RED accepted no execution contract; GREEN rejects
+  CPU/MPS/fixtures, binds CUDA/PyTorch/device/AWS evidence, and fails changed
+  post-inference authentication before gold.
+- Output-parent and post-install RED races either published through a
+  replacement or left a final tree; GREEN rejects the replacement and
+  quarantines an intact installed tree.
+
+Final verification:
+
+```text
+expanded focused planning/lock/runner/sealing suite: 198 passed
+bounded confirmatory v2/v3 regressions:              139 passed
+hardware authority/profile/cohort regressions:       240 passed
+aws contracts including model snapshot keys:          14 passed
+complete Trainer snapshot/compatibility suite:         85 passed
+python -m py_compile:                                  passed
+git diff --check:                                      passed
+```
+
+### Remaining concern
+
+The host has no CUDA GPU and no live AWS environment, so the default production
+CUDA/PKCS7 path was not exercised against physical hardware. Tests use the same
+injected verifier/probe seams as the hardware authority suites; production
+publication itself rejects those test-only adapter paths and requires observed
+CUDA plus the authenticated receipt.
