@@ -8,10 +8,12 @@ import hashlib
 import json
 import os
 import re
+import secrets
 import subprocess
 import tempfile
 import time
 from collections.abc import Callable, Mapping, Sequence
+from dataclasses import replace as dataclass_replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Protocol
@@ -29,12 +31,32 @@ from cluster.aws.p5.canary import (
     parse_qualification_receipt_bytes,
     qualification_roundtrip_blob,
 )
+from cluster.aws.p5.checkpoint_mirror import _canonical_json
+from cluster.aws.p5.run_finalization import (
+    FinalizationError,
+    parse_run_finalization_receipt_bytes,
+)
 from cluster.aws.gpu_profile import (
     validate_runtime_environment as validate_selected_runtime_environment,
 )
 
 from .approval import verify_scope_approval
-from .aws_contracts import bootstrap_receipt_key
+from .aws_collect import (
+    COLLECTION_RECEIPT_FIELDS,
+    COLLECTION_RECEIPT_TYPE,
+    SEED_COLLECTION_OBJECT_COUNT,
+    CollectionError,
+    CollectionReceiptRef,
+    SubprocessAwsDownloadRunner,
+    admit_prior_seed_collection,
+    download_timeout_seconds,
+    parse_seed_collection_receipt_bytes,
+)
+from .aws_contracts import (
+    bootstrap_receipt_key,
+    collection_receipt_key,
+    run_receipt_key,
+)
 from .aws_lifecycle import (
     AuthenticatedProviderLifecycle,
     LIFECYCLE_BINDING_FIELDS,
@@ -63,7 +85,16 @@ from .contracts import (
     verify_release_member,
 )
 from .errors import MsctlError
-from .fsutil import atomic_write_at, open_directory
+from .fsutil import (
+    atomic_write_at,
+    hash_fd,
+    open_directory,
+    open_directory_at,
+    open_parent_at,
+    open_regular_at,
+    remove_tree_at,
+    rename_noreplace_at,
+)
 from .jsonutil import (
     canonical_json,
     canonical_sha256,
@@ -493,6 +524,7 @@ class AwsP5Backend:
         instance_profile_arn: str,
         state_root: Path | str,
         runner: AwsJsonRunner | None = None,
+        download_runner: object | None = None,
         approval_verifier: Callable[..., object] = verify_scope_approval,
         corpus_verifier: Callable[..., object] | None = None,
         identity_verifier: Callable[
@@ -542,6 +574,9 @@ class AwsP5Backend:
         self.instance_profile_arn = instance_profile_arn
         self.state_root = Path(state_root)
         self.runner = runner or SubprocessAwsJsonRunner()
+        self.download_runner = download_runner or (
+            SubprocessAwsDownloadRunner()
+        )
         self.approval_verifier = approval_verifier
         self.corpus_verifier = corpus_verifier
         self.identity_verifier = identity_verifier
@@ -614,6 +649,7 @@ class AwsP5Backend:
         instance_profile_arn: str,
         state_root: Path | str,
         runner: AwsJsonRunner | None = None,
+        download_runner: object | None = None,
         scope_approval_verifier: Callable[..., object] = verify_scope_approval,
         corpus_verifier: Callable[..., object] | None = None,
         sleep: Callable[[float], None] = time.sleep,
@@ -663,6 +699,7 @@ class AwsP5Backend:
             instance_profile_arn=instance_profile_arn,
             state_root=state_root,
             runner=runner,
+            download_runner=download_runner,
             approval_verifier=scope_approval_verifier,
             corpus_verifier=corpus_verifier,
             identity_verifier=selection_identity_verifier,
@@ -3602,7 +3639,7 @@ class AwsP5Backend:
         )
         if not apply:
             return {
-                "provider": manifest.provider,
+                "provider": self.profile.provider,
                 "s3_uri": f"s3://{bucket}/{key}",
                 "commands": [argv],
                 "verified": False,
@@ -3633,7 +3670,7 @@ class AwsP5Backend:
                 "S3 object metadata is invalid",
             )
         return {
-            "provider": AWS_P5_PROFILE,
+            "provider": self.profile.provider,
             "s3_uri": f"s3://{bucket}/{key}",
             "verified": True,
             "object": row,
@@ -4987,7 +5024,7 @@ class AwsP5Backend:
         )
         if not apply:
             return {
-                "provider": manifest.provider,
+                "provider": self.profile.provider,
                 "s3_uri": f"s3://{bucket}/{key}",
                 "out": str(destination),
                 "commands": [argv],
@@ -5010,11 +5047,1033 @@ class AwsP5Backend:
                 "AWS CLI did not materialize the requested regular file",
             )
         return {
-            "provider": AWS_P5_PROFILE,
+            "provider": self.profile.provider,
             "s3_uri": f"s3://{bucket}/{key}",
             "out": str(destination),
             "collected": 1,
         }
+
+    def _collect_fetch_receipt(
+        self,
+        *,
+        uri: str,
+        sha256: str,
+        version_id: str,
+        operation: str,
+        label: str,
+    ) -> bytes:
+        """GET one exact receipt version and independently hash its bytes."""
+
+        prefix = self.runtime.s3_root.rstrip("/") + "/"
+        if not isinstance(uri, str) or not uri.startswith(prefix):
+            raise MsctlError(
+                "COLLECT_RECEIPT_INVALID",
+                f"{label} is outside the pinned S3 root",
+            )
+        bucket, key = self._s3_location(uri.removeprefix(prefix))
+        expected_checksum = base64.b64encode(
+            bytes.fromhex(sha256)
+        ).decode("ascii")
+        with tempfile.TemporaryDirectory(
+            prefix="memorysplit-collect-receipt-",
+            dir=Path(tempfile.gettempdir()).resolve(),
+        ) as temporary:
+            destination = Path(temporary) / "receipt.json"
+            try:
+                output = _aws_output_object(
+                    self._run(
+                        self._aws_argv(
+                            "s3api",
+                            "get-object",
+                            "--bucket",
+                            bucket,
+                            "--key",
+                            key,
+                            "--version-id",
+                            version_id,
+                            "--checksum-mode",
+                            "ENABLED",
+                            str(destination),
+                            query=(
+                                "{receipt:{checksum_sha256:ChecksumSHA256,"
+                                "version_id:VersionId}}"
+                            ),
+                        ),
+                        operation=operation,
+                    ),
+                    {"receipt"},
+                    label=f"{label} download",
+                )
+            except MsctlError as error:
+                if error.code == "AWS_COMMAND_FAILED":
+                    raise MsctlError(
+                        "COLLECT_INCOMPLETE",
+                        f"{label} is unavailable",
+                    ) from error
+                raise
+            row = _aws_output_object(
+                output["receipt"],
+                {"checksum_sha256", "version_id"},
+                label=f"{label} object",
+            )
+            try:
+                payload = read_regular_input(
+                    destination,
+                    label=label,
+                    maximum_bytes=16 * 1024 * 1024,
+                )
+            except (AttestationError, OSError) as error:
+                raise MsctlError(
+                    "COLLECT_RECEIPT_INVALID",
+                    f"downloaded {label} is unsafe",
+                ) from error
+        if (
+            row["checksum_sha256"] != expected_checksum
+            or row["version_id"] != version_id
+            or hashlib.sha256(payload).hexdigest() != sha256
+        ):
+            raise MsctlError(
+                "COLLECT_RECEIPT_INVALID",
+                f"downloaded {label} identity differs",
+            )
+        return payload
+
+    def _collect_run_receipt_value(
+        self,
+        manifest: object,
+        *,
+        uri: str,
+        sha256: str,
+        version_id: str,
+    ) -> tuple[dict[str, object], bytes, ProviderLifecycleBinding]:
+        """Fetch and authenticate this seed's exact finalization receipt."""
+
+        payload = self._collect_fetch_receipt(
+            uri=uri,
+            sha256=sha256,
+            version_id=version_id,
+            operation="fetch seed run finalization receipt",
+            label="run finalization receipt",
+        )
+        try:
+            value = parse_run_finalization_receipt_bytes(
+                payload,
+                receipt_uri=uri,
+                receipt_sha256=sha256,
+                receipt_version_id=version_id,
+            )
+        except FinalizationError as error:
+            raise MsctlError(
+                "COLLECT_RECEIPT_INVALID",
+                f"run finalization receipt is invalid: {error}",
+            ) from error
+        if value["seed"] != manifest.seed:
+            raise MsctlError(
+                "COLLECT_RECEIPT_INVALID",
+                "run finalization receipt seed differs from the manifest",
+            )
+        # The finalization may have happened on an earlier boot; every other
+        # lifecycle commitment must match the authenticated binding exactly.
+        try:
+            expected_binding = dataclass_replace(
+                self.lifecycle_binding,
+                boot_id=str(value["boot_id"]),
+            )
+        except (TypeError, ValueError) as error:
+            raise MsctlError(
+                "COLLECT_RECEIPT_INVALID",
+                "run finalization receipt boot identity is invalid",
+            ) from error
+        try:
+            parse_run_finalization_receipt_bytes(
+                payload,
+                receipt_uri=uri,
+                receipt_sha256=sha256,
+                receipt_version_id=version_id,
+                expected_binding=expected_binding,
+            )
+        except FinalizationError as error:
+            raise MsctlError(
+                "COLLECT_RECEIPT_INVALID",
+                f"run finalization lifecycle authority differs: {error}",
+            ) from error
+        for field, expected_value in (
+            ("release_sha256", manifest.release_sha256),
+            ("release_receipt_sha256", manifest.release_receipt_sha256),
+            ("run_manifest_sha256", manifest.sha256),
+            ("dataset_receipt_sha256", manifest.dataset_receipt_sha256),
+            ("dataset_build_id", manifest.dataset_build_id),
+            ("ordered_stream_sha256", manifest.ordered_stream_sha256),
+            ("source_commit", manifest.source_commit),
+            ("source_tree", manifest.source_tree),
+        ):
+            if value[field] != expected_value:
+                raise MsctlError(
+                    "COLLECT_RECEIPT_INVALID",
+                    f"run finalization {field} differs from the manifest",
+                )
+        by_run = {run.run_id: run for run in manifest.runs}
+        for row in value["arms"]:
+            run = by_run.get(row["run_id"])
+            if run is None or row["config_sha256"] != run.config_sha256:
+                raise MsctlError(
+                    "COLLECT_RECEIPT_INVALID",
+                    "run finalization arms do not bind the manifest runs",
+                )
+        return value, payload, expected_binding
+
+    def _collect_checkpoint_receipt(
+        self,
+        manifest: object,
+        expected_binding: ProviderLifecycleBinding,
+        checkpoint_reference: Mapping[str, object],
+    ) -> tuple[object, bytes]:
+        """Fetch and cross-bind the exact Task 3C checkpoint receipt."""
+
+        payload = self._collect_fetch_receipt(
+            uri=str(checkpoint_reference["uri"]),
+            sha256=str(checkpoint_reference["sha256"]),
+            version_id=str(checkpoint_reference["version_id"]),
+            operation="fetch seed checkpoint receipt",
+            label="checkpoint receipt",
+        )
+        try:
+            receipt = parse_paired_checkpoint_receipt_v3(
+                payload,
+                receipt_uri=str(checkpoint_reference["uri"]),
+                receipt_sha256=str(checkpoint_reference["sha256"]),
+                receipt_version_id=str(
+                    checkpoint_reference["version_id"]
+                ),
+            )
+        except MsctlError as error:
+            raise MsctlError(
+                "COLLECT_RECEIPT_INVALID",
+                "checkpoint receipt is invalid",
+            ) from error
+        if receipt.provider_selection_sha256 is None:
+            raise MsctlError(
+                "COLLECT_RECEIPT_INVALID",
+                "collection requires a provider-aware checkpoint receipt",
+            )
+        expected = expected_binding.to_dict()
+        for field in LIFECYCLE_BINDING_FIELDS:
+            actual = getattr(receipt, field)
+            if field == "arms":
+                actual = list(actual)
+            if actual != expected[field]:
+                raise MsctlError(
+                    "COLLECT_RECEIPT_INVALID",
+                    "checkpoint receipt lifecycle differs from the "
+                    "authenticated provider authority",
+                )
+        by_run = {run.run_id: run for run in manifest.runs}
+        if (
+            receipt.seed != manifest.seed
+            or receipt.release_sha256 != manifest.release_sha256
+            or receipt.release_receipt_sha256
+            != manifest.release_receipt_sha256
+            or receipt.run_manifest_sha256 != manifest.sha256
+            or receipt.dataset_receipt_sha256
+            != manifest.dataset_receipt_sha256
+            or receipt.dataset_build_id != manifest.dataset_build_id
+            or receipt.ordered_stream_sha256
+            != manifest.ordered_stream_sha256
+            or receipt.source_commit != manifest.source_commit
+            or receipt.source_tree != manifest.source_tree
+            or any(
+                by_run.get(checkpoint.run_id) is None
+                or checkpoint.config_sha256
+                != by_run[checkpoint.run_id].config_sha256
+                for checkpoint in receipt.checkpoints
+            )
+        ):
+            raise MsctlError(
+                "COLLECT_RECEIPT_INVALID",
+                "checkpoint receipt does not bind the selected manifest",
+            )
+        return receipt, payload
+
+    @staticmethod
+    def _collection_rows(
+        run_value: Mapping[str, object],
+        run_payload: bytes,
+        run_reference: Mapping[str, object],
+        checkpoint_receipt: object,
+        checkpoint_payload: bytes,
+    ) -> list[dict[str, object]]:
+        """Enumerate the sixteen canonical collection rows."""
+
+        rows: list[dict[str, object]] = []
+        for arm_row in run_value["arms"]:
+            for item in arm_row["snapshots"]:
+                snapshot = item["object"]
+                rows.append(
+                    {
+                        "arm": arm_row["arm"],
+                        "bytes": snapshot["bytes"],
+                        "kind": "snapshot",
+                        "sha256": snapshot["sha256"],
+                        "step": item["step"],
+                        "uri": snapshot["uri"],
+                        "version_id": snapshot["version_id"],
+                    }
+                )
+            log = arm_row["log"]
+            rows.append(
+                {
+                    "arm": arm_row["arm"],
+                    "bytes": log["bytes"],
+                    "kind": "log",
+                    "sha256": log["sha256"],
+                    "step": None,
+                    "uri": log["uri"],
+                    "version_id": log["version_id"],
+                }
+            )
+        for checkpoint in checkpoint_receipt.checkpoints:
+            rows.append(
+                {
+                    "arm": checkpoint.arm,
+                    "bytes": checkpoint.object.bytes,
+                    "kind": "checkpoint",
+                    "sha256": checkpoint.object.sha256,
+                    "step": None,
+                    "uri": checkpoint.object.uri,
+                    "version_id": checkpoint.object.version_id,
+                }
+            )
+        reference = run_value["checkpoint_receipt"]
+        rows.append(
+            {
+                "arm": None,
+                "bytes": len(checkpoint_payload),
+                "kind": "checkpoint_receipt",
+                "sha256": reference["sha256"],
+                "step": None,
+                "uri": reference["uri"],
+                "version_id": reference["version_id"],
+            }
+        )
+        rows.append(
+            {
+                "arm": None,
+                "bytes": len(run_payload),
+                "kind": "run_receipt",
+                "sha256": run_reference["sha256"],
+                "step": None,
+                "uri": run_reference["uri"],
+                "version_id": run_reference["version_id"],
+            }
+        )
+        return rows
+
+    @staticmethod
+    def _stage_collection_bytes(
+        staging_fd: int,
+        relative: str,
+        payload: bytes,
+    ) -> None:
+        parent_fd, name = open_parent_at(
+            staging_fd,
+            relative,
+            label="collection staging entry",
+            create=True,
+        )
+        try:
+            flags = (
+                os.O_WRONLY
+                | os.O_CREAT
+                | os.O_EXCL
+                | getattr(os, "O_NOFOLLOW", 0)
+                | getattr(os, "O_CLOEXEC", 0)
+            )
+            descriptor = os.open(name, flags, 0o600, dir_fd=parent_fd)
+            try:
+                view = memoryview(payload)
+                while view:
+                    written = os.write(descriptor, view)
+                    view = view[written:]
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
+        finally:
+            os.close(parent_fd)
+
+    def _rehash_staged_collection_object(
+        self,
+        staging_fd: int,
+        relative: str,
+        row: Mapping[str, object],
+    ) -> None:
+        """Stream-hash the descriptor-pinned staged bytes independently."""
+
+        try:
+            descriptor, parent_fd, _name = open_regular_at(
+                staging_fd,
+                relative,
+                label="collected object",
+            )
+        except MsctlError as error:
+            raise MsctlError(
+                "COLLECT_OBJECT_MISMATCH",
+                "collected object was not materialized as a regular file",
+                details={"uri": row["uri"]},
+            ) from error
+        try:
+            size, digest = hash_fd(descriptor)
+        finally:
+            os.close(descriptor)
+            os.close(parent_fd)
+        if size != row["bytes"] or digest != row["sha256"]:
+            raise MsctlError(
+                "COLLECT_OBJECT_MISMATCH",
+                "collected object bytes differ from the receipt identity",
+                details={"uri": row["uri"]},
+            )
+
+    def _download_collection_body(
+        self,
+        row: Mapping[str, object],
+        *,
+        local_path: str,
+    ) -> None:
+        prefix = self.runtime.s3_root.rstrip("/") + "/"
+        bucket, key = self._s3_location(
+            str(row["uri"]).removeprefix(prefix)
+        )
+        argv = self._aws_argv(
+            "s3api",
+            "get-object",
+            "--bucket",
+            bucket,
+            "--key",
+            key,
+            "--version-id",
+            str(row["version_id"]),
+            "--checksum-mode",
+            "ENABLED",
+            local_path,
+            query=(
+                "{object:{checksum_sha256:ChecksumSHA256,"
+                "content_length:ContentLength,version_id:VersionId}}"
+            ),
+        )
+        try:
+            timeout_seconds = download_timeout_seconds(row["bytes"])
+        except CollectionError as error:
+            raise MsctlError(
+                "COLLECT_OBJECT_MISMATCH",
+                "collected object size is invalid",
+            ) from error
+        try:
+            output = _aws_output_object(
+                self.download_runner.run_json(
+                    argv,
+                    operation=f"collect {row['kind']} body",
+                    timeout_seconds=timeout_seconds,
+                ),
+                {"object"},
+                label="collection body download",
+            )
+        except MsctlError as error:
+            if error.code in {"AWS_COMMAND_FAILED", "EXTERNAL_UNAVAILABLE"}:
+                raise MsctlError(
+                    "COLLECT_INCOMPLETE",
+                    "collection evidence object is unavailable",
+                    details={"uri": row["uri"]},
+                ) from error
+            raise
+        downloaded = _aws_output_object(
+            output["object"],
+            {"checksum_sha256", "content_length", "version_id"},
+            label="collection body object",
+        )
+        if (
+            downloaded["checksum_sha256"]
+            != base64.b64encode(
+                bytes.fromhex(str(row["sha256"]))
+            ).decode("ascii")
+            or downloaded["content_length"] != row["bytes"]
+            or downloaded["version_id"] != row["version_id"]
+        ):
+            raise MsctlError(
+                "COLLECT_OBJECT_MISMATCH",
+                "collection evidence object version or checksum differs",
+                details={"uri": row["uri"]},
+            )
+
+    def _publish_collection_receipt(
+        self,
+        *,
+        payload: bytes,
+        digest: str,
+        request_id: str,
+        seed: int,
+        body_path: str,
+    ) -> str:
+        """Publish the receipt no-replace and verify it by exact HEAD."""
+
+        bucket, key = self._s3_location(
+            collection_receipt_key(seed, digest)
+        )
+        checksum = base64.b64encode(bytes.fromhex(digest)).decode("ascii")
+        expected_metadata = {
+            "receipt-sha256": digest,
+            "receipt-type": COLLECTION_RECEIPT_TYPE,
+            "request-id": request_id,
+            "seed": str(seed),
+        }
+        put = self._aws_argv(
+            "s3api",
+            "put-object",
+            "--bucket",
+            bucket,
+            "--key",
+            key,
+            "--body",
+            body_path,
+            "--checksum-algorithm",
+            "SHA256",
+            "--checksum-sha256",
+            checksum,
+            "--metadata",
+            ",".join(
+                f"{name}={value}"
+                for name, value in expected_metadata.items()
+            ),
+            "--if-none-match",
+            "*",
+            query=(
+                "{object:{checksum_sha256:ChecksumSHA256,"
+                "version_id:VersionId}}"
+            ),
+        )
+        put_version: str | None = None
+        try:
+            put_output = _aws_output_object(
+                self._run(put, operation="publish seed collection receipt"),
+                {"object"},
+                label="S3 collection receipt put",
+            )
+        except MsctlError as error:
+            if error.code != "AWS_COMMAND_FAILED":
+                raise
+            # A lost or conflicting no-replace PUT recovers only through
+            # the exact HEAD verification below.
+            put_output = None
+        if put_output is not None:
+            put_row = _aws_output_object(
+                put_output["object"],
+                {"checksum_sha256", "version_id"},
+                label="S3 collection receipt put object",
+            )
+            if (
+                put_row["checksum_sha256"] != checksum
+                or not isinstance(put_row["version_id"], str)
+                or not put_row["version_id"]
+            ):
+                raise MsctlError(
+                    "COLLECT_CONFLICT",
+                    "S3 did not confirm the immutable collection receipt",
+                )
+            put_version = str(put_row["version_id"])
+        head = self._aws_argv(
+            "s3api",
+            "head-object",
+            "--bucket",
+            bucket,
+            "--key",
+            key,
+            "--checksum-mode",
+            "ENABLED",
+            query=(
+                "{object:{checksum_sha256:ChecksumSHA256,"
+                "content_length:ContentLength,metadata:Metadata,"
+                "version_id:VersionId}}"
+            ),
+        )
+        try:
+            head_output = _aws_output_object(
+                self._run(head, operation="verify seed collection receipt"),
+                {"object"},
+                label="S3 collection receipt head",
+            )
+        except MsctlError as error:
+            if error.code == "AWS_COMMAND_FAILED":
+                raise MsctlError(
+                    "COLLECT_CONFLICT",
+                    "published collection receipt cannot be verified",
+                ) from error
+            raise
+        row = _aws_output_object(
+            head_output["object"],
+            {"checksum_sha256", "content_length", "metadata", "version_id"},
+            label="S3 collection receipt object",
+        )
+        if (
+            row["checksum_sha256"] != checksum
+            or row["content_length"] != len(payload)
+            or row["metadata"] != expected_metadata
+            or not isinstance(row["version_id"], str)
+            or not row["version_id"]
+            or (
+                put_version is not None
+                and row["version_id"] != put_version
+            )
+        ):
+            raise MsctlError(
+                "COLLECT_CONFLICT",
+                "published collection receipt does not match local bytes",
+            )
+        return str(row["version_id"])
+
+    def _verify_published_collection_head(
+        self,
+        reference: Mapping[str, object],
+    ) -> None:
+        """Exact-HEAD verify one durably recorded collection receipt."""
+
+        prefix = self.runtime.s3_root.rstrip("/") + "/"
+        uri = str(reference["uri"])
+        if not uri.startswith(prefix):
+            raise MsctlError(
+                "COLLECT_INCOMPLETE",
+                "recorded collection receipt is outside the pinned S3 root",
+            )
+        bucket, key = self._s3_location(uri.removeprefix(prefix))
+        try:
+            output = _aws_output_object(
+                self._run(
+                    self._aws_argv(
+                        "s3api",
+                        "head-object",
+                        "--bucket",
+                        bucket,
+                        "--key",
+                        key,
+                        "--version-id",
+                        str(reference["version_id"]),
+                        "--checksum-mode",
+                        "ENABLED",
+                        query=(
+                            "{object:{checksum_sha256:ChecksumSHA256,"
+                            "content_length:ContentLength,"
+                            "version_id:VersionId}}"
+                        ),
+                    ),
+                    operation="verify published seed collection receipt",
+                ),
+                {"object"},
+                label="published collection receipt",
+            )
+        except MsctlError as error:
+            if error.code == "AWS_COMMAND_FAILED":
+                raise MsctlError(
+                    "COLLECT_INCOMPLETE",
+                    "published collection receipt is unavailable",
+                ) from error
+            raise
+        row = _aws_output_object(
+            output["object"],
+            {"checksum_sha256", "content_length", "version_id"},
+            label="published collection receipt object",
+        )
+        if (
+            row["checksum_sha256"]
+            != base64.b64encode(
+                bytes.fromhex(str(reference["sha256"]))
+            ).decode("ascii")
+            or row["content_length"] != reference["bytes"]
+            or row["version_id"] != reference["version_id"]
+        ):
+            raise MsctlError(
+                "COLLECT_INCOMPLETE",
+                "published collection receipt differs from durable state",
+            )
+
+    def collect_seed_evidence(
+        self,
+        *,
+        release: object,
+        manifest: object,
+        run_receipt: Mapping[str, object] | None,
+        out: Path | str | None,
+        apply: bool,
+    ) -> dict[str, object]:
+        """Collect one seed's sixteen training-evidence objects durably.
+
+        Collection requires no paid-instance approval: it creates no
+        capacity, sends no remote command, and only publishes one
+        content-addressed collection receipt. Every evidence body stays
+        opaque; only the finalization and checkpoint receipts are parsed.
+        """
+
+        # 1) Authenticate the manifest, release, provider lifecycle, and
+        #    the exact operator-declared run receipt triple.
+        self._validate_manifest(manifest)
+        self._validate_release(release, manifest)
+        if (
+            not self._selected_manifest_lifecycle(manifest)
+            or self.lifecycle_binding is None
+        ):
+            raise MsctlError(
+                "OPERATION_UNSUPPORTED",
+                "seed evidence collection requires an authenticated "
+                "selected manifest",
+            )
+        if (
+            not isinstance(run_receipt, Mapping)
+            or set(run_receipt) != {"uri", "sha256", "version_id"}
+        ):
+            raise MsctlError(
+                "COLLECT_RECEIPT_INVALID",
+                "collection requires the exact run receipt triple",
+            )
+        try:
+            receipt_sha256 = require_sha256(
+                run_receipt["sha256"],
+                label="run receipt",
+            )
+        except MsctlError as error:
+            raise MsctlError(
+                "COLLECT_RECEIPT_INVALID",
+                "run receipt SHA-256 is invalid",
+            ) from error
+        receipt_version = run_receipt["version_id"]
+        if (
+            not isinstance(receipt_version, str)
+            or receipt_version in {"", "null"}
+        ):
+            raise MsctlError(
+                "COLLECT_RECEIPT_INVALID",
+                "run receipt version ID must be a real non-null version",
+            )
+        expected_key = run_receipt_key(manifest.seed, receipt_sha256)
+        receipt_uri = run_receipt["uri"]
+        if receipt_uri != f"{self.runtime.s3_root}/{expected_key}":
+            raise MsctlError(
+                "COLLECT_RECEIPT_INVALID",
+                "run receipt URI must use its canonical key under the "
+                "pinned S3 root",
+            )
+        if out is None:
+            raise MsctlError(
+                "CLI_USAGE",
+                "seed evidence collection requires --out",
+            )
+        # 2) Validate the nonexisting, nonsymlink output destination.
+        destination = Path(out).absolute()
+        if destination.exists() or destination.is_symlink():
+            raise MsctlError(
+                "COLLECT_DESTINATION_EXISTS",
+                "refusing to replace an existing collection destination",
+            )
+        bucket, key = self._s3_location(expected_key)
+        first_get = self._aws_argv(
+            "s3api",
+            "get-object",
+            "--bucket",
+            bucket,
+            "--key",
+            key,
+            "--version-id",
+            receipt_version,
+            "--checksum-mode",
+            "ENABLED",
+            str(destination / expected_key),
+            query=(
+                "{receipt:{checksum_sha256:ChecksumSHA256,"
+                "version_id:VersionId}}"
+            ),
+        )
+        if not apply:
+            # Later commands depend on the fetched receipt contents, so the
+            # dry run performs zero AWS calls and renders only the first
+            # exact finalization receipt GET.
+            return {
+                "provider": self.profile.provider,
+                "seed": manifest.seed,
+                "run_manifest_sha256": manifest.sha256,
+                "run_receipt": dict(run_receipt),
+                "out": str(destination),
+                "commands": [first_get],
+                "collected": 0,
+                "idempotent": False,
+            }
+
+        store = StateStore(self.state_root)
+        with store.locked():
+            # 3) Idempotent replay or conflict, before any AWS call.
+            existing = store.read_collection(manifest.sha256)
+            if existing is not None:
+                stored = existing["run_receipt"]
+                if (
+                    stored["uri"] != receipt_uri
+                    or stored["sha256"] != receipt_sha256
+                    or stored["version_id"] != receipt_version
+                ):
+                    raise MsctlError(
+                        "COLLECT_CONFLICT",
+                        "existing collection state binds a different run "
+                        "receipt",
+                    )
+                self._verify_published_collection_head(
+                    existing["collection_receipt"]
+                )
+                return {
+                    "provider": self.profile.provider,
+                    "seed": manifest.seed,
+                    "run_manifest_sha256": manifest.sha256,
+                    "run_receipt": dict(stored),
+                    "collection_receipt": dict(
+                        existing["collection_receipt"]
+                    ),
+                    "objects_collected": existing["objects_collected"],
+                    "bytes_collected": existing["bytes_collected"],
+                    "out": str(destination),
+                    "collected": 0,
+                    "idempotent": True,
+                }
+            # 4) GET and authenticate the exact finalization receipt.
+            run_value, run_payload, expected_binding = (
+                self._collect_run_receipt_value(
+                    manifest,
+                    uri=receipt_uri,
+                    sha256=receipt_sha256,
+                    version_id=receipt_version,
+                )
+            )
+            # 5) GET and cross-bind the exact Task 3C checkpoint receipt.
+            checkpoint_receipt, checkpoint_payload = (
+                self._collect_checkpoint_receipt(
+                    manifest,
+                    expected_binding,
+                    run_value["checkpoint_receipt"],
+                )
+            )
+            run_reference = {
+                "bytes": len(run_payload),
+                "sha256": receipt_sha256,
+                "uri": receipt_uri,
+                "version_id": receipt_version,
+            }
+            rows = self._collection_rows(
+                run_value,
+                run_payload,
+                run_reference,
+                checkpoint_receipt,
+                checkpoint_payload,
+            )
+            if len(rows) != SEED_COLLECTION_OBJECT_COUNT:
+                raise MsctlError(
+                    "COLLECT_INCOMPLETE",
+                    "collection did not enumerate all sixteen objects",
+                )
+            prefix = self.runtime.s3_root.rstrip("/") + "/"
+            if any(
+                not str(row["uri"]).startswith(prefix) for row in rows
+            ):
+                raise MsctlError(
+                    "COLLECT_OBJECT_MISMATCH",
+                    "collection object is outside the pinned S3 root",
+                )
+            # 6) GET every body by exact version into a private no-follow
+            #    staging tree and independently stream-rehash each file.
+            request_id = secrets.token_hex(16)
+            parent_fd = open_directory(
+                destination.parent,
+                label="collection destination parent",
+                create=True,
+            )
+            staging_name = f".{destination.name}.collect-{request_id}"
+            staging_path = destination.parent / staging_name
+            published = False
+            staging_fd: int | None = None
+            try:
+                os.mkdir(staging_name, mode=0o700, dir_fd=parent_fd)
+                staging_fd = open_directory_at(
+                    parent_fd,
+                    staging_name,
+                    label="collection staging",
+                )
+                bytes_collected = 0
+                for row in rows:
+                    relative = str(row["uri"]).removeprefix(prefix)
+                    if row["kind"] in {"checkpoint_receipt", "run_receipt"}:
+                        self._stage_collection_bytes(
+                            staging_fd,
+                            relative,
+                            (
+                                checkpoint_payload
+                                if row["kind"] == "checkpoint_receipt"
+                                else run_payload
+                            ),
+                        )
+                    else:
+                        directory_fd, _name = open_parent_at(
+                            staging_fd,
+                            relative,
+                            label="collection staging entry",
+                            create=True,
+                        )
+                        os.close(directory_fd)
+                        self._download_collection_body(
+                            row,
+                            local_path=str(staging_path / relative),
+                        )
+                    self._rehash_staged_collection_object(
+                        staging_fd,
+                        relative,
+                        row,
+                    )
+                    bytes_collected += int(row["bytes"])
+                # 7) Build and self-parse the canonical collection receipt.
+                shared_fields = COLLECTION_RECEIPT_FIELDS - {
+                    "checkpoint_receipt",
+                    "collected_at",
+                    "objects",
+                    "receipt_type",
+                    "request_id",
+                    "run_receipt",
+                }
+                collection_value: dict[str, object] = {
+                    field: run_value[field] for field in shared_fields
+                }
+                collection_value.update(
+                    {
+                        "receipt_type": COLLECTION_RECEIPT_TYPE,
+                        "request_id": request_id,
+                        "collected_at": datetime.now(UTC).strftime(
+                            "%Y-%m-%dT%H:%M:%SZ"
+                        ),
+                        "run_receipt": dict(run_reference),
+                        "checkpoint_receipt": {
+                            "bytes": len(checkpoint_payload),
+                            "sha256": str(
+                                run_value["checkpoint_receipt"]["sha256"]
+                            ),
+                            "uri": str(
+                                run_value["checkpoint_receipt"]["uri"]
+                            ),
+                            "version_id": str(
+                                run_value["checkpoint_receipt"][
+                                    "version_id"
+                                ]
+                            ),
+                        },
+                        "objects": [dict(sorted(row.items())) for row in rows],
+                    }
+                )
+                collection_bytes = _canonical_json(collection_value)
+                collection_sha256 = hashlib.sha256(
+                    collection_bytes
+                ).hexdigest()
+                collection_uri = f"{self.runtime.s3_root}/" + (
+                    collection_receipt_key(manifest.seed, collection_sha256)
+                )
+                try:
+                    parse_seed_collection_receipt_bytes(
+                        collection_bytes,
+                        receipt_uri=collection_uri,
+                        receipt_sha256=collection_sha256,
+                        receipt_version_id="unpublished",
+                        expected_binding=expected_binding,
+                    )
+                except CollectionError as error:
+                    raise MsctlError(
+                        "COLLECT_RECEIPT_INVALID",
+                        f"built collection receipt failed self-parse: "
+                        f"{error}",
+                    ) from error
+                receipt_relative = collection_receipt_key(
+                    manifest.seed,
+                    collection_sha256,
+                )
+                self._stage_collection_bytes(
+                    staging_fd,
+                    receipt_relative,
+                    collection_bytes,
+                )
+                # 8) Publish no-replace, checksum-bound, then exact HEAD.
+                version_id = self._publish_collection_receipt(
+                    payload=collection_bytes,
+                    digest=collection_sha256,
+                    request_id=request_id,
+                    seed=manifest.seed,
+                    body_path=str(staging_path / receipt_relative),
+                )
+                collection_reference = {
+                    "bytes": len(collection_bytes),
+                    "sha256": collection_sha256,
+                    "uri": collection_uri,
+                    "version_id": version_id,
+                }
+                # 9) Atomically write collection state, then rename the
+                #    staging tree no-replace.
+                now = _timestamp()
+                store.write_collection(
+                    manifest.sha256,
+                    {
+                        **self.lifecycle_binding.to_dict(),
+                        "schema_version": 2,
+                        "operation": "collect",
+                        "run_manifest_sha256": manifest.sha256,
+                        "release_sha256": manifest.release_sha256,
+                        "release_receipt_sha256": (
+                            manifest.release_receipt_sha256
+                        ),
+                        "run_receipt": dict(run_reference),
+                        "collection_receipt": dict(collection_reference),
+                        "objects_collected": SEED_COLLECTION_OBJECT_COUNT,
+                        "bytes_collected": bytes_collected,
+                        "status": "Published",
+                        "created_at": now,
+                        "updated_at": now,
+                    },
+                )
+                try:
+                    rename_noreplace_at(
+                        parent_fd,
+                        staging_name,
+                        parent_fd,
+                        destination.name,
+                    )
+                except FileExistsError as error:
+                    raise MsctlError(
+                        "COLLECT_DESTINATION_EXISTS",
+                        "refusing to replace an existing collection "
+                        "destination",
+                    ) from error
+                published = True
+            finally:
+                if staging_fd is not None:
+                    os.close(staging_fd)
+                if not published:
+                    try:
+                        remove_tree_at(
+                            parent_fd,
+                            staging_name,
+                            label="collection staging",
+                        )
+                    except MsctlError:
+                        pass
+                    except FileNotFoundError:
+                        pass
+                os.close(parent_fd)
+            # 10) Report the durable identities.
+            return {
+                "provider": self.profile.provider,
+                "seed": manifest.seed,
+                "run_manifest_sha256": manifest.sha256,
+                "run_receipt": dict(run_reference),
+                "collection_receipt": dict(collection_reference),
+                "objects_collected": SEED_COLLECTION_OBJECT_COUNT,
+                "bytes_collected": bytes_collected,
+                "out": str(destination),
+                "collected": SEED_COLLECTION_OBJECT_COUNT,
+                "idempotent": False,
+            }
 
     def _selected_prior_run_receipt(
         self,
@@ -5248,6 +6307,196 @@ class AwsP5Backend:
                 )
         return admitted
 
+    def _selected_prior_collection_receipt(
+        self,
+        manifest: object,
+        prior_collection_receipt: Mapping[str, object] | None,
+    ) -> CollectionReceiptRef | None:
+        """Validate the operator collection triple before any AWS call."""
+
+        if manifest.seed == 0:
+            if prior_collection_receipt is not None:
+                raise MsctlError(
+                    "SEED_TRANSITION_BLOCKED",
+                    "seed 0 forbids a prior-seed collection receipt",
+                )
+            return None
+        if (
+            not isinstance(prior_collection_receipt, Mapping)
+            or set(prior_collection_receipt)
+            != {"uri", "sha256", "version_id"}
+        ):
+            raise MsctlError(
+                "SEED_TRANSITION_BLOCKED",
+                "seeds 1 through 9 require the exact prior collection "
+                "receipt triple",
+            )
+        try:
+            return CollectionReceiptRef(
+                uri=prior_collection_receipt["uri"],
+                sha256=prior_collection_receipt["sha256"],
+                version_id=prior_collection_receipt["version_id"],
+            )
+        except CollectionError as error:
+            raise MsctlError(
+                "SEED_TRANSITION_BLOCKED",
+                f"prior collection receipt triple is invalid: {error}",
+            ) from error
+
+    def _admit_selected_prior_collection(
+        self,
+        ref: CollectionReceiptRef,
+        admitted: object,
+    ) -> None:
+        """GET and authenticate the prior collection, then HEAD both
+        checkpoints."""
+
+        prefix = self.runtime.s3_root.rstrip("/") + "/"
+        if not ref.uri.startswith(prefix):
+            raise MsctlError(
+                "SEED_TRANSITION_BLOCKED",
+                "prior collection receipt is outside the pinned S3 root",
+            )
+        bucket, key = self._s3_location(ref.uri.removeprefix(prefix))
+        expected_checksum = base64.b64encode(
+            bytes.fromhex(ref.sha256)
+        ).decode("ascii")
+        with tempfile.TemporaryDirectory(
+            prefix="memorysplit-prior-collection-",
+            dir=Path(tempfile.gettempdir()).resolve(),
+        ) as temporary:
+            destination = Path(temporary) / "collection.json"
+            try:
+                output = _aws_output_object(
+                    self._run(
+                        self._aws_argv(
+                            "s3api",
+                            "get-object",
+                            "--bucket",
+                            bucket,
+                            "--key",
+                            key,
+                            "--version-id",
+                            ref.version_id,
+                            "--checksum-mode",
+                            "ENABLED",
+                            str(destination),
+                            query=(
+                                "{receipt:{checksum_sha256:ChecksumSHA256,"
+                                "version_id:VersionId}}"
+                            ),
+                        ),
+                        operation="fetch prior seed collection",
+                    ),
+                    {"receipt"},
+                    label="prior collection receipt download",
+                )
+            except MsctlError as error:
+                if error.code == "AWS_COMMAND_FAILED":
+                    raise MsctlError(
+                        "SEED_TRANSITION_BLOCKED",
+                        "prior seed collection receipt is unavailable",
+                    ) from error
+                raise
+            row = _aws_output_object(
+                output["receipt"],
+                {"checksum_sha256", "version_id"},
+                label="prior collection receipt object",
+            )
+            try:
+                payload = read_regular_input(
+                    destination,
+                    label="prior collection receipt",
+                    maximum_bytes=16 * 1024 * 1024,
+                )
+            except (AttestationError, OSError) as error:
+                raise MsctlError(
+                    "SEED_TRANSITION_BLOCKED",
+                    "downloaded prior collection receipt is unsafe",
+                ) from error
+        if (
+            row["checksum_sha256"] != expected_checksum
+            or row["version_id"] != ref.version_id
+            or hashlib.sha256(payload).hexdigest() != ref.sha256
+        ):
+            raise MsctlError(
+                "SEED_TRANSITION_BLOCKED",
+                "downloaded prior collection receipt identity differs",
+            )
+        try:
+            admitted_collection = admit_prior_seed_collection(
+                payload,
+                ref=ref,
+                admitted=admitted,
+                binding=self.lifecycle_binding,
+            )
+        except CollectionError as error:
+            raise MsctlError(
+                "SEED_TRANSITION_BLOCKED",
+                str(error),
+            ) from error
+        for checkpoint in admitted_collection.checkpoints:
+            if not checkpoint.uri.startswith(prefix):
+                raise MsctlError(
+                    "SEED_TRANSITION_BLOCKED",
+                    "prior collection checkpoint is outside the pinned "
+                    "S3 root",
+                )
+            bucket, key = self._s3_location(
+                checkpoint.uri.removeprefix(prefix)
+            )
+            try:
+                head_output = _aws_output_object(
+                    self._run(
+                        self._aws_argv(
+                            "s3api",
+                            "head-object",
+                            "--bucket",
+                            bucket,
+                            "--key",
+                            key,
+                            "--version-id",
+                            checkpoint.version_id,
+                            "--checksum-mode",
+                            "ENABLED",
+                            query=(
+                                "{object:{checksum_sha256:ChecksumSHA256,"
+                                "content_length:ContentLength,"
+                                "version_id:VersionId}}"
+                            ),
+                        ),
+                        operation="verify prior collection checkpoint",
+                    ),
+                    {"object"},
+                    label="prior collection checkpoint head",
+                )
+            except MsctlError as error:
+                if error.code == "AWS_COMMAND_FAILED":
+                    raise MsctlError(
+                        "SEED_TRANSITION_BLOCKED",
+                        "prior collection checkpoint is unavailable",
+                    ) from error
+                raise
+            head = _aws_output_object(
+                head_output["object"],
+                {"checksum_sha256", "content_length", "version_id"},
+                label="prior collection checkpoint object",
+            )
+            if (
+                head["checksum_sha256"]
+                != base64.b64encode(
+                    bytes.fromhex(checkpoint.sha256)
+                ).decode("ascii")
+                or head["content_length"] != checkpoint.bytes
+                or head["version_id"] != checkpoint.version_id
+            ):
+                raise MsctlError(
+                    "SEED_TRANSITION_BLOCKED",
+                    "prior collection checkpoint version or checksum "
+                    "differs",
+                    details={"uri": checkpoint.uri},
+                )
+
     def _resolve_selected_bootstrap_mode(
         self,
         release: object,
@@ -5389,6 +6638,7 @@ class AwsP5Backend:
         bootstrap_mode: str | None = None,
         bootstrap_receipt_sha256: str | None = None,
         prior_run_receipt: Mapping[str, object] | None = None,
+        prior_collection_receipt: Mapping[str, object] | None = None,
     ) -> dict[str, object]:
         now = _timestamp()
         is_v3 = getattr(manifest, "schema_version", None) == 3
@@ -5423,6 +6673,11 @@ class AwsP5Backend:
                         "prior_run_receipt": (
                             dict(prior_run_receipt)
                             if prior_run_receipt is not None
+                            else None
+                        ),
+                        "prior_collection_receipt": (
+                            dict(prior_collection_receipt)
+                            if prior_collection_receipt is not None
                             else None
                         ),
                     }
@@ -5954,12 +7209,15 @@ class AwsP5Backend:
         evidence: Mapping[str, str] | None = None,
         bootstrap_mode: str | None = None,
         prior_run_receipt: Mapping[str, object] | None = None,
+        prior_collection_receipt: Mapping[str, object] | None = None,
     ) -> dict[str, object]:
         self._validate_manifest(manifest)
         self._validate_release(release, manifest)
         selected = self._selected_manifest_lifecycle(manifest)
         if not selected and (
-            bootstrap_mode is not None or prior_run_receipt is not None
+            bootstrap_mode is not None
+            or prior_run_receipt is not None
+            or prior_collection_receipt is not None
         ):
             raise MsctlError(
                 "CLI_USAGE",
@@ -5968,6 +7226,7 @@ class AwsP5Backend:
             )
         self._validate_submit_selection(instance_id, terminate_at)
         prior_ref: PriorRunReceiptRef | None = None
+        prior_collection_ref: CollectionReceiptRef | None = None
         if selected:
             if instance_id != manifest.instance_id:
                 raise MsctlError(
@@ -5989,6 +7248,10 @@ class AwsP5Backend:
             prior_ref = self._selected_prior_run_receipt(
                 manifest,
                 prior_run_receipt,
+            )
+            prior_collection_ref = self._selected_prior_collection_receipt(
+                manifest,
+                prior_collection_receipt,
             )
         core: dict[str, object] | None = None
         operation_intent: dict[str, object] | None = None
@@ -6018,6 +7281,11 @@ class AwsP5Backend:
                     "prior_run_receipt": (
                         dict(prior_run_receipt)
                         if prior_run_receipt is not None
+                        else None
+                    ),
+                    "prior_collection_receipt": (
+                        dict(prior_collection_receipt)
+                        if prior_collection_receipt is not None
                         else None
                     ),
                     "commands": [
@@ -6069,6 +7337,11 @@ class AwsP5Backend:
                         if prior_run_receipt is not None
                         else None
                     ),
+                    "prior_collection_receipt": (
+                        dict(prior_collection_receipt)
+                        if prior_collection_receipt is not None
+                        else None
+                    ),
                 }
             )
         else:
@@ -6114,15 +7387,30 @@ class AwsP5Backend:
                         canonical_json(state.get("prior_run_receipt"))
                         for state in existing
                     }
+                    stored_collections = {
+                        canonical_json(
+                            state.get("prior_collection_receipt")
+                        )
+                        for state in existing
+                    }
                     declared_prior = (
                         dict(prior_run_receipt)
                         if prior_run_receipt is not None
                         else None
                     )
+                    declared_collection = (
+                        dict(prior_collection_receipt)
+                        if prior_collection_receipt is not None
+                        else None
+                    )
+                    # Idempotent replay compares the exact stored receipt
+                    # triples and never re-resolves the prior seed.
                     if (
                         stored_modes != {bootstrap_mode}
                         or stored_priors
                         != {canonical_json(declared_prior)}
+                        or stored_collections
+                        != {canonical_json(declared_collection)}
                     ):
                         raise MsctlError(
                             "BOOTSTRAP_REUSE_INVALID",
@@ -6274,9 +7562,13 @@ class AwsP5Backend:
             if selected:
                 self._require_sequential_seed_transition(store, manifest)
                 if prior_ref is not None:
-                    self._admit_selected_prior_finalization(
+                    admitted_prior = self._admit_selected_prior_finalization(
                         manifest,
                         prior_ref,
+                    )
+                    self._admit_selected_prior_collection(
+                        prior_collection_ref,
+                        admitted_prior,
                     )
                 resolved_mode, bootstrap_receipt_sha256 = (
                     self._resolve_selected_bootstrap_mode(
@@ -6376,6 +7668,7 @@ class AwsP5Backend:
                         bootstrap_mode=bootstrap_mode,
                         bootstrap_receipt_sha256=bootstrap_receipt_sha256,
                         prior_run_receipt=prior_run_receipt,
+                        prior_collection_receipt=prior_collection_receipt,
                 )
                 for run in manifest.runs
             ]
@@ -7181,19 +8474,38 @@ class AwsP5Backend:
             if selected:
                 self._require_sequential_seed_transition(store, manifest)
                 stored_prior = present[0].get("prior_run_receipt")
+                stored_collection = present[0].get(
+                    "prior_collection_receipt"
+                )
                 if manifest.seed > 0:
                     stored_ref = self._selected_prior_run_receipt(
                         manifest,
                         stored_prior,
                     )
-                    self._admit_selected_prior_finalization(
+                    admitted_prior = self._admit_selected_prior_finalization(
                         manifest,
                         stored_ref,
+                    )
+                    stored_collection_ref = (
+                        self._selected_prior_collection_receipt(
+                            manifest,
+                            stored_collection,
+                        )
+                    )
+                    self._admit_selected_prior_collection(
+                        stored_collection_ref,
+                        admitted_prior,
                     )
                 elif stored_prior is not None:
                     raise MsctlError(
                         "SEED_TRANSITION_BLOCKED",
                         "seed 0 state must not bind a prior run receipt",
+                    )
+                elif stored_collection is not None:
+                    raise MsctlError(
+                        "SEED_TRANSITION_BLOCKED",
+                        "seed 0 state must not bind a prior collection "
+                        "receipt",
                     )
                 resolved_mode, resolved_receipt_sha256 = (
                     self._resolve_selected_bootstrap_mode(
@@ -8168,8 +9480,76 @@ class AwsP5Backend:
             )
         if command == "collect":
             apply = bool(getattr(args, "apply", False))
+            selected_arguments = {
+                "release": getattr(args, "release", None),
+                "manifest": getattr(args, "manifest", None),
+                "run_receipt_uri": getattr(args, "run_receipt_uri", None),
+                "run_receipt_sha256": getattr(
+                    args,
+                    "run_receipt_sha256",
+                    None,
+                ),
+                "run_receipt_version_id": getattr(
+                    args,
+                    "run_receipt_version_id",
+                    None,
+                ),
+            }
+            source = getattr(args, "source", None)
+            if any(
+                value is not None for value in selected_arguments.values()
+            ):
+                if source is not None:
+                    raise MsctlError(
+                        "CLI_USAGE",
+                        "selected collect forbids the legacy --source "
+                        "argument",
+                    )
+                missing = [
+                    f"--{name.replace('_', '-')}"
+                    for name, value in selected_arguments.items()
+                    if value is None
+                ]
+                if getattr(args, "out", None) is None:
+                    missing.append("--out")
+                if missing:
+                    raise MsctlError(
+                        "CLI_USAGE",
+                        "selected collect requires its complete argument "
+                        "set",
+                        details={"missing": missing},
+                    )
+                release, manifest = self._load_bound_inputs(
+                    release_path=selected_arguments["release"],
+                    manifest_path=selected_arguments["manifest"],
+                    repo_root=args.repo_root,
+                )
+                # Collection needs no paid-instance approval: it creates no
+                # capacity and only publishes one content-addressed receipt.
+                return not apply, self.collect_seed_evidence(
+                    release=release,
+                    manifest=manifest,
+                    run_receipt={
+                        "uri": str(
+                            selected_arguments["run_receipt_uri"]
+                        ),
+                        "sha256": str(
+                            selected_arguments["run_receipt_sha256"]
+                        ),
+                        "version_id": str(
+                            selected_arguments["run_receipt_version_id"]
+                        ),
+                    },
+                    out=args.out,
+                    apply=apply,
+                )
+            if source is None:
+                raise MsctlError(
+                    "CLI_USAGE",
+                    "AWS collect requires --source",
+                )
             return not apply, self.collect(
-                source=str(args.source),
+                source=str(source),
                 out=args.out,
                 apply=apply,
             )
@@ -8203,9 +9583,20 @@ class AwsP5Backend:
                     or command.startswith("cleanup")
                 )
             ):
+                if command == "evaluate":
+                    raise MsctlError(
+                        "OPERATION_UNSUPPORTED",
+                        "AWS v3 evaluation awaits the later "
+                        "sealed-evaluation task",
+                    )
+                # Per-seed collection receipts are necessary but never
+                # sufficient: even ten collection states cannot reach
+                # terminate-instances.
                 raise MsctlError(
                     "OPERATION_UNSUPPORTED",
-                    "AWS v3 evaluation is outside the checkpoint/resume task",
+                    "AWS v3 cleanup requires all ten per-seed collection "
+                    "receipts and cohort evaluation/report collection "
+                    "from the later sealed-evaluation task",
                 )
             evidence = None
             if command in {"runs render", "submit", "resume", "evaluate"}:
@@ -8256,10 +9647,30 @@ class AwsP5Backend:
                     getattr(args, "prior_run_receipt_sha256", None),
                     getattr(args, "prior_run_receipt_version_id", None),
                 )
+                collection_values = (
+                    getattr(
+                        args,
+                        "prior_collection_receipt_uri",
+                        None,
+                    ),
+                    getattr(
+                        args,
+                        "prior_collection_receipt_sha256",
+                        None,
+                    ),
+                    getattr(
+                        args,
+                        "prior_collection_receipt_version_id",
+                        None,
+                    ),
+                )
                 declared_mode = getattr(args, "bootstrap_mode", None)
                 if not selected and (
                     declared_mode is not None
                     or any(value is not None for value in prior_values)
+                    or any(
+                        value is not None for value in collection_values
+                    )
                 ):
                     raise MsctlError(
                         "CLI_USAGE",
@@ -8284,20 +9695,50 @@ class AwsP5Backend:
                         "sha256": str(prior_values[1]),
                         "version_id": str(prior_values[2]),
                     }
-                if (
-                    selected
-                    and manifest.seed > 0
-                    and prior_run_receipt is None
+                prior_collection_receipt = None
+                if any(value is not None for value in collection_values):
+                    if any(value is None for value in collection_values):
+                        raise MsctlError(
+                            "CLI_USAGE",
+                            "the prior collection triple requires URI, "
+                            "SHA-256, and version ID together",
+                        )
+                    prior_collection_receipt = {
+                        "uri": str(collection_values[0]),
+                        "sha256": str(collection_values[1]),
+                        "version_id": str(collection_values[2]),
+                    }
+                if selected and manifest.seed > 0 and (
+                    prior_run_receipt is None
+                    or prior_collection_receipt is None
                 ):
                     raise MsctlError(
                         "CLI_USAGE",
                         "selected seeds 1 through 9 require the prior "
-                        "receipt triple",
+                        "receipt and prior collection triples",
                         details={
                             "missing": [
-                                "--prior-run-receipt-uri",
-                                "--prior-run-receipt-sha256",
-                                "--prior-run-receipt-version-id",
+                                *(
+                                    [
+                                        "--prior-run-receipt-uri",
+                                        "--prior-run-receipt-sha256",
+                                        "--prior-run-receipt-version-id",
+                                    ]
+                                    if prior_run_receipt is None
+                                    else []
+                                ),
+                                *(
+                                    [
+                                        "--prior-collection-receipt-uri",
+                                        "--prior-collection-receipt-sha256",
+                                        (
+                                            "--prior-collection-receipt-"
+                                            "version-id"
+                                        ),
+                                    ]
+                                    if prior_collection_receipt is None
+                                    else []
+                                ),
                             ]
                         },
                     )
@@ -8311,6 +9752,7 @@ class AwsP5Backend:
                     evidence=evidence,
                     bootstrap_mode=declared_mode,
                     prior_run_receipt=prior_run_receipt,
+                    prior_collection_receipt=prior_collection_receipt,
                 )
             if command == "status":
                 return False, self.status(

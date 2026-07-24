@@ -330,6 +330,17 @@ def run_receipt_key(seed: object, receipt_sha256: object) -> str:
     return f"receipts/runs/seed-{seed}/sha256/{digest}.json"
 
 
+def collection_receipt_key(seed: object, receipt_sha256: object) -> str:
+    """Return one content-addressed per-seed collection receipt key."""
+
+    if type(seed) is not int or seed not in SEEDS:
+        raise ValueError(
+            "collection receipt seed must be an exact integer from 0 to 9"
+        )
+    digest = validate_sha256(receipt_sha256)
+    return f"receipts/collections/seed-{seed}/sha256/{digest}.json"
+
+
 __all__ = [
     "ARMS",
     "AWS_ENVIRONMENT_RECEIPT_V2_FIELDS",
@@ -353,6 +364,7 @@ __all__ = [
     "bootstrap_receipt_key",
     "checkpoint_object_key",
     "checkpoint_receipt_key",
+    "collection_receipt_key",
     "dataset_receipt_key",
     "expected_config_paths",
     "allowed_gpu_product_names",

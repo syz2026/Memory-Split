@@ -157,6 +157,26 @@ def test_seed_transition_and_bootstrap_closure_is_required():
     )
 
 
+def test_seed_collection_closure_is_required():
+    module = _load_module()
+
+    collection_members = {
+        "msctl/aws_collect.py",
+        # Runtime dependencies imported by the collection module.
+        "cluster/aws/p5/checkpoint_mirror.py",
+        "cluster/aws/p5/run_finalization.py",
+        "msctl/aws_contracts.py",
+        "msctl/aws_lifecycle.py",
+        "msctl/aws_seed_transition.py",
+        "msctl/errors.py",
+    }
+    assert collection_members <= module.REQUIRED_MEMBERS
+    assert all(
+        module._classification(path) == "included"
+        for path in collection_members
+    )
+
+
 def test_authenticated_package_metadata_comes_only_from_fixed_authority(
     tmp_path,
     monkeypatch,
@@ -558,6 +578,7 @@ def _minimal_repo(
         "msctl/aws_launch_manifest.py": "MANIFEST_FORMAT = 2\n",
         "msctl/aws_resume_launch.py": "RESUME_FORMAT = 3\n",
         "msctl/aws_seed_transition.py": "TRANSITION_FORMAT = 1\n",
+        "msctl/aws_collect.py": "COLLECTION_FORMAT = 3\n",
         "msctl/aws_contracts.py": (
             REPO_ROOT / "msctl" / "aws_contracts.py"
         ).read_bytes(),

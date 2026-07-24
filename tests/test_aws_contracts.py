@@ -198,6 +198,41 @@ def test_run_finalization_keys_reject_malformed_sha256(value):
         contract.run_receipt_key(0, value)
 
 
+def test_collection_receipt_key_is_exact_for_every_seed():
+    contract = _contracts()
+    digest = "0123456789abcdef" * 4
+
+    for seed in contract.SEEDS:
+        assert contract.collection_receipt_key(seed, digest) == (
+            f"receipts/collections/seed-{seed}/sha256/{digest}.json"
+        )
+    assert "collection_receipt_key" in contract.__all__
+
+
+@pytest.mark.parametrize(
+    "seed",
+    [10, -1, True, 1.0, "1", None],
+    ids=["ten", "negative", "bool", "float", "text", "none"],
+)
+def test_collection_receipt_key_rejects_foreign_seeds(seed):
+    contract = _contracts()
+
+    with pytest.raises(ValueError, match="seed"):
+        contract.collection_receipt_key(seed, "a" * 64)
+
+
+@pytest.mark.parametrize(
+    "value",
+    ["A" * 64, "a" * 63, "g" * 64, "sha256:" + "a" * 64, b"a" * 64, None],
+    ids=["uppercase", "short", "non-hex", "algorithm-prefix", "bytes", "none"],
+)
+def test_collection_receipt_key_rejects_malformed_sha256(value):
+    contract = _contracts()
+
+    with pytest.raises(ValueError, match="SHA-256"):
+        contract.collection_receipt_key(0, value)
+
+
 def test_bootstrap_receipt_key_is_exact_and_instance_scoped():
     contract = _contracts()
 

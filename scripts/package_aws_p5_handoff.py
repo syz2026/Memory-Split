@@ -115,6 +115,7 @@ REQUIRED_MEMBERS = EXPECTED_CONFIGS | PROVIDER_BRIDGE_MEMBERS | {
     "evals/confirmatory/__init__.py",
     "msctl/__init__.py",
     "msctl/__main__.py",
+    "msctl/aws_collect.py",
     "msctl/aws_contracts.py",
     "msctl/aws_argv.py",
     "msctl/aws_launch_manifest.py",

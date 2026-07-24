@@ -2843,6 +2843,22 @@ def _selected_authority_cli_arguments(tmp_path) -> list[str]:
         ),
         (["status"], "status"),
         (["cancel"], "cancel"),
+        (
+            [
+                "collect",
+                "--run-receipt-uri",
+                "s3://bucket/receipts/runs/seed-3/sha256/"
+                + "a" * 64
+                + ".json",
+                "--run-receipt-sha256",
+                "a" * 64,
+                "--run-receipt-version-id",
+                "run-receipt-version-1",
+                "--out",
+                "collected-evidence",
+            ],
+            "collect",
+        ),
     ],
 )
 def test_selected_dispatch_uses_fixed_authority_and_selected_constructor(
@@ -2955,6 +2971,138 @@ def test_selected_dispatch_rejects_partial_authority_groups(tmp_path):
 
     assert getattr(caught.value, "code", None) == "CLI_USAGE"
     assert "--runtime-lock" in caught.value.details["missing"]
+
+
+def test_selected_collect_cli_requires_complete_arguments_without_source(
+    tmp_path,
+):
+    from msctl.cli import build_parser, dispatch
+
+    manifest_path = _write_json(
+        tmp_path / "runs-s3.json",
+        {"schema_version": 3, "seed": 3},
+    )
+
+    args = build_parser().parse_args(
+        [
+            "--profile",
+            str(tmp_path / "aws-v3.json"),
+            "collect",
+            "--release",
+            str(tmp_path / "RELEASE.json"),
+            "--manifest",
+            str(manifest_path),
+            "--out",
+            str(tmp_path / "evidence"),
+            *_selected_authority_cli_arguments(tmp_path),
+        ]
+    )
+    with pytest.raises(Exception) as caught:
+        dispatch(
+            args,
+            profile_loader=lambda _: _selected_cli_profile(),
+            aws_backend_factory=lambda **_: pytest.fail(
+                "selected collect must not build the legacy backend"
+            ),
+            selected_backend_factory=lambda **_: pytest.fail(
+                "incomplete collect arguments must not build a backend"
+            ),
+            environ={
+                "AWS_REGION": "us-east-1",
+                "MS_AWS_INSTANCE_PROFILE_ARN": (
+                    "arn:aws:iam::123456789012:instance-profile/"
+                    "MemorySplitSelected"
+                ),
+            },
+        )
+    assert getattr(caught.value, "code", None) == "CLI_USAGE"
+    assert "--run-receipt-uri" in caught.value.details["missing"]
+
+    args = build_parser().parse_args(
+        [
+            "--profile",
+            str(tmp_path / "aws-v3.json"),
+            "collect",
+            "--source",
+            "results/seed-3.json",
+            "--release",
+            str(tmp_path / "RELEASE.json"),
+            "--manifest",
+            str(manifest_path),
+            "--run-receipt-uri",
+            "s3://bucket/receipts/runs/seed-3/sha256/" + "a" * 64 + ".json",
+            "--run-receipt-sha256",
+            "a" * 64,
+            "--run-receipt-version-id",
+            "run-receipt-version-1",
+            "--out",
+            str(tmp_path / "evidence"),
+            *_selected_authority_cli_arguments(tmp_path),
+        ]
+    )
+
+    with pytest.raises(Exception) as caught:
+        dispatch(
+            args,
+            profile_loader=lambda _: _selected_cli_profile(),
+            aws_backend_factory=lambda **_: pytest.fail(
+                "selected collect must not build the legacy backend"
+            ),
+            selected_backend_factory=lambda **_: pytest.fail(
+                "selected collect with --source must not build a backend"
+            ),
+            environ={
+                "AWS_REGION": "us-east-1",
+                "MS_AWS_INSTANCE_PROFILE_ARN": (
+                    "arn:aws:iam::123456789012:instance-profile/"
+                    "MemorySplitSelected"
+                ),
+            },
+        )
+    assert getattr(caught.value, "code", None) == "CLI_USAGE"
+    assert "--source" in str(caught.value)
+
+
+def test_local_collect_rejects_selected_arguments_and_requires_source(
+    tmp_path,
+):
+    from msctl.cli import build_parser, dispatch
+    from msctl.profile import SUPPORTED_PROFILE
+
+    local_profile = SimpleNamespace(provider=SUPPORTED_PROFILE)
+
+    args = build_parser().parse_args(
+        [
+            "collect",
+            "--release",
+            str(tmp_path / "RELEASE.json"),
+            "--out",
+            str(tmp_path / "evidence"),
+        ]
+    )
+    with pytest.raises(Exception) as caught:
+        dispatch(
+            args,
+            profile_loader=lambda _: local_profile,
+            environ={},
+        )
+    assert getattr(caught.value, "code", None) == "CLI_USAGE"
+
+    args = build_parser().parse_args(
+        [
+            "collect",
+            "--out",
+            str(tmp_path / "evidence"),
+        ]
+    )
+    with pytest.raises(Exception) as caught:
+        dispatch(
+            args,
+            profile_loader=lambda _: local_profile,
+            environ={},
+        )
+    assert getattr(caught.value, "code", None) == "CLI_USAGE"
+    assert "--source" in caught.value.details["missing"]
 
 
 def test_selected_arguments_are_forbidden_for_legacy_manifests(tmp_path):

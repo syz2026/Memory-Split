@@ -55,7 +55,20 @@ _SELECTED_PROFILE_IDS = {
     "aws-p5.48xlarge-v3",
     "aws-p6-b300.48xlarge-v3",
 }
-_SELECTED_LIFECYCLE_COMMANDS = {"submit", "resume", "status", "cancel"}
+_SELECTED_LIFECYCLE_COMMANDS = {
+    "submit",
+    "resume",
+    "status",
+    "cancel",
+    "collect",
+}
+_SELECTED_COLLECT_ARGUMENTS = (
+    "release",
+    "manifest",
+    "run_receipt_uri",
+    "run_receipt_sha256",
+    "run_receipt_version_id",
+)
 _SELECTED_AUTHORITY_ARGUMENTS = (
     "authority_root",
     "runtime_lock",
@@ -233,6 +246,9 @@ def build_parser() -> JsonArgumentParser:
             leaf.add_argument("--prior-run-receipt-uri")
             leaf.add_argument("--prior-run-receipt-sha256")
             leaf.add_argument("--prior-run-receipt-version-id")
+            leaf.add_argument("--prior-collection-receipt-uri")
+            leaf.add_argument("--prior-collection-receipt-sha256")
+            leaf.add_argument("--prior-collection-receipt-version-id")
             _add_selected_authority_arguments(
                 leaf,
                 include_instance_id=False,
@@ -273,8 +289,14 @@ def build_parser() -> JsonArgumentParser:
     canary_run.add_argument("--apply", action="store_true")
 
     collect = _leaf(commands, "collect", help_text="collect result evidence")
-    collect.add_argument("--source", required=True)
+    collect.add_argument("--source")
     collect.add_argument("--out", required=True)
+    collect.add_argument("--release")
+    collect.add_argument("--manifest")
+    collect.add_argument("--run-receipt-uri")
+    collect.add_argument("--run-receipt-sha256")
+    collect.add_argument("--run-receipt-version-id")
+    _add_selected_authority_arguments(collect)
     collect.add_argument("--apply", action="store_true")
 
     cleanup = _leaf(commands, "cleanup", help_text="safe cleanup lifecycle")
@@ -389,6 +411,17 @@ def _dispatch_selected_lifecycle(
                     ]
                 },
             )
+    if command == "collect":
+        if getattr(args, "source", None) is not None:
+            raise MsctlError(
+                "CLI_USAGE",
+                "selected collect forbids the legacy --source argument",
+            )
+        _require_cli_values(
+            args,
+            *_SELECTED_COLLECT_ARGUMENTS,
+            "out",
+        )
     manifest_value = require_object(
         load_json(args.manifest, label="run manifest"),
         label="run manifest",
@@ -813,6 +846,19 @@ def dispatch(
             environ=environment,
         )
     if command == "collect":
+        incompatible = [
+            f"--{name.replace('_', '-')}"
+            for name in _SELECTED_COLLECT_ARGUMENTS
+            if getattr(args, name, None) is not None
+        ]
+        if incompatible:
+            raise MsctlError(
+                "CLI_USAGE",
+                "local collect does not accept selected collection "
+                "arguments",
+                details={"incompatible": incompatible},
+            )
+        _require_cli_values(args, "source")
         return not args.apply, collect_evidence(
             source=args.source,
             out=args.out,

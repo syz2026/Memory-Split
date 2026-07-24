@@ -13,6 +13,7 @@ from collections.abc import Sequence
 from contextlib import contextmanager
 from pathlib import Path
 
+from .aws_contracts import collection_receipt_key, run_receipt_key
 from .aws_lifecycle import (
     LIFECYCLE_BINDING_FIELDS,
     ProviderLifecycleBinding,
@@ -141,6 +142,7 @@ AWS_V3_RESUME_STATE_KEYS = AWS_V3_RUN_STATE_KEYS | {
 AWS_SELECTED_TRANSITION_KEYS = {
     "bootstrap_mode",
     "bootstrap_receipt_sha256",
+    "prior_collection_receipt",
     "prior_run_receipt",
 }
 AWS_SELECTED_RUN_STATE_KEYS = (
@@ -199,6 +201,22 @@ AWS_EVALUATION_STATE_KEYS = {
     "created_at",
     "updated_at",
 }
+AWS_COLLECTION_STATE_KEYS = {
+    "schema_version",
+    "operation",
+    "provider",
+    "seed",
+    "run_manifest_sha256",
+    "release_sha256",
+    "release_receipt_sha256",
+    "run_receipt",
+    "collection_receipt",
+    "objects_collected",
+    "bytes_collected",
+    "status",
+    "created_at",
+    "updated_at",
+} | set(LIFECYCLE_BINDING_FIELDS)
 AWS_PAIR_INTENT_KEYS = {
     "schema_version",
     "provider",
@@ -516,6 +534,152 @@ def _validate_aws_run_state(value: dict[str, object], run_id: str) -> None:
             )
 
 
+def _reconstruct_lifecycle_binding(
+    value: dict[str, object],
+    *,
+    label: str,
+) -> ProviderLifecycleBinding:
+    try:
+        return ProviderLifecycleBinding(
+            cohort_id=value["cohort_id"],
+            provider=value["provider"],
+            profile_id=value["profile_id"],
+            profile_sha256=value["profile_sha256"],
+            hardware_amendment_sha256=value[
+                "hardware_amendment_sha256"
+            ],
+            provider_selection_sha256=value[
+                "provider_selection_sha256"
+            ],
+            provider_selection_version_id=value[
+                "provider_selection_version_id"
+            ],
+            runtime_lock_sha256=value["runtime_lock_sha256"],
+            runtime_sbom_sha256=value["runtime_sbom_sha256"],
+            qualification_evidence_sha256=value[
+                "qualification_evidence_sha256"
+            ],
+            qualification_environment_receipt_sha256=value[
+                "qualification_environment_receipt_sha256"
+            ],
+            qualification_canary_receipt_sha256=value[
+                "qualification_canary_receipt_sha256"
+            ],
+            qualification_approval_receipt_sha256=value[
+                "qualification_approval_receipt_sha256"
+            ],
+            qualification_approval_public_key_sha256=value[
+                "qualification_approval_public_key_sha256"
+            ],
+            objective_controls_contract_sha256=value[
+                "objective_controls_contract_sha256"
+            ],
+            account_id=value["account_id"],
+            instance_id=value["instance_id"],
+            boot_id=value["boot_id"],
+            region=value["region"],
+            availability_zone=value["availability_zone"],
+            purchase_model=value["purchase_model"],
+            seed=value["seed"],
+            arms=(
+                tuple(value["arms"])
+                if isinstance(value["arms"], list)
+                else value["arms"]
+            ),
+        )
+    except (KeyError, TypeError, ValueError) as error:
+        raise MsctlError(
+            "STATE_CORRUPT",
+            f"{label} is invalid",
+        ) from error
+
+
+def _validate_collection_state(
+    value: dict[str, object],
+    manifest_sha256: str,
+) -> None:
+    require_exact_keys(
+        value,
+        AWS_COLLECTION_STATE_KEYS,
+        label="AWS collection state",
+    )
+    if (
+        type(value["schema_version"]) is not int
+        or value["schema_version"] != 2
+        or value["operation"] != "collect"
+        or value["provider"] not in _AWS_SELECTED_PROVIDERS
+        or value["status"] != "Published"
+    ):
+        raise MsctlError(
+            "STATE_CORRUPT",
+            "AWS collection identity is invalid",
+        )
+    binding = _reconstruct_lifecycle_binding(
+        value,
+        label="AWS collection lifecycle binding",
+    )
+    if value["run_manifest_sha256"] != manifest_sha256:
+        raise MsctlError(
+            "STATE_CORRUPT",
+            "AWS collection state has the wrong manifest binding",
+        )
+    for field in (
+        "run_manifest_sha256",
+        "release_sha256",
+        "release_receipt_sha256",
+    ):
+        require_sha256(value[field], label=f"AWS collection state {field}")
+    for field, key_helper in (
+        ("run_receipt", run_receipt_key),
+        ("collection_receipt", collection_receipt_key),
+    ):
+        row = require_object(
+            value[field],
+            label=f"AWS collection state {field}",
+        )
+        require_exact_keys(
+            row,
+            {"bytes", "sha256", "uri", "version_id"},
+            label=f"AWS collection state {field}",
+        )
+        digest = require_sha256(
+            row["sha256"],
+            label=f"AWS collection state {field} hash",
+        )
+        try:
+            expected_suffix = "/" + key_helper(binding.seed, digest)
+        except ValueError as error:
+            raise MsctlError(
+                "STATE_CORRUPT",
+                f"AWS collection state {field} key is invalid",
+            ) from error
+        if (
+            not isinstance(row["uri"], str)
+            or not row["uri"].startswith("s3://")
+            or not row["uri"].endswith(expected_suffix)
+            or not isinstance(row["version_id"], str)
+            or row["version_id"] in {"", "null"}
+            or type(row["bytes"]) is not int
+            or row["bytes"] <= 0
+        ):
+            raise MsctlError(
+                "STATE_CORRUPT",
+                f"AWS collection state {field} is invalid",
+            )
+    if (
+        type(value["objects_collected"]) is not int
+        or value["objects_collected"] != 16
+        or type(value["bytes_collected"]) is not int
+        or value["bytes_collected"] <= 0
+    ):
+        raise MsctlError(
+            "STATE_CORRUPT",
+            "AWS collection object accounting is invalid",
+        )
+    for field in ("created_at", "updated_at"):
+        _require_string(value[field], label=f"AWS collection state {field}")
+
+
 def _validate_aws_v3_run_state(
     value: dict[str, object],
     run_id: str,
@@ -554,59 +718,10 @@ def _validate_aws_v3_run_state(
     ):
         raise MsctlError("STATE_CORRUPT", "AWS v3 run identity is invalid")
     if selected_lifecycle:
-        try:
-            ProviderLifecycleBinding(
-                cohort_id=value["cohort_id"],
-                provider=value["provider"],
-                profile_id=value["profile_id"],
-                profile_sha256=value["profile_sha256"],
-                hardware_amendment_sha256=value[
-                    "hardware_amendment_sha256"
-                ],
-                provider_selection_sha256=value[
-                    "provider_selection_sha256"
-                ],
-                provider_selection_version_id=value[
-                    "provider_selection_version_id"
-                ],
-                runtime_lock_sha256=value["runtime_lock_sha256"],
-                runtime_sbom_sha256=value["runtime_sbom_sha256"],
-                qualification_evidence_sha256=value[
-                    "qualification_evidence_sha256"
-                ],
-                qualification_environment_receipt_sha256=value[
-                    "qualification_environment_receipt_sha256"
-                ],
-                qualification_canary_receipt_sha256=value[
-                    "qualification_canary_receipt_sha256"
-                ],
-                qualification_approval_receipt_sha256=value[
-                    "qualification_approval_receipt_sha256"
-                ],
-                qualification_approval_public_key_sha256=value[
-                    "qualification_approval_public_key_sha256"
-                ],
-                objective_controls_contract_sha256=value[
-                    "objective_controls_contract_sha256"
-                ],
-                account_id=value["account_id"],
-                instance_id=value["instance_id"],
-                boot_id=value["boot_id"],
-                region=value["region"],
-                availability_zone=value["availability_zone"],
-                purchase_model=value["purchase_model"],
-                seed=value["seed"],
-                arms=(
-                    tuple(value["arms"])
-                    if isinstance(value["arms"], list)
-                    else value["arms"]
-                ),
-            )
-        except (TypeError, ValueError) as error:
-            raise MsctlError(
-                "STATE_CORRUPT",
-                "AWS selected lifecycle binding is invalid",
-            ) from error
+        _reconstruct_lifecycle_binding(
+            value,
+            label="AWS selected lifecycle binding",
+        )
         if value["bootstrap_mode"] not in {"bootstrap", "reuse"}:
             raise MsctlError(
                 "STATE_CORRUPT",
@@ -622,26 +737,30 @@ def _validate_aws_v3_run_state(
                 "STATE_CORRUPT",
                 "AWS selected bootstrap mode forbids a reused receipt hash",
             )
-        prior_run_receipt = value["prior_run_receipt"]
-        if value["seed"] == 0:
-            if prior_run_receipt is not None:
-                raise MsctlError(
-                    "STATE_CORRUPT",
-                    "AWS selected seed 0 forbids a prior run receipt",
-                )
-        else:
+        for field, label in (
+            ("prior_run_receipt", "prior run receipt"),
+            ("prior_collection_receipt", "prior collection receipt"),
+        ):
+            prior_receipt = value[field]
+            if value["seed"] == 0:
+                if prior_receipt is not None:
+                    raise MsctlError(
+                        "STATE_CORRUPT",
+                        f"AWS selected seed 0 forbids a {label}",
+                    )
+                continue
             prior = require_object(
-                prior_run_receipt,
-                label="AWS selected prior run receipt",
+                prior_receipt,
+                label=f"AWS selected {label}",
             )
             require_exact_keys(
                 prior,
                 {"uri", "sha256", "version_id"},
-                label="AWS selected prior run receipt",
+                label=f"AWS selected {label}",
             )
             require_sha256(
                 prior["sha256"],
-                label="AWS selected prior run receipt hash",
+                label=f"AWS selected {label} hash",
             )
             if (
                 not isinstance(prior["uri"], str)
@@ -651,7 +770,7 @@ def _validate_aws_v3_run_state(
             ):
                 raise MsctlError(
                     "STATE_CORRUPT",
-                    "AWS selected prior run receipt is invalid",
+                    f"AWS selected {label} is invalid",
                 )
     for field in (
         "release_sha256",
@@ -924,6 +1043,7 @@ class StateStore:
         self._runs_fd: int | None = None
         self._evaluations_fd: int | None = None
         self._intents_fd: int | None = None
+        self._collections_fd: int | None = None
 
     def _state_error(self, error: Exception) -> MsctlError:
         return MsctlError(
@@ -950,6 +1070,15 @@ class StateStore:
             self._intents_fd,
         )
 
+    def _require_collections_locked(self) -> int:
+        self._require_locked()
+        if self._collections_fd is None:
+            raise MsctlError(
+                "UNSAFE_STATE",
+                "state access requires the pinned state lock",
+            )
+        return self._collections_fd
+
     @contextmanager
     def locked(self):
         if self._root_fd is not None:
@@ -958,6 +1087,7 @@ class StateStore:
         runs_fd: int | None = None
         evaluations_fd: int | None = None
         intents_fd: int | None = None
+        collections_fd: int | None = None
         try:
             root_fd = open_directory(
                 self.root,
@@ -982,8 +1112,20 @@ class StateStore:
                 label="state intents",
                 create=True,
             )
+            collections_fd = open_directory_at(
+                root_fd,
+                "collections",
+                label="state collections",
+                create=True,
+            )
         except MsctlError as error:
-            for descriptor in (intents_fd, evaluations_fd, runs_fd, root_fd):
+            for descriptor in (
+                collections_fd,
+                intents_fd,
+                evaluations_fd,
+                runs_fd,
+                root_fd,
+            ):
                 if descriptor is not None:
                     os.close(descriptor)
             raise self._state_error(error) from error
@@ -991,6 +1133,7 @@ class StateStore:
         assert runs_fd is not None
         assert evaluations_fd is not None
         assert intents_fd is not None
+        assert collections_fd is not None
         lock_flags = (
             os.O_RDWR
             | os.O_CREAT
@@ -1005,6 +1148,7 @@ class StateStore:
         except (OSError, MsctlError) as error:
             if lock_fd is not None:
                 os.close(lock_fd)
+            os.close(collections_fd)
             os.close(intents_fd)
             os.close(evaluations_fd)
             os.close(runs_fd)
@@ -1015,6 +1159,7 @@ class StateStore:
         self._runs_fd = runs_fd
         self._evaluations_fd = evaluations_fd
         self._intents_fd = intents_fd
+        self._collections_fd = collections_fd
         lock_acquired = False
         try:
             fcntl.flock(lock_fd, fcntl.LOCK_EX)
@@ -1024,6 +1169,7 @@ class StateStore:
             if lock_acquired:
                 fcntl.flock(lock_fd, fcntl.LOCK_UN)
             os.close(lock_fd)
+            os.close(collections_fd)
             os.close(intents_fd)
             os.close(evaluations_fd)
             os.close(runs_fd)
@@ -1032,6 +1178,7 @@ class StateStore:
             self._runs_fd = None
             self._evaluations_fd = None
             self._intents_fd = None
+            self._collections_fd = None
 
     def _run_name(self, run_id: str) -> str:
         if RUN_ID_RE.fullmatch(run_id) is None:
@@ -1326,6 +1473,82 @@ class StateStore:
             self._evaluation_name(manifest_sha256),
             value,
             label="evaluation state",
+        )
+
+    def _collection_name(self, manifest_sha256: str) -> str:
+        try:
+            require_sha256(
+                manifest_sha256,
+                label="collection manifest hash",
+            )
+        except MsctlError as error:
+            raise MsctlError(
+                "UNSAFE_STATE",
+                "invalid manifest hash for collection state",
+            ) from error
+        return f"{manifest_sha256}.json"
+
+    def read_collection(
+        self, manifest_sha256: str
+    ) -> dict[str, object] | None:
+        collections_fd = self._require_collections_locked()
+        name = self._collection_name(manifest_sha256)
+        try:
+            raw = load_json_at(
+                collections_fd,
+                name,
+                label="collection state",
+            )
+        except MsctlError as error:
+            if error.code == "FILE_NOT_FOUND":
+                return None
+            if error.code == "INVALID_JSON":
+                raise MsctlError(
+                    "STATE_CORRUPT",
+                    "collection state is not valid JSON",
+                ) from error
+            raise MsctlError(
+                "UNSAFE_STATE",
+                "collection state must be a regular file",
+            ) from error
+        try:
+            value = require_object(raw, label="collection state")
+            _validate_collection_state(value, manifest_sha256)
+        except MsctlError as error:
+            raise MsctlError(
+                "STATE_CORRUPT",
+                "collection state schema is invalid",
+            ) from error
+        return value
+
+    def write_collection(
+        self,
+        manifest_sha256: str,
+        value: dict[str, object],
+    ) -> None:
+        collections_fd = self._require_collections_locked()
+        try:
+            _validate_collection_state(value, manifest_sha256)
+        except MsctlError as error:
+            raise MsctlError(
+                "STATE_CORRUPT",
+                "collection state write schema is invalid",
+            ) from error
+        existing = self.read_collection(manifest_sha256)
+        if existing is not None and any(
+            existing[field] != value[field]
+            for field in AWS_COLLECTION_STATE_KEYS
+            if field != "updated_at"
+        ):
+            raise MsctlError(
+                "STATE_CORRUPT",
+                "collection state rewrite changes immutable fields",
+            )
+        atomic_write_json_at(
+            collections_fd,
+            self._collection_name(manifest_sha256),
+            value,
+            label="collection state",
         )
 
     def _intent_name(self, submission_key: str) -> str:

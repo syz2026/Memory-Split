@@ -465,6 +465,20 @@ def _prior_triple(seed: int) -> dict[str, str]:
     }
 
 
+def _collection_triple(seed: int) -> dict[str, str]:
+    digest = hashlib.sha256(
+        f"prior-collection-{seed}".encode("ascii")
+    ).hexdigest()
+    return {
+        "uri": (
+            f"{S3_ROOT}/receipts/collections/seed-{seed - 1}/"
+            f"sha256/{digest}.json"
+        ),
+        "sha256": digest,
+        "version_id": "prior-collection-version-1",
+    }
+
+
 def _selected_run_state(
     binding,
     *,
@@ -476,6 +490,7 @@ def _selected_run_state(
     bootstrap_mode: str = "bootstrap",
     bootstrap_receipt_sha256: str | None = None,
     prior_run_receipt: dict[str, str] | None = None,
+    prior_collection_receipt: dict[str, str] | None = None,
 ) -> dict[str, object]:
     seed = binding.seed
     return {
@@ -514,6 +529,7 @@ def _selected_run_state(
         "bootstrap_mode": bootstrap_mode,
         "bootstrap_receipt_sha256": bootstrap_receipt_sha256,
         "prior_run_receipt": copy.deepcopy(prior_run_receipt),
+        "prior_collection_receipt": copy.deepcopy(prior_collection_receipt),
     }
 
 
@@ -563,10 +579,12 @@ def test_selected_state_requires_bootstrap_and_prior_receipt_fields(tmp_path):
 
     for mutation in (
         "drop-new-keys",
+        "drop-collection-key",
         "unknown-mode",
         "reuse-without-receipt",
         "bootstrap-with-receipt",
         "seed-zero-with-prior",
+        "seed-zero-with-prior-collection",
     ):
         journal_copy = copy.deepcopy(journal)
         for state in journal_copy["states"]:
@@ -574,6 +592,9 @@ def test_selected_state_requires_bootstrap_and_prior_receipt_fields(tmp_path):
                 state.pop("bootstrap_mode")
                 state.pop("bootstrap_receipt_sha256")
                 state.pop("prior_run_receipt")
+                state.pop("prior_collection_receipt")
+            elif mutation == "drop-collection-key":
+                state.pop("prior_collection_receipt")
             elif mutation == "unknown-mode":
                 state["bootstrap_mode"] = "refresh"
             elif mutation == "reuse-without-receipt":
@@ -582,6 +603,8 @@ def test_selected_state_requires_bootstrap_and_prior_receipt_fields(tmp_path):
                 state["bootstrap_receipt_sha256"] = "b" * 64
             elif mutation == "seed-zero-with-prior":
                 state["prior_run_receipt"] = _prior_triple(1)
+            elif mutation == "seed-zero-with-prior-collection":
+                state["prior_collection_receipt"] = _collection_triple(1)
         target = StateStore(tmp_path / f"state-{mutation}")
         with target.locked(), pytest.raises(Exception) as caught:
             target.write_aws_pair_transaction(
@@ -605,14 +628,25 @@ def test_selected_seed_one_state_requires_exact_prior_triple(tmp_path):
         binding,
         manifest_sha256=manifest_sha256,
         prior_run_receipt=_prior_triple(1),
+        prior_collection_receipt=_collection_triple(1),
     )
     store = StateStore(tmp_path / "state")
     with store.locked():
         store.write_aws_pair_transaction(manifest_sha256, journal, states)
         stored = store.read_run(str(states[0]["run_id"]))
     assert stored["prior_run_receipt"] == _prior_triple(1)
+    assert stored["prior_collection_receipt"] == _collection_triple(1)
 
-    for mutation in ("missing", "extra-key", "bad-hash", "null-version"):
+    for mutation in (
+        "missing",
+        "extra-key",
+        "bad-hash",
+        "null-version",
+        "collection-missing",
+        "collection-extra-key",
+        "collection-bad-hash",
+        "collection-null-version",
+    ):
         journal_copy = copy.deepcopy(journal)
         for state in journal_copy["states"]:
             if mutation == "missing":
@@ -623,6 +657,14 @@ def test_selected_seed_one_state_requires_exact_prior_triple(tmp_path):
                 state["prior_run_receipt"]["sha256"] = "not-a-hash"
             elif mutation == "null-version":
                 state["prior_run_receipt"]["version_id"] = "null"
+            elif mutation == "collection-missing":
+                state["prior_collection_receipt"] = None
+            elif mutation == "collection-extra-key":
+                state["prior_collection_receipt"]["bytes"] = 10
+            elif mutation == "collection-bad-hash":
+                state["prior_collection_receipt"]["sha256"] = "not-a-hash"
+            elif mutation == "collection-null-version":
+                state["prior_collection_receipt"]["version_id"] = "null"
         target = StateStore(tmp_path / f"state-{mutation}")
         with target.locked(), pytest.raises(Exception) as caught:
             target.write_aws_pair_transaction(
@@ -693,6 +735,7 @@ def test_selected_resume_transition_updates_lease_scope_only(tmp_path):
         binding,
         manifest_sha256=manifest_sha256,
         prior_run_receipt=_prior_triple(1),
+        prior_collection_receipt=_collection_triple(1),
         status="Failed",
     )
     store = StateStore(tmp_path / "state")
@@ -718,9 +761,17 @@ def test_selected_resume_transition_updates_lease_scope_only(tmp_path):
     assert stored["bootstrap_mode"] == "reuse"
     assert stored["bootstrap_receipt_sha256"] == "b" * 64
     assert stored["prior_run_receipt"] == _prior_triple(1)
+    assert stored["prior_collection_receipt"] == _collection_triple(1)
 
 
-def test_selected_resume_transition_keeps_prior_receipt_immutable(tmp_path):
+@pytest.mark.parametrize(
+    "field",
+    ["prior_run_receipt", "prior_collection_receipt"],
+)
+def test_selected_resume_transition_keeps_prior_receipts_immutable(
+    tmp_path,
+    field,
+):
     from msctl.state import StateStore
 
     profile = load_aws_gpu_profile(P5_PROFILE)
@@ -730,6 +781,7 @@ def test_selected_resume_transition_keeps_prior_receipt_immutable(tmp_path):
         binding,
         manifest_sha256=manifest_sha256,
         prior_run_receipt=_prior_triple(2),
+        prior_collection_receipt=_collection_triple(2),
         status="Failed",
     )
     store = StateStore(tmp_path / "state")
@@ -738,7 +790,11 @@ def test_selected_resume_transition_keeps_prior_receipt_immutable(tmp_path):
 
     transitioned = _resume_transition_states(states)
     for state in transitioned:
-        state["prior_run_receipt"] = _prior_triple(1)
+        state[field] = (
+            _prior_triple(1)
+            if field == "prior_run_receipt"
+            else _collection_triple(1)
+        )
     resume_journal = {
         "schema_version": 2,
         "provider": binding.provider,
@@ -770,6 +826,7 @@ def test_selected_same_operation_replay_changes_no_transition_fields(tmp_path):
         ("bootstrap_mode", "reuse"),
         ("bootstrap_receipt_sha256", "b" * 64),
         ("terminate_at", "2099-02-01T00:00:00Z"),
+        ("prior_collection_receipt", _collection_triple(1)),
     ):
         replayed = copy.deepcopy(journal)
         for state in replayed["states"]:
@@ -833,6 +890,9 @@ def test_read_all_aws_pairs_returns_every_validated_journal(tmp_path):
             manifest_sha256=manifest_sha256,
             status="Success",
             prior_run_receipt=_prior_triple(seed) if seed else None,
+            prior_collection_receipt=(
+                _collection_triple(seed) if seed else None
+            ),
         )
         with store.locked():
             store.write_aws_pair_transaction(
@@ -1371,6 +1431,37 @@ def _prior_receipt_download(payload: bytes, ref):
     )
 
 
+def _prior_collection_bits(prior_value, prior_payload, prior_ref):
+    """Build one valid prior collection receipt for a prior finalization."""
+
+    from tests.test_aws_collect import _collection_ref, _collection_value
+
+    collection_value = _collection_value(
+        prior_value,
+        prior_payload,
+        prior_ref,
+    )
+    collection_payload, collection_ref = _collection_ref(collection_value)
+    return collection_value, collection_payload, collection_ref
+
+
+def _collection_checkpoint_head_outputs(collection_value) -> list[object]:
+    import base64
+
+    return [
+        {
+            "object": {
+                "checksum_sha256": base64.b64encode(
+                    bytes.fromhex(row["sha256"])
+                ).decode("ascii"),
+                "content_length": row["bytes"],
+                "version_id": row["version_id"],
+            }
+        }
+        for row in collection_value["objects"][12:14]
+    ]
+
+
 def _evidence_head_outputs(admitted) -> list[object]:
     import base64
 
@@ -1540,6 +1631,9 @@ def test_selected_submit_seed_one_full_flow_and_identity_tags(
         ref=prior_ref,
         **_admit_arguments(prior_binding),
     )
+    collection_value, collection_payload, collection_ref = (
+        _prior_collection_bits(prior_value, prior_payload, prior_ref)
+    )
 
     prior_state_binding = provider_lifecycle(
         load_aws_gpu_profile(P5_PROFILE),
@@ -1563,6 +1657,8 @@ def test_selected_submit_seed_one_full_flow_and_identity_tags(
     runner.outputs = [
         _prior_receipt_download(prior_payload, prior_ref),
         *_evidence_head_outputs(admitted),
+        _prior_receipt_download(collection_payload, collection_ref),
+        *_collection_checkpoint_head_outputs(collection_value),
         MsctlError("AWS_COMMAND_FAILED", "no bootstrap receipt"),
         *_submit_tail_outputs(manifest, backend, bound_discovery=False),
     ]
@@ -1581,6 +1677,11 @@ def test_selected_submit_seed_one_full_flow_and_identity_tags(
             "sha256": prior_ref.sha256,
             "version_id": prior_ref.version_id,
         },
+        prior_collection_receipt={
+            "uri": collection_ref.uri,
+            "sha256": collection_ref.sha256,
+            "version_id": collection_ref.version_id,
+        },
     )
 
     assert result["submitted"] == 1
@@ -1592,6 +1693,11 @@ def test_selected_submit_seed_one_full_flow_and_identity_tags(
         "sha256": prior_ref.sha256,
         "version_id": prior_ref.version_id,
     }
+    assert resources["prior_collection_receipt"] == {
+        "uri": collection_ref.uri,
+        "sha256": collection_ref.sha256,
+        "version_id": collection_ref.version_id,
+    }
     assert resources["terminate_at"] == terminate_at
     assert approval_record["calls_at_approval"] == 0
 
@@ -1599,9 +1705,38 @@ def test_selected_submit_seed_one_full_flow_and_identity_tags(
         argv
         for argv, operation in runner.calls
         if "head-object" in argv and "--version-id" in argv
-        and "prior" in operation
+        and operation == "verify prior evidence object"
     ]
     assert len(head_calls) == 14
+    checkpoint_head_calls = [
+        argv
+        for argv, operation in runner.calls
+        if "head-object" in argv and "--version-id" in argv
+        and operation == "verify prior collection checkpoint"
+    ]
+    assert len(checkpoint_head_calls) == 2
+    collection_get_calls = [
+        argv
+        for argv, operation in runner.calls
+        if "get-object" in argv
+        and operation == "fetch prior seed collection"
+    ]
+    assert len(collection_get_calls) == 1
+    ordered_operations = [operation for _argv, operation in runner.calls]
+    assert ordered_operations.index("fetch prior seed collection") > (
+        max(
+            index
+            for index, operation in enumerate(ordered_operations)
+            if operation == "verify prior evidence object"
+        )
+    )
+    assert ordered_operations.index("resolve bootstrap receipt") > (
+        max(
+            index
+            for index, operation in enumerate(ordered_operations)
+            if operation == "verify prior collection checkpoint"
+        )
+    )
     assert not any(
         "get-object" in argv and "snapshots/" in " ".join(argv)
         for argv, _operation in runner.calls
@@ -1683,6 +1818,11 @@ def test_selected_submit_seed_one_full_flow_and_identity_tags(
         "sha256": prior_ref.sha256,
         "version_id": prior_ref.version_id,
     }
+    assert stored["prior_collection_receipt"] == {
+        "uri": collection_ref.uri,
+        "sha256": collection_ref.sha256,
+        "version_id": collection_ref.version_id,
+    }
     assert stored["terminate_at"] == terminate_at
 
 
@@ -1714,6 +1854,23 @@ def test_selected_seed_zero_submit_resolves_reuse_and_forbids_prior(
             evidence=evidence,
             bootstrap_mode="reuse",
             prior_run_receipt=_prior_triple(1),
+            prior_collection_receipt=_collection_triple(1),
+        )
+    assert getattr(caught.value, "code", None) == "SEED_TRANSITION_BLOCKED"
+    assert runner.calls == []
+
+    with pytest.raises(Exception) as caught:
+        backend.submit(
+            release=release,
+            manifest=manifest,
+            instance_id=manifest.instance_id,
+            terminate_at=terminate_at,
+            approval_path=tmp_path / "approval.json",
+            apply=True,
+            evidence=evidence,
+            bootstrap_mode="reuse",
+            prior_run_receipt=None,
+            prior_collection_receipt=_collection_triple(1),
         )
     assert getattr(caught.value, "code", None) == "SEED_TRANSITION_BLOCKED"
     assert runner.calls == []
@@ -1802,6 +1959,9 @@ def test_selected_submit_gates_fail_before_any_aws_call_or_state(
             prior_run_receipt=(
                 _prior_triple(other_seed) if other_seed else None
             ),
+            prior_collection_receipt=(
+                _collection_triple(other_seed) if other_seed else None
+            ),
         )
         store = StateStore(root / "state")
         with store.locked():
@@ -1822,6 +1982,7 @@ def test_selected_submit_gates_fail_before_any_aws_call_or_state(
                 evidence=_selected_evidence(manifest),
                 bootstrap_mode="bootstrap",
                 prior_run_receipt=_prior_triple(1),
+                prior_collection_receipt=_collection_triple(1),
             )
 
         assert getattr(caught.value, "code", None) == expected_code, case
@@ -2294,6 +2455,7 @@ def test_selected_resume_flows_fresh_deadline_through_every_binding(
     assert stored["bootstrap_mode"] == "reuse"
     assert stored["bootstrap_receipt_sha256"] == receipt_sha256
     assert stored["prior_run_receipt"] is None
+    assert stored["prior_collection_receipt"] is None
     assert stored["attempt"] == 2
 
 
@@ -2556,6 +2718,7 @@ def test_prior_evidence_head_drift_blocks_before_any_binding(
                 "sha256": prior_ref.sha256,
                 "version_id": prior_ref.version_id,
             },
+            prior_collection_receipt=_collection_triple(1),
         )
     assert getattr(caught.value, "code", None) == "SEED_TRANSITION_BLOCKED"
     assert len(runner.calls) == 2
@@ -2623,3 +2786,445 @@ def test_prior_receipt_dataclasses_fail_closed():
         evidence=(evidence,) * 14,
     )
     assert admitted.seed == 8
+
+
+def test_selected_submit_requires_both_prior_triples(tmp_path, monkeypatch):
+    from msctl.state import StateStore
+
+    for case, run_triple, collection_triple in (
+        ("missing-collection", _prior_triple(1), None),
+        ("missing-run", None, _collection_triple(1)),
+        ("missing-both", None, None),
+    ):
+        root = tmp_path / case
+        backend, lifecycle, runner = _selected_backend(
+            root,
+            monkeypatch,
+            seed=1,
+        )
+        manifest = _selected_flow_manifest(lifecycle.binding)
+        release = _selected_release(manifest)
+        backend.approval_verifier = lambda **_kwargs: {}
+
+        with pytest.raises(Exception) as caught:
+            backend.submit(
+                release=release,
+                manifest=manifest,
+                instance_id=manifest.instance_id,
+                terminate_at=_fresh_deadline(),
+                approval_path=root / "approval.json",
+                apply=True,
+                evidence=_selected_evidence(manifest),
+                bootstrap_mode="bootstrap",
+                prior_run_receipt=run_triple,
+                prior_collection_receipt=collection_triple,
+            )
+
+        assert getattr(caught.value, "code", None) == (
+            "SEED_TRANSITION_BLOCKED"
+        ), case
+        assert runner.calls == [], case
+        store = StateStore(root / "state")
+        with store.locked():
+            assert store.read_aws_pair(manifest.sha256) is None
+
+
+def test_prior_collection_drift_blocks_before_any_binding(
+    tmp_path,
+    monkeypatch,
+):
+    from msctl.aws_seed_transition import admit_prior_seed_finalization
+    from msctl.state import StateStore
+
+    for case in ("foreign-collection", "checkpoint-head-drift"):
+        root = tmp_path / case
+        backend, lifecycle, runner = _selected_backend(
+            root,
+            monkeypatch,
+            seed=1,
+        )
+        manifest = _selected_flow_manifest(lifecycle.binding)
+        release = _selected_release(manifest)
+        backend.approval_verifier = lambda **_kwargs: {}
+        prior_binding = provider_lifecycle(
+            load_aws_gpu_profile(P5_PROFILE),
+            seed=1,
+        ).binding
+        prior_value = _receipt_value(prior_binding, seed=0)
+        prior_payload, prior_ref = _receipt_ref(prior_value)
+        admitted = admit_prior_seed_finalization(
+            prior_payload,
+            ref=prior_ref,
+            **_admit_arguments(prior_binding),
+        )
+        if case == "foreign-collection":
+            # A collection receipt for a different finalization of the same
+            # seed parses cleanly but must not admit this transition.
+            foreign_value = copy.deepcopy(prior_value)
+            foreign_value["request_id"] = "7" * 32
+            foreign_payload, foreign_ref = _receipt_ref(foreign_value)
+            collection_value, collection_payload, collection_ref = (
+                _prior_collection_bits(
+                    foreign_value,
+                    foreign_payload,
+                    foreign_ref,
+                )
+            )
+            expected_calls = 16
+            outputs = [
+                _prior_receipt_download(prior_payload, prior_ref),
+                *_evidence_head_outputs(admitted),
+                _prior_receipt_download(
+                    collection_payload,
+                    collection_ref,
+                ),
+            ]
+        else:
+            collection_value, collection_payload, collection_ref = (
+                _prior_collection_bits(
+                    prior_value,
+                    prior_payload,
+                    prior_ref,
+                )
+            )
+            heads = _collection_checkpoint_head_outputs(collection_value)
+            heads[0]["object"]["version_id"] = "drifted-version"
+            expected_calls = 17
+            outputs = [
+                _prior_receipt_download(prior_payload, prior_ref),
+                *_evidence_head_outputs(admitted),
+                _prior_receipt_download(
+                    collection_payload,
+                    collection_ref,
+                ),
+                heads[0],
+            ]
+        runner.outputs = outputs
+
+        with pytest.raises(Exception) as caught:
+            backend.submit(
+                release=release,
+                manifest=manifest,
+                instance_id=manifest.instance_id,
+                terminate_at=_fresh_deadline(),
+                approval_path=root / "approval.json",
+                apply=True,
+                evidence=_selected_evidence(manifest),
+                bootstrap_mode="bootstrap",
+                prior_run_receipt={
+                    "uri": prior_ref.uri,
+                    "sha256": prior_ref.sha256,
+                    "version_id": prior_ref.version_id,
+                },
+                prior_collection_receipt={
+                    "uri": collection_ref.uri,
+                    "sha256": collection_ref.sha256,
+                    "version_id": collection_ref.version_id,
+                },
+            )
+
+        assert getattr(caught.value, "code", None) == (
+            "SEED_TRANSITION_BLOCKED"
+        ), case
+        assert len(runner.calls) == expected_calls, case
+        assert not any(
+            "create-tags" in argv or "send-command" in argv
+            for argv, _operation in runner.calls
+        ), case
+        store = StateStore(root / "state")
+        with store.locked():
+            assert store.read_aws_pair(manifest.sha256) is None
+
+
+def test_selected_submit_replay_compares_stored_collection_triple(
+    tmp_path,
+    monkeypatch,
+):
+    from msctl.aws_seed_transition import admit_prior_seed_finalization
+    from msctl.errors import MsctlError
+
+    backend, lifecycle, runner = _selected_backend(
+        tmp_path,
+        monkeypatch,
+        seed=1,
+    )
+    manifest = _selected_flow_manifest(lifecycle.binding)
+    release = _selected_release(manifest)
+    evidence = _selected_evidence(manifest)
+    terminate_at = _fresh_deadline()
+    backend.approval_verifier = lambda **_kwargs: {}
+
+    prior_binding = provider_lifecycle(
+        load_aws_gpu_profile(P5_PROFILE),
+        seed=1,
+    ).binding
+    prior_value = _receipt_value(prior_binding, seed=0)
+    prior_payload, prior_ref = _receipt_ref(prior_value)
+    admitted = admit_prior_seed_finalization(
+        prior_payload,
+        ref=prior_ref,
+        **_admit_arguments(prior_binding),
+    )
+    collection_value, collection_payload, collection_ref = (
+        _prior_collection_bits(prior_value, prior_payload, prior_ref)
+    )
+    run_triple = {
+        "uri": prior_ref.uri,
+        "sha256": prior_ref.sha256,
+        "version_id": prior_ref.version_id,
+    }
+    collection_triple = {
+        "uri": collection_ref.uri,
+        "sha256": collection_ref.sha256,
+        "version_id": collection_ref.version_id,
+    }
+    runner.outputs = [
+        _prior_receipt_download(prior_payload, prior_ref),
+        *_evidence_head_outputs(admitted),
+        _prior_receipt_download(collection_payload, collection_ref),
+        *_collection_checkpoint_head_outputs(collection_value),
+        MsctlError("AWS_COMMAND_FAILED", "no bootstrap receipt"),
+        *_submit_tail_outputs(manifest, backend, bound_discovery=False),
+    ]
+    submit_arguments = {
+        "release": release,
+        "manifest": manifest,
+        "instance_id": manifest.instance_id,
+        "terminate_at": terminate_at,
+        "approval_path": tmp_path / "approval.json",
+        "apply": True,
+        "evidence": evidence,
+        "bootstrap_mode": "bootstrap",
+        "prior_run_receipt": run_triple,
+        "prior_collection_receipt": collection_triple,
+    }
+    assert backend.submit(**submit_arguments)["submitted"] == 1
+
+    runner.calls.clear()
+    drifted = dict(submit_arguments)
+    drifted["prior_collection_receipt"] = _collection_triple(1)
+    with pytest.raises(Exception) as caught:
+        backend.submit(**drifted)
+    assert getattr(caught.value, "code", None) == "BOOTSTRAP_REUSE_INVALID"
+    assert runner.calls == []
+
+    runner.calls.clear()
+    runner.outputs = [
+        {
+            "command": {
+                "command_id": "cmd-0123456789abcdef0",
+                "status": "InProgress",
+            }
+        },
+    ]
+    replay = backend.submit(**submit_arguments)
+    assert replay["idempotent"] is True
+    assert not any(
+        "get-object" in argv or "head-object" in argv
+        for argv, _operation in runner.calls
+    )
+
+
+def test_selected_resume_readmits_stored_collection_before_bootstrap(
+    tmp_path,
+    monkeypatch,
+):
+    from msctl.aws_seed_transition import admit_prior_seed_finalization
+    from msctl.errors import MsctlError
+
+    import msctl.aws_p5 as aws_p5_module
+
+    backend, lifecycle, runner = _selected_backend(
+        tmp_path,
+        monkeypatch,
+        seed=1,
+    )
+    manifest = _selected_flow_manifest(lifecycle.binding)
+    release = _selected_release(manifest)
+    evidence = _selected_evidence(manifest)
+    backend.approval_verifier = lambda **_kwargs: {}
+    prior_binding = provider_lifecycle(
+        load_aws_gpu_profile(P5_PROFILE),
+        seed=1,
+    ).binding
+    prior_value = _receipt_value(prior_binding, seed=0)
+    prior_payload, prior_ref = _receipt_ref(prior_value)
+    admitted = admit_prior_seed_finalization(
+        prior_payload,
+        ref=prior_ref,
+        **_admit_arguments(prior_binding),
+    )
+    collection_value, collection_payload, collection_ref = (
+        _prior_collection_bits(prior_value, prior_payload, prior_ref)
+    )
+    runner.outputs = [
+        _prior_receipt_download(prior_payload, prior_ref),
+        *_evidence_head_outputs(admitted),
+        _prior_receipt_download(collection_payload, collection_ref),
+        *_collection_checkpoint_head_outputs(collection_value),
+        MsctlError("AWS_COMMAND_FAILED", "no bootstrap receipt"),
+        *_submit_tail_outputs(manifest, backend, bound_discovery=False),
+    ]
+    submitted = backend.submit(
+        release=release,
+        manifest=manifest,
+        instance_id=manifest.instance_id,
+        terminate_at=_fresh_deadline(),
+        approval_path=tmp_path / "approval.json",
+        apply=True,
+        evidence=evidence,
+        bootstrap_mode="bootstrap",
+        prior_run_receipt={
+            "uri": prior_ref.uri,
+            "sha256": prior_ref.sha256,
+            "version_id": prior_ref.version_id,
+        },
+        prior_collection_receipt={
+            "uri": collection_ref.uri,
+            "sha256": collection_ref.sha256,
+            "version_id": collection_ref.version_id,
+        },
+    )
+    assert submitted["submitted"] == 1
+    from msctl.state import StateStore
+
+    store = StateStore(tmp_path / "state")
+    with store.locked():
+        states = [store.read_run(run.run_id) for run in manifest.runs]
+        backend._refresh_paired_states(
+            store,
+            manifest,
+            states,
+            {"status": "Failed"},
+        )
+
+    monkeypatch.setattr(
+        backend,
+        "_checkpoint_map",
+        lambda _manifest, receipt: {
+            checkpoint.arm: checkpoint
+            for checkpoint in receipt.checkpoints
+        },
+    )
+    monkeypatch.setattr(
+        aws_p5_module,
+        "verify_aws_checkpoint_receipt_v3",
+        lambda *_args, **_kwargs: None,
+    )
+    receipt = _selected_checkpoint_receipt(manifest)
+    bootstrap_payload = _canonical(
+        _controller_bootstrap_receipt(manifest, backend)
+    )
+
+    def _put(argv: list[str]):
+        checksum = argv[argv.index("--checksum-sha256") + 1]
+        return {
+            "object": {
+                "checksum_sha256": checksum,
+                "version_id": "intent-version-2",
+            }
+        }
+
+    def _head(argv: list[str]):
+        del argv
+        intent_path = sorted(
+            Path(backend.state_root).glob("intent-*.json"),
+            key=lambda path: path.stat().st_mtime,
+        )[-1]
+        payload = intent_path.read_bytes()
+        return {
+            "object": {
+                "checksum_sha256": __import__("base64").b64encode(
+                    hashlib.sha256(payload).digest()
+                ).decode("ascii"),
+                "content_length": len(payload),
+                "metadata": {
+                    "operation-id": json.loads(payload)["operation_id"],
+                    "sha256": hashlib.sha256(payload).hexdigest(),
+                },
+                "version_id": "intent-version-2",
+            }
+        }
+
+    runner.calls.clear()
+    runner.outputs = [
+        _prior_receipt_download(prior_payload, prior_ref),
+        *_evidence_head_outputs(admitted),
+        _prior_receipt_download(collection_payload, collection_ref),
+        *_collection_checkpoint_head_outputs(collection_value),
+        _download(
+            bootstrap_payload,
+            {
+                "receipt": {
+                    "content_length": len(bootstrap_payload),
+                    "version_id": "bootstrap-receipt-1",
+                }
+            },
+        ),
+        {
+            "instances": [
+                _selected_identity_instance(manifest, backend, bound=True)
+            ]
+        },
+        {
+            "attribute": {
+                "instance_id": manifest.instance_id,
+                "shutdown_behavior": "terminate",
+            }
+        },
+        {
+            "command": {
+                "command_id": "cmd-0123456789abcdef0",
+                "status": "Failed",
+            }
+        },
+        {
+            "managed_instances": [
+                {
+                    "instance_id": manifest.instance_id,
+                    "ping_status": "Online",
+                }
+            ]
+        },
+        _argv_document_listing(),
+        _put,
+        _head,
+        {"command": {"command_id": "cmd-0123456789abcdef1"}},
+    ]
+
+    result = backend.resume(
+        release=release,
+        manifest=manifest,
+        checkpoint_receipt=receipt,
+        approval_path=tmp_path / "approval.json",
+        apply=True,
+        evidence=evidence,
+        terminate_at=_fresh_deadline(),
+        bootstrap_mode="reuse",
+    )
+
+    assert result["submitted"] == 1
+    operations = [operation for _argv, operation in runner.calls]
+    assert operations.count("verify prior collection checkpoint") == 2
+    assert operations.index("fetch prior seed collection") < (
+        operations.index("resolve bootstrap receipt")
+    )
+    with store.locked():
+        stored = store.read_run(str(manifest.runs[0].run_id))
+    assert stored["prior_collection_receipt"] == {
+        "uri": collection_ref.uri,
+        "sha256": collection_ref.sha256,
+        "version_id": collection_ref.version_id,
+    }
+
+
+def test_controller_bootstrap_receipt_fields_mirror_bootstrap_contract():
+    from cluster.aws.p5.bootstrap import BOOTSTRAP_RECEIPT_FIELDS
+    from msctl.aws_p5 import _BOOTSTRAP_RECEIPT_FIELDS
+
+    assert tuple(sorted(_BOOTSTRAP_RECEIPT_FIELDS)) == tuple(
+        sorted(BOOTSTRAP_RECEIPT_FIELDS)
+    )
+    assert len(_BOOTSTRAP_RECEIPT_FIELDS) == len(
+        set(_BOOTSTRAP_RECEIPT_FIELDS)
+    )
