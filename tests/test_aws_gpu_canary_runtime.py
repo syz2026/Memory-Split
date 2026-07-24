@@ -32,6 +32,10 @@ class _Tensor:
         del other
         return self._derived()
 
+    def __getitem__(self, key):
+        del key
+        return self._derived()
+
     def sin(self):
         return self._derived()
 
@@ -108,15 +112,47 @@ class _AdamW:
         del kwargs
 
 
+class _Distributed:
+    def __init__(self):
+        self.backend = None
+        self.barriers = 0
+        self.destroyed = False
+
+    def init_process_group(self, backend):
+        self.backend = backend
+
+    def barrier(self):
+        self.barriers += 1
+
+    def all_reduce(self, value):
+        del value
+
+    def all_gather_object(self, values, value):
+        del value
+        values[:] = [0, 1, 2, 3]
+
+    def destroy_process_group(self):
+        self.destroyed = True
+
+
 class _Torch:
     bfloat16 = "bfloat16"
 
     def __init__(self):
         self.cuda = _Cuda()
         self.version = SimpleNamespace(cuda="13.0")
+        self.ddp_calls = []
+
+        def distributed_data_parallel(model, **kwargs):
+            self.ddp_calls.append(kwargs)
+            return model
+
         self.nn = SimpleNamespace(
             Parameter=lambda value: value,
             Linear=_Linear,
+            parallel=SimpleNamespace(
+                DistributedDataParallel=distributed_data_parallel,
+            ),
             functional=SimpleNamespace(
                 scaled_dot_product_attention=lambda query, *_args, **_kwargs: (
                     query._derived()
@@ -124,6 +160,7 @@ class _Torch:
             ),
         )
         self.optim = SimpleNamespace(AdamW=_AdamW)
+        self.distributed = _Distributed()
         self.saved_state = None
 
     def ones(self, *args, **kwargs):
@@ -239,16 +276,78 @@ def test_torch_phases_cover_all_gpus_checkpoint_resume_and_throughput(tmp_path):
     )
     assert saved["checkpoint_sha256"] == resumed["checkpoint_sha256"]
 
-    ticks = iter(range(201))
+    worker = {
+        "arm": "split90",
+        "backend": "nccl",
+        "ranks": [0, 1, 2, 3],
+        "world_size": 4,
+        "updates": 100,
+        "warmup_updates": 10,
+        "tokens_per_update": 524_288,
+        "update_seconds": [1.0] * 100,
+    }
+    calls = []
+
+    def throughput_runner(argv, **kwargs):
+        calls.append((argv, kwargs))
+        return _completed(
+            argv,
+            json.dumps(
+                worker,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("ascii")
+            + b"\n",
+        )
+
     throughput, _ = runtime.phase_throughput(
-        torch_module=torch,
         arm="split90",
         updates=100,
         warmup_updates=10,
         tokens_per_update=524_288,
-        clock=lambda: float(next(ticks)),
+        runner=throughput_runner,
     )
     assert throughput["update_seconds"] == [1.0] * 100
+    assert throughput["backend"] == "nccl"
+    assert throughput["ranks"] == [0, 1, 2, 3]
+    assert throughput["world_size"] == 4
+    assert "--nproc_per_node=4" in calls[0][0]
+    assert calls[0][1]["shell"] is False
+
+
+def test_throughput_worker_executes_four_rank_ddp_and_reports_rank_set(
+    monkeypatch,
+    capsys,
+):
+    torch = _Torch()
+    monkeypatch.setenv("RANK", "0")
+    monkeypatch.setenv("LOCAL_RANK", "0")
+    monkeypatch.setenv("WORLD_SIZE", "4")
+    tick = 0
+
+    def clock():
+        nonlocal tick
+        tick += 1
+        return tick / 10.0
+
+    runtime.throughput_worker(
+        arm="split90",
+        updates=100,
+        warmup_updates=10,
+        tokens_per_update=524_288,
+        torch_module=torch,
+        clock=clock,
+    )
+
+    evidence = json.loads(capsys.readouterr().out)
+    assert evidence["backend"] == "nccl"
+    assert evidence["ranks"] == [0, 1, 2, 3]
+    assert evidence["world_size"] == 4
+    assert len(evidence["update_seconds"]) == 100
+    assert torch.ddp_calls == [{"device_ids": [0], "output_device": 0}]
+    assert torch.distributed.backend == "nccl"
+    assert torch.distributed.barriers == 200
+    assert torch.distributed.destroyed is True
 
 
 def test_process_phases_use_exact_argv_without_shell(monkeypatch):

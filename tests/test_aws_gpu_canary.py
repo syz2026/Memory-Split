@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 from pathlib import Path
 
 import pytest
@@ -146,6 +147,15 @@ def _v3_receipt(profile):
     receipt = _receipt(profile)
     digest = "sha256:" + "d" * 64
     receipt["schema_version"] = 3
+    for index, arm in enumerate(receipt["throughput"]["arms"]):
+        arm.update(
+            {
+                "backend": "nccl",
+                "ranks": [0, 1, 2, 3],
+                "world_size": 4,
+                "worker_stdout_sha256": f"{index + 1:x}" * 64,
+            }
+        )
     receipt["provenance"] = {
         "instance_id": "i-0123456789abcdef0",
         "boot_id": "12345678-1234-4234-9234-123456789abc",
@@ -174,6 +184,60 @@ def _v3_receipt(profile):
         "checkpoint_resume": "b" * 64,
         "nvme": "c" * 64,
         "throughput": "d" * 64,
+    }
+    phase_keys = {
+        "device-topology-software",
+        "bf16",
+        "sdpa",
+        "torch-compile",
+        "fused-adamw",
+        "simultaneous-4-plus-4-nccl",
+        "nvme",
+        *(
+            f"{phase}:{arm}"
+            for phase in (
+                "one-step-training",
+                "checkpoint",
+                "resume",
+                "throughput",
+            )
+            for arm in ("dense", "split90")
+        ),
+    }
+    receipt["phase_receipt_sha256"] = {
+        key: hashlib.sha256(key.encode("ascii")).hexdigest()
+        for key in phase_keys
+    }
+
+    def overlap(phase, receipt_phase):
+        commands = [
+            {
+                "arm": arm,
+                "argv_sha256": hashlib.sha256(
+                    f"{phase}:{arm}:argv".encode("ascii")
+                ).hexdigest(),
+                "receipt_sha256": receipt["phase_receipt_sha256"][
+                    f"{receipt_phase}:{arm}"
+                ],
+                "started_monotonic_ns": 10 + index * 5,
+                "finished_monotonic_ns": 30 + index * 5,
+                "stdout_sha256": hashlib.sha256(
+                    f"{phase}:{arm}:stdout".encode("ascii")
+                ).hexdigest(),
+                "stderr_sha256": hashlib.sha256(
+                    f"{phase}:{arm}:stderr".encode("ascii")
+                ).hexdigest(),
+            }
+            for index, arm in enumerate(("dense", "split90"))
+        ]
+        return {"concurrent": True, "commands": commands, "overlap_ns": 15}
+
+    receipt["concurrent_phase_evidence"] = {
+        "one_step_training": overlap(
+            "one_step_training",
+            "one-step-training",
+        ),
+        "throughput": overlap("throughput", "throughput"),
     }
     return receipt
 
@@ -226,6 +290,36 @@ def test_v3_qualification_requires_complete_cross_runtime_provenance():
     unknown_raw["raw_output_sha256"]["self_authored_pass"] = "e" * 64
     with pytest.raises(QualificationError, match="unknown"):
         validate_qualification_receipt(unknown_raw, profile)
+
+
+def test_v3_qualification_requires_ddp_and_real_concurrent_overlap():
+    profile = _profile("aws-p5.48xlarge-v3")
+    receipt = _v3_receipt(profile)
+
+    wrong_world = copy.deepcopy(receipt)
+    wrong_world["throughput"]["arms"][0]["world_size"] = 1
+    with pytest.raises(QualificationError, match="four-rank DDP"):
+        validate_qualification_receipt(wrong_world, profile)
+
+    sequential = copy.deepcopy(receipt)
+    commands = sequential["concurrent_phase_evidence"]["throughput"]["commands"]
+    commands[0]["started_monotonic_ns"] = 10
+    commands[0]["finished_monotonic_ns"] = 20
+    commands[1]["started_monotonic_ns"] = 20
+    commands[1]["finished_monotonic_ns"] = 30
+    sequential["concurrent_phase_evidence"]["throughput"]["overlap_ns"] = 0
+    with pytest.raises(QualificationError, match="did not actually overlap"):
+        validate_qualification_receipt(sequential, profile)
+
+    incidental = copy.deepcopy(receipt)
+    commands = incidental["concurrent_phase_evidence"]["throughput"]["commands"]
+    commands[0]["started_monotonic_ns"] = 10
+    commands[0]["finished_monotonic_ns"] = 30
+    commands[1]["started_monotonic_ns"] = 29
+    commands[1]["finished_monotonic_ns"] = 49
+    incidental["concurrent_phase_evidence"]["throughput"]["overlap_ns"] = 1
+    with pytest.raises(QualificationError, match="sustain concurrent"):
+        validate_qualification_receipt(incidental, profile)
 
 
 @pytest.mark.parametrize(

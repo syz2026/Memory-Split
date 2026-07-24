@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
 import os
 import re
@@ -10,7 +11,7 @@ import secrets
 import stat
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Mapping
 
 from cluster.aws.p5.canary import (
@@ -23,6 +24,7 @@ from .aws_sealed_evaluation import (
     SealedEvaluationFixture,
     load_sealed_evaluation_fixture,
 )
+from .aws_identity import AwsIdentityError, verify_environment_receipt
 from .aws_selection import HardwareAmendment, ProviderSelection
 from .errors import MsctlError
 from .fsutil import open_directory, rename_noreplace_at
@@ -46,6 +48,8 @@ _ROOT_FIELDS = {
     "bindings",
     "capacity",
     "decision",
+    "key_id",
+    "signature",
 }
 _BINDING_FIELDS = {
     "hardware_amendment_sha256",
@@ -77,13 +81,18 @@ _DIAGNOSTIC_FIELDS = {
     "targets_per_update",
     "optimizer_steps",
     "raw_target_tokens",
+    "artifact_path",
     "artifact_sha256",
     "passed",
     "reviewer",
     "completed_at",
+    "key_id",
+    "signature",
 }
 _MAX_JSON_BYTES = 4 * 1024 * 1024
 _REVIEWER_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 ._@+-]{1,127}$")
+_KEY_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._@+-]{0,127}$")
+RECEIPT_KEY_ENV = "MSCTL_APPROVAL_KEY"
 
 
 @dataclass(frozen=True)
@@ -138,6 +147,110 @@ def _reviewer(value: object, *, label: str) -> str:
     if not isinstance(value, str) or _REVIEWER_RE.fullmatch(value) is None:
         _fail(f"{label} is invalid")
     return value
+
+
+def _key_id(value: object, *, label: str) -> str:
+    if not isinstance(value, str) or _KEY_ID_RE.fullmatch(value) is None:
+        _fail(f"{label} is invalid")
+    return value
+
+
+def _receipt_secret(environ: Mapping[str, str] | None) -> bytes:
+    environment = os.environ if environ is None else environ
+    value = environment.get(RECEIPT_KEY_ENV)
+    if value is None or len(value.encode("utf-8")) < 32:
+        raise MsctlError(
+            "RECEIPT_KEY_UNAVAILABLE",
+            f"{RECEIPT_KEY_ENV} must contain at least 32 bytes",
+        )
+    return value.encode("utf-8")
+
+
+def _signature(
+    value: Mapping[str, object],
+    *,
+    purpose: str,
+    environ: Mapping[str, str] | None,
+) -> str:
+    unsigned = {key: item for key, item in value.items() if key != "signature"}
+    payload = purpose.encode("ascii") + b"\0" + canonical_json(unsigned)
+    return hmac.new(_receipt_secret(environ), payload, hashlib.sha256).hexdigest()
+
+
+def _verify_signature(
+    value: Mapping[str, object],
+    *,
+    purpose: str,
+    environ: Mapping[str, str] | None,
+    label: str,
+) -> None:
+    _key_id(value.get("key_id"), label=f"{label} key_id")
+    signature = value.get("signature")
+    try:
+        require_sha256(signature, label=f"{label} signature")
+    except MsctlError as error:
+        raise MsctlError(
+            "RECEIPT_SIGNATURE_INVALID",
+            f"{label} is unsigned or has an invalid signature",
+        ) from error
+    expected = _signature(value, purpose=purpose, environ=environ)
+    if not hmac.compare_digest(str(signature), expected):
+        raise MsctlError(
+            "RECEIPT_SIGNATURE_INVALID",
+            f"{label} signature is invalid",
+        )
+
+
+def sign_diagnostic_receipt(
+    value: Mapping[str, object],
+    *,
+    key_id: str,
+    environ: Mapping[str, str] | None = None,
+) -> dict[str, object]:
+    """Return a purpose-bound HMAC-signed diagnostic receipt."""
+
+    unsigned = {
+        key: item
+        for key, item in dict(value).items()
+        if key not in {"key_id", "signature"}
+    }
+    signed = {
+        **unsigned,
+        "key_id": _key_id(key_id, label="diagnostic key_id"),
+        "signature": "",
+    }
+    signed["signature"] = _signature(
+        signed,
+        purpose=DIAGNOSTIC_RECEIPT_TYPE,
+        environ=environ,
+    )
+    return signed
+
+
+def sign_launch_readiness(
+    value: Mapping[str, object],
+    *,
+    key_id: str,
+    environ: Mapping[str, str] | None = None,
+) -> dict[str, object]:
+    """Return a purpose-bound HMAC-signed protected-launch decision."""
+
+    unsigned = {
+        key: item
+        for key, item in dict(value).items()
+        if key not in {"key_id", "signature"}
+    }
+    signed = {
+        **unsigned,
+        "key_id": _key_id(key_id, label="readiness key_id"),
+        "signature": "",
+    }
+    signed["signature"] = _signature(
+        signed,
+        purpose=READINESS_RECEIPT_TYPE,
+        environ=environ,
+    )
+    return signed
 
 
 def _read_regular(path: Path, *, label: str) -> bytes:
@@ -221,6 +334,92 @@ def _file_sha256(path: Path, *, label: str) -> str:
     return hashlib.sha256(_read_regular(path, label=label)).hexdigest()
 
 
+def _artifact_sha256(
+    receipt_path: Path,
+    relative: object,
+    *,
+    label: str,
+) -> str:
+    if (
+        not isinstance(relative, str)
+        or not relative
+        or "\\" in relative
+        or PurePosixPath(relative).is_absolute()
+        or any(part in {"", ".", ".."} for part in relative.split("/"))
+    ):
+        _fail(f"{label} path must be one portable relative path")
+    parts = PurePosixPath(relative).parts
+    directory_flags = (
+        os.O_RDONLY
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+    )
+    file_flags = (
+        os.O_RDONLY
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+    )
+    directories: list[int] = []
+    descriptor: int | None = None
+    try:
+        directory_fd = os.open(receipt_path.parent, directory_flags)
+        directories.append(directory_fd)
+        for component in parts[:-1]:
+            directory_fd = os.open(
+                component,
+                directory_flags,
+                dir_fd=directory_fd,
+            )
+            directories.append(directory_fd)
+        descriptor = os.open(
+            parts[-1],
+            file_flags,
+            dir_fd=directory_fd,
+        )
+        before = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or before.st_nlink != 1
+            or before.st_size <= 0
+        ):
+            _fail(f"{label} must be one nonempty singly linked regular file")
+        digest = hashlib.sha256()
+        total = 0
+        while True:
+            chunk = os.read(descriptor, 1 << 20)
+            if not chunk:
+                break
+            digest.update(chunk)
+            total += len(chunk)
+        after = os.fstat(descriptor)
+        if (
+            before.st_dev,
+            before.st_ino,
+            before.st_size,
+            before.st_mtime_ns,
+            before.st_ctime_ns,
+        ) != (
+            after.st_dev,
+            after.st_ino,
+            after.st_size,
+            after.st_mtime_ns,
+            after.st_ctime_ns,
+        ) or total != after.st_size:
+            _fail(f"{label} changed while being rehashed")
+        return digest.hexdigest()
+    except OSError as error:
+        raise MsctlError(
+            "LAUNCH_READINESS_INVALID",
+            f"{label} cannot be rehashed safely",
+        ) from error
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+        for directory_fd in reversed(directories):
+            os.close(directory_fd)
+
+
 def _environment_identity(
     path: Path,
     *,
@@ -228,45 +427,31 @@ def _environment_identity(
     selection: ProviderSelection,
 ) -> tuple[str, str, str]:
     data = _read_regular(path, label="environment receipt")
-    value = _exact(
-        _decode(data, label="environment receipt"),
-        {
-            "schema_version",
-            "profile_sha256",
-            "container_image_digest",
-            "boot_id",
-            "aws_instance_identity_document",
-            "aws_instance_identity_pkcs7",
-        },
-        label="environment receipt",
-    )
-    identity = value["aws_instance_identity_document"]
-    if not isinstance(identity, dict):
-        _fail("environment receipt identity document must be an object")
-    instance_id = identity.get("instanceId")
-    boot_id = value["boot_id"]
-    if (
-        value["schema_version"] != 3
-        or value["profile_sha256"] != getattr(profile, "sha256", None)
-        or value["container_image_digest"] != selection.container_digest
-        or identity.get("imageId") != selection.ami_id
-        or identity.get("region") != selection.region
-        or identity.get("accountId") != selection.aws_account_id
-        or not isinstance(instance_id, str)
-        or re.fullmatch(r"^i-[0-9a-f]{8,17}$", instance_id) is None
-        or not isinstance(boot_id, str)
-        or re.fullmatch(
-            r"^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-"
-            r"[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
-            boot_id,
+    try:
+        verified = verify_environment_receipt(
+            data,
+            expected_profile_sha256=str(getattr(profile, "sha256", "")),
+            expected_container_digest=selection.container_digest,
+            expected_region=selection.region,
+            expected_ami_id=selection.ami_id,
+            expected_account_id=selection.aws_account_id,
         )
-        is None
-        or not isinstance(value["aws_instance_identity_pkcs7"], str)
-        or not value["aws_instance_identity_pkcs7"]
-        or data != canonical_json(value) + b"\n"
+    except AwsIdentityError as error:
+        raise MsctlError(
+            "LAUNCH_READINESS_INVALID",
+            "environment receipt identity signature is invalid",
+        ) from error
+    identity = verified.receipt["aws_instance_identity_document"]
+    if (
+        not isinstance(identity, dict)
+        or identity.get("instanceType") != getattr(profile, "instance_type", None)
     ):
         _fail("environment receipt is incomplete or cross-runtime")
-    return instance_id, str(boot_id), hashlib.sha256(data).hexdigest()
+    return (
+        verified.instance_id,
+        verified.boot_id,
+        verified.receipt_sha256,
+    )
 
 
 def _expected_command_plan_sha256(
@@ -297,11 +482,22 @@ def _expected_command_plan_sha256(
     )
 
 
-def load_diagnostic_receipt(path: Path | str, *, diagnostic_id: str) -> str:
+def load_diagnostic_receipt(
+    path: Path | str,
+    *,
+    diagnostic_id: str,
+    environ: Mapping[str, str] | None = None,
+) -> str:
     candidate = Path(path)
     data = _read_regular(candidate, label=f"diagnostic {diagnostic_id}")
     value = _decode(data, label=f"diagnostic {diagnostic_id}")
     receipt = _exact(value, _DIAGNOSTIC_FIELDS, label="diagnostic receipt")
+    _verify_signature(
+        receipt,
+        purpose=DIAGNOSTIC_RECEIPT_TYPE,
+        environ=environ,
+        label=f"diagnostic {diagnostic_id}",
+    )
     if (
         diagnostic_id not in DIAGNOSTIC_IDS
         or receipt["schema_version"] != 3
@@ -314,10 +510,17 @@ def load_diagnostic_receipt(path: Path | str, *, diagnostic_id: str) -> str:
         or receipt["passed"] is not True
     ):
         _fail(f"diagnostic {diagnostic_id} is incomplete or stale")
-    require_sha256(
+    expected_artifact = require_sha256(
         receipt["artifact_sha256"],
         label=f"diagnostic {diagnostic_id} artifact",
     )
+    actual_artifact = _artifact_sha256(
+        candidate,
+        receipt["artifact_path"],
+        label=f"diagnostic {diagnostic_id} artifact",
+    )
+    if not hmac.compare_digest(expected_artifact, actual_artifact):
+        _fail(f"diagnostic {diagnostic_id} artifact hash does not match")
     _reviewer(receipt["reviewer"], label="diagnostic reviewer")
     _timestamp(receipt["completed_at"], label="diagnostic completed_at")
     if data != canonical_json(receipt) + b"\n":
@@ -371,6 +574,8 @@ def create_launch_readiness(
     sealed_evaluation_fixture: Path | str,
     reviewer: str,
     reviewed_at: str,
+    key_id: str,
+    environ: Mapping[str, str] | None = None,
 ) -> dict[str, object]:
     """Create a decision only after validating every bound artifact."""
 
@@ -415,6 +620,7 @@ def create_launch_readiness(
         diagnostic_id: load_diagnostic_receipt(
             diagnostic_receipts[diagnostic_id],
             diagnostic_id=diagnostic_id,
+            environ=environ,
         )
         for diagnostic_id in DIAGNOSTIC_IDS
     }
@@ -436,7 +642,7 @@ def create_launch_readiness(
         ("release", release_sha256),
     ):
         require_sha256(digest, label=f"readiness {label}")
-    return {
+    unsigned = {
         "schema_version": 3,
         "receipt_type": READINESS_RECEIPT_TYPE,
         "profile_id": profile_id,
@@ -462,6 +668,11 @@ def create_launch_readiness(
             ),
         },
     }
+    return sign_launch_readiness(
+        unsigned,
+        key_id=key_id,
+        environ=environ,
+    )
 
 
 def validate_launch_readiness(
@@ -479,8 +690,15 @@ def validate_launch_readiness(
     expected_instance_id: str | None = None,
     path: Path | None = None,
     sha256: str | None = None,
+    environ: Mapping[str, str] | None = None,
 ) -> LaunchReadiness:
     receipt = _exact(value, _ROOT_FIELDS, label="launch readiness")
+    _verify_signature(
+        receipt,
+        purpose=READINESS_RECEIPT_TYPE,
+        environ=environ,
+        label="launch readiness",
+    )
     bindings = _exact(
         receipt["bindings"],
         _BINDING_FIELDS,
@@ -608,6 +826,7 @@ def validate_launch_readiness(
             digest = load_diagnostic_receipt(
                 diagnostic_receipts[diagnostic_id],
                 diagnostic_id=diagnostic_id,
+                environ=environ,
             )
             if digest != diagnostics[diagnostic_id]:
                 _fail(
@@ -717,6 +936,7 @@ def plan_launch_readiness(
         qualification_receipt=kwargs["qualification_receipt"],
         diagnostic_receipts=kwargs["diagnostic_receipts"],
         sealed_evaluation_fixture=kwargs["sealed_evaluation_fixture"],
+        environ=kwargs.get("environ"),
     )
     result = {
         "receipt": receipt,

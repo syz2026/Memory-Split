@@ -11,7 +11,6 @@ import re
 import secrets
 import stat
 import subprocess
-import tempfile
 import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
@@ -36,10 +35,22 @@ from .aws_fleet import (
     verify_fleet_collection,
     write_fleet_advance,
 )
+from .aws_identity import (
+    AWS_INSTANCE_IDENTITY_CERTIFICATES,
+    AwsIdentityError,
+    verify_instance_identity_pkcs7,
+)
 from .aws_argv import (
     ARGV_DOCUMENT_CONTENT,
     ARGV_DOCUMENT_NAME,
     ARGV_DOCUMENT_SHA256,
+)
+from .aws_canary import (
+    ORCHESTRATION_PLAN_TYPE,
+    build_canary_intent,
+    canary_plan_uri,
+    load_canary_plan,
+    plan_canary,
 )
 from .aws_selection import (
     HardwareAmendment,
@@ -172,32 +183,7 @@ _V3_INSTANCE_FIELDS = {
 _SAFE_PATH = "/usr/local/bin:/usr/bin:/bin"
 _MAX_PAID_RUNTIME = timedelta(minutes=1440)
 _AWS_PRIVATE_HOME = "/var/lib/memorysplit/aws-private-home"
-_AWS_US_EAST_1_DSA_CERTIFICATE = """-----BEGIN CERTIFICATE-----
-MIIC7TCCAq0CCQCWukjZ5V4aZzAJBgcqhkjOOAQDMFwxCzAJBgNVBAYTAlVTMRkw
-FwYDVQQIExBXYXNoaW5ndG9uIFN0YXRlMRAwDgYDVQQHEwdTZWF0dGxlMSAwHgYD
-VQQKExdBbWF6b24gV2ViIFNlcnZpY2VzIExMQzAeFw0xMjAxMDUxMjU2MTJaFw0z
-ODAxMDUxMjU2MTJaMFwxCzAJBgNVBAYTAlVTMRkwFwYDVQQIExBXYXNoaW5ndG9u
-IFN0YXRlMRAwDgYDVQQHEwdTZWF0dGxlMSAwHgYDVQQKExdBbWF6b24gV2ViIFNl
-cnZpY2VzIExMQzCCAbcwggEsBgcqhkjOOAQBMIIBHwKBgQCjkvcS2bb1VQ4yt/5e
-ih5OO6kK/n1Lzllr7D8ZwtQP8fOEpp5E2ng+D6Ud1Z1gYipr58Kj3nssSNpI6bX3
-VyIQzK7wLclnd/YozqNNmgIyZecN7EglK9ITHJLP+x8FtUpt3QbyYXJdmVMegN6P
-hviYt5JH/nYl4hh3Pa1HJdskgQIVALVJ3ER11+Ko4tP6nwvHwh6+ERYRAoGBAI1j
-k+tkqMVHuAFcvAGKocTgsjJem6/5qomzJuKDmbJNu9Qxw3rAotXau8Qe+MBcJl/U
-hhy1KHVpCGl9fueQ2s6IL0CaO/buycU1CiYQk40KNHCcHfNiZbdlx1E9rpUp7bnF
-lRa2v1ntMX3caRVDdbtPEWmdxSCYsYFDk4mZrOLBA4GEAAKBgEbmeve5f8LIE/Gf
-MNmP9CM5eovQOGx5ho8WqD+aTebs+k2tn92BBPqeZqpWRa5P/+jrdKml1qx4llHW
-MXrs3IgIb6+hUIB+S8dz8/mmO0bpr76RoZVCXYab2CZedFut7qc3WUH9+EUAH5mw
-vSeDCOUMYQR7R9LINYwouHIziqQYMAkGByqGSM44BAMDLwAwLAIUWXBlk40xTwSw
-7HX32MxXYruse9ACFBNGmdX2ZBrVNGrN9N2f6ROk0k9K
------END CERTIFICATE-----
-"""
-# AWS currently publishes the same DSA trust anchor for these two Regions.
-# Keep both entries explicit so Region support cannot expand accidentally.
-_AWS_US_WEST_2_DSA_CERTIFICATE = _AWS_US_EAST_1_DSA_CERTIFICATE
-_AWS_DSA_CERTIFICATES = {
-    "us-east-1": _AWS_US_EAST_1_DSA_CERTIFICATE,
-    "us-west-2": _AWS_US_WEST_2_DSA_CERTIFICATE,
-}
+_AWS_DSA_CERTIFICATES = AWS_INSTANCE_IDENTITY_CERTIFICATES
 
 
 @dataclass(frozen=True)
@@ -258,59 +244,13 @@ def _verify_instance_identity_pkcs7(
     pkcs7: str,
     region: str,
 ) -> bool:
-    certificate_text = _AWS_DSA_CERTIFICATES.get(region)
-    if certificate_text is None:
+    try:
+        return verify_instance_identity_pkcs7(identity, pkcs7, region)
+    except AwsIdentityError as error:
         raise MsctlError(
             "ENVIRONMENT_RECEIPT_INVALID",
-            "no pinned AWS PKCS7 trust anchor exists for the selected region",
-        )
-    wrapped = (
-        "-----BEGIN PKCS7-----\n"
-        + "\n".join(
-            pkcs7[index : index + 64] for index in range(0, len(pkcs7), 64)
-        )
-        + "\n-----END PKCS7-----\n"
-    )
-    with tempfile.TemporaryDirectory(prefix="msctl-iid-") as directory:
-        root = Path(directory)
-        signature = root / "identity.pkcs7"
-        certificate = root / "aws-dsa.pem"
-        signature.write_text(wrapped, encoding="ascii")
-        certificate.write_text(
-            certificate_text,
-            encoding="ascii",
-        )
-        completed = subprocess.run(
-            [
-                "/usr/bin/openssl",
-                "smime",
-                "-verify",
-                "-in",
-                str(signature),
-                "-inform",
-                "PEM",
-                "-certfile",
-                str(certificate),
-                "-nointern",
-                "-noverify",
-            ],
-            stdin=subprocess.DEVNULL,
-            capture_output=True,
-            check=False,
-            shell=False,
-            env={},
-            timeout=10,
-        )
-    if completed.returncode != 0:
-        return False
-    try:
-        signed = json.loads(
-            completed.stdout.decode("utf-8"),
-            object_pairs_hook=_strict_json_object,
-        )
-    except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
-        return False
-    return signed == dict(identity)
+            str(error),
+        ) from error
 
 
 class AwsJsonRunner(Protocol):
@@ -1011,6 +951,7 @@ class AwsP5Backend:
                     else None
                 ),
                 expected_instance_id=binding.instance_id,
+                environ=self.environ,
             )
         context = V3LifecycleContext(
             amendment=amendment,
@@ -2062,6 +2003,362 @@ class AwsP5Backend:
             "status": status,
             "control_bundle_version_id": published["version_id"],
             "installed": 1,
+        }
+
+    def canary_plan(
+        self,
+        *,
+        release_path: Path | str,
+        amendment_path: Path | str,
+        provider_selection_path: Path | str,
+        environment_receipt: Path | str,
+        instance_id: str,
+        out: Path | str,
+        apply: bool,
+    ) -> dict[str, object]:
+        """Render or exclusively publish one authenticated canary plan."""
+
+        if self.profile.provider not in _V3_PROFILES:
+            raise MsctlError(
+                "CANARY_PLAN_INVALID",
+                "executable qualification is available only to AWS v3 profiles",
+            )
+        release = load_release(release_path)
+        amendment = load_hardware_amendment(amendment_path)
+        selection = load_provider_selection(
+            provider_selection_path,
+            amendment=amendment,
+            profile=self.profile,
+        )
+        required_release_members = {
+            "cluster/aws/p5/canary.py",
+            "cluster/aws/p5/canary_orchestrator.py",
+            "cluster/aws/p5/canary_runtime.py",
+            "cluster/aws/p5/interruption_checkpoint.py",
+            "cluster/aws/p5/profile.py",
+            "msctl/aws_identity.py",
+            "msctl/jsonutil.py",
+        }
+        if (
+            release.provider != self.profile.provider
+            or not required_release_members <= set(release.members)
+        ):
+            raise MsctlError(
+                "CANARY_PLAN_INVALID",
+                "release does not contain the closed executable canary",
+            )
+        try:
+            validate_runtime_attested_contract(
+                release.metadata.get("environment"),
+                profile_sha256=self.profile.sha256,
+            )
+        except MsctlError as error:
+            raise MsctlError(
+                "CANARY_PLAN_INVALID",
+                "release does not bind the runtime-attested environment contract",
+            ) from error
+        return plan_canary(
+            out=out,
+            apply=apply,
+            profile=self.profile,
+            runtime=self.runtime,
+            release=release,
+            selection=selection,
+            environment_receipt=environment_receipt,
+            instance_id=instance_id,
+        )
+
+    def _canary_instance_argv(self, instance_id: str) -> list[str]:
+        if _INSTANCE_ID_RE.fullmatch(instance_id) is None:
+            raise MsctlError(
+                "INSTANCE_BINDING_MISMATCH",
+                "canary requires one valid explicit EC2 instance ID",
+            )
+        return self._aws_argv(
+            "ec2",
+            "describe-instances",
+            "--instance-ids",
+            instance_id,
+            query=(
+                "{instances:Reservations[].Instances[]."
+                "{instance_id:InstanceId,instance_type:InstanceType,"
+                "state:State.Name,ami_id:ImageId,"
+                "instance_profile_arn:IamInstanceProfile.Arn}}"
+            ),
+        )
+
+    def _require_canary_instance(self, instance_id: str) -> None:
+        output = _aws_output_object(
+            self._run(
+                self._canary_instance_argv(instance_id),
+                operation="validate canary instance",
+            ),
+            {"instances"},
+            label="canary EC2 instance output",
+        )
+        rows = _aws_output_list(
+            output["instances"],
+            label="canary EC2 instances",
+        )
+        if len(rows) != 1:
+            raise MsctlError(
+                "INSTANCE_BINDING_MISMATCH",
+                "explicit canary instance did not resolve exactly once",
+            )
+        row = _aws_output_object(
+            rows[0],
+            {
+                "instance_id",
+                "instance_type",
+                "state",
+                "ami_id",
+                "instance_profile_arn",
+            },
+            label="canary EC2 instance",
+        )
+        if row != {
+            "instance_id": instance_id,
+            "instance_type": self.profile.instance_type,
+            "state": "running",
+            "ami_id": self.runtime.ami_id,
+            "instance_profile_arn": self.instance_profile_arn,
+        }:
+            raise MsctlError(
+                "INSTANCE_BINDING_MISMATCH",
+                "explicit canary instance has the wrong immutable runtime",
+            )
+
+    def _publish_canary_plan(
+        self,
+        plan: Mapping[str, object],
+        *,
+        plan_sha256: str,
+        plan_uri: str,
+    ) -> dict[str, object]:
+        digest = require_sha256(plan_sha256, label="canary plan")
+        payload = canonical_json(plan) + b"\n"
+        expected_uri = canary_plan_uri(self.runtime.s3_root, digest)
+        if (
+            hashlib.sha256(payload).hexdigest() != digest
+            or plan_uri != expected_uri
+        ):
+            raise MsctlError(
+                "CANARY_PLAN_INVALID",
+                "canary plan bytes or content address changed before publication",
+            )
+        relative = plan_uri.removeprefix(self.runtime.s3_root.rstrip("/") + "/")
+        bucket, key = self._s3_location(relative)
+        directory_fd = open_directory(
+            self.state_root,
+            label="AWS state root",
+            create=True,
+        )
+        name = f"canary-plan-{digest}.json"
+        try:
+            atomic_write_at(
+                directory_fd,
+                name,
+                payload,
+                label="canary plan",
+            )
+        finally:
+            os.close(directory_fd)
+        checksum = base64.b64encode(bytes.fromhex(digest)).decode("ascii")
+        kms_key_id = getattr(self.runtime, "kms_key_id", None)
+        if not isinstance(kms_key_id, str) or not kms_key_id:
+            raise MsctlError(
+                "CANARY_PLAN_INVALID",
+                "canary publication requires the pinned runtime KMS key",
+            )
+        metadata = (
+            f"plan-type={ORCHESTRATION_PLAN_TYPE},sha256={digest}"
+        )
+        put = self._aws_argv(
+            "s3api",
+            "put-object",
+            "--bucket",
+            bucket,
+            "--key",
+            key,
+            "--body",
+            str((self.state_root / name).absolute()),
+            "--checksum-algorithm",
+            "SHA256",
+            "--checksum-sha256",
+            checksum,
+            "--metadata",
+            metadata,
+            "--if-none-match",
+            "*",
+            "--server-side-encryption",
+            "aws:kms",
+            "--ssekms-key-id",
+            kms_key_id,
+            query=(
+                "{object:{checksum_sha256:ChecksumSHA256,"
+                "version_id:VersionId}}"
+            ),
+        )
+        try:
+            put_output = _aws_output_object(
+                self._run(put, operation="publish canary plan"),
+                {"object"},
+                label="S3 canary plan put",
+            )
+        except MsctlError:
+            put_output = None
+        if put_output is not None:
+            put_row = _aws_output_object(
+                put_output["object"],
+                {"checksum_sha256", "version_id"},
+                label="S3 canary plan put",
+            )
+            if (
+                put_row["checksum_sha256"] != checksum
+                or not isinstance(put_row["version_id"], str)
+                or not put_row["version_id"]
+            ):
+                raise MsctlError(
+                    "S3_OBJECT_MISMATCH",
+                    "S3 did not confirm the immutable canary plan",
+                )
+        head = self._aws_argv(
+            "s3api",
+            "head-object",
+            "--bucket",
+            bucket,
+            "--key",
+            key,
+            "--checksum-mode",
+            "ENABLED",
+            query=(
+                "{object:{checksum_sha256:ChecksumSHA256,"
+                "content_length:ContentLength,metadata:Metadata,"
+                "server_side_encryption:ServerSideEncryption,"
+                "sse_kms_key_id:SSEKMSKeyId,version_id:VersionId}}"
+            ),
+        )
+        head_output = _aws_output_object(
+            self._run(head, operation="verify canary plan"),
+            {"object"},
+            label="S3 canary plan head",
+        )
+        row = _aws_output_object(
+            head_output["object"],
+            {
+                "checksum_sha256",
+                "content_length",
+                "metadata",
+                "server_side_encryption",
+                "sse_kms_key_id",
+                "version_id",
+            },
+            label="S3 canary plan",
+        )
+        if (
+            row["checksum_sha256"] != checksum
+            or row["content_length"] != len(payload)
+            or row["metadata"]
+            != {
+                "plan-type": ORCHESTRATION_PLAN_TYPE,
+                "sha256": digest,
+            }
+            or row["server_side_encryption"] != "aws:kms"
+            or row["sse_kms_key_id"] != kms_key_id
+            or not isinstance(row["version_id"], str)
+            or not row["version_id"]
+        ):
+            raise MsctlError(
+                "S3_OBJECT_MISMATCH",
+                "published canary plan bytes, metadata, or encryption differ",
+            )
+        return {
+            "plan_sha256": digest,
+            "plan_uri": plan_uri,
+            "version_id": row["version_id"],
+        }
+
+    def canary_run(
+        self,
+        *,
+        plan_path: Path | str,
+        instance_id: str,
+        apply: bool,
+    ) -> dict[str, object]:
+        """Plan or send one exact canary intent to one explicit instance."""
+
+        if self.profile.provider not in _V3_PROFILES:
+            raise MsctlError(
+                "CANARY_RUN_INVALID",
+                "executable qualification is available only to AWS v3 profiles",
+            )
+        plan, plan_sha256 = load_canary_plan(
+            plan_path,
+            profile=self.profile,
+            runtime=self.runtime,
+            expected_instance_id=instance_id,
+        )
+        plan_uri = canary_plan_uri(self.runtime.s3_root, plan_sha256)
+        intent = build_canary_intent(
+            plan=plan,
+            plan_sha256=plan_sha256,
+            plan_uri=plan_uri,
+            runtime=self.runtime,
+            control_bundle_sha256=self.control_bundle.sha256,
+        )
+        intent_sha256 = hashlib.sha256(canonical_json(intent)).hexdigest()
+        result = {
+            "schema_version": 3,
+            "operation": "canary",
+            "instance_id": instance_id,
+            "plan_sha256": plan_sha256,
+            "plan_uri": plan_uri,
+            "intent": intent,
+            "intent_sha256": intent_sha256,
+            "submitted": 0,
+            "idempotent": False,
+        }
+        if not apply:
+            return result
+
+        self._require_canary_instance(instance_id)
+        self._require_ssm_online(instance_id)
+        self._ensure_argv_document()
+        control = self._publish_control_bundle()
+        published_plan = self._publish_canary_plan(
+            plan,
+            plan_sha256=plan_sha256,
+            plan_uri=plan_uri,
+        )
+        published_intent = self._publish_operation_intent(intent)
+        existing = self._find_operation_command(
+            operation_id=str(intent["operation_id"]),
+            instance_id=instance_id,
+        )
+        if existing is not None:
+            return {
+                **result,
+                "command_id": existing["command_id"],
+                "status": existing["status"],
+                "control_bundle_version_id": control["version_id"],
+                "plan_version_id": published_plan["version_id"],
+                "intent_version_id": published_intent["version_id"],
+                "idempotent": True,
+            }
+        command_id = self._send_operation_intent(
+            instance_id=instance_id,
+            intent=intent,
+            published=published_intent,
+            operation="run canary",
+        )
+        return {
+            **result,
+            "command_id": command_id,
+            "status": "Pending",
+            "control_bundle_version_id": control["version_id"],
+            "plan_version_id": published_plan["version_id"],
+            "intent_version_id": published_intent["version_id"],
+            "submitted": 1,
         }
 
     def _ensure_argv_document(self) -> None:
@@ -6821,6 +7118,24 @@ class AwsP5Backend:
             apply = bool(getattr(args, "apply", False))
             return not apply, self.control_install(
                 instance_id=str(args.instance_id),
+                apply=apply,
+            )
+        if command == "canary plan":
+            apply = bool(getattr(args, "apply", False))
+            return not apply, self.canary_plan(
+                release_path=args.release,
+                amendment_path=args.amendment,
+                provider_selection_path=args.provider_selection,
+                environment_receipt=args.environment_receipt,
+                instance_id=args.instance_id,
+                out=args.out,
+                apply=apply,
+            )
+        if command == "canary run":
+            apply = bool(getattr(args, "apply", False))
+            return not apply, self.canary_run(
+                plan_path=args.canary_plan,
+                instance_id=args.instance_id,
                 apply=apply,
             )
         if command == "env ensure" and self.profile.provider in _V3_PROFILES:

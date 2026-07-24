@@ -133,6 +133,7 @@ ARGV_DOCUMENT_CONTENT = canonical_json(_ARGV_DOCUMENT).decode("ascii")
 ARGV_DOCUMENT_SHA256 = hashlib.sha256(
     ARGV_DOCUMENT_CONTENT.encode("ascii")
 ).hexdigest()
+CANARY_INTENT_TYPE = "memorysplit-aws-gpu-canary-intent-v3"
 
 
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
@@ -185,6 +186,41 @@ _BASE_FIELDS = {
     "ssm_document",
     "started_receipt_uri",
     "terminal_receipt_uri",
+}
+_CANARY_FIELDS = {
+    "schema_version",
+    "intent_type",
+    "operation",
+    "provider",
+    "instance_type",
+    "profile_sha256",
+    "gres",
+    "instance_id",
+    "release_sha256",
+    "provider_selection_sha256",
+    "environment_receipt_sha256",
+    "command_plan_sha256",
+    "orchestration_plan_sha256",
+    "orchestration_plan_uri",
+    "qualification_receipt_uri",
+    "control_bundle_sha256",
+    "environment",
+    "steps",
+    "operation_id",
+    "ssm_document",
+    "started_receipt_uri",
+    "terminal_receipt_uri",
+}
+_CANARY_RECEIPT_BINDING_FIELDS = {
+    "intent_type",
+    "release_sha256",
+    "provider_selection_sha256",
+    "environment_receipt_sha256",
+    "command_plan_sha256",
+    "orchestration_plan_sha256",
+    "orchestration_plan_uri",
+    "qualification_receipt_uri",
+    "control_bundle_sha256",
 }
 _V3_PROVENANCE_FIELDS = {
     "cohort_assignment_sha256",
@@ -363,6 +399,152 @@ def _validate_checkpoint_receipt(value: object) -> None:
         raise RemoteIntentError("checkpoint binding pair is incomplete")
 
 
+def _validate_canary_intent(
+    intent: dict[str, object],
+    *,
+    expected_control_bundle_sha256: str | None,
+) -> dict[str, object]:
+    if set(intent) != _CANARY_FIELDS:
+        raise RemoteIntentError("canary intent fields do not match the contract")
+    provider = intent["provider"]
+    profile_contract = (
+        _PROFILE_CONTRACTS.get(provider)
+        if isinstance(provider, str)
+        else None
+    )
+    if (
+        intent["schema_version"] != 3
+        or intent["intent_type"] != CANARY_INTENT_TYPE
+        or intent["operation"] != "canary"
+        or provider
+        not in {"aws-p5.48xlarge-v3", "aws-p6-b300.48xlarge-v3"}
+        or profile_contract is None
+        or intent["instance_type"] != profile_contract["instance_type"]
+        or intent["gres"] != profile_contract["gres"]
+        or not isinstance(intent["profile_sha256"], str)
+        or _SHA256_RE.fullmatch(intent["profile_sha256"]) is None
+        or not isinstance(intent["instance_id"], str)
+        or _INSTANCE_RE.fullmatch(intent["instance_id"]) is None
+    ):
+        raise RemoteIntentError("canary intent identity is invalid")
+    for field in (
+        "release_sha256",
+        "provider_selection_sha256",
+        "environment_receipt_sha256",
+        "command_plan_sha256",
+        "orchestration_plan_sha256",
+        "control_bundle_sha256",
+        "operation_id",
+    ):
+        _sha256(intent[field], label=f"canary intent {field}")
+    if (
+        expected_control_bundle_sha256 is None
+        or intent["control_bundle_sha256"]
+        != _sha256(
+            expected_control_bundle_sha256,
+            label="installed control bundle",
+        )
+    ):
+        raise RemoteIntentError(
+            "canary intent control bundle does not match the installed bytes"
+        )
+
+    identity = {
+        key: value
+        for key, value in intent.items()
+        if key
+        not in {
+            "operation_id",
+            "ssm_document",
+            "started_receipt_uri",
+            "terminal_receipt_uri",
+        }
+    }
+    if hashlib.sha256(canonical_json(identity)).hexdigest() != intent["operation_id"]:
+        raise RemoteIntentError("canary operation ID does not match its identity")
+
+    environment = intent["environment"]
+    if (
+        not isinstance(environment, dict)
+        or set(environment) != _ENVIRONMENT_FIELDS
+        or set(environment) & _FORBIDDEN_ENVIRONMENT
+        or not all(isinstance(value, str) and value for value in environment.values())
+        or environment["AWS_REGION"] not in {"us-east-1", "us-west-2"}
+        or re.fullmatch(r"^ami-[0-9a-f]{8,17}$", environment["MS_AWS_AMI_ID"])
+        is None
+        or re.fullmatch(
+            r"^sha256:[0-9a-f]{64}$",
+            environment["MS_CONTAINER_DIGEST"],
+        )
+        is None
+        or any(
+            not environment[field].isdigit() or int(environment[field]) <= 0
+            for field in ("MS_RUNTIME_GID", "MS_RUNTIME_UID")
+        )
+    ):
+        raise RemoteIntentError(
+            "canary environment is not closed, pinned, and credential-free"
+        )
+    s3_root = _s3_uri(environment["MS_S3_ROOT"])
+    plan_uri = _s3_uri(intent["orchestration_plan_uri"], root=s3_root)
+    qualification_uri = _s3_uri(
+        intent["qualification_receipt_uri"],
+        root=s3_root,
+    )
+    expected_plan_uri = (
+        f"{s3_root}/qualification/plans/sha256/"
+        f"{intent['orchestration_plan_sha256']}.json"
+    )
+    expected_qualification_uri = (
+        f"{s3_root}/qualification/{provider}/{intent['instance_id']}/"
+        f"environment-{intent['environment_receipt_sha256']}/"
+        f"plan-{intent['command_plan_sha256']}.json"
+    )
+    if (
+        plan_uri != expected_plan_uri
+        or qualification_uri != expected_qualification_uri
+    ):
+        raise RemoteIntentError("canary object paths are not deterministic")
+
+    receipt_root = (
+        f"{s3_root}/operations/{intent['operation_id']}/receipts"
+    )
+    if (
+        _s3_uri(intent["started_receipt_uri"], root=s3_root)
+        != f"{receipt_root}/started.json"
+        or _s3_uri(intent["terminal_receipt_uri"], root=s3_root)
+        != f"{receipt_root}/terminal.json"
+    ):
+        raise RemoteIntentError("canary receipt paths do not match the operation")
+    if intent["ssm_document"] != {
+        "name": ARGV_DOCUMENT_NAME,
+        "sha256": ARGV_DOCUMENT_SHA256,
+    }:
+        raise RemoteIntentError("canary intent names the wrong SSM document")
+
+    release_root = f"/mnt/memorysplit/releases/{intent['release_sha256']}"
+    expected_argv = [
+        "/usr/bin/python3",
+        f"{release_root}/cluster/aws/p5/canary_orchestrator.py",
+        "--plan-uri",
+        plan_uri,
+        "--plan-sha256",
+        str(intent["orchestration_plan_sha256"]),
+        "--region",
+        str(environment["AWS_REGION"]),
+    ]
+    if intent["steps"] != [
+        {
+            "name": "execute-canary-orchestration",
+            "argv": expected_argv,
+        }
+    ]:
+        raise RemoteIntentError(
+            "canary intent does not contain the exact release-mounted argv"
+        )
+    return intent
+
+
 def _validate_intent(
     payload: bytes,
     *,
@@ -375,6 +557,11 @@ def _validate_intent(
     ):
         raise RemoteIntentError("operation intent SHA-256 mismatch")
     intent = _decode_object(payload, label="operation intent")
+    if intent.get("operation") == "canary":
+        return _validate_canary_intent(
+            intent,
+            expected_control_bundle_sha256=expected_control_bundle_sha256,
+        )
     schema_version = intent.get("schema_version")
     expected_fields = (
         _BASE_FIELDS | _v3_provenance_fields(intent)
@@ -577,11 +764,16 @@ def _receipt(
         "instance_id": intent["instance_id"],
         "execution_nonce": nonce,
     }
+    binding_fields = (
+        _CANARY_RECEIPT_BINDING_FIELDS
+        if intent.get("operation") == "canary"
+        else _v3_provenance_fields(intent)
+    )
     if schema_version == 3:
         value.update(
             {
                 field: intent[field]
-                for field in _v3_provenance_fields(intent)
+                for field in binding_fields
             }
         )
     if returncode is not None:
@@ -612,8 +804,13 @@ def _validate_receipt(
         "execution_nonce",
     }
     schema_version = 3 if intent.get("schema_version") == 3 else 1
+    binding_fields = (
+        _CANARY_RECEIPT_BINDING_FIELDS
+        if intent.get("operation") == "canary"
+        else _v3_provenance_fields(intent)
+    )
     if schema_version == 3:
-        fields |= _v3_provenance_fields(intent)
+        fields |= binding_fields
     if kind == "terminal":
         fields |= {"returncode", "status"}
     if set(value) != fields:
@@ -639,7 +836,7 @@ def _validate_receipt(
             schema_version == 3
             and any(
                 value[field] != intent[field]
-                for field in _v3_provenance_fields(intent)
+                for field in binding_fields
             )
         )
         or not isinstance(nonce, str)

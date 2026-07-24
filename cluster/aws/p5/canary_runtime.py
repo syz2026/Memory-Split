@@ -101,10 +101,14 @@ _EVIDENCE_FIELDS = {
     "nvme": {"model", "devices", "device_bytes", "raid_level"},
     "throughput": {
         "arm",
+        "backend",
+        "ranks",
+        "world_size",
         "updates",
         "warmup_updates",
         "tokens_per_update",
         "update_seconds",
+        "worker_stdout_sha256",
     },
 }
 _ECR_IMAGE_RE = re.compile(
@@ -544,13 +548,15 @@ def phase_one_step_training(
 ) -> tuple[dict[str, object], list[dict[str, object]]]:
     if arm not in {"dense", "split90"}:
         raise CanaryRuntimeError("one-step training requires one closed arm")
+    port = 29622 if arm == "dense" else 29623
     argv = [
         sys.executable,
         "-m",
         "torch.distributed.run",
         "--nnodes=1",
         "--nproc_per_node=4",
-        "--standalone",
+        "--rdzv_backend=c10d",
+        f"--rdzv_endpoint=127.0.0.1:{port}",
         str(Path(__file__).resolve()),
         "training-worker",
         "--arm",
@@ -703,12 +709,11 @@ def phase_nvme(
 
 def phase_throughput(
     *,
-    torch_module: Any | None = None,
     arm: str | None,
     updates: int,
     warmup_updates: int,
     tokens_per_update: int,
-    clock: Callable[[], float] = time.perf_counter,
+    runner: Callable[..., subprocess.CompletedProcess[bytes]] = subprocess.run,
 ) -> tuple[dict[str, object], list[dict[str, object]]]:
     if (
         arm not in {"dense", "split90"}
@@ -717,22 +722,217 @@ def phase_throughput(
         or tokens_per_update != 524_288
     ):
         raise CanaryRuntimeError("throughput geometry is not the reviewed canary")
-    torch_value = _torch(torch_module)
-    durations: list[float] = []
-    for _ in range(updates):
-        started = clock()
-        _one_step(torch_value)
-        duration = float(clock() - started)
-        if not math.isfinite(duration) or duration <= 0:
-            raise CanaryRuntimeError("throughput duration is not positive and finite")
-        durations.append(duration)
+    port = 29630 if arm == "dense" else 29631
+    argv = [
+        sys.executable,
+        "-m",
+        "torch.distributed.run",
+        "--nnodes=1",
+        "--nproc_per_node=4",
+        "--rdzv_backend=c10d",
+        f"--rdzv_endpoint=127.0.0.1:{port}",
+        str(Path(__file__).resolve()),
+        "throughput-worker",
+        "--arm",
+        arm,
+        "--updates",
+        str(updates),
+        "--warmup-updates",
+        str(warmup_updates),
+        "--tokens-per-update",
+        str(tokens_per_update),
+    ]
+    record, stdout, _stderr = _command(
+        argv,
+        timeout=7_200.0,
+        runner=runner,
+    )
+    try:
+        result = json.loads(
+            stdout.decode("utf-8"),
+            object_pairs_hook=lambda pairs: _unique_object(
+                pairs,
+                label="throughput worker output",
+            ),
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise CanaryRuntimeError(
+            "throughput worker did not return canonical JSON"
+        ) from error
+    fields = {
+        "arm",
+        "backend",
+        "ranks",
+        "world_size",
+        "updates",
+        "warmup_updates",
+        "tokens_per_update",
+        "update_seconds",
+    }
+    if (
+        not isinstance(result, dict)
+        or set(result) != fields
+        or stdout != _canonical(result)
+        or result["arm"] != arm
+        or result["backend"] != "nccl"
+        or result["ranks"] != [0, 1, 2, 3]
+        or result["world_size"] != 4
+        or result["updates"] != updates
+        or result["warmup_updates"] != warmup_updates
+        or result["tokens_per_update"] != tokens_per_update
+    ):
+        raise CanaryRuntimeError(
+            "throughput worker did not prove four-rank DDP geometry"
+        )
+    durations = result["update_seconds"]
+    if (
+        not isinstance(durations, list)
+        or len(durations) != updates
+        or any(
+            isinstance(duration, bool)
+            or not isinstance(duration, (int, float))
+            or not math.isfinite(float(duration))
+            or float(duration) <= 0.0
+            for duration in durations
+        )
+    ):
+        raise CanaryRuntimeError("throughput worker durations are invalid")
     return {
         "arm": arm,
+        "backend": "nccl",
+        "ranks": [0, 1, 2, 3],
+        "world_size": 4,
         "updates": updates,
         "warmup_updates": warmup_updates,
         "tokens_per_update": tokens_per_update,
-        "update_seconds": durations,
-    }, []
+        "update_seconds": [float(duration) for duration in durations],
+        "worker_stdout_sha256": _sha256(stdout),
+    }, [record]
+
+
+def _unique_object(
+    pairs: list[tuple[str, object]],
+    *,
+    label: str,
+) -> dict[str, object]:
+    value: dict[str, object] = {}
+    for key, item in pairs:
+        if key in value:
+            raise CanaryRuntimeError(f"{label} repeats field {key}")
+        value[key] = item
+    return value
+
+
+def throughput_worker(
+    *,
+    arm: str,
+    updates: int,
+    warmup_updates: int,
+    tokens_per_update: int,
+    torch_module: Any | None = None,
+    clock: Callable[[], float] = time.perf_counter,
+) -> None:
+    """Run synchronized four-rank DDP updates and report rank-zero timings."""
+
+    if (
+        arm not in {"dense", "split90"}
+        or updates != 100
+        or warmup_updates != 10
+        or tokens_per_update != 524_288
+    ):
+        raise CanaryRuntimeError("throughput worker geometry is not reviewed")
+    torch_value = _torch(torch_module)
+    try:
+        rank = int(os.environ["RANK"])
+        local_rank = int(os.environ["LOCAL_RANK"])
+        world_size = int(os.environ["WORLD_SIZE"])
+    except (KeyError, ValueError) as error:
+        raise CanaryRuntimeError(
+            "throughput worker rank environment is unavailable"
+        ) from error
+    if (
+        world_size != 4
+        or rank not in range(4)
+        or local_rank not in range(4)
+    ):
+        raise CanaryRuntimeError("throughput worker requires exactly four ranks")
+    torch_value.cuda.set_device(local_rank)
+    distributed = torch_value.distributed
+    distributed.init_process_group("nccl")
+    try:
+        device = f"cuda:{local_rank}"
+        model = torch_value.nn.Linear(
+            128,
+            128,
+            device=device,
+            dtype=torch_value.bfloat16,
+        )
+        ddp = torch_value.nn.parallel.DistributedDataParallel(
+            model,
+            device_ids=[local_rank],
+            output_device=local_rank,
+        )
+        optimizer = torch_value.optim.AdamW(
+            ddp.parameters(),
+            lr=1e-3,
+            fused=True,
+        )
+        per_rank_tokens = tokens_per_update // world_size
+        if per_rank_tokens * world_size != tokens_per_update:
+            raise CanaryRuntimeError(
+                "throughput tokens do not divide across four ranks"
+            )
+        durations: list[float] = []
+        for _ in range(updates):
+            sample = torch_value.randn(
+                (per_rank_tokens, 128),
+                device=device,
+                dtype=torch_value.bfloat16,
+            )
+            target = torch_value.randn(
+                (per_rank_tokens, 128),
+                device=device,
+                dtype=torch_value.bfloat16,
+            )
+            distributed.barrier()
+            started = clock()
+            residual = ddp(sample).float() - target.float()
+            if arm == "split90":
+                residual = residual[: (per_rank_tokens * 9) // 10]
+            loss = residual.square().mean()
+            loss.backward()
+            optimizer.step()
+            optimizer.zero_grad(set_to_none=True)
+            _sync(torch_value)
+            distributed.barrier()
+            duration = float(clock() - started)
+            if not math.isfinite(duration) or duration <= 0.0:
+                raise CanaryRuntimeError(
+                    "throughput duration is not positive and finite"
+                )
+            durations.append(duration)
+        ranks: list[object] = [None] * world_size
+        distributed.all_gather_object(ranks, rank)
+        if ranks != [0, 1, 2, 3]:
+            raise CanaryRuntimeError("throughput DDP rank set is incomplete")
+        if rank == 0:
+            print(
+                _canonical(
+                    {
+                        "arm": arm,
+                        "backend": "nccl",
+                        "ranks": ranks,
+                        "world_size": world_size,
+                        "updates": updates,
+                        "warmup_updates": warmup_updates,
+                        "tokens_per_update": tokens_per_update,
+                        "update_seconds": durations,
+                    }
+                ).decode("ascii"),
+                end="",
+            )
+    finally:
+        distributed.destroy_process_group()
 
 
 def build_phase_receipt(
@@ -897,6 +1097,9 @@ def _validate_evidence(
     if (
         arm not in {"dense", "split90"}
         or evidence["arm"] != arm
+        or evidence["backend"] != "nccl"
+        or evidence["ranks"] != [0, 1, 2, 3]
+        or evidence["world_size"] != 4
         or evidence["updates"] != 100
         or evidence["warmup_updates"] != 10
         or evidence["tokens_per_update"] != 524_288
@@ -911,6 +1114,10 @@ def _validate_evidence(
         )
     ):
         raise CanaryRuntimeError("throughput evidence is incomplete")
+    _lower_sha256(
+        evidence["worker_stdout_sha256"],
+        label="throughput worker output",
+    )
 
 
 def validate_phase_receipt(receipt: object) -> dict[str, object]:
@@ -972,6 +1179,40 @@ def validate_phase_receipt(receipt: object) -> dict[str, object]:
         receipt["arm"],
         receipt["evidence"],
     )
+    if receipt["phase"] in {"one-step-training", "throughput"}:
+        raw_outputs = receipt["raw_outputs"]
+        evidence = receipt["evidence"]
+        expected_worker = (
+            "training-worker"
+            if receipt["phase"] == "one-step-training"
+            else "throughput-worker"
+        )
+        if (
+            len(raw_outputs) != 1
+            or raw_outputs[0]["stdout_sha256"]
+            != evidence["worker_stdout_sha256"]
+        ):
+            raise CanaryRuntimeError(
+                "distributed worker output is not bound to raw command evidence"
+            )
+        argv = raw_outputs[0]["argv"]
+        script_indexes = [
+            index
+            for index, argument in enumerate(argv)
+            if argument.endswith("/cluster/aws/p5/canary_runtime.py")
+        ]
+        if (
+            argv[1:3] != ["-m", "torch.distributed.run"]
+            or argv.count("--nnodes=1") != 1
+            or argv.count("--nproc_per_node=4") != 1
+            or argv.count("--rdzv_backend=c10d") != 1
+            or len(script_indexes) != 1
+            or script_indexes[0] + 1 >= len(argv)
+            or argv[script_indexes[0] + 1] != expected_worker
+        ):
+            raise CanaryRuntimeError(
+                "distributed worker argv does not prove four-rank DDP"
+            )
     expected_raw = _sha256(
         _canonical(
             {
@@ -1038,7 +1279,12 @@ def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "phase",
-        choices=(*PHASES, "nccl-worker", "training-worker"),
+        choices=(
+            *PHASES,
+            "nccl-worker",
+            "training-worker",
+            "throughput-worker",
+        ),
     )
     parser.add_argument("--provider")
     parser.add_argument("--instance-type")
@@ -1073,6 +1319,16 @@ def main(argv: Sequence[str] | None = None) -> int:
             if arguments.arm is None:
                 raise CanaryRuntimeError("training worker arm is required")
             training_worker()
+            return 0
+        if arguments.phase == "throughput-worker":
+            if arguments.arm is None:
+                raise CanaryRuntimeError("throughput worker arm is required")
+            throughput_worker(
+                arm=arguments.arm,
+                updates=arguments.updates,
+                warmup_updates=arguments.warmup_updates,
+                tokens_per_update=arguments.tokens_per_update,
+            )
             return 0
         required = (
             arguments.provider,

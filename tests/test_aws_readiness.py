@@ -12,8 +12,11 @@ from msctl.aws_readiness import (
     DIAGNOSTIC_IDS,
     DIAGNOSTIC_RECEIPT_TYPE,
     _expected_command_plan_sha256,
+    load_diagnostic_receipt,
     load_launch_readiness,
     plan_launch_readiness,
+    sign_diagnostic_receipt,
+    sign_launch_readiness,
     validate_launch_readiness,
 )
 from msctl.errors import MsctlError
@@ -31,7 +34,14 @@ def _write(path: Path, value: object) -> Path:
     return path
 
 
-def _readiness_inputs(tmp_path: Path) -> dict[str, object]:
+def _readiness_inputs(tmp_path: Path, monkeypatch) -> dict[str, object]:
+    monkeypatch.setenv("MSCTL_APPROVAL_KEY", "k" * 32)
+    monkeypatch.setattr(
+        "msctl.aws_identity.verify_instance_identity_pkcs7",
+        lambda identity, pkcs7, region: (
+            bool(identity) and pkcs7 == "YQ==" and bool(region)
+        ),
+    )
     profile, amendment, selection = _selection(P5)
     release = SimpleNamespace(archive_sha256="2" * 64)
     instance_id = "i-0123456789abcdef0"
@@ -48,7 +58,7 @@ def _readiness_inputs(tmp_path: Path) -> dict[str, object]:
             "instanceType": profile.instance_type,
             "region": selection.region,
         },
-        "aws_instance_identity_pkcs7": "reviewed-pkcs7",
+        "aws_instance_identity_pkcs7": "YQ==",
     }
     environment_path = _write(tmp_path / "environment.json", environment)
     environment_sha256 = hashlib.sha256(environment_path.read_bytes()).hexdigest()
@@ -79,21 +89,28 @@ def _readiness_inputs(tmp_path: Path) -> dict[str, object]:
 
     diagnostic_paths: dict[str, Path] = {}
     for index, diagnostic_id in enumerate(DIAGNOSTIC_IDS):
+        artifact = tmp_path / "artifacts" / f"{diagnostic_id}.bin"
+        artifact.parent.mkdir(exist_ok=True)
+        artifact.write_bytes(f"diagnostic-{index}\n".encode("ascii"))
+        unsigned = {
+            "schema_version": 3,
+            "receipt_type": DIAGNOSTIC_RECEIPT_TYPE,
+            "diagnostic_id": diagnostic_id,
+            "model_parameters": 28_969_216,
+            "targets_per_update": 524_288,
+            "optimizer_steps": 1_106,
+            "raw_target_tokens": 579_862_528,
+            "artifact_path": f"artifacts/{diagnostic_id}.bin",
+            "artifact_sha256": hashlib.sha256(
+                artifact.read_bytes()
+            ).hexdigest(),
+            "passed": True,
+            "reviewer": "gate-reviewer",
+            "completed_at": "2026-07-24T00:30:00Z",
+        }
         diagnostic_paths[diagnostic_id] = _write(
             tmp_path / f"{diagnostic_id}.json",
-            {
-                "schema_version": 3,
-                "receipt_type": DIAGNOSTIC_RECEIPT_TYPE,
-                "diagnostic_id": diagnostic_id,
-                "model_parameters": 28_969_216,
-                "targets_per_update": 524_288,
-                "optimizer_steps": 1_106,
-                "raw_target_tokens": 579_862_528,
-                "artifact_sha256": f"{index + 1:x}" * 64,
-                "passed": True,
-                "reviewer": "gate-reviewer",
-                "completed_at": "2026-07-24T00:30:00Z",
-            },
+            sign_diagnostic_receipt(unsigned, key_id="qualification-review"),
         )
     return {
         "profile": profile,
@@ -106,11 +123,15 @@ def _readiness_inputs(tmp_path: Path) -> dict[str, object]:
         "sealed_evaluation_fixture": _sealed_fixture(tmp_path),
         "reviewer": "launch-reviewer",
         "reviewed_at": "2026-07-24T02:00:00Z",
+        "key_id": "qualification-review",
     }
 
 
-def test_readiness_cli_contract_binds_every_gate_and_is_exclusive(tmp_path):
-    inputs = _readiness_inputs(tmp_path)
+def test_readiness_cli_contract_binds_every_gate_and_is_exclusive(
+    tmp_path,
+    monkeypatch,
+):
+    inputs = _readiness_inputs(tmp_path, monkeypatch)
     destination = tmp_path / "readiness.json"
 
     dry_run = plan_launch_readiness(
@@ -141,6 +162,8 @@ def test_readiness_cli_contract_binds_every_gate_and_is_exclusive(tmp_path):
     )
     assert loaded.sha256 == applied["receipt_sha256"]
     assert loaded.decision["protected_launch_allowed"] is True
+    assert loaded.value["key_id"] == "qualification-review"
+    assert len(loaded.value["signature"]) == 64
     assert set(loaded.bindings["diagnostic_receipt_sha256"]) == set(
         DIAGNOSTIC_IDS
     )
@@ -152,8 +175,11 @@ def test_readiness_cli_contract_binds_every_gate_and_is_exclusive(tmp_path):
         plan_launch_readiness(out=destination, apply=True, **inputs)
 
 
-def test_readiness_rejects_false_stale_and_changed_bound_evidence(tmp_path):
-    inputs = _readiness_inputs(tmp_path)
+def test_readiness_rejects_false_stale_and_changed_bound_evidence(
+    tmp_path,
+    monkeypatch,
+):
+    inputs = _readiness_inputs(tmp_path, monkeypatch)
     planned = plan_launch_readiness(
         out=tmp_path / "unused.json",
         apply=False,
@@ -163,6 +189,19 @@ def test_readiness_rejects_false_stale_and_changed_bound_evidence(tmp_path):
 
     denied = copy.deepcopy(receipt)
     denied["decision"]["protected_launch_allowed"] = False
+    with pytest.raises(MsctlError, match="signature is invalid"):
+        validate_launch_readiness(
+            denied,
+            profile=inputs["profile"],
+            amendment=inputs["amendment"],
+            selection=inputs["selection"],
+            release=inputs["release"],
+        )
+
+    denied = sign_launch_readiness(
+        denied,
+        key_id="qualification-review",
+    )
     with pytest.raises(MsctlError, match="false, stale, or cross-profile"):
         validate_launch_readiness(
             denied,
@@ -187,7 +226,7 @@ def test_readiness_rejects_false_stale_and_changed_bound_evidence(tmp_path):
     changed["artifact_sha256"] = "f" * 64
     _write(diagnostic_path, changed)
     readiness_path = _write(tmp_path / "readiness.json", receipt)
-    with pytest.raises(MsctlError, match="binding is stale"):
+    with pytest.raises(MsctlError, match="signature is invalid"):
         load_launch_readiness(
             readiness_path,
             profile=inputs["profile"],
@@ -196,3 +235,53 @@ def test_readiness_rejects_false_stale_and_changed_bound_evidence(tmp_path):
             release=inputs["release"],
             diagnostic_receipts=inputs["diagnostic_receipts"],
         )
+
+
+def test_diagnostic_signature_and_artifact_rehash_reject_tampering(
+    tmp_path,
+    monkeypatch,
+):
+    inputs = _readiness_inputs(tmp_path, monkeypatch)
+    diagnostic_id = DIAGNOSTIC_IDS[0]
+    receipt_path = inputs["diagnostic_receipts"][diagnostic_id]
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+
+    unsigned = dict(receipt)
+    unsigned["signature"] = ""
+    _write(receipt_path, unsigned)
+    with pytest.raises(MsctlError, match="unsigned"):
+        load_diagnostic_receipt(receipt_path, diagnostic_id=diagnostic_id)
+
+    _write(receipt_path, receipt)
+    artifact = tmp_path / str(receipt["artifact_path"])
+    artifact.write_bytes(b"tampered diagnostic output\n")
+    with pytest.raises(MsctlError, match="artifact hash does not match"):
+        load_diagnostic_receipt(receipt_path, diagnostic_id=diagnostic_id)
+
+
+def test_diagnostic_artifact_rehash_rejects_symlinked_parent(
+    tmp_path,
+    monkeypatch,
+):
+    inputs = _readiness_inputs(tmp_path, monkeypatch)
+    diagnostic_id = DIAGNOSTIC_IDS[0]
+    receipt_path = inputs["diagnostic_receipts"][diagnostic_id]
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+
+    outside = tmp_path.parent / f"{tmp_path.name}-outside-artifacts"
+    outside.mkdir()
+    artifact = outside / "diagnostic.bin"
+    artifact.write_bytes(b"diagnostic-0\n")
+    (tmp_path / "linked-artifacts").symlink_to(outside, target_is_directory=True)
+    changed = {
+        **receipt,
+        "artifact_path": "linked-artifacts/diagnostic.bin",
+        "artifact_sha256": hashlib.sha256(artifact.read_bytes()).hexdigest(),
+    }
+    _write(
+        receipt_path,
+        sign_diagnostic_receipt(changed, key_id="qualification-review"),
+    )
+
+    with pytest.raises(MsctlError, match="cannot be rehashed safely"):
+        load_diagnostic_receipt(receipt_path, diagnostic_id=diagnostic_id)

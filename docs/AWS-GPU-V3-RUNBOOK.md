@@ -752,34 +752,52 @@ ID and requires bootstrap, qualification, and readiness to be repeated.
 
 ## 9. Canary, 100/10 ETA, and launch gate
 
-Render the profile-bound canary plan without executing it:
+Render the authenticated, instance-bound orchestration plan without executing
+it, then publish that local plan exclusively:
 
 ```bash
 CANARY_PLAN="$REVIEW_ROOT/canary-plan-${INSTANCE_ID}.json"
-export RELEASE_SHA256
-python - <<'PY' > "$CANARY_PLAN"
-import json
-import os
-from pathlib import Path
-from cluster.aws.p5.canary import render_canary_command_plan
-from cluster.aws.p5.profile import load_aws_gpu_profile, validate_runtime_environment
 
-profile = load_aws_gpu_profile(Path(os.environ["PROFILE"]))
-runtime = validate_runtime_environment(profile, os.environ)
-release_sha256 = os.environ["RELEASE_SHA256"]
-print(json.dumps(render_canary_command_plan(
-    profile,
-    runtime,
-    release_sha256=release_sha256,
-    release_root=f"/mnt/memorysplit/releases/{release_sha256}",
-), sort_keys=True))
-PY
-python -m json.tool "$CANARY_PLAN"
+# DRY RUN: verifies the release, provider selection, PKCS7 identity receipt,
+# explicit instance ID, and exact release-mounted phase argv.
+python3 -m msctl --profile "$PROFILE" --repo-root . \
+  canary plan \
+  --release "$RELEASE_RECEIPT" \
+  --amendment configs/hardware-amendment-v3.json \
+  --provider-selection "$SELECTION" \
+  --environment-receipt "$ENVIRONMENT_RECEIPT" \
+  --instance-id "$INSTANCE_ID" \
+  --out "$CANARY_PLAN" \
+  > "$REVIEW_ROOT/canary-plan-review-${INSTANCE_ID}.json"
+
+# APPLY writes the canonical plan once and refuses replacement.
+python3 -m msctl --profile "$PROFILE" --repo-root . \
+  canary plan \
+  --release "$RELEASE_RECEIPT" \
+  --amendment configs/hardware-amendment-v3.json \
+  --provider-selection "$SELECTION" \
+  --environment-receipt "$ENVIRONMENT_RECEIPT" \
+  --instance-id "$INSTANCE_ID" \
+  --out "$CANARY_PLAN" \
+  --apply > "$REVIEW_ROOT/canary-plan-result-${INSTANCE_ID}.json"
+
+# DRY RUN: render the content-addressed SSM intent without AWS mutations.
+python3 -m msctl --profile "$PROFILE" --repo-root . \
+  canary run \
+  --canary-plan "$CANARY_PLAN" \
+  --instance-id "$INSTANCE_ID" \
+  > "$REVIEW_ROOT/canary-run-review-${INSTANCE_ID}.json"
+
+# APPLY only after reviewing the exact instance and immutable argv.
+python3 -m msctl --profile "$PROFILE" --repo-root . \
+  canary run \
+  --canary-plan "$CANARY_PLAN" \
+  --instance-id "$INSTANCE_ID" \
+  --apply > "$REVIEW_ROOT/canary-run-result-${INSTANCE_ID}.json"
 ```
 
-The approved SSM executor must show the exact instance ID and argv from this
-plan in dry-run/review mode before it executes them. It must not translate them
-into implicit fleet discovery. Each phase runs
+The SSM path validates the one explicit instance and never calls
+`RunInstances` or performs implicit fleet discovery. Each phase runs
 `cluster/aws/p5/canary_runtime.py` from the mounted, digest-named release using
 `/opt/venv/bin/python`; no shell-generated command is accepted. Preserve every
 raw-output hash and build one closed qualification receipt. It must bind the
@@ -791,6 +809,8 @@ hash, and every phase raw-output hash, and it must prove:
 - BF16, SDPA, `torch.compile`, fused AdamW, NVLink/fabric manager, NVMe, and
   checkpoint/resume;
 - concurrent Dense on GPUs 0–3 and Split90 on GPUs 4–7;
+- measured process overlap covering at least half of the shorter concurrent
+  arm, so incidental startup/teardown overlap cannot qualify;
 - exactly 100 updates per arm, discarding exactly the first 10 warmup updates;
 - ETA computed from the slower arm’s remaining 90 measured updates, 13,582
   production updates per arm, and all ten pairs.
@@ -824,9 +844,11 @@ names are closed; substitutions or omissions fail:
 ```bash
 set -euo pipefail
 export QUALIFICATION_RECEIPT
+test -n "${MSCTL_APPROVAL_KEY:?set the protected receipt HMAC key}"
 READINESS="$OPERATOR_ROOT/receipts/readiness-${INSTANCE_ID}.json"
 READINESS_REVIEWER=REPLACE_WITH_REVIEWED_IDENTITY
 READINESS_REVIEWED_AT=REPLACE_WITH_UTC_TIMESTAMP
+READINESS_KEY_ID=REPLACE_WITH_HMAC_KEY_ID
 DIAGNOSTIC_ARGS=(
   --diagnostic-receipt "full_corpus_dense=$OPERATOR_ROOT/receipts/diagnostic-full-corpus-dense.json"
   --diagnostic-receipt "full_corpus_split90=$OPERATOR_ROOT/receipts/diagnostic-full-corpus-split90.json"
@@ -848,6 +870,7 @@ python -m msctl --profile "$PROFILE" --repo-root . \
   --sealed-evaluation-fixture "$SEALED_FIXTURE_ROOT" \
   --reviewer "$READINESS_REVIEWER" \
   --reviewed-at "$READINESS_REVIEWED_AT" \
+  --key-id "$READINESS_KEY_ID" \
   --out "$READINESS" \
   > "$REVIEW_ROOT/readiness-plan-${INSTANCE_ID}.json"
 
@@ -863,16 +886,21 @@ python -m msctl --profile "$PROFILE" --repo-root . \
   --sealed-evaluation-fixture "$SEALED_FIXTURE_ROOT" \
   --reviewer "$READINESS_REVIEWER" \
   --reviewed-at "$READINESS_REVIEWED_AT" \
+  --key-id "$READINESS_KEY_ID" \
   --out "$READINESS" \
   --apply > "$REVIEW_ROOT/readiness-result-${INSTANCE_ID}.json"
 ```
 
-The receipt always contains `protected_launch_allowed: true`; the CLI has no
-flag that can bypass validation to manufacture that decision. It binds
+Each diagnostic receipt must also contain its relative `artifact_path`,
+artifact SHA-256, HMAC `key_id`, and purpose-bound signature; readiness
+rehashes the regular artifact and rejects unsigned or symlinked inputs.
+The readiness receipt always contains `protected_launch_allowed: true`; the CLI
+has no flag that can bypass validation to manufacture that decision. It binds
 `sealed_fixture_sha256`, never a not-yet-created checkpoint or study-lock hash.
 Do not edit the frozen preregistration, fixture, receipt, or any bound artifact
-after review. Missing, false, stale, cross-profile, cross-instance, or
-cross-boot evidence must fail locally before any paid lifecycle AWS call.
+after review. Missing, false, stale, cross-profile, cross-instance, cross-boot,
+unsigned, or artifact-mismatched evidence must fail locally before any paid
+lifecycle AWS call.
 
 ## 10. Instantiate manifests and make the explicit fleet plan
 

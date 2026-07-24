@@ -119,6 +119,32 @@ def build_parser() -> JsonArgumentParser:
     control_install.add_argument("--instance-id", required=True)
     control_install.add_argument("--apply", action="store_true")
 
+    canary = _leaf(commands, "canary", help_text="AWS GPU qualification canary")
+    canary_sub = canary.add_subparsers(dest="action", required=True)
+    canary_plan = _leaf(
+        canary_sub,
+        "plan",
+        help_text="render or exclusively publish one authenticated canary plan",
+    )
+    canary_plan.add_argument("--release", required=True)
+    canary_plan.add_argument(
+        "--amendment",
+        default=str(DEFAULT_ROOT / "configs" / "hardware-amendment-v3.json"),
+    )
+    canary_plan.add_argument("--provider-selection", required=True)
+    canary_plan.add_argument("--environment-receipt", required=True)
+    canary_plan.add_argument("--instance-id", required=True)
+    canary_plan.add_argument("--out", required=True)
+    canary_plan.add_argument("--apply", action="store_true")
+    canary_run = _leaf(
+        canary_sub,
+        "run",
+        help_text="plan or send one immutable canary intent through AWS SSM",
+    )
+    canary_run.add_argument("--canary-plan", required=True)
+    canary_run.add_argument("--instance-id", required=True)
+    canary_run.add_argument("--apply", action="store_true")
+
     provider = _leaf(commands, "provider", help_text="provider selection")
     provider_sub = provider.add_subparsers(dest="action", required=True)
     select = _leaf(
@@ -166,6 +192,7 @@ def build_parser() -> JsonArgumentParser:
     readiness_create.add_argument("--sealed-evaluation-fixture", required=True)
     readiness_create.add_argument("--reviewer", required=True)
     readiness_create.add_argument("--reviewed-at", required=True)
+    readiness_create.add_argument("--key-id", required=True)
     readiness_create.add_argument("--out", required=True)
     readiness_create.add_argument("--apply", action="store_true")
 
@@ -527,6 +554,8 @@ def dispatch(
             sealed_evaluation_fixture=args.sealed_evaluation_fixture,
             reviewer=args.reviewer,
             reviewed_at=args.reviewed_at,
+            key_id=args.key_id,
+            environ=environment,
         )
     if command == "fleet plan":
         return not args.apply, plan_fleet(

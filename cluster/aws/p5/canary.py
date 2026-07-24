@@ -38,7 +38,12 @@ _ROOT_FIELDS = frozenset(
     }
 )
 _V3_ROOT_FIELDS = _ROOT_FIELDS | frozenset(
-    {"provenance", "raw_output_sha256"}
+    {
+        "provenance",
+        "raw_output_sha256",
+        "phase_receipt_sha256",
+        "concurrent_phase_evidence",
+    }
 )
 _PROFILE_FIELDS = frozenset({"profile_id", "provider", "profile_sha256"})
 _PROVENANCE_FIELDS = frozenset(
@@ -95,6 +100,22 @@ _THROUGHPUT_FIELDS = frozenset(
     }
 )
 _ARM_FIELDS = frozenset({"arm", "gpu_ids", "update_seconds"})
+_V3_ARM_FIELDS = _ARM_FIELDS | frozenset(
+    {"backend", "ranks", "world_size", "worker_stdout_sha256"}
+)
+_CONCURRENT_PHASES = ("one_step_training", "throughput")
+_OVERLAP_FIELDS = frozenset({"concurrent", "commands", "overlap_ns"})
+_COMMAND_EXECUTION_FIELDS = frozenset(
+    {
+        "arm",
+        "argv_sha256",
+        "receipt_sha256",
+        "started_monotonic_ns",
+        "finished_monotonic_ns",
+        "stdout_sha256",
+        "stderr_sha256",
+    }
+)
 _CAPABILITY_FIELDS = frozenset(
     {
         "fabric_manager_nvlink",
@@ -498,6 +519,147 @@ def _validate_v3_provenance(
     return provenance
 
 
+def _phase_receipt_key(phase: str, arm: str | None) -> str:
+    return phase if arm is None else f"{phase}:{arm}"
+
+
+def _expected_phase_receipt_keys() -> frozenset[str]:
+    return frozenset(
+        {
+            "device-topology-software",
+            "bf16",
+            "sdpa",
+            "torch-compile",
+            "fused-adamw",
+            "simultaneous-4-plus-4-nccl",
+            "nvme",
+            *(
+                _phase_receipt_key(phase, arm)
+                for phase in (
+                    "one-step-training",
+                    "checkpoint",
+                    "resume",
+                    "throughput",
+                )
+                for arm in _ARMS
+            ),
+        }
+    )
+
+
+def validate_concurrent_overlap(
+    commands: object,
+    *,
+    label: str = "concurrent phase",
+) -> int:
+    """Validate two measured process lifetimes and return their real overlap."""
+
+    if not isinstance(commands, list) or len(commands) != 2:
+        raise QualificationError(f"{label} must contain exactly two commands")
+    by_arm: dict[str, Mapping[str, object]] = {}
+    for index, raw in enumerate(commands):
+        command = _object(
+            raw,
+            _COMMAND_EXECUTION_FIELDS,
+            label=f"{label}.commands[{index}]",
+        )
+        arm = command["arm"]
+        started = command["started_monotonic_ns"]
+        finished = command["finished_monotonic_ns"]
+        if (
+            arm not in _ARMS
+            or arm in by_arm
+            or type(started) is not int
+            or type(finished) is not int
+            or started < 0
+            or finished <= started
+        ):
+            raise QualificationError(
+                f"{label} command lifetime or arm identity is invalid"
+            )
+        for field in (
+            "argv_sha256",
+            "receipt_sha256",
+            "stdout_sha256",
+            "stderr_sha256",
+        ):
+            digest = command[field]
+            if not isinstance(digest, str) or _SHA256_RE.fullmatch(digest) is None:
+                raise QualificationError(
+                    f"{label}.{field} must be lowercase SHA-256"
+                )
+        by_arm[str(arm)] = command
+    if set(by_arm) != set(_ARMS):
+        raise QualificationError(f"{label} does not contain both arms")
+    overlap = min(
+        int(by_arm[arm]["finished_monotonic_ns"]) for arm in _ARMS
+    ) - max(int(by_arm[arm]["started_monotonic_ns"]) for arm in _ARMS)
+    if overlap <= 0:
+        raise QualificationError(f"{label} commands did not actually overlap")
+    shorter_lifetime = min(
+        int(by_arm[arm]["finished_monotonic_ns"])
+        - int(by_arm[arm]["started_monotonic_ns"])
+        for arm in _ARMS
+    )
+    if overlap * 2 < shorter_lifetime:
+        raise QualificationError(
+            f"{label} commands did not sustain concurrent execution"
+        )
+    return overlap
+
+
+def _validate_v3_execution_evidence(
+    phase_receipt_sha256: object,
+    concurrent_phase_evidence: object,
+) -> None:
+    hashes = _object(
+        phase_receipt_sha256,
+        _expected_phase_receipt_keys(),
+        label="phase_receipt_sha256",
+    )
+    for name, digest in hashes.items():
+        if not isinstance(digest, str) or _SHA256_RE.fullmatch(digest) is None:
+            raise QualificationError(
+                f"phase_receipt_sha256.{name} must be lowercase SHA-256"
+            )
+    phases = _object(
+        concurrent_phase_evidence,
+        frozenset(_CONCURRENT_PHASES),
+        label="concurrent_phase_evidence",
+    )
+    phase_names = {
+        "one_step_training": "one-step-training",
+        "throughput": "throughput",
+    }
+    for name, receipt_phase in phase_names.items():
+        phase = _object(
+            phases[name],
+            _OVERLAP_FIELDS,
+            label=f"concurrent_phase_evidence.{name}",
+        )
+        if phase["concurrent"] is not True:
+            raise QualificationError(
+                f"concurrent_phase_evidence.{name}.concurrent must be true"
+            )
+        overlap = validate_concurrent_overlap(
+            phase["commands"],
+            label=f"concurrent_phase_evidence.{name}",
+        )
+        if type(phase["overlap_ns"]) is not int or phase["overlap_ns"] != overlap:
+            raise QualificationError(
+                f"concurrent_phase_evidence.{name}.overlap_ns is not measured"
+            )
+        for command in phase["commands"]:
+            arm = str(command["arm"])
+            if (
+                command["receipt_sha256"]
+                != hashes[_phase_receipt_key(receipt_phase, arm)]
+            ):
+                raise QualificationError(
+                    f"concurrent_phase_evidence.{name} receipt binding is stale"
+                )
+
+
 def _exact_capability(
     value: object,
     *,
@@ -700,6 +862,11 @@ def validate_qualification_receipt(
 
     _validate_software(root["software"], profile=profile)
     _validate_capabilities(root["capabilities"], profile=profile)
+    if schema_version == 3:
+        _validate_v3_execution_evidence(
+            root["phase_receipt_sha256"],
+            root["concurrent_phase_evidence"],
+        )
 
     throughput_value = _object(
         root["throughput"],
@@ -734,7 +901,11 @@ def validate_qualification_receipt(
         ),
     }
     for index, raw_arm in enumerate(arms):
-        arm = _object(raw_arm, _ARM_FIELDS, label=f"throughput.arms[{index}]")
+        arm = _object(
+            raw_arm,
+            _V3_ARM_FIELDS if schema_version == 3 else _ARM_FIELDS,
+            label=f"throughput.arms[{index}]",
+        )
         name = arm["arm"]
         if name not in _ARMS or name in by_arm:
             raise QualificationError(
@@ -744,6 +915,17 @@ def validate_qualification_receipt(
             raise QualificationError(
                 f"throughput {name} GPU IDs do not form the required 4+4 pair"
             )
+        if schema_version == 3:
+            if (
+                arm["backend"] != "nccl"
+                or arm["ranks"] != [0, 1, 2, 3]
+                or arm["world_size"] != 4
+                or not isinstance(arm["worker_stdout_sha256"], str)
+                or _SHA256_RE.fullmatch(arm["worker_stdout_sha256"]) is None
+            ):
+                raise QualificationError(
+                    f"throughput {name} did not prove a four-rank DDP workload"
+                )
         by_arm[name] = arm
     if set(by_arm) != set(_ARMS):
         raise QualificationError(
@@ -793,6 +975,7 @@ def build_qualification_receipt(
     phase_receipts: Sequence[Mapping[str, object]],
     *,
     provenance: Mapping[str, object],
+    concurrent_phase_evidence: Mapping[str, object],
 ) -> dict[str, object]:
     """Assemble only validated runtime phase receipts into one v3 receipt."""
 
@@ -831,6 +1014,26 @@ def build_qualification_receipt(
         by_key[key] = receipt
     if set(by_key) != expected_keys:
         raise QualificationError("canary phase receipt inventory is not exact")
+    phase_hashes = {
+        _phase_receipt_key(str(phase), arm if isinstance(arm, str) else None):
+        hashlib.sha256(
+            (
+                json.dumps(
+                    receipt,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    ensure_ascii=True,
+                    allow_nan=False,
+                )
+                + "\n"
+            ).encode("ascii")
+        ).hexdigest()
+        for (phase, arm), receipt in by_key.items()
+    }
+    _validate_v3_execution_evidence(
+        phase_hashes,
+        concurrent_phase_evidence,
+    )
 
     all_gpu_ids = list(range(profile.allocated_gpus))
     gpu_groups = {
@@ -902,6 +1105,13 @@ def build_qualification_receipt(
         or throughputs[arm].get("updates") != CANARY_UPDATES
         or throughputs[arm].get("warmup_updates") != WARMUP_UPDATES
         or throughputs[arm].get("tokens_per_update") != TOKENS_PER_UPDATE
+        or throughputs[arm].get("backend") != "nccl"
+        or throughputs[arm].get("ranks") != [0, 1, 2, 3]
+        or throughputs[arm].get("world_size") != 4
+        or not isinstance(
+            throughputs[arm].get("worker_stdout_sha256"),
+            str,
+        )
         or not isinstance(throughputs[arm].get("update_seconds"), list)
         for arm in _ARMS
     ):
@@ -1019,13 +1229,21 @@ def build_qualification_receipt(
             "arms": [
                 {
                     "arm": arm,
+                    "backend": throughputs[arm]["backend"],
                     "gpu_ids": gpu_groups[arm],
+                    "ranks": throughputs[arm]["ranks"],
                     "update_seconds": throughputs[arm]["update_seconds"],
+                    "worker_stdout_sha256": throughputs[arm][
+                        "worker_stdout_sha256"
+                    ],
+                    "world_size": throughputs[arm]["world_size"],
                 }
                 for arm in _ARMS
             ],
         },
         "provenance": dict(provenance),
+        "phase_receipt_sha256": phase_hashes,
+        "concurrent_phase_evidence": dict(concurrent_phase_evidence),
         "raw_output_sha256": {
             "device_topology_software": raw_hash(
                 ("device-topology-software", None)
@@ -1054,6 +1272,7 @@ def build_qualification_receipt(
         receipt,
         profile,
         expected_instance_id=provenance.get("instance_id"),
+        expected_boot_id=provenance.get("boot_id"),
         expected_provider_selection_sha256=provenance.get(
             "provider_selection_sha256"
         ),
