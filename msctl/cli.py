@@ -9,7 +9,9 @@ import sys
 from collections.abc import Callable
 from pathlib import Path
 
+from .aws_fleet import plan_fleet
 from .aws_p5 import build_aws_backend
+from .aws_selection import plan_provider_selection
 from .cleanup import apply_cleanup, make_cleanup_plan
 from .collect import collect_evidence
 from .contracts import load_release
@@ -32,7 +34,12 @@ from .operations import (
     status_runs,
     submit_runs,
 )
-from .profile import AWS_GPU_PROFILES, SUPPORTED_PROFILE, load_profile
+from .profile import (
+    AWS_GPU_PROFILES,
+    AWS_P5_PROFILE,
+    SUPPORTED_PROFILE,
+    load_profile,
+)
 
 
 SCHEMA_VERSION = 1
@@ -88,6 +95,52 @@ def build_parser() -> JsonArgumentParser:
     capacity_sub = capacity.add_subparsers(dest="action", required=True)
     _leaf(capacity_sub, "check", help_text="query bounded Slurm capacity")
 
+    provider = _leaf(commands, "provider", help_text="provider selection")
+    provider_sub = provider.add_subparsers(dest="action", required=True)
+    select = _leaf(
+        provider_sub,
+        "select",
+        help_text="render or exclusively publish a v3 provider selection",
+    )
+    select.add_argument(
+        "--amendment",
+        default=str(DEFAULT_ROOT / "configs" / "hardware-amendment-v3.json"),
+    )
+    select.add_argument("--region", required=True)
+    select.add_argument("--ami-id", required=True)
+    select.add_argument("--container-image", required=True)
+    select.add_argument("--container-digest", required=True)
+    select.add_argument("--selected-at", required=True)
+    select.add_argument("--out", required=True)
+    select.add_argument("--apply", action="store_true")
+
+    fleet = _leaf(commands, "fleet", help_text="explicit AWS fleet planning")
+    fleet_sub = fleet.add_subparsers(dest="action", required=True)
+    fleet_plan = _leaf(
+        fleet_sub,
+        "plan",
+        help_text="render or exclusively publish a deterministic fleet plan",
+    )
+    fleet_plan.add_argument(
+        "--amendment",
+        default=str(DEFAULT_ROOT / "configs" / "hardware-amendment-v3.json"),
+    )
+    fleet_plan.add_argument("--provider-selection", required=True)
+    fleet_plan.add_argument(
+        "--manifest",
+        dest="manifest_paths",
+        action="append",
+        required=True,
+    )
+    fleet_plan.add_argument(
+        "--instance-id",
+        dest="instance_ids",
+        action="append",
+        required=True,
+    )
+    fleet_plan.add_argument("--out", required=True)
+    fleet_plan.add_argument("--apply", action="store_true")
+
     env = _leaf(commands, "env", help_text="environment lifecycle")
     env_sub = env.add_subparsers(dest="action", required=True)
     ensure_env = _leaf(env_sub, "ensure", help_text="plan or build environment")
@@ -127,6 +180,9 @@ def build_parser() -> JsonArgumentParser:
     instantiate.add_argument("--dataset-receipt", required=True)
     instantiate.add_argument("--seed", required=True, type=int)
     instantiate.add_argument("--out", required=True)
+    instantiate.add_argument("--hardware-amendment")
+    instantiate.add_argument("--provider-selection")
+    instantiate.add_argument("--sealed-evaluation")
     instantiate.add_argument("--apply", action="store_true")
     render = _leaf(runs_sub, "render", help_text="render deterministic Slurm argv")
     render.add_argument("--release", required=True)
@@ -137,6 +193,9 @@ def build_parser() -> JsonArgumentParser:
     render_dataset.add_argument("--dataset-root")
     render_dataset.add_argument("--dataset-verification")
     render.add_argument("--environment-receipt")
+    render.add_argument("--hardware-amendment")
+    render.add_argument("--provider-selection")
+    render.add_argument("--fleet-plan")
 
     for name in ("submit", "resume", "cancel", "evaluate"):
         leaf = _leaf(commands, name, help_text=f"plan or {name} runs")
@@ -150,6 +209,9 @@ def build_parser() -> JsonArgumentParser:
             dataset_binding.add_argument("--dataset-verification")
             leaf.add_argument("--environment-receipt")
         leaf.add_argument("--approval")
+        leaf.add_argument("--hardware-amendment")
+        leaf.add_argument("--provider-selection")
+        leaf.add_argument("--fleet-plan")
         if name == "submit":
             leaf.add_argument("--instance-id")
             leaf.add_argument("--terminate-at")
@@ -161,6 +223,9 @@ def build_parser() -> JsonArgumentParser:
     status.add_argument("--release", required=True)
     status.add_argument("--manifest", required=True)
     status.add_argument("--cached", action="store_true")
+    status.add_argument("--hardware-amendment")
+    status.add_argument("--provider-selection")
+    status.add_argument("--fleet-plan")
 
     collect = _leaf(commands, "collect", help_text="collect result evidence")
     collect.add_argument("--source", required=True)
@@ -173,11 +238,17 @@ def build_parser() -> JsonArgumentParser:
     cleanup_plan.add_argument("--root")
     cleanup_plan.add_argument("--release")
     cleanup_plan.add_argument("--manifest")
+    cleanup_plan.add_argument("--hardware-amendment")
+    cleanup_plan.add_argument("--provider-selection")
+    cleanup_plan.add_argument("--fleet-plan")
     cleanup_apply = _leaf(cleanup_sub, "apply", help_text="apply frozen cleanup")
     cleanup_apply.add_argument("--plan")
     cleanup_apply.add_argument("--release", required=True)
     cleanup_apply.add_argument("--manifest")
     cleanup_apply.add_argument("--approval")
+    cleanup_apply.add_argument("--hardware-amendment")
+    cleanup_apply.add_argument("--provider-selection")
+    cleanup_apply.add_argument("--fleet-plan")
     cleanup_apply.add_argument("--apply", action="store_true", required=True)
     return parser
 
@@ -265,10 +336,39 @@ def dispatch(
             repo_root=args.repo_root,
             apply=args.apply,
             cohort_loader=cohort_loader,
+            hardware_amendment=args.hardware_amendment,
+            provider_selection=args.provider_selection,
+            sealed_evaluation=args.sealed_evaluation,
+        )
+    if command == "provider select":
+        return not args.apply, plan_provider_selection(
+            profile=profile,
+            amendment_path=args.amendment,
+            region=args.region,
+            ami_id=args.ami_id,
+            container_image=args.container_image,
+            container_digest=args.container_digest,
+            selected_at=args.selected_at,
+            out=args.out,
+            apply=args.apply,
+        )
+    if command == "fleet plan":
+        return not args.apply, plan_fleet(
+            profile=profile,
+            amendment_path=args.amendment,
+            provider_selection_path=args.provider_selection,
+            manifest_paths=args.manifest_paths,
+            instance_ids=args.instance_ids,
+            repo_root=args.repo_root,
+            out=args.out,
+            apply=args.apply,
         )
     if provider in AWS_GPU_PROFILES:
         if command == "submit":
-            _require_cli_values(args, "instance_id", "terminate_at")
+            if provider == AWS_P5_PROFILE:
+                _require_cli_values(args, "instance_id", "terminate_at")
+            else:
+                _require_cli_values(args, "terminate_at")
         if command in {"runs render", "submit", "resume", "evaluate"}:
             _require_cli_values(
                 args,

@@ -29,7 +29,13 @@ from .jsonutil import (
     resolve_inside,
     sha256_file,
 )
-from .profile import AWS_P5_PROFILE, SUPPORTED_PROFILE
+from .profile import (
+    AWS_GPU_PROFILES,
+    AWS_P5_PROFILE,
+    AWS_P5_V3_PROFILE,
+    AWS_P6_B300_V3_PROFILE,
+    SUPPORTED_PROFILE,
+)
 
 
 @dataclass(frozen=True)
@@ -68,12 +74,21 @@ class RunManifest:
     cohort_assignment_sha256: str | None
     study_lock_sha256: str | None
     source_commit: str | None
+    preregistration_sha256: str | None
+    hardware_amendment_sha256: str | None
+    provider_selection_sha256: str | None
+    profile_sha256: str | None
+    sealed_evaluation_sha256: str | None
+    estimated_instance_hours: float
+    estimated_gpu_hours: float
     runs: tuple[Run, ...]
     sha256: str
     value: dict[str, object]
 
     @property
     def gpu_hours(self) -> float:
+        if self.schema_version == 3:
+            return self.estimated_gpu_hours
         return sum(run.estimated_gpu_hours for run in self.runs)
 
 
@@ -97,6 +112,11 @@ class CheckpointReceipt:
     sha256: str
     checkpoints: tuple[Checkpoint, ...]
     value: dict[str, object]
+    hardware_amendment_sha256: str | None = None
+    provider_selection_sha256: str | None = None
+    profile_sha256: str | None = None
+    preregistration_sha256: str | None = None
+    sealed_evaluation_sha256: str | None = None
 
 
 _GIT_OBJECT_RE = re.compile(r"^[0-9a-f]{40}(?:[0-9a-f]{24})?$")
@@ -385,10 +405,8 @@ def _verify_release_internals(
         payload["RELEASE-METADATA.json"],
         label="RELEASE-METADATA.json",
     )
-    aws_package = (
-        release_value["provider"] == AWS_P5_PROFILE
-        and "package_format_version" in metadata
-    )
+    aws_provider = release_value["provider"] in AWS_GPU_PROFILES
+    aws_package = aws_provider and "package_format_version" in metadata
     if aws_package:
         metadata_fields = {
             "schema_version",
@@ -403,7 +421,7 @@ def _verify_release_internals(
             "config_sha256",
             "members",
         }
-    elif release_value["provider"] == AWS_P5_PROFILE:
+    elif aws_provider:
         metadata_fields = {
             "schema_version",
             "provider",
@@ -536,7 +554,7 @@ def _verify_release_internals(
     profile_member_path = (
         "cluster/profiles/illumina-usfc-prd.json"
         if release_value["provider"] == SUPPORTED_PROFILE
-        else "cluster/profiles/aws-p5.48xlarge.json"
+        else f"cluster/profiles/{release_value['provider']}.json"
     )
     profile_member = members.get(profile_member_path)
     if profile_member is None or profile_member["sha256"] != profile_hash:
@@ -635,11 +653,12 @@ def _verify_release_internals(
             label="RELEASE-METADATA.json.seed_assignment",
         )
         seeds = assignment["seeds"]
-        expected_seeds = (
-            [0]
-            if release_value["provider"] == SUPPORTED_PROFILE
-            else [1, 2, 3, 4]
-        )
+        if release_value["provider"] == SUPPORTED_PROFILE:
+            expected_seeds = [0]
+        elif release_value["provider"] == AWS_P5_PROFILE:
+            expected_seeds = [1, 2, 3, 4]
+        else:
+            expected_seeds = list(range(10))
         if (
             not isinstance(assignment["cohort_id"], str)
             or not assignment["cohort_id"]
@@ -662,7 +681,7 @@ def load_release(path: Path | str) -> Release:
     release_path = Path(os.path.abspath(os.fspath(path)))
     value = require_object(load_json(release_path, label="release"), label="release")
     aws_package = (
-        value.get("provider") == AWS_P5_PROFILE
+        value.get("provider") in AWS_GPU_PROFILES
         and "package_format_version" in value
     )
     release_fields = {
@@ -701,7 +720,7 @@ def load_release(path: Path | str) -> Release:
             "RELEASE_INVALID",
             "release schema version is unsupported",
         ) from error
-    if value["provider"] not in {SUPPORTED_PROFILE, AWS_P5_PROFILE}:
+    if value["provider"] not in {SUPPORTED_PROFILE, *AWS_GPU_PROFILES}:
         raise MsctlError(
             "RELEASE_INVALID",
             "release provider is unsupported",
@@ -843,7 +862,7 @@ def load_run_manifest(
     if (
         isinstance(schema_version, bool)
         or not isinstance(schema_version, int)
-        or schema_version not in {1, 2}
+        or schema_version not in {1, 2, 3}
     ):
         raise MsctlError(
             "RUN_MANIFEST_INVALID",
@@ -863,19 +882,42 @@ def load_run_manifest(
             "study_lock_sha256",
             "source_commit",
         }
+    elif schema_version == 3:
+        root_fields |= {
+            "seed",
+            "cohort_assignment_sha256",
+            "preregistration_sha256",
+            "hardware_amendment_sha256",
+            "provider_selection_sha256",
+            "profile_sha256",
+            "sealed_evaluation_sha256",
+            "source_commit",
+            "estimated_instance_hours",
+            "estimated_gpu_hours",
+        }
     require_exact_keys(value, root_fields, label="run manifest")
     provider = value["provider"]
-    if provider not in {SUPPORTED_PROFILE, AWS_P5_PROFILE} or (
-        schema_version == 1 and provider != SUPPORTED_PROFILE
-    ):
+    v3_providers = {AWS_P5_V3_PROFILE, AWS_P6_B300_V3_PROFILE}
+    valid_provider = (
+        (schema_version == 1 and provider == SUPPORTED_PROFILE)
+        or (
+            schema_version == 2
+            and provider in {SUPPORTED_PROFILE, AWS_P5_PROFILE}
+        )
+        or (schema_version == 3 and provider in v3_providers)
+    )
+    if not valid_provider:
         raise MsctlError(
             "RUN_MANIFEST_INVALID",
             "run manifest provider or schema is unsupported",
         )
     manifest_seed = 0 if schema_version == 1 else value["seed"]
-    owned_seeds = (
-        (0,) if provider == SUPPORTED_PROFILE else (1, 2, 3, 4)
-    )
+    if schema_version == 3:
+        owned_seeds = tuple(range(10))
+    else:
+        owned_seeds = (
+            (0,) if provider == SUPPORTED_PROFILE else (1, 2, 3, 4)
+        )
     if (
         isinstance(manifest_seed, bool)
         or not isinstance(manifest_seed, int)
@@ -966,6 +1008,16 @@ def load_run_manifest(
                 ),
             )
         )
+    if schema_version == 3 and any(
+        run.run_id != f"memorysplit-v3-360m-s{manifest_seed}-{run.arm}"
+        or run.config
+        != f"configs/360m-v3/{run.arm}-s{manifest_seed}.yaml"
+        for run in runs
+    ):
+        raise MsctlError(
+            "RUN_MANIFEST_INVALID",
+            "v3 run IDs and config paths must identify the frozen seed pair",
+        )
     if (
         {run.arm for run in runs} != {"dense", "split90"}
         or len({run.run_id for run in runs}) != 2
@@ -976,7 +1028,7 @@ def load_run_manifest(
             "run IDs, configs, and Dense/Split90 arms must be unique",
         )
     source_commit: str | None = None
-    if schema_version == 2:
+    if schema_version in {2, 3}:
         raw_commit = value["source_commit"]
         if (
             not isinstance(raw_commit, str)
@@ -987,6 +1039,34 @@ def load_run_manifest(
                 "run manifest source commit is invalid",
             )
         source_commit = raw_commit
+    estimated_instance_hours = 0.0
+    estimated_gpu_hours = 0.0
+    if schema_version == 3:
+        estimated_instance_hours = require_nonnegative_number(
+            value["estimated_instance_hours"],
+            label="run manifest.estimated_instance_hours",
+        )
+        estimated_gpu_hours = require_nonnegative_number(
+            value["estimated_gpu_hours"],
+            label="run manifest.estimated_gpu_hours",
+        )
+        if (
+            estimated_instance_hours <= 0
+            or estimated_gpu_hours <= 0
+            or estimated_gpu_hours != estimated_instance_hours * 8
+        ):
+            raise MsctlError(
+                "RUN_MANIFEST_INVALID",
+                "v3 estimated GPU hours must equal eight times instance hours",
+            )
+    preregistration_sha256 = (
+        require_sha256(
+            value["preregistration_sha256"],
+            label="run manifest.preregistration_sha256",
+        )
+        if schema_version == 3
+        else None
+    )
     return RunManifest(
         schema_version=schema_version,
         provider=str(provider),
@@ -1004,7 +1084,7 @@ def load_run_manifest(
                 value["cohort_assignment_sha256"],
                 label="run manifest.cohort_assignment_sha256",
             )
-            if schema_version == 2
+            if schema_version in {2, 3}
             else None
         ),
         study_lock_sha256=(
@@ -1013,9 +1093,44 @@ def load_run_manifest(
                 label="run manifest.study_lock_sha256",
             )
             if schema_version == 2
-            else None
+            else preregistration_sha256
         ),
         source_commit=source_commit,
+        preregistration_sha256=preregistration_sha256,
+        hardware_amendment_sha256=(
+            require_sha256(
+                value["hardware_amendment_sha256"],
+                label="run manifest.hardware_amendment_sha256",
+            )
+            if schema_version == 3
+            else None
+        ),
+        provider_selection_sha256=(
+            require_sha256(
+                value["provider_selection_sha256"],
+                label="run manifest.provider_selection_sha256",
+            )
+            if schema_version == 3
+            else None
+        ),
+        profile_sha256=(
+            require_sha256(
+                value["profile_sha256"],
+                label="run manifest.profile_sha256",
+            )
+            if schema_version == 3
+            else None
+        ),
+        sealed_evaluation_sha256=(
+            require_sha256(
+                value["sealed_evaluation_sha256"],
+                label="run manifest.sealed_evaluation_sha256",
+            )
+            if schema_version == 3
+            else None
+        ),
+        estimated_instance_hours=estimated_instance_hours,
+        estimated_gpu_hours=estimated_gpu_hours,
         runs=tuple(sorted(runs, key=lambda run: run.run_id)),
         sha256=canonical_sha256(value),
         value=value,
@@ -1027,7 +1142,7 @@ def bind_release(release: Release, manifest: RunManifest) -> None:
         release.archive_sha256 != manifest.release_sha256
         or release.provider != manifest.provider
         or (
-            manifest.schema_version == 2
+            manifest.schema_version in {2, 3}
             and release.source_commit != manifest.source_commit
         )
     ):
@@ -1198,10 +1313,18 @@ def verify_checkpoint_receipt(
     if (
         isinstance(schema_version, bool)
         or not isinstance(schema_version, int)
-        or schema_version not in {1, 2}
+        or schema_version not in {1, 2, 3}
         or (
             manifest.provider == AWS_P5_PROFILE
             and schema_version != 2
+        )
+        or (
+            manifest.schema_version == 3
+            and schema_version != 3
+        )
+        or (
+            manifest.schema_version != 3
+            and schema_version == 3
         )
     ):
         raise MsctlError(
@@ -1216,8 +1339,17 @@ def verify_checkpoint_receipt(
         "dataset_sha256",
         "checkpoints",
     }
-    if schema_version == 2:
+    if schema_version in {2, 3}:
         receipt_fields.add("source_commit")
+    if schema_version == 3:
+        receipt_fields |= {
+            "cohort_assignment_sha256",
+            "preregistration_sha256",
+            "hardware_amendment_sha256",
+            "provider_selection_sha256",
+            "profile_sha256",
+            "sealed_evaluation_sha256",
+        }
     require_exact_keys(value, receipt_fields, label="checkpoint receipt")
     if (
         value["provider"] != manifest.provider
@@ -1225,8 +1357,24 @@ def verify_checkpoint_receipt(
         or value["run_manifest_sha256"] != manifest.sha256
         or value["dataset_sha256"] != manifest.dataset_sha256
         or (
-            schema_version == 2
+            schema_version in {2, 3}
             and value["source_commit"] != manifest.source_commit
+        )
+        or (
+            schema_version == 3
+            and (
+                value["cohort_assignment_sha256"]
+                != manifest.cohort_assignment_sha256
+                or value["preregistration_sha256"]
+                != manifest.preregistration_sha256
+                or value["hardware_amendment_sha256"]
+                != manifest.hardware_amendment_sha256
+                or value["provider_selection_sha256"]
+                != manifest.provider_selection_sha256
+                or value["profile_sha256"] != manifest.profile_sha256
+                or value["sealed_evaluation_sha256"]
+                != manifest.sealed_evaluation_sha256
+            )
         )
     ):
         raise MsctlError(
@@ -1252,7 +1400,7 @@ def verify_checkpoint_receipt(
             "step",
             "world_size",
         }
-        if schema_version == 2:
+        if schema_version in {2, 3}:
             row_fields |= {
                 "arm",
                 "seed",
@@ -1261,9 +1409,7 @@ def verify_checkpoint_receipt(
             }
         require_exact_keys(row, row_fields, label=f"checkpoint[{index}]")
         run_id = row["run_id"]
-        expected_world_size = (
-            4 if manifest.provider == AWS_P5_PROFILE else 3
-        )
+        expected_world_size = 4 if manifest.provider in AWS_GPU_PROFILES else 3
         if (
             not isinstance(run_id, str)
             or run_id not in by_id
@@ -1275,7 +1421,7 @@ def verify_checkpoint_receipt(
             or not isinstance(row["step"], int)
             or row["step"] <= 0
             or (
-                schema_version == 2
+                schema_version in {2, 3}
                 and (
                     row["arm"] != by_id[run_id].arm
                     or row["seed"] != by_id[run_id].seed
@@ -1322,7 +1468,7 @@ def verify_checkpoint_receipt(
                 dataset_sha256=manifest.dataset_sha256,
                 source_commit=(
                     str(row["source_commit"])
-                    if schema_version == 2
+                    if schema_version in {2, 3}
                     else manifest.source_commit
                 ),
                 step=int(row["step"]),
@@ -1346,4 +1492,25 @@ def verify_checkpoint_receipt(
             sorted(checkpoints, key=lambda item: item.run_id)
         ),
         value=value,
+        hardware_amendment_sha256=getattr(
+            manifest,
+            "hardware_amendment_sha256",
+            None,
+        ),
+        provider_selection_sha256=getattr(
+            manifest,
+            "provider_selection_sha256",
+            None,
+        ),
+        profile_sha256=getattr(manifest, "profile_sha256", None),
+        preregistration_sha256=getattr(
+            manifest,
+            "preregistration_sha256",
+            None,
+        ),
+        sealed_evaluation_sha256=getattr(
+            manifest,
+            "sealed_evaluation_sha256",
+            None,
+        ),
     )

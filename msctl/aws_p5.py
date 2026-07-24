@@ -11,16 +11,29 @@ import re
 import subprocess
 import tempfile
 from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Protocol
 from urllib.parse import urlsplit
 
 from .approval import verify_scope_approval
+from .aws_fleet import (
+    FleetManifestBinding,
+    FleetPlan,
+    load_fleet_plan,
+    validate_fleet_manifest,
+)
 from .aws_argv import (
     ARGV_DOCUMENT_CONTENT,
     ARGV_DOCUMENT_NAME,
     ARGV_DOCUMENT_SHA256,
+)
+from .aws_selection import (
+    HardwareAmendment,
+    ProviderSelection,
+    load_hardware_amendment,
+    load_provider_selection,
 )
 from .contracts import (
     bind_release,
@@ -41,7 +54,12 @@ from .jsonutil import (
     require_sha256,
     sha256_file,
 )
-from .profile import AWS_GPU_PROFILES, AWS_P5_PROFILE
+from .profile import (
+    AWS_GPU_PROFILES,
+    AWS_P5_PROFILE,
+    AWS_P5_V3_PROFILE,
+    AWS_P6_B300_V3_PROFILE,
+)
 from .state import StateStore
 
 
@@ -61,6 +79,15 @@ _PROFILE_SEEDS = {
     "aws-p5.48xlarge-v3": tuple(range(10)),
     "aws-p6-b300.48xlarge-v3": tuple(range(10)),
 }
+_V3_PROFILES = frozenset({AWS_P5_V3_PROFILE, AWS_P6_B300_V3_PROFILE})
+_V3_PROVENANCE_FIELDS = (
+    "cohort_assignment_sha256",
+    "preregistration_sha256",
+    "hardware_amendment_sha256",
+    "provider_selection_sha256",
+    "profile_sha256",
+    "sealed_evaluation_sha256",
+)
 _INSTANCE_ID_RE = re.compile(r"^i-[0-9a-f]{8,17}$")
 _COMMAND_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9-]{7,127}$")
 _REGION_RE = re.compile(r"^[a-z]{2}(?:-[a-z0-9]+)+-[0-9]+$")
@@ -99,6 +126,14 @@ _SELECTED_INSTANCE_FIELDS = _INSTANCE_FIELDS | {
     "runtime_sha256",
     "terminate_at",
 }
+_V3_INSTANCE_FIELDS = {
+    "preregistration_sha256",
+    "hardware_amendment_sha256",
+    "provider_selection_sha256",
+    "sealed_evaluation_sha256",
+    "fleet_plan_sha256",
+    "fleet_wave",
+}
 _SAFE_PATH = "/usr/local/bin:/usr/bin:/bin"
 _MAX_PAID_RUNTIME = timedelta(minutes=1440)
 _AWS_PRIVATE_HOME = "/var/lib/memorysplit/aws-private-home"
@@ -128,6 +163,29 @@ _AWS_DSA_CERTIFICATES = {
     "us-east-1": _AWS_US_EAST_1_DSA_CERTIFICATE,
     "us-west-2": _AWS_US_WEST_2_DSA_CERTIFICATE,
 }
+
+
+@dataclass(frozen=True)
+class V3LifecycleContext:
+    """Validated amendment, selection, and fleet binding for one seed pair."""
+
+    amendment: HardwareAmendment
+    selection: ProviderSelection
+    fleet_plan: FleetPlan
+    fleet_binding: FleetManifestBinding
+
+    @property
+    def instance_id(self) -> str:
+        return self.fleet_binding.instance_id
+
+
+def _manifest_schema(manifest: object) -> int | None:
+    value = getattr(manifest, "schema_version", None)
+    return value if type(value) is int else None
+
+
+def _is_v3_manifest(manifest: object) -> bool:
+    return _manifest_schema(manifest) == 3
 
 
 def _verify_instance_identity_pkcs7(
@@ -535,10 +593,17 @@ class AwsP5Backend:
         }
 
     def _validate_manifest(self, manifest: object) -> None:
-        if self.profile.provider != AWS_P5_PROFILE:
+        schema_version = _manifest_schema(manifest)
+        expected_schema = 2 if self.profile.provider == AWS_P5_PROFILE else 3
+        if schema_version != expected_schema:
             raise MsctlError(
                 "RUN_MANIFEST_INVALID",
-                "v2 run manifests remain bound to the legacy AWS P5 profile",
+                "AWS lifecycle manifest schema does not match the selected profile",
+                details={
+                    "provider": self.profile.provider,
+                    "expected_schema_version": expected_schema,
+                    "actual_schema_version": schema_version,
+                },
             )
         runs = getattr(manifest, "runs", ())
         if (
@@ -556,21 +621,24 @@ class AwsP5Backend:
                 "AWS lifecycle requires one owned Dense/Split90 seed pair",
             )
         if (
-            getattr(manifest, "schema_version", None) != 2
-            or not isinstance(getattr(manifest, "source_commit", None), str)
+            not isinstance(getattr(manifest, "source_commit", None), str)
             or _COMMIT_RE.fullmatch(manifest.source_commit) is None
         ):
             raise MsctlError(
                 "RUN_MANIFEST_INVALID",
-                "AWS lifecycle requires a v2 source-bound run manifest",
+                "AWS lifecycle requires a source-bound run manifest",
             )
-        for field in (
+        hash_fields = [
             "release_sha256",
             "dataset_sha256",
             "cohort_assignment_sha256",
-            "study_lock_sha256",
             "sha256",
-        ):
+        ]
+        if schema_version == 2:
+            hash_fields.append("study_lock_sha256")
+        else:
+            hash_fields.extend(_V3_PROVENANCE_FIELDS[1:])
+        for field in hash_fields:
             try:
                 require_sha256(
                     getattr(manifest, field, None),
@@ -592,6 +660,147 @@ class AwsP5Backend:
                     "RUN_MANIFEST_INVALID",
                     "AWS run manifest has an invalid config binding",
                 ) from error
+        if schema_version == 3:
+            instance_hours = getattr(manifest, "estimated_instance_hours", None)
+            gpu_hours = getattr(manifest, "estimated_gpu_hours", None)
+            if (
+                getattr(manifest, "profile_sha256", None) != self.profile.sha256
+                or getattr(manifest, "study_lock_sha256", None)
+                != getattr(manifest, "preregistration_sha256", None)
+                or isinstance(instance_hours, bool)
+                or not isinstance(instance_hours, (int, float))
+                or instance_hours <= 0
+                or isinstance(gpu_hours, bool)
+                or not isinstance(gpu_hours, (int, float))
+                or gpu_hours != instance_hours * self.profile.allocated_gpus
+            ):
+                raise MsctlError(
+                    "RUN_MANIFEST_INVALID",
+                    "v3 manifest profile or estimated-hour binding is invalid",
+                )
+
+    def _validate_v3_context(
+        self,
+        manifest: object,
+        context: V3LifecycleContext | None,
+        *,
+        instance_id: str | None = None,
+    ) -> V3LifecycleContext | None:
+        if not _is_v3_manifest(manifest):
+            if context is not None:
+                raise MsctlError(
+                    "FLEET_PLAN_INVALID",
+                    "v2 lifecycle cannot consume v3 amendment or fleet bindings",
+                )
+            return None
+        if context is None:
+            raise MsctlError(
+                "FLEET_PLAN_REQUIRED",
+                "v3 lifecycle requires a validated provider selection and fleet plan",
+            )
+        selection = context.selection
+        plan = context.fleet_plan
+        binding = validate_fleet_manifest(
+            plan,
+            manifest,
+            instance_id=instance_id,
+        )
+        if (
+            context.fleet_binding != binding
+            or context.amendment.sha256
+            != getattr(manifest, "hardware_amendment_sha256", None)
+            or selection.sha256
+            != getattr(manifest, "provider_selection_sha256", None)
+            or selection.profile_sha256 != self.profile.sha256
+            or selection.provider != self.profile.provider
+            or selection.region != self.runtime.region
+            or selection.ami_id != self.runtime.ami_id
+            or selection.container_image != self.runtime.container_image
+            or selection.container_digest != self.runtime.container_digest
+        ):
+            raise MsctlError(
+                "PROVIDER_SELECTION_MISMATCH",
+                "v3 lifecycle context conflicts with the selected runtime",
+            )
+        return context
+
+    def _load_v3_context(
+        self,
+        manifest: object,
+        *,
+        amendment_path: Path | str | None,
+        provider_selection_path: Path | str | None,
+        fleet_plan_path: Path | str | None,
+        instance_id: str | None = None,
+    ) -> V3LifecycleContext | None:
+        if not _is_v3_manifest(manifest):
+            if any(
+                value is not None
+                for value in (
+                    amendment_path,
+                    provider_selection_path,
+                    fleet_plan_path,
+                )
+            ):
+                raise MsctlError(
+                    "CLI_USAGE",
+                    "v3 lifecycle bindings cannot be supplied to a v2 manifest",
+                )
+            return None
+        if (
+            amendment_path is None
+            or provider_selection_path is None
+            or fleet_plan_path is None
+        ):
+            raise MsctlError(
+                "CLI_USAGE",
+                "v3 lifecycle requires --hardware-amendment, "
+                "--provider-selection, and --fleet-plan",
+            )
+        amendment = load_hardware_amendment(amendment_path)
+        selection = load_provider_selection(
+            provider_selection_path,
+            amendment=amendment,
+            profile=self.profile,
+        )
+        plan = load_fleet_plan(
+            fleet_plan_path,
+            profile=self.profile,
+            selection=selection,
+        )
+        binding = validate_fleet_manifest(
+            plan,
+            manifest,
+            instance_id=instance_id,
+        )
+        context = V3LifecycleContext(
+            amendment=amendment,
+            selection=selection,
+            fleet_plan=plan,
+            fleet_binding=binding,
+        )
+        return self._validate_v3_context(
+            manifest,
+            context,
+            instance_id=instance_id,
+        )
+
+    def _v3_bindings(
+        self,
+        manifest: object,
+        context: V3LifecycleContext | None,
+    ) -> dict[str, object]:
+        if not _is_v3_manifest(manifest):
+            return {}
+        validated = self._validate_v3_context(manifest, context)
+        assert validated is not None
+        return {
+            field: getattr(manifest, field)
+            for field in _V3_PROVENANCE_FIELDS
+        } | {
+            "fleet_plan_sha256": validated.fleet_plan.sha256,
+            "fleet_wave": validated.fleet_binding.wave,
+        }
 
     def _validate_release(self, release: object, manifest: object) -> None:
         if (
@@ -620,7 +829,9 @@ class AwsP5Backend:
         checkpoints: Mapping[str, object] | None = None,
         checkpoint_receipt_sha256: str | None = None,
         evidence: Mapping[str, str] | None = None,
+        context: V3LifecycleContext | None = None,
     ) -> dict[str, object]:
+        v3_bindings = self._v3_bindings(manifest, context)
         lifecycle_evidence = dict(
             evidence
             or {
@@ -645,6 +856,8 @@ class AwsP5Backend:
         staging = f"{scratch_root}/staging"
         dataset_root = f"{scratch_root}/dataset"
         profile_name = f"{self.profile.profile_id}.json"
+        cohort_version = "v3" if _is_v3_manifest(manifest) else "v2"
+        cohort_name = f"cohort-assignment-{cohort_version}.json"
         steps: list[dict[str, object]] = []
         if operation == "submit":
             assert terminate_at is not None
@@ -671,7 +884,7 @@ class AwsP5Backend:
                 f"releases/{release.archive_sha256}/RELEASE.json"
             )
             cohort_bucket, cohort_key = self._s3_location(
-                f"releases/{release.archive_sha256}/cohort-assignment-v2.json"
+                f"releases/{release.archive_sha256}/{cohort_name}"
             )
             steps.extend(
                 [
@@ -762,7 +975,7 @@ class AwsP5Backend:
                             "ENABLED",
                             (
                                 f"{staging}/releases/{release.archive_sha256}/"
-                                "cohort-assignment-v2.json"
+                                f"{cohort_name}"
                             ),
                         ],
                     },
@@ -816,7 +1029,7 @@ class AwsP5Backend:
                         "--cohort-assignment",
                         (
                             f"{staging}/releases/{release.archive_sha256}/"
-                            "cohort-assignment-v2.json"
+                                f"{cohort_name}"
                         ),
                         "--cohort-assignment-sha256",
                         manifest.cohort_assignment_sha256,
@@ -860,6 +1073,43 @@ class AwsP5Backend:
                         manifest.cohort_assignment_sha256,
                         "--code-commit",
                         manifest.source_commit,
+                        *(
+                            argument
+                            for field, option in (
+                                (
+                                    "preregistration_sha256",
+                                    "--preregistration-sha256",
+                                ),
+                                (
+                                    "hardware_amendment_sha256",
+                                    "--hardware-amendment-sha256",
+                                ),
+                                (
+                                    "provider_selection_sha256",
+                                    "--provider-selection-sha256",
+                                ),
+                                (
+                                    "sealed_evaluation_sha256",
+                                    "--sealed-evaluation-sha256",
+                                ),
+                                (
+                                    "fleet_plan_sha256",
+                                    "--fleet-plan-sha256",
+                                ),
+                            )
+                            if field in v3_bindings
+                            for argument in (option, str(v3_bindings[field]))
+                        ),
+                        *(
+                            [
+                                "--run-manifest-sha256",
+                                manifest.sha256,
+                                "--fleet-wave",
+                                str(v3_bindings["fleet_wave"]),
+                            ]
+                            if v3_bindings
+                            else []
+                        ),
                         "--bootstrap-receipt",
                         f"{staging}/bootstrap-receipt.json",
                         "--corpus-receipt",
@@ -1014,7 +1264,7 @@ class AwsP5Backend:
             ]
         steps.append({"name": "paired-launch", "argv": launcher_argv})
         return {
-            "schema_version": 1,
+            "schema_version": 3 if v3_bindings else 1,
             "operation": operation,
             "provider": self.profile.provider,
             "instance_type": self.profile.instance_type,
@@ -1024,6 +1274,7 @@ class AwsP5Backend:
             "release_sha256": release.archive_sha256,
             "run_manifest_sha256": manifest.sha256,
             "dataset_sha256": manifest.dataset_sha256,
+            **v3_bindings,
             **lifecycle_evidence,
             "runtime_sha256": self._runtime_sha256(),
             "environment": {
@@ -1306,6 +1557,21 @@ class AwsP5Backend:
                     "Name=instance-state-name,Values=pending,running,stopping",
                 ]
             )
+        v3_query = (
+            "preregistration_sha256:"
+            "Tags[?Key=='MemorySplitPreregistrationSHA256']|[0].Value,"
+            "hardware_amendment_sha256:"
+            "Tags[?Key=='MemorySplitHardwareAmendmentSHA256']|[0].Value,"
+            "provider_selection_sha256:"
+            "Tags[?Key=='MemorySplitProviderSelectionSHA256']|[0].Value,"
+            "sealed_evaluation_sha256:"
+            "Tags[?Key=='MemorySplitSealedEvaluationSHA256']|[0].Value,"
+            "fleet_plan_sha256:"
+            "Tags[?Key=='MemorySplitFleetPlanSHA256']|[0].Value,"
+            "fleet_wave:to_number(Tags[?Key=='MemorySplitFleetWave']|[0].Value),"
+            if _is_v3_manifest(manifest)
+            else ""
+        )
         query = (
             "{instances:Reservations[].Instances[]."
             "{instance_id:InstanceId,instance_type:InstanceType,"
@@ -1320,6 +1586,7 @@ class AwsP5Backend:
             "run_manifest_sha256:"
             "Tags[?Key=='MemorySplitRunManifestSHA256']|[0].Value,"
             "profile_sha256:Tags[?Key=='MemorySplitProfileSHA256']|[0].Value,"
+            f"{v3_query}"
             "gres:Tags[?Key=='MemorySplitGRES']|[0].Value}}"
         )
         return self._aws_argv(
@@ -1329,12 +1596,31 @@ class AwsP5Backend:
             query=query,
         )
 
-    def _selected_instance_argv(self, instance_id: str) -> list[str]:
+    def _selected_instance_argv(
+        self,
+        instance_id: str,
+        manifest: object | None = None,
+    ) -> list[str]:
         if _INSTANCE_ID_RE.fullmatch(instance_id) is None:
             raise MsctlError(
                 "INSTANCE_BINDING_MISMATCH",
                 "EC2 instance ID is invalid",
             )
+        v3_query = (
+            "preregistration_sha256:"
+            "Tags[?Key=='MemorySplitPreregistrationSHA256']|[0].Value,"
+            "hardware_amendment_sha256:"
+            "Tags[?Key=='MemorySplitHardwareAmendmentSHA256']|[0].Value,"
+            "provider_selection_sha256:"
+            "Tags[?Key=='MemorySplitProviderSelectionSHA256']|[0].Value,"
+            "sealed_evaluation_sha256:"
+            "Tags[?Key=='MemorySplitSealedEvaluationSHA256']|[0].Value,"
+            "fleet_plan_sha256:"
+            "Tags[?Key=='MemorySplitFleetPlanSHA256']|[0].Value,"
+            "fleet_wave:to_number(Tags[?Key=='MemorySplitFleetWave']|[0].Value),"
+            if manifest is not None and _is_v3_manifest(manifest)
+            else ""
+        )
         query = (
             "{instances:Reservations[].Instances[]."
             "{instance_id:InstanceId,instance_type:InstanceType,"
@@ -1350,6 +1636,7 @@ class AwsP5Backend:
             "run_manifest_sha256:"
             "Tags[?Key=='MemorySplitRunManifestSHA256']|[0].Value,"
             "profile_sha256:Tags[?Key=='MemorySplitProfileSHA256']|[0].Value,"
+            f"{v3_query}"
             "runtime_sha256:Tags[?Key=='MemorySplitRuntimeSHA256']|[0].Value,"
             "container_digest:"
             "Tags[?Key=='MemorySplitContainerDigest']|[0].Value,"
@@ -1369,6 +1656,7 @@ class AwsP5Backend:
         manifest: object,
         *,
         terminate_at: str,
+        context: V3LifecycleContext | None = None,
     ) -> dict[str, object]:
         return {
             "provider": self.profile.provider,
@@ -1383,6 +1671,7 @@ class AwsP5Backend:
             "container_digest": self.runtime.container_digest,
             "gres": _profile_gres(self.profile),
             "terminate_at": terminate_at,
+            **self._v3_bindings(manifest, context),
         }
 
     def _parse_selected_instance(
@@ -1393,6 +1682,7 @@ class AwsP5Backend:
         instance_id: str,
         terminate_at: str,
         require_bound: bool,
+        context: V3LifecycleContext | None = None,
     ) -> dict[str, object]:
         root = _aws_output_object(
             output,
@@ -1410,7 +1700,11 @@ class AwsP5Backend:
             )
         row = _aws_output_object(
             rows[0],
-            _SELECTED_INSTANCE_FIELDS,
+            (
+                _SELECTED_INSTANCE_FIELDS | _V3_INSTANCE_FIELDS
+                if _is_v3_manifest(manifest)
+                else _SELECTED_INSTANCE_FIELDS
+            ),
             label="selected EC2 instance",
         )
         if (
@@ -1427,6 +1721,7 @@ class AwsP5Backend:
         expected = self._selected_binding(
             manifest,
             terminate_at=terminate_at,
+            context=context,
         )
         observed = {field: row[field] for field in expected}
         if require_bound:
@@ -1447,10 +1742,12 @@ class AwsP5Backend:
         manifest: object,
         *,
         terminate_at: str,
+        context: V3LifecycleContext | None = None,
     ) -> str:
         binding = self._selected_binding(
             manifest,
             terminate_at=terminate_at,
+            context=context,
         )
         names = {
             "provider": "MemorySplitProvider",
@@ -1466,6 +1763,25 @@ class AwsP5Backend:
             "gres": "MemorySplitGRES",
             "terminate_at": "MemorySplitTerminateAt",
         }
+        if _is_v3_manifest(manifest):
+            names.update(
+                {
+                    "preregistration_sha256": (
+                        "MemorySplitPreregistrationSHA256"
+                    ),
+                    "hardware_amendment_sha256": (
+                        "MemorySplitHardwareAmendmentSHA256"
+                    ),
+                    "provider_selection_sha256": (
+                        "MemorySplitProviderSelectionSHA256"
+                    ),
+                    "sealed_evaluation_sha256": (
+                        "MemorySplitSealedEvaluationSHA256"
+                    ),
+                    "fleet_plan_sha256": "MemorySplitFleetPlanSHA256",
+                    "fleet_wave": "MemorySplitFleetWave",
+                }
+            )
         return canonical_json(
             [
                 {"Key": names[field], "Value": str(binding[field])}
@@ -1479,14 +1795,16 @@ class AwsP5Backend:
         *,
         instance_id: str,
         terminate_at: str,
+        context: V3LifecycleContext | None = None,
     ) -> dict[str, object]:
-        selected_argv = self._selected_instance_argv(instance_id)
+        selected_argv = self._selected_instance_argv(instance_id, manifest)
         self._parse_selected_instance(
             self._run(selected_argv, operation="validate selected instance"),
             manifest,
             instance_id=instance_id,
             terminate_at=terminate_at,
             require_bound=False,
+            context=context,
         )
         modify = self._aws_argv(
             "ec2",
@@ -1508,7 +1826,11 @@ class AwsP5Backend:
             "--resources",
             instance_id,
             "--tags",
-            self._instance_tags(manifest, terminate_at=terminate_at),
+            self._instance_tags(
+                manifest,
+                terminate_at=terminate_at,
+                context=context,
+            ),
             query="{}",
         )
         _aws_output_object(
@@ -1522,6 +1844,7 @@ class AwsP5Backend:
             instance_id=instance_id,
             terminate_at=terminate_at,
             require_bound=True,
+            context=context,
         )
         attribute = self._aws_argv(
             "ec2",
@@ -1562,8 +1885,9 @@ class AwsP5Backend:
         instance_id: str,
         terminate_at: str,
         operation: str,
+        context: V3LifecycleContext | None = None,
     ) -> dict[str, object]:
-        selected_argv = self._selected_instance_argv(instance_id)
+        selected_argv = self._selected_instance_argv(instance_id, manifest)
         row = self._parse_selected_instance(
             self._run(
                 selected_argv,
@@ -1573,6 +1897,7 @@ class AwsP5Backend:
             instance_id=instance_id,
             terminate_at=terminate_at,
             require_bound=True,
+            context=context,
         )
         attribute = self._aws_argv(
             "ec2",
@@ -1613,6 +1938,7 @@ class AwsP5Backend:
         self,
         output: object,
         manifest: object,
+        context: V3LifecycleContext | None = None,
     ) -> list[dict[str, object]]:
         root = _aws_output_object(
             output,
@@ -1625,7 +1951,11 @@ class AwsP5Backend:
         ):
             row = _aws_output_object(
                 raw,
-                _INSTANCE_FIELDS,
+                (
+                    _INSTANCE_FIELDS | _V3_INSTANCE_FIELDS
+                    if _is_v3_manifest(manifest)
+                    else _INSTANCE_FIELDS
+                ),
                 label=f"EC2 instance[{index}]",
             )
             if (
@@ -1644,6 +1974,16 @@ class AwsP5Backend:
                 or row["run_manifest_sha256"] != manifest.sha256
                 or row["profile_sha256"] != self.profile.sha256
                 or row["gres"] != _profile_gres(self.profile)
+                or (
+                    _is_v3_manifest(manifest)
+                    and any(
+                        row[field] != expected
+                        for field, expected in self._v3_bindings(
+                            manifest,
+                            context,
+                        ).items()
+                    )
+                )
             ):
                 raise MsctlError(
                     "INSTANCE_BINDING_MISMATCH",
@@ -1664,20 +2004,27 @@ class AwsP5Backend:
             )
         return instances
 
-    def discover_instances(self, manifest: object) -> list[dict[str, object]]:
+    def discover_instances(
+        self,
+        manifest: object,
+        context: V3LifecycleContext | None = None,
+    ) -> list[dict[str, object]]:
         self._validate_manifest(manifest)
+        self._validate_v3_context(manifest, context)
         return self._parse_instances(
             self._run(
                 self._discover_argv(manifest),
                 operation="instance discovery",
             ),
             manifest,
+            context,
         )
 
     def _validate_exact_instance(
         self,
         manifest: object,
         instance_id: str,
+        context: V3LifecycleContext | None = None,
     ) -> dict[str, object]:
         rows = self._parse_instances(
             self._run(
@@ -1685,6 +2032,7 @@ class AwsP5Backend:
                 operation="instance validation",
             ),
             manifest,
+            context,
         )
         if len(rows) != 1:
             raise MsctlError(
@@ -1806,6 +2154,7 @@ class AwsP5Backend:
         self,
         state: dict[str, object],
         manifest: object,
+        context: V3LifecycleContext | None = None,
     ) -> bool:
         by_id = {run.run_id: run for run in manifest.runs}
         run = by_id.get(state.get("run_id"))
@@ -1824,7 +2173,6 @@ class AwsP5Backend:
             and state.get("run_manifest_sha256") == manifest.sha256
             and state.get("cohort_assignment_sha256")
             == manifest.cohort_assignment_sha256
-            and state.get("study_lock_sha256") == manifest.study_lock_sha256
             and state.get("source_commit") == manifest.source_commit
             and state.get("profile_sha256") == self.profile.sha256
             and state.get("runtime_sha256") == self._runtime_sha256()
@@ -1838,6 +2186,19 @@ class AwsP5Backend:
                     isinstance(command_id, str)
                     and _COMMAND_ID_RE.fullmatch(command_id) is not None
                 )
+            )
+            and (
+                (
+                    all(
+                        state.get(field) == expected
+                        for field, expected in self._v3_bindings(
+                            manifest,
+                            context,
+                        ).items()
+                    )
+                )
+                if _is_v3_manifest(manifest)
+                else state.get("study_lock_sha256") == manifest.study_lock_sha256
             )
         )
 
@@ -1871,12 +2232,14 @@ class AwsP5Backend:
         release: object,
         instance_id: str,
         terminate_at: str,
+        context: V3LifecycleContext | None = None,
     ) -> dict[str, object]:
         operation_intent = self._training_operation_intent(
             operation="submit",
             release=release,
             manifest=manifest,
             terminate_at=terminate_at,
+            context=context,
         )
         return {
             "provider": self.profile.provider,
@@ -1922,6 +2285,7 @@ class AwsP5Backend:
         manifest: object,
         instance_id: str,
         terminate_at: str,
+        context: V3LifecycleContext | None = None,
     ) -> dict[str, object]:
         return aws_resource_request(
             "submit",
@@ -1931,6 +2295,7 @@ class AwsP5Backend:
                 manifest=manifest,
                 instance_id=instance_id,
                 terminate_at=terminate_at,
+                context=context,
             ),
         )
 
@@ -1941,6 +2306,7 @@ class AwsP5Backend:
         manifest: object,
         instance_id: str,
         terminate_at: str,
+        context: V3LifecycleContext | None = None,
     ) -> dict[str, object]:
         return {
             "ami_id": self.runtime.ami_id,
@@ -1955,6 +2321,7 @@ class AwsP5Backend:
             "runtime_sha256": self._runtime_sha256(),
             "seed": manifest.seed,
             "terminate_at": terminate_at,
+            **self._v3_bindings(manifest, context),
         }
 
     def _cleanup_resources(
@@ -1964,6 +2331,7 @@ class AwsP5Backend:
         manifest: object,
         instance_id: str,
         terminate_at: str,
+        context: V3LifecycleContext | None = None,
     ) -> dict[str, object]:
         return aws_resource_request(
             "cleanup",
@@ -1973,6 +2341,28 @@ class AwsP5Backend:
                 manifest=manifest,
                 instance_id=instance_id,
                 terminate_at=terminate_at,
+                context=context,
+            ),
+        )
+
+    def _cancel_resources(
+        self,
+        *,
+        release: object,
+        manifest: object,
+        instance_id: str,
+        terminate_at: str,
+        context: V3LifecycleContext | None = None,
+    ) -> dict[str, object]:
+        return aws_resource_request(
+            "cancel",
+            profile=self.profile,
+            bindings=self._execution_bindings(
+                release=release,
+                manifest=manifest,
+                instance_id=instance_id,
+                terminate_at=terminate_at,
+                context=context,
             ),
         )
 
@@ -1983,6 +2373,7 @@ class AwsP5Backend:
         manifest: object,
         instance_id: str,
         terminate_at: str,
+        context: V3LifecycleContext | None = None,
     ) -> dict[str, object]:
         return aws_resource_request(
             "evaluate",
@@ -1992,6 +2383,7 @@ class AwsP5Backend:
                 manifest=manifest,
                 instance_id=instance_id,
                 terminate_at=terminate_at,
+                context=context,
             ),
         )
 
@@ -2003,6 +2395,7 @@ class AwsP5Backend:
         instance_id: str,
         terminate_at: str,
         checkpoint_receipt_sha256: str,
+        context: V3LifecycleContext | None = None,
     ) -> dict[str, object]:
         return aws_resource_request(
             "resume",
@@ -2013,6 +2406,7 @@ class AwsP5Backend:
                     manifest=manifest,
                     instance_id=instance_id,
                     terminate_at=terminate_at,
+                    context=context,
                 ),
                 "checkpoint_receipt_sha256": checkpoint_receipt_sha256,
             },
@@ -2157,10 +2551,13 @@ class AwsP5Backend:
                 local_path=Path(repo_root) / run.config,
                 label="run config",
             )
+        version = "v3" if _is_v3_manifest(manifest) else "v2"
         cohort_member = release.members.get(
-            "configs/cohort-assignment-v2.json"
+            f"configs/cohort-assignment-{version}.json"
         )
-        study_member = release.members.get("configs/preregistration-v2.yaml")
+        study_member = release.members.get(
+            f"configs/preregistration-{version}.yaml"
+        )
         if (
             cohort_member is None
             or cohort_member.get("sha256")
@@ -2172,6 +2569,26 @@ class AwsP5Backend:
                 "RELEASE_COHORT_MISMATCH",
                 "AWS release does not bind the manifest cohort and study lock",
             )
+        if _is_v3_manifest(manifest):
+            amendment_member = release.members.get(
+                "configs/hardware-amendment-v3.json"
+            )
+            sealed_matches = [
+                relative
+                for relative, member in release.members.items()
+                if member.get("sha256") == manifest.sealed_evaluation_sha256
+            ]
+            if (
+                amendment_member is None
+                or amendment_member.get("sha256")
+                != manifest.hardware_amendment_sha256
+                or len(sealed_matches) != 1
+            ):
+                raise MsctlError(
+                    "RELEASE_COHORT_MISMATCH",
+                    "AWS v3 release does not bind the amendment and sealed "
+                    "evaluation",
+                )
         return release, manifest
 
     def _load_lifecycle_evidence(
@@ -2206,9 +2623,14 @@ class AwsP5Backend:
             },
             label="AWS dataset pointer",
         )
+        allowed_pointer_providers = {self.profile.provider}
+        if _is_v3_manifest(manifest):
+            # The v3 amendment supersedes hardware selection, not the frozen
+            # Task 4 dataset publication originally qualified on legacy P5.
+            allowed_pointer_providers.add(AWS_P5_PROFILE)
         if (
             pointer["schema_version"] != 1
-            or pointer["provider"] != self.profile.provider
+            or pointer["provider"] not in allowed_pointer_providers
             or pointer["materialization"] != "s3"
             or pointer["durable_uri_env"]
             != getattr(self.profile, "durable_uri_env", "MS_S3_ROOT")
@@ -2331,14 +2753,17 @@ class AwsP5Backend:
         release: object,
         manifest: object,
         evidence: Mapping[str, str] | None = None,
+        context: V3LifecycleContext | None = None,
     ) -> dict[str, object]:
         self._validate_manifest(manifest)
         self._validate_release(release, manifest)
+        self._validate_v3_context(manifest, context)
         operation_intent = self._training_operation_intent(
             operation="render",
             release=release,
             manifest=manifest,
             evidence=evidence,
+            context=context,
         )
         return {
             "provider": self.profile.provider,
@@ -2358,12 +2783,14 @@ class AwsP5Backend:
         release: object,
         manifest: object,
         cached: bool,
+        context: V3LifecycleContext | None = None,
     ) -> dict[str, object]:
         self._validate_manifest(manifest)
         self._validate_release(release, manifest)
+        validated_context = self._validate_v3_context(manifest, context)
         store = StateStore(self.state_root)
         with store.locked():
-            states = self._paired_states(store, manifest)
+            states = self._paired_states(store, manifest, context)
             command_ids = {state.get("command_id") for state in states}
             instance_ids = {state.get("instance_id") for state in states}
             if (
@@ -2378,6 +2805,14 @@ class AwsP5Backend:
                 )
             command_id = str(next(iter(command_ids)))
             instance_id = str(next(iter(instance_ids)))
+            if (
+                validated_context is not None
+                and instance_id != validated_context.instance_id
+            ):
+                raise MsctlError(
+                    "FLEET_PLAN_INVALID",
+                    "status state is bound to a different fleet instance",
+                )
             if cached:
                 statuses = {str(state.get("status")) for state in states}
                 status = (
@@ -3115,10 +3550,11 @@ class AwsP5Backend:
         attempt: int,
         checkpoint_receipt_sha256: str | None = None,
         prior_command_ids: list[str] | None = None,
+        context: V3LifecycleContext | None = None,
     ) -> dict[str, object]:
         now = _timestamp()
         state: dict[str, object] = {
-            "schema_version": 1,
+            "schema_version": 3 if _is_v3_manifest(manifest) else 1,
             "run_id": run.run_id,
             "arm": run.arm,
             "seed": run.seed,
@@ -3137,7 +3573,6 @@ class AwsP5Backend:
                 "environment_receipt_sha256"
             ],
             "cohort_assignment_sha256": manifest.cohort_assignment_sha256,
-            "study_lock_sha256": manifest.study_lock_sha256,
             "source_commit": manifest.source_commit,
             "profile_sha256": self.profile.sha256,
             "runtime_sha256": self._runtime_sha256(),
@@ -3156,6 +3591,10 @@ class AwsP5Backend:
             "created_at": now,
             "updated_at": now,
         }
+        if _is_v3_manifest(manifest):
+            state.update(self._v3_bindings(manifest, context))
+        else:
+            state["study_lock_sha256"] = manifest.study_lock_sha256
         if operation == "resume":
             state["checkpoint_receipt_sha256"] = checkpoint_receipt_sha256
             state["prior_command_ids"] = list(prior_command_ids or [])
@@ -3166,6 +3605,7 @@ class AwsP5Backend:
         store: StateStore,
         manifest: object,
         states: Sequence[dict[str, object]],
+        context: V3LifecycleContext | None = None,
     ) -> None:
         if len(states) != 2 or len({state["run_id"] for state in states}) != 2:
             raise MsctlError(
@@ -3178,18 +3618,21 @@ class AwsP5Backend:
                 "STATE_CORRUPT",
                 "AWS pair update must bind one operation",
             )
+        pair = {
+            "schema_version": 3 if _is_v3_manifest(manifest) else 1,
+            "provider": self.profile.provider,
+            "instance_type": self.profile.instance_type,
+            "profile_sha256": self.profile.sha256,
+            "gres": _profile_gres(self.profile),
+            "run_manifest_sha256": manifest.sha256,
+            "operation_id": next(iter(operation_ids)),
+            "states": [dict(state) for state in states],
+        }
+        if _is_v3_manifest(manifest):
+            pair.update(self._v3_bindings(manifest, context))
         store.write_aws_pair(
             manifest.sha256,
-            {
-                "schema_version": 1,
-                "provider": self.profile.provider,
-                "instance_type": self.profile.instance_type,
-                "profile_sha256": self.profile.sha256,
-                "gres": _profile_gres(self.profile),
-                "run_manifest_sha256": manifest.sha256,
-                "operation_id": next(iter(operation_ids)),
-                "states": [dict(state) for state in states],
-            },
+            pair,
         )
         for state in states:
             store.write_run(str(state["run_id"]), state)
@@ -3198,6 +3641,7 @@ class AwsP5Backend:
         self,
         store: StateStore,
         manifest: object,
+        context: V3LifecycleContext | None = None,
     ) -> None:
         journal = store.read_aws_pair(manifest.sha256)
         if journal is None:
@@ -3207,6 +3651,16 @@ class AwsP5Backend:
             or journal.get("instance_type") != self.profile.instance_type
             or journal.get("profile_sha256") != self.profile.sha256
             or journal.get("gres") != _profile_gres(self.profile)
+            or (
+                _is_v3_manifest(manifest)
+                and any(
+                    journal.get(field) != expected
+                    for field, expected in self._v3_bindings(
+                        manifest,
+                        context,
+                    ).items()
+                )
+            )
         ):
             raise MsctlError(
                 "STATE_CORRUPT",
@@ -3416,14 +3870,27 @@ class AwsP5Backend:
         *,
         release: object,
         manifest: object,
-        instance_id: str,
+        instance_id: str | None,
         terminate_at: str,
         approval_path: Path | str | None,
         apply: bool,
         evidence: Mapping[str, str] | None = None,
+        context: V3LifecycleContext | None = None,
     ) -> dict[str, object]:
         self._validate_manifest(manifest)
         self._validate_release(release, manifest)
+        validated_context = self._validate_v3_context(
+            manifest,
+            context,
+            instance_id=instance_id,
+        )
+        if validated_context is not None:
+            instance_id = validated_context.instance_id
+        if not isinstance(instance_id, str):
+            raise MsctlError(
+                "INSTANCE_BINDING_MISMATCH",
+                "submit requires one explicit or fleet-bound EC2 instance ID",
+            )
         self._validate_submit_selection(instance_id, terminate_at)
         core = self._training_operation_intent(
             operation="submit",
@@ -3431,6 +3898,7 @@ class AwsP5Backend:
             manifest=manifest,
             terminate_at=terminate_at,
             evidence=evidence,
+            context=context,
         )
         operation_intent = self._operation_envelope(
             core,
@@ -3443,6 +3911,7 @@ class AwsP5Backend:
                 release=release,
                 instance_id=instance_id,
                 terminate_at=terminate_at,
+                context=context,
             )
             plan["operation_intent"] = operation_intent
             plan["operation_id"] = operation_intent["operation_id"]
@@ -3452,6 +3921,7 @@ class AwsP5Backend:
             manifest=manifest,
             instance_id=instance_id,
             terminate_at=terminate_at,
+            context=context,
         )
         resources.update(
             {
@@ -3473,12 +3943,12 @@ class AwsP5Backend:
 
         store = StateStore(self.state_root)
         with store.locked():
-            self._repair_paired_states(store, manifest)
+            self._repair_paired_states(store, manifest, context)
             states = [store.read_run(run.run_id) for run in manifest.runs]
             existing = [state for state in states if state is not None]
             if existing:
                 if len(existing) != 2 or not all(
-                    self._same_state_binding(state, manifest)
+                    self._same_state_binding(state, manifest, context)
                     for state in existing
                 ):
                     raise MsctlError(
@@ -3599,7 +4069,7 @@ class AwsP5Backend:
                     "active": status in _ACTIVE_COMMAND_STATES,
                 }
 
-            discovered = self.discover_instances(manifest)
+            discovered = self.discover_instances(manifest, context)
             if discovered:
                 if discovered[0]["instance_id"] != instance_id:
                     raise MsctlError(
@@ -3615,7 +4085,7 @@ class AwsP5Backend:
                     "an active instance already claims this seed without paired state",
                     details={"instance_id": discovered[0]["instance_id"]},
                 )
-            selected_argv = self._selected_instance_argv(instance_id)
+            selected_argv = self._selected_instance_argv(instance_id, manifest)
             self._parse_selected_instance(
                 self._run(
                     selected_argv,
@@ -3625,6 +4095,7 @@ class AwsP5Backend:
                 instance_id=instance_id,
                 terminate_at=terminate_at,
                 require_bound=False,
+                context=context,
             )
             self._require_ssm_online(instance_id)
             self._ensure_argv_document()
@@ -3632,6 +4103,7 @@ class AwsP5Backend:
                 manifest,
                 instance_id=instance_id,
                 terminate_at=terminate_at,
+                context=context,
             )
             published = self._publish_operation_intent(operation_intent)
             new_states = [
@@ -3644,16 +4116,17 @@ class AwsP5Backend:
                         intent=operation_intent,
                         published=published,
                         attempt=1,
+                        context=context,
                 )
                 for run in manifest.runs
             ]
-            self._write_paired_states(store, manifest, new_states)
+            self._write_paired_states(store, manifest, new_states, context)
             now = _timestamp()
             for state in new_states:
                 state["status"] = "SENDING"
                 state["send_attempted"] = True
                 state["updated_at"] = now
-            self._write_paired_states(store, manifest, new_states)
+            self._write_paired_states(store, manifest, new_states, context)
             command_id = self._send_operation_intent(
                 instance_id=instance_id,
                 intent=operation_intent,
@@ -3665,7 +4138,7 @@ class AwsP5Backend:
                 state["command_id"] = command_id
                 state["status"] = "Pending"
                 state["updated_at"] = now
-            self._write_paired_states(store, manifest, new_states)
+            self._write_paired_states(store, manifest, new_states, context)
             return {
                 "provider": self.profile.provider,
                 "seed": manifest.seed,
@@ -3683,15 +4156,30 @@ class AwsP5Backend:
         receipt: object,
     ) -> dict[str, object]:
         checkpoints = getattr(receipt, "checkpoints", ())
+        expected_schema = 3 if _is_v3_manifest(manifest) else 2
         by_run = {run.run_id: run for run in manifest.runs}
         if (
-            getattr(receipt, "schema_version", None) != 2
+            getattr(receipt, "schema_version", None) != expected_schema
             or len(checkpoints) != 2
             or {checkpoint.run_id for checkpoint in checkpoints} != set(by_run)
         ):
             raise MsctlError(
                 "CHECKPOINT_PROVENANCE_MISMATCH",
-                "AWS resume requires one complete v2 paired receipt",
+                "AWS resume requires one complete schema-matched paired receipt",
+            )
+        if _is_v3_manifest(manifest) and any(
+            getattr(receipt, field, None) != getattr(manifest, field, None)
+            for field in (
+                "hardware_amendment_sha256",
+                "provider_selection_sha256",
+                "profile_sha256",
+                "preregistration_sha256",
+                "sealed_evaluation_sha256",
+            )
+        ):
+            raise MsctlError(
+                "CHECKPOINT_PROVENANCE_MISMATCH",
+                "v3 checkpoint receipt drops immutable lifecycle provenance",
             )
         by_arm: dict[str, object] = {}
         for checkpoint in checkpoints:
@@ -3726,9 +4214,11 @@ class AwsP5Backend:
         approval_path: Path | str | None,
         apply: bool,
         evidence: Mapping[str, str] | None = None,
+        context: V3LifecycleContext | None = None,
     ) -> dict[str, object]:
         self._validate_manifest(manifest)
         self._validate_release(release, manifest)
+        validated_context = self._validate_v3_context(manifest, context)
         checkpoints = self._checkpoint_map(manifest, checkpoint_receipt)
         checkpoint_publication = self._checkpoint_publication(
             checkpoint_receipt=checkpoint_receipt,
@@ -3742,6 +4232,7 @@ class AwsP5Backend:
             checkpoints=checkpoints,
             checkpoint_receipt_sha256=checkpoint_receipt.sha256,
             evidence=evidence,
+            context=context,
         )
         if not apply:
             return {
@@ -3763,7 +4254,7 @@ class AwsP5Backend:
 
         store = StateStore(self.state_root)
         with store.locked():
-            self._repair_paired_states(store, manifest)
+            self._repair_paired_states(store, manifest, context)
             states = [store.read_run(run.run_id) for run in manifest.runs]
             if any(state is None for state in states):
                 raise MsctlError(
@@ -3772,7 +4263,8 @@ class AwsP5Backend:
                 )
             present = [state for state in states if state is not None]
             if not all(
-                self._same_state_binding(state, manifest) for state in present
+                self._same_state_binding(state, manifest, context)
+                for state in present
             ):
                 raise MsctlError(
                     "RUN_ID_CONFLICT",
@@ -3792,6 +4284,14 @@ class AwsP5Backend:
                     "AWS paired state does not bind one instance",
                 )
             instance_id = str(next(iter(instance_ids)))
+            if (
+                validated_context is not None
+                and instance_id != validated_context.instance_id
+            ):
+                raise MsctlError(
+                    "FLEET_PLAN_INVALID",
+                    "resume state is bound to a different fleet instance",
+                )
             deadlines = {state.get("terminate_at") for state in present}
             if len(deadlines) != 1 or not isinstance(
                 next(iter(deadlines)),
@@ -3808,6 +4308,7 @@ class AwsP5Backend:
                 instance_id=instance_id,
                 terminate_at=terminate_at,
                 operation="resume",
+                context=context,
             )
             resume_resources = self._resume_resources(
                 release=release,
@@ -3815,6 +4316,7 @@ class AwsP5Backend:
                 instance_id=instance_id,
                 terminate_at=terminate_at,
                 checkpoint_receipt_sha256=checkpoint_receipt.sha256,
+                context=context,
             )
             resume_resources.update(
                 {
@@ -3993,13 +4495,13 @@ class AwsP5Backend:
                         "updated_at": now,
                     }
                 )
-            self._write_paired_states(store, manifest, present)
+            self._write_paired_states(store, manifest, present, context)
             now = _timestamp()
             for state in present:
                 state["status"] = "SENDING"
                 state["send_attempted"] = True
                 state["updated_at"] = now
-            self._write_paired_states(store, manifest, present)
+            self._write_paired_states(store, manifest, present, context)
             command_id = self._send_operation_intent(
                 instance_id=instance_id,
                 intent=operation_intent,
@@ -4011,7 +4513,7 @@ class AwsP5Backend:
                 state["command_id"] = command_id
                 state["status"] = "Pending"
                 state["updated_at"] = now
-            self._write_paired_states(store, manifest, present)
+            self._write_paired_states(store, manifest, present, context)
             return {
                 "provider": self.profile.provider,
                 "seed": manifest.seed,
@@ -4027,6 +4529,7 @@ class AwsP5Backend:
         self,
         store: StateStore,
         manifest: object,
+        context: V3LifecycleContext | None = None,
     ) -> list[dict[str, object]]:
         states = [store.read_run(run.run_id) for run in manifest.runs]
         if any(state is None for state in states):
@@ -4036,7 +4539,8 @@ class AwsP5Backend:
             )
         present = [state for state in states if state is not None]
         if not all(
-            self._same_state_binding(state, manifest) for state in present
+            self._same_state_binding(state, manifest, context)
+            for state in present
         ):
             raise MsctlError(
                 "RUN_ID_CONFLICT",
@@ -4079,26 +4583,64 @@ class AwsP5Backend:
         manifest: object,
         approval_path: Path | str | None,
         apply: bool,
+        context: V3LifecycleContext | None = None,
     ) -> dict[str, object]:
         self._validate_manifest(manifest)
         self._validate_release(release, manifest)
+        validated_context = self._validate_v3_context(manifest, context)
         if not apply:
             return {
                 "provider": self.profile.provider,
                 "seed": manifest.seed,
                 "operation": "cancel",
                 "run_ids": [run.run_id for run in manifest.runs],
+                **self._v3_bindings(manifest, context),
                 "cancelled": 0,
             }
-        self._verify_approval(
-            approval_path,
-            operation="cancel",
-            release=release,
-            manifest=manifest,
-        )
+        if validated_context is None:
+            self._verify_approval(
+                approval_path,
+                operation="cancel",
+                release=release,
+                manifest=manifest,
+            )
         store = StateStore(self.state_root)
         with store.locked():
-            states = self._paired_states(store, manifest)
+            states = self._paired_states(store, manifest, context)
+            command_ids = {state.get("command_id") for state in states}
+            if (
+                validated_context is not None
+                and {state.get("instance_id") for state in states}
+                != {validated_context.instance_id}
+            ):
+                raise MsctlError(
+                    "FLEET_PLAN_INVALID",
+                    "cancel state is bound to a different fleet instance",
+                )
+            if validated_context is not None:
+                deadline = states[0].get("terminate_at")
+                selected_instance = states[0].get("instance_id")
+                if not isinstance(deadline, str) or not isinstance(
+                    selected_instance,
+                    str,
+                ):
+                    raise MsctlError(
+                        "STATE_CORRUPT",
+                        "v3 cancel state lacks its execution binding",
+                    )
+                self._verify_approval(
+                    approval_path,
+                    operation="cancel",
+                    release=release,
+                    manifest=manifest,
+                    resources=self._cancel_resources(
+                        release=release,
+                        manifest=manifest,
+                        instance_id=selected_instance,
+                        terminate_at=deadline,
+                        context=context,
+                    ),
+                )
             if {state.get("status") for state in states} == {"Cancelling"}:
                 return {
                     "provider": self.profile.provider,
@@ -4108,7 +4650,6 @@ class AwsP5Backend:
                     "cancelled": 0,
                     "idempotent": True,
                 }
-            command_ids = {state.get("command_id") for state in states}
             if None in command_ids or len(command_ids) != 1:
                 raise MsctlError(
                     "SUBMISSION_UNCERTAIN",
@@ -4195,7 +4736,11 @@ class AwsP5Backend:
                 "--sealed-release",
                 release_root,
                 "--expected-study-lock-sha256",
-                manifest.study_lock_sha256,
+                (
+                    manifest.sealed_evaluation_sha256
+                    if _is_v3_manifest(manifest)
+                    else manifest.study_lock_sha256
+                ),
                 "--device",
                 "cuda",
                 "--output-dir",
@@ -4209,7 +4754,9 @@ class AwsP5Backend:
         release: object,
         manifest: object,
         evidence: Mapping[str, str] | None = None,
+        context: V3LifecycleContext | None = None,
     ) -> dict[str, object]:
+        v3_bindings = self._v3_bindings(manifest, context)
         remote_argv = self._evaluation_argv(release, manifest)
         lifecycle_evidence = dict(
             evidence
@@ -4222,7 +4769,7 @@ class AwsP5Backend:
         for field, digest in lifecycle_evidence.items():
             require_sha256(digest, label=field)
         return {
-            "schema_version": 1,
+            "schema_version": 3 if v3_bindings else 1,
             "operation": "evaluate",
             "provider": self.profile.provider,
             "instance_type": self.profile.instance_type,
@@ -4232,6 +4779,7 @@ class AwsP5Backend:
             "release_sha256": release.archive_sha256,
             "run_manifest_sha256": manifest.sha256,
             "dataset_sha256": manifest.dataset_sha256,
+            **v3_bindings,
             **lifecycle_evidence,
             "runtime_sha256": self._runtime_sha256(),
             "environment": {
@@ -4261,13 +4809,16 @@ class AwsP5Backend:
         approval_path: Path | str | None,
         apply: bool,
         evidence: Mapping[str, str] | None = None,
+        context: V3LifecycleContext | None = None,
     ) -> dict[str, object]:
         self._validate_manifest(manifest)
         self._validate_release(release, manifest)
+        validated_context = self._validate_v3_context(manifest, context)
         operation_intent = self._evaluation_operation_intent(
             release,
             manifest,
             evidence,
+            context,
         )
         if not apply:
             return {
@@ -4284,7 +4835,7 @@ class AwsP5Backend:
             )
         store = StateStore(self.state_root)
         with store.locked():
-            states = self._paired_states(store, manifest)
+            states = self._paired_states(store, manifest, context)
             if {
                 state.get("environment_receipt_sha256") for state in states
             } != {operation_intent["environment_receipt_sha256"]}:
@@ -4299,6 +4850,14 @@ class AwsP5Backend:
                     "AWS evaluation requires one paired instance",
                 )
             instance_id = str(next(iter(instance_ids)))
+            if (
+                validated_context is not None
+                and instance_id != validated_context.instance_id
+            ):
+                raise MsctlError(
+                    "FLEET_PLAN_INVALID",
+                    "evaluation state is bound to a different fleet instance",
+                )
             deadlines = {state.get("terminate_at") for state in states}
             if len(deadlines) != 1 or not isinstance(
                 next(iter(deadlines)),
@@ -4315,6 +4874,7 @@ class AwsP5Backend:
                 manifest=manifest,
                 instance_id=instance_id,
                 terminate_at=terminate_at,
+                context=context,
             )
             evaluation_resources.update(
                 {
@@ -4343,6 +4903,7 @@ class AwsP5Backend:
                 instance_id=instance_id,
                 terminate_at=terminate_at,
                 operation="evaluation",
+                context=context,
             )
             training_commands = {
                 state.get("command_id") for state in states
@@ -4388,6 +4949,16 @@ class AwsP5Backend:
                     or existing.get("instance_id") != instance_id
                     or existing.get("terminate_at") != terminate_at
                     or existing.get("operation") != "evaluate"
+                    or (
+                        _is_v3_manifest(manifest)
+                        and any(
+                            existing.get(field) != expected
+                            for field, expected in self._v3_bindings(
+                                manifest,
+                                context,
+                            ).items()
+                        )
+                    )
                 ):
                     raise MsctlError(
                         "RUN_ID_CONFLICT",
@@ -4471,10 +5042,10 @@ class AwsP5Backend:
             self._ensure_argv_document()
             published = self._publish_operation_intent(operation_intent)
             now = _timestamp()
-            store.write_evaluation(
-                manifest.sha256,
-                {
-                    "schema_version": 1,
+            evaluation_state = {
+                    "schema_version": (
+                        3 if _is_v3_manifest(manifest) else 1
+                    ),
                     "provider": self.profile.provider,
                     "instance_type": self.profile.instance_type,
                     "gres": _profile_gres(self.profile),
@@ -4506,8 +5077,10 @@ class AwsP5Backend:
                     "send_attempted": False,
                     "created_at": now,
                     "updated_at": now,
-                },
-            )
+                }
+            if _is_v3_manifest(manifest):
+                evaluation_state.update(self._v3_bindings(manifest, context))
+            store.write_evaluation(manifest.sha256, evaluation_state)
             state = store.read_evaluation(manifest.sha256)
             assert state is not None
             state["status"] = "SENDING"
@@ -4543,9 +5116,11 @@ class AwsP5Backend:
         manifest: object,
         approval_path: Path | str | None,
         apply: bool,
+        context: V3LifecycleContext | None = None,
     ) -> dict[str, object]:
         self._validate_manifest(manifest)
         self._validate_release(release, manifest)
+        validated_context = self._validate_v3_context(manifest, context)
         if not apply:
             return {
                 "provider": self.profile.provider,
@@ -4553,6 +5128,7 @@ class AwsP5Backend:
                 "release_sha256": release.archive_sha256,
                 "run_manifest_sha256": manifest.sha256,
                 "operation": "cleanup",
+                **self._v3_bindings(manifest, context),
                 "terminated": 0,
             }
         if approval_path is None:
@@ -4562,7 +5138,7 @@ class AwsP5Backend:
             )
         store = StateStore(self.state_root)
         with store.locked():
-            states = self._paired_states(store, manifest)
+            states = self._paired_states(store, manifest, context)
             instance_ids = {state.get("instance_id") for state in states}
             if None in instance_ids or len(instance_ids) != 1:
                 raise MsctlError(
@@ -4570,6 +5146,14 @@ class AwsP5Backend:
                     "AWS cleanup requires one paired instance",
                 )
             instance_id = str(next(iter(instance_ids)))
+            if (
+                validated_context is not None
+                and instance_id != validated_context.instance_id
+            ):
+                raise MsctlError(
+                    "FLEET_PLAN_INVALID",
+                    "cleanup state is bound to a different fleet instance",
+                )
             deadlines = {state.get("terminate_at") for state in states}
             if len(deadlines) != 1 or not isinstance(
                 next(iter(deadlines)),
@@ -4590,6 +5174,7 @@ class AwsP5Backend:
                     manifest=manifest,
                     instance_id=instance_id,
                     terminate_at=terminate_at,
+                    context=context,
                 ),
             )
             if {state.get("status") for state in states} == {"Terminating"}:
@@ -4606,6 +5191,7 @@ class AwsP5Backend:
                 instance_id=instance_id,
                 terminate_at=terminate_at,
                 operation="cleanup",
+                context=context,
             )
             command_ids = {state.get("command_id") for state in states}
             if None in command_ids or len(command_ids) != 1:
@@ -4697,14 +5283,11 @@ class AwsP5Backend:
             return False, self.auth_check()
         if command == "capacity check":
             return False, self.capacity_check()
-        if self.profile.provider != AWS_P5_PROFILE:
+        if command == "env ensure" and self.profile.provider in _V3_PROFILES:
             raise MsctlError(
                 "EXTERNAL_OPERATION_UNSUPPORTED",
-                "v3 AWS GPU lifecycle awaits a profile-bound manifest contract",
-                details={
-                    "operation": command,
-                    "provider": self.profile.provider,
-                },
+                "v3 AWS runtime environments are externally selected and attested",
+                details={"operation": command},
             )
         if command == "env ensure":
             apply = bool(getattr(args, "apply", False))
@@ -4767,6 +5350,24 @@ class AwsP5Backend:
                 manifest_path=manifest_path,
                 repo_root=args.repo_root,
             )
+            requested_instance_id = (
+                getattr(args, "instance_id", None)
+                if command == "submit"
+                else None
+            )
+            context = self._load_v3_context(
+                manifest,
+                amendment_path=getattr(args, "hardware_amendment", None),
+                provider_selection_path=getattr(
+                    args,
+                    "provider_selection",
+                    None,
+                ),
+                fleet_plan_path=getattr(args, "fleet_plan", None),
+                instance_id=requested_instance_id,
+            )
+            if command == "submit" and context is not None:
+                requested_instance_id = context.instance_id
             evidence = None
             if command in {"runs render", "submit", "resume", "evaluate"}:
                 dataset_pointer = getattr(args, "dataset_pointer", None)
@@ -4798,7 +5399,7 @@ class AwsP5Backend:
                     dataset_verification=dataset_verification,
                     environment_receipt=environment_receipt,
                     expected_instance_id=(
-                        str(getattr(args, "instance_id"))
+                        str(requested_instance_id)
                         if command == "submit"
                         else None
                     ),
@@ -4808,22 +5409,25 @@ class AwsP5Backend:
                     release=release,
                     manifest=manifest,
                     evidence=evidence,
+                    context=context,
                 )
             if command == "submit":
                 return not args.apply, self.submit(
                     release=release,
                     manifest=manifest,
-                    instance_id=args.instance_id,
+                    instance_id=requested_instance_id,
                     terminate_at=args.terminate_at,
                     approval_path=args.approval,
                     apply=args.apply,
                     evidence=evidence,
+                    context=context,
                 )
             if command == "status":
                 return False, self.status(
                     release=release,
                     manifest=manifest,
                     cached=args.cached,
+                    context=context,
                 )
             if command == "resume":
                 receipt = verify_checkpoint_receipt(
@@ -4838,6 +5442,7 @@ class AwsP5Backend:
                     approval_path=args.approval,
                     apply=args.apply,
                     evidence=evidence,
+                    context=context,
                 )
             if command == "cancel":
                 return not args.apply, self.cancel(
@@ -4845,6 +5450,7 @@ class AwsP5Backend:
                     manifest=manifest,
                     approval_path=args.approval,
                     apply=args.apply,
+                    context=context,
                 )
             if command == "evaluate":
                 return not args.apply, self.evaluate(
@@ -4853,6 +5459,7 @@ class AwsP5Backend:
                     approval_path=args.approval,
                     apply=args.apply,
                     evidence=evidence,
+                    context=context,
                 )
             apply = bool(getattr(args, "apply", False))
             return not apply, self.cleanup(
@@ -4860,6 +5467,7 @@ class AwsP5Backend:
                 manifest=manifest,
                 approval_path=getattr(args, "approval", None),
                 apply=apply,
+                context=context,
             )
         raise MsctlError(
             "EXTERNAL_OPERATION_UNSUPPORTED",

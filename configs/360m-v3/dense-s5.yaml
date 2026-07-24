@@ -1,0 +1,23 @@
+schema_version: 3
+cohort_id: memorysplit-confirmatory-v3-360m-n10-aws
+run_id: memorysplit-v3-360m-s5-dense
+condition: dense
+seed: 5
+model: d360m
+ctx: 1024
+train_corpus: dataset/corpus-receipt.json
+sidecar_name: dense_target_weights
+out_dir: runs/seed-5/dense
+micro_batch_size: 8
+tokens_per_step: 524288
+max_steps: 13582
+total_tokens: 7120879616
+lr: 0.001
+warmup_steps: 300
+weight_decay: 0.1
+compile: true
+device: cuda
+log_every: 20
+eval_every: 250
+snapshot_steps: [1358, 3396, 6791, 10187, 13582]
+ckpt_minutes: 30

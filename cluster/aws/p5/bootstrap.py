@@ -28,6 +28,8 @@ from cluster.aws.p5.interruption_checkpoint import (
     S3ObjectStore,
 )
 from cluster.aws.p5.profile import (
+    AWS_P5_V3_PROFILE_ID,
+    AWS_P6_B300_V3_PROFILE_ID,
     LEGACY_AWS_P5_PROFILE_ID,
     AwsGpuProfile,
     AwsGpuRuntime,
@@ -41,6 +43,11 @@ _COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
 _CONTAINER_IMAGE_RE = re.compile(
     r"^[A-Za-z0-9][A-Za-z0-9./:_-]*@sha256:[0-9a-f]{64}$"
 )
+_V3_PROFILE_IDS = frozenset(
+    {AWS_P5_V3_PROFILE_ID, AWS_P6_B300_V3_PROFILE_ID}
+)
+_V2_COHORT_ID = "memorysplit-confirmatory-v2-360m-n5"
+_V3_COHORT_ID = "memorysplit-confirmatory-v3-360m-n10-aws"
 
 
 class BootstrapError(ValueError):
@@ -767,6 +774,24 @@ def _verify_release_archive(
             raise BootstrapError(
                 "release metadata must contain valid UTF-8 JSON"
             ) from error
+        assignment = (
+            metadata.get("seed_assignment")
+            if isinstance(metadata, dict)
+            else None
+        )
+        v3_provider = provider in _V3_PROFILE_IDS
+        assignment_providers = {provider}
+        if v3_provider:
+            assignment_providers.add(AWS_P5_V3_PROFILE_ID)
+        valid_assignment = (
+            isinstance(assignment, dict)
+            and set(assignment) == {"arms", "cohort_id", "provider", "seeds"}
+            and assignment.get("arms") == ["dense", "split90"]
+            and assignment.get("cohort_id")
+            == (_V3_COHORT_ID if v3_provider else _V2_COHORT_ID)
+            and assignment.get("provider") in assignment_providers
+            and assignment.get("seeds") == list(assigned_seeds)
+        )
         if (
             not isinstance(metadata, dict)
             or _canonical_pretty(metadata) != metadata_bytes
@@ -775,13 +800,7 @@ def _verify_release_archive(
             or metadata.get("provider") != provider
             or metadata.get("source")
             != {"commit": code_commit, "dirty": False}
-            or metadata.get("seed_assignment")
-            != {
-                "arms": ["dense", "split90"],
-                "cohort_id": "memorysplit-confirmatory-v2-360m-n5",
-                "provider": provider,
-                "seeds": list(assigned_seeds),
-            }
+            or not valid_assignment
         ):
             raise BootstrapError("release metadata identity does not match")
         rows = metadata.get("members")

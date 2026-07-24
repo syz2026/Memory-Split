@@ -86,6 +86,21 @@ AWS_RESUME_STATE_KEYS = AWS_RUN_STATE_KEYS | {
     "checkpoint_receipt_sha256",
     "prior_command_ids",
 }
+AWS_V3_BINDING_KEYS = {
+    "preregistration_sha256",
+    "hardware_amendment_sha256",
+    "provider_selection_sha256",
+    "sealed_evaluation_sha256",
+    "fleet_plan_sha256",
+    "fleet_wave",
+}
+AWS_V3_RUN_STATE_KEYS = (
+    AWS_RUN_STATE_KEYS - {"study_lock_sha256"}
+) | AWS_V3_BINDING_KEYS
+AWS_V3_RESUME_STATE_KEYS = AWS_V3_RUN_STATE_KEYS | {
+    "checkpoint_receipt_sha256",
+    "prior_command_ids",
+}
 RESUME_STATE_KEYS = RUN_STATE_KEYS | {
     "checkpoint_receipt_sha256",
     "prior_job_ids",
@@ -134,6 +149,10 @@ AWS_EVALUATION_STATE_KEYS = {
     "created_at",
     "updated_at",
 }
+AWS_V3_EVALUATION_STATE_KEYS = AWS_EVALUATION_STATE_KEYS | {
+    "cohort_assignment_sha256",
+    *AWS_V3_BINDING_KEYS,
+}
 AWS_PAIR_INTENT_KEYS = {
     "schema_version",
     "provider",
@@ -143,6 +162,10 @@ AWS_PAIR_INTENT_KEYS = {
     "run_manifest_sha256",
     "operation_id",
     "states",
+}
+AWS_V3_PAIR_INTENT_KEYS = AWS_PAIR_INTENT_KEYS | {
+    "cohort_assignment_sha256",
+    *AWS_V3_BINDING_KEYS,
 }
 INTENT_KEYS = {
     "schema_version",
@@ -332,10 +355,21 @@ def _validate_run_state(value: dict[str, object], run_id: str) -> None:
 
 def _validate_aws_run_state(value: dict[str, object], run_id: str) -> None:
     operation = value.get("operation")
-    keys = AWS_RESUME_STATE_KEYS if operation == "resume" else AWS_RUN_STATE_KEYS
+    schema_version = value.get("schema_version")
+    if schema_version == 3:
+        keys = (
+            AWS_V3_RESUME_STATE_KEYS
+            if operation == "resume"
+            else AWS_V3_RUN_STATE_KEYS
+        )
+    else:
+        keys = (
+            AWS_RESUME_STATE_KEYS if operation == "resume" else AWS_RUN_STATE_KEYS
+        )
     require_exact_keys(value, keys, label="AWS run state")
     require_schema_version(
-        value["schema_version"],
+        schema_version,
+        expected=3 if schema_version == 3 else 1,
         label="AWS run state.schema_version",
     )
     contract = _AWS_PROFILE_CONTRACTS.get(value["provider"])
@@ -351,7 +385,7 @@ def _validate_aws_run_state(value: dict[str, object], run_id: str) -> None:
         or value["seed"] not in contract["assigned_seeds"]
     ):
         raise MsctlError("STATE_CORRUPT", "AWS run identity is invalid")
-    for field in (
+    hash_fields = [
         "release_sha256",
         "run_manifest_sha256",
         "config_sha256",
@@ -360,12 +394,28 @@ def _validate_aws_run_state(value: dict[str, object], run_id: str) -> None:
         "dataset_verification_sha256",
         "environment_receipt_sha256",
         "cohort_assignment_sha256",
-        "study_lock_sha256",
         "profile_sha256",
         "runtime_sha256",
         "operation_id",
         "intent_sha256",
-    ):
+    ]
+    if schema_version == 3:
+        hash_fields.extend(
+            [
+                "preregistration_sha256",
+                "hardware_amendment_sha256",
+                "provider_selection_sha256",
+                "sealed_evaluation_sha256",
+                "fleet_plan_sha256",
+            ]
+        )
+        require_nonnegative_int(
+            value["fleet_wave"],
+            label="AWS run state fleet wave",
+        )
+    else:
+        hash_fields.append("study_lock_sha256")
+    for field in hash_fields:
         require_sha256(value[field], label=f"AWS run state {field}")
     if (
         not isinstance(value["source_commit"], str)
@@ -425,16 +475,22 @@ def _validate_evaluation_state(
     manifest_sha256: str,
 ) -> None:
     if value.get("provider") in _AWS_PROFILE_CONTRACTS:
+        schema_version = value.get("schema_version")
         require_exact_keys(
             value,
-            AWS_EVALUATION_STATE_KEYS,
+            (
+                AWS_V3_EVALUATION_STATE_KEYS
+                if schema_version == 3
+                else AWS_EVALUATION_STATE_KEYS
+            ),
             label="AWS evaluation state",
         )
         require_schema_version(
-            value["schema_version"],
+            schema_version,
+            expected=3 if schema_version == 3 else 1,
             label="AWS evaluation state.schema_version",
         )
-        for field in (
+        hash_fields = [
             "release_sha256",
             "run_manifest_sha256",
             "dataset_sha256",
@@ -445,7 +501,23 @@ def _validate_evaluation_state(
             "runtime_sha256",
             "operation_id",
             "intent_sha256",
-        ):
+        ]
+        if schema_version == 3:
+            hash_fields.extend(
+                [
+                    "cohort_assignment_sha256",
+                    "preregistration_sha256",
+                    "hardware_amendment_sha256",
+                    "provider_selection_sha256",
+                    "sealed_evaluation_sha256",
+                    "fleet_plan_sha256",
+                ]
+            )
+            require_nonnegative_int(
+                value["fleet_wave"],
+                label="AWS evaluation fleet wave",
+            )
+        for field in hash_fields:
             require_sha256(
                 value[field],
                 label=f"AWS evaluation state {field}",
@@ -861,9 +933,19 @@ class StateStore:
         value: dict[str, object],
         manifest_sha256: str,
     ) -> None:
-        require_exact_keys(value, AWS_PAIR_INTENT_KEYS, label="AWS pair intent")
+        schema_version = value.get("schema_version")
+        require_exact_keys(
+            value,
+            (
+                AWS_V3_PAIR_INTENT_KEYS
+                if schema_version == 3
+                else AWS_PAIR_INTENT_KEYS
+            ),
+            label="AWS pair intent",
+        )
         require_schema_version(
-            value["schema_version"],
+            schema_version,
+            expected=3 if schema_version == 3 else 1,
             label="AWS pair intent.schema_version",
         )
         contract = _AWS_PROFILE_CONTRACTS.get(value["provider"])
@@ -879,6 +961,23 @@ class StateStore:
             label="AWS pair profile SHA-256",
         )
         require_sha256(value["operation_id"], label="AWS pair operation")
+        if schema_version == 3:
+            for field in (
+                "cohort_assignment_sha256",
+                "preregistration_sha256",
+                "hardware_amendment_sha256",
+                "provider_selection_sha256",
+                "sealed_evaluation_sha256",
+                "fleet_plan_sha256",
+            ):
+                require_sha256(
+                    value[field],
+                    label=f"AWS pair {field}",
+                )
+            require_nonnegative_int(
+                value["fleet_wave"],
+                label="AWS pair fleet wave",
+            )
         states = value["states"]
         if not isinstance(states, list) or len(states) != 2:
             raise MsctlError("STATE_CORRUPT", "AWS pair intent is incomplete")
@@ -896,6 +995,21 @@ class StateStore:
                 or state["instance_type"] != value["instance_type"]
                 or state["profile_sha256"] != value["profile_sha256"]
                 or state["gres"] != value["gres"]
+                or (
+                    schema_version == 3
+                    and any(
+                        state[field] != value[field]
+                        for field in (
+                            "cohort_assignment_sha256",
+                            "preregistration_sha256",
+                            "hardware_amendment_sha256",
+                            "provider_selection_sha256",
+                            "sealed_evaluation_sha256",
+                            "fleet_plan_sha256",
+                            "fleet_wave",
+                        )
+                    )
+                )
                 or run_id in run_ids
             ):
                 raise MsctlError(

@@ -38,6 +38,8 @@ from cluster.aws.p5.corpus_contract import (
     verify_canonical_corpus,
 )
 from cluster.aws.p5.profile import (
+    AWS_P5_V3_PROFILE_ID,
+    AWS_P6_B300_V3_PROFILE_ID,
     AwsGpuProfile,
     AwsGpuRuntime,
     load_aws_gpu_profile,
@@ -48,6 +50,10 @@ from cluster.aws.p5.profile import (
 # Historical module constant retained for legacy receipt/import compatibility.
 PROVIDER = "aws-p5.48xlarge"
 COHORT_ID = "memorysplit-confirmatory-v2-360m-n5"
+V3_COHORT_ID = "memorysplit-confirmatory-v3-360m-n10-aws"
+_V3_PROFILE_IDS = frozenset(
+    {AWS_P5_V3_PROFILE_ID, AWS_P6_B300_V3_PROFILE_ID}
+)
 _ARMS = ("dense", "split90")
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
@@ -70,6 +76,18 @@ _MANIFEST_FIELDS = frozenset(
         "runs",
     }
 )
+_V3_PROVENANCE_FIELDS = frozenset(
+    {
+        "run_manifest_sha256",
+        "preregistration_sha256",
+        "hardware_amendment_sha256",
+        "provider_selection_sha256",
+        "sealed_evaluation_sha256",
+        "fleet_plan_sha256",
+        "fleet_wave",
+    }
+)
+_V3_MANIFEST_FIELDS = _MANIFEST_FIELDS | _V3_PROVENANCE_FIELDS
 _RUN_FIELDS = frozenset(
     {
         "arm",
@@ -109,6 +127,7 @@ _CONFIG_FIELDS = frozenset(
         "ckpt_minutes",
     }
 )
+_V3_CONFIG_FIELDS = (_CONFIG_FIELDS - {"snap_frac"}) | {"snapshot_steps"}
 _BOOTSTRAP_FIELDS = frozenset(
     {
         "schema_version",
@@ -301,6 +320,14 @@ def _canonical_pretty(value: object) -> bytes:
     ).encode("ascii")
 
 
+def _is_v3_profile(profile: AwsGpuProfile) -> bool:
+    return profile.profile_id in _V3_PROFILE_IDS
+
+
+def _cohort_id(profile: AwsGpuProfile) -> str:
+    return V3_COHORT_ID if _is_v3_profile(profile) else COHORT_ID
+
+
 def _validate_release_root(
     repo: Path,
     scratch: Path,
@@ -386,6 +413,20 @@ def _validate_release_root(
         metadata = json.loads(metadata_bytes.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError) as error:
         raise LaunchError("release metadata must contain UTF-8 JSON") from error
+    assignment = metadata.get("seed_assignment") if isinstance(metadata, dict) else None
+    assignment_providers = {profile.provider}
+    if _is_v3_profile(profile):
+        # The hardware amendment may supersede the original scientific P5-v3
+        # assignment while the release itself remains selected-profile bound.
+        assignment_providers.add(AWS_P5_V3_PROFILE_ID)
+    valid_assignment = (
+        isinstance(assignment, dict)
+        and set(assignment) == {"arms", "cohort_id", "provider", "seeds"}
+        and assignment.get("arms") == ["dense", "split90"]
+        and assignment.get("cohort_id") == _cohort_id(profile)
+        and assignment.get("provider") in assignment_providers
+        and assignment.get("seeds") == list(profile.assigned_seeds)
+    )
     if (
         not isinstance(metadata, dict)
         or _canonical_pretty(metadata) != metadata_bytes
@@ -394,13 +435,7 @@ def _validate_release_root(
         or metadata.get("provider") != profile.provider
         or metadata.get("source")
         != {"commit": code_commit, "dirty": False}
-        or metadata.get("seed_assignment")
-        != {
-            "arms": ["dense", "split90"],
-            "cohort_id": COHORT_ID,
-            "provider": profile.provider,
-            "seeds": list(profile.assigned_seeds),
-        }
+        or not valid_assignment
     ):
         raise LaunchError("release metadata identity does not match")
     rows = metadata.get("members")
@@ -510,7 +545,7 @@ def _load_config(path: Path) -> dict[str, object]:
         scalar = raw_value.strip()
         if (
             not scalar
-            or scalar[0] in "[{&*!|>@`"
+            or scalar[0] in "{&*!|>@`"
             or " #" in scalar
             or "\t" in scalar
         ):
@@ -526,6 +561,15 @@ def _load_config(path: Path) -> dict[str, object]:
             scalar,
         ):
             parsed = float(scalar)
+        elif scalar.startswith("[") and scalar.endswith("]"):
+            try:
+                parsed = json.loads(scalar)
+            except json.JSONDecodeError as error:
+                raise LaunchError("config list scalar is invalid") from error
+            if not isinstance(parsed, list) or any(
+                type(item) is not int for item in parsed
+            ):
+                raise LaunchError("config list scalar must contain integers")
         elif scalar.startswith('"') and scalar.endswith('"'):
             try:
                 parsed = json.loads(scalar)
@@ -540,7 +584,11 @@ def _load_config(path: Path) -> dict[str, object]:
         else:
             raise LaunchError("config contains an unsupported YAML scalar")
         value[key] = parsed
-    _exact_fields(value, _CONFIG_FIELDS, label="config")
+    _exact_fields(
+        value,
+        _V3_CONFIG_FIELDS if value.get("schema_version") == 3 else _CONFIG_FIELDS,
+        label="config",
+    )
     return value
 
 
@@ -555,11 +603,16 @@ def _validate_config(
     seed: int,
     arm: str,
     corpus_path: str,
+    v3: bool = False,
 ) -> str:
     expected = {
-        "schema_version": 2,
-        "cohort_id": COHORT_ID,
-        "run_id": f"memorysplit-v2-360m-s{seed}-{arm}",
+        "schema_version": 3 if v3 else 2,
+        "cohort_id": V3_COHORT_ID if v3 else COHORT_ID,
+        "run_id": (
+            f"memorysplit-v3-360m-s{seed}-{arm}"
+            if v3
+            else f"memorysplit-v2-360m-s{seed}-{arm}"
+        ),
         "condition": arm,
         "seed": seed,
         "model": "d360m",
@@ -582,9 +635,12 @@ def _validate_config(
         "device": "cuda",
         "log_every": 20,
         "eval_every": 250,
-        "snap_frac": 0.1,
         "ckpt_minutes": 30,
     }
+    if v3:
+        expected["snapshot_steps"] = [1_358, 3_396, 6_791, 10_187, 13_582]
+    else:
+        expected["snap_frac"] = 0.1
     for name, expected_value in expected.items():
         actual = config[name]
         if isinstance(expected_value, int) and not isinstance(
@@ -871,13 +927,22 @@ def load_launch_plan(
     manifest_file = Path(manifest_path)
     manifest_digest = _hash_regular(manifest_file, label="run manifest")
     manifest = _load_json(manifest_file, label="run manifest")
-    _exact_fields(manifest, _MANIFEST_FIELDS, label="run manifest")
-    _exact_int(manifest["schema_version"], 1, label="manifest schema version")
+    is_v3 = _is_v3_profile(profile)
+    _exact_fields(
+        manifest,
+        _V3_MANIFEST_FIELDS if is_v3 else _MANIFEST_FIELDS,
+        label="run manifest",
+    )
+    _exact_int(
+        manifest["schema_version"],
+        3 if is_v3 else 1,
+        label="manifest schema version",
+    )
     if manifest["provider"] != profile.provider:
         raise LaunchError(
             f"run manifest provider must be {profile.provider}"
         )
-    if manifest["cohort_id"] != COHORT_ID:
+    if manifest["cohort_id"] != _cohort_id(profile):
         raise LaunchError("run manifest cohort ID does not match")
     if type(manifest["seed"]) is not int or manifest["seed"] != seed:
         raise LaunchError("run manifest seed does not match assigned seed")
@@ -897,6 +962,14 @@ def load_launch_plan(
         manifest["cohort_assignment_sha256"],
         label="manifest cohort assignment",
     )
+    if is_v3:
+        for field in _V3_PROVENANCE_FIELDS - {"fleet_wave"}:
+            _sha256(
+                manifest[field],
+                label=f"manifest {field.replace('_', ' ')}",
+            )
+        if type(manifest["fleet_wave"]) is not int or manifest["fleet_wave"] < 0:
+            raise LaunchError("manifest fleet wave must be a nonnegative integer")
     code_commit = _commit(manifest["code_commit"])
 
     corpus_binding = manifest["corpus_receipt"]
@@ -1006,7 +1079,8 @@ def load_launch_plan(
         ),
     ):
         run = runs[arm]
-        expected_config = f"configs/360m-v2/{arm}-s{seed}.yaml"
+        config_version = "v3" if is_v3 else "v2"
+        expected_config = f"configs/360m-{config_version}/{arm}-s{seed}.yaml"
         config_relative = _portable_relative(
             run["config"], label=f"{arm} config path"
         )
@@ -1026,6 +1100,7 @@ def load_launch_plan(
             seed=seed,
             arm=arm,
             corpus_path="dataset/corpus-receipt.json",
+            v3=is_v3,
         )
         out_dir = _inside_output(
             scratch, out_relative, label=f"{arm} output"

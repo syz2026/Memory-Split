@@ -115,6 +115,15 @@ _BASE_FIELDS = {
     "started_receipt_uri",
     "terminal_receipt_uri",
 }
+_V3_PROVENANCE_FIELDS = {
+    "cohort_assignment_sha256",
+    "preregistration_sha256",
+    "hardware_amendment_sha256",
+    "provider_selection_sha256",
+    "sealed_evaluation_sha256",
+    "fleet_plan_sha256",
+    "fleet_wave",
+}
 _ENVIRONMENT_FIELDS = {
     "AWS_REGION",
     "MS_AWS_AMI_ID",
@@ -281,7 +290,13 @@ def _validate_intent(
     ):
         raise RemoteIntentError("operation intent SHA-256 mismatch")
     intent = _decode_object(payload, label="operation intent")
-    if set(intent) != _BASE_FIELDS:
+    schema_version = intent.get("schema_version")
+    expected_fields = (
+        _BASE_FIELDS | _V3_PROVENANCE_FIELDS
+        if schema_version == 3
+        else _BASE_FIELDS
+    )
+    if set(intent) != expected_fields:
         raise RemoteIntentError("operation intent fields do not match the contract")
     provider = intent["provider"]
     profile_contract = (
@@ -290,7 +305,7 @@ def _validate_intent(
         else None
     )
     if (
-        intent["schema_version"] != 1
+        schema_version not in {1, 3}
         or intent["operation"] not in {"submit", "resume", "evaluate"}
         or profile_contract is None
         or intent["instance_type"] != profile_contract["instance_type"]
@@ -344,6 +359,22 @@ def _validate_intent(
         "operation_id",
     ):
         _sha256(intent[field], label=f"operation intent {field}")
+    if schema_version == 3:
+        if provider not in {
+            "aws-p5.48xlarge-v3",
+            "aws-p6-b300.48xlarge-v3",
+        }:
+            raise RemoteIntentError(
+                "schema-v3 operation intent requires one v3 AWS profile"
+            )
+        for field in _V3_PROVENANCE_FIELDS - {"fleet_wave"}:
+            _sha256(intent[field], label=f"operation intent {field}")
+        if type(intent["fleet_wave"]) is not int or intent["fleet_wave"] < 0:
+            raise RemoteIntentError("operation intent fleet wave is invalid")
+    elif provider != "aws-p5.48xlarge":
+        raise RemoteIntentError(
+            "legacy operation intent requires the legacy AWS P5 profile"
+        )
     identity = {
         key: value
         for key, value in intent.items()
@@ -431,9 +462,14 @@ def _receipt(
     nonce: str,
     returncode: int | None = None,
 ) -> bytes:
+    schema_version = 3 if intent.get("schema_version") == 3 else 1
     value: dict[str, object] = {
-        "schema_version": 1,
-        "receipt_type": "memorysplit-aws-operation-v1",
+        "schema_version": schema_version,
+        "receipt_type": (
+            "memorysplit-aws-operation-v3"
+            if schema_version == 3
+            else "memorysplit-aws-operation-v1"
+        ),
         "kind": kind,
         "provider": intent["provider"],
         "instance_type": intent["instance_type"],
@@ -444,6 +480,13 @@ def _receipt(
         "instance_id": intent["instance_id"],
         "execution_nonce": nonce,
     }
+    if schema_version == 3:
+        value.update(
+            {
+                field: intent[field]
+                for field in _V3_PROVENANCE_FIELDS
+            }
+        )
     if returncode is not None:
         value["returncode"] = returncode
         value["status"] = "success" if returncode == 0 else "failed"
@@ -471,14 +514,22 @@ def _validate_receipt(
         "instance_id",
         "execution_nonce",
     }
+    schema_version = 3 if intent.get("schema_version") == 3 else 1
+    if schema_version == 3:
+        fields |= _V3_PROVENANCE_FIELDS
     if kind == "terminal":
         fields |= {"returncode", "status"}
     if set(value) != fields:
         raise RemoteIntentError(f"{kind} receipt fields do not match")
     nonce = value["execution_nonce"]
     if (
-        value["schema_version"] != 1
-        or value["receipt_type"] != "memorysplit-aws-operation-v1"
+        value["schema_version"] != schema_version
+        or value["receipt_type"]
+        != (
+            "memorysplit-aws-operation-v3"
+            if schema_version == 3
+            else "memorysplit-aws-operation-v1"
+        )
         or value["kind"] != kind
         or value["provider"] != intent["provider"]
         or value["instance_type"] != intent["instance_type"]
@@ -487,6 +538,13 @@ def _validate_receipt(
         or value["operation_id"] != intent["operation_id"]
         or value["intent_sha256"] != intent_sha256
         or value["instance_id"] != intent["instance_id"]
+        or (
+            schema_version == 3
+            and any(
+                value[field] != intent[field]
+                for field in _V3_PROVENANCE_FIELDS
+            )
+        )
         or not isinstance(nonce, str)
         or _NONCE_RE.fullmatch(nonce) is None
     ):

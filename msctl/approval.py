@@ -20,7 +20,13 @@ from .jsonutil import (
     require_schema_version,
     require_sha256,
 )
-from .profile import AWS_GPU_PROFILES, AWS_P5_PROFILE, IlluminaProfile
+from .profile import (
+    AWS_GPU_PROFILES,
+    AWS_P5_PROFILE,
+    AWS_P5_V3_PROFILE,
+    AWS_P6_B300_V3_PROFILE,
+    IlluminaProfile,
+)
 from .slurm import resource_request
 
 
@@ -219,9 +225,13 @@ def verify_scope_approval(
         "script",
     }
     expected_resource_fields = set(resources)
-    extended_aws_operation = (
-        profile.provider in AWS_GPU_PROFILES
-        and operation in {"submit", "resume", "evaluate", "cleanup"}
+    v3_aws = profile.provider in {
+        AWS_P5_V3_PROFILE,
+        AWS_P6_B300_V3_PROFILE,
+    }
+    extended_aws_operation = profile.provider in AWS_GPU_PROFILES and (
+        operation in {"submit", "resume", "evaluate", "cleanup"}
+        or (v3_aws and operation == "cancel")
     )
     if extended_aws_operation:
         expected_resource_fields = base_resource_fields | {
@@ -240,6 +250,16 @@ def verify_scope_approval(
         }
         if operation == "resume":
             expected_resource_fields.add("checkpoint_receipt_sha256")
+        if v3_aws:
+            expected_resource_fields |= {
+                "cohort_assignment_sha256",
+                "preregistration_sha256",
+                "hardware_amendment_sha256",
+                "provider_selection_sha256",
+                "sealed_evaluation_sha256",
+                "fleet_plan_sha256",
+                "fleet_wave",
+            }
     require_exact_keys(
         receipt_resources,
         expected_resource_fields,
@@ -276,6 +296,23 @@ def verify_scope_approval(
                 require_sha256(
                     resources.get(field),
                     label=f"resource request.{field}",
+                )
+            if v3_aws:
+                for field in (
+                    "cohort_assignment_sha256",
+                    "preregistration_sha256",
+                    "hardware_amendment_sha256",
+                    "provider_selection_sha256",
+                    "sealed_evaluation_sha256",
+                    "fleet_plan_sha256",
+                ):
+                    require_sha256(
+                        resources.get(field),
+                        label=f"resource request.{field}",
+                    )
+                require_nonnegative_int(
+                    resources.get("fleet_wave"),
+                    label="resource request.fleet_wave",
                 )
             if (
                 resources.get("provider") != profile.provider
