@@ -16,11 +16,11 @@ LAUNCH_INTENT_FORMAT = "memorysplit-aws-corpus-launch-v1"
 
 CORPUS_BUCKET = "memorysplit-corpus-056956104102-us-east-1"
 CORPUS_KEY_PREFIX = "v2/builds"
-CORPUS_KMS_KEY_ARN = (
-    "arn:aws:kms:us-east-1:056956104102:key/01234567-89ab-cdef-0123-456789abcdef"
-)
 MAX_HOURLY_USD = Decimal("5.491")
 MAX_COMPUTE_USD = Decimal("131.78")
+
+_CORPUS_ACCOUNT = "056956104102"
+_CORPUS_REGION = "us-east-1"
 
 _PROFILE_ID = "aws-i4i.16xlarge-corpus-v1"
 _MAX_PROFILE_BYTES = 65_536
@@ -42,6 +42,10 @@ _SUBNET_RE = re.compile(r"^subnet-[0-9a-f]{8,17}$")
 _SECURITY_GROUP_RE = re.compile(r"^sg-[0-9a-f]{8,17}$")
 _TEMPLATE_VERSION_RE = re.compile(r"^[1-9][0-9]*$")
 _ETAG_RE = re.compile(r"^[0-9a-f]{32}(?:-[0-9]+)?$")
+_KMS_KEY_ARN_RE = re.compile(
+    rf"^arn:aws:kms:{_CORPUS_REGION}:{_CORPUS_ACCOUNT}:key/"
+    r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+)
 _INSTANCE_PROFILE_ARN_RE = re.compile(
     r"^arn:aws:iam::[0-9]{12}:instance-profile/[A-Za-z0-9+=,.@_-]+$"
 )
@@ -247,6 +251,39 @@ def _decimal_string(value: object, *, label: str) -> Decimal:
     return Decimal(value)
 
 
+def _canonical_decimal_from_decimal(
+    value: Decimal,
+    *,
+    label: str,
+    maximum: Decimal | None = None,
+    exact: str | None = None,
+) -> str:
+    if value.is_nan() or value.is_infinite():
+        raise ValueError(f"{label} must be a finite decimal")
+    if value < 0:
+        raise ValueError(f"{label} must be non-negative")
+    text = format(value, "f")
+    if _DECIMAL_RE.fullmatch(text) is None:
+        raise ValueError(f"{label} must be a canonical decimal string")
+    if "." in text and text.endswith("0"):
+        raise ValueError(f"{label} must be a canonical decimal string")
+    if value != Decimal(text):
+        raise ValueError(f"{label} must be a canonical decimal string")
+    if maximum is not None and value > maximum:
+        raise ValueError(f"{label} exceeds the approved profile ceiling")
+    if exact is not None and text != exact:
+        raise ValueError(f"{label} must be exactly {exact!r}")
+    return text
+
+
+def _kms_key_arn(value: object, *, label: str) -> str:
+    if not isinstance(value, str) or _KMS_KEY_ARN_RE.fullmatch(value) is None:
+        raise ValueError(
+            f"{label} must be arn:aws:kms:{_CORPUS_REGION}:{_CORPUS_ACCOUNT}:key/<uuid>"
+        )
+    return value
+
+
 def _bounded_price(value: object, *, label: str, maximum: Decimal) -> Decimal:
     parsed = _decimal_string(value, label=label)
     if parsed > maximum:
@@ -326,8 +363,7 @@ def _validate_s3_object_version(
         raise ValueError(f"{label}.etag must be a lowercase S3 ETag")
     if obj.sse_algorithm != "aws:kms":
         raise ValueError(f"{label}.sse_algorithm must be aws:kms")
-    if obj.kms_key_arn != CORPUS_KMS_KEY_ARN:
-        raise ValueError(f"{label}.kms_key_arn must match the dedicated corpus KMS key")
+    _kms_key_arn(obj.kms_key_arn, label=f"{label}.kms_key_arn")
 
 
 def _validate_profile(profile: CorpusBuilderProfile) -> None:
@@ -352,6 +388,16 @@ def _validate_profile(profile: CorpusBuilderProfile) -> None:
         raise ValueError("profile.max_hourly_usd drift")
     if profile.max_compute_usd != MAX_COMPUTE_USD:
         raise ValueError("profile.max_compute_usd drift")
+    _canonical_decimal_from_decimal(
+        profile.max_hourly_usd,
+        label="profile.max_hourly_usd",
+        exact="5.491",
+    )
+    _canonical_decimal_from_decimal(
+        profile.max_compute_usd,
+        label="profile.max_compute_usd",
+        exact="131.78",
+    )
     if profile.bucket_name != CORPUS_BUCKET:
         raise ValueError("profile.bucket_name drift")
     if profile.key_prefix != CORPUS_KEY_PREFIX:
@@ -381,6 +427,9 @@ def _validate_phase_receipt(receipt: PhaseReceipt) -> None:
             label=f"phase receipt.objects[{index}]",
             expected_build_id=receipt.build_id,
         )
+    kms_arns = {obj.kms_key_arn for obj in receipt.objects}
+    if len(kms_arns) != 1:
+        raise ValueError("phase receipt.objects must share one KMS key ARN")
 
 
 def _validate_launch_intent(intent: LaunchIntent) -> None:
@@ -398,6 +447,10 @@ def _validate_launch_intent(intent: LaunchIntent) -> None:
         raise ValueError("launch intent package and source manifest build_id mismatch")
     _validate_s3_object_version(intent.package, label="launch intent.package")
     _validate_s3_object_version(intent.source_manifest, label="launch intent.source_manifest")
+    if intent.package.kms_key_arn != intent.source_manifest.kms_key_arn:
+        raise ValueError(
+            "launch intent package and source manifest KMS key ARN mismatch"
+        )
     if not _AMI_RE.fullmatch(intent.ami_id):
         raise ValueError("launch intent.ami_id drift")
     if not _ACCOUNT_RE.fullmatch(intent.ami_owner_id):
@@ -416,6 +469,16 @@ def _validate_launch_intent(intent: LaunchIntent) -> None:
         raise ValueError("launch intent.hourly_usd exceeds the approved profile ceiling")
     if intent.max_compute_usd > MAX_COMPUTE_USD:
         raise ValueError("launch intent.max_compute_usd exceeds the approved profile ceiling")
+    _canonical_decimal_from_decimal(
+        intent.hourly_usd,
+        label="launch intent.hourly_usd",
+        maximum=MAX_HOURLY_USD,
+    )
+    _canonical_decimal_from_decimal(
+        intent.max_compute_usd,
+        label="launch intent.max_compute_usd",
+        maximum=MAX_COMPUTE_USD,
+    )
     _utc_timestamp(intent.not_after, label="launch intent.not_after")
 
 
@@ -450,11 +513,9 @@ def s3_object_version_from_dict(
     if not isinstance(etag, str) or _ETAG_RE.fullmatch(etag) is None:
         raise ValueError("S3 object version.etag must be a lowercase S3 ETag")
     sse_algorithm = obj["sse_algorithm"]
-    kms_key_arn = obj["kms_key_arn"]
+    kms_key_arn = _kms_key_arn(obj["kms_key_arn"], label="S3 object version.kms_key_arn")
     if sse_algorithm != "aws:kms":
         raise ValueError("S3 object version.sse_algorithm must be aws:kms")
-    if kms_key_arn != CORPUS_KMS_KEY_ARN:
-        raise ValueError("S3 object version.kms_key_arn must match the dedicated corpus KMS key")
     parsed = S3ObjectVersion(
         uri=uri,
         version_id=version_id,
@@ -462,7 +523,7 @@ def s3_object_version_from_dict(
         sha256=digest,
         etag=etag,
         sse_algorithm="aws:kms",
-        kms_key_arn=CORPUS_KMS_KEY_ARN,
+        kms_key_arn=kms_key_arn,
     )
     _validate_s3_object_version(parsed, label="S3 object version", expected_build_id=expected_build_id)
     return parsed
@@ -485,6 +546,9 @@ def _parse_s3_objects(
         raise ValueError(f"{label} repeats an object URI")
     if uris != sorted(uris):
         raise ValueError(f"{label} object URIs must be sorted and unique")
+    kms_arns = {obj.kms_key_arn for obj in objects}
+    if len(kms_arns) != 1:
+        raise ValueError(f"{label} must share one KMS key ARN")
     return objects
 
 
@@ -557,8 +621,16 @@ def _profile_dict(profile: CorpusBuilderProfile) -> dict[str, object]:
         "bucket_name": profile.bucket_name,
         "instance_type": profile.instance_type,
         "key_prefix": profile.key_prefix,
-        "max_compute_usd": format(profile.max_compute_usd, "f"),
-        "max_hourly_usd": format(profile.max_hourly_usd, "f"),
+        "max_compute_usd": _canonical_decimal_from_decimal(
+            profile.max_compute_usd,
+            label="profile.max_compute_usd",
+            exact="131.78",
+        ),
+        "max_hourly_usd": _canonical_decimal_from_decimal(
+            profile.max_hourly_usd,
+            label="profile.max_hourly_usd",
+            exact="5.491",
+        ),
         "max_runtime_seconds": profile.max_runtime_seconds,
         "memory_mib": profile.memory_mib,
         "nvme_devices": profile.nvme_devices,
@@ -769,11 +841,19 @@ def _launch_intent_dict(intent: LaunchIntent) -> dict[str, object]:
         "ami_id": intent.ami_id,
         "ami_owner_id": intent.ami_owner_id,
         "format": intent.format,
-        "hourly_usd": format(intent.hourly_usd, "f"),
+        "hourly_usd": _canonical_decimal_from_decimal(
+            intent.hourly_usd,
+            label="launch intent.hourly_usd",
+            maximum=MAX_HOURLY_USD,
+        ),
         "instance_profile_arn": intent.instance_profile_arn,
         "launch_template_id": intent.launch_template_id,
         "launch_template_version": intent.launch_template_version,
-        "max_compute_usd": format(intent.max_compute_usd, "f"),
+        "max_compute_usd": _canonical_decimal_from_decimal(
+            intent.max_compute_usd,
+            label="launch intent.max_compute_usd",
+            maximum=MAX_COMPUTE_USD,
+        ),
         "not_after": intent.not_after,
         "package": _s3_object_dict(intent.package),
         "profile_sha256": intent.profile_sha256,

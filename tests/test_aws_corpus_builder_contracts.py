@@ -8,7 +8,6 @@ from pathlib import Path
 import pytest
 
 from cluster.aws.corpus_builder.contracts import (
-    CORPUS_KMS_KEY_ARN,
     LAUNCH_INTENT_FORMAT,
     MAX_COMPUTE_USD,
     MAX_HOURLY_USD,
@@ -31,7 +30,8 @@ ROOT = Path(__file__).resolve().parents[1]
 PROFILE_PATH = ROOT / "cluster" / "profiles" / "aws-i4i.16xlarge-corpus-v1.json"
 
 _BUCKET = "memorysplit-corpus-056956104102-us-east-1"
-_KMS_ARN = CORPUS_KMS_KEY_ARN
+_KMS_ARN = "arn:aws:kms:us-east-1:056956104102:key/01234567-89ab-cdef-0123-456789abcdef"
+_KMS_ARN_OTHER = "arn:aws:kms:us-east-1:056956104102:key/fedcba98-7654-3210-fedc-ba9876543210"
 _SHA256_A = "a" * 64
 _SHA256_B = "b" * 64
 _SHA256_C = "c" * 64
@@ -235,6 +235,8 @@ def test_launch_intent_round_trip_is_canonical():
         lambda value: value.pop("not_after"),
         lambda value: value.update(not_after="2026-07-25T12:00:00+00:00"),
         lambda value: value.update(hourly_usd=5.491),
+        lambda value: value.update(hourly_usd="5.491E+0"),
+        lambda value: value.update(max_compute_usd="1.3178E+2"),
         lambda value: value.update(max_compute_usd="131.780"),
         lambda value: value.update(ami_id="ami-latest"),
         lambda value: value.update(launch_template_version="$Latest"),
@@ -307,10 +309,16 @@ def test_launch_intent_accepts_prices_at_profile_ceiling():
         lambda obj: obj.update(uri=f"s3://{_BUCKET}/other-prefix/{_SHA256_B}/x.json"),
         lambda obj: obj.update(sse_algorithm="AES256", kms_key_arn=""),
         lambda obj: obj.update(
-            kms_key_arn=(
-                "arn:aws:kms:us-east-1:056956104102:key/"
-                "fedcba98-7654-3210-fedc-ba9876543210"
-            )
+            kms_key_arn="arn:aws:kms:us-east-1:056956104102:alias/corpus-key"
+        ),
+        lambda obj: obj.update(
+            kms_key_arn="arn:aws:kms:us-west-2:056956104102:key/01234567-89ab-cdef-0123-456789abcdef"
+        ),
+        lambda obj: obj.update(
+            kms_key_arn="arn:aws:kms:us-east-1:999999999999:key/01234567-89ab-cdef-0123-456789abcdef"
+        ),
+        lambda obj: obj.update(
+            kms_key_arn="arn:aws:kms:us-east-1:056956104102:key/not-a-valid-uuid"
         ),
     ],
 )
@@ -420,3 +428,144 @@ def test_public_serializers_reject_invalid_dataclass_inputs():
     )
     with pytest.raises(ValueError):
         launch_intent_to_bytes(bad_intent)
+
+
+def test_s3_object_accepts_any_valid_corpus_account_kms_key_uuid():
+    value = _valid_s3_object()
+    value["kms_key_arn"] = _KMS_ARN_OTHER
+    parsed = s3_object_version_from_dict(value)
+    assert parsed.kms_key_arn == _KMS_ARN_OTHER
+
+
+def test_phase_receipt_requires_one_shared_kms_key_across_objects():
+    value = _valid_phase_receipt_dict(
+        objects=[
+            _valid_s3_object(object_name="receipt.json"),
+            {
+                **_valid_s3_object(object_name="manifest.json"),
+                "kms_key_arn": _KMS_ARN_OTHER,
+            },
+        ]
+    )
+
+    with pytest.raises(ValueError):
+        phase_receipt_from_bytes(_canonical_bytes(value))
+
+
+def test_launch_intent_requires_package_and_manifest_share_kms_key():
+    value = _valid_launch_intent_dict()
+    value["source_manifest"] = {
+        **_valid_s3_object(build_id=_SHA256_B, object_name="source-manifest.json"),
+        "kms_key_arn": _KMS_ARN_OTHER,
+    }
+
+    with pytest.raises(ValueError):
+        launch_intent_from_bytes(_canonical_bytes(value))
+
+
+@pytest.mark.parametrize(
+    "hourly_usd",
+    [
+        Decimal("5.4910"),
+        Decimal("5.490"),
+        Decimal("-0.001"),
+        Decimal("5.492"),
+    ],
+)
+def test_launch_intent_serializer_rejects_noncanonical_or_over_ceiling_decimals(
+    hourly_usd,
+):
+    valid_intent = launch_intent_from_bytes(_canonical_bytes(_valid_launch_intent_dict()))
+    bad_intent = LaunchIntent(
+        format=valid_intent.format,
+        schema_version=valid_intent.schema_version,
+        profile_sha256=valid_intent.profile_sha256,
+        package=valid_intent.package,
+        source_manifest=valid_intent.source_manifest,
+        ami_id=valid_intent.ami_id,
+        ami_owner_id=valid_intent.ami_owner_id,
+        launch_template_id=valid_intent.launch_template_id,
+        launch_template_version=valid_intent.launch_template_version,
+        subnet_id=valid_intent.subnet_id,
+        security_group_id=valid_intent.security_group_id,
+        instance_profile_arn=valid_intent.instance_profile_arn,
+        hourly_usd=hourly_usd,
+        max_compute_usd=valid_intent.max_compute_usd,
+        not_after=valid_intent.not_after,
+    )
+
+    with pytest.raises(ValueError):
+        launch_intent_to_bytes(bad_intent)
+
+
+@pytest.mark.parametrize(
+    "max_compute_usd",
+    [
+        Decimal("131.780"),
+        Decimal("-1"),
+        Decimal("131.79"),
+    ],
+)
+def test_launch_intent_serializer_rejects_noncanonical_max_compute(max_compute_usd):
+    valid_intent = launch_intent_from_bytes(_canonical_bytes(_valid_launch_intent_dict()))
+    bad_intent = LaunchIntent(
+        format=valid_intent.format,
+        schema_version=valid_intent.schema_version,
+        profile_sha256=valid_intent.profile_sha256,
+        package=valid_intent.package,
+        source_manifest=valid_intent.source_manifest,
+        ami_id=valid_intent.ami_id,
+        ami_owner_id=valid_intent.ami_owner_id,
+        launch_template_id=valid_intent.launch_template_id,
+        launch_template_version=valid_intent.launch_template_version,
+        subnet_id=valid_intent.subnet_id,
+        security_group_id=valid_intent.security_group_id,
+        instance_profile_arn=valid_intent.instance_profile_arn,
+        hourly_usd=valid_intent.hourly_usd,
+        max_compute_usd=max_compute_usd,
+        not_after=valid_intent.not_after,
+    )
+
+    with pytest.raises(ValueError):
+        launch_intent_to_bytes(bad_intent)
+
+
+def test_profile_serializer_rejects_noncanonical_decimal_fields():
+    profile = load_corpus_builder_profile(PROFILE_PATH)
+    bad_profile = CorpusBuilderProfile(
+        profile_id=profile.profile_id,
+        region=profile.region,
+        instance_type=profile.instance_type,
+        vcpus=profile.vcpus,
+        memory_mib=profile.memory_mib,
+        nvme_devices=profile.nvme_devices,
+        nvme_total_gib=profile.nvme_total_gib,
+        root_volume_gib=profile.root_volume_gib,
+        max_runtime_seconds=profile.max_runtime_seconds,
+        watchdog_shutdown_seconds=profile.watchdog_shutdown_seconds,
+        max_hourly_usd=Decimal("5.4910"),
+        max_compute_usd=profile.max_compute_usd,
+        bucket_name=profile.bucket_name,
+        key_prefix=profile.key_prefix,
+    )
+
+    with pytest.raises(ValueError):
+        corpus_builder_profile_to_bytes(bad_profile)
+
+
+def test_all_public_serializers_round_trip_byte_for_byte():
+    profile = load_corpus_builder_profile(PROFILE_PATH)
+    profile_bytes = corpus_builder_profile_to_bytes(profile)
+    assert corpus_builder_profile_to_bytes(
+        load_corpus_builder_profile(PROFILE_PATH)
+    ) == profile_bytes
+
+    receipt_payload = _canonical_bytes(_valid_phase_receipt_dict())
+    receipt = phase_receipt_from_bytes(receipt_payload)
+    assert phase_receipt_to_bytes(receipt) == receipt_payload
+    assert phase_receipt_from_bytes(phase_receipt_to_bytes(receipt)) == receipt
+
+    intent_payload = _canonical_bytes(_valid_launch_intent_dict())
+    intent = launch_intent_from_bytes(intent_payload)
+    assert launch_intent_to_bytes(intent) == intent_payload
+    assert launch_intent_from_bytes(launch_intent_to_bytes(intent)) == intent

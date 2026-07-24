@@ -2,7 +2,6 @@
 
 from cluster.aws.corpus_builder.contracts import (
     CORPUS_BUCKET,
-    CORPUS_KMS_KEY_ARN,
     CORPUS_KEY_PREFIX,
     LAUNCH_INTENT_FORMAT,
     MAX_COMPUTE_USD,
@@ -23,7 +22,6 @@ from cluster.aws.corpus_builder.contracts import (
 
 __all__ = [
     "CORPUS_BUCKET",
-    "CORPUS_KMS_KEY_ARN",
     "CORPUS_KEY_PREFIX",
     "LAUNCH_INTENT_FORMAT",
     "MAX_COMPUTE_USD",
