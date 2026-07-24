@@ -3,7 +3,7 @@
 Date: 2026-07-24
 Branch: `feat/aws-corpus-builder`
 Exact base: `f2d91d0b7fb8dcf932e2afee190a0f9ebb90e905`
-Status: `DONE_WITH_INTEGRATION_CONCERNS`
+Status: `DONE`
 
 ## Commits
 
@@ -223,3 +223,157 @@ uploads assert streaming bodies rather than materialized artifact bytes.
    requires the later AWS runtime/package task to provide a compatible boto3.
 
 No push, amend, AWS API call, or network call was performed.
+
+## Review-fix addendum
+
+This addendum supersedes the two integration concerns above. Task 3 runtime,
+CLI, and test authorities are now admitted by Task 2 packaging, and the live
+CLI dependency is declared in the authoritative `requirements.txt`.
+
+### Commit and changed files
+
+- Review fixes:
+  `36d38777002183832c4243785bf8181149439920` —
+  `fix: close exact publication review gaps`.
+- Modified only `cluster/aws/corpus_builder/s3.py`,
+  `scripts/aws_corpus_cleanroom_verify.py`,
+  `tests/test_aws_corpus_builder_s3.py`,
+  `cluster/aws/corpus_builder/package.py`,
+  `tests/test_package_aws_corpus_builder.py`, and `requirements.txt`.
+- This report is committed separately so it can record the implementation
+  commit without amending it.
+
+### Review-fix RED/GREEN evidence
+
+Receipt namespace/KMS authority and GET-body closure RED:
+
+```bash
+python -m pytest -q \
+  tests/test_aws_corpus_builder_s3.py::test_phase_receipt_rejects_key_build_id_before_any_s3_mutation \
+  tests/test_aws_corpus_builder_s3.py::test_phase_receipt_rejects_kms_mismatch_before_any_s3_mutation \
+  tests/test_aws_corpus_builder_s3.py::test_get_streaming_body_closes_on_every_authority_validation_failure
+```
+
+Exact RED result: `8 failed in 0.17s` (both publication cases did not raise,
+and all six metadata-drift bodies remained open). After the fix, the same
+cases plus the successful-download closure assertion reported
+`9 passed in 0.08s`.
+
+Pinned clean-room authority RED:
+
+```bash
+python -m pytest -q \
+  tests/test_aws_corpus_builder_s3.py::test_cleanroom_cli_downloads_only_receipt_bound_versions_then_verifies \
+  tests/test_aws_corpus_builder_s3.py::test_cleanroom_cli_rejects_symlinked_destination_ancestor_before_s3 \
+  tests/test_aws_corpus_builder_s3.py::test_cleanroom_cli_rejects_non_final_receipt_before_objects_or_verifier \
+  tests/test_aws_corpus_builder_s3.py::test_cleanroom_cli_rechecks_pinned_authority_after_verification
+```
+
+Exact RED result: `5 failed in 0.16s`. The first implementation run exposed a
+test-only missing `stat` import (`1 failed, 4 passed in 0.10s`); after fixing
+the harness, the exact command reported `5 passed in 0.09s`.
+
+Package inventory/dependency RED:
+
+```bash
+python -m pytest -q \
+  tests/test_package_aws_corpus_builder.py::test_package_allowlist_is_exact \
+  tests/test_package_aws_corpus_builder.py::test_task3_runtime_cli_and_tests_are_required_reviewed_members \
+  tests/test_package_aws_corpus_builder.py::test_live_cleanroom_dependency_is_declared_once
+```
+
+Exact RED result: `3 failed in 0.10s`. After admitting the Task 3 runtime,
+CLI, and focused test authorities and declaring `boto3>=1.34`, the exact
+command reported `3 passed in 0.09s`. The focused archive-membership test
+reported `1 passed in 0.68s`.
+
+### Final verification
+
+Task 3 focused suite:
+
+```bash
+python -m pytest -q tests/test_aws_corpus_builder_s3.py
+```
+
+Exact result: `36 passed in 0.11s`.
+
+Task 2 package suite:
+
+```bash
+python -m pytest -q tests/test_package_aws_corpus_builder.py
+```
+
+Exact result: `48 passed in 13.97s`.
+
+Previously reported focused AWS/corpus regression:
+
+```bash
+python -m pytest -q \
+  tests/test_aws_corpus_builder_s3.py \
+  tests/test_package_aws_corpus_builder.py \
+  tests/test_aws_corpus_builder_contracts.py \
+  tests/test_parallel_corpus.py \
+  tests/test_reasoning_v2_contracts_strict.py \
+  tests/test_reasoning_v2_contracts.py \
+  tests/test_reasoning_v2_catalog.py \
+  tests/test_reasoning_v2_source_lock.py
+```
+
+Exact result: `410 passed in 26.03s`. As before, this local-only regression was
+run outside the filesystem sandbox solely because its package tests create Git
+repositories under the system temporary directory. No network or AWS path ran.
+
+Static checks:
+
+```bash
+python -m py_compile \
+  cluster/aws/corpus_builder/s3.py \
+  cluster/aws/corpus_builder/package.py \
+  scripts/aws_corpus_cleanroom_verify.py \
+  scripts/package_aws_corpus_builder.py \
+  tests/test_aws_corpus_builder_s3.py \
+  tests/test_package_aws_corpus_builder.py
+git diff --check
+```
+
+Both were silent with exit code zero.
+
+### Added fake-S3 and filesystem mutation coverage
+
+1. Receipt-key build ID mismatch is rejected with unchanged PUT/list counts.
+2. Supplied KMS mismatch against the receipt objects' one shared KMS authority
+   is rejected with unchanged PUT/list counts.
+3. GET response drift in KMS, bytes, SHA-256, ETag, encryption, or version ID
+   closes the returned streaming body; the successful stream closes too.
+4. A non-final phase receipt performs only its own exact download and invokes
+   neither corpus-object downloads nor the verifier.
+5. A symlink in any destination ancestor is rejected before S3 reads.
+6. Destination-root replacement and phase-receipt name replacement after
+   parsing/verifying are detected by final descriptor/name binding checks.
+7. The exact phase receipt remains owner-only in a sibling control directory,
+   outside the corpus namespace.
+8. Task 3 package membership, required focused-test authority, archive
+   inclusion, and the live dependency declaration are covered directly.
+
+### Review-fix self-review
+
+- Canonical Task 1 validation completes before publication preflight; key build
+  ID and the receipt objects' shared KMS ARN are checked before either LIST or
+  PUT can execute.
+- GET-body ownership is centralized: every response-authority failure closes
+  the body, and both receipt-reuse and object-download success/error paths close
+  it in `finally`.
+- Clean-room creation walks and pins every real ancestor, exclusively creates
+  and pins `0700` corpus/control directories, downloads through directory FDs,
+  and never places the phase receipt in the corpus namespace.
+- The phase receipt's authority descriptor is opened through the pinned control
+  descriptor, parsed from that descriptor, retained, and rechecked after corpus
+  verification for inode, size, SHA-256, exact name binding, and exclusive
+  control contents. It is never reopened or removed through an unverified
+  pathname.
+- Task 2 now requires/packages the Task 3 runtime and CLI and requires the Task
+  3 focused test without broadening the archive to all tests.
+- The existing production-completion gate remains intentionally unchanged for
+  Task 4. No other concern remains for Task 3.
+- No AWS/network call, package-index access, push, amend, brief edit, progress
+  edit, other-worktree edit, or unrelated source change was performed.
