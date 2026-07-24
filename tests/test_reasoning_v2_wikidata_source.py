@@ -2712,3 +2712,137 @@ def test_archive_materialization_fdopen_close_preserves_body_error(
     assert target_fd >= 0
     with pytest.raises(OSError):
         os.fstat(target_fd)
+
+
+def test_two_name_preswap_retries_until_candidate_is_quarantined(
+    archive_authority: _AuthorityFixture,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    output_root = tmp_path / "derived"
+    candidate_inode: int | None = None
+    marker_inode: int | None = None
+    final_name: str | None = None
+    adversary_swapped = False
+
+    def preswap_exact_names(phase, authority, receipt_sha256):
+        nonlocal candidate_inode, marker_inode, final_name
+        nonlocal adversary_swapped
+        namespace = output_root / "wikidata"
+        if phase == "before_postpublish_verify":
+            final_name = receipt_sha256
+            candidate_inode = (namespace / receipt_sha256).stat().st_ino
+            raise RuntimeError("forced failed candidate")
+        if phase != "before_quarantine_exchange" or adversary_swapped:
+            return
+        adversary_swapped = True
+        markers = tuple(
+            path
+            for path in namespace.iterdir()
+            if path.name.startswith(".quarantine-")
+        )
+        assert len(markers) == 1
+        marker_inode = markers[0].stat().st_ino
+        wikidata_source_module._atomic_exchange_directories(
+            authority.namespace_fd,
+            receipt_sha256,
+            markers[0].name,
+        )
+        assert (namespace / receipt_sha256).stat().st_ino == marker_inode
+        assert markers[0].stat().st_ino == candidate_inode
+
+    monkeypatch.setattr(
+        wikidata_source_module,
+        "_derived_view_build_hook",
+        preswap_exact_names,
+    )
+
+    with pytest.raises(RuntimeError, match="forced failed candidate"):
+        _build_view(archive_authority, output_root)
+
+    assert adversary_swapped
+    assert final_name is not None
+    namespace = output_root / "wikidata"
+    final = namespace / final_name
+    assert not final.exists() or final.stat().st_ino != candidate_inode
+    quarantined_candidates = tuple(
+        path
+        for path in namespace.iterdir()
+        if path.name.startswith(".quarantine-")
+        and path.stat().st_ino == candidate_inode
+    )
+    assert len(quarantined_candidates) == 1
+    assert all(
+        path.stat().st_ino != marker_inode
+        for path in namespace.iterdir()
+    )
+
+
+def test_repeated_original_state_exhaustion_refreshes_marker(
+    archive_authority: _AuthorityFixture,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    output_root = tmp_path / "derived"
+    candidate_inode: int | None = None
+    final_name: str | None = None
+    allocated_markers: list[str] = []
+    exchange_calls = 0
+    forced_repeats = 2
+    original_allocate = wikidata_source_module._allocate_quarantine_marker
+    original_exchange = wikidata_source_module._atomic_exchange_directories
+
+    def record_marker(namespace_fd, published_name):
+        marker = original_allocate(namespace_fd, published_name)
+        allocated_markers.append(marker.name)
+        return marker
+
+    def repeat_original_state(directory_fd, first_name, second_name):
+        nonlocal exchange_calls
+        exchange_calls += 1
+        original_exchange(directory_fd, first_name, second_name)
+        if exchange_calls <= forced_repeats:
+            original_exchange(directory_fd, first_name, second_name)
+
+    def fail_after_publish(phase, _authority, receipt_sha256):
+        nonlocal candidate_inode, final_name
+        if phase != "before_postpublish_verify":
+            return
+        final_name = receipt_sha256
+        candidate_inode = (
+            output_root / "wikidata" / receipt_sha256
+        ).stat().st_ino
+        raise RuntimeError("forced repeated-state failure")
+
+    monkeypatch.setattr(
+        wikidata_source_module,
+        "_allocate_quarantine_marker",
+        record_marker,
+    )
+    monkeypatch.setattr(
+        wikidata_source_module,
+        "_atomic_exchange_directories",
+        repeat_original_state,
+    )
+    monkeypatch.setattr(
+        wikidata_source_module,
+        "_derived_view_build_hook",
+        fail_after_publish,
+    )
+
+    with pytest.raises(RuntimeError, match="forced repeated-state failure"):
+        _build_view(archive_authority, output_root)
+
+    assert final_name is not None
+    assert len(allocated_markers) >= 2
+    assert exchange_calls >= forced_repeats + 1
+    namespace = output_root / "wikidata"
+    final = namespace / final_name
+    assert not final.exists() or final.stat().st_ino != candidate_inode
+    quarantines = tuple(
+        path
+        for path in namespace.iterdir()
+        if path.name.startswith(".quarantine-")
+    )
+    assert len(quarantines) == 1
+    assert quarantines[0].stat().st_ino == candidate_inode

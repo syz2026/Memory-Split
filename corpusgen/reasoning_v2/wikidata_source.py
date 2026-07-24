@@ -4637,6 +4637,17 @@ class _QuarantineMarker:
     entry_name: str | None
 
 
+_QUARANTINE_SAME_STATE_RETRIES = 1
+
+
+@dataclass(frozen=True)
+class _QuarantineExchangeState:
+    candidate_at_final: bool
+    candidate_at_marker: bool
+    marker_at_final: bool
+    marker_at_marker: bool
+
+
 def _allocate_quarantine_marker(
     namespace_fd: int,
     published_name: str,
@@ -4784,79 +4795,260 @@ def _named_derived_directory_matches(
     return True
 
 
+def _classify_quarantine_exchange(
+    authority: _PrivateBuildAuthority,
+    published_name: str,
+    marker: _QuarantineMarker,
+) -> _QuarantineExchangeState:
+    return _QuarantineExchangeState(
+        candidate_at_final=_named_derived_directory_matches(
+            authority.namespace_fd,
+            published_name,
+            authority.descriptor,
+            authority.identity,
+            "published candidate at final name",
+        ),
+        candidate_at_marker=_named_derived_directory_matches(
+            authority.namespace_fd,
+            marker.name,
+            authority.descriptor,
+            authority.identity,
+            "published candidate at quarantine name",
+        ),
+        marker_at_final=_named_derived_directory_matches(
+            marker.namespace_fd,
+            published_name,
+            marker.descriptor,
+            marker.identity,
+            "quarantine marker at final name",
+        ),
+        marker_at_marker=_named_derived_directory_matches(
+            marker.namespace_fd,
+            marker.name,
+            marker.descriptor,
+            marker.identity,
+            "quarantine marker at quarantine name",
+        ),
+    )
+
+
+def _record_quarantine_marker_location(
+    marker: _QuarantineMarker,
+    published_name: str,
+    state: _QuarantineExchangeState,
+) -> None:
+    if state.marker_at_final and not state.marker_at_marker:
+        marker.entry_name = published_name
+    elif state.marker_at_marker and not state.marker_at_final:
+        marker.entry_name = marker.name
+    else:
+        marker.entry_name = None
+
+
+def _refresh_quarantine_marker(
+    marker: _QuarantineMarker,
+    published_name: str,
+    state: _QuarantineExchangeState,
+) -> BaseException | None:
+    fresh = _allocate_quarantine_marker(
+        marker.namespace_fd,
+        published_name,
+    )
+    _check_named_derived_directory(
+        fresh.namespace_fd,
+        fresh.name,
+        fresh.descriptor,
+        fresh.identity,
+        "fresh quarantine marker",
+    )
+    retired = _QuarantineMarker(
+        namespace_fd=marker.namespace_fd,
+        name=marker.name,
+        descriptor=marker.descriptor,
+        identity=marker.identity,
+        entry_name=marker.name if state.marker_at_marker else None,
+    )
+    marker.namespace_fd = fresh.namespace_fd
+    marker.name = fresh.name
+    marker.descriptor = fresh.descriptor
+    marker.identity = fresh.identity
+    marker.entry_name = fresh.entry_name
+
+    cleanup_error: BaseException | None = None
+    if retired.entry_name is not None:
+        try:
+            _remove_quarantine_marker(
+                retired,
+                sync_parent=True,
+            )
+        except BaseException as error:
+            cleanup_error = error
+    close_error = _close_descriptors_exhaustively((retired.descriptor,))
+    if close_error is not None:
+        cleanup_error = _append_secondary_error(
+            cleanup_error,
+            close_error,
+            "retired quarantine marker close failure",
+        )
+    return cleanup_error
+
+
+def _sync_and_classify_quarantine(
+    authority: _PrivateBuildAuthority,
+    published_name: str,
+    marker: _QuarantineMarker,
+) -> _QuarantineExchangeState:
+    fsync_directory(authority.namespace_fd)
+    state = _classify_quarantine_exchange(
+        authority,
+        published_name,
+        marker,
+    )
+    _record_quarantine_marker_location(
+        marker,
+        published_name,
+        state,
+    )
+    return state
+
+
 def _exchange_quarantine_published_candidate(
     authority: _PrivateBuildAuthority,
     published_name: str,
     marker: _QuarantineMarker,
 ) -> str:
-    _check_named_derived_directory(
-        authority.namespace_fd,
-        published_name,
-        authority.descriptor,
-        authority.identity,
-        "published candidate before quarantine exchange",
-    )
-    _check_named_derived_directory(
-        marker.namespace_fd,
-        marker.name,
-        marker.descriptor,
-        marker.identity,
-        "quarantine marker before exchange",
-    )
-    _derived_view_build_hook(
-        "before_quarantine_exchange",
-        authority,
-        published_name,
-    )
-    _atomic_exchange_directories(
-        authority.namespace_fd,
-        published_name,
-        marker.name,
-    )
-    candidate_moved = _named_derived_directory_matches(
-        authority.namespace_fd,
-        marker.name,
-        authority.descriptor,
-        authority.identity,
-        "published candidate after quarantine exchange",
-    )
-    marker_at_final = _named_derived_directory_matches(
-        authority.namespace_fd,
-        published_name,
-        marker.descriptor,
-        marker.identity,
-        "quarantine marker at final name",
-    )
-    marker.entry_name = published_name if marker_at_final else None
+    secondary_error: BaseException | None = None
+    repeated_original_state = 0
+    try:
+        _check_named_derived_directory(
+            authority.namespace_fd,
+            published_name,
+            authority.descriptor,
+            authority.identity,
+            "published candidate before quarantine exchange",
+        )
+        _check_named_derived_directory(
+            marker.namespace_fd,
+            marker.name,
+            marker.descriptor,
+            marker.identity,
+            "quarantine marker before exchange",
+        )
+        _derived_view_build_hook(
+            "before_quarantine_exchange",
+            authority,
+            published_name,
+        )
+        _atomic_exchange_directories(
+            authority.namespace_fd,
+            published_name,
+            marker.name,
+        )
+    except BaseException as error:
+        secondary_error = error
 
-    if candidate_moved:
-        if marker_at_final:
-            _remove_quarantine_marker(marker, sync_parent=True)
-        else:
-            fsync_directory(authority.namespace_fd)
-        return marker.name
-
-    if marker_at_final:
-        try:
-            _rollback_quarantine_exchange(
-                authority,
-                published_name,
-                marker,
-            )
-        except BaseException as rollback_error:
-            rollback_failure = ValueError(
-                "quarantine exchange rollback failed"
-            )
-            rollback_failure.add_note(
-                f"conditional rollback also failed: {rollback_error!r}"
-            )
-            raise rollback_failure from rollback_error
-        raise ValueError(
-            "published candidate did not move during quarantine exchange"
+    while True:
+        state = _classify_quarantine_exchange(
+            authority,
+            published_name,
+            marker,
+        )
+        _record_quarantine_marker_location(
+            marker,
+            published_name,
+            state,
         )
 
-    fsync_directory(authority.namespace_fd)
-    raise ValueError("quarantine exchange identities are indeterminate")
+        if state.candidate_at_final:
+            if (
+                state.marker_at_marker
+                and repeated_original_state
+                < _QUARANTINE_SAME_STATE_RETRIES
+            ):
+                repeated_original_state += 1
+            else:
+                try:
+                    refresh_error = _refresh_quarantine_marker(
+                        marker,
+                        published_name,
+                        state,
+                    )
+                except BaseException as error:
+                    if secondary_error is None:
+                        secondary_error = error
+                    if not state.marker_at_marker:
+                        continue
+                else:
+                    if refresh_error is not None and secondary_error is None:
+                        secondary_error = refresh_error
+                    repeated_original_state = 0
+
+            try:
+                _check_named_derived_directory(
+                    authority.namespace_fd,
+                    published_name,
+                    authority.descriptor,
+                    authority.identity,
+                    "failed candidate before quarantine retry",
+                )
+                _check_named_derived_directory(
+                    marker.namespace_fd,
+                    marker.name,
+                    marker.descriptor,
+                    marker.identity,
+                    "retained marker before quarantine retry",
+                )
+                _atomic_exchange_directories(
+                    authority.namespace_fd,
+                    published_name,
+                    marker.name,
+                )
+            except BaseException as error:
+                if secondary_error is None:
+                    secondary_error = error
+            continue
+
+        repeated_original_state = 0
+        if state.candidate_at_marker and state.marker_at_final:
+            marker.entry_name = published_name
+            try:
+                _remove_quarantine_marker(
+                    marker,
+                    sync_parent=False,
+                )
+            except BaseException as error:
+                if secondary_error is None:
+                    secondary_error = error
+                continue
+
+        one_sided_wrong_source = (
+            state.marker_at_final
+            and not state.marker_at_marker
+            and not state.candidate_at_marker
+        )
+        if one_sided_wrong_source:
+            try:
+                _rollback_quarantine_exchange(
+                    authority,
+                    published_name,
+                    marker,
+                )
+            except BaseException as error:
+                if secondary_error is None:
+                    secondary_error = error
+
+        terminal = _sync_and_classify_quarantine(
+            authority,
+            published_name,
+            marker,
+        )
+        if terminal.candidate_at_final:
+            continue
+        if terminal.candidate_at_marker and terminal.marker_at_final:
+            continue
+        if secondary_error is not None:
+            raise secondary_error
+        return marker.name
 
 
 def _cleanup_private_build(authority: _PrivateBuildAuthority) -> None:
