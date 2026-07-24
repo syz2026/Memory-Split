@@ -1,0 +1,136 @@
+schema_version: 1
+amendment_id: memorysplit-v3-objective-controls-amendment-1
+append_only: true
+status: prospective
+adopted_date: '2026-07-24'
+parent_contract:
+  source_commit: b3471e0969ca2a997d33acf60d2e777720afa1c4
+  preregistration_path: configs/preregistration-v3.yaml
+  preregistration_sha256: 6b2b5da3e3dc3d533498a0aa9d1891f356134ce045b1553b74a0161d94cb81d7
+  cohort_assignment_path: configs/cohort-assignment-v3.json
+  cohort_assignment_sha256: 47faf6f15e13336f67666081c3d0ebf5be3b981f3d2ac455385faa39e543199c
+outcome_inspection_before_amendment:
+  protected_outcomes_inspected: 0
+  seed_level_outcomes_inspected: false
+  arm_level_outcomes_inspected: false
+  aggregate_outcomes_inspected: false
+protected_primary_cohort:
+  cohort_id: memorysplit-confirmatory-v3-360m-n10-aws
+  unchanged: true
+  model_parameters: 356033536
+  conditions:
+  - dense
+  - split90
+  seeds:
+  - 0
+  - 1
+  - 2
+  - 3
+  - 4
+  - 5
+  - 6
+  - 7
+  - 8
+  - 9
+  cell_count: 20
+  cells:
+  - memorysplit-v3-360m-s0-dense
+  - memorysplit-v3-360m-s0-split90
+  - memorysplit-v3-360m-s1-dense
+  - memorysplit-v3-360m-s1-split90
+  - memorysplit-v3-360m-s2-dense
+  - memorysplit-v3-360m-s2-split90
+  - memorysplit-v3-360m-s3-dense
+  - memorysplit-v3-360m-s3-split90
+  - memorysplit-v3-360m-s4-dense
+  - memorysplit-v3-360m-s4-split90
+  - memorysplit-v3-360m-s5-dense
+  - memorysplit-v3-360m-s5-split90
+  - memorysplit-v3-360m-s6-dense
+  - memorysplit-v3-360m-s6-split90
+  - memorysplit-v3-360m-s7-dense
+  - memorysplit-v3-360m-s7-split90
+  - memorysplit-v3-360m-s8-dense
+  - memorysplit-v3-360m-s8-split90
+  - memorysplit-v3-360m-s9-dense
+  - memorysplit-v3-360m-s9-split90
+  claim_bearing_conditions:
+  - dense
+  - split90
+  added_360m_controls: []
+  replicated_360m_selectivity_vs_random_claim: disclaimed
+development_diagnostics_29m:
+  manifest_path: configs/29m-v3/manifest.json
+  run_count: 8
+  model_parameters: 28969216
+  targets_per_update: 524288
+  optimizer_steps: 1106
+  raw_target_tokens: 579862528
+  shared_seed: 0
+  shared_initialization_id: memorysplit-v3-29m-shared-init-s0
+  run_ids:
+  - full_corpus_dense
+  - full_corpus_split90
+  - no_arc_conceptarc_dense
+  - no_arc_conceptarc_split90
+  - no_refinement_dense
+  - no_refinement_split90
+  - full_corpus_random_fact90
+  - full_corpus_matched_nonfactual_mask
+  non_claim_bearing: true
+  selection_use_forbidden: true
+  statistical_exclusions:
+  - primary_exact_test
+  - fixed_checkpoint_aulc
+  - practical_equivalence_test
+  - continuation_decisions
+  - effect_direction_gate
+admission:
+  non_directional: true
+  required_identity_bindings:
+  - config_sha256
+  - corpus_variant_id
+  - corpus_sha256
+  - sidecar_id
+  - sidecar_sha256
+  - provenance_id
+  - provenance_sha256
+  finite_optimization_required: true
+  checkpoint_resume:
+    exact_required: true
+    max_abs_delta: 1.0e-05
+    threshold_rule: less_than_or_equal
+  language_noninferiority:
+    max_relative_degradation: 0.01
+    threshold_rule: less_than_or_equal
+  required_audits:
+  - route
+  - mask
+  - semantic_closure
+  learnability:
+    run_ids:
+    - full_corpus_dense
+    - full_corpus_split90
+    - no_arc_conceptarc_dense
+    - no_arc_conceptarc_split90
+    - no_refinement_dense
+    - no_refinement_split90
+    primary_cells:
+    - graph__composition_ood
+    - graph__joint_ood
+    - non_path__composition_ood
+    - non_path__joint_ood
+    accuracy_floor: 0.75
+    floor_rule: strictly_greater_than
+  controls:
+    run_ids:
+    - full_corpus_random_fact90
+    - full_corpus_matched_nonfactual_mask
+    role: integrity_only
+    directional_accuracy_threshold: null
+  forbidden_uses:
+  - primary_exact_test
+  - fixed_checkpoint_aulc
+  - practical_equivalence_test
+  - continuation_decisions
+  - effect_direction_gate
