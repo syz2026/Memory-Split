@@ -870,3 +870,128 @@ Both static checks were silent with exit code zero.
 The unrelated pre-existing full-suite failures recorded earlier remain outside
 this task's ownership. All requested focused, source-lock, compilation, and
 diff gates are green.
+
+## Fresh-marker ownership closure
+
+Status: `DONE_WITH_CONCERNS`
+
+Implementation commit:
+`812133ddfa1472707583407be9feb98ccf7f2efb` —
+`fix: release failed Wikidata quarantine markers`.
+
+### Remaining leak addressed
+
+1. `_refresh_quarantine_marker` now owns each newly allocated marker locally
+   until its post-allocation descriptor/name check passes and all active-marker
+   fields have been transferred. A `finally` path releases every untransferred
+   marker.
+2. Release first attempts descriptor-bound exact removal. The existing retained
+   descriptor and creation identity must still match the named entry, so a
+   substituted entry is never removed. Successful exact removal fsyncs the
+   namespace.
+3. Descriptor closure is attempted exhaustively whether removal succeeds,
+   fails, or detects substitution. Removal and close errors are secondary to
+   the original allocation/bind validation error and are attached as notes.
+4. Initial quarantine-marker allocation now applies the same owned-marker
+   release discipline if its post-creation emptiness check fails.
+5. Successful ownership transfer reuses the release helper for the retired
+   marker. Repeated failed fresh-marker checks therefore retain only the active
+   marker descriptor and active marker namespace entry.
+
+### Fresh-marker TDD evidence
+
+The repeated bind-failure stress test was added before production changes.
+It forces four post-allocation bind failures, keeps the failed candidate at
+final until a fresh marker succeeds, injects one close failure after the real
+close, and records live retained-marker descriptors and named quarantine
+entries after every failed retry.
+
+Direct RED command:
+
+```bash
+python -m pytest -q \
+  tests/test_reasoning_v2_wikidata_source.py::test_repeated_fresh_marker_bind_failures_keep_resources_bounded
+```
+
+Exact RED result:
+
+```text
+F                                                                        [100%]
+1 failed in 0.45s
+```
+
+The failing resource observations were
+`[(2, 2), (3, 3), (4, 4), (5, 5)]`, proving one leaked descriptor and one
+leaked namespace entry per retry instead of the required constant
+`[(1, 1), (1, 1), (1, 1), (1, 1)]`.
+
+The same test after implementation:
+
+```text
+.                                                                        [100%]
+1 passed in 0.62s
+```
+
+### Final verification
+
+```bash
+python -m pytest -q tests/test_reasoning_v2_wikidata_source.py
+```
+
+```text
+........................................................................ [ 94%]
+....                                                                     [100%]
+76 passed in 3.21s
+```
+
+```bash
+python -m pytest -q \
+  tests/test_reasoning_v2_source_lock.py \
+  tests/test_current_sources.py
+```
+
+```text
+........................................................................ [ 64%]
+.......................................                                  [100%]
+111 passed in 15.42s
+```
+
+The regression command used unrestricted local filesystem execution only
+because its fixtures create temporary Git repositories. No network or AWS
+access was enabled or used.
+
+```bash
+python -m py_compile \
+  corpusgen/reasoning_v2/wikidata_source.py \
+  tests/test_reasoning_v2_wikidata_source.py
+git diff --check
+```
+
+Both static checks were silent with exit code zero.
+
+### Bounded-resource and self-review
+
+- Each failed retry now records exactly one live marker descriptor and one
+  `.quarantine-*` entry. After completion, every allocated marker descriptor is
+  closed and exactly one quarantine entry remains, bound to the failed
+  candidate rather than a marker.
+- The injected close error occurs only after the real descriptor close. The
+  reported quarantine error remains the first fresh-marker bind `ValueError`;
+  the close error does not replace it, and the original postpublication
+  `RuntimeError` remains the build's primary exception.
+- Exact-removal checks reuse the retained descriptor and creation identity.
+  Identity mismatch fails before `rmdir`, closes only the retained descriptor,
+  and preserves the substituted name.
+- The four-location quarantine state machine, one-sided rollback restriction,
+  fresh-marker retry bound, external-sort bounds, deterministic bytes, and all
+  Task 1/Task 2 public interfaces and schema/format v1 remain unchanged.
+- The implementation commit contains exactly the two authorized Wikidata
+  code/test files. This appendix is the only report change. No amend, push,
+  source mutation, AWS operation, network operation, or other worktree edit
+  occurred.
+
+### Concern
+
+The unrelated pre-existing full-suite failures recorded earlier remain outside
+this task's ownership. All requested focused, source-lock, compilation, and
+diff gates are green.
