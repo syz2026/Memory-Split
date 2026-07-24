@@ -56,6 +56,10 @@ _RULETAKER_URL = (
     + _RULETAKER_ARCHIVE
 )
 _FINEMATH_TARGETS = 1_068_131_943
+_FINEMATH_SELECTION_ALGORITHM = "nfc-fineweb-exact-dedup-gpt2-eot-v1"
+_FINEMATH_SHARD_RE = re.compile(
+    r"train-(?P<index>[0-9]{5})-of-(?P<count>[0-9]{5})\.parquet\Z"
+)
 _FINEWEB_FILES = (
     "sample/10BT/000_00000.parquet",
     "sample/10BT/001_00000.parquet",
@@ -273,6 +277,107 @@ class SourceFile:
         )
 
 
+def _validate_finemath_shard_sequence(
+    paths: tuple[str, ...],
+    subset: str,
+) -> None:
+    if not paths or paths != tuple(sorted(paths, key=_byte_key)):
+        raise ValueError(f"FineMath {subset} shard sequence is not canonical")
+    counts = set()
+    indices = []
+    for path in paths:
+        relative = PurePosixPath(path)
+        match = (
+            _FINEMATH_SHARD_RE.fullmatch(relative.name)
+            if relative.parent.as_posix() == subset
+            else None
+        )
+        if match is None:
+            raise ValueError(f"FineMath {subset} shard path is invalid: {path}")
+        counts.add(int(match.group("count")))
+        indices.append(int(match.group("index")))
+    if len(counts) != 1:
+        raise ValueError(f"FineMath {subset} shard counts disagree")
+    count = counts.pop()
+    if count <= 0 or len(paths) != count or indices != list(range(count)):
+        raise ValueError(f"FineMath {subset} shard sequence is incomplete")
+
+
+@dataclass(frozen=True)
+class FineMathSelectionProof:
+    algorithm: Literal["nfc-fineweb-exact-dedup-gpt2-eot-v1"]
+    quota: int
+    four_plus_paths: tuple[str, ...]
+    three_plus_paths: tuple[str, ...]
+    selected_paths: tuple[str, ...]
+    usable_targets: int
+    fineweb_duplicate_rows: int
+
+    def __post_init__(self) -> None:
+        if self.algorithm != _FINEMATH_SELECTION_ALGORITHM:
+            raise ValueError("FineMath selection algorithm identity drift")
+        if type(self.quota) is not int or self.quota < 0:
+            raise ValueError("FineMath selection quota must be non-negative")
+        _validate_finemath_shard_sequence(
+            self.four_plus_paths,
+            "finemath-4plus",
+        )
+        _validate_finemath_shard_sequence(
+            self.three_plus_paths,
+            "finemath-3plus",
+        )
+        combined = (*self.four_plus_paths, *self.three_plus_paths)
+        if (
+            not self.selected_paths
+            or self.selected_paths != combined[: len(self.selected_paths)]
+        ):
+            raise ValueError("FineMath selected shard sequence is not a prefix")
+        if type(self.usable_targets) is not int or self.usable_targets <= self.quota:
+            raise ValueError("FineMath selection does not exceed its quota")
+        if (
+            type(self.fineweb_duplicate_rows) is not int
+            or self.fineweb_duplicate_rows < 0
+        ):
+            raise ValueError("FineMath duplicate-row count must be non-negative")
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "algorithm": self.algorithm,
+            "fineweb_duplicate_rows": self.fineweb_duplicate_rows,
+            "four_plus_paths": list(self.four_plus_paths),
+            "quota": self.quota,
+            "selected_paths": list(self.selected_paths),
+            "three_plus_paths": list(self.three_plus_paths),
+            "usable_targets": self.usable_targets,
+        }
+
+    @classmethod
+    def from_dict(cls, value: object) -> "FineMathSelectionProof":
+        expected = {
+            "algorithm",
+            "fineweb_duplicate_rows",
+            "four_plus_paths",
+            "quota",
+            "selected_paths",
+            "three_plus_paths",
+            "usable_targets",
+        }
+        if not isinstance(value, dict) or set(value) != expected:
+            raise ValueError("FineMath selection proof fields do not match")
+        for field in ("four_plus_paths", "three_plus_paths", "selected_paths"):
+            if not isinstance(value[field], list):
+                raise ValueError(f"FineMath selection {field} must be a list")
+        return cls(
+            algorithm=value["algorithm"],
+            quota=value["quota"],
+            four_plus_paths=tuple(value["four_plus_paths"]),
+            three_plus_paths=tuple(value["three_plus_paths"]),
+            selected_paths=tuple(value["selected_paths"]),
+            usable_targets=value["usable_targets"],
+            fineweb_duplicate_rows=value["fineweb_duplicate_rows"],
+        )
+
+
 @dataclass(frozen=True)
 class SourceEntry:
     source_id: str
@@ -284,6 +389,7 @@ class SourceEntry:
     license_files: tuple[str, ...]
     materialized_path: str
     files: tuple[SourceFile, ...]
+    finemath_selection: FineMathSelectionProof | None = None
 
     def __post_init__(self) -> None:
         _safe_source_id(self.source_id)
@@ -338,10 +444,20 @@ class SourceEntry:
                 "source license file is missing from file inventory: "
                 + sorted(missing_licenses, key=_byte_key)[0]
             )
+        if self.source_id == "finemath":
+            if not isinstance(self.finemath_selection, FineMathSelectionProof):
+                raise ValueError("FineMath source requires a selection proof")
+        elif self.finemath_selection is not None:
+            raise ValueError("FineMath selection proof is only valid for FineMath")
 
     def as_dict(self) -> dict[str, object]:
         return {
             "files": [row.as_dict() for row in self.files],
+            "finemath_selection": (
+                None
+                if self.finemath_selection is None
+                else self.finemath_selection.as_dict()
+            ),
             "license_files": list(self.license_files),
             "license_spdx": self.license_spdx,
             "materialized_path": self.materialized_path,
@@ -356,6 +472,7 @@ class SourceEntry:
     def from_dict(cls, value: object) -> "SourceEntry":
         expected = {
             "files",
+            "finemath_selection",
             "license_files",
             "license_spdx",
             "materialized_path",
@@ -381,6 +498,13 @@ class SourceEntry:
             license_files=tuple(raw_licenses),
             materialized_path=value["materialized_path"],
             files=tuple(SourceFile.from_dict(row) for row in raw_files),
+            finemath_selection=(
+                None
+                if value["finemath_selection"] is None
+                else FineMathSelectionProof.from_dict(
+                    value["finemath_selection"]
+                )
+            ),
         )
 
 
@@ -605,6 +729,14 @@ def _reviewed_catalog_dict() -> dict[str, object]:
                     )
                 ],
                 "fixed_revision": None if fixed is None else fixed[2],
+                "finemath_selection_policy": (
+                    {
+                        "algorithm": _FINEMATH_SELECTION_ALGORITHM,
+                        "quota": _FINEMATH_TARGETS,
+                    }
+                    if source_id == "finemath"
+                    else None
+                ),
                 "license_files": list(_reviewed_license_paths(request)),
                 "license_spdx": _REVIEWED_LICENSES[source_id],
                 "materialized_path": source_id,
@@ -879,9 +1011,23 @@ def _validate_resolved_entry(
                 f"{request.source_id}:{path}"
             )
     if request.source_id == "finemath":
-        if "README.md" not in entry.license_files or not any(
-            _is_finemath_train_file(row.path, "finemath-4plus")
-            for row in entry.files
+        proof = entry.finemath_selection
+        if (
+            proof is None
+            or proof.algorithm != _FINEMATH_SELECTION_ALGORITHM
+            or proof.quota != _FINEMATH_TARGETS
+        ):
+            raise ValueError("FineMath source selection proof identity drift")
+        allowed_paths = {"README.md", *proof.selected_paths}
+        if (
+            entry.license_files != ("README.md",)
+            or paths != allowed_paths
+        ):
+            raise ValueError("FineMath source inventory is not exactly selected")
+        if not all(
+            _is_finemath_train_file(path, "finemath-4plus")
+            or _is_finemath_train_file(path, "finemath-3plus")
+            for path in proof.selected_paths
         ):
             raise ValueError("FineMath source does not prove an ODC-By data snapshot")
     if request.source_id == "ruletaker":
@@ -1023,6 +1169,21 @@ def _namespace_identity(metadata: os.stat_result) -> tuple[int, int, int, int]:
     )
 
 
+def _directory_identity(
+    metadata: os.stat_result,
+) -> tuple[int, int, int, int, int, int, int | None, int | None]:
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_uid,
+        stat.S_IMODE(metadata.st_mode),
+        metadata.st_nlink,
+        metadata.st_size,
+        getattr(metadata, "st_mtime_ns", None),
+        getattr(metadata, "st_ctime_ns", None),
+    )
+
+
 def _file_identity(
     metadata: os.stat_result,
 ) -> tuple[int, int, int, int, int, int, int | None, int | None]:
@@ -1131,6 +1292,98 @@ def _require_named_directory_identity(
         raise ValueError(f"{description} identity drift")
 
 
+def _iter_parquet_texts_from_descriptor(
+    descriptor: int,
+    description: str,
+) -> Iterable[str]:
+    try:
+        import pyarrow.parquet as parquet
+    except ImportError as error:
+        raise RuntimeError(
+            "FineMath verification requires pyarrow"
+        ) from error
+    duplicate = os.dup(descriptor)
+    os.lseek(duplicate, 0, os.SEEK_SET)
+    with os.fdopen(duplicate, "rb") as handle:
+        parquet_file = parquet.ParquetFile(handle)
+        if "text" not in parquet_file.schema.names:
+            raise ValueError(f"source parquet has no text column: {description}")
+        for batch in parquet_file.iter_batches(
+            batch_size=1024,
+            columns=["text"],
+        ):
+            for value in batch.column(0).to_pylist():
+                if not isinstance(value, str):
+                    raise ValueError(
+                        f"source parquet text is not a string: {description}"
+                    )
+                yield value
+
+
+def _encode_finemath_text(text: str) -> list[int]:
+    from train.tokenizer import get_tok
+
+    return get_tok().encode(text)
+
+
+def _verify_finemath_selection_descriptors(
+    lock: SourceLock,
+    descriptors: dict[
+        str,
+        tuple[int, tuple[int, int, int, int, int, int, int | None, int | None]],
+    ],
+) -> None:
+    entry = next(row for row in lock.sources if row.source_id == "finemath")
+    proof = entry.finemath_selection
+    if proof is None:
+        raise ValueError("FineMath selection proof is missing")
+    expected_paths = {
+        *(f"fineweb_edu/{path}" for path in _FINEWEB_FILES),
+        *(f"finemath/{path}" for path in proof.selected_paths),
+    }
+    if set(descriptors) != expected_paths:
+        raise ValueError("FineMath selection proof descriptors are incomplete")
+    with tempfile.TemporaryDirectory(
+        prefix=".finemath-verify-",
+    ) as temporary:
+        try:
+            computed = _select_finemath_files(
+                four_plus=proof.four_plus_paths,
+                three_plus=proof.three_plus_paths,
+                fineweb_paths=tuple(
+                    f"fineweb_edu/{path}" for path in _FINEWEB_FILES
+                ),
+                materialize=lambda relative: f"finemath/{relative}",
+                iter_texts=lambda relative: _iter_parquet_texts_from_descriptor(
+                    descriptors[relative][0],
+                    relative,
+                ),
+                encode=_encode_finemath_text,
+                quota=proof.quota,
+                database_path=Path(temporary) / "fineweb.sqlite3",
+            )
+        except (OSError, RuntimeError, ValueError) as error:
+            raise ValueError(
+                "FineMath selection proof verification failed"
+            ) from error
+    if computed != proof:
+        raise ValueError("FineMath selection proof drift")
+    for relative, (descriptor, identity) in descriptors.items():
+        if _file_identity(os.fstat(descriptor)) != identity:
+            raise ValueError(
+                f"FineMath selection proof file identity drift: {relative}"
+            )
+
+
+def _directory_verification_hook(
+    phase: str,
+    directory_fd: int,
+    relative: str,
+    names: tuple[str, ...],
+) -> None:
+    del phase, directory_fd, relative, names
+
+
 def _verify_source_tree_fd(
     lock: SourceLock,
     root_fd: int,
@@ -1141,11 +1394,40 @@ def _verify_source_tree_fd(
         directory=True,
         description="source root",
     )
-    root_identity = _namespace_identity(root_metadata)
+    root_identity = _directory_identity(root_metadata)
     expected_files, expected_directories, license_bindings = _expected_paths(lock)
+    expected_children: dict[str, set[str]] = {
+        relative: set() for relative in expected_directories
+    }
+    for relative in expected_directories - {""}:
+        path = PurePosixPath(relative)
+        parent = path.parent.as_posix()
+        if parent == ".":
+            parent = ""
+        expected_children[parent].add(path.name)
+    for relative in expected_files:
+        path = PurePosixPath(relative)
+        parent = path.parent.as_posix()
+        if parent == ".":
+            parent = ""
+        expected_children[parent].add(path.name)
     actual_files: set[str] = set()
     actual_directories = {""}
     license_payloads: dict[str, bytes] = {}
+    finemath_entry = next(
+        row for row in lock.sources if row.source_id == "finemath"
+    )
+    finemath_proof = finemath_entry.finemath_selection
+    if finemath_proof is None:
+        raise ValueError("FineMath selection proof is missing")
+    proof_paths = {
+        *(f"fineweb_edu/{path}" for path in _FINEWEB_FILES),
+        *(f"finemath/{path}" for path in finemath_proof.selected_paths),
+    }
+    proof_descriptors: dict[
+        str,
+        tuple[int, tuple[int, int, int, int, int, int, int | None, int | None]],
+    ] = {}
     total_bytes = 0
 
     def visit(directory_fd: int, prefix: tuple[str, ...]) -> None:
@@ -1157,9 +1439,55 @@ def _verify_source_tree_fd(
             directory=True,
             description=description,
         )
-        directory_identity = _namespace_identity(directory_before)
-        for name in list_entries(directory_fd):
-            metadata = entry_lstat(directory_fd, name)
+        identity_before = _directory_identity(directory_before)
+        relative_directory = "/".join(prefix)
+        initial_names = list_entries(directory_fd)
+        expected_names = tuple(
+            sorted(expected_children[relative_directory], key=_byte_key)
+        )
+        if initial_names != expected_names:
+            extras = sorted(set(initial_names) - set(expected_names), key=_byte_key)
+            if extras:
+                extra_name = extras[0]
+                extra = entry_lstat(directory_fd, extra_name)
+                extra_relative = "/".join((*prefix, extra_name))
+                if stat.S_ISLNK(extra.st_mode):
+                    kind = "symlink"
+                elif stat.S_ISDIR(extra.st_mode):
+                    kind = "unlisted directory"
+                elif stat.S_ISREG(extra.st_mode):
+                    kind = "unlisted file"
+                else:
+                    kind = "special file"
+                raise ValueError(
+                    f"source tree contains {kind}: {extra_relative}"
+                )
+            missing_name = sorted(
+                set(expected_names) - set(initial_names),
+                key=_byte_key,
+            )[0]
+            missing_relative = "/".join((*prefix, missing_name))
+            kind = (
+                "directory"
+                if missing_relative in expected_directories
+                else "file"
+            )
+            raise ValueError(
+                f"source tree is missing listed {kind}: {missing_relative}"
+            )
+        _directory_verification_hook(
+            "after_initial_snapshot",
+            directory_fd,
+            relative_directory,
+            initial_names,
+        )
+        for name in initial_names:
+            try:
+                metadata = entry_lstat(directory_fd, name)
+            except FileNotFoundError as error:
+                raise ValueError(
+                    f"source directory entry race: {description}/{name}"
+                ) from error
             relative_parts = (*prefix, name)
             relative = "/".join(relative_parts)
             if stat.S_ISLNK(metadata.st_mode):
@@ -1226,6 +1554,13 @@ def _verify_source_tree_fd(
                     or os.read(descriptor, 1)
                 ):
                     raise ValueError(f"source file identity drift: {relative}")
+                if relative in proof_paths:
+                    proof_descriptor = os.dup(descriptor)
+                    os.lseek(proof_descriptor, 0, os.SEEK_SET)
+                    proof_descriptors[relative] = (
+                        proof_descriptor,
+                        _file_identity(opened),
+                    )
             finally:
                 os.close(descriptor)
             expected = expected_files[relative]
@@ -1239,40 +1574,61 @@ def _verify_source_tree_fd(
                 license_payloads[relative] = b"".join(payload_chunks)
             actual_files.add(relative)
             total_bytes += byte_count
+        _directory_verification_hook(
+            "before_final_snapshot",
+            directory_fd,
+            relative_directory,
+            initial_names,
+        )
+        final_names = list_entries(directory_fd)
         directory_after = os.fstat(directory_fd)
-        if _namespace_identity(directory_after) != directory_identity:
-            raise ValueError(f"{description} identity drift")
+        if (
+            final_names != initial_names
+            or final_names != expected_names
+            or _directory_identity(directory_after) != identity_before
+        ):
+            raise ValueError(f"source directory entry race: {description}")
 
-    visit(root_fd, ())
-    if _namespace_identity(os.fstat(root_fd)) != root_identity:
-        raise ValueError("source root identity drift")
-    missing_files = sorted(set(expected_files) - actual_files, key=_byte_key)
-    if missing_files:
-        raise ValueError(f"source tree is missing listed file: {missing_files[0]}")
-    missing_directories = sorted(
-        expected_directories - actual_directories,
-        key=_byte_key,
-    )
-    if missing_directories:
-        raise ValueError(
-            f"source tree is missing listed directory: {missing_directories[0]}"
+    try:
+        visit(root_fd, ())
+        if _directory_identity(os.fstat(root_fd)) != root_identity:
+            raise ValueError("source directory entry race: source root")
+        missing_files = sorted(set(expected_files) - actual_files, key=_byte_key)
+        if missing_files:
+            raise ValueError(
+                f"source tree is missing listed file: {missing_files[0]}"
+            )
+        missing_directories = sorted(
+            expected_directories - actual_directories,
+            key=_byte_key,
         )
-    for entry in lock.sources:
-        payloads = tuple(
-            license_payloads[
-                (PurePosixPath(entry.materialized_path) / relative).as_posix()
-            ]
-            for relative in entry.license_files
-        )
-        if _license_from_bytes(payloads) != entry.license_spdx:
-            raise ValueError(f"license file SPDX drift: {entry.source_id}")
-    return {
-        "bytes": total_bytes,
-        "dataset_id": lock.dataset_id,
-        "files": len(actual_files),
-        "passed": True,
-        "source_lock_sha256": lock.sha256,
-    }
+        if missing_directories:
+            raise ValueError(
+                f"source tree is missing listed directory: "
+                f"{missing_directories[0]}"
+            )
+        for entry in lock.sources:
+            payloads = tuple(
+                license_payloads[
+                    (
+                        PurePosixPath(entry.materialized_path) / relative
+                    ).as_posix()
+                ]
+                for relative in entry.license_files
+            )
+            if _license_from_bytes(payloads) != entry.license_spdx:
+                raise ValueError(f"license file SPDX drift: {entry.source_id}")
+        _verify_finemath_selection_descriptors(lock, proof_descriptors)
+        return {
+            "bytes": total_bytes,
+            "dataset_id": lock.dataset_id,
+            "files": len(actual_files),
+            "passed": True,
+            "source_lock_sha256": lock.sha256,
+        }
+    finally:
+        for descriptor, _identity in proof_descriptors.values():
+            os.close(descriptor)
 
 
 def verify_source_tree(
@@ -1519,6 +1875,275 @@ def _fsync_directory_map(descriptors: dict[str, int]) -> None:
         fsync_directory(descriptors[relative])
 
 
+def _cleanup_quarantine_hook(
+    phase: str,
+    parent_fd: int,
+    name: str,
+    quarantine_name: str,
+    descriptor: int,
+    is_directory: bool,
+) -> None:
+    del phase, parent_fd, name, quarantine_name, descriptor, is_directory
+
+
+def _cleanup_quarantine_name(name: str) -> str:
+    digest = hashlib.sha256(name.encode("utf-8")).hexdigest()[:12]
+    return (
+        f".memorysplit-source-cleanup-{digest}-{secrets.token_hex(12)}"
+    )
+
+
+def _restore_cleanup_quarantine(
+    parent_fd: int,
+    quarantine_name: str,
+    original_name: str,
+    *,
+    description: str,
+) -> None:
+    try:
+        atomic_rename_noreplace(
+            parent_fd,
+            quarantine_name,
+            parent_fd,
+            original_name,
+        )
+    except FileExistsError as error:
+        fsync_directory(parent_fd)
+        raise ValueError(
+            f"{description} cleanup quarantine restore blocked"
+        ) from error
+    fsync_directory(parent_fd)
+
+
+def _open_cleanup_child(
+    parent_fd: int,
+    name: str,
+    *,
+    description: str,
+) -> tuple[int, os.stat_result, bool]:
+    metadata = entry_lstat(parent_fd, name)
+    if stat.S_ISDIR(metadata.st_mode):
+        _require_owned_mode(
+            metadata,
+            directory=True,
+            description=description,
+        )
+        descriptor, _identity = _open_bound_directory(
+            parent_fd,
+            name,
+            description=description,
+        )
+        opened = os.fstat(descriptor)
+        if _directory_identity(opened) != _directory_identity(metadata):
+            os.close(descriptor)
+            raise ValueError(f"{description} cleanup identity drift")
+        return descriptor, opened, True
+    if stat.S_ISREG(metadata.st_mode):
+        _require_owned_mode(
+            metadata,
+            directory=False,
+            description=description,
+        )
+        descriptor, opened = open_regular_file_at(parent_fd, name)
+        if _file_identity(opened) != _file_identity(metadata):
+            os.close(descriptor)
+            raise ValueError(f"{description} cleanup identity drift")
+        return descriptor, opened, False
+    if stat.S_ISLNK(metadata.st_mode):
+        raise ValueError(f"{description} is a symlink during cleanup")
+    raise ValueError(f"{description} is special during cleanup")
+
+
+def _delete_quarantined_directory_contents(
+    directory_fd: int,
+    *,
+    description: str,
+) -> None:
+    while True:
+        names = list_entries(directory_fd)
+        if not names:
+            return
+        child_name = names[0]
+        child_description = f"{description}/{child_name}"
+        child_fd, child_metadata, is_directory = _open_cleanup_child(
+            directory_fd,
+            child_name,
+            description=child_description,
+        )
+        try:
+            _quarantine_verified_cleanup_entry(
+                directory_fd,
+                child_name,
+                child_fd,
+                child_metadata,
+                is_directory=is_directory,
+                description=child_description,
+            )
+        finally:
+            os.close(child_fd)
+
+
+def _quarantine_verified_cleanup_entry(
+    parent_fd: int,
+    name: str,
+    pinned_fd: int,
+    pinned_metadata: os.stat_result,
+    *,
+    is_directory: bool,
+    description: str,
+) -> None:
+    expected_identity = (
+        _directory_identity(pinned_metadata)
+        if is_directory
+        else _file_identity(pinned_metadata)
+    )
+    current_pinned = os.fstat(pinned_fd)
+    current_identity = (
+        _directory_identity(current_pinned)
+        if is_directory
+        else _file_identity(current_pinned)
+    )
+    if current_identity != expected_identity:
+        raise ValueError(f"{description} cleanup pinned identity drift")
+    named = entry_lstat(parent_fd, name)
+    named_identity = (
+        _directory_identity(named)
+        if is_directory and stat.S_ISDIR(named.st_mode)
+        else _file_identity(named)
+        if not is_directory and stat.S_ISREG(named.st_mode)
+        else None
+    )
+    if named_identity != expected_identity:
+        raise ValueError(f"{description} cleanup named identity drift")
+
+    quarantine_name = _cleanup_quarantine_name(name)
+    _cleanup_quarantine_hook(
+        "before_quarantine",
+        parent_fd,
+        name,
+        quarantine_name,
+        pinned_fd,
+        is_directory,
+    )
+    atomic_rename_noreplace(
+        parent_fd,
+        name,
+        parent_fd,
+        quarantine_name,
+    )
+    fsync_directory(parent_fd)
+    _cleanup_quarantine_hook(
+        "after_quarantine",
+        parent_fd,
+        name,
+        quarantine_name,
+        pinned_fd,
+        is_directory,
+    )
+
+    quarantine_fd = -1
+    try:
+        if is_directory:
+            quarantine_fd, _identity = _open_bound_directory(
+                parent_fd,
+                quarantine_name,
+                description=f"{description} cleanup quarantine",
+            )
+            quarantined = os.fstat(quarantine_fd)
+            quarantined_identity = _directory_identity(quarantined)
+        else:
+            quarantine_fd, quarantined = open_regular_file_at(
+                parent_fd,
+                quarantine_name,
+            )
+            quarantined_identity = _file_identity(quarantined)
+        pinned_after = os.fstat(pinned_fd)
+        pinned_after_identity = (
+            _directory_identity(pinned_after)
+            if is_directory
+            else _file_identity(pinned_after)
+        )
+        if (
+            quarantined_identity != pinned_after_identity
+            or (
+                is_directory
+                and _namespace_identity(pinned_after)
+                != _namespace_identity(pinned_metadata)
+            )
+            or (
+                not is_directory
+                and _regular_inode_identity(pinned_after)
+                != _regular_inode_identity(pinned_metadata)
+            )
+        ):
+            os.close(quarantine_fd)
+            quarantine_fd = -1
+            _restore_cleanup_quarantine(
+                parent_fd,
+                quarantine_name,
+                name,
+                description=description,
+            )
+            raise ValueError(f"{description} cleanup quarantine identity drift")
+
+        try:
+            if is_directory:
+                _delete_quarantined_directory_contents(
+                    quarantine_fd,
+                    description=description,
+                )
+            _cleanup_quarantine_hook(
+                "before_delete",
+                parent_fd,
+                name,
+                quarantine_name,
+                pinned_fd,
+                is_directory,
+            )
+            pinned_final = os.fstat(pinned_fd)
+            quarantine_final = os.fstat(quarantine_fd)
+            named_final = entry_lstat(parent_fd, quarantine_name)
+            if is_directory:
+                if (
+                    _namespace_identity(pinned_final)
+                    != _namespace_identity(pinned_metadata)
+                    or _namespace_identity(quarantine_final)
+                    != _namespace_identity(pinned_metadata)
+                    or _namespace_identity(named_final)
+                    != _namespace_identity(pinned_metadata)
+                ):
+                    raise ValueError(
+                        f"{description} cleanup directory identity drift"
+                    )
+                os.rmdir(quarantine_name, dir_fd=parent_fd)
+            else:
+                if (
+                    _file_identity(pinned_final) != expected_identity
+                    or _file_identity(quarantine_final) != expected_identity
+                    or _file_identity(named_final) != expected_identity
+                ):
+                    raise ValueError(
+                        f"{description} cleanup file identity drift"
+                    )
+                os.unlink(quarantine_name, dir_fd=parent_fd)
+            fsync_directory(parent_fd)
+        except BaseException as error:
+            if entry_exists(parent_fd, quarantine_name):
+                try:
+                    _restore_cleanup_quarantine(
+                        parent_fd,
+                        quarantine_name,
+                        name,
+                        description=description,
+                    )
+                except ValueError as restore_error:
+                    raise restore_error from error
+            raise
+    finally:
+        if quarantine_fd >= 0:
+            os.close(quarantine_fd)
+
+
 def _remove_owned_directory_at(
     parent_fd: int,
     name: str,
@@ -1526,67 +2151,24 @@ def _remove_owned_directory_at(
     *,
     description: str,
 ) -> None:
-    directory_fd, actual_identity = _open_bound_directory(
+    directory_fd, metadata, is_directory = _open_cleanup_child(
         parent_fd,
         name,
         description=description,
     )
     try:
-        if actual_identity != expected_identity:
+        if not is_directory or _namespace_identity(metadata) != expected_identity:
             raise ValueError(f"{description} identity drift during cleanup")
-        for child_name in list_entries(directory_fd):
-            metadata = entry_lstat(directory_fd, child_name)
-            child_description = f"{description}/{child_name}"
-            if stat.S_ISDIR(metadata.st_mode):
-                _require_owned_mode(
-                    metadata,
-                    directory=True,
-                    description=child_description,
-                )
-                _remove_owned_directory_at(
-                    directory_fd,
-                    child_name,
-                    _namespace_identity(metadata),
-                    description=child_description,
-                )
-            elif stat.S_ISREG(metadata.st_mode):
-                _require_owned_mode(
-                    metadata,
-                    directory=False,
-                    description=child_description,
-                )
-                child_fd, opened = open_regular_file_at(
-                    directory_fd,
-                    child_name,
-                )
-                try:
-                    if _file_identity(opened) != _file_identity(metadata):
-                        raise ValueError(
-                            f"{child_description} identity drift during cleanup"
-                        )
-                finally:
-                    os.close(child_fd)
-                os.unlink(child_name, dir_fd=directory_fd)
-                fsync_directory(directory_fd)
-            elif stat.S_ISLNK(metadata.st_mode):
-                raise ValueError(
-                    f"{child_description} is a symlink during cleanup"
-                )
-            else:
-                raise ValueError(
-                    f"{child_description} is special during cleanup"
-                )
-        _require_named_directory_identity(
+        _quarantine_verified_cleanup_entry(
             parent_fd,
             name,
             directory_fd,
-            expected_identity,
+            metadata,
+            is_directory=True,
             description=description,
         )
     finally:
         os.close(directory_fd)
-    os.rmdir(name, dir_fd=parent_fd)
-    fsync_directory(parent_fd)
 
 
 def stage_source_lock(
@@ -1993,13 +2575,6 @@ def _download_url(url: str, destination: Path) -> None:
         raise ValueError("RuleTaker dataset archive is empty")
 
 
-@dataclass(frozen=True)
-class _FineMathSelection:
-    selected_paths: tuple[str, ...]
-    usable_targets: int
-    fineweb_duplicate_rows: int
-
-
 def _validated_finemath_paths(info: Any) -> tuple[tuple[str, ...], tuple[str, ...]]:
     card_data = getattr(info, "card_data", None)
     card_license = card_data.get("license") if card_data is not None else None
@@ -2043,7 +2618,7 @@ def _select_finemath_files(
     encode: Callable[[str], list[int]],
     quota: int,
     database_path: Path,
-) -> _FineMathSelection:
+) -> FineMathSelectionProof:
     if type(quota) is not int or quota < 0:
         raise ValueError("FineMath quota must be a non-negative integer")
     if len(fineweb_paths) != len(_FINEWEB_FILES):
@@ -2103,7 +2678,11 @@ def _select_finemath_files(
                     continue
                 token_count += len(encode(normalized)) + 1
             if token_count > quota:
-                return _FineMathSelection(
+                return FineMathSelectionProof(
+                    algorithm=_FINEMATH_SELECTION_ALGORITHM,
+                    quota=quota,
+                    four_plus_paths=ordered_four,
+                    three_plus_paths=ordered_three,
                     selected_paths=tuple(selected),
                     usable_targets=token_count,
                     fineweb_duplicate_rows=duplicate_rows,
@@ -2309,8 +2888,9 @@ class PublicSourceResolver:
             dir=download_root.parent,
         ) as temporary:
             cache = Path(temporary) / "cache"
+            finemath_selection = None
             if request.source_id == "finemath":
-                self._download_finemath(
+                finemath_selection = self._download_finemath(
                     request,
                     info,
                     revision,
@@ -2359,6 +2939,7 @@ class PublicSourceResolver:
             license_files=license_paths,
             materialized_path=request.source_id,
             files=files,
+            finemath_selection=finemath_selection,
         )
 
     def _download_finemath(
@@ -2369,7 +2950,7 @@ class PublicSourceResolver:
         download_root: Path,
         materialized: Path,
         cache: Path,
-    ) -> _FineMathSelection:
+    ) -> FineMathSelectionProof:
         four_plus, three_plus = _validated_finemath_paths(info)
         self._download_hf_file(
             request,

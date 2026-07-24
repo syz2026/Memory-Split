@@ -944,6 +944,310 @@ def test_load_authority_rejects_nested_finemath_train_spoof(
         load_source_lock(_write_lock(tmp_path, valid_lock_json))
 
 
+def test_finemath_lock_binds_exact_selection_proof(fixture_source_lock):
+    entry = next(
+        row
+        for row in fixture_source_lock.lock.sources
+        if row.source_id == "finemath"
+    )
+    proof = entry.finemath_selection
+    assert proof is not None
+    assert proof.algorithm == "nfc-fineweb-exact-dedup-gpt2-eot-v1"
+    assert proof.quota == source_lock_module._FINEMATH_TARGETS
+    assert proof.selected_paths == (
+        "finemath-4plus/train-00000-of-00064.parquet",
+    )
+    assert proof.selected_paths == (
+        *proof.four_plus_paths[: len(proof.selected_paths)],
+    )
+    assert len(proof.three_plus_paths) == 128
+
+
+def test_finemath_selection_proof_requires_complete_fallback_inventory():
+    four_plus = tuple(
+        f"finemath-4plus/train-{index:05d}-of-00001.parquet"
+        for index in range(1)
+    )
+    with pytest.raises(ValueError, match="3plus.*sequence"):
+        source_lock_module.FineMathSelectionProof(
+            algorithm="nfc-fineweb-exact-dedup-gpt2-eot-v1",
+            quota=4,
+            four_plus_paths=four_plus,
+            three_plus_paths=(),
+            selected_paths=(four_plus[0],),
+            usable_targets=5,
+            fineweb_duplicate_rows=0,
+        )
+
+
+@pytest.mark.parametrize(
+    "extra_path",
+    [
+        "finemath-4plus/train-00001-of-00064.parquet",
+        "finemath-3plus/train-00000-of-00128.parquet",
+        "foreign/unreviewed.bin",
+    ],
+)
+def test_load_rejects_every_extra_finemath_inventory_path(
+    tmp_path,
+    valid_lock_json,
+    extra_path,
+):
+    source = _source_json(valid_lock_json, "finemath")
+    source["files"].append(
+        {
+            "bytes": 1,
+            "path": extra_path,
+            "sha256": hashlib.sha256(b"x").hexdigest(),
+        }
+    )
+    source["files"].sort(key=lambda item: item["path"].encode())
+    with pytest.raises(ValueError, match="FineMath.*inventory"):
+        load_source_lock(_write_lock(tmp_path, valid_lock_json))
+
+
+def test_verify_recomputes_finemath_selection_proof(
+    fixture_source_lock,
+):
+    original = fixture_source_lock.lock
+    finemath = next(
+        row for row in original.sources if row.source_id == "finemath"
+    )
+    forged = replace(
+        original,
+        sources=tuple(
+            replace(
+                finemath,
+                finemath_selection=replace(
+                    finemath.finemath_selection,
+                    usable_targets=finemath.finemath_selection.usable_targets + 1,
+                ),
+            )
+            if row.source_id == "finemath"
+            else row
+            for row in original.sources
+        ),
+    )
+    with pytest.raises(ValueError, match="FineMath selection proof"):
+        verify_source_tree(forged, fixture_source_lock.download_root)
+
+
+def _write_file_at(directory_fd, name, payload):
+    descriptor = os.open(
+        name,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+        0o600,
+        dir_fd=directory_fd,
+    )
+    try:
+        os.write(descriptor, payload)
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def test_verify_detects_inserted_then_removed_directory_entry(
+    fixture_source_lock,
+    monkeypatch,
+):
+    def mutate(phase, directory_fd, relative, _names):
+        if relative:
+            return
+        if phase == "after_initial_snapshot":
+            _write_file_at(directory_fd, "transient-race", b"race")
+        elif phase == "before_final_snapshot":
+            os.unlink("transient-race", dir_fd=directory_fd)
+
+    monkeypatch.setattr(
+        source_lock_module,
+        "_directory_verification_hook",
+        mutate,
+        raising=False,
+    )
+    with pytest.raises(ValueError, match="directory entry race"):
+        verify_source_tree(
+            fixture_source_lock.lock,
+            fixture_source_lock.download_root,
+        )
+
+
+def test_verify_detects_removed_and_replaced_entry(
+    fixture_source_lock,
+    monkeypatch,
+):
+    def mutate(phase, directory_fd, relative, names):
+        if (
+            phase == "after_initial_snapshot"
+            and relative == "clrs_text/src"
+            and "data.txt" in names
+        ):
+            descriptor = os.open("data.txt", os.O_RDONLY, dir_fd=directory_fd)
+            try:
+                payload = os.read(descriptor, 1 << 20)
+            finally:
+                os.close(descriptor)
+            os.unlink("data.txt", dir_fd=directory_fd)
+            _write_file_at(directory_fd, "data.txt", payload)
+
+    monkeypatch.setattr(
+        source_lock_module,
+        "_directory_verification_hook",
+        mutate,
+        raising=False,
+    )
+    with pytest.raises(ValueError, match="directory entry race"):
+        verify_source_tree(
+            fixture_source_lock.lock,
+            fixture_source_lock.download_root,
+        )
+
+
+def test_verify_detects_nested_insert_remove_race(
+    fixture_source_lock,
+    monkeypatch,
+):
+    def mutate(phase, directory_fd, relative, _names):
+        if relative != "arc_agi_1/data/training":
+            return
+        if phase == "after_initial_snapshot":
+            _write_file_at(directory_fd, "nested-race", b"race")
+        elif phase == "before_final_snapshot":
+            os.unlink("nested-race", dir_fd=directory_fd)
+
+    monkeypatch.setattr(
+        source_lock_module,
+        "_directory_verification_hook",
+        mutate,
+        raising=False,
+    )
+    with pytest.raises(ValueError, match="directory entry race"):
+        verify_source_tree(
+            fixture_source_lock.lock,
+            fixture_source_lock.download_root,
+        )
+
+
+def _run_cleanup_with_hook(tmp_path, monkeypatch, setup, hook):
+    parent = tmp_path / "cleanup-parent"
+    stage = parent / "stage"
+    stage.mkdir(parents=True, mode=0o700)
+    setup(stage)
+    parent_fd = os.open(
+        parent,
+        os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+    )
+    monkeypatch.setattr(
+        source_lock_module,
+        "_cleanup_quarantine_hook",
+        hook,
+        raising=False,
+    )
+    try:
+        with pytest.raises(ValueError, match="cleanup.*identity|restore"):
+            source_lock_module._remove_owned_directory_at(
+                parent_fd,
+                "stage",
+                source_lock_module._namespace_identity(stage.lstat()),
+                description="cleanup test stage",
+            )
+    finally:
+        os.close(parent_fd)
+    return stage
+
+
+def test_cleanup_never_unlinks_replacement_file(
+    tmp_path,
+    monkeypatch,
+):
+    def setup(stage):
+        (stage / "victim").write_bytes(b"verified")
+
+    def hook(phase, parent_fd, name, _quarantine, _descriptor, is_directory):
+        if phase == "before_quarantine" and name == "victim" and not is_directory:
+            os.rename(
+                "victim",
+                "original-preserved",
+                src_dir_fd=parent_fd,
+                dst_dir_fd=parent_fd,
+            )
+            _write_file_at(parent_fd, "victim", b"replacement")
+
+    stage = _run_cleanup_with_hook(tmp_path, monkeypatch, setup, hook)
+    assert (stage / "original-preserved").read_bytes() == b"verified"
+    assert (stage / "victim").read_bytes() == b"replacement"
+
+
+def test_cleanup_never_removes_replacement_directory(
+    tmp_path,
+    monkeypatch,
+):
+    def setup(stage):
+        child = stage / "victim-dir"
+        child.mkdir(mode=0o700)
+        (child / "verified").write_bytes(b"verified")
+
+    def hook(phase, parent_fd, name, _quarantine, _descriptor, is_directory):
+        if phase == "before_quarantine" and name == "victim-dir" and is_directory:
+            os.rename(
+                "victim-dir",
+                "original-preserved",
+                src_dir_fd=parent_fd,
+                dst_dir_fd=parent_fd,
+            )
+            os.mkdir("victim-dir", mode=0o700, dir_fd=parent_fd)
+            replacement_fd = os.open(
+                "victim-dir",
+                os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+                dir_fd=parent_fd,
+            )
+            try:
+                _write_file_at(replacement_fd, "replacement", b"replacement")
+            finally:
+                os.close(replacement_fd)
+
+    stage = _run_cleanup_with_hook(tmp_path, monkeypatch, setup, hook)
+    assert (stage / "original-preserved" / "verified").read_bytes() == b"verified"
+    assert (stage / "victim-dir" / "replacement").read_bytes() == b"replacement"
+
+
+def test_cleanup_restore_failure_preserves_quarantine_and_blocker(
+    tmp_path,
+    monkeypatch,
+):
+    state = {"replaced": False}
+
+    def setup(stage):
+        (stage / "victim").write_bytes(b"verified")
+
+    def hook(phase, parent_fd, name, _quarantine, _descriptor, is_directory):
+        if (
+            phase == "before_quarantine"
+            and name == "victim"
+            and not is_directory
+        ):
+            os.rename(
+                "victim",
+                "original-preserved",
+                src_dir_fd=parent_fd,
+                dst_dir_fd=parent_fd,
+            )
+            _write_file_at(parent_fd, "victim", b"replacement")
+            state["replaced"] = True
+        elif (
+            phase == "after_quarantine"
+            and name == "victim"
+            and state["replaced"]
+        ):
+            _write_file_at(parent_fd, "victim", b"restore-blocker")
+
+    stage = _run_cleanup_with_hook(tmp_path, monkeypatch, setup, hook)
+    assert (stage / "original-preserved").read_bytes() == b"verified"
+    assert (stage / "victim").read_bytes() == b"restore-blocker"
+    quarantines = tuple(stage.glob(".memorysplit-source-cleanup-*"))
+    assert len(quarantines) == 1
+    assert quarantines[0].read_bytes() == b"replacement"
+
+
 def test_load_authority_requires_expected_generator_commit(
     tmp_path,
     valid_lock_json,

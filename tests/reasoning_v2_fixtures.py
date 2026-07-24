@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
@@ -131,6 +132,25 @@ class FakePublicResolver:
                 hashlib.sha256(source_id.encode()).hexdigest()[:40],
             ),
         )
+        finemath_selection = None
+        if source_id == "finemath":
+            four_plus_paths = tuple(
+                f"finemath-4plus/train-{index:05d}-of-00064.parquet"
+                for index in range(64)
+            )
+            three_plus_paths = tuple(
+                f"finemath-3plus/train-{index:05d}-of-00128.parquet"
+                for index in range(128)
+            )
+            finemath_selection = source_lock_module.FineMathSelectionProof(
+                algorithm="nfc-fineweb-exact-dedup-gpt2-eot-v1",
+                quota=source_lock_module._FINEMATH_TARGETS,
+                four_plus_paths=four_plus_paths,
+                three_plus_paths=three_plus_paths,
+                selected_paths=(four_plus_paths[0],),
+                usable_targets=source_lock_module._FINEMATH_TARGETS + 1,
+                fineweb_duplicate_rows=0,
+            )
         return SourceEntry(
             source_id=source_id,
             transport=request.transport,
@@ -141,6 +161,7 @@ class FakePublicResolver:
             license_files=(license_path,),
             materialized_path=source_id,
             files=rows,
+            finemath_selection=finemath_selection,
         )
 
 
@@ -222,6 +243,25 @@ def fixed_contract_environment(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
         source_lock_module,
         "FIXED_FINEWEB_FILES",
         copy.deepcopy(fineweb_files),
+    )
+    monkeypatch.setattr(source_lock_module, "_FINEMATH_TARGETS", 4)
+
+    def iter_fixture_texts(descriptor, _description):
+        metadata = os.fstat(descriptor)
+        payload = os.pread(descriptor, metadata.st_size, 0)
+        return iter((payload.decode("utf-8"),))
+
+    monkeypatch.setattr(
+        source_lock_module,
+        "_iter_parquet_texts_from_descriptor",
+        iter_fixture_texts,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        source_lock_module,
+        "_encode_finemath_text",
+        lambda text: list(text),
+        raising=False,
     )
     return contract_root
 
