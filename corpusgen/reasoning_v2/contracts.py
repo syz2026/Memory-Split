@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import json
 import math
+from collections.abc import Mapping
 from dataclasses import dataclass
 from fractions import Fraction
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any, Literal, NoReturn, cast
 
 
@@ -133,6 +135,95 @@ _SPLIT90_DOSE_FIELDS = frozenset(
     }
 )
 
+_EXPECTED_SOURCE_POLICY: dict[str, object] = {
+    "fineweb_source_lock": "configs/current-dataset-lock.json",
+    "wikidata_source_lock": "sources/wikidata5m.lock.json",
+    "finemath_repository": "HuggingFaceTB/finemath",
+    "finemath_subsets_in_order": (
+        "finemath-4plus",
+        "finemath-3plus-cross-deduplicated-remainder",
+    ),
+    "cross_deduplicate_finemath_against_fineweb": True,
+    "objective_auxiliary_sources": (
+        "deepmind_mathematics_generator",
+        "clrs_text",
+        "ruletaker",
+        "prontoqa",
+        "reasoning_gym_exact_answer",
+        "arc_agi_training",
+        "conceptarc_training",
+    ),
+    "arc_conceptarc_total_max_percent": 0.25,
+    "teacher_generated_cot_total_max_percent": 0.5,
+    "teacher_generated_cot_requires": (
+        "independent_answer_validation",
+        "trace_validation",
+        "contamination_review",
+    ),
+    "excluded_from_claim_bearing_core": (
+        "proof_pile_variants",
+        "ambiguous_license_sources",
+        "benchmark_evaluation_answers",
+    ),
+}
+_EXPECTED_PUBLICATION_REQUIREMENTS: dict[str, object] = {
+    "complete_once_wikidata_training_graph": True,
+    "stable_fact_universe_and_exposure_burden": True,
+    "solver_verification_rate": 1.0,
+    "structural_train_evaluation_overlap_max": 0.0,
+    "deterministic_rebuild_required": True,
+    "reasoning_lane_cycle_fill_forbidden": True,
+}
+_EXPECTED_INTERVENTION: dict[str, object] = {
+    "primary_arms": ("dense", "split90"),
+    "published_views": (
+        "dense",
+        "split50",
+        "split90",
+        "random_fact_90",
+        "matched_nonfactual_mask",
+    ),
+    "split90_minimum_percent": {
+        "distinct_offloadable_atomic_facts": 90.0,
+        "train_only_information_weighted_burden": 90.0,
+    },
+    "always_internal": ("rules", "operators", "schemas", "proof_procedures"),
+    "matched_pair_invariants": (
+        "model_architecture",
+        "parameters",
+        "initialization",
+        "data_seed",
+        "raw_target_tokens",
+        "token_bytes",
+        "token_order",
+        "packing_boundaries",
+        "optimizer",
+        "optimizer_schedule",
+        "targets_per_update",
+        "training_steps",
+        "inference_budget",
+        "evaluation_items",
+        "exact_graph_memory",
+    ),
+    "only_claim_bearing_difference": (
+        "direct_target_weights_on_routed_factual_payloads"
+    ),
+    "semantic_mask_closure_required": True,
+    "candidate_and_final_state_fact_surfaces_forbidden": True,
+    "memory": {
+        "kind": "exact_non_trainable_graph",
+        "identical_between_arms": True,
+        "byte_identity_required": True,
+        "may_return": ("exact_row", "MISS"),
+        "may_not": (
+            "rank_candidates",
+            "infer_paths",
+            "generate_proofs",
+            "generate_answers",
+        ),
+    },
+}
+
 
 @dataclass(frozen=True)
 class LaneContract:
@@ -162,8 +253,8 @@ class ReasoningV2Recipe:
     context_length: int
     shard_count: int
     lanes: tuple[LaneContract, ...]
-    source_policy: dict[str, object]
-    intervention: dict[str, object]
+    source_policy: Mapping[str, object]
+    intervention: Mapping[str, object]
 
     @property
     def lane_shares(self) -> tuple[tuple[LaneId, Fraction], ...]:
@@ -338,6 +429,53 @@ def _percent_as_share(value: object, description: str) -> Fraction:
 def _require_exact(value: object, expected: object, description: str) -> None:
     if type(value) is not type(expected) or value != expected:
         raise ValueError(f"{description} does not match the frozen contract")
+
+
+def _require_frozen_contract(
+    value: object,
+    expected: object,
+    description: str,
+) -> None:
+    if type(expected) is dict:
+        actual_object = _require_object(value, description)
+        expected_object = cast(dict[str, object], expected)
+        if set(actual_object) != set(expected_object):
+            raise ValueError(
+                f"{description} fields do not match the frozen contract"
+            )
+        for key, expected_item in expected_object.items():
+            _require_frozen_contract(
+                actual_object[key],
+                expected_item,
+                f"{description}.{key}",
+            )
+        return
+    if type(expected) is tuple:
+        actual_list = _require_list(value, description)
+        expected_items = cast(tuple[object, ...], expected)
+        if len(actual_list) != len(expected_items):
+            raise ValueError(f"{description} does not match the frozen contract")
+        for index, (actual_item, expected_item) in enumerate(
+            zip(actual_list, expected_items, strict=True)
+        ):
+            _require_frozen_contract(
+                actual_item,
+                expected_item,
+                f"{description}[{index}]",
+            )
+        return
+    _require_exact(value, expected, description)
+
+
+def _deep_freeze(value: object) -> object:
+    if type(value) is dict:
+        raw_object = cast(dict[str, object], value)
+        return MappingProxyType(
+            {key: _deep_freeze(item) for key, item in raw_object.items()}
+        )
+    if type(value) is list:
+        return tuple(_deep_freeze(item) for item in cast(list[object], value))
+    return value
 
 
 def load_recipe(path: Path) -> ReasoningV2Recipe:
@@ -524,11 +662,21 @@ def load_recipe(path: Path) -> ReasoningV2Recipe:
     recomputed_quotas = hamilton_quotas(total_targets, shares)
     if committed_quotas != recomputed_quotas:
         raise ValueError("committed lane quotas do not match Hamilton quotas")
-    for field in _SPLIT90_DOSE_FIELDS:
-        _number_as_fraction(
-            split90_dose[field],
-            f"Split90 {field.replace('_', ' ')}",
-        )
+    _require_frozen_contract(
+        source_policy,
+        _EXPECTED_SOURCE_POLICY,
+        "source policy",
+    )
+    _require_frozen_contract(
+        publication_requirements,
+        _EXPECTED_PUBLICATION_REQUIREMENTS,
+        "publication requirements",
+    )
+    _require_frozen_contract(
+        intervention,
+        _EXPECTED_INTERVENTION,
+        "intervention",
+    )
 
     quota_by_lane = dict(committed_quotas)
     lanes = tuple(
@@ -548,8 +696,8 @@ def load_recipe(path: Path) -> ReasoningV2Recipe:
         context_length=_CONTEXT_LENGTH,
         shard_count=_FULL_SHARD_COUNT,
         lanes=lanes,
-        source_policy=cast(dict[str, object], source_policy),
-        intervention=cast(dict[str, object], intervention),
+        source_policy=cast(Mapping[str, object], _deep_freeze(source_policy)),
+        intervention=cast(Mapping[str, object], _deep_freeze(intervention)),
     )
 
 
