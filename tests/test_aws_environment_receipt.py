@@ -733,6 +733,350 @@ def test_help_works_without_site_packages():
     assert "--apply" in completed.stdout
 
 
+SELECTED_CONTAINER_FACTS = {
+    "python": "3.12.11",
+    "pytorch": "2.9.0+cu130",
+    "cuda": "13.0",
+    "cudnn": "9.10.2",
+    "nccl": "2.28.3",
+}
+SELECTED_HOST_FACTS = {
+    "cuda": "13.2",
+    "nvidia_driver": "595.71.05",
+    "fabric_manager": "595.71.05",
+    "docker": "28.5.1",
+    "nvidia_container_runtime": "1.18.0",
+    "aws_cli": "2.31.7",
+    "kernel": "6.17",
+    "efa": "1.47.0",
+    "ofi_nccl": "1.18.0",
+}
+P6_AMI_ID = "ami-0260c4d597dcc8641"
+P6_AMI_OWNER = "898082745236"
+UNSUPPORTED_FRAMEWORK_AMI = "ami-0b39828e6910b0bb8"
+
+
+def _selected_profile(kind: str):
+    if kind == "p6":
+        return SimpleNamespace(
+            profile_id="aws-p6-b300.48xlarge-v3",
+            provider="aws-p6-b300.48xlarge",
+            instance_type="p6-b300.48xlarge",
+            gpu_model="NVIDIA B300",
+            allocated_gpus=8,
+            architecture="x86_64",
+            software_floors=(
+                ("cuda", "13.0"),
+                ("efa", "1.44.0"),
+                ("kernel", "6.1"),
+                ("nvidia_driver", "R580"),
+                ("nvlink", "R580"),
+                ("ofi_nccl", "1.17.1"),
+            ),
+            sha256=hashlib.sha256(b"p6-profile").hexdigest(),
+        )
+    if kind == "p5":
+        return SimpleNamespace(
+            profile_id="aws-p5.48xlarge-v3",
+            provider="aws-p5.48xlarge",
+            instance_type="p5.48xlarge",
+            gpu_model="NVIDIA H100 80GB",
+            allocated_gpus=8,
+            architecture="x86_64",
+            software_floors=(),
+            sha256=hashlib.sha256(b"p5-profile").hexdigest(),
+        )
+    raise AssertionError(kind)
+
+
+def _selected_lock(
+    profile,
+    control_sha256: str,
+    *,
+    ami_id: str = P6_AMI_ID,
+) -> dict[str, object]:
+    return {
+        "schema_version": 1,
+        "source_commit": "b" * 40,
+        "source_tree": "c" * 40,
+        "control_bundle_sha256": control_sha256,
+        "profile_sha256": profile.sha256,
+        "ami_id": ami_id,
+        "ami_owner_id": (
+            P6_AMI_OWNER if profile.profile_id.startswith("aws-p6") else "210987654321"
+        ),
+        "container_image": IMAGE,
+        "container_image_digest": IMAGE_DIGEST,
+        "versions": {
+            **SELECTED_CONTAINER_FACTS,
+            "nvidia_driver": SELECTED_HOST_FACTS["nvidia_driver"],
+            "fabric_manager": SELECTED_HOST_FACTS["fabric_manager"],
+            "docker": SELECTED_HOST_FACTS["docker"],
+            "nvidia_container_runtime": SELECTED_HOST_FACTS[
+                "nvidia_container_runtime"
+            ],
+            "aws_cli": SELECTED_HOST_FACTS["aws_cli"],
+        },
+    }
+
+
+class _SelectedCommands:
+    def __init__(
+        self,
+        module,
+        *,
+        host_facts: dict[str, str] | None = None,
+        container_facts: dict[str, str] | None = None,
+        gpu_names: list[str] | None = None,
+    ) -> None:
+        self.module = module
+        self.host_facts = dict(
+            SELECTED_HOST_FACTS if host_facts is None else host_facts
+        )
+        self.container_facts = dict(
+            SELECTED_CONTAINER_FACTS
+            if container_facts is None
+            else container_facts
+        )
+        self.gpu_names = list(
+            ["NVIDIA B300"] * 8 if gpu_names is None else gpu_names
+        )
+        self.calls: list[tuple[tuple[str, ...], dict[str, str]]] = []
+
+    def run(self, argv, *, environment) -> bytes:
+        rendered = tuple(argv)
+        self.calls.append((rendered, dict(environment)))
+        for field, expected in self.module.SELECTED_HOST_VERSION_COMMANDS.items():
+            if rendered == tuple(expected):
+                return (self.host_facts[field] + "\n").encode("ascii")
+        if rendered == tuple(self.module.gpu_names_argv()):
+            return ("\n".join(self.gpu_names) + "\n").encode("utf-8")
+        if rendered == tuple(self.module.container_inspect_argv(IMAGE)):
+            return _canonical([IMAGE])
+        if rendered == tuple(self.module.container_facts_argv(IMAGE)):
+            return _canonical(self.container_facts)
+        raise AssertionError(f"unexpected selected-GPU command: {rendered!r}")
+
+
+def _selected_case(
+    tmp_path: Path,
+    module,
+    *,
+    profile_kind: str = "p6",
+    name: str | None = None,
+):
+    profile = _selected_profile(profile_kind)
+    root = tmp_path / (name or f"selected-{profile_kind}")
+    root.mkdir()
+    control = root / "control.zip"
+    control.write_bytes(b"selected GPU control bundle")
+    lock = root / "runtime-lock.json"
+    lock_value = _selected_lock(
+        profile,
+        hashlib.sha256(control.read_bytes()).hexdigest(),
+        ami_id=P6_AMI_ID if profile_kind == "p6" else IDENTITY["imageId"],
+    )
+    lock.write_bytes(_canonical(lock_value))
+    boot = root / "boot_id"
+    boot.write_text("12345678-1234-4abc-8def-1234567890ab\n", encoding="ascii")
+    identity = {
+        **IDENTITY,
+        "imageId": lock_value["ami_id"],
+        "instanceType": profile.instance_type,
+    }
+    return {
+        "module": module,
+        "profile": profile,
+        "control": control,
+        "lock": lock,
+        "lock_value": lock_value,
+        "boot": boot,
+        "identity": identity,
+        "output": root / "gpu-evidence.json",
+    }
+
+
+def _attest_selected(case, *, commands=None, identity=None):
+    module = case["module"]
+    return module.attest_selected_gpu_environment(
+        selected_profile=case["profile"],
+        runtime_lock_path=case["lock"],
+        control_bundle_path=case["control"],
+        output_path=case["output"],
+        apply=False,
+        imds_reader=_FakeImds(
+            identity=case["identity"] if identity is None else identity
+        ),
+        command_reader=commands or _SelectedCommands(module),
+        boot_id_path=case["boot"],
+    )
+
+
+def test_selected_gpu_attestation_measures_framework_only_in_locked_container(
+    tmp_path,
+):
+    module = _load_module()
+    case = _selected_case(tmp_path, module)
+    commands = _SelectedCommands(module)
+
+    evidence = _attest_selected(case, commands=commands)
+
+    assert evidence["evidence_type"] == "memorysplit-aws-gpu-attestation-v1"
+    assert evidence["profile_id"] == case["profile"].profile_id
+    assert evidence["provider"] == case["profile"].provider
+    assert evidence["instance_type"] == "p6-b300.48xlarge"
+    assert evidence["gpu_model"] == "NVIDIA B300"
+    assert evidence["gpu_count"] == 8
+    assert evidence["host_facts"] == SELECTED_HOST_FACTS
+    assert evidence["container_facts"] == SELECTED_CONTAINER_FACTS
+    assert module.parse_gpu_evidence_bytes(
+        module.canonical_gpu_evidence(evidence)
+    ) == evidence
+    assert module.attest_legacy_p5_environment is module.attest_environment
+
+    container_argv = module.container_facts_argv(IMAGE)
+    assert container_argv in [argv for argv, _ in commands.calls]
+    assert container_argv[:8] == (
+        "/usr/bin/docker",
+        "run",
+        "--rm",
+        "--network",
+        "none",
+        "--pull",
+        "never",
+        "--gpus",
+    )
+    assert "all" in container_argv
+    assert "--entrypoint" in container_argv
+    assert container_argv[container_argv.index("--entrypoint") + 1] == (
+        "/usr/bin/python3"
+    )
+    assert IMAGE in container_argv
+    assert tuple(module.container_inspect_argv(IMAGE)) in [
+        argv for argv, _ in commands.calls
+    ]
+    host_commands = {
+        tuple(argv) for argv in module.SELECTED_HOST_VERSION_COMMANDS.values()
+    } | {tuple(module.gpu_names_argv()), tuple(module.container_inspect_argv(IMAGE))}
+    for argv, _ in commands.calls:
+        if argv in host_commands:
+            assert "torch" not in " ".join(argv)
+            assert argv[0] != "/usr/bin/python3"
+    assert not case["output"].exists()
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("cuda", "12.9"),
+        ("nvidia_driver", "579.99"),
+        ("kernel", "6.0"),
+        ("efa", "1.43.9"),
+        ("ofi_nccl", "1.17.0"),
+    ],
+)
+def test_p6_attestation_rejects_measured_host_facts_below_official_floor(
+    tmp_path,
+    field,
+    value,
+):
+    module = _load_module()
+    case = _selected_case(tmp_path, module)
+    host_facts = dict(SELECTED_HOST_FACTS)
+    host_facts[field] = value
+
+    with pytest.raises(module.AttestationError, match="floor|P6|B300"):
+        _attest_selected(
+            case,
+            commands=_SelectedCommands(module, host_facts=host_facts),
+        )
+
+
+def test_p6_attestation_requires_exact_b300_identity_and_supported_base_ami(tmp_path):
+    module = _load_module()
+
+    wrong_gpu = _selected_case(tmp_path, module, profile_kind="p6")
+    with pytest.raises(module.AttestationError, match="B300|GPU|profile"):
+        _attest_selected(
+            wrong_gpu,
+            commands=_SelectedCommands(module, gpu_names=["NVIDIA B200"] * 8),
+        )
+
+    wrong_ami = _selected_case(
+        tmp_path,
+        module,
+        profile_kind="p6",
+        name="selected-p6-wrong-ami",
+    )
+    value = copy.deepcopy(wrong_ami["lock_value"])
+    value["ami_id"] = UNSUPPORTED_FRAMEWORK_AMI
+    wrong_ami["lock"].write_bytes(_canonical(value))
+    identity = {
+        **wrong_ami["identity"],
+        "imageId": UNSUPPORTED_FRAMEWORK_AMI,
+    }
+    with pytest.raises(module.AttestationError, match="AMI|P6|supported"):
+        _attest_selected(wrong_ami, identity=identity)
+
+
+def test_selected_gpu_attestation_rejects_cross_profile_evidence(tmp_path):
+    module = _load_module()
+
+    p6 = _selected_case(tmp_path, module, profile_kind="p6")
+    p6_identity_as_p5 = {**p6["identity"], "instanceType": "p5.48xlarge"}
+    with pytest.raises(module.AttestationError, match="instance|profile"):
+        _attest_selected(p6, identity=p6_identity_as_p5)
+
+    p5 = _selected_case(tmp_path, module, profile_kind="p5")
+    with pytest.raises(module.AttestationError, match="H100|GPU|profile"):
+        _attest_selected(
+            p5,
+            commands=_SelectedCommands(module, gpu_names=["NVIDIA B300"] * 8),
+        )
+
+
+def test_gpu_evidence_parser_revalidates_profile_identity_and_p6_floors(tmp_path):
+    module = _load_module()
+    p6 = _selected_case(tmp_path, module, profile_kind="p6")
+    p6_evidence = _attest_selected(p6)
+    p6_evidence["host_facts"]["efa"] = "1.43.9"
+    with pytest.raises(module.AttestationError, match="floor|P6|B300"):
+        module.parse_gpu_evidence_bytes(_canonical(p6_evidence))
+
+    p5 = _selected_case(tmp_path, module, profile_kind="p5")
+    p5_evidence = _attest_selected(
+        p5,
+        commands=_SelectedCommands(
+            module,
+            gpu_names=["NVIDIA H100 80GB"] * 8,
+        ),
+    )
+    p5_evidence["provider"] = "aws-p6-b300.48xlarge"
+    with pytest.raises(module.AttestationError, match="profile|identity|provider"):
+        module.parse_gpu_evidence_bytes(_canonical(p5_evidence))
+
+
+def test_selected_host_fact_commands_parse_real_efa_and_ofi_version_markers():
+    module = _load_module()
+
+    assert module.SELECTED_HOST_VERSION_COMMANDS["efa"] == (
+        "/usr/bin/cat",
+        "/opt/amazon/efa_installed_packages",
+    )
+    assert module.SELECTED_HOST_VERSION_COMMANDS["ofi_nccl"] == (
+        "/usr/bin/strings",
+        "/opt/amazon/ofi-nccl/lib/libnccl-net.so",
+    )
+    assert module._selected_host_version(
+        "efa",
+        b"# EFA installer version: 1.47.0\n",
+    ) == "1.47.0"
+    assert module._selected_host_version(
+        "ofi_nccl",
+        b"NET/OFI Initializing aws-ofi-nccl 1.18.0-aws\n",
+    ) == "1.18.0"
+
+
 class _ControllerRunner:
     def __init__(self, *outputs: object) -> None:
         self.outputs = list(outputs)

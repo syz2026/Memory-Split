@@ -16,8 +16,13 @@ from dataclasses import dataclass
 from pathlib import Path
 
 if __package__ in {None, ""}:
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
+from build_image import (  # noqa: E402
+    BuildPlanError,
+    parse_image_binding_bytes,
+)
 from cluster.aws.p5.attest_environment import (  # noqa: E402
     AttestationError,
     parse_runtime_lock_bytes,
@@ -26,14 +31,6 @@ from cluster.aws.p5.attest_environment import (  # noqa: E402
 from msctl.aws_contracts import validate_digest_pinned_oci_image  # noqa: E402
 
 
-BASE_REGISTRY = (
-    "763104351884.dkr.ecr.us-east-1.amazonaws.com/pytorch-training"
-)
-BASE_DIGEST = (
-    "sha256:1414a836532f22b271c03b7ccdbdff3d"
-    "aa0591975b3bd9a3cf51601a45b37f4f"
-)
-BASE_IMAGE = f"{BASE_REGISTRY}@{BASE_DIGEST}"
 PLATFORM = "linux/amd64"
 HOST_CANDIDATE = {
     "schema_version": 1,
@@ -63,23 +60,9 @@ _SPEC_FIELDS = {
     "source",
     "control_bundle_sha256",
     "profile_sha256",
-    "container",
     "host_runtime_versions",
 }
 _SOURCE_FIELDS = {"commit", "tree"}
-_CONTAINER_FIELDS = {
-    "base_image",
-    "platform",
-    "image_binding",
-    "versions",
-}
-_IMAGE_BINDING_FIELDS = {
-    "schema_version",
-    "source_commit",
-    "repository_uri",
-    "container_image",
-    "container_image_digest",
-}
 _CONTAINER_VERSION_FIELDS = {"python", "pytorch", "cuda", "cudnn", "nccl"}
 _LOCK_VERSION_FIELDS = (
     "python",
@@ -93,20 +76,20 @@ _LOCK_VERSION_FIELDS = (
     "nvidia_container_runtime",
     "aws_cli",
 )
-_HOST_RUNTIME_VERSION_FIELDS = set(_LOCK_VERSION_FIELDS)
+_HOST_RUNTIME_VERSION_FIELDS = {
+    "nvidia_driver",
+    "fabric_manager",
+    "docker",
+    "nvidia_container_runtime",
+    "aws_cli",
+}
 _SHA1_RE = re.compile(r"^[0-9a-f]{40}$")
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
-_DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 _VERSION_RE = re.compile(r"^[0-9]+(?:[._+-][0-9A-Za-z]+)*$")
 _SIMPLE_VERSION_RE = re.compile(r"^[0-9]+(?:\.[0-9]+)*$")
 _LOCK_REQUIREMENT_RE = re.compile(
     r"^(?P<name>[a-z0-9][a-z0-9._-]*)=="
     r"(?P<version>[0-9][0-9A-Za-z.!+_-]*)$"
-)
-_PRIVATE_ECR_RE = re.compile(
-    r"^[0-9]{12}\.dkr\.ecr\."
-    r"[a-z]{2}(?:-[a-z0-9]+)+-[0-9]+\.amazonaws\.com/"
-    r"[a-z0-9]+(?:(?:[._-]|/)[a-z0-9]+)*$"
 )
 _FLOATING_MARKERS = frozenset(
     {
@@ -310,67 +293,25 @@ def _runtime_spec(data: bytes) -> dict[str, object]:
     ):
         raise RuntimeArtifactError("runtime input fields do not match schema version 1")
     source = spec["source"]
-    container = spec["container"]
     host_versions = spec["host_runtime_versions"]
     if not isinstance(source, dict) or set(source) != _SOURCE_FIELDS:
         raise RuntimeArtifactError("runtime input source fields do not match schema")
-    if not isinstance(container, dict) or set(container) != _CONTAINER_FIELDS:
-        raise RuntimeArtifactError("runtime input container fields do not match schema")
-    commit = _sha1(source["commit"], label="source commit")
+    _sha1(source["commit"], label="source commit")
     _sha1(source["tree"], label="source tree")
     _sha256(spec["control_bundle_sha256"], label="control bundle")
     _sha256(spec["profile_sha256"], label="profile")
-    if container["base_image"] != BASE_IMAGE or container["platform"] != PLATFORM:
-        raise RuntimeArtifactError("container base image or platform is not reviewed")
-    binding = container["image_binding"]
-    if (
-        not isinstance(binding, dict)
-        or set(binding) != _IMAGE_BINDING_FIELDS
-        or type(binding.get("schema_version")) is not int
-        or binding["schema_version"] != 1
-        or binding["source_commit"] != commit
-        or not isinstance(binding["repository_uri"], str)
-        or _PRIVATE_ECR_RE.fullmatch(binding["repository_uri"]) is None
-    ):
-        raise RuntimeArtifactError("container image binding fields are invalid")
-    digest = binding["container_image_digest"]
-    if not isinstance(digest, str) or _DIGEST_RE.fullmatch(digest) is None:
-        raise RuntimeArtifactError("container image binding digest is invalid")
-    try:
-        validate_digest_pinned_oci_image(binding["container_image"], digest)
-    except ValueError as error:
-        raise RuntimeArtifactError("container image binding is not digest-pinned") from error
-    if binding["container_image"] != f"{binding['repository_uri']}@{digest}":
-        raise RuntimeArtifactError("container image binding repository is inconsistent")
-    container_versions = _version_object(
-        container["versions"],
-        fields=_CONTAINER_VERSION_FIELDS,
-        label="container versions",
-    )
-    expected_prefixes = {
-        "python": "3.12",
-        "pytorch": "2.9.0",
-        "cuda": "13.0",
-    }
-    for field, prefix in expected_prefixes.items():
-        value = container_versions[field]
-        if value != prefix and not value.startswith(prefix + ".") and not value.startswith(
-            prefix + "+"
-        ):
-            raise RuntimeArtifactError(
-                f"container {field} does not match the reviewed base release"
-            )
     normalized_host_versions = _version_object(
         host_versions,
         fields=_HOST_RUNTIME_VERSION_FIELDS,
         label="host runtime versions",
     )
-    for field in ("cuda", "nvidia_driver"):
-        if normalized_host_versions[field] != HOST_CANDIDATE["versions"][field]:
-            raise RuntimeArtifactError(
-                f"host runtime {field} differs from the reviewed AMI fact"
-            )
-    spec["container"]["versions"] = container_versions
+    if (
+        normalized_host_versions["nvidia_driver"]
+        != HOST_CANDIDATE["versions"]["nvidia_driver"]
+    ):
+        raise RuntimeArtifactError(
+            "host runtime nvidia_driver differs from the reviewed AMI fact"
+        )
     spec["host_runtime_versions"] = normalized_host_versions
     return spec
 
@@ -431,26 +372,272 @@ def _dependency_packages(data: bytes) -> list[dict[str, object]]:
     return packages
 
 
+def _hash_map(value: object, *, label: str) -> None:
+    if not isinstance(value, dict) or not value:
+        raise RuntimeArtifactError(f"{label} must be one nonempty hash map")
+    for key, item in value.items():
+        if not isinstance(key, str):
+            raise RuntimeArtifactError(f"{label} key is not a string")
+        if isinstance(item, dict):
+            _hash_map(item, label=f"{label}.{key}")
+        else:
+            _sha256(item, label=f"{label}.{key}")
+
+
+def parse_runtime_sbom_bytes(data: bytes) -> dict[str, object]:
+    """Parse the closed full runtime SBOM emitted beside the legacy lock."""
+
+    sbom = _canonical_object(data, label="runtime SBOM")
+    if set(sbom) != {
+        "schema_version",
+        "document_type",
+        "source",
+        "runtime_lock_sha256",
+        "image_binding_sha256",
+        "project_dependency_lock",
+        "host",
+        "container",
+    }:
+        raise RuntimeArtifactError("runtime SBOM fields do not match closed schema")
+    if (
+        type(sbom["schema_version"]) is not int
+        or sbom["schema_version"] != 2
+        or sbom["document_type"] != "memorysplit-aws-gpu-sbom-v2"
+    ):
+        raise RuntimeArtifactError("runtime SBOM identity is invalid")
+    source = sbom["source"]
+    if not isinstance(source, dict) or set(source) != _SOURCE_FIELDS:
+        raise RuntimeArtifactError("runtime SBOM source fields do not match schema")
+    _sha1(source["commit"], label="runtime SBOM source commit")
+    _sha1(source["tree"], label="runtime SBOM source tree")
+    _sha256(sbom["runtime_lock_sha256"], label="runtime SBOM lock")
+    _sha256(sbom["image_binding_sha256"], label="runtime SBOM image binding")
+
+    project = sbom["project_dependency_lock"]
+    if not isinstance(project, dict) or set(project) != {"sha256", "packages"}:
+        raise RuntimeArtifactError(
+            "runtime SBOM project dependency fields do not match schema"
+        )
+    _sha256(project["sha256"], label="runtime SBOM dependency lock")
+    if not isinstance(project["packages"], list):
+        raise RuntimeArtifactError("runtime SBOM dependency packages must be a list")
+    dependency_names: list[str] = []
+    for package in project["packages"]:
+        if not isinstance(package, dict) or set(package) != {
+            "name",
+            "version",
+            "allowed_distribution_sha256",
+        }:
+            raise RuntimeArtifactError(
+                "runtime SBOM dependency package fields do not match schema"
+            )
+        name = package["name"]
+        if not isinstance(name, str) or not name:
+            raise RuntimeArtifactError("runtime SBOM dependency name is invalid")
+        dependency_names.append(name)
+        _fixed_version(
+            package["version"],
+            label=f"runtime SBOM dependency {name}",
+        )
+        hashes = package["allowed_distribution_sha256"]
+        if not isinstance(hashes, list) or not hashes:
+            raise RuntimeArtifactError("runtime SBOM dependency hashes are empty")
+        for digest in hashes:
+            _sha256(digest, label=f"runtime SBOM dependency {name} hash")
+    if dependency_names != sorted(set(dependency_names)):
+        raise RuntimeArtifactError("runtime SBOM dependency packages are not sorted")
+
+    host = sbom["host"]
+    if not isinstance(host, dict) or set(host) != {
+        "ami_id",
+        "ami_owner_id",
+        "ami_name",
+        "architecture",
+        "versions",
+        "minimum_versions",
+    }:
+        raise RuntimeArtifactError("runtime SBOM host fields do not match schema")
+    if (
+        host["ami_id"] != HOST_CANDIDATE["ami_id"]
+        or host["ami_owner_id"] != HOST_CANDIDATE["ami_owner_id"]
+        or host["ami_name"] != HOST_CANDIDATE["ami_name"]
+        or host["architecture"] != HOST_CANDIDATE["architecture"]
+        or host["minimum_versions"] != HOST_CANDIDATE["minimum_versions"]
+    ):
+        raise RuntimeArtifactError("runtime SBOM host differs from reviewed AMI")
+    if not isinstance(host["versions"], dict) or not isinstance(
+        host["minimum_versions"],
+        dict,
+    ):
+        raise RuntimeArtifactError("runtime SBOM host versions are invalid")
+    for name, version in host["versions"].items():
+        _fixed_version(version, label=f"runtime SBOM host {name}")
+    if any(
+        host["versions"].get(name) != version
+        for name, version in HOST_CANDIDATE["versions"].items()
+    ):
+        raise RuntimeArtifactError("runtime SBOM host facts differ from reviewed AMI")
+
+    container = sbom["container"]
+    container_fields = {
+        "platform",
+        "base_image",
+        "base_image_digest",
+        "image",
+        "image_digest",
+        "versions",
+        "os_release",
+        "python",
+        "installed_python_packages",
+        "inventory_method",
+        "installed_distribution_count",
+        "project_install_report_sha256",
+        "build_inputs",
+        "repository_transcript_sha256",
+        "command_transcript_sha256",
+        "inherited_entrypoint",
+        "entrypoint_sha256",
+        "inspection_artifact_sha256",
+    }
+    if not isinstance(container, dict) or set(container) != container_fields:
+        raise RuntimeArtifactError("runtime SBOM container fields do not match schema")
+    if container["platform"] != PLATFORM:
+        raise RuntimeArtifactError("runtime SBOM container platform is invalid")
+    try:
+        validate_digest_pinned_oci_image(
+            container["base_image"],
+            container["base_image_digest"],
+        )
+        validate_digest_pinned_oci_image(
+            container["image"],
+            container["image_digest"],
+        )
+    except ValueError as error:
+        raise RuntimeArtifactError("runtime SBOM image is not digest-pinned") from error
+    if (
+        not isinstance(container["versions"], dict)
+        or set(container["versions"]) != _CONTAINER_VERSION_FIELDS
+    ):
+        raise RuntimeArtifactError("runtime SBOM container versions are invalid")
+    for name, version in container["versions"].items():
+        _fixed_version(version, label=f"runtime SBOM container {name}")
+    if not isinstance(container["os_release"], dict) or set(
+        container["os_release"]
+    ) != {"id", "version_id", "pretty_name"}:
+        raise RuntimeArtifactError("runtime SBOM OS release is invalid")
+    if not isinstance(container["python"], dict) or set(container["python"]) != {
+        "implementation",
+        "version",
+    }:
+        raise RuntimeArtifactError("runtime SBOM Python identity is invalid")
+    installed = container["installed_python_packages"]
+    if (
+        not isinstance(installed, list)
+        or container["inventory_method"] != "importlib.metadata.distributions"
+        or type(container["installed_distribution_count"]) is not int
+        or container["installed_distribution_count"] != len(installed)
+    ):
+        raise RuntimeArtifactError("runtime SBOM installed inventory is invalid")
+    installed_names: list[str] = []
+    for package in installed:
+        if not isinstance(package, dict) or set(package) != {
+            "name",
+            "version",
+            "installer",
+            "archive_sha256",
+            "record_sha256",
+            "wheel_metadata_sha256",
+        }:
+            raise RuntimeArtifactError(
+                "runtime SBOM installed package fields do not match schema"
+            )
+        name = package["name"]
+        if not isinstance(name, str) or not name:
+            raise RuntimeArtifactError("runtime SBOM installed package is invalid")
+        installed_names.append(name)
+        _fixed_version(
+            package["version"],
+            label=f"runtime SBOM installed {name}",
+        )
+        for field in (
+            "archive_sha256",
+            "record_sha256",
+            "wheel_metadata_sha256",
+        ):
+            digest = package[field]
+            if digest is not None:
+                _sha256(digest, label=f"runtime SBOM installed {name} {field}")
+    if installed_names != sorted(set(installed_names)) or "torch" not in installed_names:
+        raise RuntimeArtifactError(
+            "runtime SBOM installed inventory is incomplete or unsorted"
+        )
+    for field in (
+        "project_install_report_sha256",
+        "entrypoint_sha256",
+        "inspection_artifact_sha256",
+    ):
+        _sha256(container[field], label=f"runtime SBOM container {field}")
+    _hash_map(container["build_inputs"], label="runtime SBOM build inputs")
+    _hash_map(
+        container["repository_transcript_sha256"],
+        label="runtime SBOM repository transcripts",
+    )
+    _hash_map(
+        container["command_transcript_sha256"],
+        label="runtime SBOM command transcripts",
+    )
+    inherited = container["inherited_entrypoint"]
+    if not isinstance(inherited, dict) or set(inherited) != {
+        "entrypoint",
+        "command",
+    }:
+        raise RuntimeArtifactError("runtime SBOM inherited entrypoint is invalid")
+    return sbom
+
+
 def produce_runtime_artifacts(
     *,
     spec_bytes: bytes,
     host_candidate_bytes: bytes,
     dependency_lock_bytes: bytes,
+    image_binding_bytes: bytes,
 ) -> RuntimeArtifacts:
-    """Produce current-parser-compatible lock bytes and a separated-facts SBOM."""
+    """Produce a parser-compatible lock and full measured runtime SBOM."""
 
     spec = _runtime_spec(spec_bytes)
     host = _host_candidate(host_candidate_bytes)
     packages = _dependency_packages(dependency_lock_bytes)
-    container = spec["container"]
-    container_versions = container["versions"]
+    try:
+        binding = parse_image_binding_bytes(
+            image_binding_bytes,
+            dependency_lock_bytes=dependency_lock_bytes,
+        )
+    except (BuildPlanError, TypeError, ValueError) as error:
+        raise RuntimeArtifactError(
+            "image binding is not tool-produced closed build authority"
+        ) from error
+    if (
+        binding["source_commit"] != spec["source"]["commit"]
+        or binding["source_tree"] != spec["source"]["tree"]
+    ):
+        raise RuntimeArtifactError("image binding source differs from runtime input")
+    inspection = binding["inspection_artifact"]
+    container_versions = _version_object(
+        inspection["container_facts"],
+        fields=_CONTAINER_VERSION_FIELDS,
+        label="measured container versions",
+    )
     host_runtime_versions = spec["host_runtime_versions"]
     versions = {
-        field: host_runtime_versions[field] for field in _LOCK_VERSION_FIELDS
+        field: (
+            container_versions[field]
+            if field in _CONTAINER_VERSION_FIELDS
+            else host_runtime_versions[field]
+        )
+        for field in _LOCK_VERSION_FIELDS
     }
     if tuple(versions) != _LOCK_VERSION_FIELDS:
         raise RuntimeArtifactError("runtime version provenance ordering drifted")
-    binding = container["image_binding"]
     lock = {
         "schema_version": 1,
         "source_commit": spec["source"]["commit"],
@@ -475,13 +662,15 @@ def produce_runtime_artifacts(
 
     host_versions = {**host["versions"], **host_runtime_versions}
     sbom = {
-        "schema_version": 1,
-        "document_type": "memorysplit-aws-gpu-sbom-v1",
+        "schema_version": 2,
+        "document_type": "memorysplit-aws-gpu-sbom-v2",
         "source": dict(spec["source"]),
         "runtime_lock_sha256": hashlib.sha256(lock_bytes).hexdigest(),
-        "dependency_lock_sha256": hashlib.sha256(
-            dependency_lock_bytes
-        ).hexdigest(),
+        "image_binding_sha256": hashlib.sha256(image_binding_bytes).hexdigest(),
+        "project_dependency_lock": {
+            "sha256": hashlib.sha256(dependency_lock_bytes).hexdigest(),
+            "packages": packages,
+        },
         "host": {
             "ami_id": host["ami_id"],
             "ami_owner_id": host["ami_owner_id"],
@@ -491,18 +680,42 @@ def produce_runtime_artifacts(
             "minimum_versions": dict(host["minimum_versions"]),
         },
         "container": {
-            "platform": container["platform"],
-            "base_image": container["base_image"],
+            "platform": PLATFORM,
+            "base_image": binding["base_image"],
+            "base_image_digest": binding["base_image_digest"],
             "image": binding["container_image"],
             "image_digest": binding["container_image_digest"],
             "versions": dict(container_versions),
+            "os_release": dict(inspection["os_release"]),
+            "python": dict(inspection["python"]),
+            "installed_python_packages": list(
+                inspection["installed_python_packages"]
+            ),
+            "inventory_method": inspection["inventory_method"],
+            "installed_distribution_count": inspection[
+                "installed_distribution_count"
+            ],
+            "project_install_report_sha256": inspection[
+                "project_install_report_sha256"
+            ],
+            "build_inputs": dict(binding["build_inputs"]),
+            "repository_transcript_sha256": dict(
+                binding["repository_transcript_sha256"]
+            ),
+            "command_transcript_sha256": dict(
+                binding["command_transcript_sha256"]
+            ),
+            "inherited_entrypoint": dict(binding["inherited_entrypoint"]),
+            "entrypoint_sha256": binding["entrypoint_sha256"],
+            "inspection_artifact_sha256": binding[
+                "inspection_artifact_sha256"
+            ],
         },
-        "python_packages": packages,
     }
-    return RuntimeArtifacts(
-        runtime_lock_bytes=lock_bytes,
-        sbom_bytes=canonical_json(sbom),
-    )
+    sbom_bytes = canonical_json(sbom)
+    if parse_runtime_sbom_bytes(sbom_bytes) != sbom:
+        raise RuntimeArtifactError("runtime SBOM did not survive closed parsing")
+    return RuntimeArtifacts(runtime_lock_bytes=lock_bytes, sbom_bytes=sbom_bytes)
 
 
 def _write_no_replace(path: Path | str, data: bytes) -> None:
@@ -566,6 +779,7 @@ def _parser() -> argparse.ArgumentParser:
         "--dependency-lock",
         default=str(root / "requirements.lock"),
     )
+    parser.add_argument("--image-binding", required=True)
     parser.add_argument("--runtime-lock-out", required=True)
     parser.add_argument("--sbom-out", required=True)
     parser.add_argument("--apply", action="store_true")
@@ -590,6 +804,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             dependency_lock_bytes=read_regular_input(
                 arguments.dependency_lock,
                 label="dependency lock",
+            ),
+            image_binding_bytes=read_regular_input(
+                arguments.image_binding,
+                label="image binding",
             ),
         )
         result = {

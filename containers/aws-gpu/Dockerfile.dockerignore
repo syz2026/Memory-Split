@@ -1,4 +1,5 @@
 **
 !containers/
 !containers/aws-gpu/
+!containers/aws-gpu/inspect_container.py
 !containers/aws-gpu/requirements.lock

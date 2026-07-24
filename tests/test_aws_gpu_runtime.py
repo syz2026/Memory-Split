@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import hashlib
 import importlib.util
 import json
@@ -23,6 +24,7 @@ BUILD_SCRIPT = RUNTIME_ROOT / "build_image.py"
 RUNTIME_LOCK_SCRIPT = RUNTIME_ROOT / "runtime_lock.py"
 HOST_CANDIDATE = RUNTIME_ROOT / "host-candidate.json"
 DOCKERIGNORE = RUNTIME_ROOT / "Dockerfile.dockerignore"
+INSPECT_SCRIPT = RUNTIME_ROOT / "inspect_container.py"
 
 BASE_REGISTRY = (
     "763104351884.dkr.ecr.us-east-1.amazonaws.com/pytorch-training"
@@ -36,6 +38,14 @@ PRIVATE_REPOSITORY = (
     "123456789012.dkr.ecr.us-east-1.amazonaws.com/memorysplit/aws-gpu"
 )
 SOURCE_COMMIT = "b3471e0969ca2a997d33acf60d2e777720afa1c4"
+SOURCE_TREE = "f" * 40
+CONTAINER_FACTS = {
+    "python": "3.12.11",
+    "pytorch": "2.9.0+cu130",
+    "cuda": "13.0",
+    "cudnn": "9.10.2",
+    "nccl": "2.28.3",
+}
 
 
 def _locked_requirements(data: str) -> dict[str, tuple[str, ...]]:
@@ -99,39 +109,15 @@ def _canonical(value: object) -> bytes:
 
 
 def _runtime_spec() -> dict[str, object]:
-    digest = "sha256:" + "9" * 64
     return {
         "schema_version": 1,
         "source": {
             "commit": SOURCE_COMMIT,
-            "tree": "c" * 40,
+            "tree": SOURCE_TREE,
         },
         "control_bundle_sha256": "d" * 64,
         "profile_sha256": "e" * 64,
-        "container": {
-            "base_image": BASE_IMAGE,
-            "platform": "linux/amd64",
-            "image_binding": {
-                "schema_version": 1,
-                "source_commit": SOURCE_COMMIT,
-                "repository_uri": PRIVATE_REPOSITORY,
-                "container_image": f"{PRIVATE_REPOSITORY}@{digest}",
-                "container_image_digest": digest,
-            },
-            "versions": {
-                "python": "3.12.11",
-                "pytorch": "2.9.0+cu130",
-                "cuda": "13.0",
-                "cudnn": "9.10.2",
-                "nccl": "2.28.3",
-            },
-        },
         "host_runtime_versions": {
-            "python": "3.12.3",
-            "pytorch": "2.9.0+cu132",
-            "cuda": "13.2",
-            "cudnn": "9.10.1",
-            "nccl": "2.28.1",
             "nvidia_driver": "595.71.05",
             "fabric_manager": "595.71.05",
             "docker": "28.5.1",
@@ -156,6 +142,197 @@ class _RecordingRunner:
         return self.outputs.pop(0)
 
 
+class _RepositoryReader:
+    def __init__(
+        self,
+        *,
+        commit: str = SOURCE_COMMIT,
+        tree: str = SOURCE_TREE,
+        clean: bool = True,
+    ) -> None:
+        self.commit = commit
+        self.tree = tree
+        self.clean = clean
+        self.calls: list[Path] = []
+
+    def inspect(self, repository_root):
+        self.calls.append(Path(repository_root))
+        return {
+            "source_commit": self.commit,
+            "source_tree": self.tree,
+            "clean": self.clean,
+            "command_transcript_sha256": {
+                "head": "1" * 64,
+                "tree": "2" * 64,
+                "status": "3" * 64,
+            },
+        }
+
+
+def _locked_packages(data: str) -> list[dict[str, object]]:
+    packages = []
+    pending = ""
+    for raw_line in data.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        pending = f"{pending} {line}".strip()
+        if pending.endswith("\\"):
+            pending = pending[:-1].rstrip()
+            continue
+        requirement, *hashes = pending.split()
+        name, version = requirement.split("==", 1)
+        packages.append(
+            {
+                "name": name.replace("_", "-").lower(),
+                "version": version,
+                "installer": "pip",
+                "archive_sha256": hashes[0].removeprefix("--hash=sha256:"),
+                "record_sha256": "4" * 64,
+                "wheel_metadata_sha256": "5" * 64,
+            }
+        )
+        pending = ""
+    packages.append(
+        {
+            "name": "torch",
+            "version": "2.9.0+cu130",
+            "installer": "pip",
+            "archive_sha256": None,
+            "record_sha256": "6" * 64,
+            "wheel_metadata_sha256": "7" * 64,
+        }
+    )
+    return sorted(packages, key=lambda item: item["name"])
+
+
+def _inspection_artifact() -> dict[str, object]:
+    return {
+        "schema_version": 1,
+        "artifact_type": "memorysplit-container-inspection-v1",
+        "os_release": {
+            "id": "ubuntu",
+            "version_id": "24.04",
+            "pretty_name": "Ubuntu 24.04.4 LTS",
+        },
+        "python": {
+            "implementation": "CPython",
+            "version": "3.12.11",
+        },
+        "container_facts": dict(CONTAINER_FACTS),
+        "installed_python_packages": _locked_packages(
+            REQUIREMENTS_LOCK.read_text(encoding="utf-8")
+        ),
+        "inventory_method": "importlib.metadata.distributions",
+        "installed_distribution_count": len(
+            _locked_packages(REQUIREMENTS_LOCK.read_text(encoding="utf-8"))
+        ),
+        "project_install_report_sha256": "8" * 64,
+    }
+
+
+def _docker_inspect(
+    *,
+    repo_digests: list[str],
+    entrypoint: list[str] | None = None,
+    command: list[str] | None = None,
+    image_id: str = "sha256:" + "b" * 64,
+) -> bytes:
+    return _canonical(
+        {
+            "Id": image_id,
+            "RepoDigests": repo_digests,
+            "Config": {
+                "Entrypoint": (
+                    ["/usr/local/bin/dlc-entrypoint"] if entrypoint is None else entrypoint
+                ),
+                "Cmd": ["bash"] if command is None else command,
+            },
+        }
+    )
+
+
+def _apply_outputs(digest: str) -> list[bytes]:
+    facts = _canonical(CONTAINER_FACTS)
+    inspection = _canonical(_inspection_artifact())
+    return [
+        b"image built\n",
+        _docker_inspect(repo_digests=[BASE_IMAGE]),
+        _docker_inspect(repo_digests=[]),
+        facts,
+        facts,
+        inspection,
+        f"source: digest: {digest} size: 2048\n".encode("ascii"),
+        _docker_inspect(repo_digests=[f"{PRIVATE_REPOSITORY}@{digest}"]),
+        facts,
+        inspection,
+    ]
+
+
+def _image_binding() -> dict[str, object]:
+    digest = "sha256:" + "9" * 64
+    inspection = _inspection_artifact()
+    entrypoint = {
+        "entrypoint": ["/usr/local/bin/dlc-entrypoint"],
+        "command": ["bash"],
+    }
+    return {
+        "schema_version": 2,
+        "binding_type": "memorysplit-aws-gpu-image-binding-v2",
+        "source_commit": SOURCE_COMMIT,
+        "source_tree": SOURCE_TREE,
+        "repository_uri": PRIVATE_REPOSITORY,
+        "base_image": BASE_IMAGE,
+        "base_image_digest": BASE_DIGEST,
+        "container_image": f"{PRIVATE_REPOSITORY}@{digest}",
+        "container_image_digest": digest,
+        "build_inputs": {
+            "dockerfile_sha256": "a" * 64,
+            "dockerignore_sha256": "b" * 64,
+            "dependency_lock_sha256": hashlib.sha256(
+                REQUIREMENTS_LOCK.read_bytes()
+            ).hexdigest(),
+            "inspection_script_sha256": "c" * 64,
+        },
+        "repository_transcript_sha256": {
+            "plan": {"head": "1" * 64, "tree": "2" * 64, "status": "3" * 64},
+            "pre_apply": {
+                "head": "1" * 64,
+                "tree": "2" * 64,
+                "status": "3" * 64,
+            },
+            "final": {"head": "1" * 64, "tree": "2" * 64, "status": "3" * 64},
+        },
+        "command_transcript_sha256": {
+            name: f"{index:x}" * 64
+            for index, name in enumerate(
+                (
+                    "build",
+                    "inspect_base",
+                    "inspect_local",
+                    "facts_base",
+                    "facts_local",
+                    "inspection_local",
+                    "push",
+                    "inspect_final",
+                    "facts_final",
+                    "inspection_final",
+                ),
+                start=1,
+            )
+        },
+        "container_facts_sha256": hashlib.sha256(
+            _canonical(CONTAINER_FACTS)
+        ).hexdigest(),
+        "entrypoint_sha256": hashlib.sha256(_canonical(entrypoint)).hexdigest(),
+        "inherited_entrypoint": entrypoint,
+        "inspection_artifact_sha256": hashlib.sha256(
+            _canonical(inspection)
+        ).hexdigest(),
+        "inspection_artifact": inspection,
+    }
+
+
 def test_dockerfile_uses_only_the_approved_digest_pinned_base():
     text = DOCKERFILE.read_text(encoding="utf-8")
     instructions = [
@@ -172,6 +349,10 @@ def test_dockerfile_uses_only_the_approved_digest_pinned_base():
     assert "--only-binary=:all:" in text
     assert "--no-compile" in text
     assert "requirements.lock" in text
+    assert "--force-reinstall" in text
+    assert "--ignore-installed" not in text
+    assert "--report=/opt/memorysplit/project-install-report.json" in text
+    assert "inspect_container.py" in text
     assert re.search(r"(?m)^USER 10001:10001$", text)
     assert "# syntax=" not in text
     assert "ARG APP_UID" not in text
@@ -179,6 +360,7 @@ def test_dockerfile_uses_only_the_approved_digest_pinned_base():
     assert not re.search(r"(?im)^\s*ADD\s+https?://", text)
     assert not re.search(r"(?i)\b(curl|wget)\b", text)
     assert "apt-get" not in text
+    assert re.search(r"(?im)^\s*(ENTRYPOINT|CMD)\b", text) is None
     assert not (ROOT / "runtime" / "aws-p5").exists()
 
 
@@ -215,8 +397,87 @@ def test_docker_context_is_a_closed_dependency_only_allowlist():
         "**",
         "!containers/",
         "!containers/aws-gpu/",
+        "!containers/aws-gpu/inspect_container.py",
         "!containers/aws-gpu/requirements.lock",
     ]
+
+
+def test_container_inspection_contract_includes_inherited_and_selected_packages():
+    module = _load_script(INSPECT_SCRIPT)
+
+    class Distribution:
+        def __init__(self, name, version, files):
+            self.metadata = {"Name": name}
+            self.version = version
+            self.files = files
+
+        def read_text(self, name):
+            return self.files.get(name)
+
+    selected_hash = "a" * 64
+    install_report = _canonical(
+        {
+            "install": [
+                {
+                    "metadata": {"name": "numpy", "version": "2.5.1"},
+                    "download_info": {
+                        "archive_info": {"hashes": {"sha256": selected_hash}}
+                    },
+                }
+            ]
+        }
+    )
+    artifact = module.build_inspection_artifact(
+        os_release_bytes=(
+            b'ID=ubuntu\nVERSION_ID="24.04"\n'
+            b'PRETTY_NAME="Ubuntu 24.04.4 LTS"\n'
+        ),
+        install_report_bytes=install_report,
+        distributions=(
+            Distribution(
+                "numpy",
+                "2.5.1",
+                {
+                    "INSTALLER": "pip\n",
+                    "RECORD": "numpy.py,sha256=x,1\n",
+                    "WHEEL": "Wheel-Version: 1.0\n",
+                },
+            ),
+            Distribution(
+                "torch",
+                "2.9.0+cu130",
+                {
+                    "INSTALLER": "pip\n",
+                    "RECORD": "torch.py,sha256=y,1\n",
+                    "WHEEL": "Wheel-Version: 1.0\n",
+                },
+            ),
+        ),
+        container_facts=CONTAINER_FACTS,
+        python_version=CONTAINER_FACTS["python"],
+        python_implementation="CPython",
+    )
+
+    assert artifact["os_release"]["version_id"] == "24.04"
+    assert artifact["python"] == {
+        "implementation": "CPython",
+        "version": CONTAINER_FACTS["python"],
+    }
+    packages = {
+        package["name"]: package
+        for package in artifact["installed_python_packages"]
+    }
+    assert set(packages) == {"numpy", "torch"}
+    assert artifact["inventory_method"] == "importlib.metadata.distributions"
+    assert artifact["installed_distribution_count"] == 2
+    assert packages["numpy"]["archive_sha256"] == selected_hash
+    assert packages["torch"]["archive_sha256"] is None
+    assert packages["torch"]["record_sha256"] == hashlib.sha256(
+        b"torch.py,sha256=y,1\n"
+    ).hexdigest()
+    assert module.parse_inspection_artifact_bytes(
+        module.canonical_json(artifact)
+    ) == artifact
 
 
 def test_build_plan_is_dry_run_and_does_not_inherit_secrets(monkeypatch, tmp_path):
@@ -231,6 +492,7 @@ def test_build_plan_is_dry_run_and_does_not_inherit_secrets(monkeypatch, tmp_pat
         source_commit=SOURCE_COMMIT,
         repository_root=ROOT,
         docker_config=docker_config,
+        repository_reader=_RepositoryReader(),
     )
     result = module.execute_build_plan(
         plan,
@@ -276,37 +538,198 @@ def test_build_plan_is_dry_run_and_does_not_inherit_secrets(monkeypatch, tmp_pat
 def test_explicit_apply_builds_then_pushes_and_emits_digest_binding(tmp_path):
     module = _load_script(BUILD_SCRIPT)
     digest = "sha256:" + "9" * 64
-    runner = _RecordingRunner(
-        [
-            b"image built\n",
-            f"source-b3471e0969ca: digest: {digest} size: 2048\n".encode(
-                "ascii"
-            ),
-        ]
-    )
+    runner = _RecordingRunner(_apply_outputs(digest))
     plan = module.render_build_plan(
         repository_uri=PRIVATE_REPOSITORY,
         source_commit=SOURCE_COMMIT,
         repository_root=ROOT,
         docker_config=tmp_path / "docker",
+        repository_reader=_RepositoryReader(),
     )
 
-    binding = module.execute_build_plan(plan, apply=True, runner=runner)
+    binding = module.execute_build_plan(
+        plan,
+        apply=True,
+        runner=runner,
+        repository_reader=_RepositoryReader(),
+    )
 
     assert [call[0] for call in runner.calls] == [
-        tuple(plan["commands"]["build"]),
-        tuple(plan["commands"]["push"]),
+        tuple(plan["commands"][name])
+        for name in (
+            "build",
+            "inspect_base",
+            "inspect_local",
+            "facts_base",
+            "facts_local",
+            "inspection_local",
+            "push",
+        )
+    ] + [
+        tuple(module.final_image_inspect_argv(f"{PRIVATE_REPOSITORY}@{digest}")),
+        tuple(module.container_facts_argv(f"{PRIVATE_REPOSITORY}@{digest}")),
+        tuple(module.container_inspection_argv(f"{PRIVATE_REPOSITORY}@{digest}")),
     ]
     assert all(call[1] == plan["environment"] for call in runner.calls)
-    assert binding == {
-        "schema_version": 1,
-        "source_commit": SOURCE_COMMIT,
-        "repository_uri": PRIVATE_REPOSITORY,
-        "container_image": f"{PRIVATE_REPOSITORY}@{digest}",
-        "container_image_digest": digest,
+    assert binding["schema_version"] == 2
+    assert binding["binding_type"] == "memorysplit-aws-gpu-image-binding-v2"
+    assert binding["source_commit"] == SOURCE_COMMIT
+    assert binding["source_tree"] == SOURCE_TREE
+    assert binding["repository_uri"] == PRIVATE_REPOSITORY
+    assert binding["base_image"] == BASE_IMAGE
+    assert binding["base_image_digest"] == BASE_DIGEST
+    assert binding["container_image"] == f"{PRIVATE_REPOSITORY}@{digest}"
+    assert binding["container_image_digest"] == digest
+    assert binding["build_inputs"] == plan["inputs"]
+    assert set(binding["command_transcript_sha256"]) == {
+        "build",
+        "inspect_base",
+        "inspect_local",
+        "facts_base",
+        "facts_local",
+        "inspection_local",
+        "push",
+        "inspect_final",
+        "facts_final",
+        "inspection_final",
+    }
+    assert all(
+        re.fullmatch(r"[0-9a-f]{64}", value)
+        for value in binding["command_transcript_sha256"].values()
+    )
+    assert binding["inspection_artifact"] == _inspection_artifact()
+    assert binding["inherited_entrypoint"] == {
+        "entrypoint": ["/usr/local/bin/dlc-entrypoint"],
+        "command": ["bash"],
     }
     assert ":" not in binding["container_image"].split("@", 1)[0].rsplit("/", 1)[-1]
     assert module.canonical_json(binding).endswith(b"\n")
+
+
+@pytest.mark.parametrize(
+    "reader",
+    [
+        _RepositoryReader(clean=False),
+        _RepositoryReader(commit="0" * 40),
+    ],
+)
+def test_build_plan_requires_actual_clean_expected_repository(reader, tmp_path):
+    module = _load_script(BUILD_SCRIPT)
+
+    with pytest.raises(module.BuildPlanError, match="clean|commit|source"):
+        module.render_build_plan(
+            repository_uri=PRIVATE_REPOSITORY,
+            source_commit=SOURCE_COMMIT,
+            repository_root=ROOT,
+            docker_config=tmp_path / "docker",
+            repository_reader=reader,
+        )
+
+
+def test_apply_rechecks_repository_before_first_docker_command(tmp_path):
+    module = _load_script(BUILD_SCRIPT)
+    plan = module.render_build_plan(
+        repository_uri=PRIVATE_REPOSITORY,
+        source_commit=SOURCE_COMMIT,
+        repository_root=ROOT,
+        docker_config=tmp_path / "docker",
+        repository_reader=_RepositoryReader(),
+    )
+
+    with pytest.raises(module.BuildPlanError, match="clean|source|repository"):
+        module.execute_build_plan(
+            plan,
+            apply=True,
+            runner=_ForbiddenRunner(),
+            repository_reader=_RepositoryReader(clean=False),
+        )
+
+
+def test_apply_holds_and_rehashes_build_inputs_before_push(tmp_path):
+    module = _load_script(BUILD_SCRIPT)
+    repository = tmp_path / "repository"
+    runtime = repository / "containers" / "aws-gpu"
+    runtime.mkdir(parents=True)
+    for source in (DOCKERFILE, REQUIREMENTS_LOCK, DOCKERIGNORE, INSPECT_SCRIPT):
+        shutil.copyfile(source, runtime / source.name)
+    plan = module.render_build_plan(
+        repository_uri=PRIVATE_REPOSITORY,
+        source_commit=SOURCE_COMMIT,
+        repository_root=repository,
+        docker_config=tmp_path / "docker",
+        repository_reader=_RepositoryReader(),
+    )
+
+    class MutatingRunner(_RecordingRunner):
+        def run(self, argv, *, environment):
+            output = super().run(argv, environment=environment)
+            if len(self.calls) == 1:
+                with (runtime / "requirements.lock").open("ab") as stream:
+                    stream.write(b"# post-build drift\n")
+            return output
+
+    runner = MutatingRunner(_apply_outputs("sha256:" + "9" * 64))
+    with pytest.raises(module.BuildPlanError, match="changed|drift|input"):
+        module.execute_build_plan(
+            plan,
+            apply=True,
+            runner=runner,
+            repository_reader=_RepositoryReader(),
+        )
+
+    assert len(runner.calls) == 1
+    assert "push" not in runner.calls[0][0]
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ["entrypoint", "local-facts", "final-facts", "final-image-id"],
+)
+def test_apply_rejects_unmeasured_or_changed_container_runtime(
+    tmp_path,
+    mutation,
+):
+    module = _load_script(BUILD_SCRIPT)
+    digest = "sha256:" + "9" * 64
+    outputs = _apply_outputs(digest)
+    if mutation == "entrypoint":
+        outputs[2] = _docker_inspect(
+            repo_digests=[],
+            entrypoint=["/unreviewed-entrypoint"],
+        )
+    elif mutation == "local-facts":
+        facts = dict(CONTAINER_FACTS)
+        facts["cuda"] = "12.9"
+        outputs[4] = _canonical(facts)
+    elif mutation == "final-facts":
+        facts = dict(CONTAINER_FACTS)
+        facts["pytorch"] = "2.9.1+cu130"
+        outputs[8] = _canonical(facts)
+    elif mutation == "final-image-id":
+        outputs[7] = _docker_inspect(
+            repo_digests=[f"{PRIVATE_REPOSITORY}@{digest}"],
+            image_id="sha256:" + "c" * 64,
+        )
+    else:
+        raise AssertionError(mutation)
+    plan = module.render_build_plan(
+        repository_uri=PRIVATE_REPOSITORY,
+        source_commit=SOURCE_COMMIT,
+        repository_root=ROOT,
+        docker_config=tmp_path / "docker",
+        repository_reader=_RepositoryReader(),
+    )
+
+    with pytest.raises(
+        module.BuildPlanError,
+        match="entrypoint|container|framework|fact|runtime",
+    ):
+        module.execute_build_plan(
+            plan,
+            apply=True,
+            runner=_RecordingRunner(outputs),
+            repository_reader=_RepositoryReader(),
+        )
 
 
 def test_build_plan_binds_inputs_and_rejects_post_plan_drift(tmp_path):
@@ -314,13 +737,14 @@ def test_build_plan_binds_inputs_and_rejects_post_plan_drift(tmp_path):
     repository = tmp_path / "repository"
     runtime = repository / "containers" / "aws-gpu"
     runtime.mkdir(parents=True)
-    for source in (DOCKERFILE, REQUIREMENTS_LOCK, DOCKERIGNORE):
+    for source in (DOCKERFILE, REQUIREMENTS_LOCK, DOCKERIGNORE, INSPECT_SCRIPT):
         shutil.copyfile(source, runtime / source.name)
     plan = module.render_build_plan(
         repository_uri=PRIVATE_REPOSITORY,
         source_commit=SOURCE_COMMIT,
         repository_root=repository,
         docker_config=tmp_path / "docker",
+        repository_reader=_RepositoryReader(),
     )
 
     assert plan["inputs"] == {
@@ -332,6 +756,9 @@ def test_build_plan_binds_inputs_and_rejects_post_plan_drift(tmp_path):
         ).hexdigest(),
         "dependency_lock_sha256": hashlib.sha256(
             (runtime / "requirements.lock").read_bytes()
+        ).hexdigest(),
+        "inspection_script_sha256": hashlib.sha256(
+            (runtime / "inspect_container.py").read_bytes()
         ).hexdigest(),
     }
 
@@ -365,6 +792,7 @@ def test_build_renderer_rejects_nonprivate_or_mutable_repository(repository, tmp
             source_commit=SOURCE_COMMIT,
             repository_root=ROOT,
             docker_config=tmp_path / "docker",
+            repository_reader=_RepositoryReader(),
         )
 
 
@@ -374,16 +802,19 @@ def test_runtime_lock_and_sbom_are_deterministic_and_parser_compatible():
     host = json.loads(host_bytes)
     dependency_bytes = REQUIREMENTS_LOCK.read_bytes()
     spec_bytes = _canonical(_runtime_spec())
+    image_binding_bytes = _canonical(_image_binding())
 
     first = module.produce_runtime_artifacts(
         spec_bytes=spec_bytes,
         host_candidate_bytes=host_bytes,
         dependency_lock_bytes=dependency_bytes,
+        image_binding_bytes=image_binding_bytes,
     )
     second = module.produce_runtime_artifacts(
         spec_bytes=spec_bytes,
         host_candidate_bytes=host_bytes,
         dependency_lock_bytes=dependency_bytes,
+        image_binding_bytes=image_binding_bytes,
     )
 
     assert first == second
@@ -429,41 +860,64 @@ def test_runtime_lock_and_sbom_are_deterministic_and_parser_compatible():
     }
     assert lock["ami_id"] == host["ami_id"]
     assert lock["ami_owner_id"] == host["ami_owner_id"]
-    assert lock["versions"] == _runtime_spec()["host_runtime_versions"]
+    assert lock["versions"] == {
+        **CONTAINER_FACTS,
+        **_runtime_spec()["host_runtime_versions"],
+    }
 
     sbom = json.loads(first.sbom_bytes)
     assert first.sbom_bytes == _canonical(sbom)
-    assert sbom["document_type"] == "memorysplit-aws-gpu-sbom-v1"
+    assert module.parse_runtime_sbom_bytes(first.sbom_bytes) == sbom
+    assert sbom["document_type"] == "memorysplit-aws-gpu-sbom-v2"
     assert sbom["runtime_lock_sha256"] == hashlib.sha256(
         first.runtime_lock_bytes
     ).hexdigest()
-    assert sbom["dependency_lock_sha256"] == hashlib.sha256(
+    assert sbom["project_dependency_lock"]["sha256"] == hashlib.sha256(
         dependency_bytes
     ).hexdigest()
     assert sbom["host"]["versions"]["cuda"] == "13.2"
     assert sbom["container"]["versions"]["cuda"] == "13.0"
-    assert sbom["host"]["versions"]["pytorch"] == "2.9.0+cu132"
-    assert sbom["container"]["versions"]["pytorch"] == "2.9.0+cu130"
     assert sbom["host"]["ami_id"] == "ami-0260c4d597dcc8641"
     assert sbom["container"]["base_image"] == BASE_IMAGE
+    assert sbom["container"]["base_image_digest"] == BASE_DIGEST
     assert sbom["container"]["image"] == lock["container_image"]
-    packages = sbom["python_packages"]
-    assert [item["name"] for item in packages] == sorted(
-        _locked_requirements(REQUIREMENTS_LOCK.read_text(encoding="utf-8"))
+    assert sbom["container"]["os_release"]["id"] == "ubuntu"
+    assert sbom["container"]["python"]["version"] == CONTAINER_FACTS["python"]
+    assert sbom["container"]["inherited_entrypoint"] == {
+        "entrypoint": ["/usr/local/bin/dlc-entrypoint"],
+        "command": ["bash"],
+    }
+    packages = sbom["container"]["installed_python_packages"]
+    assert sbom["container"]["inventory_method"] == (
+        "importlib.metadata.distributions"
     )
-    assert all(item["allowed_distribution_sha256"] for item in packages)
+    assert sbom["container"]["installed_distribution_count"] == len(packages)
+    assert "torch" in {item["name"] for item in packages}
+    assert set(_locked_requirements(REQUIREMENTS_LOCK.read_text())) < {
+        item["name"] for item in packages
+    }
     assert all(
-        re.fullmatch(r"[0-9a-f]{64}", digest)
+        item["archive_sha256"] is not None
         for item in packages
-        for digest in item["allowed_distribution_sha256"]
+        if item["name"] != "torch"
     )
+    assert sbom["container"]["inspection_artifact_sha256"] == hashlib.sha256(
+        _canonical(_inspection_artifact())
+    ).hexdigest()
+    assert "python_packages" not in sbom
+    open_sbom = copy.deepcopy(sbom)
+    open_sbom["unexpected"] = True
+    with pytest.raises(module.RuntimeArtifactError, match="schema|field|closed"):
+        module.parse_runtime_sbom_bytes(_canonical(open_sbom))
+    wrong_host_sbom = copy.deepcopy(sbom)
+    wrong_host_sbom["host"]["ami_id"] = "ami-0b39828e6910b0bb8"
+    with pytest.raises(module.RuntimeArtifactError, match="host|AMI|reviewed"):
+        module.parse_runtime_sbom_bytes(_canonical(wrong_host_sbom))
 
 
 @pytest.mark.parametrize(
     ("path", "value"),
     [
-        (("container", "versions", "python"), "latest"),
-        (("container", "versions", "pytorch"), "2.9.0+nightly20260724"),
         (("host_runtime_versions", "docker"), "28+rolling"),
         (("host_runtime_versions", "aws_cli"), "${AWS_PROFILE}"),
     ],
@@ -481,24 +935,63 @@ def test_runtime_producer_rejects_floating_or_environment_versions(path, value):
             spec_bytes=_canonical(spec),
             host_candidate_bytes=HOST_CANDIDATE.read_bytes(),
             dependency_lock_bytes=REQUIREMENTS_LOCK.read_bytes(),
+            image_binding_bytes=_canonical(_image_binding()),
+        )
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("python", "latest"),
+        ("pytorch", "2.9.0+nightly20260724"),
+    ],
+)
+def test_runtime_producer_rejects_unmeasured_container_version_claims(field, value):
+    module = _load_script(RUNTIME_LOCK_SCRIPT)
+    binding = _image_binding()
+    binding["inspection_artifact"]["container_facts"][field] = value
+    binding["inspection_artifact_sha256"] = hashlib.sha256(
+        _canonical(binding["inspection_artifact"])
+    ).hexdigest()
+
+    with pytest.raises(module.RuntimeArtifactError):
+        module.produce_runtime_artifacts(
+            spec_bytes=_canonical(_runtime_spec()),
+            host_candidate_bytes=HOST_CANDIDATE.read_bytes(),
+            dependency_lock_bytes=REQUIREMENTS_LOCK.read_bytes(),
+            image_binding_bytes=_canonical(binding),
         )
 
 
 def test_runtime_producer_rejects_open_schemas_mutable_images_and_fake_hashes():
     module = _load_script(RUNTIME_LOCK_SCRIPT)
-    cases: list[tuple[dict[str, object], bytes, bytes]] = []
+    cases: list[tuple[dict[str, object], bytes, bytes, dict[str, object]]] = []
 
     extra = _runtime_spec()
     extra["unexpected"] = True
-    cases.append((extra, HOST_CANDIDATE.read_bytes(), REQUIREMENTS_LOCK.read_bytes()))
+    cases.append(
+        (
+            extra,
+            HOST_CANDIDATE.read_bytes(),
+            REQUIREMENTS_LOCK.read_bytes(),
+            _image_binding(),
+        )
+    )
 
-    tagged = _runtime_spec()
-    tagged["container"]["image_binding"]["container_image"] = (
+    tagged = _image_binding()
+    tagged["container_image"] = (
         PRIVATE_REPOSITORY
         + ":latest@"
-        + tagged["container"]["image_binding"]["container_image_digest"]
+        + tagged["container_image_digest"]
     )
-    cases.append((tagged, HOST_CANDIDATE.read_bytes(), REQUIREMENTS_LOCK.read_bytes()))
+    cases.append(
+        (
+            _runtime_spec(),
+            HOST_CANDIDATE.read_bytes(),
+            REQUIREMENTS_LOCK.read_bytes(),
+            tagged,
+        )
+    )
 
     changed_host = json.loads(HOST_CANDIDATE.read_bytes())
     changed_host["versions"]["nvidia_driver"] = "579.99"
@@ -507,18 +1000,47 @@ def test_runtime_producer_rejects_open_schemas_mutable_images_and_fake_hashes():
             _runtime_spec(),
             _canonical(changed_host),
             REQUIREMENTS_LOCK.read_bytes(),
+            _image_binding(),
         )
     )
 
     unhashed = b"numpy==2.3.2\n"
-    cases.append((_runtime_spec(), HOST_CANDIDATE.read_bytes(), unhashed))
+    cases.append(
+        (
+            _runtime_spec(),
+            HOST_CANDIDATE.read_bytes(),
+            unhashed,
+            _image_binding(),
+        )
+    )
 
-    for spec, host_bytes, dependency_bytes in cases:
+    dependency_only = _image_binding()
+    dependency_only["inspection_artifact"]["installed_python_packages"] = [
+        package
+        for package in dependency_only["inspection_artifact"][
+            "installed_python_packages"
+        ]
+        if package["name"] != "torch"
+    ]
+    dependency_only["inspection_artifact_sha256"] = hashlib.sha256(
+        _canonical(dependency_only["inspection_artifact"])
+    ).hexdigest()
+    cases.append(
+        (
+            _runtime_spec(),
+            HOST_CANDIDATE.read_bytes(),
+            REQUIREMENTS_LOCK.read_bytes(),
+            dependency_only,
+        )
+    )
+
+    for spec, host_bytes, dependency_bytes, binding in cases:
         with pytest.raises(module.RuntimeArtifactError):
             module.produce_runtime_artifacts(
                 spec_bytes=_canonical(spec),
                 host_candidate_bytes=host_bytes,
                 dependency_lock_bytes=dependency_bytes,
+                image_binding_bytes=_canonical(binding),
             )
 
 
@@ -539,6 +1061,7 @@ def test_operator_clis_default_to_offline_dry_run(
             str(tmp_path / "docker"),
         ],
         runner=_ForbiddenRunner(),
+        repository_reader=_RepositoryReader(),
     )
     build_output = json.loads(capsys.readouterr().out)
 
@@ -549,6 +1072,8 @@ def test_operator_clis_default_to_offline_dry_run(
     runtime_module = _load_script(RUNTIME_LOCK_SCRIPT)
     runtime_input = tmp_path / "runtime-input.json"
     runtime_input.write_bytes(_canonical(_runtime_spec()))
+    image_binding = tmp_path / "image-binding.json"
+    image_binding.write_bytes(_canonical(_image_binding()))
     lock_output = tmp_path / "runtime-lock.json"
     sbom_output = tmp_path / "sbom.json"
     runtime_status = runtime_module.main(
@@ -559,6 +1084,8 @@ def test_operator_clis_default_to_offline_dry_run(
             str(HOST_CANDIDATE),
             "--dependency-lock",
             str(REQUIREMENTS_LOCK),
+            "--image-binding",
+            str(image_binding),
             "--runtime-lock-out",
             str(lock_output),
             "--sbom-out",
@@ -579,6 +1106,7 @@ def test_operator_tree_contains_no_embedded_secret_or_network_fetcher():
         REQUIREMENTS_INPUT,
         BUILD_SCRIPT,
         RUNTIME_LOCK_SCRIPT,
+        INSPECT_SCRIPT,
         HOST_CANDIDATE,
     ]
     combined = "\n".join(
@@ -605,6 +1133,8 @@ def test_runtime_apply_rejects_identical_outputs_before_any_write(
     module = _load_script(RUNTIME_LOCK_SCRIPT)
     runtime_input = tmp_path / "runtime-input.json"
     runtime_input.write_bytes(_canonical(_runtime_spec()))
+    image_binding = tmp_path / "image-binding.json"
+    image_binding.write_bytes(_canonical(_image_binding()))
     output = tmp_path / "artifact.json"
     writes: list[tuple[object, bytes]] = []
 
@@ -620,6 +1150,8 @@ def test_runtime_apply_rejects_identical_outputs_before_any_write(
             str(HOST_CANDIDATE),
             "--dependency-lock",
             str(REQUIREMENTS_LOCK),
+            "--image-binding",
+            str(image_binding),
             "--runtime-lock-out",
             str(output),
             "--sbom-out",

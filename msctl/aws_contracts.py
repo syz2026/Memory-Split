@@ -63,6 +63,32 @@ AWS_ENVIRONMENT_RECEIPT_V2_FIELDS: Final = (
     "boot_id",
     "runtime_facts",
 )
+AWS_GPU_ATTESTATION_EVIDENCE_V1_FIELDS: Final = (
+    "schema_version",
+    "evidence_type",
+    "profile_id",
+    "provider",
+    "profile_sha256",
+    "runtime_lock_sha256",
+    "control_bundle_sha256",
+    "source_commit",
+    "source_tree",
+    "container_image",
+    "container_image_digest",
+    "ami_id",
+    "ami_owner_id",
+    "instance_type",
+    "gpu_model",
+    "gpu_count",
+    "host_facts",
+    "container_facts",
+    "aws_instance_identity_document",
+    "aws_instance_identity_pkcs7",
+    "account_id",
+    "instance_id",
+    "region",
+    "boot_id",
+)
 
 EXPECTED_CONFIG_PATHS: Final = tuple(
     f"{CONFIG_ROOT}/{arm}-s{seed}.yaml"
@@ -211,6 +237,7 @@ def checkpoint_receipt_key(seed: object, sha256: object) -> str:
 __all__ = [
     "ARMS",
     "AWS_ENVIRONMENT_RECEIPT_V2_FIELDS",
+    "AWS_GPU_ATTESTATION_EVIDENCE_V1_FIELDS",
     "AWS_RUNTIME_LOCK_FIELDS",
     "AWS_RUNTIME_VERSION_FIELDS",
     "COHORT_ASSIGNMENT_PATH",

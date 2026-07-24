@@ -19,13 +19,16 @@ RUN groupadd --gid 10001 memorysplit \
         --shell /usr/sbin/nologin --uid 10001 memorysplit
 
 COPY containers/aws-gpu/requirements.lock /opt/memorysplit/requirements.lock
+COPY containers/aws-gpu/inspect_container.py /opt/memorysplit/inspect_container.py
 
 RUN python -m pip install \
         --disable-pip-version-check \
+        --force-reinstall \
         --no-cache-dir \
         --no-compile \
         --no-deps \
         --only-binary=:all: \
+        --report=/opt/memorysplit/project-install-report.json \
         --require-hashes \
         --requirement /opt/memorysplit/requirements.lock \
     && python -c "import torch; assert torch.__version__.split('+', 1)[0] == '2.9.0'"

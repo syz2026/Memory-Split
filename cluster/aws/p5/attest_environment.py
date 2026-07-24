@@ -28,6 +28,7 @@ from cluster.aws.p5.profile import (
 )
 from msctl.aws_contracts import (
     AWS_ENVIRONMENT_RECEIPT_V2_FIELDS,
+    AWS_GPU_ATTESTATION_EVIDENCE_V1_FIELDS,
     AWS_RUNTIME_LOCK_FIELDS,
     AWS_RUNTIME_VERSION_FIELDS,
     validate_digest_pinned_oci_image,
@@ -37,6 +38,7 @@ from msctl.aws_contracts import (
 PROVIDER = "aws-p5.48xlarge"
 PROFILE_ID = PROFILE_ID_V3
 RECEIPT_TYPE = "memorysplit-aws-environment-v2"
+GPU_EVIDENCE_TYPE = "memorysplit-aws-gpu-attestation-v1"
 IMDS_DOCUMENT_PATH = "/latest/dynamic/instance-identity/document"
 IMDS_PKCS7_PATH = "/latest/dynamic/instance-identity/pkcs7"
 TRUSTED_PYTHON_BINARY = "/usr/bin/python3"
@@ -113,9 +115,52 @@ VERSION_COMMANDS = {
 }
 if tuple(VERSION_COMMANDS) != AWS_RUNTIME_VERSION_FIELDS:
     raise RuntimeError("runtime command fields differ from the shared AWS contract")
+SELECTED_HOST_VERSION_COMMANDS = {
+    "cuda": ("/usr/local/cuda/bin/nvcc", "--version"),
+    "nvidia_driver": VERSION_COMMANDS["nvidia_driver"],
+    "fabric_manager": VERSION_COMMANDS["fabric_manager"],
+    "docker": VERSION_COMMANDS["docker"],
+    "nvidia_container_runtime": VERSION_COMMANDS["nvidia_container_runtime"],
+    "aws_cli": VERSION_COMMANDS["aws_cli"],
+    "kernel": ("/usr/bin/uname", "--kernel-release"),
+    "efa": ("/usr/bin/cat", "/opt/amazon/efa_installed_packages"),
+    "ofi_nccl": (
+        "/usr/bin/strings",
+        "/opt/amazon/ofi-nccl/lib/libnccl-net.so",
+    ),
+}
+_CONTAINER_FACT_FIELDS = {"python", "pytorch", "cuda", "cudnn", "nccl"}
+_SELECTED_HOST_FACT_FIELDS = set(SELECTED_HOST_VERSION_COMMANDS)
+_P6_PROFILE_ID = "aws-p6-b300.48xlarge-v3"
+_P6_PROVIDER = "aws-p6-b300.48xlarge"
+_P6_INSTANCE_TYPE = "p6-b300.48xlarge"
+_P6_GPU_MODEL = "NVIDIA B300"
+_P6_AMI_ID = "ami-0260c4d597dcc8641"
+_P6_AMI_OWNER_ID = "898082745236"
+_UNSUPPORTED_P6_FRAMEWORK_AMI = "ami-0b39828e6910b0bb8"
+_P6_FLOORS = {
+    "cuda": "13.0",
+    "nvidia_driver": "580.0",
+    "kernel": "6.1",
+    "efa": "1.44.0",
+    "ofi_nccl": "1.17.1",
+}
+_CONTAINER_FACT_SCRIPT = (
+    "import json,platform,torch;"
+    "v=torch.cuda.nccl.version();"
+    "n='.'.join(map(str,v)) if isinstance(v,tuple) else str(v or '');"
+    "print(json.dumps({"
+    "'cuda':str(torch.version.cuda or ''),"
+    "'cudnn':str(torch.backends.cudnn.version() or ''),"
+    "'nccl':n,"
+    "'python':platform.python_version(),"
+    "'pytorch':str(torch.__version__)"
+    "},sort_keys=True,separators=(',',':')))"
+)
 
 _LOCK_FIELDS = set(AWS_RUNTIME_LOCK_FIELDS)
 _RECEIPT_FIELDS = set(AWS_ENVIRONMENT_RECEIPT_V2_FIELDS)
+_GPU_EVIDENCE_FIELDS = set(AWS_GPU_ATTESTATION_EVIDENCE_V1_FIELDS)
 _VERSION_FIELDS = set(AWS_RUNTIME_VERSION_FIELDS)
 _IDENTITY_REQUIRED_FIELDS = {
     "accountId",
@@ -191,6 +236,14 @@ def canonical_receipt(receipt: Mapping[str, object]) -> bytes:
     if set(receipt) != _RECEIPT_FIELDS:
         raise AttestationError("environment receipt fields do not match schema v2")
     return _canonical_json(dict(receipt)) + b"\n"
+
+
+def canonical_gpu_evidence(evidence: Mapping[str, object]) -> bytes:
+    """Serialize closed profile-aware GPU evidence without changing legacy v2."""
+
+    if set(evidence) != _GPU_EVIDENCE_FIELDS:
+        raise AttestationError("GPU attestation evidence fields do not match schema v1")
+    return _canonical_json(dict(evidence)) + b"\n"
 
 
 def _strict_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
@@ -440,7 +493,11 @@ def parse_runtime_lock_bytes(data: bytes) -> dict[str, object]:
     return _validate_runtime_lock(data)
 
 
-def _validate_identity(data: bytes) -> dict[str, object]:
+def _validate_identity(
+    data: bytes,
+    *,
+    expected_instance_type: str = "p5.48xlarge",
+) -> dict[str, object]:
     identity = _decode_json(data, label="AWS instance identity document")
     fields = set(identity)
     if (
@@ -475,7 +532,7 @@ def _validate_identity(data: bytes) -> dict[str, object]:
         raise AttestationError("AWS instance private IP is not private IPv4")
     if (
         "instanceType" in identity
-        and identity["instanceType"] != "p5.48xlarge"
+        and identity["instanceType"] != expected_instance_type
     ):
         raise AttestationError("AWS instance identity has the wrong instance type")
     if (
@@ -630,6 +687,46 @@ def container_inspect_argv(image: str) -> tuple[str, ...]:
     )
 
 
+def container_facts_argv(image: str) -> tuple[str, ...]:
+    """Measure framework facts inside the exact local image without networking."""
+
+    return (
+        "/usr/bin/docker",
+        "run",
+        "--rm",
+        "--network",
+        "none",
+        "--pull",
+        "never",
+        "--gpus",
+        "all",
+        "--read-only",
+        "--env",
+        "PYTHONDONTWRITEBYTECODE=1",
+        "--env",
+        "PYTHONNOUSERSITE=1",
+        "--workdir",
+        "/",
+        "--entrypoint",
+        "/usr/bin/python3",
+        image,
+        "-I",
+        "-P",
+        "-c",
+        _CONTAINER_FACT_SCRIPT,
+    )
+
+
+def gpu_names_argv() -> tuple[str, ...]:
+    """Measure every locally visible GPU product name on the host."""
+
+    return (
+        "/usr/bin/nvidia-smi",
+        "--query-gpu=name",
+        "--format=csv,noheader,nounits",
+    )
+
+
 class UrllibImdsReader:
     """Minimal IMDSv2 reader with no ambient proxy or credential behavior."""
 
@@ -768,6 +865,326 @@ def _runtime_facts(command_reader: object, lock: Mapping[str, object]) -> dict[s
     if facts != lock["versions"]:
         raise AttestationError("runtime versions drift from the runtime lock")
     return facts
+
+
+def _selected_host_version(field: str, data: bytes) -> str:
+    if field in {
+        "nvidia_driver",
+        "fabric_manager",
+        "docker",
+        "nvidia_container_runtime",
+        "aws_cli",
+    }:
+        return _command_version(field, data)
+    try:
+        text = data.decode("utf-8", errors="strict")
+    except UnicodeDecodeError as error:
+        raise AttestationError(f"host {field} version is not UTF-8") from error
+    if field == "cuda":
+        match = re.search(r"\brelease\s+([0-9]+(?:\.[0-9]+)+)\b", text, re.I)
+        if match is None:
+            match = re.search(r"\b([0-9]+(?:\.[0-9]+)+)\b", text)
+    elif field == "efa":
+        match = re.search(
+            r"#\s*EFA installer version:\s*([0-9]+(?:\.[0-9]+)+)",
+            text,
+            re.I,
+        )
+        if match is None:
+            match = re.search(r"\b([0-9]+(?:\.[0-9]+)+)\b", text)
+    elif field == "ofi_nccl":
+        match = re.search(
+            r"aws-ofi-nccl\s+([0-9]+(?:\.[0-9]+)+)",
+            text,
+            re.I,
+        )
+        if match is None:
+            match = re.search(r"\b([0-9]+(?:\.[0-9]+)+)\b", text)
+    else:
+        match = re.search(r"\b([0-9]+(?:\.[0-9]+)+(?:[-+._][0-9]+)*)\b", text)
+    if match is None:
+        raise AttestationError(f"host {field} command returned no fixed version")
+    return _fixed_version(match.group(1), label=f"host {field}")
+
+
+def _version_tuple(value: object, *, label: str) -> tuple[int, ...]:
+    if not isinstance(value, str):
+        raise AttestationError(f"{label} is not a measured version")
+    match = re.match(r"^([0-9]+(?:\.[0-9]+)*)", value)
+    if match is None:
+        raise AttestationError(f"{label} is not a numeric measured version")
+    return tuple(int(part) for part in match.group(1).split("."))
+
+
+def _require_floor(actual: object, minimum: str, *, label: str) -> None:
+    measured = _version_tuple(actual, label=label)
+    floor = _version_tuple(minimum, label=f"{label} floor")
+    width = max(len(measured), len(floor))
+    if measured + (0,) * (width - len(measured)) < floor + (0,) * (
+        width - len(floor)
+    ):
+        raise AttestationError(f"{label} is below the official P6-B300 floor")
+
+
+def _selected_profile_values(profile: object) -> dict[str, object]:
+    fields = {
+        name: getattr(profile, name, None)
+        for name in (
+            "profile_id",
+            "provider",
+            "instance_type",
+            "gpu_model",
+            "allocated_gpus",
+            "sha256",
+        )
+    }
+    profile_id = fields["profile_id"]
+    expected = {
+        "aws-p5.48xlarge-v3": (
+            "aws-p5.48xlarge",
+            "p5.48xlarge",
+            "NVIDIA H100 80GB",
+        ),
+        _P6_PROFILE_ID: (
+            _P6_PROVIDER,
+            _P6_INSTANCE_TYPE,
+            _P6_GPU_MODEL,
+        ),
+    }.get(profile_id)
+    if (
+        expected is None
+        or tuple(
+            fields[name] for name in ("provider", "instance_type", "gpu_model")
+        )
+        != expected
+        or type(fields["allocated_gpus"]) is not int
+        or fields["allocated_gpus"] != 8
+        or getattr(profile, "architecture", "x86_64") != "x86_64"
+        or not isinstance(fields["sha256"], str)
+        or _SHA256_RE.fullmatch(fields["sha256"]) is None
+    ):
+        raise AttestationError("selected GPU profile identity is not supported")
+    if profile_id == _P6_PROFILE_ID:
+        supplied_floors = dict(getattr(profile, "software_floors", ()))
+        expected_floors = {
+            "cuda": "13.0",
+            "efa": "1.44.0",
+            "kernel": "6.1",
+            "nvidia_driver": "R580",
+            "ofi_nccl": "1.17.1",
+        }
+        if any(
+            supplied_floors.get(name) != value
+            for name, value in expected_floors.items()
+        ):
+            raise AttestationError(
+                "selected P6-B300 profile changes an official software floor"
+            )
+    return fields
+
+
+def _run_selected_command(
+    run: object,
+    argv: Sequence[str],
+    *,
+    label: str,
+) -> bytes:
+    try:
+        return run(argv, environment=MINIMAL_COMMAND_ENVIRONMENT)
+    except AttestationError:
+        raise
+    except Exception as error:
+        raise AttestationError(f"{label} command failed") from error
+
+
+def _selected_runtime_facts(
+    command_reader: object,
+    lock: Mapping[str, object],
+    profile: Mapping[str, object],
+) -> tuple[dict[str, str], dict[str, str]]:
+    run = getattr(command_reader, "run", None)
+    if not callable(run):
+        raise AttestationError("selected GPU command reader is unavailable")
+    host_facts: dict[str, str] = {}
+    for field, argv in SELECTED_HOST_VERSION_COMMANDS.items():
+        output = _run_selected_command(run, argv, label=f"host {field}")
+        host_facts[field] = _selected_host_version(field, output)
+
+    names_output = _run_selected_command(
+        run,
+        gpu_names_argv(),
+        label="host GPU identity",
+    )
+    try:
+        gpu_names = [
+            line.strip()
+            for line in names_output.decode("utf-8", errors="strict").splitlines()
+            if line.strip()
+        ]
+    except UnicodeDecodeError as error:
+        raise AttestationError("GPU identity output is not UTF-8") from error
+    if (
+        len(gpu_names) != profile["allocated_gpus"]
+        or any(name != profile["gpu_model"] for name in gpu_names)
+    ):
+        raise AttestationError("measured GPU identity differs from selected profile")
+
+    image = str(lock["container_image"])
+    inspect_output = _run_selected_command(
+        run,
+        container_inspect_argv(image),
+        label="local digest-pinned container inspection",
+    )
+    try:
+        repo_digests = json.loads(inspect_output.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise AttestationError("local container digest inspection is invalid") from error
+    if (
+        not isinstance(repo_digests, list)
+        or image not in repo_digests
+        or any(not isinstance(item, str) for item in repo_digests)
+    ):
+        raise AttestationError("exact digest-pinned container is not present locally")
+
+    container_output = _run_selected_command(
+        run,
+        container_facts_argv(image),
+        label="digest-pinned container framework measurement",
+    )
+    container_facts = _decode_json(container_output, label="container facts")
+    if (
+        container_output != _canonical_json(container_facts) + b"\n"
+        or set(container_facts) != _CONTAINER_FACT_FIELDS
+    ):
+        raise AttestationError("container facts do not match the closed schema")
+    normalized_container = {
+        field: _fixed_version(
+            container_facts[field],
+            label=f"container facts.{field}",
+        )
+        for field in sorted(_CONTAINER_FACT_FIELDS)
+    }
+    if profile["profile_id"] == _P6_PROFILE_ID:
+        for field, minimum in _P6_FLOORS.items():
+            _require_floor(
+                host_facts[field],
+                minimum,
+                label=f"P6-B300 host {field}",
+            )
+    expected_lock_versions = {
+        **normalized_container,
+        "nvidia_driver": host_facts["nvidia_driver"],
+        "fabric_manager": host_facts["fabric_manager"],
+        "docker": host_facts["docker"],
+        "nvidia_container_runtime": host_facts["nvidia_container_runtime"],
+        "aws_cli": host_facts["aws_cli"],
+    }
+    if expected_lock_versions != lock["versions"]:
+        raise AttestationError(
+            "measured host/container versions drift from the runtime lock"
+        )
+    return host_facts, normalized_container
+
+
+def parse_gpu_evidence_bytes(data: bytes) -> dict[str, object]:
+    """Parse canonical profile-aware evidence without accepting it as legacy v2."""
+
+    evidence = _decode_json(data, label="GPU attestation evidence")
+    if data != canonical_gpu_evidence(evidence):
+        raise AttestationError(
+            "GPU attestation evidence must use canonical JSON plus one newline"
+        )
+    if (
+        type(evidence.get("schema_version")) is not int
+        or evidence["schema_version"] != 1
+        or evidence.get("evidence_type") != GPU_EVIDENCE_TYPE
+        or evidence.get("profile_id")
+        not in {"aws-p5.48xlarge-v3", _P6_PROFILE_ID}
+    ):
+        raise AttestationError("GPU attestation evidence identity is invalid")
+    for field in (
+        "profile_sha256",
+        "runtime_lock_sha256",
+        "control_bundle_sha256",
+    ):
+        _sha256(evidence[field], label=f"GPU evidence {field}")
+    for field in ("source_commit", "source_tree"):
+        if (
+            not isinstance(evidence[field], str)
+            or _SHA1_RE.fullmatch(evidence[field]) is None
+        ):
+            raise AttestationError(f"GPU evidence {field} is invalid")
+    _validate_image(
+        evidence["container_image"],
+        evidence["container_image_digest"],
+    )
+    host_facts = evidence["host_facts"]
+    container_facts = evidence["container_facts"]
+    if (
+        not isinstance(host_facts, dict)
+        or set(host_facts) != _SELECTED_HOST_FACT_FIELDS
+        or not isinstance(container_facts, dict)
+        or set(container_facts) != _CONTAINER_FACT_FIELDS
+    ):
+        raise AttestationError("GPU evidence fact fields do not match schema")
+    for field, value in host_facts.items():
+        _fixed_version(value, label=f"GPU evidence host_facts.{field}")
+    for field, value in container_facts.items():
+        _fixed_version(value, label=f"GPU evidence container_facts.{field}")
+    expected_instance = (
+        _P6_INSTANCE_TYPE
+        if evidence["profile_id"] == _P6_PROFILE_ID
+        else "p5.48xlarge"
+    )
+    identity_value = evidence["aws_instance_identity_document"]
+    if not isinstance(identity_value, dict):
+        raise AttestationError("GPU evidence identity document must be an object")
+    identity = _validate_identity(
+        _canonical_json(identity_value),
+        expected_instance_type=expected_instance,
+    )
+    if (
+        evidence["instance_type"] != expected_instance
+        or identity.get("instanceType") != expected_instance
+        or evidence["account_id"] != identity["accountId"]
+        or evidence["instance_id"] != identity["instanceId"]
+        or evidence["region"] != identity["region"]
+        or evidence["ami_id"] != identity["imageId"]
+        or evidence["gpu_count"] != 8
+    ):
+        raise AttestationError("GPU evidence duplicated identities are inconsistent")
+    expected_profile = {
+        "aws-p5.48xlarge-v3": (
+            "aws-p5.48xlarge",
+            "NVIDIA H100 80GB",
+        ),
+        _P6_PROFILE_ID: (_P6_PROVIDER, _P6_GPU_MODEL),
+    }[evidence["profile_id"]]
+    if (
+        (evidence["provider"], evidence["gpu_model"]) != expected_profile
+        or not isinstance(evidence["ami_owner_id"], str)
+        or re.fullmatch(r"[0-9]{12}", evidence["ami_owner_id"]) is None
+    ):
+        raise AttestationError("GPU evidence profile identity is inconsistent")
+    if evidence["profile_id"] == _P6_PROFILE_ID:
+        if (
+            evidence["ami_id"] != _P6_AMI_ID
+            or evidence["ami_owner_id"] != _P6_AMI_OWNER_ID
+        ):
+            raise AttestationError("GPU evidence is not the supported P6-B300 tuple")
+        for field, minimum in _P6_FLOORS.items():
+            _require_floor(
+                host_facts[field],
+                minimum,
+                label=f"P6-B300 host {field}",
+            )
+    boot_id = evidence["boot_id"]
+    if not isinstance(boot_id, str) or _UUID_RE.fullmatch(boot_id) is None:
+        raise AttestationError("GPU evidence boot ID is invalid")
+    pkcs7 = evidence["aws_instance_identity_pkcs7"]
+    if not isinstance(pkcs7, str) or _canonical_pkcs7(pkcs7.encode("ascii")) != pkcs7:
+        raise AttestationError("GPU evidence PKCS7 is invalid")
+    return evidence
 
 
 def _open_or_create_output_directory(path: Path | str) -> int:
@@ -999,6 +1416,119 @@ def attest_environment(
     if apply:
         _publish_receipt(output_path, payload)
     return receipt
+
+
+attest_legacy_p5_environment = attest_environment
+
+
+def attest_selected_gpu_environment(
+    *,
+    selected_profile: object,
+    runtime_lock_path: Path | str,
+    control_bundle_path: Path | str,
+    output_path: Path | str,
+    apply: bool,
+    imds_reader: object | None = None,
+    command_reader: object | None = None,
+    boot_id_path: Path | str = "/proc/sys/kernel/random/boot_id",
+) -> dict[str, object]:
+    """Attest a selected P5/P6 tuple while keeping legacy receipt v2 unchanged."""
+
+    profile = _selected_profile_values(selected_profile)
+    lock_data = _read_regular(runtime_lock_path, label="runtime lock")
+    lock = parse_runtime_lock_bytes(lock_data)
+    control_data = _read_regular(control_bundle_path, label="control bundle")
+    control_sha256 = hashlib.sha256(control_data).hexdigest()
+    if (
+        lock["profile_sha256"] != profile["sha256"]
+        or lock["control_bundle_sha256"] != control_sha256
+    ):
+        raise AttestationError(
+            "selected profile or control bundle does not match runtime lock"
+        )
+    if profile["profile_id"] == _P6_PROFILE_ID and (
+        lock["ami_id"] == _UNSUPPORTED_P6_FRAMEWORK_AMI
+        or lock["ami_id"] != _P6_AMI_ID
+        or lock["ami_owner_id"] != _P6_AMI_OWNER_ID
+    ):
+        raise AttestationError(
+            "P6-B300 requires the officially supported immutable Base DLAMI"
+        )
+
+    imds = imds_reader or UrllibImdsReader()
+    token_reader = getattr(imds, "token", None)
+    metadata_reader = getattr(imds, "read", None)
+    if not callable(token_reader) or not callable(metadata_reader):
+        raise AttestationError("IMDSv2 reader is unavailable")
+    token = token_reader()
+    if not isinstance(token, str) or not token:
+        raise AttestationError("IMDSv2 token is invalid")
+    identity = _validate_identity(
+        metadata_reader(IMDS_DOCUMENT_PATH, token=token),
+        expected_instance_type=str(profile["instance_type"]),
+    )
+    if identity.get("instanceType") != profile["instance_type"]:
+        raise AttestationError(
+            "authenticated instance type does not match selected GPU profile"
+        )
+    pkcs7 = _canonical_pkcs7(metadata_reader(IMDS_PKCS7_PATH, token=token))
+    if (
+        identity["imageId"] != lock["ami_id"]
+        or identity["architecture"] != "x86_64"
+    ):
+        raise AttestationError(
+            "authenticated instance identity differs from selected GPU runtime"
+        )
+
+    boot_data = _read_regular(
+        boot_id_path,
+        label="kernel boot ID",
+        maximum_bytes=128,
+    )
+    try:
+        boot_id = boot_data.decode("ascii").strip()
+    except UnicodeDecodeError as error:
+        raise AttestationError("kernel boot ID is not ASCII") from error
+    if _UUID_RE.fullmatch(boot_id) is None:
+        raise AttestationError("kernel boot ID is not a lowercase UUID")
+
+    host_facts, container_facts = _selected_runtime_facts(
+        command_reader or SubprocessCommandReader(),
+        lock,
+        profile,
+    )
+    evidence: dict[str, object] = {
+        "schema_version": 1,
+        "evidence_type": GPU_EVIDENCE_TYPE,
+        "profile_id": profile["profile_id"],
+        "provider": profile["provider"],
+        "profile_sha256": profile["sha256"],
+        "runtime_lock_sha256": hashlib.sha256(lock_data).hexdigest(),
+        "control_bundle_sha256": control_sha256,
+        "source_commit": lock["source_commit"],
+        "source_tree": lock["source_tree"],
+        "container_image": lock["container_image"],
+        "container_image_digest": lock["container_image_digest"],
+        "ami_id": lock["ami_id"],
+        "ami_owner_id": lock["ami_owner_id"],
+        "instance_type": profile["instance_type"],
+        "gpu_model": profile["gpu_model"],
+        "gpu_count": profile["allocated_gpus"],
+        "host_facts": host_facts,
+        "container_facts": container_facts,
+        "aws_instance_identity_document": identity,
+        "aws_instance_identity_pkcs7": pkcs7,
+        "account_id": identity["accountId"],
+        "instance_id": identity["instanceId"],
+        "region": identity["region"],
+        "boot_id": boot_id,
+    }
+    payload = canonical_gpu_evidence(evidence)
+    if parse_gpu_evidence_bytes(payload) != evidence:
+        raise AttestationError("GPU evidence did not survive closed-schema parsing")
+    if apply:
+        _publish_receipt(output_path, payload)
+    return evidence
 
 
 def _parser() -> argparse.ArgumentParser:
