@@ -2846,3 +2846,173 @@ def test_repeated_original_state_exhaustion_refreshes_marker(
     )
     assert len(quarantines) == 1
     assert quarantines[0].stat().st_ino == candidate_inode
+
+
+def test_repeated_fresh_marker_bind_failures_keep_resources_bounded(
+    archive_authority: _AuthorityFixture,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    output_root = tmp_path / "derived"
+    candidate_inode: int | None = None
+    final_name: str | None = None
+    bind_failures = 4
+    fresh_checks = 0
+    fresh_bind_succeeded = False
+    close_failure_injected = False
+    allocation_records: list[
+        tuple[int, wikidata_source_module._CreationIdentity]
+    ] = []
+    failed_fresh: dict[
+        int,
+        wikidata_source_module._CreationIdentity,
+    ] = {}
+    observations: list[tuple[int, int]] = []
+    original_allocate = wikidata_source_module._allocate_quarantine_marker
+    original_check = wikidata_source_module._check_named_derived_directory
+    original_exchange = wikidata_source_module._atomic_exchange_directories
+    real_close = os.close
+
+    def marker_is_open(
+        descriptor: int,
+        identity: wikidata_source_module._CreationIdentity,
+    ) -> bool:
+        try:
+            metadata = os.fstat(descriptor)
+        except OSError:
+            return False
+        return (
+            wikidata_source_module._creation_identity(metadata)
+            == identity
+        )
+
+    def record_allocation(namespace_fd, published_name):
+        marker = original_allocate(namespace_fd, published_name)
+        allocation_records.append((marker.descriptor, marker.identity))
+        return marker
+
+    def fail_fresh_bind(
+        parent_fd,
+        name,
+        descriptor,
+        identity,
+        description,
+    ):
+        nonlocal fresh_checks, fresh_bind_succeeded
+        if description == "fresh quarantine marker":
+            fresh_checks += 1
+            if fresh_checks <= bind_failures:
+                failed_fresh[descriptor] = identity
+                raise ValueError(
+                    f"injected fresh marker bind failure {fresh_checks}"
+                )
+            fresh_bind_succeeded = True
+        return original_check(
+            parent_fd,
+            name,
+            descriptor,
+            identity,
+            description,
+        )
+
+    def injected_close(descriptor):
+        nonlocal close_failure_injected
+        inject = (
+            not close_failure_injected
+            and descriptor in failed_fresh
+            and marker_is_open(descriptor, failed_fresh[descriptor])
+        )
+        real_close(descriptor)
+        if inject:
+            close_failure_injected = True
+            raise OSError("injected fresh marker close failure")
+
+    def repeat_until_fresh_marker(directory_fd, first_name, second_name):
+        if (
+            0 < fresh_checks <= bind_failures
+            and len(observations) < fresh_checks
+        ):
+            namespace = output_root / "wikidata"
+            open_markers = sum(
+                marker_is_open(descriptor, identity)
+                for descriptor, identity in allocation_records
+            )
+            named_markers = sum(
+                path.name.startswith(".quarantine-")
+                for path in namespace.iterdir()
+            )
+            observations.append((open_markers, named_markers))
+        original_exchange(directory_fd, first_name, second_name)
+        if not fresh_bind_succeeded:
+            original_exchange(directory_fd, first_name, second_name)
+
+    def fail_after_publish(phase, _authority, receipt_sha256):
+        nonlocal candidate_inode, final_name
+        if phase != "before_postpublish_verify":
+            return
+        final_name = receipt_sha256
+        candidate_inode = (
+            output_root / "wikidata" / receipt_sha256
+        ).stat().st_ino
+        raise RuntimeError("forced fresh-marker stress failure")
+
+    monkeypatch.setattr(
+        wikidata_source_module,
+        "_allocate_quarantine_marker",
+        record_allocation,
+    )
+    monkeypatch.setattr(
+        wikidata_source_module,
+        "_check_named_derived_directory",
+        fail_fresh_bind,
+    )
+    monkeypatch.setattr(
+        wikidata_source_module,
+        "_close_descriptor",
+        injected_close,
+    )
+    monkeypatch.setattr(
+        wikidata_source_module,
+        "_atomic_exchange_directories",
+        repeat_until_fresh_marker,
+    )
+    monkeypatch.setattr(
+        wikidata_source_module,
+        "_derived_view_build_hook",
+        fail_after_publish,
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match="forced fresh-marker stress failure",
+    ) as raised:
+        _build_view(archive_authority, output_root)
+
+    assert fresh_bind_succeeded
+    assert fresh_checks == bind_failures + 1
+    assert observations == [(1, 1)] * bind_failures
+    assert close_failure_injected
+    notes = getattr(raised.value, "__notes__", ())
+    assert any(
+        "injected fresh marker bind failure 1" in note
+        for note in notes
+    )
+    assert all(
+        "fresh marker close failure" not in note
+        for note in notes
+    )
+    assert not any(
+        marker_is_open(descriptor, identity)
+        for descriptor, identity in allocation_records
+    )
+    assert final_name is not None
+    namespace = output_root / "wikidata"
+    final = namespace / final_name
+    assert not final.exists() or final.stat().st_ino != candidate_inode
+    quarantines = tuple(
+        path
+        for path in namespace.iterdir()
+        if path.name.startswith(".quarantine-")
+    )
+    assert len(quarantines) == 1
+    assert quarantines[0].stat().st_ino == candidate_inode

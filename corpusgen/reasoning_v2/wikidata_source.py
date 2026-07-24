@@ -4662,16 +4662,28 @@ def _allocate_quarantine_marker(
             )
         except FileExistsError:
             continue
-        if list_entries(descriptor):
-            os.close(descriptor)
-            raise ValueError("quarantine marker is not empty")
-        return _QuarantineMarker(
+        marker = _QuarantineMarker(
             namespace_fd=namespace_fd,
             name=name,
             descriptor=descriptor,
             identity=identity,
             entry_name=name,
         )
+        try:
+            if list_entries(descriptor):
+                raise ValueError("quarantine marker is not empty")
+        except BaseException as error:
+            cleanup_error = _release_owned_quarantine_marker(
+                marker,
+                remove_entry=True,
+            )
+            if cleanup_error is not None:
+                error.add_note(
+                    f"quarantine allocation cleanup also failed: "
+                    f"{cleanup_error!r}"
+                )
+            raise
+        return marker
     raise FileExistsError("could not allocate quarantine marker")
 
 
@@ -4696,6 +4708,30 @@ def _remove_quarantine_marker(
     marker.entry_name = None
     if sync_parent:
         fsync_directory(marker.namespace_fd)
+
+
+def _release_owned_quarantine_marker(
+    marker: _QuarantineMarker,
+    *,
+    remove_entry: bool,
+) -> BaseException | None:
+    cleanup_error: BaseException | None = None
+    if remove_entry:
+        try:
+            _remove_quarantine_marker(
+                marker,
+                sync_parent=True,
+            )
+        except BaseException as error:
+            cleanup_error = error
+    close_error = _close_descriptors_exhaustively((marker.descriptor,))
+    if close_error is not None:
+        cleanup_error = _append_secondary_error(
+            cleanup_error,
+            close_error,
+            "quarantine marker descriptor close failure",
+        )
+    return cleanup_error
 
 
 def _rollback_quarantine_exchange(
@@ -4850,47 +4886,54 @@ def _refresh_quarantine_marker(
     published_name: str,
     state: _QuarantineExchangeState,
 ) -> BaseException | None:
-    fresh = _allocate_quarantine_marker(
-        marker.namespace_fd,
-        published_name,
-    )
-    _check_named_derived_directory(
-        fresh.namespace_fd,
-        fresh.name,
-        fresh.descriptor,
-        fresh.identity,
-        "fresh quarantine marker",
-    )
-    retired = _QuarantineMarker(
-        namespace_fd=marker.namespace_fd,
-        name=marker.name,
-        descriptor=marker.descriptor,
-        identity=marker.identity,
-        entry_name=marker.name if state.marker_at_marker else None,
-    )
-    marker.namespace_fd = fresh.namespace_fd
-    marker.name = fresh.name
-    marker.descriptor = fresh.descriptor
-    marker.identity = fresh.identity
-    marker.entry_name = fresh.entry_name
-
-    cleanup_error: BaseException | None = None
-    if retired.entry_name is not None:
-        try:
-            _remove_quarantine_marker(
-                retired,
-                sync_parent=True,
-            )
-        except BaseException as error:
-            cleanup_error = error
-    close_error = _close_descriptors_exhaustively((retired.descriptor,))
-    if close_error is not None:
-        cleanup_error = _append_secondary_error(
-            cleanup_error,
-            close_error,
-            "retired quarantine marker close failure",
+    fresh: _QuarantineMarker | None = None
+    ownership_transferred = False
+    primary_error: BaseException | None = None
+    try:
+        fresh = _allocate_quarantine_marker(
+            marker.namespace_fd,
+            published_name,
         )
-    return cleanup_error
+        _check_named_derived_directory(
+            fresh.namespace_fd,
+            fresh.name,
+            fresh.descriptor,
+            fresh.identity,
+            "fresh quarantine marker",
+        )
+        retired = _QuarantineMarker(
+            namespace_fd=marker.namespace_fd,
+            name=marker.name,
+            descriptor=marker.descriptor,
+            identity=marker.identity,
+            entry_name=marker.name if state.marker_at_marker else None,
+        )
+        marker.namespace_fd = fresh.namespace_fd
+        marker.name = fresh.name
+        marker.descriptor = fresh.descriptor
+        marker.identity = fresh.identity
+        marker.entry_name = fresh.entry_name
+        ownership_transferred = True
+        return _release_owned_quarantine_marker(
+            retired,
+            remove_entry=retired.entry_name is not None,
+        )
+    except BaseException as error:
+        primary_error = error
+        raise
+    finally:
+        if fresh is not None and not ownership_transferred:
+            cleanup_error = _release_owned_quarantine_marker(
+                fresh,
+                remove_entry=True,
+            )
+            if cleanup_error is not None:
+                if primary_error is None:
+                    raise cleanup_error
+                primary_error.add_note(
+                    f"fresh quarantine marker cleanup also failed: "
+                    f"{cleanup_error!r}"
+                )
 
 
 def _sync_and_classify_quarantine(
