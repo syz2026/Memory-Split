@@ -156,3 +156,59 @@ bounded existing confirmatory v2/v3 regressions
 from the review base. The review fix did not change the manifest, closure,
 solver, gold-isolation, no-replace, or scope-exclusion contracts. There are no
 remaining filesystem-race review concerns.
+
+## Quarantine-authority re-review addendum
+
+- Status: `DONE`.
+- Review base:
+  `ef6bcd6303307519b7742d4612a789b90497407f`.
+- Fix commit:
+  `4791de8943f1c480f2236165e2a549fb1cf4e212`.
+
+This addendum supersedes the prior addendum's automatic recursive-deletion
+claim. Pathname compare-and-unlink cannot be one atomic authority operation,
+so the sealed-release authority path now performs no automatic `unlink` or
+`rmdir`.
+
+### Findings closed
+
+1. Failed staging and failed installed releases are atomically renamed under
+   their pinned parent to unpredictable
+   `.sealed-release-quarantine-<random>` names. Device, inode, type, mode,
+   owner, link identity, exact membership, mtime, and ctime are verified after
+   the rename. Quarantines are fsynced, preserved intact, and block later
+   publication until explicit offline cleanup.
+2. The authority path never recursively deletes quarantine contents. A
+   replacement detected after rename is atomically restored when possible;
+   otherwise all objects are preserved under a fail-closed error. Tests patch
+   `os.unlink` and `os.rmdir` to raise and prove stage/install failure handling
+   does not call either operation.
+3. Preflight, full verification, and publication now finish descriptor-based
+   file/solver validation and capture the final open-directory snapshot before
+   the outer swap hook. The last authority operation is the composite
+   parent-path, parent-name-to-descriptor, and exact membership/metadata
+   binding.
+4. SHA-256 content address is exposed as `authoritative_commitment`; returned
+   paths are marked `informational_reopen_and_verify`. Downstream verification
+   still reopens the path and re-establishes every trust binding.
+
+### Re-review RED to GREEN
+
+```text
+quarantine preservation, blockers, final binding, and path authority
+RED: 21 failed
+GREEN: 21 passed
+
+full focused suite (23 original plus adversarial regressions)
+46 passed in 8.57s
+
+bounded existing confirmatory v2/v3 regressions
+204 passed in 86.81s
+```
+
+`python -m py_compile` passed for the sealing module, CLI, and focused tests.
+`git diff --check` passed. The sealing authority module contains no pathname
+`unlink`/`rmdir` call, and `contracts.py`/`fixtures.py` remain unchanged from
+the re-review base. Manifest, solver, gold-isolation, no-replace, canonical
+UTF-8, and scope-exclusion behavior remain unchanged. There are no remaining
+re-review concerns.
