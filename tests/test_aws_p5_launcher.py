@@ -289,6 +289,7 @@ def _launcher_fixture(tmp_path: Path, seed: int = 1) -> dict[str, Path | dict]:
             "    'resume_sha256': True,\n"
             "    'sidecar_name': True,\n"
             "    'sigusr1_checkpoint': True,\n"
+            "    'sigusr1_request_token': True,\n"
             "}\n"
             "if sys.argv[1:] == ['--capabilities-json']:\n"
             "    print(json.dumps(CAPABILITIES, sort_keys=True, separators=(',', ':')))\n"
@@ -1086,10 +1087,11 @@ def test_trainer_contract_preflight_rejects_missing_capability(tmp_path):
         "receipt_v2": True,
         "resume_sha256": True,
         "sidecar_name": True,
-        "sigusr1_checkpoint": False,
+        "sigusr1_checkpoint": True,
+        "sigusr1_request_token": False,
     }
 
-    with pytest.raises(LaunchError, match="trainer contract|SIGUSR1"):
+    with pytest.raises(LaunchError, match="request token"):
         preflight_trainer_contract(
             plan,
             runner=lambda _argv, _environment, _timeout: CommandResult(
@@ -1791,6 +1793,39 @@ def test_production_checkpoint_request_factory_builds_real_requests(tmp_path):
     assert request.source_tree == plan.source_tree
     assert request.rank_zero_pids == rank_zero_pids
     assert request.s3_root == plan.runtime.s3_root
+
+
+def test_launcher_binds_per_arm_checkpoint_request_token_paths(tmp_path):
+    plan = _load_fixture_plan(_v3_mirror_fixture(tmp_path, seed=1))
+    rank_zero_pids = {"dense": 101, "split90": 102}
+
+    scheduler, request_factory = launch_module._production_checkpoint_scheduler(
+        plan,
+        rank_zero_pids,
+    )
+    request = request_factory("periodic")
+
+    assert scheduler.active is False
+    assert request.runtime_uid == plan.runtime_uid
+    assert request.runtime_gid == plan.runtime_gid
+    assert set(request.request_token_paths) == {"dense", "split90"}
+    assert len(set(request.request_token_paths.values())) == 2
+    for launch in plan.arms:
+        expected_host = launch.checkpoint_path.with_name(
+            "checkpoint-request.json"
+        )
+        assert launch.request_token_path == expected_host
+        assert request.request_token_paths[launch.arm] == expected_host
+        env_values = [
+            launch.argv[index + 1]
+            for index, value in enumerate(launch.argv[:-1])
+            if value == "--env"
+        ]
+        assert (
+            "MS_CHECKPOINT_REQUEST_TOKEN_FILE="
+            "/output/run/checkpoint-request.json"
+        ) in env_values
+        assert f"MS_CHECKPOINT_REQUEST_ARM={launch.arm}" in env_values
 
 
 class _CancelRecordingScheduler:

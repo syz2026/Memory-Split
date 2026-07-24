@@ -108,6 +108,7 @@ def test_run_train_capabilities_json_is_strict_and_does_not_require_config():
         "resume_sha256": True,
         "sidecar_name": True,
         "sigusr1_checkpoint": True,
+        "sigusr1_request_token": True,
     }
 
     assert completed.returncode == 0
@@ -115,6 +116,154 @@ def test_run_train_capabilities_json_is_strict_and_does_not_require_config():
     assert completed.stdout == (
         json.dumps(expected, sort_keys=True, separators=(",", ":")) + "\n"
     )
+
+
+def test_checkpoint_request_token_is_canonical_and_arm_bound() -> None:
+    request_id = "a" * 32
+
+    payload = safeio.checkpoint_request_token_bytes(
+        request_id,
+        arm="dense",
+    )
+
+    assert payload == (
+        b'{"arm":"dense","request_id":"'
+        + request_id.encode("ascii")
+        + b'","schema_version":1}\n'
+    )
+    assert (
+        safeio.parse_checkpoint_request_token(
+            payload,
+            expected_arm="dense",
+        )
+        == request_id
+    )
+    with pytest.raises(ValueError, match="arm"):
+        safeio.parse_checkpoint_request_token(
+            payload,
+            expected_arm="split90",
+        )
+    with pytest.raises(ValueError, match="canonical|fields"):
+        safeio.parse_checkpoint_request_token(
+            payload[:-1],
+            expected_arm="dense",
+        )
+
+
+def test_checkpoint_request_token_publish_is_exclusive_and_substitution_safe(
+    tmp_path,
+) -> None:
+    parent = tmp_path / "run"
+    parent.mkdir(mode=0o700)
+    path = parent / "checkpoint-request.json"
+    first = safeio.publish_checkpoint_request_token(
+        path,
+        request_id="a" * 32,
+        arm="dense",
+        owner_uid=os.geteuid(),
+        owner_gid=os.getegid(),
+    )
+
+    with pytest.raises(FileExistsError, match="exists|pending"):
+        safeio.publish_checkpoint_request_token(
+            path,
+            request_id="b" * 32,
+            arm="dense",
+            owner_uid=os.geteuid(),
+            owner_gid=os.getegid(),
+        )
+    assert path.read_bytes() == safeio.checkpoint_request_token_bytes(
+        "a" * 32,
+        arm="dense",
+    )
+
+    path.unlink()
+    replacement = safeio.checkpoint_request_token_bytes(
+        "b" * 32,
+        arm="dense",
+    )
+    path.write_bytes(replacement)
+    path.chmod(0o400)
+    with pytest.raises(ValueError, match="identity|changed"):
+        safeio.cleanup_checkpoint_request_token(first)
+    assert path.read_bytes() == replacement
+
+
+@pytest.mark.parametrize("mutation", ["hardlink", "mode", "owner"])
+def test_checkpoint_request_token_consume_rejects_unsafe_files(
+    tmp_path,
+    mutation,
+) -> None:
+    parent = tmp_path / mutation
+    parent.mkdir(mode=0o700)
+    path = parent / "checkpoint-request.json"
+    published = safeio.publish_checkpoint_request_token(
+        path,
+        request_id="c" * 32,
+        arm="split90",
+        owner_uid=os.geteuid(),
+        owner_gid=os.getegid(),
+    )
+    expected_uid = os.geteuid()
+    if mutation == "hardlink":
+        os.link(path, parent / "linked-token")
+    elif mutation == "mode":
+        path.chmod(0o600)
+    elif mutation == "owner":
+        expected_uid += 1
+    else:
+        raise AssertionError(mutation)
+
+    with pytest.raises(ValueError, match="hard.link|mode|owner|unsafe"):
+        safeio.consume_checkpoint_request_token(
+            path,
+            expected_arm="split90",
+            expected_uid=expected_uid,
+            expected_gid=os.getegid(),
+        )
+
+    if mutation == "hardlink":
+        (parent / "linked-token").unlink()
+    if path.exists():
+        path.chmod(0o400)
+        safeio.cleanup_checkpoint_request_token_path(
+            path,
+            request_id=published.request_id,
+            arm=published.arm,
+            owner_uid=published.owner_uid,
+            owner_gid=published.owner_gid,
+        )
+
+
+def test_checkpoint_request_token_rejects_symlinked_path_components(
+    tmp_path,
+) -> None:
+    real_parent = tmp_path / "real"
+    real_parent.mkdir(mode=0o700)
+    linked_parent = tmp_path / "linked"
+    linked_parent.symlink_to(real_parent, target_is_directory=True)
+    path = linked_parent / "checkpoint-request.json"
+
+    with pytest.raises(ValueError, match="symlink|unsafe"):
+        safeio.publish_checkpoint_request_token(
+            path,
+            request_id="d" * 32,
+            arm="dense",
+            owner_uid=os.geteuid(),
+            owner_gid=os.getegid(),
+        )
+    target = tmp_path / "target"
+    target.write_bytes(b"unchanged")
+    (real_parent / "checkpoint-request.json").symlink_to(target)
+    with pytest.raises(FileExistsError, match="exists|pending"):
+        safeio.publish_checkpoint_request_token(
+            real_parent / "checkpoint-request.json",
+            request_id="d" * 32,
+            arm="dense",
+            owner_uid=os.geteuid(),
+            owner_gid=os.getegid(),
+        )
+    assert target.read_bytes() == b"unchanged"
 
 
 def test_operational_steps_preserve_config_fingerprint_and_resume_one_to_two(
@@ -848,6 +997,7 @@ def test_checkpoint_metadata_binds_installed_generation(tmp_path):
             "mtime_ns": checkpoint_stat.st_mtime_ns,
             "uid": checkpoint_stat.st_uid,
         },
+        "request_token": None,
         "receipt_type": "memorysplit-trainer-checkpoint-v1",
         "schema_version": 1,
         "step": 0,
@@ -915,6 +1065,143 @@ def test_sigusr1_handler_only_requests_checkpoint_until_safe_boundary(
 
     assert trainer._service_checkpoint_request() is True
     assert torch.load(trainer.ckpt_path, weights_only=False)["step"] == 0
+    trainer.close()
+
+
+def test_sigusr1_service_consumes_and_binds_exact_request_token(
+    tmp_path,
+    monkeypatch,
+):
+    bp, mp = write_corpus(tmp_path, n=64)
+    cfg = tiny_cfg(tmp_path, bp, mp)
+    cfg["condition"] = "dense"
+    token_path = Path(cfg["out_dir"]) / "checkpoint-request.json"
+    installed = {}
+    monkeypatch.setenv(
+        "MS_CHECKPOINT_REQUEST_TOKEN_FILE",
+        str(token_path),
+    )
+    monkeypatch.setenv("MS_CHECKPOINT_REQUEST_ARM", "dense")
+    monkeypatch.setattr(signal, "getsignal", lambda signum: f"old-{signum}")
+    monkeypatch.setattr(
+        signal,
+        "signal",
+        lambda signum, handler: installed.__setitem__(signum, handler),
+    )
+    trainer = Trainer(cfg)
+    request_id = "a" * 32
+    safeio.publish_checkpoint_request_token(
+        token_path,
+        request_id=request_id,
+        arm="dense",
+        owner_uid=os.geteuid(),
+        owner_gid=os.getegid(),
+    )
+
+    installed[signal.SIGUSR1](signal.SIGUSR1, None)
+
+    assert token_path.exists()
+    assert not trainer.ckpt_path.exists()
+    assert trainer._service_checkpoint_request() is True
+    metadata = json.loads(
+        (trainer.out_dir / "ckpt.meta.json").read_text(encoding="ascii")
+    )
+    assert metadata["request_token"] == request_id
+    assert not token_path.exists()
+
+    trainer.save_ckpt()
+    periodic = json.loads(
+        (trainer.out_dir / "ckpt.meta.json").read_text(encoding="ascii")
+    )
+    assert periodic["request_token"] is None
+    trainer.close()
+
+
+def test_sigusr1_service_fails_closed_until_pending_token_exists(
+    tmp_path,
+    monkeypatch,
+):
+    bp, mp = write_corpus(tmp_path, n=64)
+    cfg = tiny_cfg(tmp_path, bp, mp)
+    cfg["condition"] = "dense"
+    token_path = Path(cfg["out_dir"]) / "checkpoint-request.json"
+    installed = {}
+    monkeypatch.setenv(
+        "MS_CHECKPOINT_REQUEST_TOKEN_FILE",
+        str(token_path),
+    )
+    monkeypatch.setenv("MS_CHECKPOINT_REQUEST_ARM", "dense")
+    monkeypatch.setattr(signal, "getsignal", lambda signum: f"old-{signum}")
+    monkeypatch.setattr(
+        signal,
+        "signal",
+        lambda signum, handler: installed.__setitem__(signum, handler),
+    )
+    trainer = Trainer(cfg)
+    installed[signal.SIGUSR1](signal.SIGUSR1, None)
+
+    with pytest.raises(FileNotFoundError, match="request token|missing"):
+        trainer._service_checkpoint_request()
+    assert not trainer.ckpt_path.exists()
+
+    safeio.publish_checkpoint_request_token(
+        token_path,
+        request_id="b" * 32,
+        arm="dense",
+        owner_uid=os.geteuid(),
+        owner_gid=os.getegid(),
+    )
+    assert trainer._service_checkpoint_request() is True
+    metadata = json.loads(
+        (trainer.out_dir / "ckpt.meta.json").read_text(encoding="ascii")
+    )
+    assert metadata["request_token"] == "b" * 32
+    trainer.close()
+
+
+def test_periodic_checkpoint_does_not_consume_pending_signal_token(
+    tmp_path,
+    monkeypatch,
+):
+    bp, mp = write_corpus(tmp_path, n=64)
+    cfg = tiny_cfg(tmp_path, bp, mp)
+    cfg["condition"] = "dense"
+    token_path = Path(cfg["out_dir"]) / "checkpoint-request.json"
+    installed = {}
+    monkeypatch.setenv(
+        "MS_CHECKPOINT_REQUEST_TOKEN_FILE",
+        str(token_path),
+    )
+    monkeypatch.setenv("MS_CHECKPOINT_REQUEST_ARM", "dense")
+    monkeypatch.setattr(signal, "getsignal", lambda signum: f"old-{signum}")
+    monkeypatch.setattr(
+        signal,
+        "signal",
+        lambda signum, handler: installed.__setitem__(signum, handler),
+    )
+    trainer = Trainer(cfg)
+    safeio.publish_checkpoint_request_token(
+        token_path,
+        request_id="c" * 32,
+        arm="dense",
+        owner_uid=os.geteuid(),
+        owner_gid=os.getegid(),
+    )
+
+    assert trainer._service_checkpoint_request(checkpoint_due=True) is False
+    periodic = json.loads(
+        (trainer.out_dir / "ckpt.meta.json").read_text(encoding="ascii")
+    )
+    assert periodic["request_token"] is None
+    assert token_path.exists()
+
+    installed[signal.SIGUSR1](signal.SIGUSR1, None)
+    assert trainer._service_checkpoint_request() is True
+    acknowledged = json.loads(
+        (trainer.out_dir / "ckpt.meta.json").read_text(encoding="ascii")
+    )
+    assert acknowledged["request_token"] == "c" * 32
+    assert not token_path.exists()
     trainer.close()
 
 

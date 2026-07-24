@@ -24,6 +24,7 @@ from cluster.aws.p5.checkpoint_mirror import (
     PublishedCheckpointPair,
     S3VersionedObjectStore,
     VersionedUploadedObject,
+    cleanup_checkpoint_request_tokens,
     publish_paired_checkpoint,
     read_trainer_checkpoint_metadata,
 )
@@ -58,6 +59,8 @@ def _write_metadata(
     receipt_sha256: str = "d" * 64,
     build_id: str = "b" * 64,
     ordered_stream_sha256: str = "e" * 64,
+    request_token: str | None = "a" * 32,
+    include_request_token: bool = True,
 ) -> dict[str, object]:
     installed = checkpoint.stat(follow_symlinks=False)
     value = {
@@ -86,6 +89,8 @@ def _write_metadata(
         "step": step,
         "world_size": world_size,
     }
+    if include_request_token:
+        value["request_token"] = request_token
     checkpoint.with_name("ckpt.meta.json").write_bytes(_canonical_json(value))
     return value
 
@@ -121,6 +126,25 @@ def test_trainer_metadata_reads_the_exact_installed_generation(
     assert actual.config_fingerprint == expected["config_fingerprint"]
     assert actual.data == expected["data"]
     assert actual.installed == expected["installed"]
+    assert actual.request_token == "a" * 32
+
+
+def test_legacy_trainer_metadata_without_request_token_remains_readable(
+    tmp_path: Path,
+) -> None:
+    checkpoint = tmp_path / "ckpt.pt"
+    checkpoint.write_bytes(b"legacy-metadata-generation")
+    _write_metadata(
+        checkpoint,
+        step=18,
+        include_request_token=False,
+    )
+
+    actual = read_trainer_checkpoint_metadata(checkpoint)
+
+    assert actual is not None
+    assert actual.step == 18
+    assert actual.request_token is None
 
 
 def test_present_mismatched_trainer_metadata_fails(tmp_path: Path) -> None:
@@ -277,12 +301,18 @@ def _request(tmp_path: Path) -> CheckpointMirrorRequest:
         source_tree="a" * 40,
         rank_zero_pids={"dense": 101, "split90": 102},
         checkpoint_paths=checkpoint_paths,
+        request_token_paths={
+            arm: path.with_name("checkpoint-request.json")
+            for arm, path in checkpoint_paths.items()
+        },
         config_sha256={"dense": "b" * 64, "split90": "c" * 64},
         run_ids={
             "dense": "memorysplit-v3-360m-dense-s0",
             "split90": "memorysplit-v3-360m-split90-s0",
         },
         s3_root="s3://memorysplit-test/prefix",
+        runtime_uid=os.geteuid(),
+        runtime_gid=os.getegid(),
     )
 
 
@@ -423,6 +453,153 @@ def test_baseline_pins_the_generation_validated_before_signal(
     assert store.put_order == []
 
 
+def test_unrelated_generation_between_baseline_and_signal_waits_for_token_ack(
+    tmp_path: Path,
+) -> None:
+    request = _request(tmp_path)
+    store = _MemoryVersionedStore()
+    arm_by_pid = {101: "dense", 102: "split90"}
+    now = [0.0]
+    dense_acknowledged = False
+
+    def install_generation(
+        arm: str,
+        *,
+        step: int,
+        request_token: str | None,
+        label: str,
+    ) -> None:
+        checkpoint = request.checkpoint_paths[arm]
+        checkpoint.write_bytes(f"{label}-{arm}".encode("ascii"))
+        _write_metadata(
+            checkpoint,
+            step=step,
+            sidecar_name=f"{arm}_target_weights",
+            request_token=request_token,
+        )
+        if request_token == request.request_id:
+            try:
+                request.request_token_paths[arm].unlink()
+            except FileNotFoundError:
+                pass
+
+    def signal_process(pid: int, _signum: int) -> None:
+        arm = arm_by_pid[pid]
+        if arm == "dense":
+            install_generation(
+                arm,
+                step=2,
+                request_token=None,
+                label="unrelated-pre-signal",
+            )
+        else:
+            install_generation(
+                arm,
+                step=3,
+                request_token=request.request_id,
+                label="acknowledged",
+            )
+
+    def sleep(seconds: float) -> None:
+        nonlocal dense_acknowledged
+        now[0] += max(seconds, 0.01)
+        if not dense_acknowledged:
+            dense_acknowledged = True
+            install_generation(
+                "dense",
+                step=4,
+                request_token=request.request_id,
+                label="acknowledged",
+            )
+
+    published = publish_paired_checkpoint(
+        request,
+        object_store=store,
+        signal_process=signal_process,
+        staging_root=tmp_path / "staging",
+        monotonic=lambda: now[0],
+        sleep=sleep,
+        staged_at=lambda: "2026-07-23T12:01:00Z",
+    )
+
+    assert dense_acknowledged is True
+    assert [
+        row["step"] for row in published.value["checkpoints"]
+    ] == [4, 3]
+    assert all(
+        not path.exists() for path in request.request_token_paths.values()
+    )
+
+
+def test_production_mirroring_rejects_cross_request_metadata_tokens(
+    tmp_path: Path,
+) -> None:
+    request = _request(tmp_path)
+    store = _MemoryVersionedStore()
+    arm_by_pid = {101: "dense", 102: "split90"}
+    now = [0.0]
+
+    def signal_process(pid: int, _signum: int) -> None:
+        arm = arm_by_pid[pid]
+        checkpoint = request.checkpoint_paths[arm]
+        checkpoint.write_bytes(f"wrong-request-{arm}".encode("ascii"))
+        _write_metadata(
+            checkpoint,
+            step=5,
+            sidecar_name=f"{arm}_target_weights",
+            request_token="b" * 32,
+        )
+
+    def sleep(seconds: float) -> None:
+        now[0] += max(seconds, 0.01)
+
+    with pytest.raises(TimeoutError, match="fresh|token|generation"):
+        publish_paired_checkpoint(
+            request,
+            object_store=store,
+            signal_process=signal_process,
+            staging_root=tmp_path / "staging",
+            monotonic=lambda: now[0],
+            sleep=sleep,
+            staged_at=lambda: "2026-07-23T12:01:00Z",
+        )
+
+    assert store.put_order == []
+    assert all(
+        not path.exists() for path in request.request_token_paths.values()
+    )
+
+
+def test_failed_signal_cleans_both_published_request_tokens(
+    tmp_path: Path,
+) -> None:
+    request = _request(tmp_path)
+    observations = []
+
+    def signal_process(pid: int, _signum: int) -> None:
+        observations.append(
+            tuple(
+                request.request_token_paths[arm].exists()
+                for arm in ("dense", "split90")
+            )
+        )
+        if pid == 102:
+            raise OSError("split90 signal failed")
+
+    with pytest.raises(ValueError, match="SIGUSR1"):
+        publish_paired_checkpoint(
+            request,
+            object_store=_MemoryVersionedStore(),
+            signal_process=signal_process,
+            staging_root=tmp_path / "staging",
+        )
+
+    assert observations == [(True, True), (True, True)]
+    assert all(
+        not path.exists() for path in request.request_token_paths.values()
+    )
+
+
 def test_publisher_recovers_a_lost_put_response_by_exact_head(
     tmp_path: Path,
 ) -> None:
@@ -467,6 +644,7 @@ def test_identical_checkpoint_bytes_recover_by_exact_head_without_progress(
     request = _request(tmp_path)
     store = _PreconditionMemoryStore()
     arm_by_pid = {101: "dense", 102: "split90"}
+    active_request = [request]
 
     def install_generation(arm: str) -> None:
         checkpoint = request.checkpoint_paths[arm]
@@ -479,6 +657,7 @@ def test_identical_checkpoint_bytes_recover_by_exact_head_without_progress(
             checkpoint,
             step=3,
             sidecar_name=f"{arm}_target_weights",
+            request_token=active_request[0].request_id,
         )
 
     def signal_process(pid: int, _signum: int) -> None:
@@ -493,8 +672,10 @@ def test_identical_checkpoint_bytes_recover_by_exact_head_without_progress(
     )
     puts_after_first = list(store.put_order)
 
+    second_request = replace(request, request_id="b" * 32)
+    active_request[0] = second_request
     second = publish_paired_checkpoint(
-        replace(request, request_id="b" * 32),
+        second_request,
         object_store=store,
         signal_process=signal_process,
         staging_root=tmp_path / "staging-second",
@@ -2585,6 +2766,23 @@ def test_forked_attempt_cancel_kills_reaps_and_closes_descriptors(
     with pytest.raises(RuntimeError, match="consumed"):
         attempt.poll()
     assert not sentinel.exists()
+
+
+def test_forked_attempt_cancel_removes_pending_request_tokens(
+    tmp_path: Path,
+) -> None:
+    request = _request(tmp_path)
+    checkpoint_mirror_module._publish_request_tokens(request)
+    attempt = ForkedCheckpointMirrorAttempt(
+        lambda: (time.sleep(30.0), _forked_pair())[1],
+        cancel_cleanup=lambda: cleanup_checkpoint_request_tokens(request),
+    )
+
+    attempt.cancel()
+
+    assert all(
+        not path.exists() for path in request.request_token_paths.values()
+    )
 
 
 def test_forked_attempt_reports_malformed_child_payload_as_failure() -> None:

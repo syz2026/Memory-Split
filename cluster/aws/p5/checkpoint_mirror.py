@@ -21,6 +21,14 @@ import time
 from typing import Callable, Mapping, Protocol, Sequence
 from urllib.parse import urlsplit
 
+from train.safeio import (
+    CHECKPOINT_REQUEST_TOKEN_FILENAME,
+    PublishedCheckpointRequestToken,
+    cleanup_checkpoint_request_token,
+    cleanup_checkpoint_request_token_path,
+    publish_checkpoint_request_token,
+)
+
 
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _REQUEST_ID_RE = re.compile(r"^[0-9a-f]{32}$")
@@ -39,7 +47,7 @@ PAIR_CHECKPOINT_MAX_AGE_SECONDS = 1200
 PAIR_CHECKPOINT_ATTEMPT_SECONDS = 120
 PAIR_CHECKPOINT_TRIGGER_AGE_SECONDS = 1080
 PAIR_CHECKPOINT_RETRY_SECONDS = 5
-_METADATA_FIELDS = {
+_LEGACY_METADATA_FIELDS = {
     "checkpoint_version",
     "config_fingerprint",
     "data",
@@ -49,6 +57,7 @@ _METADATA_FIELDS = {
     "step",
     "world_size",
 }
+_METADATA_FIELDS = _LEGACY_METADATA_FIELDS | {"request_token"}
 _DATA_FIELDS = {
     "build_id",
     "global_cursor",
@@ -77,6 +86,7 @@ class TrainerCheckpointMetadata:
     config_fingerprint: str
     data: dict[str, object]
     installed: dict[str, int]
+    request_token: str | None
 
 
 @dataclass(frozen=True)
@@ -384,6 +394,8 @@ class ForkedCheckpointMirrorAttempt:
     def __init__(
         self,
         publish: Callable[[], PublishedCheckpointPair],
+        *,
+        cancel_cleanup: Callable[[], None] | None = None,
     ) -> None:
         read_fd, write_fd = os.pipe()
         pid = os.fork()
@@ -408,6 +420,7 @@ class ForkedCheckpointMirrorAttempt:
         self._read_fd: int | None = read_fd
         self._chunks: list[bytes] = []
         self._saw_eof = False
+        self._cancel_cleanup = cancel_cleanup
 
     def _drain_pipe(self) -> None:
         # The child blocks writing payloads larger than the kernel pipe
@@ -436,6 +449,7 @@ class ForkedCheckpointMirrorAttempt:
         os.close(self._read_fd)
         self._read_fd = None
         self._pid = None
+        self._cancel_cleanup = None
         try:
             ok, value = pickle.loads(b"".join(self._chunks))
         except Exception:
@@ -445,19 +459,25 @@ class ForkedCheckpointMirrorAttempt:
         return True, value
 
     def cancel(self) -> None:
-        if self._pid is not None:
-            try:
-                os.kill(self._pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-            try:
-                os.waitpid(self._pid, 0)
-            except ChildProcessError:
-                pass
-            self._pid = None
-        if self._read_fd is not None:
-            os.close(self._read_fd)
-            self._read_fd = None
+        cleanup = self._cancel_cleanup
+        self._cancel_cleanup = None
+        try:
+            if self._pid is not None:
+                try:
+                    os.kill(self._pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                try:
+                    os.waitpid(self._pid, 0)
+                except ChildProcessError:
+                    pass
+                self._pid = None
+            if self._read_fd is not None:
+                os.close(self._read_fd)
+                self._read_fd = None
+        finally:
+            if cleanup is not None:
+                cleanup()
 
 
 class CheckpointMirrorScheduler:
@@ -623,9 +643,12 @@ class CheckpointMirrorRequest:
     source_tree: str
     rank_zero_pids: Mapping[str, int]
     checkpoint_paths: Mapping[str, Path]
+    request_token_paths: Mapping[str, Path]
     config_sha256: Mapping[str, str]
     run_ids: Mapping[str, str]
     s3_root: str
+    runtime_uid: int
+    runtime_gid: int
 
     def __post_init__(self) -> None:
         if type(self.seed) is not int or self.seed not in range(10):
@@ -669,6 +692,7 @@ class CheckpointMirrorRequest:
         for label, mapping in (
             ("rank-zero PID", self.rank_zero_pids),
             ("checkpoint path", self.checkpoint_paths),
+            ("request token path", self.request_token_paths),
             ("config SHA-256", self.config_sha256),
             ("run ID", self.run_ids),
         ):
@@ -683,6 +707,34 @@ class CheckpointMirrorRequest:
             not isinstance(path, Path) for path in self.checkpoint_paths.values()
         ):
             raise ValueError("checkpoint paths must be pathlib Paths")
+        if (
+            any(
+                not isinstance(path, Path)
+                for path in self.request_token_paths.values()
+            )
+            or len(set(self.request_token_paths.values())) != len(_ARMS)
+            or any(
+                self.request_token_paths[arm]
+                != self.checkpoint_paths[arm].with_name(
+                    CHECKPOINT_REQUEST_TOKEN_FILENAME
+                )
+                for arm in _ARMS
+            )
+        ):
+            raise ValueError(
+                "checkpoint request token paths must be distinct reviewed "
+                "checkpoint siblings"
+            )
+        if (
+            type(self.runtime_uid) is not int
+            or self.runtime_uid < 0
+            or type(self.runtime_gid) is not int
+            or self.runtime_gid < 0
+        ):
+            raise ValueError(
+                "checkpoint request token runtime UID/GID must be non-negative "
+                "exact integers"
+            )
         if any(
             not isinstance(digest, str) or _SHA256_RE.fullmatch(digest) is None
             for digest in self.config_sha256.values()
@@ -820,7 +872,7 @@ def _read_trainer_checkpoint_generation(
         raise ValueError("trainer checkpoint metadata is not canonical JSON") from error
     if (
         not isinstance(value, dict)
-        or set(value) != _METADATA_FIELDS
+        or set(value) not in (_METADATA_FIELDS, _LEGACY_METADATA_FIELDS)
         or (
             json.dumps(
                 value,
@@ -836,6 +888,7 @@ def _read_trainer_checkpoint_generation(
         raise ValueError("trainer checkpoint metadata fields are invalid")
     data = value["data"]
     installed = value["installed"]
+    request_token = value.get("request_token")
     if (
         type(value["schema_version"]) is not int
         or value["schema_version"] != 1
@@ -881,6 +934,13 @@ def _read_trainer_checkpoint_generation(
         or installed["bytes"] <= 0
         or installed["links"] != 1
         or not stat.S_ISREG(installed["mode"])
+        or (
+            request_token is not None
+            and (
+                not isinstance(request_token, str)
+                or _REQUEST_ID_RE.fullmatch(request_token) is None
+            )
+        )
     ):
         raise ValueError("trainer checkpoint metadata values are invalid")
     try:
@@ -902,6 +962,7 @@ def _read_trainer_checkpoint_generation(
             config_fingerprint=value["config_fingerprint"],
             data=dict(data),
             installed=dict(installed),
+            request_token=request_token,
         ),
         (
             metadata_stat.st_dev,
@@ -970,13 +1031,24 @@ def _stage_generation(
     sleep: Callable[[float], None],
 ) -> _StagedCheckpoint:
     checkpoint = request.checkpoint_paths[arm]
+    observed_generation = baseline
     while monotonic() < deadline:
         generation = _metadata_generation(checkpoint)
-        if generation is None or generation == baseline:
+        if generation is None or generation == observed_generation:
             sleep(min(0.05, max(0.0, deadline - monotonic())))
             continue
-        metadata = read_trainer_checkpoint_metadata(checkpoint)
-        assert metadata is not None
+        metadata, validated_generation = (
+            _read_trainer_checkpoint_generation(checkpoint)
+        )
+        assert metadata is not None and validated_generation is not None
+        if validated_generation == baseline:
+            observed_generation = validated_generation
+            sleep(min(0.05, max(0.0, deadline - monotonic())))
+            continue
+        if metadata.request_token != request.request_id:
+            observed_generation = validated_generation
+            sleep(min(0.05, max(0.0, deadline - monotonic())))
+            continue
         data = metadata.data
         if (
             metadata.world_size != 4
@@ -1040,6 +1112,51 @@ def _stage_generation(
             except FileNotFoundError:
                 pass
     raise TimeoutError(f"{arm} did not produce a fresh checkpoint generation")
+
+
+def _cleanup_published_request_tokens(
+    tokens: Sequence[PublishedCheckpointRequestToken],
+) -> None:
+    for token in reversed(tokens):
+        cleanup_checkpoint_request_token(token)
+
+
+def _publish_request_tokens(
+    request: CheckpointMirrorRequest,
+) -> tuple[PublishedCheckpointRequestToken, PublishedCheckpointRequestToken]:
+    published = []
+    try:
+        for arm in _ARMS:
+            published.append(
+                publish_checkpoint_request_token(
+                    request.request_token_paths[arm],
+                    request_id=request.request_id,
+                    arm=arm,
+                    owner_uid=request.runtime_uid,
+                    owner_gid=request.runtime_gid,
+                )
+            )
+    except BaseException:
+        _cleanup_published_request_tokens(published)
+        raise
+    return published[0], published[1]
+
+
+def cleanup_checkpoint_request_tokens(
+    request: CheckpointMirrorRequest,
+) -> None:
+    """Remove only exact pending files for a cancelled mirror request."""
+
+    if not isinstance(request, CheckpointMirrorRequest):
+        raise ValueError("checkpoint mirror request is invalid")
+    for arm in reversed(_ARMS):
+        cleanup_checkpoint_request_token_path(
+            request.request_token_paths[arm],
+            request_id=request.request_id,
+            arm=arm,
+            owner_uid=request.runtime_uid,
+            owner_gid=request.runtime_gid,
+        )
 
 
 def _checkpoint_metadata(
@@ -1153,39 +1270,59 @@ def publish_paired_checkpoint(
         baselines[arm] = _validated_metadata_generation(
             request.checkpoint_paths[arm]
         )
+    request_tokens = _publish_request_tokens(request)
     signal_errors = []
-    for arm in _ARMS:
-        try:
-            signal_process(request.rank_zero_pids[arm], signal.SIGUSR1)
-        except OSError as error:
-            signal_errors.append((arm, error))
+    try:
+        for arm in _ARMS:
+            try:
+                signal_process(request.rank_zero_pids[arm], signal.SIGUSR1)
+            except OSError as error:
+                signal_errors.append((arm, error))
+    except BaseException:
+        _cleanup_published_request_tokens(request_tokens)
+        raise
     if signal_errors:
+        _cleanup_published_request_tokens(request_tokens)
         raise ValueError("both rank-zero processes must accept SIGUSR1")
-    staging_root.mkdir(parents=True, exist_ok=True, mode=0o700)
-    with tempfile.TemporaryDirectory(
-        prefix=f"checkpoint-{request.request_id}-",
-        dir=staging_root,
-    ) as staging_text:
+    try:
+        staging_root.mkdir(parents=True, exist_ok=True, mode=0o700)
+    except BaseException:
+        _cleanup_published_request_tokens(request_tokens)
+        raise
+    try:
+        staging_directory = tempfile.TemporaryDirectory(
+            prefix=f"checkpoint-{request.request_id}-",
+            dir=staging_root,
+        )
+    except BaseException:
+        _cleanup_published_request_tokens(request_tokens)
+        raise
+    with staging_directory as staging_text:
         staging = Path(staging_text)
         deadline = monotonic() + PAIR_CHECKPOINT_ATTEMPT_SECONDS
         staged_by_arm: dict[str, _StagedCheckpoint] = {}
-        with ThreadPoolExecutor(max_workers=2) as executor:
-            futures = {
-                executor.submit(
-                    _stage_generation,
-                    request,
-                    arm,
-                    baselines[arm],
-                    staging,
-                    deadline=deadline,
-                    monotonic=monotonic,
-                    sleep=sleep,
-                ): arm
-                for arm in _ARMS
-            }
-            for future in as_completed(futures):
-                arm = futures[future]
-                staged_by_arm[arm] = future.result()
+        try:
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                futures = {
+                    executor.submit(
+                        _stage_generation,
+                        request,
+                        arm,
+                        baselines[arm],
+                        staging,
+                        deadline=deadline,
+                        monotonic=monotonic,
+                        sleep=sleep,
+                    ): arm
+                    for arm in _ARMS
+                }
+                for future in as_completed(futures):
+                    arm = futures[future]
+                    staged_by_arm[arm] = future.result()
+        except BaseException:
+            _cleanup_published_request_tokens(request_tokens)
+            raise
+        _cleanup_published_request_tokens(request_tokens)
         if set(staged_by_arm) != set(_ARMS):
             raise ValueError("checkpoint staging did not produce a complete pair")
 

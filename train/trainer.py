@@ -35,7 +35,11 @@ from train.data import (
 )
 from train.model import GPT, GPTConfig, PRESETS
 from train.safeio import (
+    CHECKPOINT_REQUEST_ARM_ENV,
+    CHECKPOINT_REQUEST_TOKEN_FILENAME,
+    CHECKPOINT_REQUEST_TOKEN_FILE_ENV,
     DurableOutput,
+    consume_checkpoint_request_token,
     read_regular_path,
     require_absent_path,
     write_atomic_path,
@@ -90,12 +94,14 @@ _ATOMIC_TEMPORARY_NAME = re.compile(
     r"^\.(?P<target>[A-Za-z0-9][A-Za-z0-9._-]*)"
     r"\.tmp-(?P<pid>[1-9][0-9]*)-(?P<nonce>[0-9a-f]{16})$"
 )
+_CHECKPOINT_REQUEST_ID_RE = re.compile(r"^[0-9a-f]{32}$")
 TRAINER_CAPABILITIES = {
     "rank_zero_pid_file": True,
     "receipt_v2": True,
     "resume_sha256": True,
     "sidecar_name": True,
     "sigusr1_checkpoint": True,
+    "sigusr1_request_token": True,
 }
 
 
@@ -412,6 +418,8 @@ class Trainer:
         self._previous_sigusr1_handler = None
         self._signal_handler_installed = False
         self.rank_zero_pid_path: Path | None = None
+        self.checkpoint_request_token_path: Path | None = None
+        self.checkpoint_request_arm: str | None = None
         raw_out_dir = cfg.get("out_dir")
         if not isinstance(raw_out_dir, (str, Path)):
             raise ValueError("out_dir must be a path string")
@@ -813,6 +821,36 @@ class Trainer:
         self._previous_sigusr1_handler = previous
         self._signal_handler_installed = True
         try:
+            raw_token_path = os.environ.get(
+                CHECKPOINT_REQUEST_TOKEN_FILE_ENV
+            )
+            raw_request_arm = os.environ.get(CHECKPOINT_REQUEST_ARM_ENV)
+            if (raw_token_path is None) != (raw_request_arm is None):
+                raise ValueError(
+                    "checkpoint request token path and arm must be configured "
+                    "together"
+                )
+            if raw_token_path is not None:
+                if (
+                    not raw_token_path
+                    or "\x00" in raw_token_path
+                    or raw_request_arm not in {"dense", "split90"}
+                    or self.cfg.get("condition") != raw_request_arm
+                ):
+                    raise ValueError(
+                        "checkpoint request token runtime binding is invalid"
+                    )
+                token_path = Path(raw_token_path)
+                expected_path = (
+                    self.out_dir / CHECKPOINT_REQUEST_TOKEN_FILENAME
+                ).absolute()
+                if token_path.absolute() != expected_path:
+                    raise ValueError(
+                        "checkpoint request token path is outside the "
+                        "reviewed output"
+                    )
+                self.checkpoint_request_token_path = token_path
+                self.checkpoint_request_arm = raw_request_arm
             raw_pid_path = os.environ.get("MS_RANK_ZERO_PID_FILE")
             if raw_pid_path is None:
                 return
@@ -847,13 +885,40 @@ class Trainer:
         if type(checkpoint_due) is not bool:
             raise ValueError("checkpoint_due must be boolean")
         master_requested = False
+        generation = None
         if self.is_master:
             generation = self._checkpoint_request_generation
             master_requested = generation != self._checkpoint_request_consumed
-            self._checkpoint_request_consumed = generation
         requested = self._broadcast_master_bool(master_requested)
+        request_token = None
+        if requested:
+            token_holder: dict[str, str | None] = {"request_token": None}
+
+            def consume_pending_token() -> None:
+                if (
+                    self.checkpoint_request_token_path is None
+                    or self.checkpoint_request_arm is None
+                ):
+                    return
+                token_holder["request_token"] = (
+                    consume_checkpoint_request_token(
+                        self.checkpoint_request_token_path,
+                        expected_arm=self.checkpoint_request_arm,
+                        expected_uid=os.geteuid(),
+                        expected_gid=os.getegid(),
+                    )
+                )
+
+            self._rank0_action(
+                consume_pending_token,
+                "checkpoint request token consumption",
+            )
+            request_token = token_holder["request_token"]
+            if self.is_master:
+                assert generation is not None
+                self._checkpoint_request_consumed = generation
         if requested or checkpoint_due:
-            self.save_ckpt()
+            self.save_ckpt(request_token=request_token)
         return requested
 
     def close(self) -> None:
@@ -1461,7 +1526,18 @@ class Trainer:
                 device=self.local_rank,
             )
 
-    def save_ckpt(self) -> None:
+    def save_ckpt(self, *, request_token: str | None = None) -> None:
+        if (
+            request_token is not None
+            and (
+                not isinstance(request_token, str)
+                or _CHECKPOINT_REQUEST_ID_RE.fullmatch(request_token) is None
+            )
+        ):
+            raise ValueError(
+                "checkpoint request token must be 32 lowercase hexadecimal "
+                "characters"
+            )
         rng_by_rank = self._rng_states_by_rank()
         data_states = self._data_states_by_rank()
 
@@ -1514,6 +1590,7 @@ class Trainer:
                     "mtime_ns": installed.st_mtime_ns,
                     "uid": installed.st_uid,
                 },
+                "request_token": request_token,
                 "receipt_type": "memorysplit-trainer-checkpoint-v1",
                 "schema_version": 1,
                 "step": self.step,

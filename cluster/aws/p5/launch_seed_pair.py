@@ -41,6 +41,7 @@ from cluster.aws.p5.checkpoint_mirror import (
     CheckpointStaleError,
     ForkedCheckpointMirrorAttempt,
     S3VersionedObjectStore,
+    cleanup_checkpoint_request_tokens,
     publish_paired_checkpoint,
 )
 from cluster.aws.p5.corpus_contract import (
@@ -66,6 +67,11 @@ from msctl.aws_contracts import (
     PROVIDER,
     SEEDS,
     SNAPSHOT_STEPS,
+)
+from train.safeio import (
+    CHECKPOINT_REQUEST_ARM_ENV,
+    CHECKPOINT_REQUEST_TOKEN_FILENAME,
+    CHECKPOINT_REQUEST_TOKEN_FILE_ENV,
 )
 
 
@@ -196,6 +202,7 @@ class ArmLaunch:
     scientific_config_sha256: str
     out_dir: Path
     checkpoint_path: Path
+    request_token_path: Path
     rank_zero_pid_file: Path
     cidfile_path: Path
     container_name: str
@@ -1352,6 +1359,9 @@ def load_launch_plan(
         checkpoint_path = _inside_output(
             scratch, checkpoint_relative, label=f"{arm} checkpoint"
         )
+        request_token_path = checkpoint_path.with_name(
+            CHECKPOINT_REQUEST_TOKEN_FILENAME
+        )
         pid_path = _inside_output(
             scratch, pid_relative, label=f"{arm} rank-zero PID file"
         )
@@ -1476,6 +1486,13 @@ def load_launch_plan(
             "--env",
             "MS_RANK_ZERO_PID_FILE=/output/rank-zero.pid",
             "--env",
+            (
+                f"{CHECKPOINT_REQUEST_TOKEN_FILE_ENV}="
+                f"/output/run/{CHECKPOINT_REQUEST_TOKEN_FILENAME}"
+            ),
+            "--env",
+            f"{CHECKPOINT_REQUEST_ARM_ENV}={arm}",
+            "--env",
             "OMP_NUM_THREADS=1",
             "--env",
             "PYTHONUNBUFFERED=1",
@@ -1508,6 +1525,7 @@ def load_launch_plan(
                 scientific_config_sha256=scientific_config_sha256,
                 out_dir=out_dir,
                 checkpoint_path=checkpoint_path,
+                request_token_path=request_token_path,
                 rank_zero_pid_file=pid_path,
                 cidfile_path=cidfile_path,
                 container_name=container_name,
@@ -1590,6 +1608,7 @@ _TRAINER_CONTRACT_FIELDS = frozenset(
         "resume_sha256",
         "sidecar_name",
         "sigusr1_checkpoint",
+        "sigusr1_request_token",
     }
 )
 
@@ -1715,6 +1734,7 @@ def preflight_trainer_contract(
             "resume_sha256": "explicit resume SHA",
             "sidecar_name": "sidecar_name",
             "sigusr1_checkpoint": "SIGUSR1 checkpoint",
+            "sigusr1_request_token": "SIGUSR1 request token",
         }
         raise LaunchError(
             "trainer contract is unavailable: "
@@ -2611,6 +2631,9 @@ def _production_checkpoint_scheduler(
             checkpoint_paths={
                 arm: launches[arm].checkpoint_path for arm in _ARMS
             },
+            request_token_paths={
+                arm: launches[arm].request_token_path for arm in _ARMS
+            },
             config_sha256={
                 arm: launches[arm].config_sha256 for arm in _ARMS
             },
@@ -2619,6 +2642,8 @@ def _production_checkpoint_scheduler(
                 for arm in _ARMS
             },
             s3_root=plan.runtime.s3_root,
+            runtime_uid=plan.runtime_uid,
+            runtime_gid=plan.runtime_gid,
         )
 
     def start_attempt(
@@ -2629,7 +2654,10 @@ def _production_checkpoint_scheduler(
                 mirror_request,
                 object_store=object_store,
                 staging_root=staging_root,
-            )
+            ),
+            cancel_cleanup=lambda: cleanup_checkpoint_request_tokens(
+                mirror_request
+            ),
         )
 
     scheduler = CheckpointMirrorScheduler(
