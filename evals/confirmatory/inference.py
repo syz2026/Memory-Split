@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections import defaultdict
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from decimal import Decimal
 from fractions import Fraction
 import math
 from statistics import fmean
@@ -24,6 +25,7 @@ V3_BOOTSTRAP_CONFIDENCE = 0.90
 V3_EQUIVALENCE_MARGIN = 0.01
 V3_SNAPSHOT_STEPS = SNAPSHOT_STEPS
 _V3_SEEDS = tuple(range(V3_CONFIRMATORY_SEED_COUNT))
+_V3_EQUIVALENCE_MARGIN_EXACT = Fraction(1, 100)
 _ALTERNATIVES = {"two-sided", "greater", "less"}
 
 
@@ -34,6 +36,49 @@ def _finite(value: object, name: str) -> float:
     if not math.isfinite(result):
         raise ValueError(f"{name} must be finite")
     return result
+
+
+def _exact_rational(value: object, name: str) -> Fraction:
+    if isinstance(value, bool):
+        raise ValueError(f"{name} must be an exact rational number")
+    if isinstance(value, Fraction):
+        return value
+    if type(value) is int:
+        return Fraction(value)
+    if isinstance(value, Decimal) and value.is_finite():
+        return Fraction(value)
+    exact_value = getattr(value, "exact_value", None)
+    if isinstance(exact_value, Fraction):
+        return exact_value
+    raise ValueError(
+        f"{name} must be an exact rational number, not a binary float"
+    )
+
+
+def _finite_number(value: object, name: str) -> float | Fraction:
+    if isinstance(value, Fraction):
+        return value
+    if isinstance(value, Decimal):
+        if not value.is_finite():
+            raise ValueError(f"{name} must be finite")
+        return Fraction(value)
+    exact_value = getattr(value, "exact_value", None)
+    if isinstance(exact_value, Fraction):
+        return exact_value
+    return _finite(value, name)
+
+
+def _mean(
+    values: Sequence[float | Fraction],
+    *,
+    exact: bool,
+) -> float | Fraction:
+    if exact:
+        exact_values = tuple(
+            _exact_rational(value, "arithmetic-mean value") for value in values
+        )
+        return sum(exact_values, Fraction()) / len(exact_values)
+    return fmean(values)
 
 
 def _positive_integer(value: object, name: str) -> int:
@@ -66,8 +111,8 @@ class PairedObservation:
     seed: int
     world_id: str
     pair_id: str
-    treatment: float
-    control: float
+    treatment: float | Fraction
+    control: float | Fraction
 
     def __post_init__(self) -> None:
         if isinstance(self.seed, bool) or not isinstance(self.seed, int) or self.seed < 0:
@@ -79,26 +124,26 @@ class PairedObservation:
         object.__setattr__(
             self,
             "treatment",
-            _finite(self.treatment, "treatment"),
+            _finite_number(self.treatment, "treatment"),
         )
         object.__setattr__(
             self,
             "control",
-            _finite(self.control, "control"),
+            _finite_number(self.control, "control"),
         )
 
     @property
-    def difference(self) -> float:
+    def difference(self) -> float | Fraction:
         return self.treatment - self.control
 
 
 @dataclass(frozen=True)
 class BootstrapEstimate:
-    estimate: float
-    ci_low: float
-    ci_high: float
-    seed_effects: tuple[float, ...]
-    replicates: tuple[float, ...]
+    estimate: float | Fraction
+    ci_low: float | Fraction
+    ci_high: float | Fraction
+    seed_effects: tuple[float | Fraction, ...]
+    replicates: tuple[float | Fraction, ...]
     n_seeds: int
     n_worlds: int
     n_pairs: int
@@ -109,14 +154,50 @@ class BootstrapEstimate:
     def __post_init__(self) -> None:
         if self.hierarchy != HIERARCHY:
             raise ValueError("bootstrap hierarchy must be seed/world/pair")
-        for name in ("estimate", "ci_low", "ci_high"):
-            _finite(getattr(self, name), name)
-        if self.ci_low > self.ci_high:
+        estimate = _finite_number(self.estimate, "estimate")
+        ci_low = _finite_number(self.ci_low, "ci_low")
+        ci_high = _finite_number(self.ci_high, "ci_high")
+        if ci_low > ci_high:
             raise ValueError("bootstrap interval bounds are reversed")
-        if len(self.seed_effects) != self.n_seeds:
+        if not isinstance(self.seed_effects, (list, tuple)):
+            raise ValueError("seed effects must be an ordered sequence")
+        if not isinstance(self.replicates, (list, tuple)):
+            raise ValueError("bootstrap replicates must be an ordered sequence")
+        seed_effects = tuple(
+            _finite_number(value, "seed effect") for value in self.seed_effects
+        )
+        replicates = tuple(
+            _finite_number(value, "bootstrap replicate")
+            for value in self.replicates
+        )
+        n_seeds = _positive_integer(self.n_seeds, "n_seeds")
+        n_worlds = _positive_integer(self.n_worlds, "n_worlds")
+        n_pairs = _positive_integer(self.n_pairs, "n_pairs")
+        n_resamples = _positive_integer(self.n_resamples, "n_resamples")
+        rng_seed = _rng_seed(self.rng_seed)
+        if len(seed_effects) != n_seeds:
             raise ValueError("seed effect count does not match n_seeds")
-        if len(self.replicates) != self.n_resamples:
+        if len(replicates) != n_resamples:
             raise ValueError("replicate count does not match n_resamples")
+        if not n_seeds <= n_worlds <= n_pairs:
+            raise ValueError(
+                "bootstrap counts must satisfy n_seeds <= n_worlds <= n_pairs"
+            )
+        exact = all(isinstance(value, Fraction) for value in seed_effects)
+        if estimate != _mean(seed_effects, exact=exact):
+            raise ValueError("bootstrap estimate disagrees with seed effects")
+        if ci_low < min(replicates) or ci_high > max(replicates):
+            raise ValueError("bootstrap interval lies outside its replicates")
+        object.__setattr__(self, "estimate", estimate)
+        object.__setattr__(self, "ci_low", ci_low)
+        object.__setattr__(self, "ci_high", ci_high)
+        object.__setattr__(self, "seed_effects", seed_effects)
+        object.__setattr__(self, "replicates", replicates)
+        object.__setattr__(self, "n_seeds", n_seeds)
+        object.__setattr__(self, "n_worlds", n_worlds)
+        object.__setattr__(self, "n_pairs", n_pairs)
+        object.__setattr__(self, "n_resamples", n_resamples)
+        object.__setattr__(self, "rng_seed", rng_seed)
 
 
 def nearest_rank_interval(
@@ -198,11 +279,17 @@ def _panel(
 
 def _seed_effect(
     worlds: Mapping[str, Sequence[PairedObservation]],
-) -> float:
-    return fmean(
-        fmean(row.difference for row in rows)
+    *,
+    exact: bool,
+) -> float | Fraction:
+    world_effects = tuple(
+        _mean(
+            tuple(row.difference for row in rows),
+            exact=exact,
+        )
         for rows in worlds.values()
     )
+    return _mean(world_effects, exact=exact)
 
 
 def _sample(
@@ -221,6 +308,7 @@ def _hierarchical_paired_bootstrap(
     confidence: float,
     required_seed_count: int,
     required_seeds: tuple[int, ...] | None = None,
+    exact: bool = False,
 ) -> BootstrapEstimate:
     count = _positive_integer(n_resamples, "n_resamples")
     seed_value = _rng_seed(rng_seed)
@@ -233,24 +321,48 @@ def _hierarchical_paired_bootstrap(
         required_seeds=required_seeds,
     )
     seeds = tuple(panel)
-    seed_effects = tuple(_seed_effect(panel[seed]) for seed in seeds)
-    estimate = fmean(seed_effects)
+    seed_effects = tuple(
+        _seed_effect(panel[seed], exact=exact) for seed in seeds
+    )
+    estimate = _mean(seed_effects, exact=exact)
 
     rng = np.random.Generator(np.random.PCG64(seed_value))
-    replicates: list[float] = []
+    replicates: list[float | Fraction] = []
     for _ in range(count):
-        sampled_seed_effects = []
+        sampled_seed_effects: list[float | Fraction] = []
         for seed in _sample(seeds, rng):
             world_names = tuple(panel[seed])
-            sampled_world_effects = []
+            sampled_world_effects: list[float | Fraction] = []
             for world in _sample(world_names, rng):
                 pairs = panel[seed][world]
                 sampled_world_effects.append(
-                    fmean(row.difference for row in _sample(pairs, rng))
+                    _mean(
+                        tuple(
+                            row.difference for row in _sample(pairs, rng)
+                        ),
+                        exact=exact,
+                    )
                 )
-            sampled_seed_effects.append(fmean(sampled_world_effects))
-        replicates.append(fmean(sampled_seed_effects))
-    low, high = nearest_rank_interval(replicates, confidence_value)
+            sampled_seed_effects.append(
+                _mean(sampled_world_effects, exact=exact)
+            )
+        replicates.append(_mean(sampled_seed_effects, exact=exact))
+    if exact:
+        ordered = sorted(replicates)
+        tail = round((1.0 - confidence_value) / 2.0, 15)
+
+        def exact_index(percentile: float) -> int:
+            return min(
+                len(ordered) - 1,
+                max(0, math.ceil(percentile * len(ordered)) - 1),
+            )
+
+        low, high = (
+            ordered[exact_index(tail)],
+            ordered[exact_index(1.0 - tail)],
+        )
+    else:
+        low, high = nearest_rank_interval(replicates, confidence_value)
     return BootstrapEstimate(
         estimate=estimate,
         ci_low=low,
@@ -284,16 +396,25 @@ def hierarchical_paired_bootstrap(
 
 
 def v3_supports_practical_equivalence(
-    ci_low: float,
-    ci_high: float,
+    ci_low: object,
+    ci_high: object,
 ) -> bool:
     """Apply the frozen strict two-one-sided ±0.01 equivalence rule."""
 
-    low = _finite(ci_low, "practical-equivalence lower bound")
-    high = _finite(ci_high, "practical-equivalence upper bound")
+    low = _exact_rational(
+        ci_low,
+        "practical-equivalence lower bound",
+    )
+    high = _exact_rational(
+        ci_high,
+        "practical-equivalence upper bound",
+    )
     if low > high:
         raise ValueError("practical-equivalence interval bounds are reversed")
-    return low > -V3_EQUIVALENCE_MARGIN and high < V3_EQUIVALENCE_MARGIN
+    return (
+        low > -_V3_EQUIVALENCE_MARGIN_EXACT
+        and high < _V3_EQUIVALENCE_MARGIN_EXACT
+    )
 
 
 @dataclass(frozen=True)
@@ -306,6 +427,19 @@ class PracticalEquivalenceBounds:
     def __post_init__(self) -> None:
         if not isinstance(self.bootstrap, BootstrapEstimate):
             raise TypeError("practical-equivalence bootstrap is invalid")
+        _exact_rational(
+            self.bootstrap.ci_low,
+            "practical-equivalence lower bound",
+        )
+        _exact_rational(
+            self.bootstrap.ci_high,
+            "practical-equivalence upper bound",
+        )
+        for value in (
+            *self.bootstrap.seed_effects,
+            *self.bootstrap.replicates,
+        ):
+            _exact_rational(value, "practical-equivalence bootstrap value")
         if (
             self.bootstrap.n_seeds != V3_CONFIRMATORY_SEED_COUNT
             or self.bootstrap.n_resamples != V3_BOOTSTRAP_DRAWS
@@ -338,20 +472,21 @@ def v3_practical_equivalence_bounds(
         confidence=V3_BOOTSTRAP_CONFIDENCE,
         required_seed_count=V3_CONFIRMATORY_SEED_COUNT,
         required_seeds=_V3_SEEDS,
+        exact=True,
     )
     return PracticalEquivalenceBounds(bootstrap=bootstrap)
 
 
 def v3_right_step_aulc(
-    points: Sequence[tuple[int, float]],
-) -> float:
+    points: Sequence[tuple[int, object]],
+) -> Fraction:
     """Integrate the five frozen checkpoint values as a right-step curve."""
 
     if isinstance(points, (str, bytes)) or not isinstance(points, Sequence):
         raise ValueError("AULC points must be an ordered sequence")
     if len(points) != len(V3_SNAPSHOT_STEPS):
         raise ValueError("AULC requires the five frozen optimizer steps")
-    materialized: list[tuple[int, float]] = []
+    materialized: list[tuple[int, Fraction]] = []
     for index, point in enumerate(points):
         if (
             not isinstance(point, (list, tuple))
@@ -360,13 +495,16 @@ def v3_right_step_aulc(
         ):
             raise ValueError(f"AULC point {index} is invalid")
         materialized.append(
-            (point[0], _finite(point[1], f"AULC value {index}"))
+            (
+                point[0],
+                _exact_rational(point[1], f"AULC value {index}"),
+            )
         )
     steps = tuple(step for step, _ in materialized)
     if steps != V3_SNAPSHOT_STEPS:
         raise ValueError("AULC points disagree with the ordered optimizer steps")
     previous = 0
-    area = 0.0
+    area = Fraction()
     for step, value in materialized:
         area += (step - previous) * value
         previous = step
@@ -378,7 +516,7 @@ class ExactTestResult:
     method: str
     alternative: str
     n: int
-    statistic: float | int
+    statistic: float | int | Fraction
     extreme_count: int
     assignments: int
     p_value: float
@@ -389,7 +527,7 @@ class ExactTestResult:
         _alternative(self.alternative)
         if isinstance(self.n, bool) or not isinstance(self.n, int) or self.n < 0:
             raise ValueError("exact test n must be non-negative")
-        _finite(self.statistic, "exact test statistic")
+        _finite_number(self.statistic, "exact test statistic")
         if (
             isinstance(self.extreme_count, bool)
             or not isinstance(self.extreme_count, int)
@@ -405,11 +543,26 @@ class ExactTestResult:
         if p_value != self.extreme_count / self.assignments:
             raise ValueError("exact test p-value disagrees with assignment counts")
 
+    @property
+    def exact_p_value(self) -> Fraction:
+        return Fraction(self.extreme_count, self.assignments)
+
 
 def _differences(values: Sequence[float]) -> tuple[float, ...]:
     if isinstance(values, (str, bytes)) or not isinstance(values, Sequence):
         raise ValueError("paired differences must be an ordered sequence")
     result = tuple(_finite(value, "paired difference") for value in values)
+    if not result:
+        raise ValueError("paired differences must not be empty")
+    return result
+
+
+def _exact_differences(values: Sequence[object]) -> tuple[Fraction, ...]:
+    if isinstance(values, (str, bytes)) or not isinstance(values, Sequence):
+        raise ValueError("paired differences must be an ordered sequence")
+    result = tuple(
+        _exact_rational(value, "paired difference") for value in values
+    )
     if not result:
         raise ValueError("paired differences must not be empty")
     return result
@@ -461,17 +614,35 @@ def exact_sign_flip_test(
 
 
 def v3_exact_sign_flip_test(
-    differences: Sequence[float],
+    differences: Sequence[object],
 ) -> ExactTestResult:
     """Run the frozen one-sided exhaustive sign flip over exactly ten pairs."""
 
-    values = _differences(differences)
+    values = _exact_differences(differences)
     if len(values) != V3_CONFIRMATORY_SEED_COUNT:
         raise ValueError("v3 exact sign-flip test requires exactly ten pairs")
-    result = exact_sign_flip_test(values, alternative="greater")
-    if result.assignments != V3_SIGN_ASSIGNMENTS:
-        raise AssertionError("v3 exhaustive sign assignments are inconsistent")
-    return result
+    observed_sum = sum(values, Fraction())
+    observed = observed_sum / len(values)
+    magnitudes = tuple(abs(value) for value in values)
+    extreme = 0
+    for mask in range(V3_SIGN_ASSIGNMENTS):
+        statistic = sum(
+            (
+                magnitude if mask & (1 << index) else -magnitude
+                for index, magnitude in enumerate(magnitudes)
+            ),
+            Fraction(),
+        )
+        extreme += statistic >= observed_sum
+    return ExactTestResult(
+        method="paired_sign_flip",
+        alternative="greater",
+        n=len(values),
+        statistic=observed,
+        extreme_count=extreme,
+        assignments=V3_SIGN_ASSIGNMENTS,
+        p_value=extreme / V3_SIGN_ASSIGNMENTS,
+    )
 
 
 def exact_paired_sign_test(

@@ -16,6 +16,7 @@ from msctl.aws_contracts import (
     SEEDS,
     SNAPSHOT_STEPS,
     checkpoint_object_key,
+    checkpoint_receipt_key,
 )
 
 
@@ -29,6 +30,9 @@ def _snapshots() -> list[dict]:
         for arm in ARMS:
             for step in SNAPSHOT_STEPS:
                 digest = _digest(seed, arm, step)
+                receipt_digest = hashlib.sha256(
+                    f"receipt:{seed}:{step}".encode("ascii")
+                ).hexdigest()
                 snapshots.append(
                     {
                         "seed": seed,
@@ -41,6 +45,13 @@ def _snapshots() -> list[dict]:
                             digest,
                         ),
                         "s3_version_id": f"version-{seed}-{arm}-{step}",
+                        "checkpoint_receipt_sha256": receipt_digest,
+                        "checkpoint_receipt_s3_object_key": (
+                            checkpoint_receipt_key(seed, receipt_digest)
+                        ),
+                        "checkpoint_receipt_s3_version_id": (
+                            f"receipt-version-{seed}-{step}"
+                        ),
                     }
                 )
     return snapshots
@@ -79,12 +90,17 @@ def test_v3_study_lock_binds_the_exact_ordered_100_snapshot_cohort():
         first.checkpoint_sha256,
     )
     assert first.s3_version_id
+    assert first.checkpoint_receipt_s3_object_key == checkpoint_receipt_key(
+        first.seed,
+        first.checkpoint_receipt_sha256,
+    )
+    assert first.checkpoint_receipt_s3_version_id
 
     with pytest.raises(FrozenInstanceError):
         first.checkpoint_sha256 = "0" * 64
 
 
-@pytest.mark.parametrize("mutation", ["missing", "reordered", "replaced"])
+@pytest.mark.parametrize("mutation", ["missing", "reordered", "aliased"])
 def test_v3_study_lock_is_exact_and_slots_cannot_be_replaced(mutation):
     snapshots = _snapshots()
     if mutation == "missing":
@@ -92,16 +108,15 @@ def test_v3_study_lock_is_exact_and_slots_cannot_be_replaced(mutation):
     elif mutation == "reordered":
         snapshots[0], snapshots[1] = snapshots[1], snapshots[0]
     else:
-        replacement = dict(snapshots[0])
-        replacement["checkpoint_sha256"] = "0" * 64
-        replacement["s3_object_key"] = checkpoint_object_key(
-            replacement["seed"],
-            replacement["arm"],
-            replacement["checkpoint_sha256"],
-        )
-        snapshots[-1] = replacement
+        assert snapshots[0]["seed"] == snapshots[1]["seed"]
+        assert snapshots[0]["arm"] == snapshots[1]["arm"]
+        snapshots[1]["checkpoint_sha256"] = snapshots[0][
+            "checkpoint_sha256"
+        ]
+        snapshots[1]["s3_object_key"] = snapshots[0]["s3_object_key"]
+        snapshots[1]["s3_version_id"] = snapshots[0]["s3_version_id"]
 
-    with pytest.raises(ValueError, match="exact|ordered|100|slot"):
+    with pytest.raises(ValueError, match="exact|ordered|100|slot|alias|reuse"):
         StudyLockV3.from_dict(_lock(snapshots=snapshots))
 
 
@@ -123,6 +138,63 @@ def test_v3_study_lock_rejects_random_arms_wrong_keys_and_null_versions():
         null_version[0]["s3_version_id"] = version_id
         with pytest.raises(ValueError, match="version"):
             StudyLockV3.from_dict(_lock(snapshots=null_version))
+
+
+@pytest.mark.parametrize(
+    "field",
+    ["s3_version_id", "checkpoint_receipt_s3_version_id"],
+)
+@pytest.mark.parametrize(
+    "version_id",
+    [
+        None,
+        "",
+        "null",
+        "has space",
+        "has\ttab",
+        "has\nnewline",
+        "control-\x7f",
+        "x" * 1_025,
+    ],
+)
+def test_v3_study_lock_rejects_non_real_version_id_candidates(
+    field,
+    version_id,
+):
+    snapshots = _snapshots()
+    snapshots[0][field] = version_id
+
+    with pytest.raises(ValueError, match="version"):
+        StudyLockV3.from_dict(_lock(snapshots=snapshots))
+
+
+def test_v3_study_lock_accepts_bounded_printable_opaque_version_ids():
+    snapshots = _snapshots()
+    snapshots[0]["s3_version_id"] = "opaque-A+/=._~:1"
+    snapshots[0][
+        "checkpoint_receipt_s3_version_id"
+    ] = "opaque-receipt-A+/=._~:1"
+    snapshots[len(SNAPSHOT_STEPS)][
+        "checkpoint_receipt_s3_version_id"
+    ] = "opaque-receipt-A+/=._~:1"
+
+    lock = StudyLockV3.from_dict(_lock(snapshots=snapshots))
+
+    assert lock.snapshots[0].s3_version_id == "opaque-A+/=._~:1"
+    assert (
+        lock.snapshots[0].checkpoint_receipt_s3_version_id
+        == "opaque-receipt-A+/=._~:1"
+    )
+
+
+def test_v3_study_lock_rejects_wrong_checkpoint_receipt_reference():
+    snapshots = _snapshots()
+    snapshots[0]["checkpoint_receipt_s3_object_key"] = (
+        "receipts/checkpoints/wrong.json"
+    )
+
+    with pytest.raises(ValueError, match="receipt.*key"):
+        StudyLockV3.from_dict(_lock(snapshots=snapshots))
 
 
 def test_v3_study_lock_binds_frozen_preregistration_and_sealed_release_hashes():

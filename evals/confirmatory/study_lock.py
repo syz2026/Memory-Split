@@ -12,10 +12,11 @@ from evals.confirmatory.contracts import (
     CONTRACT_VERSION,
     ConditionId,
     STUDY_CONTRACT_VERSION,
+    StudyArm,
     canonical_sha256,
 )
 from msctl.aws_contracts import ARMS, SEEDS, SNAPSHOT_STEPS
-from msctl.aws_contracts import checkpoint_object_key
+from msctl.aws_contracts import checkpoint_object_key, checkpoint_receipt_key
 
 
 STUDY_LOCK_SCHEMA = "memorysplit.confirmatory.study-lock.v2"
@@ -28,7 +29,7 @@ FROZEN_PREREGISTRATION_SHA256_V3 = (
     "6b2b5da3e3dc3d533498a0aa9d1891f356134ce045b1553b74a0161d94cb81d7"
 )
 EXPECTED_STUDY_SLOTS_V3 = tuple(
-    (seed, arm, optimizer_step)
+    (seed, StudyArm(arm), optimizer_step)
     for seed in SEEDS
     for arm in ARMS
     for optimizer_step in SNAPSHOT_STEPS
@@ -71,6 +72,7 @@ REQUIRED_RECEIPTS = (
     *(f"control:{control_id}" for control_id in REQUIRED_CONTROL_IDS),
 )
 _SHA256_RE = re.compile(r"[0-9a-f]{64}")
+_MAX_S3_VERSION_ID_LENGTH = 1_024
 
 
 def _strict_fields(
@@ -92,6 +94,20 @@ def _string(value: object, name: str) -> str:
 def _hash(value: object, name: str) -> str:
     if not isinstance(value, str) or _SHA256_RE.fullmatch(value) is None:
         raise ValueError(f"{name} must be a lowercase SHA-256")
+    return value
+
+
+def _s3_version_id(value: object, name: str) -> str:
+    if (
+        not isinstance(value, str)
+        or not 1 <= len(value) <= _MAX_S3_VERSION_ID_LENGTH
+        or value == "null"
+        or not value.isprintable()
+        or any(character.isspace() for character in value)
+    ):
+        raise ValueError(
+            f"{name} must be a bounded printable non-null version candidate"
+        )
     return value
 
 
@@ -134,14 +150,17 @@ def _ordered_strings(
 
 @dataclass(frozen=True)
 class StudySnapshotBinding:
-    """Immutable S3 identity for one protected v3 snapshot slot."""
+    """Candidate S3 identity requiring later versioned HEAD/receipt replay."""
 
     seed: int
-    arm: str
+    arm: StudyArm
     optimizer_step: int
     checkpoint_sha256: str
     s3_object_key: str
     s3_version_id: str
+    checkpoint_receipt_sha256: str
+    checkpoint_receipt_s3_object_key: str
+    checkpoint_receipt_s3_version_id: str
 
     FIELDS: ClassVar[frozenset[str]] = frozenset(
         {
@@ -151,12 +170,19 @@ class StudySnapshotBinding:
             "checkpoint_sha256",
             "s3_object_key",
             "s3_version_id",
+            "checkpoint_receipt_sha256",
+            "checkpoint_receipt_s3_object_key",
+            "checkpoint_receipt_s3_version_id",
         }
     )
 
     def __post_init__(self) -> None:
         digest = _hash(self.checkpoint_sha256, "checkpoint_sha256")
-        expected_key = checkpoint_object_key(self.seed, self.arm, digest)
+        try:
+            arm = StudyArm(self.arm)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("study snapshot arm must be dense or split90") from exc
+        expected_key = checkpoint_object_key(self.seed, arm.value, digest)
         if (
             type(self.optimizer_step) is not int
             or self.optimizer_step not in SNAPSHOT_STEPS
@@ -168,10 +194,46 @@ class StudySnapshotBinding:
                 "S3 object key is not the canonical content-addressed "
                 "checkpoint key"
             )
-        version_id = _string(self.s3_version_id, "S3 version ID")
+        version_id = _s3_version_id(self.s3_version_id, "S3 version ID")
+        receipt_digest = _hash(
+            self.checkpoint_receipt_sha256,
+            "checkpoint receipt SHA-256",
+        )
+        expected_receipt_key = checkpoint_receipt_key(
+            self.seed,
+            receipt_digest,
+        )
+        receipt_key = _string(
+            self.checkpoint_receipt_s3_object_key,
+            "checkpoint receipt S3 object key",
+        )
+        if receipt_key != expected_receipt_key:
+            raise ValueError(
+                "checkpoint receipt S3 object key is not content-addressed"
+            )
+        receipt_version_id = _s3_version_id(
+            self.checkpoint_receipt_s3_version_id,
+            "checkpoint receipt S3 version ID",
+        )
         object.__setattr__(self, "checkpoint_sha256", digest)
+        object.__setattr__(self, "arm", arm)
         object.__setattr__(self, "s3_object_key", object_key)
         object.__setattr__(self, "s3_version_id", version_id)
+        object.__setattr__(
+            self,
+            "checkpoint_receipt_sha256",
+            receipt_digest,
+        )
+        object.__setattr__(
+            self,
+            "checkpoint_receipt_s3_object_key",
+            receipt_key,
+        )
+        object.__setattr__(
+            self,
+            "checkpoint_receipt_s3_version_id",
+            receipt_version_id,
+        )
 
     @classmethod
     def from_dict(cls, raw: Mapping[str, Any]) -> "StudySnapshotBinding":
@@ -181,11 +243,18 @@ class StudySnapshotBinding:
     def to_dict(self) -> dict[str, Any]:
         return {
             "seed": self.seed,
-            "arm": self.arm,
+            "arm": self.arm.value,
             "optimizer_step": self.optimizer_step,
             "checkpoint_sha256": self.checkpoint_sha256,
             "s3_object_key": self.s3_object_key,
             "s3_version_id": self.s3_version_id,
+            "checkpoint_receipt_sha256": self.checkpoint_receipt_sha256,
+            "checkpoint_receipt_s3_object_key": (
+                self.checkpoint_receipt_s3_object_key
+            ),
+            "checkpoint_receipt_s3_version_id": (
+                self.checkpoint_receipt_s3_version_id
+            ),
         }
 
 
@@ -240,6 +309,43 @@ class StudyLockV3:
         if slots != EXPECTED_STUDY_SLOTS_V3:
             raise ValueError(
                 "v3 study lock requires the exact ordered 100 snapshot slots"
+            )
+        checkpoint_hashes = tuple(
+            snapshot.checkpoint_sha256 for snapshot in snapshots
+        )
+        object_versions = tuple(
+            (snapshot.s3_object_key, snapshot.s3_version_id)
+            for snapshot in snapshots
+        )
+        if (
+            len(set(checkpoint_hashes)) != len(checkpoint_hashes)
+            or len(set(object_versions)) != len(object_versions)
+        ):
+            raise ValueError(
+                "v3 study lock rejects checkpoint alias or object reuse "
+                "across slots"
+            )
+        receipt_by_seed_step: dict[
+            tuple[int, int],
+            tuple[str, str, str],
+        ] = {}
+        for snapshot in snapshots:
+            seed_step = snapshot.seed, snapshot.optimizer_step
+            receipt = (
+                snapshot.checkpoint_receipt_sha256,
+                snapshot.checkpoint_receipt_s3_object_key,
+                snapshot.checkpoint_receipt_s3_version_id,
+            )
+            previous = receipt_by_seed_step.setdefault(seed_step, receipt)
+            if previous != receipt:
+                raise ValueError(
+                    "paired snapshot slots disagree on checkpoint receipt"
+                )
+        if len(set(receipt_by_seed_step.values())) != len(
+            receipt_by_seed_step
+        ):
+            raise ValueError(
+                "checkpoint receipt evidence is reused across seed/step slots"
             )
         object.__setattr__(self, "preregistration_sha256", preregistration)
         object.__setattr__(

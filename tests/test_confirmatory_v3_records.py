@@ -1,11 +1,16 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from fractions import Fraction
+import hashlib
 
 import pytest
 
 import evals.confirmatory as confirmatory
+from evals.confirmatory import contracts as contracts_module
+from evals.confirmatory import metrics as metrics_module
 from evals.confirmatory.contracts import (
+    Arm,
     CHECKPOINT_SCHEMA,
     CONTRACT_VERSION,
     ITEM_SCHEMA,
@@ -14,6 +19,7 @@ from evals.confirmatory.contracts import (
     STUDY_CHECKPOINT_SCHEMA,
     STUDY_CONTRACT_VERSION,
     STUDY_TARGETS_PER_UPDATE,
+    ItemRecord,
     StudyCheckpointRecord,
 )
 from evals.confirmatory.metrics import (
@@ -22,6 +28,19 @@ from evals.confirmatory.metrics import (
     StudyMetricsRecord,
     StudyOutcomeRecord,
     validate_study_outcome_binding,
+)
+from evals.confirmatory.study_lock import (
+    FROZEN_PREREGISTRATION_SHA256_V3,
+    STUDY_LOCK_SCHEMA_V3,
+    StudyLockV3,
+    StudySnapshotBinding,
+)
+from msctl.aws_contracts import (
+    ARMS,
+    SEEDS,
+    SNAPSHOT_STEPS,
+    checkpoint_object_key,
+    checkpoint_receipt_key,
 )
 
 
@@ -33,11 +52,13 @@ def test_confirmatory_package_exports_the_v3_foundation_api():
     assert confirmatory.StudyCheckpointRecord is StudyCheckpointRecord
     assert confirmatory.StudyOutcomeRecord is StudyOutcomeRecord
     assert confirmatory.StudyMetricsRecord is StudyMetricsRecord
+    assert confirmatory.StudyArm is contracts_module.StudyArm
     assert confirmatory.STUDY_CONTRACT_VERSION == 3
     assert confirmatory.STUDY_LOCK_SCHEMA_V3.endswith(".study-lock.v3")
     assert callable(confirmatory.v3_exact_sign_flip_test)
     assert callable(confirmatory.v3_practical_equivalence_bounds)
     assert callable(confirmatory.v3_right_step_aulc)
+    assert callable(confirmatory.exact_study_paired_delta)
 
 
 def _proof() -> list[dict]:
@@ -66,7 +87,7 @@ def _checkpoint(**changes) -> dict:
         "schema_version": STUDY_CONTRACT_VERSION,
         "checkpoint_sha256": "a" * 64,
         "model_id": "memorysplit-360m-v3",
-        "arm": "split",
+        "arm": "split90",
         "condition_id": "split90",
         "seed": 0,
         "optimizer_step": STEP,
@@ -92,7 +113,7 @@ def _outcome(**changes) -> dict:
         "seed": 0,
         "world_id": "world-1",
         "checkpoint_sha256": "a" * 64,
-        "arm": "split",
+        "arm": "split90",
         "condition_id": "split90",
         "optimizer_step": STEP,
         "raw_token_count": RAW_TOKENS,
@@ -103,6 +124,77 @@ def _outcome(**changes) -> dict:
     }
     value.update(changes)
     return value
+
+
+def _item(**changes) -> ItemRecord:
+    value = {
+        "record_type": ITEM_SCHEMA,
+        "schema_version": CONTRACT_VERSION,
+        "item_id": "item-1",
+        "pair_id": "pair-1",
+        "twin": "original",
+        "stratum": "composition_ood",
+        "family": "graph",
+        "world_id": "world-1",
+        "task": "path_composition",
+        "path_length": 2,
+        "composition_split": "heldout",
+        "composition_id": "P1/P2",
+        "prompt": "fixture prompt",
+        "initial_slots": ["Q1", None, None, None],
+        "store_id": "store-1",
+        "memory_mode": "memory_on",
+        "control": "correct",
+    }
+    value.update(changes)
+    return ItemRecord.from_dict(value)
+
+
+def _snapshot_digest(seed: int, arm: str, step: int) -> str:
+    if (seed, arm, step) == (0, "split90", STEP):
+        return "a" * 64
+    return hashlib.sha256(f"{seed}:{arm}:{step}".encode("ascii")).hexdigest()
+
+
+def _study_lock() -> StudyLockV3:
+    snapshots = []
+    for seed in SEEDS:
+        for arm in ARMS:
+            for step in SNAPSHOT_STEPS:
+                digest = _snapshot_digest(seed, arm, step)
+                receipt_digest = hashlib.sha256(
+                    f"receipt:{seed}:{step}".encode("ascii")
+                ).hexdigest()
+                snapshots.append(
+                    {
+                        "seed": seed,
+                        "arm": arm,
+                        "optimizer_step": step,
+                        "checkpoint_sha256": digest,
+                        "s3_object_key": checkpoint_object_key(
+                            seed,
+                            arm,
+                            digest,
+                        ),
+                        "s3_version_id": f"version-{seed}-{arm}-{step}",
+                        "checkpoint_receipt_sha256": receipt_digest,
+                        "checkpoint_receipt_s3_object_key": (
+                            checkpoint_receipt_key(seed, receipt_digest)
+                        ),
+                        "checkpoint_receipt_s3_version_id": (
+                            f"receipt-version-{seed}-{step}"
+                        ),
+                    }
+                )
+    return StudyLockV3.from_dict(
+        {
+            "record_type": STUDY_LOCK_SCHEMA_V3,
+            "schema_version": STUDY_CONTRACT_VERSION,
+            "preregistration_sha256": FROZEN_PREREGISTRATION_SHA256_V3,
+            "sealed_evaluation_release_sha256": "f" * 64,
+            "snapshots": snapshots,
+        }
+    )
 
 
 def _rate(numerator: int, denominator: int) -> dict:
@@ -135,7 +227,7 @@ def _metrics(**changes) -> dict:
         },
         "checkpoint_sha256": "a" * 64,
         "seed": 0,
-        "arm": "split",
+        "arm": "split90",
         "condition_id": "split90",
         "optimizer_step": STEP,
         "raw_token_count": RAW_TOKENS,
@@ -146,6 +238,66 @@ def _metrics(**changes) -> dict:
     return value
 
 
+def _metrics_at_rate(
+    numerator: int,
+    denominator: int,
+    *,
+    arm: str,
+    condition_id: str,
+    checkpoint_sha256: str,
+) -> StudyMetricsRecord:
+    record = _metrics(
+        primary_accuracy=numerator / denominator,
+        primary_cells={
+            cell: _rate(numerator, denominator)
+            for cell in (
+                "graph__composition_ood",
+                "graph__joint_ood",
+                "non_path__composition_ood",
+                "non_path__joint_ood",
+            )
+        },
+        overall_pair_accuracy=_rate(4 * numerator, 4 * denominator),
+        by_stratum={
+            "composition_ood": _rate(2 * numerator, 2 * denominator),
+            "joint_ood": _rate(2 * numerator, 2 * denominator),
+        },
+        by_family={
+            "graph": _rate(2 * numerator, 2 * denominator),
+            "non_path": _rate(2 * numerator, 2 * denominator),
+        },
+        arm=arm,
+        condition_id=condition_id,
+        checkpoint_sha256=checkpoint_sha256,
+    )
+    return StudyMetricsRecord.from_dict(record)
+
+
+def test_v3_paired_metric_delta_preserves_exact_rate_counts_at_margin():
+    dense = _metrics_at_rate(
+        10,
+        100,
+        arm="dense",
+        condition_id="dense",
+        checkpoint_sha256="9" * 64,
+    )
+    split90 = _metrics_at_rate(
+        11,
+        100,
+        arm="split90",
+        condition_id="split90",
+        checkpoint_sha256="a" * 64,
+    )
+
+    delta = metrics_module.exact_study_paired_delta(
+        split90=split90,
+        dense=dense,
+    )
+
+    assert delta == Fraction(1, 100)
+    assert not confirmatory.v3_supports_practical_equivalence(-delta, delta)
+
+
 def test_v3_study_records_round_trip_without_versioning_semantic_records():
     checkpoint = StudyCheckpointRecord.from_dict(_checkpoint())
     outcome = StudyOutcomeRecord.from_dict(_outcome())
@@ -154,6 +306,9 @@ def test_v3_study_records_round_trip_without_versioning_semantic_records():
     assert checkpoint.to_dict() == _checkpoint()
     assert outcome.to_dict() == _outcome()
     assert metrics.to_dict() == _metrics()
+    assert checkpoint.arm is contracts_module.StudyArm.SPLIT90
+    assert outcome.arm is contracts_module.StudyArm.SPLIT90
+    assert metrics.arm is contracts_module.StudyArm.SPLIT90
     assert STUDY_TARGETS_PER_UPDATE == 524_288
 
     assert CONTRACT_VERSION == 2
@@ -161,6 +316,14 @@ def test_v3_study_records_round_trip_without_versioning_semantic_records():
     assert SEALED_GOLD_SCHEMA.endswith(".sealed-gold.v2")
     assert STORE_SCHEMA.endswith(".store.v2")
     assert CHECKPOINT_SCHEMA.endswith(".checkpoint.v2")
+
+
+def test_v3_study_arm_is_explicit_without_changing_legacy_v2_arm():
+    assert {arm.value for arm in contracts_module.StudyArm} == {
+        "dense",
+        "split90",
+    }
+    assert {arm.value for arm in Arm} == {"dense", "split", "random"}
 
 
 @pytest.mark.parametrize(
@@ -207,25 +370,107 @@ def test_v3_study_records_are_restricted_to_n10_dense_and_split90(
         )
 
 
-def test_v3_outcome_binding_authenticates_step_and_raw_token_identity():
+def _binding_records():
     checkpoint = StudyCheckpointRecord.from_dict(_checkpoint())
     outcome = StudyOutcomeRecord.from_dict(_outcome())
+    item = _item()
+    lock = _study_lock()
+    snapshot = next(
+        snapshot
+        for snapshot in lock.snapshots
+        if (
+            snapshot.seed,
+            snapshot.arm,
+            snapshot.optimizer_step,
+        )
+        == (0, "split90", STEP)
+    )
+    return item, checkpoint, outcome, snapshot, lock
+
+
+def test_v3_outcome_binding_authenticates_item_checkpoint_and_lock_snapshot():
+    item, checkpoint, outcome, snapshot, lock = _binding_records()
 
     assert (
         validate_study_outcome_binding(
             outcome=outcome,
+            item=item,
             checkpoint=checkpoint,
+            snapshot=snapshot,
+            lock=lock,
         )
         is outcome
     )
 
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("item_id", "other-item"),
+        ("pair_id", "other-pair"),
+        ("twin", "counterfactual"),
+        ("world_id", "other-world"),
+        ("family", "non_path"),
+        ("stratum", "joint_ood"),
+        ("memory_mode", "memory_off"),
+        ("control", "no_query"),
+    ],
+)
+def test_v3_outcome_binding_rejects_every_crossed_item_identity(field, value):
+    item, checkpoint, outcome, snapshot, lock = _binding_records()
+
+    with pytest.raises(ValueError, match=field):
+        validate_study_outcome_binding(
+            outcome=replace(outcome, **{field: value}),
+            item=item,
+            checkpoint=checkpoint,
+            snapshot=snapshot,
+            lock=lock,
+        )
+
+
+def test_v3_outcome_binding_rejects_checkpoint_and_object_replacements():
+    item, checkpoint, outcome, snapshot, lock = _binding_records()
+    later_step = 3_396
+
     with pytest.raises(ValueError, match="optimizer_step"):
         validate_study_outcome_binding(
-            outcome=replace(outcome, optimizer_step=3_396),
+            outcome=replace(
+                outcome,
+                optimizer_step=later_step,
+                raw_token_count=later_step * STUDY_TARGETS_PER_UPDATE,
+            ),
+            item=item,
             checkpoint=checkpoint,
+            snapshot=snapshot,
+            lock=lock,
         )
-    with pytest.raises(ValueError, match="checkpoint"):
+
+    replacement_hash = "8" * 64
+    replacement_receipt_hash = "7" * 64
+    replacement = StudySnapshotBinding(
+        seed=snapshot.seed,
+        arm=snapshot.arm,
+        optimizer_step=snapshot.optimizer_step,
+        checkpoint_sha256=replacement_hash,
+        s3_object_key=checkpoint_object_key(
+            snapshot.seed,
+            snapshot.arm,
+            replacement_hash,
+        ),
+        s3_version_id="replacement-version",
+        checkpoint_receipt_sha256=replacement_receipt_hash,
+        checkpoint_receipt_s3_object_key=checkpoint_receipt_key(
+            snapshot.seed,
+            replacement_receipt_hash,
+        ),
+        checkpoint_receipt_s3_version_id="replacement-receipt-version",
+    )
+    with pytest.raises(ValueError, match="lock|object|checkpoint"):
         validate_study_outcome_binding(
-            outcome=replace(outcome, checkpoint_sha256="f" * 64),
+            outcome=outcome,
+            item=item,
             checkpoint=checkpoint,
+            snapshot=replacement,
+            lock=lock,
         )

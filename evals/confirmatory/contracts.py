@@ -89,6 +89,11 @@ class Arm(StrEnum):
     RANDOM_MASK = "random"
 
 
+class StudyArm(StrEnum):
+    DENSE = "dense"
+    SPLIT90 = "split90"
+
+
 class ConditionId(StrEnum):
     DENSE = "dense"
     SPLIT90 = "split90"
@@ -167,18 +172,18 @@ def validate_study_record_identity(
     condition_id: object,
     optimizer_step: object,
     raw_token_count: object,
-) -> tuple[int, Arm, ConditionId, int, int]:
+) -> tuple[int, StudyArm, ConditionId, int, int]:
     """Validate one protected AWS N=10 arm/checkpoint identity."""
 
     if type(seed) is not int or seed not in STUDY_SEEDS:
         raise ValueError("study seed must be an exact integer from 0 to 9")
-    typed_arm = _enum(arm, Arm, "arm")
+    typed_arm = _enum(arm, StudyArm, "arm")
     typed_condition = _enum(condition_id, ConditionId, "condition_id")
     if typed_condition.value not in STUDY_CONDITIONS:
         raise ValueError("study condition_id must be dense or split90")
     expected_arm = {
-        ConditionId.DENSE: Arm.DENSE,
-        ConditionId.SPLIT90: Arm.SPLIT,
+        ConditionId.DENSE: StudyArm.DENSE,
+        ConditionId.SPLIT90: StudyArm.SPLIT90,
     }[typed_condition]
     if typed_arm is not expected_arm:
         raise ValueError("study condition_id disagrees with arm")
@@ -712,7 +717,7 @@ class StudyCheckpointRecord:
     schema_version: int
     checkpoint_sha256: str
     model_id: str
-    arm: Arm
+    arm: StudyArm
     condition_id: ConditionId
     seed: int
     optimizer_step: int
@@ -747,20 +752,6 @@ class StudyCheckpointRecord:
                 f"{STUDY_CHECKPOINT_SCHEMA}"
             )
         _study_schema_version(self.schema_version, "study checkpoint")
-        base = CheckpointRecord(
-            record_type=CHECKPOINT_SCHEMA,
-            schema_version=CONTRACT_VERSION,
-            checkpoint_sha256=self.checkpoint_sha256,
-            model_id=self.model_id,
-            arm=self.arm,
-            condition_id=self.condition_id,
-            seed=self.seed,
-            raw_token_count=self.raw_token_count,
-            configuration_sha256=self.configuration_sha256,
-            route_dose_sha256=self.route_dose_sha256,
-            corpus_sha256=self.corpus_sha256,
-            code_sha256=self.code_sha256,
-        )
         (
             seed,
             arm,
@@ -768,11 +759,29 @@ class StudyCheckpointRecord:
             optimizer_step,
             raw_token_count,
         ) = validate_study_record_identity(
-            seed=base.seed,
-            arm=base.arm,
-            condition_id=base.condition_id,
+            seed=self.seed,
+            arm=self.arm,
+            condition_id=self.condition_id,
             optimizer_step=self.optimizer_step,
-            raw_token_count=base.raw_token_count,
+            raw_token_count=self.raw_token_count,
+        )
+        legacy_arm = {
+            StudyArm.DENSE: Arm.DENSE,
+            StudyArm.SPLIT90: Arm.SPLIT,
+        }[arm]
+        base = CheckpointRecord(
+            record_type=CHECKPOINT_SCHEMA,
+            schema_version=CONTRACT_VERSION,
+            checkpoint_sha256=self.checkpoint_sha256,
+            model_id=self.model_id,
+            arm=legacy_arm,
+            condition_id=condition_id,
+            seed=seed,
+            raw_token_count=raw_token_count,
+            configuration_sha256=self.configuration_sha256,
+            route_dose_sha256=self.route_dose_sha256,
+            corpus_sha256=self.corpus_sha256,
+            code_sha256=self.code_sha256,
         )
         for field in (
             "checkpoint_sha256",

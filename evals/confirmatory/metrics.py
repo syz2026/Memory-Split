@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections import defaultdict
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
+from fractions import Fraction
 import math
 import re
 from types import MappingProxyType
@@ -23,16 +24,19 @@ from evals.confirmatory.contracts import (
     StoreRecord,
     Stratum,
     STUDY_CONTRACT_VERSION,
+    StudyArm,
     StudyCheckpointRecord,
     Twin,
     validate_study_record_identity,
 )
 from evals.confirmatory.actions import ActionSlot, validate_action_slots
+from evals.confirmatory.study_lock import StudyLockV3, StudySnapshotBinding
 from evals.confirmatory.solver import (
     ProofAnswerVerification,
     registered_solver,
     verify_proof_and_answer,
 )
+from msctl.aws_contracts import checkpoint_object_key
 
 
 _SHA256_RE = re.compile(r"[0-9a-f]{64}")
@@ -55,6 +59,13 @@ def _enum(value, enum_type, name: str):
         return enum_type(value)
     except (TypeError, ValueError) as exc:
         raise ValueError(f"{name} is not an approved value") from exc
+
+
+def _legacy_arm(arm: StudyArm) -> Arm:
+    return {
+        StudyArm.DENSE: Arm.DENSE,
+        StudyArm.SPLIT90: Arm.SPLIT,
+    }[arm]
 
 
 def _nonempty(value: object, name: str) -> str:
@@ -232,7 +243,7 @@ class StudyOutcomeRecord:
     seed: int
     world_id: str
     checkpoint_sha256: str
-    arm: Arm
+    arm: StudyArm
     condition_id: ConditionId
     optimizer_step: int
     raw_token_count: int
@@ -265,22 +276,6 @@ class StudyOutcomeRecord:
     )
 
     def __post_init__(self) -> None:
-        base = ItemOutcome(
-            item_id=self.item_id,
-            pair_id=self.pair_id,
-            twin=self.twin,
-            stratum=self.stratum,
-            family=self.family,
-            seed=self.seed,
-            world_id=self.world_id,
-            checkpoint_sha256=self.checkpoint_sha256,
-            arm=self.arm,
-            condition_id=self.condition_id,
-            memory_mode=self.memory_mode,
-            control=self.control,
-            submitted_answer=self.submitted_answer,
-            submitted_proof=self.submitted_proof,
-        )
         (
             seed,
             arm,
@@ -288,11 +283,27 @@ class StudyOutcomeRecord:
             optimizer_step,
             raw_token_count,
         ) = validate_study_record_identity(
-            seed=base.seed,
-            arm=base.arm,
-            condition_id=base.condition_id,
+            seed=self.seed,
+            arm=self.arm,
+            condition_id=self.condition_id,
             optimizer_step=self.optimizer_step,
             raw_token_count=self.raw_token_count,
+        )
+        base = ItemOutcome(
+            item_id=self.item_id,
+            pair_id=self.pair_id,
+            twin=self.twin,
+            stratum=self.stratum,
+            family=self.family,
+            seed=seed,
+            world_id=self.world_id,
+            checkpoint_sha256=self.checkpoint_sha256,
+            arm=_legacy_arm(arm),
+            condition_id=condition_id,
+            memory_mode=self.memory_mode,
+            control=self.control,
+            submitted_answer=self.submitted_answer,
+            submitted_proof=self.submitted_proof,
         )
         for field in (
             "item_id",
@@ -358,16 +369,39 @@ class StudyOutcomeRecord:
 def validate_study_outcome_binding(
     *,
     outcome: StudyOutcomeRecord,
+    item: ItemRecord,
     checkpoint: StudyCheckpointRecord,
+    snapshot: StudySnapshotBinding,
+    lock: StudyLockV3,
 ) -> StudyOutcomeRecord:
-    """Authenticate every checkpoint and step attribution on one v3 outcome."""
+    """Authenticate one v3 outcome across item, checkpoint, and locked object."""
 
     if not isinstance(outcome, StudyOutcomeRecord):
         raise TypeError("study outcome binding requires a StudyOutcomeRecord")
+    if not isinstance(item, ItemRecord):
+        raise TypeError("study outcome binding requires an ItemRecord")
     if not isinstance(checkpoint, StudyCheckpointRecord):
         raise TypeError(
             "study outcome binding requires a StudyCheckpointRecord"
         )
+    if not isinstance(snapshot, StudySnapshotBinding):
+        raise TypeError(
+            "study outcome binding requires a StudySnapshotBinding"
+        )
+    if not isinstance(lock, StudyLockV3):
+        raise TypeError("study outcome binding requires a StudyLockV3")
+    for field in (
+        "item_id",
+        "pair_id",
+        "twin",
+        "world_id",
+        "family",
+        "stratum",
+        "memory_mode",
+        "control",
+    ):
+        if getattr(outcome, field) != getattr(item, field):
+            raise ValueError(f"study outcome item mismatch: {field}")
     for field in (
         "checkpoint_sha256",
         "seed",
@@ -378,6 +412,40 @@ def validate_study_outcome_binding(
     ):
         if getattr(outcome, field) != getattr(checkpoint, field):
             raise ValueError(f"study outcome checkpoint mismatch: {field}")
+    for field in (
+        "checkpoint_sha256",
+        "seed",
+        "arm",
+        "optimizer_step",
+    ):
+        if getattr(snapshot, field) != getattr(checkpoint, field):
+            raise ValueError(f"study lock snapshot mismatch: {field}")
+    expected_key = checkpoint_object_key(
+        checkpoint.seed,
+        checkpoint.arm.value,
+        checkpoint.checkpoint_sha256,
+    )
+    if snapshot.s3_object_key != expected_key:
+        raise ValueError("study lock snapshot object key mismatch")
+    locked_snapshot = next(
+        (
+            value
+            for value in lock.snapshots
+            if (
+                value.seed,
+                value.arm,
+                value.optimizer_step,
+            )
+            == (
+                checkpoint.seed,
+                checkpoint.arm,
+                checkpoint.optimizer_step,
+            )
+        ),
+        None,
+    )
+    if locked_snapshot != snapshot:
+        raise ValueError("study lock snapshot object identity was replaced")
     return outcome
 
 
@@ -497,6 +565,10 @@ class Rate:
     def value(self) -> float:
         return self.numerator / self.denominator
 
+    @property
+    def exact_value(self) -> Fraction:
+        return Fraction(self.numerator, self.denominator)
+
     @classmethod
     def from_dict(cls, raw: Mapping[str, Any], name: str = "rate") -> "Rate":
         value = _strict_fields(
@@ -595,9 +667,17 @@ class PairMetricSummary:
             or any(not isinstance(rate, Rate) for rate in self.by_family.values())
         ):
             raise ValueError("family diagnostics must contain both families")
-        expected_primary = sum(
-            rate.value for rate in self.primary_cells.values()
-        ) / len(PRIMARY_CELLS)
+        exact_primary = (
+            sum(
+                (
+                    rate.exact_value
+                    for rate in self.primary_cells.values()
+                ),
+                Fraction(),
+            )
+            / len(PRIMARY_CELLS)
+        )
+        expected_primary = float(exact_primary)
         if primary_accuracy != expected_primary:
             raise ValueError("primary_accuracy disagrees with primary cells")
         for name, rates in (
@@ -636,6 +716,19 @@ class PairMetricSummary:
         """Compatibility name for the frozen equal-primary-cell accuracy."""
 
         return self.primary_accuracy
+
+    @property
+    def exact_primary_accuracy(self) -> Fraction:
+        return (
+            sum(
+                (
+                    rate.exact_value
+                    for rate in self.primary_cells.values()
+                ),
+                Fraction(),
+            )
+            / len(PRIMARY_CELLS)
+        )
 
     @classmethod
     def from_dict(cls, raw: Mapping[str, Any]) -> "PairMetricSummary":
@@ -718,7 +811,7 @@ class StudyMetricsRecord:
     by_family: Mapping[ReasoningFamily, Rate]
     checkpoint_sha256: str
     seed: int
-    arm: Arm
+    arm: StudyArm
     condition_id: ConditionId
     optimizer_step: int
     raw_token_count: int
@@ -737,18 +830,6 @@ class StudyMetricsRecord:
     )
 
     def __post_init__(self) -> None:
-        summary = PairMetricSummary(
-            primary_accuracy=self.primary_accuracy,
-            primary_cells=self.primary_cells,
-            overall_pair_accuracy=self.overall_pair_accuracy,
-            by_stratum=self.by_stratum,
-            by_family=self.by_family,
-            checkpoint_sha256=self.checkpoint_sha256,
-            arm=self.arm,
-            condition_id=self.condition_id,
-            memory_mode=self.memory_mode,
-            control=self.control,
-        )
         (
             seed,
             arm,
@@ -757,10 +838,22 @@ class StudyMetricsRecord:
             raw_token_count,
         ) = validate_study_record_identity(
             seed=self.seed,
-            arm=summary.arm,
-            condition_id=summary.condition_id,
+            arm=self.arm,
+            condition_id=self.condition_id,
             optimizer_step=self.optimizer_step,
             raw_token_count=self.raw_token_count,
+        )
+        summary = PairMetricSummary(
+            primary_accuracy=self.primary_accuracy,
+            primary_cells=self.primary_cells,
+            overall_pair_accuracy=self.overall_pair_accuracy,
+            by_stratum=self.by_stratum,
+            by_family=self.by_family,
+            checkpoint_sha256=self.checkpoint_sha256,
+            arm=_legacy_arm(arm),
+            condition_id=condition_id,
+            memory_mode=self.memory_mode,
+            control=self.control,
         )
         for field in PairMetricSummary.FIELDS:
             object.__setattr__(self, field, getattr(summary, field))
@@ -778,9 +871,14 @@ class StudyMetricsRecord:
                 f"metrics record_type must be {STUDY_METRICS_SCHEMA}"
             )
         _study_schema_version(value["schema_version"], "study metrics")
+        study_arm = _enum(value["arm"], StudyArm, "arm")
         summary = PairMetricSummary.from_dict(
             {
-                field: value[field]
+                field: (
+                    _legacy_arm(study_arm).value
+                    if field == "arm"
+                    else value[field]
+                )
                 for field in PairMetricSummary.FIELDS
             }
         )
@@ -788,7 +886,9 @@ class StudyMetricsRecord:
             **{
                 field: getattr(summary, field)
                 for field in PairMetricSummary.FIELDS
+                if field != "arm"
             },
+            arm=study_arm,
             seed=value["seed"],
             optimizer_step=value["optimizer_step"],
             raw_token_count=value["raw_token_count"],
@@ -797,7 +897,11 @@ class StudyMetricsRecord:
     def to_dict(self) -> dict[str, Any]:
         summary = PairMetricSummary(
             **{
-                field: getattr(self, field)
+                field: (
+                    _legacy_arm(self.arm)
+                    if field == "arm"
+                    else getattr(self, field)
+                )
                 for field in PairMetricSummary.FIELDS
             }
         )
@@ -812,13 +916,64 @@ class StudyMetricsRecord:
             "by_family": value["by_family"],
             "checkpoint_sha256": value["checkpoint_sha256"],
             "seed": self.seed,
-            "arm": value["arm"],
+            "arm": self.arm.value,
             "condition_id": value["condition_id"],
             "optimizer_step": self.optimizer_step,
             "raw_token_count": self.raw_token_count,
             "memory_mode": value["memory_mode"],
             "control": value["control"],
         }
+
+
+def exact_study_paired_delta(
+    *,
+    split90: StudyMetricsRecord,
+    dense: StudyMetricsRecord,
+) -> Fraction:
+    """Return the exact Split90-minus-Dense primary metric contrast."""
+
+    if not isinstance(split90, StudyMetricsRecord) or not isinstance(
+        dense,
+        StudyMetricsRecord,
+    ):
+        raise TypeError("paired delta requires two StudyMetricsRecord values")
+    if (
+        split90.arm is not StudyArm.SPLIT90
+        or split90.condition_id is not ConditionId.SPLIT90
+        or dense.arm is not StudyArm.DENSE
+        or dense.condition_id is not ConditionId.DENSE
+    ):
+        raise ValueError("paired delta requires Split90 and Dense records")
+    for field in (
+        "seed",
+        "optimizer_step",
+        "raw_token_count",
+        "memory_mode",
+        "control",
+    ):
+        if getattr(split90, field) != getattr(dense, field):
+            raise ValueError(f"paired metric records disagree on {field}")
+    split_exact = PairMetricSummary(
+        **{
+            field: (
+                _legacy_arm(split90.arm)
+                if field == "arm"
+                else getattr(split90, field)
+            )
+            for field in PairMetricSummary.FIELDS
+        }
+    ).exact_primary_accuracy
+    dense_exact = PairMetricSummary(
+        **{
+            field: (
+                _legacy_arm(dense.arm)
+                if field == "arm"
+                else getattr(dense, field)
+            )
+            for field in PairMetricSummary.FIELDS
+        }
+    ).exact_primary_accuracy
+    return split_exact - dense_exact
 
 
 _PAIR_METADATA = (
