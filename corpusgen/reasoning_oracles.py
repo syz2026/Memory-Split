@@ -6,7 +6,7 @@ import math
 import re
 from collections import Counter, deque
 from collections.abc import Mapping
-from functools import lru_cache
+from functools import cache
 from typing import Any
 
 
@@ -38,9 +38,7 @@ def _matrix(value: object, *, square: bool = True) -> list[list[int]]:
     ):
         raise ReasoningOracleError("reasoning row has an invalid integer matrix")
     width = len(value[0])
-    if any(len(row) != width for row in value) or (
-        square and len(value) != width
-    ):
+    if any(len(row) != width for row in value) or (square and len(value) != width):
         raise ReasoningOracleError("reasoning row matrix shape is invalid")
     return [list(row) for row in value]
 
@@ -246,17 +244,11 @@ def _futoshiki(metadata: Mapping[str, Any]) -> str:
                 return
 
     if any(
-        len([value for value in row if value]) != len(set(value for value in row if value))
+        len([value for value in row if value]) != len({value for value in row if value})
         for row in grid
     ) or any(
         len([grid[row][column] for row in range(size) if grid[row][column]])
-        != len(
-            {
-                grid[row][column]
-                for row in range(size)
-                if grid[row][column]
-            }
-        )
+        != len({grid[row][column] for row in range(size) if grid[row][column]})
         for column in range(size)
     ):
         raise ReasoningOracleError("futoshiki clues violate Latin constraints")
@@ -334,8 +326,7 @@ def _ransom_note(
     note_counts = Counter(note)
     magazine_counts = Counter(magazine)
     answer = all(
-        magazine_counts[character] >= count
-        for character, count in note_counts.items()
+        magazine_counts[character] >= count for character, count in note_counts.items()
     )
     if answer != declared_solvable:
         raise ReasoningOracleError("ransom_note solvability metadata differs")
@@ -348,7 +339,11 @@ def _dice(metadata: Mapping[str, Any]) -> str:
         raise ReasoningOracleError("dice puzzle metadata is invalid")
     dice_text = puzzle.get("dice_str")
     target = puzzle.get("target")
-    if not isinstance(dice_text, str) or isinstance(target, bool) or not isinstance(target, int):
+    if (
+        not isinstance(dice_text, str)
+        or isinstance(target, bool)
+        or not isinstance(target, int)
+    ):
         raise ReasoningOracleError("dice inputs are invalid")
     dice = [int(value) for value in re.findall(r"1d(\d+)", dice_text)]
     if not dice or any(sides < 2 for sides in dice):
@@ -375,7 +370,10 @@ def _string_splitting(
     if (
         not isinstance(initial, (list, tuple))
         or len(initial) != 3
-        or any(isinstance(value, bool) or not isinstance(value, int) or value < 0 for value in initial)
+        or any(
+            isinstance(value, bool) or not isinstance(value, int) or value < 0
+            for value in initial
+        )
         or isinstance(maximum, bool)
         or not isinstance(maximum, int)
         or maximum <= 0
@@ -586,7 +584,7 @@ def _base_conversion(metadata: Mapping[str, Any]) -> str:
     return "".join(reversed(output))
 
 
-@lru_cache(maxsize=None)
+@cache
 def _prime_prefix(limit: int) -> tuple[int, ...]:
     if limit < 2:
         return tuple(0 for _ in range(limit + 1))

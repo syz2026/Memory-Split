@@ -19,8 +19,10 @@ from corpusgen.reasoning_expansion import (
     _ExactSubsetAccumulator,
     _PrefetchingRecordGenerator,
     _probe_generator,
+    _verify_record_manifest,
     load_expansion_recipe,
 )
+from train.tokenizer import get_tok
 
 
 class _FixtureGenerator:
@@ -29,7 +31,10 @@ class _FixtureGenerator:
     def generate(self, task: str, index: int) -> GeneratedRecord:
         offset = 0 if task == "logic" else 3
         length = self._LENGTHS[(index + offset) % len(self._LENGTHS)]
-        tokens = tuple((index + offset + position) % 997 for position in range(length))
+        tokens = (
+            *((index + offset + position) % 997 for position in range(length - 1)),
+            get_tok().EOT,
+        )
         digest = hashlib.sha256(
             canonical_json_bytes({"index": index, "task": task, "tokens": tokens})
         ).hexdigest()
@@ -115,8 +120,7 @@ def test_prefetch_preserves_serial_task_streams():
     recipe = _tiny_recipe()
     expected = {
         task.dataset: [
-            _FixtureGenerator().generate(task.dataset, index)
-            for index in range(37)
+            _FixtureGenerator().generate(task.dataset, index) for index in range(37)
         ]
         for task in recipe.tasks
     }
@@ -127,13 +131,53 @@ def test_prefetch_preserves_serial_task_streams():
     ) as generator:
         actual = {
             task.dataset: [
-                generator.generate(task.dataset, index)
-                for index in range(37)
+                generator.generate(task.dataset, index) for index in range(37)
             ]
             for task in reversed(recipe.tasks)
         }
 
     assert actual == expected
+
+
+def test_record_manifest_replays_every_emitted_record(tmp_path):
+    recipe = _tiny_recipe()
+    packed_path = tmp_path / "targets.bin"
+    manifest_path = tmp_path / "manifest.bin"
+    compiled = _compile_extension(
+        recipe,
+        _FixtureGenerator(),
+        packed_path,
+        manifest_path,
+        finish_window=80,
+        max_finish_candidates=256,
+    )
+    artifacts = {
+        "packed_targets": {
+            "bytes": packed_path.stat().st_size,
+            "path": packed_path.name,
+            "sha256": compiled["packed_stream_sha256"],
+        },
+        "record_manifest": {
+            "bytes": manifest_path.stat().st_size,
+            "path": manifest_path.name,
+            "sha256": compiled["manifest_sha256"],
+        },
+    }
+    report = _verify_record_manifest(
+        tmp_path,
+        recipe,
+        artifacts,
+        {
+            "packed_stream_sha256": compiled["packed_stream_sha256"],
+            "record_count": compiled["record_count"],
+            "record_stream_sha256": compiled["record_stream_sha256"],
+            "task_stats": compiled["task_stats"],
+        },
+        _FixtureGenerator(),
+    )
+
+    assert report["record_count"] == compiled["record_count"]
+    assert report["replayed_records"] == compiled["record_count"]
 
 
 @pytest.mark.skipif(

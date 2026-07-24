@@ -25,7 +25,7 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from fractions import Fraction
 from pathlib import Path, PurePosixPath
-from typing import Any, Protocol
+from typing import Any, Protocol, Self
 
 import numpy as np
 
@@ -36,7 +36,7 @@ from corpusgen.reasoning_oracles import (
     ReasoningOracleRejection,
     canonical_reasoning_answer,
 )
-from train.tokenizer import SPECIAL_TOKENS, VOCAB_SIZE, get_tok
+from train.tokenizer import VOCAB_SIZE, get_tok
 
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_RECIPE_PATH = ROOT / "configs" / "reasoning-dataset-v3.json"
@@ -423,8 +423,7 @@ def load_expansion_recipe(
         source_relative_path=source_relative,
         reasoning_gym_version=str(source["version"]),
         runtime_lock={
-            str(key): str(value)
-            for key, value in sorted(runtime_lock.items())
+            str(key): str(value) for key, value in sorted(runtime_lock.items())
         },
         tasks=tuple(tasks),
     )
@@ -519,9 +518,7 @@ def _actual_source_namespace(source_root: Path) -> tuple[set[str], set[str]]:
             path = current / name
             relative = path.relative_to(source_root).as_posix()
             metadata = path.lstat()
-            if not stat.S_ISDIR(metadata.st_mode) or stat.S_ISLNK(
-                metadata.st_mode
-            ):
+            if not stat.S_ISDIR(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode):
                 raise ReasoningExpansionError(
                     f"Reasoning Gym source directory is unsafe: {relative}"
                 )
@@ -546,12 +543,15 @@ def _reasoning_gym_tree_commitment(
     source_stage: Path,
     recipe: ExpansionRecipe,
 ) -> str:
-    selected, expected_files, expected_directories = (
-        _reasoning_gym_source_inventory(source_stage, recipe)
+    selected, expected_files, expected_directories = _reasoning_gym_source_inventory(
+        source_stage, recipe
     )
     source_root = source_stage / recipe.source_relative_path
     actual_files, actual_directories = _actual_source_namespace(source_root)
-    if actual_files != set(expected_files) or actual_directories != expected_directories:
+    if (
+        actual_files != set(expected_files)
+        or actual_directories != expected_directories
+    ):
         extra = sorted(
             (actual_files - set(expected_files))
             | (actual_directories - expected_directories)
@@ -589,8 +589,8 @@ def clean_reasoning_gym_bytecode(
 
     recipe = load_expansion_recipe(recipe_path)
     source_stage_root = Path(source_stage)
-    _selected, expected_files, expected_directories = (
-        _reasoning_gym_source_inventory(source_stage_root, recipe)
+    _selected, expected_files, expected_directories = _reasoning_gym_source_inventory(
+        source_stage_root, recipe
     )
     source_root = source_stage_root / recipe.source_relative_path
     actual_files, actual_directories = _actual_source_namespace(source_root)
@@ -770,8 +770,7 @@ class ReasoningGymGenerator:
                 f"Reasoning Gym {task} rejected its own oracle: {score!r}"
             )
         if any(
-            special in question or special in answer
-            for special in self.special_tokens
+            special in question or special in answer for special in self.special_tokens
         ):
             raise ReasoningExpansionError(
                 f"Reasoning Gym {task} contains a literal special token"
@@ -794,13 +793,17 @@ class ReasoningGymGenerator:
                 record_sha256=digest,
                 rejection_reason="overlength",
             )
-        if any(
-            isinstance(token, bool)
-            or not isinstance(token, int)
-            or token < 0
-            or token >= VOCAB_SIZE
-            for token in token_ids
-        ) or token_ids[-1] != self.tok.EOT or self.tok.EOT in token_ids[:-1]:
+        if (
+            any(
+                isinstance(token, bool)
+                or not isinstance(token, int)
+                or token < 0
+                or token >= VOCAB_SIZE
+                for token in token_ids
+            )
+            or token_ids[-1] != self.tok.EOT
+            or self.tok.EOT in token_ids[:-1]
+        ):
             raise ReasoningExpansionError(
                 f"Reasoning Gym {task} emitted an invalid token id"
             )
@@ -892,7 +895,7 @@ class _PrefetchingRecordGenerator:
                 state.future.cancel()
         self.executor.shutdown(wait=True, cancel_futures=True)
 
-    def __enter__(self) -> _PrefetchingRecordGenerator:
+    def __enter__(self) -> Self:
         return self
 
     def __exit__(self, *_args: object) -> None:
@@ -988,9 +991,7 @@ class _TokenWriter:
         self.record_stream_digest = hashlib.sha256(
             b"memorysplit-reasoning-record-stream-v2\0"
         )
-        self.task_ids = {
-            task.dataset: index for index, task in enumerate(recipe.tasks)
-        }
+        self.task_ids = {task.dataset: index for index, task in enumerate(recipe.tasks)}
         header = _MANIFEST_HEADER.pack(
             _MANIFEST_MAGIC,
             bytes.fromhex(recipe.sha256),
@@ -1441,9 +1442,7 @@ def _generator_artifacts(recipe: ExpansionRecipe) -> dict[str, str]:
         / "parallel"
         / "canonical.py",
         "corpusgen/reasoning_expansion.py": Path(__file__).resolve(),
-        "corpusgen/reasoning_oracles.py": ROOT
-        / "corpusgen"
-        / "reasoning_oracles.py",
+        "corpusgen/reasoning_oracles.py": ROOT / "corpusgen" / "reasoning_oracles.py",
         "train/tokenizer.py": ROOT / "train" / "tokenizer.py",
     }
     return {name: sha256_file(path) for name, path in sorted(paths.items())} | {
@@ -1594,9 +1593,7 @@ def build_reasoning_corpus(
     if output.exists() or output.is_symlink():
         raise FileExistsError(f"reasoning corpus destination exists: {output}")
     output.parent.mkdir(parents=True, exist_ok=True)
-    pointer = (
-        None if pointer_destination is None else Path(pointer_destination)
-    )
+    pointer = None if pointer_destination is None else Path(pointer_destination)
     if pointer is not None:
         if pointer.exists() or pointer.is_symlink():
             raise FileExistsError(f"reasoning corpus pointer exists: {pointer}")
@@ -1782,11 +1779,7 @@ def _verify_record_manifest(
 ) -> dict[str, Any]:
     manifest_path = root / artifacts["record_manifest"]["path"]
     packed_path = root / artifacts["packed_targets"]["path"]
-    flags = (
-        os.O_RDONLY
-        | getattr(os, "O_CLOEXEC", 0)
-        | getattr(os, "O_NOFOLLOW", 0)
-    )
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
     manifest_descriptor: int | None = None
     packed_descriptor: int | None = None
     try:
@@ -1816,9 +1809,7 @@ def _verify_record_manifest(
 
     manifest_digest = hashlib.sha256()
     packed_digest = hashlib.sha256()
-    record_stream_digest = hashlib.sha256(
-        b"memorysplit-reasoning-record-stream-v2\0"
-    )
+    record_stream_digest = hashlib.sha256(b"memorysplit-reasoning-record-stream-v2\0")
     expected_header = _MANIFEST_HEADER.pack(
         _MANIFEST_MAGIC,
         bytes.fromhex(recipe.sha256),
@@ -1842,9 +1833,7 @@ def _verify_record_manifest(
         if generator is not None
         else None
     )
-    replay_queue: list[
-        tuple[Future[GeneratedRecord], int, int, int, bytes]
-    ] = []
+    replay_queue: list[tuple[Future[GeneratedRecord], int, int, int, bytes]] = []
 
     def validate_buffer() -> None:
         nonlocal eot_count, maximum_token
@@ -1874,17 +1863,20 @@ def _verify_record_manifest(
         replay_queue.clear()
 
     try:
-        with os.fdopen(
-            manifest_descriptor,
-            "rb",
-            buffering=8 << 20,
-            closefd=False,
-        ) as manifest_handle, os.fdopen(
-            packed_descriptor,
-            "rb",
-            buffering=8 << 20,
-            closefd=False,
-        ) as packed_handle:
+        with (
+            os.fdopen(
+                manifest_descriptor,
+                "rb",
+                buffering=8 << 20,
+                closefd=False,
+            ) as manifest_handle,
+            os.fdopen(
+                packed_descriptor,
+                "rb",
+                buffering=8 << 20,
+                closefd=False,
+            ) as packed_handle,
+        ):
             header = manifest_handle.read(_MANIFEST_HEADER.size)
             if header != expected_header:
                 raise ReasoningExpansionError(
@@ -1900,9 +1892,7 @@ def _verify_record_manifest(
                     raise ReasoningExpansionError(
                         "reasoning record manifest has a partial entry"
                     )
-                task_id, token_count, source_index = _MANIFEST_RECORD.unpack(
-                    entry
-                )
+                task_id, token_count, source_index = _MANIFEST_RECORD.unpack(entry)
                 if task_id >= len(recipe.tasks):
                     raise ReasoningExpansionError(
                         "reasoning record manifest task id is invalid"
@@ -1916,10 +1906,7 @@ def _verify_record_manifest(
                         "reasoning record manifest ordering/length is invalid"
                     )
                 payload = packed_handle.read(token_count * 2)
-                if (
-                    len(payload) != token_count * 2
-                    or payload[-2:] != eot_bytes
-                ):
+                if len(payload) != token_count * 2 or payload[-2:] != eot_bytes:
                     raise ReasoningExpansionError(
                         "reasoning packed record is truncated or lacks terminal EOT"
                     )
@@ -1965,34 +1952,29 @@ def _verify_record_manifest(
         os.close(manifest_descriptor)
         os.close(packed_descriptor)
     if (
-        (
-            manifest_before.st_dev,
-            manifest_before.st_ino,
-            manifest_before.st_size,
-            manifest_before.st_mtime_ns,
-            manifest_before.st_ctime_ns,
-        )
-        != (
-            manifest_after.st_dev,
-            manifest_after.st_ino,
-            manifest_after.st_size,
-            manifest_after.st_mtime_ns,
-            manifest_after.st_ctime_ns,
-        )
-        or (
-            packed_before.st_dev,
-            packed_before.st_ino,
-            packed_before.st_size,
-            packed_before.st_mtime_ns,
-            packed_before.st_ctime_ns,
-        )
-        != (
-            packed_after.st_dev,
-            packed_after.st_ino,
-            packed_after.st_size,
-            packed_after.st_mtime_ns,
-            packed_after.st_ctime_ns,
-        )
+        manifest_before.st_dev,
+        manifest_before.st_ino,
+        manifest_before.st_size,
+        manifest_before.st_mtime_ns,
+        manifest_before.st_ctime_ns,
+    ) != (
+        manifest_after.st_dev,
+        manifest_after.st_ino,
+        manifest_after.st_size,
+        manifest_after.st_mtime_ns,
+        manifest_after.st_ctime_ns,
+    ) or (
+        packed_before.st_dev,
+        packed_before.st_ino,
+        packed_before.st_size,
+        packed_before.st_mtime_ns,
+        packed_before.st_ctime_ns,
+    ) != (
+        packed_after.st_dev,
+        packed_after.st_ino,
+        packed_after.st_size,
+        packed_after.st_mtime_ns,
+        packed_after.st_ctime_ns,
     ):
         raise ReasoningExpansionError(
             "reasoning record streams changed during verification"
@@ -2003,14 +1985,11 @@ def _verify_record_manifest(
         )
     if (
         manifest_before.st_size != artifacts["record_manifest"]["bytes"]
-        or manifest_digest.hexdigest()
-        != artifacts["record_manifest"]["sha256"]
+        or manifest_digest.hexdigest() != artifacts["record_manifest"]["sha256"]
         or packed_before.st_size != artifacts["packed_targets"]["bytes"]
         or packed_digest.hexdigest() != artifacts["packed_targets"]["sha256"]
-        or packed_digest.hexdigest()
-        != extension.get("packed_stream_sha256")
-        or record_stream_digest.hexdigest()
-        != extension.get("record_stream_sha256")
+        or packed_digest.hexdigest() != extension.get("packed_stream_sha256")
+        or record_stream_digest.hexdigest() != extension.get("record_stream_sha256")
         or record_count != extension.get("record_count")
     ):
         raise ReasoningExpansionError(
@@ -2134,7 +2113,10 @@ def verify_reasoning_corpus(
         "task_stats",
         "terminal_updates",
     }
-    if not isinstance(extension, Mapping) or set(extension) != expected_extension_fields:
+    if (
+        not isinstance(extension, Mapping)
+        or set(extension) != expected_extension_fields
+    ):
         raise ReasoningExpansionError("reasoning extension receipt is missing")
     record_count = _positive_int(
         extension.get("record_count"),
@@ -2179,9 +2161,7 @@ def verify_reasoning_corpus(
     if set(artifacts) != set(_EXTENSION_PATHS):
         raise ReasoningExpansionError("reasoning extension artifact set differs")
     expected_artifacts = _extension_artifacts(
-        manifest_bytes=(
-            _MANIFEST_HEADER.size + record_count * _MANIFEST_RECORD.size
-        ),
+        manifest_bytes=(_MANIFEST_HEADER.size + record_count * _MANIFEST_RECORD.size),
         manifest_sha256=_require_sha256(
             artifacts["record_manifest"].get("sha256"),
             "extension record manifest",
@@ -2197,9 +2177,8 @@ def verify_reasoning_corpus(
     if artifacts_list != [
         expected_artifacts[name] for name in sorted(expected_artifacts)
     ]:
-        raise ReasoningExpansionError(
-            "reasoning extension artifact order differs"
-        )
+        raise ReasoningExpansionError("reasoning extension artifact order differs")
+
     def require_ones(chunk: bytes) -> None:
         if chunk.strip(b"\x01"):
             raise ReasoningExpansionError(
@@ -2263,9 +2242,7 @@ def verify_reasoning_corpus(
         "extension_manifest_sha256": manifest_report["manifest_sha256"],
         "extension_packed_sha256": manifest_report["packed_sha256"],
         "extension_record_count": record_count,
-        "extension_record_stream_sha256": manifest_report[
-            "record_stream_sha256"
-        ],
+        "extension_record_stream_sha256": manifest_report["record_stream_sha256"],
         "extension_tokens": recipe.extension_tokens,
         "publication": str(root.resolve(strict=True)),
         "receipt_sha256": receipt_sha,
@@ -2305,12 +2282,8 @@ def _pointer_payload(
         "contract_id": recipe.contract_id,
         "expected_base_receipt_sha256": recipe.base_receipt_sha256,
         "expected_composite_stream_sha256": dict(composite),
-        "expected_extension_manifest_sha256": verified[
-            "extension_manifest_sha256"
-        ],
-        "expected_extension_packed_sha256": verified[
-            "extension_packed_sha256"
-        ],
+        "expected_extension_manifest_sha256": verified["extension_manifest_sha256"],
+        "expected_extension_packed_sha256": verified["extension_packed_sha256"],
         "expected_extension_record_stream_sha256": verified[
             "extension_record_stream_sha256"
         ],
@@ -2336,9 +2309,7 @@ def _publish_reasoning_pointer(
 ) -> dict[str, Any]:
     if pointer.exists() or pointer.is_symlink():
         raise FileExistsError(f"reasoning corpus pointer exists: {pointer}")
-    if pointer.parent.resolve(strict=True) != publication.parent.resolve(
-        strict=True
-    ):
+    if pointer.parent.resolve(strict=True) != publication.parent.resolve(strict=True):
         raise ReasoningExpansionError(
             "reasoning corpus and pointer must share a parent directory"
         )
@@ -2354,9 +2325,7 @@ def _publish_reasoning_pointer(
             or stat.S_ISLNK(metadata.st_mode)
             or metadata.st_nlink != 1
         ):
-            raise ReasoningExpansionError(
-                "reasoning pointer staging file is unsafe"
-            )
+            raise ReasoningExpansionError("reasoning pointer staging file is unsafe")
         descriptor = os.open(
             pointer.parent,
             os.O_RDONLY
@@ -2426,14 +2395,11 @@ def verify_reasoning_pointer(
         or raw.get("format") != POINTER_FORMAT
         or raw.get("schema_version") != 1
         or raw.get("launch_gate_status") != "frozen"
-        or raw.get("scientific_scope")
-        != "successor_exploratory_unpreregistered"
+        or raw.get("scientific_scope") != "successor_exploratory_unpreregistered"
         or raw.get("contract_id") != recipe.contract_id
         or raw.get("recipe_sha256") != recipe.sha256
-        or raw.get("expected_base_receipt_sha256")
-        != recipe.base_receipt_sha256
-        or raw.get("source_stage_receipt_sha256")
-        != recipe.source_stage_receipt_sha256
+        or raw.get("expected_base_receipt_sha256") != recipe.base_receipt_sha256
+        or raw.get("source_stage_receipt_sha256") != recipe.source_stage_receipt_sha256
         or raw.get("raw_target_tokens") != recipe.composite_tokens
         or raw.get("task_count") != len(recipe.tasks)
         or raw.get("receipt_relative_path") != "receipt.json"
@@ -2451,8 +2417,7 @@ def verify_reasoning_pointer(
         expected_receipt_sha256=raw["expected_receipt_sha256"],
     )
     if (
-        verified["base_receipt_sha256"]
-        != raw["expected_base_receipt_sha256"]
+        verified["base_receipt_sha256"] != raw["expected_base_receipt_sha256"]
         or verified["composite_stream_sha256"]
         != raw["expected_composite_stream_sha256"]
         or verified["extension_manifest_sha256"]
