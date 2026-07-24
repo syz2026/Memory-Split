@@ -2802,6 +2802,12 @@ def _supervise_pair_locked(
             if all(status == 0 for status in statuses.values()):
                 _terminate_all(tuple(processes.values()))
                 if finalizer is None:
+                    if plan.lifecycle_binding is not None:
+                        return SupervisionResult(
+                            status="FINALIZATION_FAILED",
+                            returncode=76,
+                            child_pids=child_pids,
+                        )
                     return SupervisionResult(
                         status="completed",
                         returncode=0,

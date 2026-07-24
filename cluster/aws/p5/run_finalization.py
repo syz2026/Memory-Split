@@ -257,11 +257,30 @@ def _strict_json(payload: bytes, *, label: str) -> dict[str, object]:
     return parsed
 
 
-def _pinned_bytes(path: Path | str, *, label: str) -> bytes:
+def _pinned_bytes(
+    path: Path | str,
+    *,
+    label: str,
+    owner_uid: int | None = None,
+    owner_gid: int | None = None,
+    expected_mode: int | None = None,
+) -> bytes:
     try:
-        payload, _metadata = _read_regular(Path(path), label=label)
+        payload, metadata = _read_regular(Path(path), label=label)
     except (OSError, ValueError) as error:
         raise _fail(f"{label} is missing, linked, or drifting") from error
+    if any(value is not None for value in (owner_uid, owner_gid, expected_mode)):
+        if (
+            type(owner_uid) is not int
+            or owner_uid < 0
+            or type(owner_gid) is not int
+            or owner_gid < 0
+            or type(expected_mode) is not int
+            or metadata.st_uid != owner_uid
+            or metadata.st_gid != owner_gid
+            or stat.S_IMODE(metadata.st_mode) != expected_mode
+        ):
+            raise _fail(f"{label} owner or mode is not the runtime identity")
     return payload
 
 
@@ -501,8 +520,18 @@ def parse_run_finalization_receipt_bytes(
     return value
 
 
-def _validate_log_bytes(payload: bytes, *, arm: str) -> None:
+def _validate_log_bytes(
+    payload: bytes,
+    *,
+    arm: str,
+    expected_tokens_per_step: int,
+) -> None:
     label = f"{arm} training log"
+    if (
+        type(expected_tokens_per_step) is not int
+        or expected_tokens_per_step <= 0
+    ):
+        raise _fail(f"{label} expected token geometry is invalid")
     if not isinstance(payload, bytes) or not payload:
         raise _fail(f"{label} is empty")
     if not payload.endswith(b"\n"):
@@ -532,6 +561,30 @@ def _validate_log_bytes(payload: bytes, *, arm: str) -> None:
         step = row["step"]
         if type(step) is not int or step <= 0 or step > TERMINAL_STEP:
             raise _fail(f"{label} row {index} step is invalid or post-terminal")
+        for field_name in ("epoch", "global_tokens", "tokens_per_step"):
+            value = row[field_name]
+            if type(value) is not int or value < 0:
+                raise _fail(f"{label} row {index} {field_name} is invalid")
+        if (
+            row["tokens_per_step"] != expected_tokens_per_step
+            or row["global_tokens"] != step * expected_tokens_per_step
+        ):
+            raise _fail(f"{label} row {index} token counts are inconsistent")
+        for field_name in (
+            "global_tok_s",
+            "loss",
+            "loss_ema",
+            "lr",
+            "tok_s",
+            *(
+                ("loss_masked_values",)
+                if "loss_masked_values" in row
+                else ()
+            ),
+        ):
+            value = row[field_name]
+            if type(value) not in (int, float) or not math.isfinite(value):
+                raise _fail(f"{label} row {index} {field_name} is invalid")
         if last_step is not None and step < last_step:
             raise _fail(f"{label} steps are not monotonically nondecreasing")
         last_step = step
@@ -751,6 +804,9 @@ def _admit_arm_evidence(
         payload = _pinned_bytes(
             snapshots_dir / name,
             label=f"{arm} snapshot step {step}",
+            owner_uid=plan.runtime_uid,
+            owner_gid=plan.runtime_gid,
+            expected_mode=0o600,
         )
         try:
             state = parse_model_snapshot_bytes(
@@ -794,8 +850,15 @@ def _admit_arm_evidence(
     log_payload = _pinned_bytes(
         run_dir / "log.jsonl",
         label=f"{arm} training log",
+        owner_uid=plan.runtime_uid,
+        owner_gid=plan.runtime_gid,
+        expected_mode=0o600,
     )
-    _validate_log_bytes(log_payload, arm=arm)
+    _validate_log_bytes(
+        log_payload,
+        arm=arm,
+        expected_tokens_per_step=launch.runtime_config["tokens_per_step"],
+    )
     log_digest = hashlib.sha256(log_payload).hexdigest()
     log = _StagedObject(
         key=log_object_key(seed, arm, log_digest),
@@ -826,27 +889,19 @@ def _lifecycle_object_metadata(
     plan: object,
     binding: ProviderLifecycleBinding,
 ) -> dict[str, str]:
+    lifecycle = binding.to_dict()
+    if set(lifecycle) != set(LIFECYCLE_BINDING_FIELDS):
+        raise _fail("provider lifecycle binding fields are not exact")
     return {
+        **{
+            field.replace("_", "-"): (
+                ",".join(value) if field == "arms" else str(value)
+            )
+            for field, value in lifecycle.items()
+        },
         "data-build-id": plan.dataset_build_id,
         "data-receipt-sha256": plan.dataset_receipt_sha256,
-        "hardware-amendment-sha256": binding.hardware_amendment_sha256,
-        "objective-controls-sha256": (
-            binding.objective_controls_contract_sha256
-        ),
         "ordered-stream-sha256": plan.ordered_stream_sha256,
-        "profile-id": binding.profile_id,
-        "profile-sha256": binding.profile_sha256,
-        "provider": binding.provider,
-        "provider-selection-sha256": binding.provider_selection_sha256,
-        "provider-selection-version-id": (
-            binding.provider_selection_version_id
-        ),
-        "qualification-evidence-sha256": (
-            binding.qualification_evidence_sha256
-        ),
-        "runtime-lock-sha256": binding.runtime_lock_sha256,
-        "runtime-sbom-sha256": binding.runtime_sbom_sha256,
-        "seed": str(binding.seed),
     }
 
 

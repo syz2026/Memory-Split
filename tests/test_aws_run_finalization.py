@@ -32,6 +32,7 @@ from msctl.aws_contracts import (
 )
 from msctl.aws_lifecycle import (
     AuthenticatedProviderLifecycle,
+    LIFECYCLE_BINDING_FIELDS,
     ProviderLifecycleBinding,
     lifecycle_operational_metadata,
 )
@@ -420,14 +421,18 @@ def _write_run_evidence(plan, *, log_steps=(20, 1_358, 6_791, TERMINAL_STEP)):
         snapshots = run_dir / "snapshots"
         snapshots.mkdir(parents=True, exist_ok=True)
         for step in SNAPSHOT_STEPS:
-            with (snapshots / f"step{step:07d}.pt").open("wb") as handle:
+            snapshot_path = snapshots / f"step{step:07d}.pt"
+            with snapshot_path.open("wb") as handle:
                 torch.save(_snapshot_state(plan, launch, step), handle)
-        (run_dir / "log.jsonl").write_bytes(
+            snapshot_path.chmod(0o600)
+        log_path = run_dir / "log.jsonl"
+        log_path.write_bytes(
             b"".join(
                 (json.dumps(_log_row(step)) + "\n").encode("ascii")
                 for step in log_steps
             )
         )
+        log_path.chmod(0o600)
 
 
 def _checkpoint_pair(
@@ -690,6 +695,20 @@ def test_clean_pair_publishes_twelve_objects_and_one_verified_receipt(
     assert store.put_order[:12] == expected_uris
     assert len(store.put_order) == 13
     assert store.put_order[-1] == result.receipt.uri
+    expected_lifecycle_metadata = {
+        field.replace("_", "-"): (
+            ",".join(value) if field == "arms" else str(value)
+        )
+        for field, value in binding.to_dict().items()
+        if field in LIFECYCLE_BINDING_FIELDS
+    }
+    assert set(expected_lifecycle_metadata) == {
+        field.replace("_", "-") for field in LIFECYCLE_BINDING_FIELDS
+    }
+    for uri in expected_uris:
+        metadata = store.objects[uri][2]
+        for key, value in expected_lifecycle_metadata.items():
+            assert metadata[key] == value
 
     payload, stored_sha256, _metadata, stored_version = store.objects[
         result.receipt.uri
@@ -946,6 +965,7 @@ def test_wrong_s3_root_fails_closed(tmp_path, monkeypatch):
         "wrong-step-snapshot",
         "hardlinked-snapshot",
         "symlinked-snapshot",
+        "wrong-mode-snapshot",
         "malformed-snapshot",
         "cross-arm-snapshot",
         "cross-selection-snapshot",
@@ -958,6 +978,7 @@ def test_wrong_s3_root_fails_closed(tmp_path, monkeypatch):
         "post-terminal-log",
         "nonmonotonic-log",
         "missing-terminal-log",
+        "nonnumeric-log",
         "foreign-log-fields",
     ],
 )
@@ -999,6 +1020,8 @@ def test_local_evidence_admission_fails_closed(
         moved = dense_snapshots / "aside.bin"
         original.rename(moved)
         original.symlink_to(moved)
+    elif mutation == "wrong-mode-snapshot":
+        (dense_snapshots / "step0001358.pt").chmod(0o640)
     elif mutation == "malformed-snapshot":
         (dense_snapshots / "step0001358.pt").write_bytes(b"not-a-snapshot")
     elif mutation == "cross-arm-snapshot":
@@ -1070,6 +1093,10 @@ def test_local_evidence_admission_fails_closed(
                 for step in (20, 1_358, 6_791)
             )
         )
+    elif mutation == "nonnumeric-log":
+        row = dict(_log_row(TERMINAL_STEP), loss="not-a-number")
+        with (dense_run / "log.jsonl").open("ab") as handle:
+            handle.write((json.dumps(row) + "\n").encode("ascii"))
     elif mutation == "foreign-log-fields":
         row = dict(_log_row(TERMINAL_STEP), gpu_temperature=80)
         with (dense_run / "log.jsonl").open("ab") as handle:
@@ -1079,6 +1106,25 @@ def test_local_evidence_admission_fails_closed(
 
     with pytest.raises(finalization.FinalizationError):
         _finalize(fixture, plan, pair=pair, store=store)
+    assert store.put_order == []
+    assert _receipt_uris(store) == []
+
+
+def test_local_evidence_owner_must_match_runtime_identity(
+    tmp_path,
+    monkeypatch,
+):
+    fixture, plan, pair, store = _prepared(tmp_path, monkeypatch)
+    _install_admit(monkeypatch, [fixture["lifecycle"]])
+    foreign_owner_plan = replace(plan, runtime_uid=plan.runtime_uid + 1)
+
+    with pytest.raises(finalization.FinalizationError, match="owner|mode"):
+        _finalize(
+            fixture,
+            foreign_owner_plan,
+            pair=pair,
+            store=store,
+        )
     assert store.put_order == []
     assert _receipt_uris(store) == []
 
@@ -1744,6 +1790,37 @@ def test_launcher_success_requires_finalization_and_exposes_references(
     )
     assert result.provider_selection_sha256 == "2" * 64
     assert result.provider_selection_version_id == "selection-version-1"
+
+
+def test_selected_provider_supervision_requires_finalizer(
+    tmp_path,
+    monkeypatch,
+):
+    from tests.test_aws_p5_launcher import _FakeProcess
+
+    fixture = _selected_fixture(tmp_path, profile_path=P5_PROFILE, seed=1)
+    plan = _authenticated_plan(fixture, monkeypatch)
+
+    result = _supervise(
+        plan,
+        finalizer=None,
+        processes={
+            "dense": _FakeProcess(101, [None, 0]),
+            "split90": _FakeProcess(202, [None, 0]),
+        },
+        checkpoint_scheduler_factory=lambda _plan, _pids: (
+            _LatestOnlyScheduler(latest=_latest_pair_sentinel()),
+            lambda reason: SimpleNamespace(reason=reason),
+        ),
+    )
+
+    assert result.status == "FINALIZATION_FAILED"
+    assert result.status != "completed"
+    assert result.returncode != 0
+    assert result.finalization_receipt_uri is None
+    assert result.finalization_receipt_version_id is None
+    assert result.provider_selection_sha256 is None
+    assert result.provider_selection_version_id is None
 
 
 def test_failing_finalization_is_reported_and_never_completed(tmp_path):
