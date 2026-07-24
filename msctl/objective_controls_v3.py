@@ -29,6 +29,49 @@ PREREGISTRATION_SHA256 = (
 COHORT_ASSIGNMENT_SHA256 = (
     "47faf6f15e13336f67666081c3d0ebf5be3b981f3d2ac455385faa39e543199c"
 )
+AMENDMENT_SHA256 = (
+    "376e6a2234fc89aac3baea52e09d40ac08f841102e33fde9daf473a4ca589bf8"
+)
+MANIFEST_SHA256 = (
+    "a03194591977fccaec4acd0c74c2bc13484f40854208948c7172f2bea4fe8781"
+)
+CONFIG_SHA256S = (
+    (
+        "configs/29m-v3/full_corpus_dense.yaml",
+        "653d65470f862babe78cbeda9e6200f0eaa98428435fd5b6935f115e3f59d472",
+    ),
+    (
+        "configs/29m-v3/full_corpus_split90.yaml",
+        "54042c4964ba5a6614827f1dda45381c8d86203f5a69c31fb9bdb753ec871664",
+    ),
+    (
+        "configs/29m-v3/no_arc_conceptarc_dense.yaml",
+        "fe3aabae2e32f24f20f128ac6e880cca8dc4450b6b99ab6df418b8a740de6494",
+    ),
+    (
+        "configs/29m-v3/no_arc_conceptarc_split90.yaml",
+        "f86fec7060f0f157dd95cf46e25825ddb733ad45cd779d2e2637cb10b4dac2ad",
+    ),
+    (
+        "configs/29m-v3/no_refinement_dense.yaml",
+        "fbb95b381e46947df76b02511adca053b16c7b0c153a9f5fd9b1b2098e782a90",
+    ),
+    (
+        "configs/29m-v3/no_refinement_split90.yaml",
+        "6269209cd552c2421f782139f6168da371a5a5500fdf38007e2f9b176edff61b",
+    ),
+    (
+        "configs/29m-v3/full_corpus_random_fact90.yaml",
+        "1df281116cb31430dcef63feb5da761506753ecce220a54add24632660cfe96e",
+    ),
+    (
+        "configs/29m-v3/full_corpus_matched_nonfactual_mask.yaml",
+        "3c0bd664988c682b251e5bae9a2902efa138946726cc40eb3fc33f85e4ae975a",
+    ),
+)
+OBJECTIVE_CONTROLS_CONTRACT_SHA256 = (
+    "222844dbf68ad9ca48be2069b5eb3b771b90166252af7eb0a4a5d8db3631adb6"
+)
 PROTECTED_COHORT_ID = "memorysplit-confirmatory-v3-360m-n10-aws"
 PROTECTED_MODEL_PARAMETERS = 356_033_536
 MODEL_PARAMETERS = 28_969_216
@@ -126,6 +169,7 @@ _ADMISSION_FIELDS = {
     "schema_version",
     "amendment_sha256",
     "manifest_sha256",
+    "objective_controls_contract_sha256",
     "runs",
 }
 _ADMISSION_RUN_FIELDS = {
@@ -296,9 +340,32 @@ PROTECTED_CELLS = tuple(
 )
 
 
+def _contract_commitment_payload() -> dict[str, object]:
+    return {
+        "schema_version": 1,
+        "source_commit": SOURCE_COMMIT,
+        "preregistration_sha256": PREREGISTRATION_SHA256,
+        "cohort_assignment_sha256": COHORT_ASSIGNMENT_SHA256,
+        "amendment_sha256": AMENDMENT_SHA256,
+        "manifest_sha256": MANIFEST_SHA256,
+        "config_sha256s": dict(CONFIG_SHA256S),
+    }
+
+
+def _computed_contract_commitment_sha256() -> str:
+    data = json.dumps(
+        _contract_commitment_payload(),
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+        allow_nan=False,
+    ).encode("ascii")
+    return hashlib.sha256(data).hexdigest()
+
+
 @dataclass(frozen=True)
 class ObjectiveControlRun:
-    """One exact, non-claim-bearing 29M development run."""
+    """Data-only view of one authenticated, non-claim-bearing 29M run."""
 
     run_id: str
     role: str
@@ -316,11 +383,12 @@ class ObjectiveControlRun:
 
 @dataclass(frozen=True)
 class ObjectiveControlsContract:
-    """Validated append-only amendment and all bound development configs."""
+    """Data-only loader result; never accepted as authority by public APIs."""
 
     amendment_id: str
     amendment_sha256: str
     manifest_sha256: str
+    objective_controls_contract_sha256: str
     preregistration_sha256: str
     cohort_assignment_sha256: str
     protected_outcomes_inspected: bool
@@ -333,7 +401,7 @@ class ObjectiveControlsContract:
 
 @dataclass(frozen=True)
 class ObjectiveControlsAdmission:
-    """A validated all-eight-run, non-directional admission decision."""
+    """Data-only result of canonical-path admission authentication."""
 
     run_ids: tuple[str, ...]
     learnability_run_ids: tuple[str, ...]
@@ -555,6 +623,7 @@ def _expected_amendment() -> dict[str, object]:
         },
         "development_diagnostics_29m": {
             "manifest_path": _MANIFEST_RELATIVE,
+            "manifest_sha256": MANIFEST_SHA256,
             "run_count": 8,
             "model_parameters": MODEL_PARAMETERS,
             "targets_per_update": TARGETS_PER_UPDATE,
@@ -866,6 +935,10 @@ def _load_runs(
             },
         )
 
+    reviewed_config_sha256s = dict(CONFIG_SHA256S)
+    expected_config_paths = {spec.config_path for spec in _RUN_SPECS}
+    if set(reviewed_config_sha256s) != expected_config_paths:
+        _fail("reviewed config commitments do not match the eight-run scope")
     parsed = []
     expected_rows = []
     for index, spec in enumerate(_RUN_SPECS):
@@ -894,13 +967,20 @@ def _load_runs(
         )
         config_data = _read_regular(config_path, label=f"config {spec.run_id}")
         actual_sha256 = hashlib.sha256(config_data).hexdigest()
-        if config_sha256 != actual_sha256:
-            _fail(f"config {spec.run_id} does not match its manifest hash")
+        reviewed_sha256 = reviewed_config_sha256s[spec.config_path]
+        if (
+            actual_sha256 != reviewed_sha256
+            or config_sha256 != reviewed_sha256
+        ):
+            _fail(
+                f"config {spec.run_id} does not match its reviewed byte "
+                "commitment"
+            )
         config_value = _yaml_object(config_data, label=f"config {spec.run_id}")
         _validate_config(config_value, spec)
         expected_row = _expected_manifest_row(
             spec,
-            config_sha256=actual_sha256,
+            config_sha256=reviewed_sha256,
         )
         if row != expected_row:
             _fail(
@@ -917,7 +997,7 @@ def _load_runs(
                 seed=SHARED_SEED,
                 initialization_id=SHARED_INITIALIZATION_ID,
                 config_path=spec.config_path,
-                config_sha256=actual_sha256,
+                config_sha256=reviewed_sha256,
                 corpus_variant_id=spec.corpus_variant_id,
                 sidecar_id=spec.sidecar_id,
                 provenance_id=spec.provenance_id,
@@ -957,6 +1037,13 @@ def load_objective_controls_contract(
         _fail("objective-controls amendment must use its canonical configs path")
     repo_root = path.parent.parent
     amendment_data = _read_regular(path, label="objective-controls amendment")
+    if hashlib.sha256(amendment_data).hexdigest() != AMENDMENT_SHA256:
+        _fail("objective-controls amendment bytes are not the reviewed commitment")
+    if (
+        _computed_contract_commitment_sha256()
+        != OBJECTIVE_CONTROLS_CONTRACT_SHA256
+    ):
+        _fail("objective-controls aggregate commitment constant is inconsistent")
     amendment_value = _yaml_object(
         amendment_data,
         label="objective-controls amendment",
@@ -994,6 +1081,8 @@ def load_objective_controls_contract(
         manifest_path,
         label="objective-controls manifest",
     )
+    if hashlib.sha256(manifest_data).hexdigest() != MANIFEST_SHA256:
+        _fail("objective-controls manifest bytes are not the reviewed commitment")
     manifest_value = _json_object(
         manifest_data,
         label="objective-controls manifest",
@@ -1014,8 +1103,11 @@ def load_objective_controls_contract(
 
     return ObjectiveControlsContract(
         amendment_id=AMENDMENT_ID,
-        amendment_sha256=hashlib.sha256(amendment_data).hexdigest(),
-        manifest_sha256=hashlib.sha256(manifest_data).hexdigest(),
+        amendment_sha256=AMENDMENT_SHA256,
+        manifest_sha256=MANIFEST_SHA256,
+        objective_controls_contract_sha256=(
+            OBJECTIVE_CONTROLS_CONTRACT_SHA256
+        ),
         preregistration_sha256=PREREGISTRATION_SHA256,
         cohort_assignment_sha256=COHORT_ASSIGNMENT_SHA256,
         protected_outcomes_inspected=False,
@@ -1044,11 +1136,11 @@ def _require_injective(bindings: Mapping[str, str], *, label: str) -> None:
         _fail(f"distinct {label} identities cannot share one hash")
 
 
-def validate_objective_controls_admission(
+def _validate_objective_controls_admission(
     contract: ObjectiveControlsContract,
     value: Mapping[str, object],
 ) -> ObjectiveControlsAdmission:
-    """Validate future all-eight-run evidence against non-directional gates."""
+    """Validate evidence after the public path authenticated the contract."""
 
     if not isinstance(contract, ObjectiveControlsContract):
         _fail("admission requires a validated objective-controls contract")
@@ -1078,6 +1170,14 @@ def validate_objective_controls_admission(
             label="objective-controls admission.manifest_sha256",
         )
         != contract.manifest_sha256
+        or _require_sha256(
+            value["objective_controls_contract_sha256"],
+            label=(
+                "objective-controls admission."
+                "objective_controls_contract_sha256"
+            ),
+        )
+        != contract.objective_controls_contract_sha256
     ):
         _fail("objective-controls admission has the wrong contract hashes")
     rows = value["runs"]
@@ -1239,18 +1339,44 @@ def validate_objective_controls_admission(
     )
 
 
+def _load_admission_authority(
+    amendment_path: Path | str,
+) -> ObjectiveControlsContract:
+    if not isinstance(amendment_path, (str, Path)):
+        _fail(
+            "admission authority requires a canonical amendment path, "
+            "not a caller-constructed contract"
+        )
+    return load_objective_controls_contract(amendment_path)
+
+
+def validate_objective_controls_admission(
+    amendment_path: Path | str,
+    value: Mapping[str, object],
+) -> ObjectiveControlsAdmission:
+    """Authenticate canonical contract bytes, then validate admission evidence."""
+
+    contract = _load_admission_authority(amendment_path)
+    return _validate_objective_controls_admission(contract, value)
+
+
 def load_objective_controls_admission(
     path: Path | str,
-    contract: ObjectiveControlsContract,
+    amendment_path: Path | str,
 ) -> ObjectiveControlsAdmission:
-    """Load strict JSON admission evidence and validate all eight runs."""
+    """Load evidence and authenticate the canonical contract before admission."""
 
+    contract = _load_admission_authority(amendment_path)
     data = _read_regular(Path(path), label="objective-controls admission")
     value = _json_object(data, label="objective-controls admission")
-    return validate_objective_controls_admission(contract, value)
+    return _validate_objective_controls_admission(contract, value)
 
 
 __all__ = [
+    "AMENDMENT_SHA256",
+    "CONFIG_SHA256S",
+    "MANIFEST_SHA256",
+    "OBJECTIVE_CONTROLS_CONTRACT_SHA256",
     "ObjectiveControlRun",
     "ObjectiveControlsAdmission",
     "ObjectiveControlsContract",

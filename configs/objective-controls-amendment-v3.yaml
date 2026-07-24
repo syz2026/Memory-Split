@@ -61,6 +61,7 @@ protected_primary_cohort:
   replicated_360m_selectivity_vs_random_claim: disclaimed
 development_diagnostics_29m:
   manifest_path: configs/29m-v3/manifest.json
+  manifest_sha256: a03194591977fccaec4acd0c74c2bc13484f40854208948c7172f2bea4fe8781
   run_count: 8
   model_parameters: 28969216
   targets_per_update: 524288

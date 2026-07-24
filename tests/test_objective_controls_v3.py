@@ -5,11 +5,13 @@ import json
 import math
 import shutil
 from copy import deepcopy
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
 import yaml
 
+import msctl.objective_controls_v3 as objective_controls
 from msctl.errors import MsctlError
 from msctl.objective_controls_v3 import (
     load_objective_controls_admission,
@@ -32,6 +34,15 @@ PREREGISTRATION_SHA256 = (
 )
 COHORT_SHA256 = (
     "47faf6f15e13336f67666081c3d0ebf5be3b981f3d2ac455385faa39e543199c"
+)
+AMENDMENT_SHA256 = (
+    "376e6a2234fc89aac3baea52e09d40ac08f841102e33fde9daf473a4ca589bf8"
+)
+MANIFEST_SHA256 = (
+    "a03194591977fccaec4acd0c74c2bc13484f40854208948c7172f2bea4fe8781"
+)
+OBJECTIVE_CONTROLS_CONTRACT_SHA256 = (
+    "222844dbf68ad9ca48be2069b5eb3b771b90166252af7eb0a4a5d8db3631adb6"
 )
 SHARED_INITIALIZATION_ID = "memorysplit-v3-29m-shared-init-s0"
 RUN_IDS = (
@@ -77,6 +88,32 @@ PROVENANCE_IDS = {
 SIDECAR_IDS = {
     run_id: f"sidecar-v3-29m-{run_id.replace('_', '-')}-v1"
     for run_id in RUN_IDS
+}
+CONFIG_SHA256S = {
+    "configs/29m-v3/full_corpus_dense.yaml": (
+        "653d65470f862babe78cbeda9e6200f0eaa98428435fd5b6935f115e3f59d472"
+    ),
+    "configs/29m-v3/full_corpus_split90.yaml": (
+        "54042c4964ba5a6614827f1dda45381c8d86203f5a69c31fb9bdb753ec871664"
+    ),
+    "configs/29m-v3/no_arc_conceptarc_dense.yaml": (
+        "fe3aabae2e32f24f20f128ac6e880cca8dc4450b6b99ab6df418b8a740de6494"
+    ),
+    "configs/29m-v3/no_arc_conceptarc_split90.yaml": (
+        "f86fec7060f0f157dd95cf46e25825ddb733ad45cd779d2e2637cb10b4dac2ad"
+    ),
+    "configs/29m-v3/no_refinement_dense.yaml": (
+        "fbb95b381e46947df76b02511adca053b16c7b0c153a9f5fd9b1b2098e782a90"
+    ),
+    "configs/29m-v3/no_refinement_split90.yaml": (
+        "6269209cd552c2421f782139f6168da371a5a5500fdf38007e2f9b176edff61b"
+    ),
+    "configs/29m-v3/full_corpus_random_fact90.yaml": (
+        "1df281116cb31430dcef63feb5da761506753ecce220a54add24632660cfe96e"
+    ),
+    "configs/29m-v3/full_corpus_matched_nonfactual_mask.yaml": (
+        "3c0bd664988c682b251e5bae9a2902efa138946726cc40eb3fc33f85e4ae975a"
+    ),
 }
 CONFIG_FIELDS = {
     "schema_version",
@@ -189,6 +226,9 @@ def _valid_admission(contract) -> dict[str, object]:
         "schema_version": 1,
         "amendment_sha256": contract.amendment_sha256,
         "manifest_sha256": contract.manifest_sha256,
+        "objective_controls_contract_sha256": (
+            contract.objective_controls_contract_sha256
+        ),
         "runs": [
             {
                 "run_id": run.run_id,
@@ -249,6 +289,47 @@ def test_canonical_amendment_binds_frozen_scope_without_changing_parent_files():
     assert contract.added_360m_controls == ()
     assert contract.statistical_exclusions == STATISTICAL_EXCLUSIONS
     assert contract.replicated_360m_selectivity_claim_disclaimed is True
+
+
+def test_contract_exposes_exact_deterministic_aggregate_commitment():
+    contract = load_objective_controls_contract(AMENDMENT)
+    amendment = yaml.safe_load(AMENDMENT.read_text(encoding="utf-8"))
+    payload = {
+        "schema_version": 1,
+        "source_commit": (
+            "b3471e0969ca2a997d33acf60d2e777720afa1c4"
+        ),
+        "preregistration_sha256": PREREGISTRATION_SHA256,
+        "cohort_assignment_sha256": COHORT_SHA256,
+        "amendment_sha256": AMENDMENT_SHA256,
+        "manifest_sha256": MANIFEST_SHA256,
+        "config_sha256s": CONFIG_SHA256S,
+    }
+    aggregate = hashlib.sha256(
+        json.dumps(
+            payload,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+            allow_nan=False,
+        ).encode("ascii")
+    ).hexdigest()
+
+    assert objective_controls.AMENDMENT_SHA256 == AMENDMENT_SHA256
+    assert objective_controls.MANIFEST_SHA256 == MANIFEST_SHA256
+    assert dict(objective_controls.CONFIG_SHA256S) == CONFIG_SHA256S
+    assert aggregate == OBJECTIVE_CONTROLS_CONTRACT_SHA256
+    assert (
+        objective_controls.OBJECTIVE_CONTROLS_CONTRACT_SHA256
+        == OBJECTIVE_CONTROLS_CONTRACT_SHA256
+    )
+    assert (
+        contract.objective_controls_contract_sha256
+        == OBJECTIVE_CONTROLS_CONTRACT_SHA256
+    )
+    assert amendment["development_diagnostics_29m"]["manifest_sha256"] == (
+        MANIFEST_SHA256
+    )
 
 
 def test_manifest_and_configs_freeze_exact_eight_run_development_matrix():
@@ -458,16 +539,117 @@ def test_contract_rejects_any_frozen_parent_byte_drift(tmp_path, parent):
     assert caught.value.code == "OBJECTIVE_CONTROLS_INVALID"
 
 
+def test_contract_rejects_semantically_equivalent_amendment_byte_drift(
+    tmp_path,
+):
+    amendment = _copy_contract(tmp_path)
+    amendment.write_bytes(
+        amendment.read_bytes() + b"# semantically equivalent drift\n"
+    )
+
+    with pytest.raises(MsctlError) as caught:
+        load_objective_controls_contract(amendment)
+
+    assert caught.value.code == "OBJECTIVE_CONTROLS_INVALID"
+
+
+def test_contract_rejects_manifest_rehash_drift(tmp_path):
+    amendment = _copy_contract(tmp_path)
+    run_id = "full_corpus_dense"
+    config_path = amendment.parent / "29m-v3" / f"{run_id}.yaml"
+    config_path.write_bytes(
+        b"# drift whose new hash is rebound in the manifest\n"
+        + config_path.read_bytes()
+    )
+    manifest = _load_manifest(amendment)
+    runs = manifest["runs"]
+    assert isinstance(runs, list)
+    row = next(row for row in runs if row["run_id"] == run_id)
+    row["config_sha256"] = _sha256(config_path)
+    _rewrite_manifest(amendment, manifest)
+
+    with pytest.raises(MsctlError) as caught:
+        load_objective_controls_contract(amendment)
+
+    assert caught.value.code == "OBJECTIVE_CONTROLS_INVALID"
+
+
+def test_contract_rejects_config_rehash_drift_with_updated_internal_hash(
+    tmp_path,
+):
+    amendment = _copy_contract(tmp_path)
+    run_id = "no_refinement_split90"
+    config_path = amendment.parent / "29m-v3" / f"{run_id}.yaml"
+    config_path.write_bytes(
+        config_path.read_bytes()
+        + b"# config bytes changed without changing parsed values\n"
+    )
+    manifest = _load_manifest(amendment)
+    runs = manifest["runs"]
+    assert isinstance(runs, list)
+    row = next(row for row in runs if row["run_id"] == run_id)
+    row["config_sha256"] = _sha256(config_path)
+    _rewrite_manifest(amendment, manifest)
+
+    with pytest.raises(MsctlError) as caught:
+        load_objective_controls_contract(amendment)
+
+    assert caught.value.code == "OBJECTIVE_CONTROLS_INVALID"
+
+
 def test_admission_accepts_only_boundary_valid_nondirectional_evidence():
     contract = load_objective_controls_contract(AMENDMENT)
     value = _valid_admission(contract)
 
-    admission = validate_objective_controls_admission(contract, value)
+    admission = validate_objective_controls_admission(AMENDMENT, value)
 
     assert admission.run_ids == RUN_IDS
     assert admission.learnability_run_ids == ORIGINAL_RUN_IDS
     assert admission.integrity_only_run_ids == CONTROL_RUN_IDS
     assert admission.directional_control_thresholds_applied == ()
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "seed_99",
+        "changed_hashes",
+        "missing_exclusions",
+        "inspected_outcomes",
+    ],
+)
+def test_caller_constructed_contract_cannot_authorize_admission(mutation):
+    contract = load_objective_controls_contract(AMENDMENT)
+    if mutation == "seed_99":
+        forged_run = replace(contract.runs[0], seed=99)
+        forged = replace(
+            contract,
+            runs=(forged_run, *contract.runs[1:]),
+        )
+    elif mutation == "changed_hashes":
+        forged = replace(
+            contract,
+            amendment_sha256="0" * 64,
+            manifest_sha256="1" * 64,
+        )
+    elif mutation == "missing_exclusions":
+        forged = replace(contract, statistical_exclusions=())
+    elif mutation == "inspected_outcomes":
+        forged = replace(contract, protected_outcomes_inspected=True)
+    else:  # pragma: no cover - parameterization guard
+        raise AssertionError(mutation)
+    value = _valid_admission(forged)
+
+    with pytest.raises(MsctlError) as caught:
+        validate_objective_controls_admission(forged, value)
+
+    assert caught.value.code == "OBJECTIVE_CONTROLS_INVALID"
+
+
+def test_public_contract_dataclass_is_explicitly_data_only():
+    documentation = objective_controls.ObjectiveControlsContract.__doc__.lower()
+    assert "data-only" in documentation
+    assert "authority" in documentation
 
 
 @pytest.mark.parametrize(
@@ -510,7 +692,7 @@ def test_admission_fails_closed_on_run_or_identity_drift(mutation):
         raise AssertionError(mutation)
 
     with pytest.raises(MsctlError) as caught:
-        validate_objective_controls_admission(contract, value)
+        validate_objective_controls_admission(AMENDMENT, value)
 
     assert caught.value.code == "OBJECTIVE_CONTROLS_INVALID"
 
@@ -543,7 +725,7 @@ def test_admission_rejects_failed_rules_and_numeric_aliases(field, bad_value):
     run[field] = bad_value
 
     with pytest.raises(MsctlError) as caught:
-        validate_objective_controls_admission(contract, value)
+        validate_objective_controls_admission(AMENDMENT, value)
 
     assert caught.value.code == "OBJECTIVE_CONTROLS_INVALID"
 
@@ -582,7 +764,7 @@ def test_learnability_floor_applies_only_to_original_six_runs(mutation):
         raise AssertionError(mutation)
 
     with pytest.raises(MsctlError) as caught:
-        validate_objective_controls_admission(contract, value)
+        validate_objective_controls_admission(AMENDMENT, value)
 
     assert caught.value.code == "OBJECTIVE_CONTROLS_INVALID"
 
@@ -592,7 +774,7 @@ def test_admission_json_loader_rejects_duplicates_and_nonfinite_values(tmp_path)
     value = _valid_admission(contract)
     valid_path = tmp_path / "valid.json"
     _write_json(valid_path, value)
-    assert load_objective_controls_admission(valid_path, contract).run_ids == (
+    assert load_objective_controls_admission(valid_path, AMENDMENT).run_ids == (
         RUN_IDS
     )
 
@@ -615,5 +797,5 @@ def test_admission_json_loader_rejects_duplicates_and_nonfinite_values(tmp_path)
 
     for path in (duplicate_path, nonfinite_path):
         with pytest.raises(MsctlError) as caught:
-            load_objective_controls_admission(path, contract)
+            load_objective_controls_admission(path, AMENDMENT)
         assert caught.value.code == "OBJECTIVE_CONTROLS_INVALID"
