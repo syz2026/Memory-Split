@@ -997,17 +997,53 @@ Resources:
       PolicyDocument:
         Version: "2012-10-17"
         Statement:
-          - Sid: MemorySplitBucketMetadata
+          - Sid: MemorySplitBucketLocation
+            Effect: Allow
+            Principal: "*"
+            Action: s3:GetBucketLocation
+            Resource:
+              Fn::GetAtt:
+                - ArtifactBucket
+                - Arn
+          - Sid: MemorySplitBucketListing
             Effect: Allow
             Principal: "*"
             Action:
-              - s3:GetBucketLocation
               - s3:ListBucket
               - s3:ListBucketVersions
             Resource:
               Fn::GetAtt:
                 - ArtifactBucket
                 - Arn
+            Condition:
+              "ForAnyValue:StringLike":
+                s3:prefix:
+                  - Fn::Sub: ${ArtifactRootPrefix}/canaries
+                  - Fn::Sub: ${ArtifactRootPrefix}/canaries/*
+                  - Fn::Sub: ${ArtifactRootPrefix}/canary-roundtrip
+                  - Fn::Sub: ${ArtifactRootPrefix}/canary-roundtrip/*
+                  - Fn::Sub: ${ArtifactRootPrefix}/checkpoints
+                  - Fn::Sub: ${ArtifactRootPrefix}/checkpoints/*
+                  - Fn::Sub: ${ArtifactRootPrefix}/collections
+                  - Fn::Sub: ${ArtifactRootPrefix}/collections/*
+                  - Fn::Sub: ${ArtifactRootPrefix}/dataset
+                  - Fn::Sub: ${ArtifactRootPrefix}/dataset/*
+                  - Fn::Sub: ${ArtifactRootPrefix}/environments
+                  - Fn::Sub: ${ArtifactRootPrefix}/environments/*
+                  - Fn::Sub: ${ArtifactRootPrefix}/evaluations
+                  - Fn::Sub: ${ArtifactRootPrefix}/evaluations/*
+                  - Fn::Sub: ${ArtifactRootPrefix}/logs
+                  - Fn::Sub: ${ArtifactRootPrefix}/logs/*
+                  - Fn::Sub: ${ArtifactRootPrefix}/operations
+                  - Fn::Sub: ${ArtifactRootPrefix}/operations/*
+                  - Fn::Sub: ${ArtifactRootPrefix}/receipts
+                  - Fn::Sub: ${ArtifactRootPrefix}/receipts/*
+                  - Fn::Sub: ${ArtifactRootPrefix}/releases
+                  - Fn::Sub: ${ArtifactRootPrefix}/releases/*
+                  - Fn::Sub: ${ArtifactRootPrefix}/sealed
+                  - Fn::Sub: ${ArtifactRootPrefix}/sealed/*
+                  - Fn::Sub: ${ArtifactRootPrefix}/snapshots
+                  - Fn::Sub: ${ArtifactRootPrefix}/snapshots/*
           - Sid: MemorySplitVersionedObjects
             Effect: Allow
             Principal: "*"

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import re
 from collections.abc import Iterator
 from pathlib import Path
@@ -183,6 +184,68 @@ def _list_prefixes(statement: dict[str, object]) -> list[str]:
 def _action_set(statement: dict[str, object]) -> set[str]:
     actions = statement["Action"]
     return {actions} if isinstance(actions, str) else set(actions)
+
+
+def _s3_policy_groups(
+    value: dict[str, object],
+) -> dict[str, list[dict[str, object]]]:
+    resources = value["Resources"]
+    return {
+        "train": resources["TrainRole"]["Properties"]["Policies"][0][
+            "PolicyDocument"
+        ]["Statement"],
+        "evaluator": resources["EvaluatorRole"]["Properties"]["Policies"][0][
+            "PolicyDocument"
+        ]["Statement"],
+        "controller": resources["ControllerOperationsPolicy"]["Properties"][
+            "PolicyDocument"
+        ]["Statement"],
+        "endpoint": resources["S3Endpoint"]["Properties"]["PolicyDocument"][
+            "Statement"
+        ],
+    }
+
+
+def _assert_exact_s3_statement_allowlist(
+    candidate: dict[str, object],
+    expected: dict[str, object],
+) -> None:
+    expected_groups = _s3_policy_groups(expected)
+    for group, statements in _s3_policy_groups(candidate).items():
+        expected_s3 = {
+            statement["Sid"]: statement
+            for statement in expected_groups[group]
+            if any(
+                action.lower().startswith("s3:")
+                for action in _action_set(statement)
+            )
+        }
+        observed_s3: list[dict[str, object]] = []
+        for statement in statements:
+            assert "NotAction" not in statement
+            assert "NotResource" not in statement
+            assert "Action" in statement
+            actions = _action_set(statement)
+            assert all("*" not in action for action in actions)
+            s3_actions = {
+                action for action in actions if action.lower().startswith("s3:")
+            }
+            if not s3_actions:
+                continue
+            observed_s3.append(statement)
+            assert statement["Resource"] != "*"
+            resources = statement["Resource"]
+            rows = resources if isinstance(resources, list) else [resources]
+            for resource in rows:
+                assert isinstance(resource, dict)
+                assert set(resource) in ({"Fn::Sub"}, {"Fn::GetAtt"})
+                if "Fn::Sub" in resource:
+                    assert resource["Fn::Sub"] != (
+                        "${ArtifactBucket.Arn}/${ArtifactRootPrefix}/*"
+                    )
+            assert statement["Sid"] in expected_s3
+            assert statement == expected_s3[statement["Sid"]]
+        assert len(observed_s3) == len(expected_s3)
 
 
 def test_template_is_plain_yaml_using_only_long_form_intrinsics(template):
@@ -889,6 +952,202 @@ def test_controller_s3_reads_and_writes_use_disjoint_exact_prefixes(template):
     ]
 
 
+def test_s3_endpoint_listing_is_limited_to_named_namespaces(template):
+    statements = {
+        statement["Sid"]: statement
+        for statement in template["Resources"]["S3Endpoint"]["Properties"][
+            "PolicyDocument"
+        ]["Statement"]
+    }
+    assert statements["MemorySplitBucketLocation"] == {
+        "Sid": "MemorySplitBucketLocation",
+        "Effect": "Allow",
+        "Principal": "*",
+        "Action": "s3:GetBucketLocation",
+        "Resource": {"Fn::GetAtt": ["ArtifactBucket", "Arn"]},
+    }
+    listing = statements["MemorySplitBucketListing"]
+    assert set(listing) == {
+        "Sid",
+        "Effect",
+        "Principal",
+        "Action",
+        "Resource",
+        "Condition",
+    }
+    assert listing["Action"] == ["s3:ListBucket", "s3:ListBucketVersions"]
+    assert listing["Resource"] == {
+        "Fn::GetAtt": ["ArtifactBucket", "Arn"]
+    }
+    assert _list_prefixes(listing) == [
+        "${ArtifactRootPrefix}/canaries",
+        "${ArtifactRootPrefix}/canaries/*",
+        "${ArtifactRootPrefix}/canary-roundtrip",
+        "${ArtifactRootPrefix}/canary-roundtrip/*",
+        "${ArtifactRootPrefix}/checkpoints",
+        "${ArtifactRootPrefix}/checkpoints/*",
+        "${ArtifactRootPrefix}/collections",
+        "${ArtifactRootPrefix}/collections/*",
+        "${ArtifactRootPrefix}/dataset",
+        "${ArtifactRootPrefix}/dataset/*",
+        "${ArtifactRootPrefix}/environments",
+        "${ArtifactRootPrefix}/environments/*",
+        "${ArtifactRootPrefix}/evaluations",
+        "${ArtifactRootPrefix}/evaluations/*",
+        "${ArtifactRootPrefix}/logs",
+        "${ArtifactRootPrefix}/logs/*",
+        "${ArtifactRootPrefix}/operations",
+        "${ArtifactRootPrefix}/operations/*",
+        "${ArtifactRootPrefix}/receipts",
+        "${ArtifactRootPrefix}/receipts/*",
+        "${ArtifactRootPrefix}/releases",
+        "${ArtifactRootPrefix}/releases/*",
+        "${ArtifactRootPrefix}/sealed",
+        "${ArtifactRootPrefix}/sealed/*",
+        "${ArtifactRootPrefix}/snapshots",
+        "${ArtifactRootPrefix}/snapshots/*",
+    ]
+    assert "${ArtifactRootPrefix}" not in _list_prefixes(listing)
+    assert "${ArtifactRootPrefix}/*" not in _list_prefixes(listing)
+
+
+def test_python_s3_statement_allowlist_accepts_only_the_reviewed_template(
+    template,
+):
+    _assert_exact_s3_statement_allowlist(template, copy.deepcopy(template))
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "s3-star",
+        "s3-get-star",
+        "action-star",
+        "not-action",
+        "not-resource",
+        "resource-star",
+        "plain-broad-resource",
+        "mapping-broad-resource",
+        "artifact-root-resource",
+        "extra-s3-statement",
+        "extra-s3-action",
+        "endpoint-list-without-condition",
+        "endpoint-root-list-prefix",
+        "endpoint-unrelated-list-prefix",
+        "endpoint-extra-s3-statement",
+        "uppercase-extra-s3-statement",
+        "extra-action-star-statement",
+    ],
+)
+def test_python_s3_statement_allowlist_rejects_every_bypass(template, case):
+    expected = copy.deepcopy(template)
+    candidate = copy.deepcopy(template)
+    groups = _s3_policy_groups(candidate)
+
+    def statement(group: str, sid: str) -> dict[str, object]:
+        return next(row for row in groups[group] if row["Sid"] == sid)
+
+    train_write = statement("train", "ReadWriteTrainingArtifacts")
+    if case == "s3-star":
+        train_write["Action"].append("s3:*")
+    elif case == "s3-get-star":
+        train_write["Action"].append("s3:Get*")
+    elif case == "action-star":
+        train_write["Action"] = "*"
+    elif case == "not-action":
+        train_write["NotAction"] = train_write.pop("Action")
+    elif case == "not-resource":
+        train_write["NotResource"] = train_write["Resource"]
+    elif case == "resource-star":
+        train_write["Resource"] = "*"
+    elif case == "plain-broad-resource":
+        train_write["Resource"] = [
+            "arn:aws:s3:::unreviewed-bucket/unreviewed/*"
+        ]
+    elif case == "mapping-broad-resource":
+        train_write["Resource"] = {
+            "AWS": "arn:aws:s3:::unreviewed-bucket/unreviewed/*"
+        }
+    elif case == "artifact-root-resource":
+        train_write["Resource"].append(
+            {
+                "Fn::Sub": (
+                    "${ArtifactBucket.Arn}/${ArtifactRootPrefix}/*"
+                )
+            }
+        )
+    elif case == "extra-s3-statement":
+        groups["controller"].append(
+            {
+                "Sid": "InjectedBroadS3",
+                "Effect": "Allow",
+                "Action": "s3:PutObject",
+                "Resource": {
+                    "Fn::Sub": (
+                        "${ArtifactBucket.Arn}/${ArtifactRootPrefix}/"
+                        "evaluations/*"
+                    )
+                },
+            }
+        )
+    elif case == "extra-s3-action":
+        train_write["Action"].append("s3:DeleteObject")
+    elif case == "endpoint-list-without-condition":
+        del statement("endpoint", "MemorySplitBucketListing")["Condition"]
+    elif case == "endpoint-root-list-prefix":
+        listing = statement("endpoint", "MemorySplitBucketListing")
+        listing["Condition"]["ForAnyValue:StringLike"]["s3:prefix"].append(
+            {"Fn::Sub": "${ArtifactRootPrefix}/*"}
+        )
+    elif case == "endpoint-unrelated-list-prefix":
+        listing = statement("endpoint", "MemorySplitBucketListing")
+        listing["Condition"]["ForAnyValue:StringLike"]["s3:prefix"].append(
+            {"Fn::Sub": "unrelated/*"}
+        )
+    elif case == "endpoint-extra-s3-statement":
+        groups["endpoint"].append(
+            {
+                "Sid": "InjectedEndpointAccess",
+                "Effect": "Allow",
+                "Principal": "*",
+                "Action": "s3:GetObject",
+                "Resource": {
+                    "Fn::Sub": (
+                        "${ArtifactBucket.Arn}/${ArtifactRootPrefix}/*"
+                    )
+                },
+            }
+        )
+    elif case == "uppercase-extra-s3-statement":
+        groups["controller"].append(
+            {
+                "Sid": "InjectedUppercaseS3",
+                "Effect": "Allow",
+                "Action": "S3:GetObject",
+                "Resource": {
+                    "Fn::Sub": (
+                        "${ArtifactBucket.Arn}/${ArtifactRootPrefix}/"
+                        "evaluations/*"
+                    )
+                },
+            }
+        )
+    elif case == "extra-action-star-statement":
+        groups["controller"].append(
+            {
+                "Sid": "InjectedAllActions",
+                "Effect": "Allow",
+                "Action": "*",
+                "Resource": "*",
+            }
+        )
+    else:
+        raise AssertionError(f"unknown mutation case: {case}")
+
+    with pytest.raises((AssertionError, KeyError, TypeError)):
+        _assert_exact_s3_statement_allowlist(candidate, expected)
+
+
 def test_controller_mutations_and_ssm_targets_are_strictly_scoped(template):
     statements = _attached_role_statements(template, "ControllerRole")
     run = statements["RunApprovedLaunchTemplate"]
@@ -1130,5 +1389,10 @@ def test_cfn_guard_required_resources_and_role_policies_are_non_vacuous():
         "ssm:resourceTag/MemorySplitManaged",
         "some Action[*] == 'kms:Sign'",
         "rule exact_s3_role_separation",
+        "rule reject_unreviewed_s3_statements",
+        "NotAction !exists",
+        "NotResource !exists",
+        "train_all_s3_statements",
+        "endpoint_all_s3_statements",
     ):
         assert policy_invariant in guard

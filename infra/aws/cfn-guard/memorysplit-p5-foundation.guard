@@ -137,6 +137,8 @@ let controller_read_resources = [
   '${ArtifactBucket.Arn}/${ArtifactRootPrefix}/canaries/*',
   '${ArtifactBucket.Arn}/${ArtifactRootPrefix}/canary-roundtrip/*',
   '${ArtifactBucket.Arn}/${ArtifactRootPrefix}/checkpoints/*',
+  '${ArtifactBucket.Arn}/${ArtifactRootPrefix}/checkpoints/receipts/*',
+  '${ArtifactBucket.Arn}/${ArtifactRootPrefix}/checkpoints/sha256/*',
   '${ArtifactBucket.Arn}/${ArtifactRootPrefix}/collections/*',
   '${ArtifactBucket.Arn}/${ArtifactRootPrefix}/dataset/*',
   '${ArtifactBucket.Arn}/${ArtifactRootPrefix}/environments/*',
@@ -177,6 +179,34 @@ let endpoint_object_resources = [
   '${ArtifactBucket.Arn}/${ArtifactRootPrefix}/sealed/*',
   '${ArtifactBucket.Arn}/${ArtifactRootPrefix}/snapshots/*'
 ]
+let endpoint_list_prefixes = [
+  '${ArtifactRootPrefix}/canaries',
+  '${ArtifactRootPrefix}/canaries/*',
+  '${ArtifactRootPrefix}/canary-roundtrip',
+  '${ArtifactRootPrefix}/canary-roundtrip/*',
+  '${ArtifactRootPrefix}/checkpoints',
+  '${ArtifactRootPrefix}/checkpoints/*',
+  '${ArtifactRootPrefix}/collections',
+  '${ArtifactRootPrefix}/collections/*',
+  '${ArtifactRootPrefix}/dataset',
+  '${ArtifactRootPrefix}/dataset/*',
+  '${ArtifactRootPrefix}/environments',
+  '${ArtifactRootPrefix}/environments/*',
+  '${ArtifactRootPrefix}/evaluations',
+  '${ArtifactRootPrefix}/evaluations/*',
+  '${ArtifactRootPrefix}/logs',
+  '${ArtifactRootPrefix}/logs/*',
+  '${ArtifactRootPrefix}/operations',
+  '${ArtifactRootPrefix}/operations/*',
+  '${ArtifactRootPrefix}/receipts',
+  '${ArtifactRootPrefix}/receipts/*',
+  '${ArtifactRootPrefix}/releases',
+  '${ArtifactRootPrefix}/releases/*',
+  '${ArtifactRootPrefix}/sealed',
+  '${ArtifactRootPrefix}/sealed/*',
+  '${ArtifactRootPrefix}/snapshots',
+  '${ArtifactRootPrefix}/snapshots/*'
+]
 let train_readable_resources = [
   '${ArtifactBucket.Arn}/${ArtifactRootPrefix}/canary-roundtrip/*',
   '${ArtifactBucket.Arn}/${ArtifactRootPrefix}/checkpoints/*',
@@ -199,7 +229,93 @@ let evaluator_readable_resources = [
   '${ArtifactBucket.Arn}/${ArtifactRootPrefix}/receipts/evaluations/*',
   '${ArtifactBucket.Arn}/${ArtifactRootPrefix}/sealed/*'
 ]
+let endpoint_all_resources = [
+  '${ArtifactBucket.Arn}/${ArtifactRootPrefix}/canaries/*',
+  '${ArtifactBucket.Arn}/${ArtifactRootPrefix}/canary-roundtrip/*',
+  '${ArtifactBucket.Arn}/${ArtifactRootPrefix}/checkpoints/*',
+  '${ArtifactBucket.Arn}/${ArtifactRootPrefix}/collections/*',
+  '${ArtifactBucket.Arn}/${ArtifactRootPrefix}/dataset/*',
+  '${ArtifactBucket.Arn}/${ArtifactRootPrefix}/environments/*',
+  '${ArtifactBucket.Arn}/${ArtifactRootPrefix}/evaluations/*',
+  '${ArtifactBucket.Arn}/${ArtifactRootPrefix}/logs/*',
+  '${ArtifactBucket.Arn}/${ArtifactRootPrefix}/operations/*',
+  '${ArtifactBucket.Arn}/${ArtifactRootPrefix}/receipts/*',
+  '${ArtifactBucket.Arn}/${ArtifactRootPrefix}/releases/*',
+  '${ArtifactBucket.Arn}/${ArtifactRootPrefix}/sealed/*',
+  '${ArtifactBucket.Arn}/${ArtifactRootPrefix}/snapshots/*',
+  'arn:${AWS::Partition}:s3:::prod-${AWS::Region}-starport-layer-bucket/*'
+]
+let train_s3_sids = [
+  'LocateArtifactBucket',
+  'ListTrainPrefixes',
+  'ReadTrainingInputs',
+  'ReadWriteTrainingArtifacts'
+]
+let train_s3_actions = [
+  's3:AbortMultipartUpload',
+  's3:GetBucketLocation',
+  's3:GetObject',
+  's3:GetObjectAttributes',
+  's3:GetObjectTagging',
+  's3:GetObjectVersion',
+  's3:ListBucket',
+  's3:ListBucketVersions',
+  's3:ListMultipartUploadParts',
+  's3:PutObject',
+  's3:PutObjectTagging'
+]
+let evaluator_s3_sids = [
+  'LocateArtifactBucket',
+  'ListEvaluatorPrefixes',
+  'ReadEvaluationInputs',
+  'ReadWriteEvaluationEvidence'
+]
+let evaluator_s3_actions = [
+  's3:GetBucketLocation',
+  's3:GetObject',
+  's3:GetObjectAttributes',
+  's3:GetObjectVersion',
+  's3:ListBucket',
+  's3:ListBucketVersions',
+  's3:PutObject',
+  's3:PutObjectTagging'
+]
+let controller_s3_sids = [
+  'ListControllerPrefixes',
+  'ReadLifecycleArtifacts',
+  'WriteControllerPublications'
+]
+let controller_s3_actions = [
+  's3:GetObject',
+  's3:GetObjectVersion',
+  's3:ListBucket',
+  's3:ListBucketVersions',
+  's3:PutObject'
+]
+let endpoint_s3_sids = [
+  'MemorySplitBucketLocation',
+  'MemorySplitBucketListing',
+  'MemorySplitVersionedObjects',
+  'EcrLayerDownloads'
+]
+let endpoint_s3_actions = [
+  's3:AbortMultipartUpload',
+  's3:GetBucketLocation',
+  's3:GetObject',
+  's3:GetObjectAttributes',
+  's3:GetObjectTagging',
+  's3:GetObjectVersion',
+  's3:ListBucket',
+  's3:ListBucketVersions',
+  's3:ListMultipartUploadParts',
+  's3:PutObject',
+  's3:PutObjectTagging'
+]
 let train_policy_statements = Resources.TrainRole.Properties.Policies[*].PolicyDocument.Statement[*]
+let train_all_s3_statements = %train_policy_statements[
+  Action == /(?i)^s3:.*/ or
+  some Action[*] == /(?i)^s3:.*/
+]
 let train_s3_read_statements = %train_policy_statements[
   Action == 's3:GetObject' or
   some Action[*] == 's3:GetObject'
@@ -213,6 +329,10 @@ let train_s3_list_statements = %train_policy_statements[
   some Action[*] == 's3:ListBucket'
 ]
 let evaluator_policy_statements = Resources.EvaluatorRole.Properties.Policies[*].PolicyDocument.Statement[*]
+let evaluator_all_s3_statements = %evaluator_policy_statements[
+  Action == /(?i)^s3:.*/ or
+  some Action[*] == /(?i)^s3:.*/
+]
 let evaluator_s3_read_statements = %evaluator_policy_statements[
   Action == 's3:GetObject' or
   some Action[*] == 's3:GetObject'
@@ -226,6 +346,10 @@ let evaluator_s3_list_statements = %evaluator_policy_statements[
   some Action[*] == 's3:ListBucket'
 ]
 let controller_policy_statements = Resources.ControllerOperationsPolicy.Properties.PolicyDocument.Statement[*]
+let controller_all_s3_statements = %controller_policy_statements[
+  Action == /(?i)^s3:.*/ or
+  some Action[*] == /(?i)^s3:.*/
+]
 let controller_s3_read_statements = %controller_policy_statements[
   Action == 's3:GetObject' or
   some Action[*] == 's3:GetObject'
@@ -238,6 +362,48 @@ let controller_s3_list_statements = %controller_policy_statements[
   Action == 's3:ListBucket' or
   some Action[*] == 's3:ListBucket'
 ]
+let endpoint_policy_statements = Resources.S3Endpoint.Properties.PolicyDocument.Statement[*]
+let endpoint_all_s3_statements = %endpoint_policy_statements[
+  Action == /(?i)^s3:.*/ or
+  some Action[*] == /(?i)^s3:.*/
+]
+let endpoint_s3_list_statements = %endpoint_policy_statements[
+  Action == 's3:ListBucket' or
+  some Action[*] == 's3:ListBucket'
+]
+
+rule exact_s3_statement_shape(
+  statements,
+  allowed_sids,
+  allowed_actions,
+  allowed_resources
+) {
+  %statements {
+    Sid IN %allowed_sids
+    Action is_string or Action is_list
+    Resource is_struct or Resource is_list
+    when Action is_string {
+      Action IN %allowed_actions
+    }
+    when Action is_list {
+      Action[*] is_string
+      Action[*] IN %allowed_actions
+    }
+    when Resource is_struct {
+      Resource[ keys == 'Fn::Sub' ] !empty or
+      Resource[ keys == 'Fn::GetAtt' ] !empty
+      Resource[ keys != /^(Fn::Sub|Fn::GetAtt)$/ ] empty
+      Resource[ keys == 'Fn::Sub' ] IN %allowed_resources
+      Resource[ keys == 'Fn::GetAtt' ] == ['ArtifactBucket', 'Arn']
+    }
+    when Resource is_list {
+      Resource[*] is_struct
+      Resource[*][ keys != /^(Fn::Sub|Fn::GetAtt)$/ ] empty
+      Resource[*][ keys == 'Fn::Sub' ] IN %allowed_resources
+      Resource[*][ keys == 'Fn::GetAtt' ] == ['ArtifactBucket', 'Arn']
+    }
+  }
+}
 
 rule no_ec2_instances {
   %ec2_instances empty
@@ -427,7 +593,89 @@ rule exact_s3_role_separation {
   %controller_s3_list_statements.Condition[ keys == 'ForAnyValue:StringLike' ][ keys == 's3:prefix' ][*][ keys == 'Fn::Sub' ] IN %controller_list_prefixes
   %controller_s3_read_statements.Resource[*][ keys == 'Fn::Sub' ] IN %controller_read_resources
   %controller_s3_write_statements.Resource[*][ keys == 'Fn::Sub' ] IN %controller_write_resources
+  Resources.S3Endpoint.Properties.PolicyDocument.Statement[ Sid == 'MemorySplitBucketLocation' ] {
+    Action == 's3:GetBucketLocation'
+    Resource[ keys == 'Fn::GetAtt' ] == ['ArtifactBucket', 'Arn']
+  }
+  Resources.S3Endpoint.Properties.PolicyDocument.Statement[ Sid == 'MemorySplitBucketListing' ] {
+    some Action[*] == 's3:ListBucket'
+    some Action[*] == 's3:ListBucketVersions'
+    Condition[ keys == 'ForAnyValue:StringLike' ][ keys == 's3:prefix' ][*][ keys == 'Fn::Sub' ] IN %endpoint_list_prefixes
+  }
   Resources.S3Endpoint.Properties.PolicyDocument.Statement[ Sid == 'MemorySplitVersionedObjects' ] {
     Resource[*][ keys == 'Fn::Sub' ] IN %endpoint_object_resources
   }
+  %endpoint_s3_list_statements.Condition[ keys == 'ForAnyValue:StringLike' ][ keys == 's3:prefix' ][*][ keys == 'Fn::Sub' ] IN %endpoint_list_prefixes
+}
+
+rule reject_unreviewed_s3_statements {
+  %train_policy_statements {
+    NotAction !exists
+    NotResource !exists
+    Action is_string or Action is_list
+    when Action is_string {
+      Action != /.*\*.*/
+    }
+    when Action is_list {
+      Action[*] != /.*\*.*/
+    }
+  }
+  %evaluator_policy_statements {
+    NotAction !exists
+    NotResource !exists
+    Action is_string or Action is_list
+    when Action is_string {
+      Action != /.*\*.*/
+    }
+    when Action is_list {
+      Action[*] != /.*\*.*/
+    }
+  }
+  %controller_policy_statements {
+    NotAction !exists
+    NotResource !exists
+    Action is_string or Action is_list
+    when Action is_string {
+      Action != /.*\*.*/
+    }
+    when Action is_list {
+      Action[*] != /.*\*.*/
+    }
+  }
+  %endpoint_policy_statements {
+    NotAction !exists
+    NotResource !exists
+    Action is_string or Action is_list
+    when Action is_string {
+      Action != /.*\*.*/
+    }
+    when Action is_list {
+      Action[*] != /.*\*.*/
+    }
+  }
+
+  exact_s3_statement_shape(
+    %train_all_s3_statements,
+    %train_s3_sids,
+    %train_s3_actions,
+    %train_readable_resources
+  )
+  exact_s3_statement_shape(
+    %evaluator_all_s3_statements,
+    %evaluator_s3_sids,
+    %evaluator_s3_actions,
+    %evaluator_readable_resources
+  )
+  exact_s3_statement_shape(
+    %controller_all_s3_statements,
+    %controller_s3_sids,
+    %controller_s3_actions,
+    %controller_read_resources
+  )
+  exact_s3_statement_shape(
+    %endpoint_all_s3_statements,
+    %endpoint_s3_sids,
+    %endpoint_s3_actions,
+    %endpoint_all_resources
+  )
 }
