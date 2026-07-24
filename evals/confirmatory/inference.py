@@ -11,9 +11,19 @@ from statistics import fmean
 
 import numpy as np
 
+from msctl.aws_contracts import SNAPSHOT_STEPS
+
 
 HIERARCHY = ("seed", "world", "pair")
 CONFIRMATORY_SEED_COUNT = 5
+V3_CONFIRMATORY_SEED_COUNT = 10
+V3_SIGN_ASSIGNMENTS = 1 << V3_CONFIRMATORY_SEED_COUNT
+V3_BOOTSTRAP_RNG_SEED = 0
+V3_BOOTSTRAP_DRAWS = 20_000
+V3_BOOTSTRAP_CONFIDENCE = 0.90
+V3_EQUIVALENCE_MARGIN = 0.01
+V3_SNAPSHOT_STEPS = SNAPSHOT_STEPS
+_V3_SEEDS = tuple(range(V3_CONFIRMATORY_SEED_COUNT))
 _ALTERNATIVES = {"two-sided", "greater", "less"}
 
 
@@ -140,6 +150,9 @@ def nearest_rank_interval(
 
 def _panel(
     observations: Sequence[PairedObservation],
+    *,
+    required_seed_count: int,
+    required_seeds: tuple[int, ...] | None = None,
 ) -> dict[int, dict[str, tuple[PairedObservation, ...]]]:
     if isinstance(observations, (str, bytes)) or not isinstance(
         observations,
@@ -160,9 +173,17 @@ def _panel(
             raise ValueError("duplicate seed/world/pair observation")
         seen.add(identity)
         grouped[row.seed][row.world_id].append(row)
-    if len(grouped) != CONFIRMATORY_SEED_COUNT:
+    if required_seeds is not None and tuple(sorted(grouped)) != required_seeds:
         raise ValueError(
-            "confirmatory bootstrap requires exactly five paired seeds"
+            "v3 confirmatory bootstrap requires exactly seeds 0 through 9"
+        )
+    if len(grouped) != required_seed_count:
+        count_name = {
+            CONFIRMATORY_SEED_COUNT: "five",
+            V3_CONFIRMATORY_SEED_COUNT: "ten",
+        }.get(required_seed_count, str(required_seed_count))
+        raise ValueError(
+            f"confirmatory bootstrap requires exactly {count_name} paired seeds"
         )
     return {
         seed: {
@@ -192,21 +213,25 @@ def _sample(
     return tuple(values[int(index)] for index in indices)
 
 
-def hierarchical_paired_bootstrap(
+def _hierarchical_paired_bootstrap(
     observations: Sequence[PairedObservation],
     *,
     n_resamples: int,
     rng_seed: int,
-    confidence: float = 0.95,
+    confidence: float,
+    required_seed_count: int,
+    required_seeds: tuple[int, ...] | None = None,
 ) -> BootstrapEstimate:
-    """Use one shared paired effect and resample seed → world → pair."""
-
     count = _positive_integer(n_resamples, "n_resamples")
     seed_value = _rng_seed(rng_seed)
     confidence_value = _finite(confidence, "confidence")
     if not 0.0 < confidence_value < 1.0:
         raise ValueError("confidence must be between zero and one")
-    panel = _panel(observations)
+    panel = _panel(
+        observations,
+        required_seed_count=required_seed_count,
+        required_seeds=required_seeds,
+    )
     seeds = tuple(panel)
     seed_effects = tuple(_seed_effect(panel[seed]) for seed in seeds)
     estimate = fmean(seed_effects)
@@ -238,6 +263,114 @@ def hierarchical_paired_bootstrap(
         n_resamples=count,
         rng_seed=seed_value,
     )
+
+
+def hierarchical_paired_bootstrap(
+    observations: Sequence[PairedObservation],
+    *,
+    n_resamples: int,
+    rng_seed: int,
+    confidence: float = 0.95,
+) -> BootstrapEstimate:
+    """Use one shared paired effect and resample seed → world → pair."""
+
+    return _hierarchical_paired_bootstrap(
+        observations,
+        n_resamples=n_resamples,
+        rng_seed=rng_seed,
+        confidence=confidence,
+        required_seed_count=CONFIRMATORY_SEED_COUNT,
+    )
+
+
+def v3_supports_practical_equivalence(
+    ci_low: float,
+    ci_high: float,
+) -> bool:
+    """Apply the frozen strict two-one-sided ±0.01 equivalence rule."""
+
+    low = _finite(ci_low, "practical-equivalence lower bound")
+    high = _finite(ci_high, "practical-equivalence upper bound")
+    if low > high:
+        raise ValueError("practical-equivalence interval bounds are reversed")
+    return low > -V3_EQUIVALENCE_MARGIN and high < V3_EQUIVALENCE_MARGIN
+
+
+@dataclass(frozen=True)
+class PracticalEquivalenceBounds:
+    bootstrap: BootstrapEstimate
+    confidence: float = V3_BOOTSTRAP_CONFIDENCE
+    margin: float = V3_EQUIVALENCE_MARGIN
+    bit_generator: str = "PCG64"
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.bootstrap, BootstrapEstimate):
+            raise TypeError("practical-equivalence bootstrap is invalid")
+        if (
+            self.bootstrap.n_seeds != V3_CONFIRMATORY_SEED_COUNT
+            or self.bootstrap.n_resamples != V3_BOOTSTRAP_DRAWS
+            or self.bootstrap.rng_seed != V3_BOOTSTRAP_RNG_SEED
+            or self.confidence != V3_BOOTSTRAP_CONFIDENCE
+            or self.margin != V3_EQUIVALENCE_MARGIN
+            or self.bit_generator != "PCG64"
+        ):
+            raise ValueError(
+                "practical-equivalence bounds disagree with the v3 contract"
+            )
+
+    @property
+    def supports_equivalence(self) -> bool:
+        return v3_supports_practical_equivalence(
+            self.bootstrap.ci_low,
+            self.bootstrap.ci_high,
+        )
+
+
+def v3_practical_equivalence_bounds(
+    observations: Sequence[PairedObservation],
+) -> PracticalEquivalenceBounds:
+    """Replay the frozen N=10 PCG64 hierarchical practical-null bounds."""
+
+    bootstrap = _hierarchical_paired_bootstrap(
+        observations,
+        n_resamples=V3_BOOTSTRAP_DRAWS,
+        rng_seed=V3_BOOTSTRAP_RNG_SEED,
+        confidence=V3_BOOTSTRAP_CONFIDENCE,
+        required_seed_count=V3_CONFIRMATORY_SEED_COUNT,
+        required_seeds=_V3_SEEDS,
+    )
+    return PracticalEquivalenceBounds(bootstrap=bootstrap)
+
+
+def v3_right_step_aulc(
+    points: Sequence[tuple[int, float]],
+) -> float:
+    """Integrate the five frozen checkpoint values as a right-step curve."""
+
+    if isinstance(points, (str, bytes)) or not isinstance(points, Sequence):
+        raise ValueError("AULC points must be an ordered sequence")
+    if len(points) != len(V3_SNAPSHOT_STEPS):
+        raise ValueError("AULC requires the five frozen optimizer steps")
+    materialized: list[tuple[int, float]] = []
+    for index, point in enumerate(points):
+        if (
+            not isinstance(point, (list, tuple))
+            or len(point) != 2
+            or type(point[0]) is not int
+        ):
+            raise ValueError(f"AULC point {index} is invalid")
+        materialized.append(
+            (point[0], _finite(point[1], f"AULC value {index}"))
+        )
+    steps = tuple(step for step, _ in materialized)
+    if steps != V3_SNAPSHOT_STEPS:
+        raise ValueError("AULC points disagree with the ordered optimizer steps")
+    previous = 0
+    area = 0.0
+    for step, value in materialized:
+        area += (step - previous) * value
+        previous = step
+    return area
 
 
 @dataclass(frozen=True)
@@ -325,6 +458,20 @@ def exact_sign_flip_test(
         assignments=total,
         p_value=extreme / total,
     )
+
+
+def v3_exact_sign_flip_test(
+    differences: Sequence[float],
+) -> ExactTestResult:
+    """Run the frozen one-sided exhaustive sign flip over exactly ten pairs."""
+
+    values = _differences(differences)
+    if len(values) != V3_CONFIRMATORY_SEED_COUNT:
+        raise ValueError("v3 exact sign-flip test requires exactly ten pairs")
+    result = exact_sign_flip_test(values, alternative="greater")
+    if result.assignments != V3_SIGN_ASSIGNMENTS:
+        raise AssertionError("v3 exhaustive sign assignments are inconsistent")
+    return result
 
 
 def exact_paired_sign_test(

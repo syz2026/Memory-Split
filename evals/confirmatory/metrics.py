@@ -22,7 +22,10 @@ from evals.confirmatory.contracts import (
     SealedGoldRecord,
     StoreRecord,
     Stratum,
+    STUDY_CONTRACT_VERSION,
+    StudyCheckpointRecord,
     Twin,
+    validate_study_record_identity,
 )
 from evals.confirmatory.actions import ActionSlot, validate_action_slots
 from evals.confirmatory.solver import (
@@ -34,6 +37,8 @@ from evals.confirmatory.solver import (
 
 _SHA256_RE = re.compile(r"[0-9a-f]{64}")
 OUTCOME_SCHEMA = "memorysplit.confirmatory.outcome.v2"
+STUDY_OUTCOME_SCHEMA = "memorysplit.confirmatory.outcome.v3"
+STUDY_METRICS_SCHEMA = "memorysplit.confirmatory.metrics.v3"
 PRIMARY_CELLS = (
     (ReasoningFamily.GRAPH, Stratum.COMPOSITION_OOD),
     (ReasoningFamily.GRAPH, Stratum.JOINT_OOD),
@@ -72,6 +77,12 @@ def _strict_fields(
 
 def _schema_version(value: object, name: str) -> int:
     if type(value) is not int or value != CONTRACT_VERSION:
+        raise ValueError(f"{name} schema_version is invalid")
+    return value
+
+
+def _study_schema_version(value: object, name: str) -> int:
+    if type(value) is not int or value != STUDY_CONTRACT_VERSION:
         raise ValueError(f"{name} schema_version is invalid")
     return value
 
@@ -207,6 +218,167 @@ class ItemOutcome:
                 action.to_dict() for action in self.submitted_proof
             ],
         }
+
+
+@dataclass(frozen=True)
+class StudyOutcomeRecord:
+    """Step-aware v3 outcome bound to one protected study checkpoint."""
+
+    item_id: str
+    pair_id: str
+    twin: Twin
+    stratum: Stratum
+    family: ReasoningFamily
+    seed: int
+    world_id: str
+    checkpoint_sha256: str
+    arm: Arm
+    condition_id: ConditionId
+    optimizer_step: int
+    raw_token_count: int
+    memory_mode: MemoryMode
+    control: Control
+    submitted_answer: str
+    submitted_proof: tuple[ActionSlot, ...]
+
+    FIELDS: ClassVar[frozenset[str]] = frozenset(
+        {
+            "record_type",
+            "schema_version",
+            "item_id",
+            "pair_id",
+            "twin",
+            "stratum",
+            "family",
+            "seed",
+            "world_id",
+            "checkpoint_sha256",
+            "arm",
+            "condition_id",
+            "optimizer_step",
+            "raw_token_count",
+            "memory_mode",
+            "control",
+            "submitted_answer",
+            "submitted_proof",
+        }
+    )
+
+    def __post_init__(self) -> None:
+        base = ItemOutcome(
+            item_id=self.item_id,
+            pair_id=self.pair_id,
+            twin=self.twin,
+            stratum=self.stratum,
+            family=self.family,
+            seed=self.seed,
+            world_id=self.world_id,
+            checkpoint_sha256=self.checkpoint_sha256,
+            arm=self.arm,
+            condition_id=self.condition_id,
+            memory_mode=self.memory_mode,
+            control=self.control,
+            submitted_answer=self.submitted_answer,
+            submitted_proof=self.submitted_proof,
+        )
+        (
+            seed,
+            arm,
+            condition_id,
+            optimizer_step,
+            raw_token_count,
+        ) = validate_study_record_identity(
+            seed=base.seed,
+            arm=base.arm,
+            condition_id=base.condition_id,
+            optimizer_step=self.optimizer_step,
+            raw_token_count=self.raw_token_count,
+        )
+        for field in (
+            "item_id",
+            "pair_id",
+            "twin",
+            "stratum",
+            "family",
+            "world_id",
+            "checkpoint_sha256",
+            "memory_mode",
+            "control",
+            "submitted_answer",
+            "submitted_proof",
+        ):
+            object.__setattr__(self, field, getattr(base, field))
+        object.__setattr__(self, "seed", seed)
+        object.__setattr__(self, "arm", arm)
+        object.__setattr__(self, "condition_id", condition_id)
+        object.__setattr__(self, "optimizer_step", optimizer_step)
+        object.__setattr__(self, "raw_token_count", raw_token_count)
+
+    @classmethod
+    def from_dict(cls, raw: Mapping[str, Any]) -> "StudyOutcomeRecord":
+        value = _strict_fields(raw, cls.FIELDS, "StudyOutcomeRecord")
+        if value["record_type"] != STUDY_OUTCOME_SCHEMA:
+            raise ValueError(
+                f"outcome record_type must be {STUDY_OUTCOME_SCHEMA}"
+            )
+        _study_schema_version(value["schema_version"], "study outcome")
+        return cls(
+            **{
+                key: field_value
+                for key, field_value in value.items()
+                if key not in {"record_type", "schema_version"}
+            }
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "record_type": STUDY_OUTCOME_SCHEMA,
+            "schema_version": STUDY_CONTRACT_VERSION,
+            "item_id": self.item_id,
+            "pair_id": self.pair_id,
+            "twin": self.twin.value,
+            "stratum": self.stratum.value,
+            "family": self.family.value,
+            "seed": self.seed,
+            "world_id": self.world_id,
+            "checkpoint_sha256": self.checkpoint_sha256,
+            "arm": self.arm.value,
+            "condition_id": self.condition_id.value,
+            "optimizer_step": self.optimizer_step,
+            "raw_token_count": self.raw_token_count,
+            "memory_mode": self.memory_mode.value,
+            "control": self.control.value,
+            "submitted_answer": self.submitted_answer,
+            "submitted_proof": [
+                action.to_dict() for action in self.submitted_proof
+            ],
+        }
+
+
+def validate_study_outcome_binding(
+    *,
+    outcome: StudyOutcomeRecord,
+    checkpoint: StudyCheckpointRecord,
+) -> StudyOutcomeRecord:
+    """Authenticate every checkpoint and step attribution on one v3 outcome."""
+
+    if not isinstance(outcome, StudyOutcomeRecord):
+        raise TypeError("study outcome binding requires a StudyOutcomeRecord")
+    if not isinstance(checkpoint, StudyCheckpointRecord):
+        raise TypeError(
+            "study outcome binding requires a StudyCheckpointRecord"
+        )
+    for field in (
+        "checkpoint_sha256",
+        "seed",
+        "arm",
+        "condition_id",
+        "optimizer_step",
+        "raw_token_count",
+    ):
+        if getattr(outcome, field) != getattr(checkpoint, field):
+            raise ValueError(f"study outcome checkpoint mismatch: {field}")
+    return outcome
 
 
 @dataclass(frozen=True, init=False)
@@ -532,6 +704,120 @@ class PairMetricSummary:
             "condition_id": self.condition_id.value,
             "memory_mode": self.memory_mode.value,
             "control": self.control.value,
+        }
+
+
+@dataclass(frozen=True)
+class StudyMetricsRecord:
+    """One step-aware v3 metric summary for a protected evaluation cell."""
+
+    primary_accuracy: float
+    primary_cells: Mapping[str, Rate]
+    overall_pair_accuracy: Rate
+    by_stratum: Mapping[Stratum, Rate]
+    by_family: Mapping[ReasoningFamily, Rate]
+    checkpoint_sha256: str
+    seed: int
+    arm: Arm
+    condition_id: ConditionId
+    optimizer_step: int
+    raw_token_count: int
+    memory_mode: MemoryMode
+    control: Control
+
+    FIELDS: ClassVar[frozenset[str]] = frozenset(
+        {
+            "record_type",
+            "schema_version",
+            *PairMetricSummary.FIELDS,
+            "seed",
+            "optimizer_step",
+            "raw_token_count",
+        }
+    )
+
+    def __post_init__(self) -> None:
+        summary = PairMetricSummary(
+            primary_accuracy=self.primary_accuracy,
+            primary_cells=self.primary_cells,
+            overall_pair_accuracy=self.overall_pair_accuracy,
+            by_stratum=self.by_stratum,
+            by_family=self.by_family,
+            checkpoint_sha256=self.checkpoint_sha256,
+            arm=self.arm,
+            condition_id=self.condition_id,
+            memory_mode=self.memory_mode,
+            control=self.control,
+        )
+        (
+            seed,
+            arm,
+            condition_id,
+            optimizer_step,
+            raw_token_count,
+        ) = validate_study_record_identity(
+            seed=self.seed,
+            arm=summary.arm,
+            condition_id=summary.condition_id,
+            optimizer_step=self.optimizer_step,
+            raw_token_count=self.raw_token_count,
+        )
+        for field in PairMetricSummary.FIELDS:
+            object.__setattr__(self, field, getattr(summary, field))
+        object.__setattr__(self, "seed", seed)
+        object.__setattr__(self, "arm", arm)
+        object.__setattr__(self, "condition_id", condition_id)
+        object.__setattr__(self, "optimizer_step", optimizer_step)
+        object.__setattr__(self, "raw_token_count", raw_token_count)
+
+    @classmethod
+    def from_dict(cls, raw: Mapping[str, Any]) -> "StudyMetricsRecord":
+        value = _strict_fields(raw, cls.FIELDS, "StudyMetricsRecord")
+        if value["record_type"] != STUDY_METRICS_SCHEMA:
+            raise ValueError(
+                f"metrics record_type must be {STUDY_METRICS_SCHEMA}"
+            )
+        _study_schema_version(value["schema_version"], "study metrics")
+        summary = PairMetricSummary.from_dict(
+            {
+                field: value[field]
+                for field in PairMetricSummary.FIELDS
+            }
+        )
+        return cls(
+            **{
+                field: getattr(summary, field)
+                for field in PairMetricSummary.FIELDS
+            },
+            seed=value["seed"],
+            optimizer_step=value["optimizer_step"],
+            raw_token_count=value["raw_token_count"],
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        summary = PairMetricSummary(
+            **{
+                field: getattr(self, field)
+                for field in PairMetricSummary.FIELDS
+            }
+        )
+        value = summary.to_dict()
+        return {
+            "record_type": STUDY_METRICS_SCHEMA,
+            "schema_version": STUDY_CONTRACT_VERSION,
+            "primary_accuracy": value["primary_accuracy"],
+            "primary_cells": value["primary_cells"],
+            "overall_pair_accuracy": value["overall_pair_accuracy"],
+            "by_stratum": value["by_stratum"],
+            "by_family": value["by_family"],
+            "checkpoint_sha256": value["checkpoint_sha256"],
+            "seed": self.seed,
+            "arm": value["arm"],
+            "condition_id": value["condition_id"],
+            "optimizer_step": self.optimizer_step,
+            "raw_token_count": self.raw_token_count,
+            "memory_mode": value["memory_mode"],
+            "control": value["control"],
         }
 
 

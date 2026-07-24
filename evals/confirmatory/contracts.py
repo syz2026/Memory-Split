@@ -13,13 +13,19 @@ from types import MappingProxyType
 from typing import Any, ClassVar
 
 from evals.confirmatory.actions import ActionSlot, validate_action_slots
+from msctl.aws_contracts import ARMS as STUDY_CONDITIONS
+from msctl.aws_contracts import SEEDS as STUDY_SEEDS
+from msctl.aws_contracts import SNAPSHOT_STEPS
 
 
 CONTRACT_VERSION = 2
+STUDY_CONTRACT_VERSION = 3
 ITEM_SCHEMA = "memorysplit.confirmatory.item.v2"
 SEALED_GOLD_SCHEMA = "memorysplit.confirmatory.sealed-gold.v2"
 STORE_SCHEMA = "memorysplit.confirmatory.store.v2"
 CHECKPOINT_SCHEMA = "memorysplit.confirmatory.checkpoint.v2"
+STUDY_CHECKPOINT_SCHEMA = "memorysplit.confirmatory.checkpoint.v3"
+STUDY_TARGETS_PER_UPDATE = 524_288
 
 _SHA256_RE = re.compile(r"[0-9a-f]{64}")
 
@@ -133,6 +139,12 @@ def _schema_version(value: object, name: str) -> int:
     return value
 
 
+def _study_schema_version(value: object, name: str) -> int:
+    if type(value) is not int or value != STUDY_CONTRACT_VERSION:
+        raise ValueError(f"unsupported {name} schema_version")
+    return value
+
+
 def _sha256(value: object, name: str) -> str:
     if not isinstance(value, str) or _SHA256_RE.fullmatch(value) is None:
         raise ValueError(f"{name} must be a lowercase SHA-256")
@@ -146,6 +158,44 @@ def _enum(value: object, cls: type[StrEnum], name: str):
         return cls(value)
     except ValueError as exc:
         raise ValueError(f"{name} is not an approved value") from exc
+
+
+def validate_study_record_identity(
+    *,
+    seed: object,
+    arm: object,
+    condition_id: object,
+    optimizer_step: object,
+    raw_token_count: object,
+) -> tuple[int, Arm, ConditionId, int, int]:
+    """Validate one protected AWS N=10 arm/checkpoint identity."""
+
+    if type(seed) is not int or seed not in STUDY_SEEDS:
+        raise ValueError("study seed must be an exact integer from 0 to 9")
+    typed_arm = _enum(arm, Arm, "arm")
+    typed_condition = _enum(condition_id, ConditionId, "condition_id")
+    if typed_condition.value not in STUDY_CONDITIONS:
+        raise ValueError("study condition_id must be dense or split90")
+    expected_arm = {
+        ConditionId.DENSE: Arm.DENSE,
+        ConditionId.SPLIT90: Arm.SPLIT,
+    }[typed_condition]
+    if typed_arm is not expected_arm:
+        raise ValueError("study condition_id disagrees with arm")
+    if type(optimizer_step) is not int or optimizer_step not in SNAPSHOT_STEPS:
+        raise ValueError("optimizer_step is not one of the five frozen steps")
+    expected_tokens = optimizer_step * STUDY_TARGETS_PER_UPDATE
+    if type(raw_token_count) is not int or raw_token_count != expected_tokens:
+        raise ValueError(
+            "raw_token_count must equal optimizer_step * 524288"
+        )
+    return (
+        seed,
+        typed_arm,
+        typed_condition,
+        optimizer_step,
+        raw_token_count,
+    )
 
 
 def _canonical_value(value: Any, path: str = "$") -> Any:
@@ -646,6 +696,114 @@ class CheckpointRecord:
             "arm": self.arm.value,
             "condition_id": self.condition_id.value,
             "seed": self.seed,
+            "raw_token_count": self.raw_token_count,
+            "configuration_sha256": self.configuration_sha256,
+            "route_dose_sha256": self.route_dose_sha256,
+            "corpus_sha256": self.corpus_sha256,
+            "code_sha256": self.code_sha256,
+        }
+
+
+@dataclass(frozen=True)
+class StudyCheckpointRecord:
+    """Step-aware v3 checkpoint while semantic evaluation records stay v2."""
+
+    record_type: str
+    schema_version: int
+    checkpoint_sha256: str
+    model_id: str
+    arm: Arm
+    condition_id: ConditionId
+    seed: int
+    optimizer_step: int
+    raw_token_count: int
+    configuration_sha256: str
+    route_dose_sha256: str
+    corpus_sha256: str
+    code_sha256: str
+
+    FIELDS: ClassVar[frozenset[str]] = frozenset(
+        {
+            "record_type",
+            "schema_version",
+            "checkpoint_sha256",
+            "model_id",
+            "arm",
+            "condition_id",
+            "seed",
+            "optimizer_step",
+            "raw_token_count",
+            "configuration_sha256",
+            "route_dose_sha256",
+            "corpus_sha256",
+            "code_sha256",
+        }
+    )
+
+    def __post_init__(self) -> None:
+        if self.record_type != STUDY_CHECKPOINT_SCHEMA:
+            raise ValueError(
+                "study checkpoint record_type must be "
+                f"{STUDY_CHECKPOINT_SCHEMA}"
+            )
+        _study_schema_version(self.schema_version, "study checkpoint")
+        base = CheckpointRecord(
+            record_type=CHECKPOINT_SCHEMA,
+            schema_version=CONTRACT_VERSION,
+            checkpoint_sha256=self.checkpoint_sha256,
+            model_id=self.model_id,
+            arm=self.arm,
+            condition_id=self.condition_id,
+            seed=self.seed,
+            raw_token_count=self.raw_token_count,
+            configuration_sha256=self.configuration_sha256,
+            route_dose_sha256=self.route_dose_sha256,
+            corpus_sha256=self.corpus_sha256,
+            code_sha256=self.code_sha256,
+        )
+        (
+            seed,
+            arm,
+            condition_id,
+            optimizer_step,
+            raw_token_count,
+        ) = validate_study_record_identity(
+            seed=base.seed,
+            arm=base.arm,
+            condition_id=base.condition_id,
+            optimizer_step=self.optimizer_step,
+            raw_token_count=base.raw_token_count,
+        )
+        for field in (
+            "checkpoint_sha256",
+            "model_id",
+            "configuration_sha256",
+            "route_dose_sha256",
+            "corpus_sha256",
+            "code_sha256",
+        ):
+            object.__setattr__(self, field, getattr(base, field))
+        object.__setattr__(self, "seed", seed)
+        object.__setattr__(self, "arm", arm)
+        object.__setattr__(self, "condition_id", condition_id)
+        object.__setattr__(self, "optimizer_step", optimizer_step)
+        object.__setattr__(self, "raw_token_count", raw_token_count)
+
+    @classmethod
+    def from_dict(cls, raw: Mapping[str, Any]) -> "StudyCheckpointRecord":
+        value = _strict_fields(raw, cls.FIELDS, "StudyCheckpointRecord")
+        return cls(**dict(value))
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "record_type": self.record_type,
+            "schema_version": self.schema_version,
+            "checkpoint_sha256": self.checkpoint_sha256,
+            "model_id": self.model_id,
+            "arm": self.arm.value,
+            "condition_id": self.condition_id.value,
+            "seed": self.seed,
+            "optimizer_step": self.optimizer_step,
             "raw_token_count": self.raw_token_count,
             "configuration_sha256": self.configuration_sha256,
             "route_dose_sha256": self.route_dose_sha256,

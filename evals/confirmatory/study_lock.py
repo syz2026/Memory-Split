@@ -11,14 +11,27 @@ from typing import Any, ClassVar
 from evals.confirmatory.contracts import (
     CONTRACT_VERSION,
     ConditionId,
+    STUDY_CONTRACT_VERSION,
     canonical_sha256,
 )
+from msctl.aws_contracts import ARMS, SEEDS, SNAPSHOT_STEPS
+from msctl.aws_contracts import checkpoint_object_key
 
 
 STUDY_LOCK_SCHEMA = "memorysplit.confirmatory.study-lock.v2"
+STUDY_LOCK_SCHEMA_V3 = "memorysplit.confirmatory.study-lock.v3"
 VALIDITY_EVIDENCE_SCHEMA = "memorysplit.confirmatory.validity-evidence.v2"
 FROZEN_PREREGISTRATION_SHA256 = (
     "fee38e363298d3def46b741320c9d7df4523d0ff3cd249187cf52d54046cbbf0"
+)
+FROZEN_PREREGISTRATION_SHA256_V3 = (
+    "6b2b5da3e3dc3d533498a0aa9d1891f356134ce045b1553b74a0161d94cb81d7"
+)
+EXPECTED_STUDY_SLOTS_V3 = tuple(
+    (seed, arm, optimizer_step)
+    for seed in SEEDS
+    for arm in ARMS
+    for optimizer_step in SNAPSHOT_STEPS
 )
 REQUIRED_FAMILIES = ("graph", "non_path")
 REQUIRED_STRATA = (
@@ -94,6 +107,12 @@ def _schema(value: object, name: str) -> int:
     return value
 
 
+def _schema_v3(value: object, name: str) -> int:
+    if type(value) is not int or value != STUDY_CONTRACT_VERSION:
+        raise ValueError(f"{name} schema_version is invalid")
+    return value
+
+
 def _ordered_strings(
     value: object,
     name: str,
@@ -111,6 +130,150 @@ def _ordered_strings(
     elif result != tuple(sorted(result)):
         raise ValueError(f"{name} must use canonical ordering")
     return result
+
+
+@dataclass(frozen=True)
+class StudySnapshotBinding:
+    """Immutable S3 identity for one protected v3 snapshot slot."""
+
+    seed: int
+    arm: str
+    optimizer_step: int
+    checkpoint_sha256: str
+    s3_object_key: str
+    s3_version_id: str
+
+    FIELDS: ClassVar[frozenset[str]] = frozenset(
+        {
+            "seed",
+            "arm",
+            "optimizer_step",
+            "checkpoint_sha256",
+            "s3_object_key",
+            "s3_version_id",
+        }
+    )
+
+    def __post_init__(self) -> None:
+        digest = _hash(self.checkpoint_sha256, "checkpoint_sha256")
+        expected_key = checkpoint_object_key(self.seed, self.arm, digest)
+        if (
+            type(self.optimizer_step) is not int
+            or self.optimizer_step not in SNAPSHOT_STEPS
+        ):
+            raise ValueError("optimizer_step is not one of the five frozen steps")
+        object_key = _string(self.s3_object_key, "S3 object key")
+        if object_key != expected_key:
+            raise ValueError(
+                "S3 object key is not the canonical content-addressed "
+                "checkpoint key"
+            )
+        version_id = _string(self.s3_version_id, "S3 version ID")
+        object.__setattr__(self, "checkpoint_sha256", digest)
+        object.__setattr__(self, "s3_object_key", object_key)
+        object.__setattr__(self, "s3_version_id", version_id)
+
+    @classmethod
+    def from_dict(cls, raw: Mapping[str, Any]) -> "StudySnapshotBinding":
+        value = _strict_fields(raw, cls.FIELDS, "study snapshot binding")
+        return cls(**dict(value))
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "seed": self.seed,
+            "arm": self.arm,
+            "optimizer_step": self.optimizer_step,
+            "checkpoint_sha256": self.checkpoint_sha256,
+            "s3_object_key": self.s3_object_key,
+            "s3_version_id": self.s3_version_id,
+        }
+
+
+@dataclass(frozen=True)
+class StudyLockV3:
+    """No-replace registry for the exact 100 protected AWS snapshots."""
+
+    record_type: str
+    schema_version: int
+    preregistration_sha256: str
+    sealed_evaluation_release_sha256: str
+    snapshots: tuple[StudySnapshotBinding, ...]
+
+    FIELDS: ClassVar[frozenset[str]] = frozenset(
+        {
+            "record_type",
+            "schema_version",
+            "preregistration_sha256",
+            "sealed_evaluation_release_sha256",
+            "snapshots",
+        }
+    )
+
+    def __post_init__(self) -> None:
+        if self.record_type != STUDY_LOCK_SCHEMA_V3:
+            raise ValueError("v3 study lock record_type is invalid")
+        _schema_v3(self.schema_version, "v3 study lock")
+        preregistration = _hash(
+            self.preregistration_sha256,
+            "preregistration_sha256",
+        )
+        if preregistration != FROZEN_PREREGISTRATION_SHA256_V3:
+            raise ValueError(
+                "v3 study lock preregistration commitment is invalid"
+            )
+        release = _hash(
+            self.sealed_evaluation_release_sha256,
+            "sealed evaluation release SHA-256",
+        )
+        if not isinstance(self.snapshots, (list, tuple)):
+            raise ValueError("v3 study lock snapshots must be ordered")
+        snapshots = tuple(
+            snapshot
+            if isinstance(snapshot, StudySnapshotBinding)
+            else StudySnapshotBinding.from_dict(snapshot)
+            for snapshot in self.snapshots
+        )
+        slots = tuple(
+            (snapshot.seed, snapshot.arm, snapshot.optimizer_step)
+            for snapshot in snapshots
+        )
+        if slots != EXPECTED_STUDY_SLOTS_V3:
+            raise ValueError(
+                "v3 study lock requires the exact ordered 100 snapshot slots"
+            )
+        object.__setattr__(self, "preregistration_sha256", preregistration)
+        object.__setattr__(
+            self,
+            "sealed_evaluation_release_sha256",
+            release,
+        )
+        object.__setattr__(self, "snapshots", snapshots)
+
+    @classmethod
+    def from_dict(cls, raw: Mapping[str, Any]) -> "StudyLockV3":
+        value = _strict_fields(raw, cls.FIELDS, "v3 study lock")
+        return cls(
+            record_type=value["record_type"],
+            schema_version=value["schema_version"],
+            preregistration_sha256=value["preregistration_sha256"],
+            sealed_evaluation_release_sha256=value[
+                "sealed_evaluation_release_sha256"
+            ],
+            snapshots=value["snapshots"],
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "record_type": self.record_type,
+            "schema_version": self.schema_version,
+            "preregistration_sha256": self.preregistration_sha256,
+            "sealed_evaluation_release_sha256": (
+                self.sealed_evaluation_release_sha256
+            ),
+            "snapshots": [
+                snapshot.to_dict() for snapshot in self.snapshots
+            ],
+        }
 
 
 @dataclass(frozen=True)
