@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import io
 import os
+import stat
 from collections.abc import Callable, Mapping
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -14,6 +15,7 @@ from cluster.aws.corpus_builder.contracts import (
     PHASE_RECEIPT_FORMAT,
     PhaseReceipt,
     S3ObjectVersion,
+    phase_receipt_to_bytes,
 )
 from cluster.aws.corpus_builder.s3 import (
     PublicationError,
@@ -26,6 +28,7 @@ from scripts import aws_corpus_cleanroom_verify
 
 
 _BUILD_ID = "b" * 64
+_OTHER_BUILD_ID = "e" * 64
 _KMS_ARN = (
     "arn:aws:kms:us-east-1:056956104102:"
     "key/01234567-89ab-cdef-0123-456789abcdef"
@@ -90,6 +93,8 @@ class VersionedFakeS3:
         self.omit_version_id = False
         self.before_put_read: Callable[[], None] | None = None
         self.get_body_override: bytes | None = None
+        self.get_response_overrides: dict[str, object] = {}
+        self.last_get_body: object | None = None
         self.on_get_read: Callable[[], None] | None = None
         self.fail_get_stream = False
         self.conditional_race: tuple[bytes, str, Mapping[str, str]] | None = None
@@ -194,7 +199,8 @@ class VersionedFakeS3:
             if self.fail_get_stream
             else ChunkedBody(payload, on_first_read=self.on_get_read)
         )
-        return {
+        self.last_get_body = body
+        response = {
             "Body": body,
             "ContentLength": entry["ContentLength"],
             "ETag": entry["ETag"],
@@ -203,6 +209,8 @@ class VersionedFakeS3:
             "ServerSideEncryption": entry["ServerSideEncryption"],
             "VersionId": entry["VersionId"],
         }
+        response.update(self.get_response_overrides)
+        return response
 
     def list_object_versions(self, **kwargs: object) -> Mapping[str, object]:
         self.list_calls.append(dict(kwargs))
@@ -296,12 +304,16 @@ def _artifact_request(tmp_path: Path, *, name: str = "artifact.bin") -> dict[str
     }
 
 
-def _phase_receipt(objects: tuple[S3ObjectVersion, ...]) -> PhaseReceipt:
+def _phase_receipt(
+    objects: tuple[S3ObjectVersion, ...],
+    *,
+    phase: str = "final",
+) -> PhaseReceipt:
     return PhaseReceipt(
         format=PHASE_RECEIPT_FORMAT,
         schema_version=1,
         build_id=_BUILD_ID,
-        phase="final",
+        phase=phase,
         package_sha256="c" * 64,
         source_lock_sha256="d" * 64,
         objects=tuple(sorted(objects, key=lambda item: item.uri)),
@@ -437,6 +449,8 @@ def test_download_streams_one_exact_version_fsyncs_and_never_overwrites(tmp_path
             "VersionId": record.version_id,
         }
     ]
+    assert isinstance(s3.last_get_body, ChunkedBody)
+    assert s3.last_get_body.closed
     destination.write_bytes(b"foreign\n")
     with pytest.raises(PublicationError, match="exists|exclusive"):
         download_exact_object(s3, record, destination)
@@ -464,6 +478,45 @@ def test_download_reheads_after_stream_and_rejects_source_mutation(tmp_path):
     with pytest.raises(PublicationError, match="KMS"):
         download_exact_object(s3, record, destination)
 
+    assert not destination.exists()
+
+
+@pytest.mark.parametrize(
+    "drift",
+    (
+        "wrong-kms",
+        "wrong-size",
+        "wrong-sha",
+        "wrong-etag",
+        "wrong-encryption",
+        "wrong-version",
+    ),
+)
+def test_get_streaming_body_closes_on_every_authority_validation_failure(
+    tmp_path,
+    drift,
+):
+    s3 = VersionedFakeS3()
+    record = publish_exact_file(s3, **_artifact_request(tmp_path))
+    if drift == "wrong-kms":
+        s3.get_response_overrides["SSEKMSKeyId"] = _OTHER_KMS_ARN
+    elif drift == "wrong-size":
+        s3.get_response_overrides["ContentLength"] = record.bytes + 1
+    elif drift == "wrong-sha":
+        s3.get_response_overrides["Metadata"] = {"sha256": "f" * 64}
+    elif drift == "wrong-etag":
+        s3.get_response_overrides["ETag"] = f'"{"f" * 32}"'
+    elif drift == "wrong-encryption":
+        s3.get_response_overrides["ServerSideEncryption"] = "AES256"
+    else:
+        s3.get_response_overrides["VersionId"] = "wrong-version"
+    destination = tmp_path / f"get-{drift}.bin"
+
+    with pytest.raises(PublicationError):
+        download_exact_object(s3, record, destination)
+
+    assert isinstance(s3.last_get_body, ChunkedBody)
+    assert s3.last_get_body.closed
     assert not destination.exists()
 
 
@@ -512,6 +565,42 @@ def test_phase_receipt_publish_is_canonical_no_overwrite_and_exactly_reusable(
         first.version_id,
     )
     assert receipt_entry["Metadata"] == {"sha256": first.sha256}
+
+
+def test_phase_receipt_rejects_key_build_id_before_any_s3_mutation(tmp_path):
+    s3 = VersionedFakeS3()
+    artifact = publish_exact_file(s3, **_artifact_request(tmp_path))
+    receipt = _phase_receipt((artifact,))
+    calls_before = (len(s3.put_calls), len(s3.list_calls))
+
+    with pytest.raises(PublicationError, match="build"):
+        publish_phase_receipt(
+            s3,
+            bucket=CORPUS_BUCKET,
+            key=f"v2/builds/{_OTHER_BUILD_ID}/phase-final.json",
+            receipt=receipt,
+            kms_key_arn=_KMS_ARN,
+        )
+
+    assert (len(s3.put_calls), len(s3.list_calls)) == calls_before
+
+
+def test_phase_receipt_rejects_kms_mismatch_before_any_s3_mutation(tmp_path):
+    s3 = VersionedFakeS3()
+    artifact = publish_exact_file(s3, **_artifact_request(tmp_path))
+    receipt = _phase_receipt((artifact,))
+    calls_before = (len(s3.put_calls), len(s3.list_calls))
+
+    with pytest.raises(PublicationError, match="KMS"):
+        publish_phase_receipt(
+            s3,
+            bucket=CORPUS_BUCKET,
+            key=f"v2/builds/{_BUILD_ID}/phase-final.json",
+            receipt=receipt,
+            kms_key_arn=_OTHER_KMS_ARN,
+        )
+
+    assert (len(s3.put_calls), len(s3.list_calls)) == calls_before
 
 
 def test_phase_receipt_rejects_any_conflicting_history_without_put_or_delete(
@@ -640,6 +729,7 @@ def test_dynamic_task1_validated_kms_arn_is_used_without_a_hardcoded_key(tmp_pat
 def _published_cleanroom_fixture(
     tmp_path: Path,
     *,
+    phase: str = "final",
     receipt_kms_arn: str = _KMS_ARN,
 ) -> tuple[VersionedFakeS3, S3ObjectVersion, dict[str, bytes]]:
     s3 = VersionedFakeS3()
@@ -661,14 +751,36 @@ def _published_cleanroom_fixture(
                 metadata={"kind": "parallel-corpus"},
             )
         )
-    receipt = _phase_receipt(tuple(objects))
-    receipt_record = publish_phase_receipt(
-        s3,
-        bucket=CORPUS_BUCKET,
-        key=f"v2/builds/{_BUILD_ID}/phase-final.json",
-        receipt=receipt,
-        kms_key_arn=receipt_kms_arn,
-    )
+    receipt = _phase_receipt(tuple(objects), phase=phase)
+    receipt_key = f"v2/builds/{_BUILD_ID}/phase-{phase}.json"
+    if receipt_kms_arn == _KMS_ARN:
+        receipt_record = publish_phase_receipt(
+            s3,
+            bucket=CORPUS_BUCKET,
+            key=receipt_key,
+            receipt=receipt,
+            kms_key_arn=receipt_kms_arn,
+        )
+    else:
+        payload = phase_receipt_to_bytes(receipt)
+        digest = hashlib.sha256(payload).hexdigest()
+        version_id = s3.install(
+            bucket=CORPUS_BUCKET,
+            key=receipt_key,
+            payload=payload,
+            kms_key_arn=receipt_kms_arn,
+            metadata={"sha256": digest},
+        )
+        entry = s3._entry(CORPUS_BUCKET, receipt_key, version_id)
+        receipt_record = S3ObjectVersion(
+            uri=f"s3://{CORPUS_BUCKET}/{receipt_key}",
+            version_id=version_id,
+            bytes=len(payload),
+            sha256=digest,
+            etag=str(entry["ETag"]).strip('"'),
+            sse_algorithm="aws:kms",
+            kms_key_arn=receipt_kms_arn,
+        )
     return s3, receipt_record, payloads
 
 
@@ -692,6 +804,10 @@ def _cleanroom_args(
         "--region",
         "us-east-1",
     ]
+
+
+def _cleanroom_control_path(destination: Path) -> Path:
+    return destination.with_name(f".{destination.name}.control")
 
 
 def test_cleanroom_cli_downloads_only_receipt_bound_versions_then_verifies(
@@ -719,6 +835,14 @@ def test_cleanroom_cli_downloads_only_receipt_bound_versions_then_verifies(
     assert result == 0
     assert verification_calls == [(destination, _BUILD_ID)]
     assert not (destination / ".phase-receipt.json").exists()
+    control = _cleanroom_control_path(destination)
+    phase_receipt = control / "phase-receipt.json"
+    receipt_key = urlsplit(receipt.uri).path.removeprefix("/")
+    receipt_entry = s3._entry(CORPUS_BUCKET, receipt_key, receipt.version_id)
+    assert phase_receipt.read_bytes() == receipt_entry["BodyBytes"]
+    assert stat.S_IMODE(destination.stat().st_mode) == 0o700
+    assert stat.S_IMODE(control.stat().st_mode) == 0o700
+    assert stat.S_IMODE(phase_receipt.stat().st_mode) == 0o600
     assert all(
         isinstance(call.get("VersionId"), str) and call["VersionId"]
         for call in s3.get_calls
@@ -748,6 +872,84 @@ def test_cleanroom_cli_rejects_foreign_files_and_symlinks_before_s3(
         )
 
     assert (len(s3.head_calls), len(s3.get_calls)) == calls_before
+
+
+def test_cleanroom_cli_rejects_symlinked_destination_ancestor_before_s3(tmp_path):
+    s3, receipt, _payloads = _published_cleanroom_fixture(tmp_path)
+    real_parent = tmp_path / "real-parent"
+    (real_parent / "nested").mkdir(parents=True)
+    alias = tmp_path / "parent-alias"
+    alias.symlink_to(real_parent, target_is_directory=True)
+    destination = alias / "nested" / "clean-room"
+    calls_before = (len(s3.head_calls), len(s3.get_calls))
+
+    with pytest.raises(PublicationError, match="ancestor|symlink|real directory"):
+        aws_corpus_cleanroom_verify.main(
+            _cleanroom_args(receipt, destination),
+            s3=s3,
+            verifier=lambda *_args, **_kwargs: None,
+        )
+
+    assert (len(s3.head_calls), len(s3.get_calls)) == calls_before
+    assert not (real_parent / "nested" / "clean-room").exists()
+
+
+def test_cleanroom_cli_rejects_non_final_receipt_before_objects_or_verifier(
+    tmp_path,
+):
+    s3, receipt, _payloads = _published_cleanroom_fixture(
+        tmp_path,
+        phase="source-verify",
+    )
+    destination = tmp_path / "non-final"
+    gets_before = len(s3.get_calls)
+    verification_calls = []
+
+    with pytest.raises(PublicationError, match="final"):
+        aws_corpus_cleanroom_verify.main(
+            _cleanroom_args(receipt, destination),
+            s3=s3,
+            verifier=lambda *_args, **_kwargs: verification_calls.append(True),
+        )
+
+    assert len(s3.get_calls) == gets_before + 1
+    assert verification_calls == []
+    assert not (destination / "receipt.json").exists()
+
+
+@pytest.mark.parametrize("mutation", ("namespace-replacement", "receipt-swap"))
+def test_cleanroom_cli_rechecks_pinned_authority_after_verification(
+    tmp_path,
+    mutation,
+):
+    s3, receipt, _payloads = _published_cleanroom_fixture(tmp_path)
+    destination = tmp_path / f"clean-{mutation}"
+    displaced = tmp_path / f"displaced-{mutation}"
+
+    def mutating_verifier(root: Path, *, expected_build_id: str):
+        assert Path(root) == destination
+        assert expected_build_id == _BUILD_ID
+        if mutation == "namespace-replacement":
+            destination.rename(displaced)
+            destination.mkdir(mode=0o700)
+        else:
+            control = _cleanroom_control_path(destination)
+            phase_path = control / "phase-receipt.json"
+            if phase_path.exists():
+                payload = phase_path.read_bytes()
+                phase_path.rename(control / "displaced-receipt.json")
+            else:
+                control.mkdir(mode=0o700)
+                payload = b"foreign phase receipt\n"
+            phase_path.write_bytes(payload)
+        return {"build_id": expected_build_id}
+
+    with pytest.raises(PublicationError, match="authority|identity|binding"):
+        aws_corpus_cleanroom_verify.main(
+            _cleanroom_args(receipt, destination),
+            s3=s3,
+            verifier=mutating_verifier,
+        )
 
 
 def test_cleanroom_cli_requires_receipt_and_objects_share_dynamic_kms_key(tmp_path):

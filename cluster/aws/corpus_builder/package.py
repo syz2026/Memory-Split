@@ -37,6 +37,7 @@ REQUIRED_PREFIXES = (
 )
 REQUIRED_FILES = (
     "requirements.txt",
+    "scripts/aws_corpus_cleanroom_verify.py",
     "scripts/build_parallel_corpus.py",
     "scripts/package_aws_corpus_builder.py",
 )
@@ -45,6 +46,7 @@ _REQUIRED_PACKAGE_PATHS = frozenset(
     {
         "cluster/aws/corpus_builder/contracts.py",
         "cluster/aws/corpus_builder/package.py",
+        "cluster/aws/corpus_builder/s3.py",
         "cluster/profiles/aws-i4i.16xlarge-corpus-v1.json",
         "configs/current-dataset-lock.json",
         "configs/reasoning-dataset-v2.json",
@@ -57,6 +59,7 @@ _REQUIRED_PACKAGE_PATHS = frozenset(
         "corpusgen/reasoning_v2/wikidata_source.py",
         "corpusgen/wikidata5m.py",
         "requirements.txt",
+        "scripts/aws_corpus_cleanroom_verify.py",
         "scripts/build_parallel_corpus.py",
         "scripts/package_aws_corpus_builder.py",
         "sources/Wikidata-CC0-1.0.txt",
@@ -69,6 +72,7 @@ _REQUIRED_PACKAGE_PATHS = frozenset(
 _REQUIRED_TEST_PATHS = frozenset(
     {
         "tests/test_aws_corpus_builder_contracts.py",
+        "tests/test_aws_corpus_builder_s3.py",
         "tests/test_parallel_corpus.py",
         "tests/test_reasoning_v2_catalog.py",
         "tests/test_reasoning_v2_renderers.py",
@@ -104,6 +108,7 @@ _REVIEWED_MEMBER_INVENTORY = frozenset(
         "cluster/aws/corpus_builder/__init__.py",
         "cluster/aws/corpus_builder/contracts.py",
         "cluster/aws/corpus_builder/package.py",
+        "cluster/aws/corpus_builder/s3.py",
         "cluster/profiles/aws-i4i.16xlarge-corpus-v1.json",
         "cluster/profiles/aws-p5.48xlarge.json",
         "cluster/profiles/illumina-usfc-prd.json",
@@ -171,6 +176,7 @@ _REVIEWED_MEMBER_INVENTORY = frozenset(
         "scripts/analyze.py",
         "scripts/analyze_keyguess_policy.py",
         "scripts/analyze_relational.py",
+        "scripts/aws_corpus_cleanroom_verify.py",
         "scripts/build_corpus.py",
         "scripts/build_current_dataset.py",
         "scripts/build_current_smoke.py",

@@ -547,15 +547,22 @@ def _get(
         ) from error
     if not isinstance(response, Mapping):
         raise PublicationError("S3 GET response must be a mapping")
-    _require_response_authority(
-        response,
-        expected,
-        required_metadata=required_metadata,
-        exact_metadata=exact_metadata,
-    )
     body = response.get("Body")
-    if body is None or not callable(getattr(body, "read", None)):
-        raise PublicationError("S3 GET response body is not readable")
+    try:
+        _require_response_authority(
+            response,
+            expected,
+            required_metadata=required_metadata,
+            exact_metadata=exact_metadata,
+        )
+        if body is None or not callable(getattr(body, "read", None)):
+            raise PublicationError("S3 GET response body is not readable")
+    except BaseException:
+        try:
+            _close_body(body)
+        except Exception:
+            pass
+        raise
     return response, body
 
 
@@ -636,6 +643,17 @@ def publish_phase_receipt(
         digest=digest,
         kms_key_arn=kms_key_arn,
     )
+    key_parts = urlsplit(uri).path.removeprefix("/").split("/")
+    build_index = len(CORPUS_KEY_PREFIX.split("/"))
+    if key_parts[build_index] != receipt.build_id:
+        raise PublicationError(
+            "phase receipt key build ID does not match receipt.build_id"
+        )
+    receipt_kms_arns = {item.kms_key_arn for item in receipt.objects}
+    if receipt_kms_arns != {kms_key_arn}:
+        raise PublicationError(
+            "phase receipt KMS key does not match its object authority"
+        )
     versions, delete_markers = _list_exact_key_history(
         s3,
         bucket=bucket,
@@ -719,29 +737,18 @@ def _same_file(left: os.stat_result, right: os.stat_result) -> bool:
     )
 
 
-def download_exact_object(
+def _download_exact_object_at(
     s3: S3Client,
     expected: S3ObjectVersion,
-    destination: Path,
-) -> None:
-    """Exclusively create, stream, fsync, hash, and re-HEAD one version."""
+    *,
+    parent_fd: int,
+    name: str,
+) -> os.stat_result:
+    """Download one exact version beneath an already-pinned directory."""
 
     expected = _validate_record(expected)
-    output = Path(destination)
-    if output.name in {"", ".", ".."}:
+    if name in {"", ".", ".."} or "/" in name or "\0" in name:
         raise PublicationError("download destination must name a file")
-    parent_flags = (
-        os.O_RDONLY
-        | getattr(os, "O_DIRECTORY", 0)
-        | getattr(os, "O_CLOEXEC", 0)
-        | getattr(os, "O_NOFOLLOW", 0)
-    )
-    try:
-        parent_fd = os.open(output.parent, parent_flags)
-    except OSError as error:
-        raise PublicationError(
-            "download destination parent must be a real directory"
-        ) from error
 
     descriptor = -1
     created: os.stat_result | None = None
@@ -755,7 +762,7 @@ def download_exact_object(
             | getattr(os, "O_NOFOLLOW", 0)
         )
         try:
-            descriptor = os.open(output.name, flags, 0o600, dir_fd=parent_fd)
+            descriptor = os.open(name, flags, 0o600, dir_fd=parent_fd)
         except FileExistsError as error:
             raise PublicationError(
                 "download destination exists; exclusive creation required"
@@ -794,7 +801,7 @@ def download_exact_object(
         os.fsync(descriptor)
         verify_exact_object(s3, expected)
         final = os.fstat(descriptor)
-        named = os.stat(output.name, dir_fd=parent_fd, follow_symlinks=False)
+        named = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
         if (
             not _same_file(created, final)
             or not _same_file(created, named)
@@ -803,6 +810,7 @@ def download_exact_object(
             raise PublicationError("download destination identity or size drift")
         os.fsync(parent_fd)
         success = True
+        return final
     except PublicationError:
         raise
     except OSError as error:
@@ -814,15 +822,47 @@ def download_exact_object(
             try:
                 current_fd = os.fstat(descriptor)
                 named = os.stat(
-                    output.name,
+                    name,
                     dir_fd=parent_fd,
                     follow_symlinks=False,
                 )
                 if _same_file(created, current_fd) and _same_file(created, named):
-                    os.unlink(output.name, dir_fd=parent_fd)
+                    os.unlink(name, dir_fd=parent_fd)
                     os.fsync(parent_fd)
             except (FileNotFoundError, OSError):
                 pass
         if descriptor >= 0:
             os.close(descriptor)
+
+
+def download_exact_object(
+    s3: S3Client,
+    expected: S3ObjectVersion,
+    destination: Path,
+) -> None:
+    """Exclusively create, stream, fsync, hash, and re-HEAD one version."""
+
+    output = Path(destination)
+    if output.name in {"", ".", ".."}:
+        raise PublicationError("download destination must name a file")
+    parent_flags = (
+        os.O_RDONLY
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    try:
+        parent_fd = os.open(output.parent, parent_flags)
+    except OSError as error:
+        raise PublicationError(
+            "download destination parent must be a real directory"
+        ) from error
+    try:
+        _download_exact_object_at(
+            s3,
+            expected,
+            parent_fd=parent_fd,
+            name=output.name,
+        )
+    finally:
         os.close(parent_fd)

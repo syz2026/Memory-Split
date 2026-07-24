@@ -4,10 +4,12 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import os
 import stat
 import sys
 from collections.abc import Callable, Sequence
+from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from urllib.parse import urlsplit
 
@@ -25,51 +27,220 @@ from cluster.aws.corpus_builder.contracts import (  # noqa: E402
 from cluster.aws.corpus_builder.s3 import (  # noqa: E402
     PublicationError,
     S3Client,
+    _download_exact_object_at,
     _resolve_exact_object,
-    download_exact_object,
 )
 from corpusgen.parallel import verify_parallel_corpus  # noqa: E402
 
 
-_PHASE_RECEIPT_NAME = ".phase-receipt.json"
+_PHASE_RECEIPT_NAME = "phase-receipt.json"
 
 
-def _prepare_empty_root(destination: Path) -> Path:
-    root = Path(destination)
-    if root.name in {"", ".", ".."}:
+def _directory_flags() -> int:
+    return (
+        os.O_RDONLY
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+
+
+def _same_inode(left: os.stat_result, right: os.stat_result) -> bool:
+    return (left.st_dev, left.st_ino) == (right.st_dev, right.st_ino)
+
+
+@dataclass(frozen=True)
+class _DirectoryBinding:
+    parent_fd: int
+    name: str
+    descriptor: int
+
+
+@dataclass
+class _PinnedCleanRoom:
+    path: Path
+    ancestor_bindings: tuple[_DirectoryBinding, ...]
+    ancestor_descriptors: tuple[int, ...]
+    parent_fd: int
+    root_name: str
+    root_fd: int
+    control_name: str
+    control_fd: int
+
+    def close(self) -> None:
+        os.close(self.control_fd)
+        os.close(self.root_fd)
+        for descriptor in reversed(self.ancestor_descriptors):
+            os.close(descriptor)
+
+
+@dataclass(frozen=True)
+class _PinnedReceipt:
+    descriptor: int
+    initial: os.stat_result
+    payload: bytes
+
+
+def _assert_directory_binding(
+    parent_fd: int,
+    name: str,
+    descriptor: int,
+    *,
+    label: str,
+    owner_only: bool = False,
+) -> None:
+    try:
+        opened = os.fstat(descriptor)
+        named = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    except OSError as error:
+        raise PublicationError(f"{label} authority binding cannot be inspected") from error
+    if (
+        not stat.S_ISDIR(opened.st_mode)
+        or not stat.S_ISDIR(named.st_mode)
+        or stat.S_ISLNK(named.st_mode)
+        or not _same_inode(opened, named)
+    ):
+        raise PublicationError(f"{label} authority binding changed")
+    if owner_only and stat.S_IMODE(opened.st_mode) != 0o700:
+        raise PublicationError(f"{label} must remain owner-only")
+
+
+def _open_pinned_parent(
+    destination: Path,
+) -> tuple[Path, tuple[_DirectoryBinding, ...], tuple[int, ...]]:
+    path = Path(os.path.abspath(os.fspath(destination)))
+    if path.name in {"", ".", ".."}:
         raise PublicationError("clean-room destination must name a directory")
+    descriptors: list[int] = []
+    bindings: list[_DirectoryBinding] = []
     try:
-        metadata = os.lstat(root)
-    except FileNotFoundError:
-        try:
-            parent = os.lstat(root.parent)
-            if not stat.S_ISDIR(parent.st_mode) or stat.S_ISLNK(parent.st_mode):
-                raise PublicationError(
-                    "clean-room destination parent must be a real directory"
+        current = os.open(os.path.sep, _directory_flags())
+        descriptors.append(current)
+        for component in path.parent.parts[1:]:
+            try:
+                named = os.stat(
+                    component,
+                    dir_fd=current,
+                    follow_symlinks=False,
                 )
-            root.mkdir(mode=0o700)
-            metadata = os.lstat(root)
-        except PublicationError:
-            raise
-        except OSError as error:
-            raise PublicationError(
-                "clean-room destination cannot be created"
-            ) from error
-    except OSError as error:
-        raise PublicationError("clean-room destination cannot be inspected") from error
-    if not stat.S_ISDIR(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode):
-        raise PublicationError("clean-room destination must be a real directory")
+            except OSError as error:
+                raise PublicationError(
+                    "clean-room destination ancestors must be real directories"
+                ) from error
+            if not stat.S_ISDIR(named.st_mode) or stat.S_ISLNK(named.st_mode):
+                raise PublicationError(
+                    "clean-room destination ancestors must not be symlinks"
+                )
+            try:
+                child = os.open(component, _directory_flags(), dir_fd=current)
+            except OSError as error:
+                raise PublicationError(
+                    "clean-room destination ancestors must be real directories"
+                ) from error
+            descriptors.append(child)
+            binding = _DirectoryBinding(current, component, child)
+            bindings.append(binding)
+            _assert_directory_binding(
+                current,
+                component,
+                child,
+                label="clean-room ancestor",
+            )
+            current = child
+    except BaseException:
+        for descriptor in reversed(descriptors):
+            os.close(descriptor)
+        raise
+    return path, tuple(bindings), tuple(descriptors)
+
+
+def _create_pinned_directory(parent_fd: int, name: str, *, label: str) -> int:
     try:
-        entries = list(os.scandir(root))
-    except OSError as error:
-        raise PublicationError("clean-room destination cannot be listed") from error
-    if entries:
-        first = entries[0]
-        kind = "symlink" if first.is_symlink() else "foreign entry"
+        os.mkdir(name, mode=0o700, dir_fd=parent_fd)
+    except FileExistsError as error:
         raise PublicationError(
-            f"clean-room destination must be empty; found {kind}: {first.name}"
+            f"{label} already exists; an empty owner-only root must be newly created"
+        ) from error
+    except OSError as error:
+        raise PublicationError(f"{label} cannot be created") from error
+    descriptor = -1
+    try:
+        descriptor = os.open(name, _directory_flags(), dir_fd=parent_fd)
+        os.fchmod(descriptor, 0o700)
+        _assert_directory_binding(
+            parent_fd,
+            name,
+            descriptor,
+            label=label,
+            owner_only=True,
         )
-    return root
+        os.fsync(parent_fd)
+        return descriptor
+    except BaseException:
+        if descriptor >= 0:
+            os.close(descriptor)
+        raise
+
+
+def _prepare_pinned_clean_room(destination: Path) -> _PinnedCleanRoom:
+    path, ancestor_bindings, ancestor_descriptors = _open_pinned_parent(destination)
+    parent_fd = ancestor_descriptors[-1]
+    root_fd = -1
+    control_fd = -1
+    control_name = f".{path.name}.control"
+    try:
+        root_fd = _create_pinned_directory(
+            parent_fd,
+            path.name,
+            label="clean-room destination",
+        )
+        control_fd = _create_pinned_directory(
+            parent_fd,
+            control_name,
+            label="clean-room control directory",
+        )
+        return _PinnedCleanRoom(
+            path=path,
+            ancestor_bindings=ancestor_bindings,
+            ancestor_descriptors=ancestor_descriptors,
+            parent_fd=parent_fd,
+            root_name=path.name,
+            root_fd=root_fd,
+            control_name=control_name,
+            control_fd=control_fd,
+        )
+    except BaseException:
+        if control_fd >= 0:
+            os.close(control_fd)
+        if root_fd >= 0:
+            os.close(root_fd)
+        for descriptor in reversed(ancestor_descriptors):
+            os.close(descriptor)
+        raise
+
+
+def _assert_clean_room_authority(room: _PinnedCleanRoom) -> None:
+    for binding in room.ancestor_bindings:
+        _assert_directory_binding(
+            binding.parent_fd,
+            binding.name,
+            binding.descriptor,
+            label="clean-room ancestor",
+        )
+    _assert_directory_binding(
+        room.parent_fd,
+        room.root_name,
+        room.root_fd,
+        label="clean-room destination",
+        owner_only=True,
+    )
+    _assert_directory_binding(
+        room.parent_fd,
+        room.control_name,
+        room.control_fd,
+        label="clean-room control directory",
+        owner_only=True,
+    )
 
 
 def _receipt_build_id(reference: S3ObjectVersion) -> str:
@@ -112,85 +283,198 @@ def _local_object_paths(
 
 
 def _create_expected_directories(
-    root: Path,
+    root_fd: int,
     directories: set[PurePosixPath],
-) -> None:
-    for relative in sorted(
-        directories,
-        key=lambda path: (len(path.parts), path.as_posix()),
-    ):
-        path = root.joinpath(*relative.parts)
-        try:
-            path.mkdir(mode=0o700)
-            metadata = os.lstat(path)
-        except OSError as error:
-            raise PublicationError(
-                f"cannot create clean-room directory: {relative.as_posix()}"
-            ) from error
-        if not stat.S_ISDIR(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode):
-            raise PublicationError(
-                f"clean-room directory is unsafe: {relative.as_posix()}"
+) -> dict[PurePosixPath, int]:
+    descriptors = {PurePosixPath(): root_fd}
+    try:
+        for relative in sorted(
+            directories,
+            key=lambda path: (len(path.parts), path.as_posix()),
+        ):
+            parent = PurePosixPath(*relative.parts[:-1])
+            descriptors[relative] = _create_pinned_directory(
+                descriptors[parent],
+                relative.name,
+                label=f"clean-room directory {relative.as_posix()}",
             )
+    except BaseException:
+        for relative, descriptor in reversed(tuple(descriptors.items())):
+            if relative.parts:
+                os.close(descriptor)
+        raise
+    return descriptors
+
+
+def _close_expected_directories(descriptors: dict[PurePosixPath, int]) -> None:
+    for relative, descriptor in reversed(tuple(descriptors.items())):
+        if relative.parts:
+            os.close(descriptor)
 
 
 def _assert_exact_namespace(
-    root: Path,
+    descriptors: dict[PurePosixPath, int],
     *,
+    file_identities: dict[PurePosixPath, os.stat_result],
     files: set[PurePosixPath],
     directories: set[PurePosixPath],
 ) -> None:
     actual_files: set[PurePosixPath] = set()
     actual_directories: set[PurePosixPath] = set()
-    pending = [(root, PurePosixPath())]
-    while pending:
-        directory, relative_parent = pending.pop()
-        try:
-            entries = list(os.scandir(directory))
-        except OSError as error:
-            raise PublicationError("clean-room namespace cannot be listed") from error
-        for entry in entries:
-            relative = relative_parent / entry.name
-            if entry.is_symlink():
-                raise PublicationError(
-                    f"clean-room namespace contains symlink: {relative.as_posix()}"
+    try:
+        for relative in sorted(
+            directories,
+            key=lambda path: (len(path.parts), path.as_posix()),
+        ):
+            parent = PurePosixPath(*relative.parts[:-1])
+            _assert_directory_binding(
+                descriptors[parent],
+                relative.name,
+                descriptors[relative],
+                label=f"clean-room directory {relative.as_posix()}",
+                owner_only=True,
+            )
+        for relative_parent, descriptor in descriptors.items():
+            for name in os.listdir(descriptor):
+                metadata = os.stat(
+                    name,
+                    dir_fd=descriptor,
+                    follow_symlinks=False,
                 )
-            if entry.is_dir(follow_symlinks=False):
-                actual_directories.add(relative)
-                pending.append((Path(entry.path), relative))
-            elif entry.is_file(follow_symlinks=False):
-                actual_files.add(relative)
-            else:
-                raise PublicationError(
-                    f"clean-room namespace contains special entry: "
-                    f"{relative.as_posix()}"
-                )
+                relative = relative_parent / name
+                if stat.S_ISLNK(metadata.st_mode):
+                    raise PublicationError(
+                        "clean-room namespace contains symlink: "
+                        f"{relative.as_posix()}"
+                    )
+                if stat.S_ISDIR(metadata.st_mode):
+                    actual_directories.add(relative)
+                    expected_fd = descriptors.get(relative)
+                    if expected_fd is not None and not _same_inode(
+                        metadata,
+                        os.fstat(expected_fd),
+                    ):
+                        raise PublicationError(
+                            "clean-room directory identity changed: "
+                            f"{relative.as_posix()}"
+                        )
+                elif stat.S_ISREG(metadata.st_mode):
+                    actual_files.add(relative)
+                    expected_identity = file_identities.get(relative)
+                    if expected_identity is not None and (
+                        not _same_inode(metadata, expected_identity)
+                        or metadata.st_size != expected_identity.st_size
+                    ):
+                        raise PublicationError(
+                            "clean-room file identity changed: "
+                            f"{relative.as_posix()}"
+                        )
+                else:
+                    raise PublicationError(
+                        "clean-room namespace contains special entry: "
+                        f"{relative.as_posix()}"
+                    )
+    except PublicationError:
+        raise
+    except OSError as error:
+        raise PublicationError("clean-room namespace cannot be inspected") from error
     if actual_files != files or actual_directories != directories:
         raise PublicationError("clean-room namespace is incomplete or foreign")
 
 
-def _remove_phase_receipt(path: Path) -> None:
+def _read_descriptor(descriptor: int) -> bytes:
+    chunks: list[bytes] = []
     try:
-        metadata = os.lstat(path)
-        if not stat.S_ISREG(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode):
-            raise PublicationError("downloaded phase receipt identity is unsafe")
-        path.unlink()
-        descriptor = os.open(
-            path.parent,
-            os.O_RDONLY
-            | getattr(os, "O_DIRECTORY", 0)
-            | getattr(os, "O_CLOEXEC", 0)
-            | getattr(os, "O_NOFOLLOW", 0),
-        )
-        try:
-            os.fsync(descriptor)
-        finally:
-            os.close(descriptor)
-    except FileNotFoundError:
-        return
-    except PublicationError:
-        raise
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        while True:
+            chunk = os.read(descriptor, 1024 * 1024)
+            if not chunk:
+                break
+            chunks.append(chunk)
     except OSError as error:
-        raise PublicationError("downloaded phase receipt cannot be removed") from error
+        raise PublicationError("pinned phase receipt cannot be read") from error
+    return b"".join(chunks)
+
+
+def _pin_phase_receipt(
+    control_fd: int,
+    downloaded: os.stat_result,
+    reference: S3ObjectVersion,
+) -> _PinnedReceipt:
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    try:
+        descriptor = os.open(_PHASE_RECEIPT_NAME, flags, dir_fd=control_fd)
+    except OSError as error:
+        raise PublicationError("downloaded phase receipt cannot be pinned") from error
+    try:
+        initial = os.fstat(descriptor)
+        named = os.stat(
+            _PHASE_RECEIPT_NAME,
+            dir_fd=control_fd,
+            follow_symlinks=False,
+        )
+        if (
+            not stat.S_ISREG(initial.st_mode)
+            or not stat.S_ISREG(named.st_mode)
+            or stat.S_ISLNK(named.st_mode)
+            or not _same_inode(downloaded, initial)
+            or not _same_inode(initial, named)
+            or initial.st_size != reference.bytes
+        ):
+            raise PublicationError("downloaded phase receipt identity changed")
+        payload = _read_descriptor(descriptor)
+        if (
+            len(payload) != reference.bytes
+            or hashlib.sha256(payload).hexdigest() != reference.sha256
+        ):
+            raise PublicationError("downloaded phase receipt hash or size changed")
+        return _PinnedReceipt(
+            descriptor=descriptor,
+            initial=initial,
+            payload=payload,
+        )
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def _verify_pinned_phase_receipt(
+    room: _PinnedCleanRoom,
+    pinned: _PinnedReceipt,
+    reference: S3ObjectVersion,
+) -> None:
+    try:
+        current = os.fstat(pinned.descriptor)
+        named = os.stat(
+            _PHASE_RECEIPT_NAME,
+            dir_fd=room.control_fd,
+            follow_symlinks=False,
+        )
+        entries = set(os.listdir(room.control_fd))
+    except OSError as error:
+        raise PublicationError("phase receipt authority cannot be inspected") from error
+    if (
+        entries != {_PHASE_RECEIPT_NAME}
+        or not stat.S_ISREG(current.st_mode)
+        or not stat.S_ISREG(named.st_mode)
+        or stat.S_ISLNK(named.st_mode)
+        or not _same_inode(pinned.initial, current)
+        or not _same_inode(pinned.initial, named)
+        or current.st_size != reference.bytes
+        or named.st_size != reference.bytes
+    ):
+        raise PublicationError("phase receipt authority identity or name binding changed")
+    payload = _read_descriptor(pinned.descriptor)
+    if (
+        payload != pinned.payload
+        or len(payload) != reference.bytes
+        or hashlib.sha256(payload).hexdigest() != reference.sha256
+    ):
+        raise PublicationError("phase receipt authority hash or size changed")
 
 
 def cleanroom_verify(
@@ -205,47 +489,73 @@ def cleanroom_verify(
 ) -> object:
     """Download one closed receipt/object set and run the corpus verifier."""
 
-    root = _prepare_empty_root(destination)
-    reference = _resolve_exact_object(
-        s3,
-        uri=receipt_uri,
-        version_id=receipt_version_id,
-        sha256=receipt_sha256,
-    )
-    phase_path = root / _PHASE_RECEIPT_NAME
+    room = _prepare_pinned_clean_room(destination)
+    pinned: _PinnedReceipt | None = None
+    directory_fds: dict[PurePosixPath, int] = {}
     try:
-        download_exact_object(s3, reference, phase_path)
-        try:
-            receipt = phase_receipt_from_bytes(phase_path.read_bytes())
-        except (OSError, ValueError) as error:
-            raise PublicationError("downloaded phase receipt is invalid") from error
-    finally:
-        _remove_phase_receipt(phase_path)
-
-    if (
-        receipt.build_id != expected_build_id
-        or _receipt_build_id(reference) != expected_build_id
-    ):
-        raise PublicationError("phase receipt build ID does not match expectation")
-    object_kms_arns = {item.kms_key_arn for item in receipt.objects}
-    if object_kms_arns != {reference.kms_key_arn}:
-        raise PublicationError(
-            "phase receipt and corpus objects do not share one KMS key"
-        )
-    files, directories = _local_object_paths(receipt)
-    _create_expected_directories(root, directories)
-    for relative, expected in files.items():
-        download_exact_object(
+        reference = _resolve_exact_object(
             s3,
-            expected,
-            root.joinpath(*relative.parts),
+            uri=receipt_uri,
+            version_id=receipt_version_id,
+            sha256=receipt_sha256,
         )
-    _assert_exact_namespace(
-        root,
-        files=set(files),
-        directories=directories,
-    )
-    return verifier(root, expected_build_id=expected_build_id)
+        downloaded = _download_exact_object_at(
+            s3,
+            reference,
+            parent_fd=room.control_fd,
+            name=_PHASE_RECEIPT_NAME,
+        )
+        pinned = _pin_phase_receipt(room.control_fd, downloaded, reference)
+        try:
+            receipt = phase_receipt_from_bytes(pinned.payload)
+        except ValueError as error:
+            raise PublicationError("downloaded phase receipt is invalid") from error
+        if receipt.phase != "final":
+            raise PublicationError("clean-room verification requires a final receipt")
+        if (
+            receipt.build_id != expected_build_id
+            or _receipt_build_id(reference) != expected_build_id
+        ):
+            raise PublicationError("phase receipt build ID does not match expectation")
+        object_kms_arns = {item.kms_key_arn for item in receipt.objects}
+        if object_kms_arns != {reference.kms_key_arn}:
+            raise PublicationError(
+                "phase receipt and corpus objects do not share one KMS key"
+            )
+        files, directories = _local_object_paths(receipt)
+        directory_fds = _create_expected_directories(room.root_fd, directories)
+        file_identities: dict[PurePosixPath, os.stat_result] = {}
+        for relative, expected in files.items():
+            parent = PurePosixPath(*relative.parts[:-1])
+            file_identities[relative] = _download_exact_object_at(
+                s3,
+                expected,
+                parent_fd=directory_fds[parent],
+                name=relative.name,
+            )
+        _assert_clean_room_authority(room)
+        _assert_exact_namespace(
+            directory_fds,
+            file_identities=file_identities,
+            files=set(files),
+            directories=directories,
+        )
+        result = verifier(room.path, expected_build_id=expected_build_id)
+        _assert_clean_room_authority(room)
+        _assert_exact_namespace(
+            directory_fds,
+            file_identities=file_identities,
+            files=set(files),
+            directories=directories,
+        )
+        _verify_pinned_phase_receipt(room, pinned, reference)
+        return result
+    finally:
+        if pinned is not None:
+            os.close(pinned.descriptor)
+        if directory_fds:
+            _close_expected_directories(directory_fds)
+        room.close()
 
 
 def _live_s3_client(*, profile: str, region: str) -> S3Client:

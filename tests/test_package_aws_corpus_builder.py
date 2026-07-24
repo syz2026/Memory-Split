@@ -29,6 +29,16 @@ from cluster.aws.corpus_builder.package import (
 ROOT = Path(__file__).resolve().parents[1]
 PACKAGE_SOURCE = ROOT / "cluster" / "aws" / "corpus_builder" / "package.py"
 SCRIPT_SOURCE = ROOT / "scripts" / "package_aws_corpus_builder.py"
+S3_SOURCE = ROOT / "cluster" / "aws" / "corpus_builder" / "s3.py"
+CLEANROOM_SCRIPT_SOURCE = ROOT / "scripts" / "aws_corpus_cleanroom_verify.py"
+S3_TEST_SOURCE = ROOT / "tests" / "test_aws_corpus_builder_s3.py"
+TASK3_RUNTIME_MEMBERS = frozenset(
+    {
+        "cluster/aws/corpus_builder/s3.py",
+        "scripts/aws_corpus_cleanroom_verify.py",
+    }
+)
+TASK3_TEST_MEMBER = "tests/test_aws_corpus_builder_s3.py"
 PROFILE = "cluster/profiles/aws-i4i.16xlarge-corpus-v1.json"
 TOKENIZER_ASSETS = (
     "vendor/tiktoken/6c7ea1a7e38e3a7f062df639a5b80947f075ffe6",
@@ -66,6 +76,7 @@ def lookup_alias(*args, **kwargs):
 """
 REQUIRED_AUTHORITIES = (
     "cluster/aws/corpus_builder/contracts.py",
+    "cluster/aws/corpus_builder/s3.py",
     PROFILE,
     "configs/current-dataset-lock.json",
     "configs/reasoning-dataset-v2.json",
@@ -81,7 +92,9 @@ REQUIRED_AUTHORITIES = (
     "sources/current-dataset-licenses.json",
     "sources/wikidata5m.lock.json",
     *TOKENIZER_ASSETS,
+    "scripts/aws_corpus_cleanroom_verify.py",
     "tests/test_aws_corpus_builder_contracts.py",
+    TASK3_TEST_MEMBER,
     "tests/test_parallel_corpus.py",
     "tests/test_reasoning_v2_catalog.py",
     "tests/test_reasoning_v2_renderers.py",
@@ -152,10 +165,11 @@ def _canonical(value: object) -> bytes:
 def _fixture_files() -> dict[str, bytes | str]:
     return {
         "README.md": "# intentionally outside the package allowlist\n",
-        "requirements.txt": "pytest\n",
+        "requirements.txt": "boto3>=1.34\npytest>=8.0\n",
         "cluster/aws/corpus_builder/__init__.py": '"""fixture package"""\n',
         "cluster/aws/corpus_builder/contracts.py": "FORMAT = 'fixture-v1'\n",
         "cluster/aws/corpus_builder/package.py": PACKAGE_SOURCE.read_bytes(),
+        "cluster/aws/corpus_builder/s3.py": S3_SOURCE.read_bytes(),
         PROFILE: '{"profile_id":"aws-i4i.16xlarge-corpus-v1"}\n',
         "configs/current-dataset-lock.json": '{"schema_version":1}\n',
         "configs/reasoning-dataset-v2.json": '{"schema_version":2}\n',
@@ -171,6 +185,7 @@ def _fixture_files() -> dict[str, bytes | str]:
         WIKIDATA_SOURCE: WIKIDATA_SOURCE_SURFACE,
         "corpusgen/wikidata5m.py": "WIKIDATA_ARCHIVE_API = 1\n",
         "scripts/build_parallel_corpus.py": "raise SystemExit(0)\n",
+        "scripts/aws_corpus_cleanroom_verify.py": CLEANROOM_SCRIPT_SOURCE.read_bytes(),
         "scripts/package_aws_corpus_builder.py": SCRIPT_SOURCE.read_bytes(),
         "sources/Wikidata-CC0-1.0.txt": "CC0 fixture notice\n",
         "sources/current-dataset-licenses.json": '{"schema_version":1}\n',
@@ -178,6 +193,7 @@ def _fixture_files() -> dict[str, bytes | str]:
         TOKENIZER_ASSETS[0]: b"tokenizer fixture a\n",
         TOKENIZER_ASSETS[1]: b"tokenizer fixture b\n",
         "tests/test_aws_corpus_builder_contracts.py": "def test_contract(): pass\n",
+        TASK3_TEST_MEMBER: S3_TEST_SOURCE.read_bytes(),
         "tests/test_parallel_corpus.py": "def test_parallel(): pass\n",
         "tests/test_reasoning_v2_catalog.py": "def test_catalog(): pass\n",
         "tests/test_reasoning_v2_renderers.py": "def test_renderers(): pass\n",
@@ -231,9 +247,27 @@ def test_package_allowlist_is_exact():
     )
     assert REQUIRED_FILES == (
         "requirements.txt",
+        "scripts/aws_corpus_cleanroom_verify.py",
         "scripts/build_parallel_corpus.py",
         "scripts/package_aws_corpus_builder.py",
     )
+
+
+def test_task3_runtime_cli_and_tests_are_required_reviewed_members():
+    assert TASK3_RUNTIME_MEMBERS <= package_module._REQUIRED_PACKAGE_PATHS
+    assert TASK3_TEST_MEMBER in package_module._REQUIRED_TEST_PATHS
+    assert TASK3_RUNTIME_MEMBERS <= package_module._REVIEWED_MEMBER_INVENTORY
+
+
+def test_live_cleanroom_dependency_is_declared_once():
+    declarations = [
+        line.strip()
+        for line in (ROOT / "requirements.txt").read_text(encoding="utf-8").splitlines()
+        if line.strip() and not line.lstrip().startswith("#")
+    ]
+    boto3 = [line for line in declarations if line.split(">", 1)[0] == "boto3"]
+
+    assert boto3 == ["boto3>=1.34"]
 
 
 def test_builder_package_is_byte_identical_canonical_and_closed(tmp_path: Path):
@@ -268,6 +302,7 @@ def test_builder_package_is_byte_identical_canonical_and_closed(tmp_path: Path):
     assert "corpusgen/parallel/Output-2026/data.bin" not in first.members
     assert "vendor/tiktoken/Cache_2/old.bin" not in first.members
     assert all(path in first.members for path in TOKENIZER_ASSETS)
+    assert TASK3_RUNTIME_MEMBERS <= set(first.members)
     assert set(REQUIRED_FILES).issubset(first.members)
     assert set(REQUIRED_AUTHORITIES) - {
         path for path in REQUIRED_AUTHORITIES if path.startswith("tests/")
