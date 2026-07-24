@@ -1,7 +1,12 @@
 """AWS claim-bearing corpus builder contracts."""
 
 from cluster.aws.corpus_builder.contracts import (
+    CORPUS_BUCKET,
+    CORPUS_KMS_KEY_ARN,
+    CORPUS_KEY_PREFIX,
     LAUNCH_INTENT_FORMAT,
+    MAX_COMPUTE_USD,
+    MAX_HOURLY_USD,
     PHASE_RECEIPT_FORMAT,
     CorpusBuilderProfile,
     LaunchIntent,
@@ -17,7 +22,12 @@ from cluster.aws.corpus_builder.contracts import (
 )
 
 __all__ = [
+    "CORPUS_BUCKET",
+    "CORPUS_KMS_KEY_ARN",
+    "CORPUS_KEY_PREFIX",
     "LAUNCH_INTENT_FORMAT",
+    "MAX_COMPUTE_USD",
+    "MAX_HOURLY_USD",
     "PHASE_RECEIPT_FORMAT",
     "CorpusBuilderProfile",
     "LaunchIntent",

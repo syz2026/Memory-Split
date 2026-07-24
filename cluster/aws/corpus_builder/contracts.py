@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -12,6 +13,14 @@ from urllib.parse import urlsplit
 
 PHASE_RECEIPT_FORMAT = "memorysplit-aws-corpus-phase-v1"
 LAUNCH_INTENT_FORMAT = "memorysplit-aws-corpus-launch-v1"
+
+CORPUS_BUCKET = "memorysplit-corpus-056956104102-us-east-1"
+CORPUS_KEY_PREFIX = "v2/builds"
+CORPUS_KMS_KEY_ARN = (
+    "arn:aws:kms:us-east-1:056956104102:key/01234567-89ab-cdef-0123-456789abcdef"
+)
+MAX_HOURLY_USD = Decimal("5.491")
+MAX_COMPUTE_USD = Decimal("131.78")
 
 _PROFILE_ID = "aws-i4i.16xlarge-corpus-v1"
 _MAX_PROFILE_BYTES = 65_536
@@ -33,9 +42,6 @@ _SUBNET_RE = re.compile(r"^subnet-[0-9a-f]{8,17}$")
 _SECURITY_GROUP_RE = re.compile(r"^sg-[0-9a-f]{8,17}$")
 _TEMPLATE_VERSION_RE = re.compile(r"^[1-9][0-9]*$")
 _ETAG_RE = re.compile(r"^[0-9a-f]{32}(?:-[0-9]+)?$")
-_KMS_ARN_RE = re.compile(
-    r"^arn:aws:kms:[a-z0-9-]+:[0-9]{12}:key/[0-9a-f-]{36}$"
-)
 _INSTANCE_PROFILE_ARN_RE = re.compile(
     r"^arn:aws:iam::[0-9]{12}:instance-profile/[A-Za-z0-9+=,.@_-]+$"
 )
@@ -241,9 +247,24 @@ def _decimal_string(value: object, *, label: str) -> Decimal:
     return Decimal(value)
 
 
+def _bounded_price(value: object, *, label: str, maximum: Decimal) -> Decimal:
+    parsed = _decimal_string(value, label=label)
+    if parsed > maximum:
+        raise ValueError(f"{label} exceeds the approved profile ceiling")
+    return parsed
+
+
 def _utc_timestamp(value: object, *, label: str) -> str:
     if not isinstance(value, str) or _UTC_TIMESTAMP_RE.fullmatch(value) is None:
         raise ValueError(f"{label} must be a UTC timestamp ending with Z")
+    try:
+        parsed = datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ").replace(
+            tzinfo=timezone.utc
+        )
+    except ValueError as error:
+        raise ValueError(f"{label} must be a valid UTC timestamp") from error
+    if parsed.strftime("%Y-%m-%dT%H:%M:%SZ") != value:
+        raise ValueError(f"{label} must be a valid UTC timestamp")
     return value
 
 
@@ -268,6 +289,136 @@ def _validate_s3_uri(value: object, *, label: str) -> str:
     return value
 
 
+def _extract_build_id(uri: str, *, label: str) -> str:
+    parsed = urlsplit(uri)
+    if parsed.hostname != CORPUS_BUCKET:
+        raise ValueError(f"{label} must use the corpus bucket")
+    parts = parsed.path.removeprefix("/").split("/")
+    prefix_parts = CORPUS_KEY_PREFIX.split("/")
+    if len(parts) < len(prefix_parts) + 2:
+        raise ValueError(f"{label} must be under {CORPUS_KEY_PREFIX}/{{build_id}}/")
+    if parts[: len(prefix_parts)] != prefix_parts:
+        raise ValueError(f"{label} must be under {CORPUS_KEY_PREFIX}/{{build_id}}/")
+    build_id = parts[len(prefix_parts)]
+    if _SHA256_RE.fullmatch(build_id) is None:
+        raise ValueError(f"{label} build_id must be a lowercase SHA-256")
+    if not parts[len(prefix_parts) + 1 :]:
+        raise ValueError(f"{label} must name an object under the build prefix")
+    return build_id
+
+
+def _validate_s3_object_version(
+    obj: S3ObjectVersion,
+    *,
+    label: str,
+    expected_build_id: str | None = None,
+) -> None:
+    uri = _validate_s3_uri(obj.uri, label=f"{label}.uri")
+    build_id = _extract_build_id(uri, label=f"{label}.uri")
+    if expected_build_id is not None and build_id != expected_build_id:
+        raise ValueError(f"{label}.uri build_id does not match the receipt build_id")
+    if not isinstance(obj.version_id, str) or not obj.version_id:
+        raise ValueError(f"{label}.version_id must be non-empty")
+    if isinstance(obj.bytes, bool) or not isinstance(obj.bytes, int) or obj.bytes <= 0:
+        raise ValueError(f"{label}.bytes must be a positive integer")
+    _sha256(obj.sha256, label=f"{label}.sha256")
+    if not isinstance(obj.etag, str) or _ETAG_RE.fullmatch(obj.etag) is None:
+        raise ValueError(f"{label}.etag must be a lowercase S3 ETag")
+    if obj.sse_algorithm != "aws:kms":
+        raise ValueError(f"{label}.sse_algorithm must be aws:kms")
+    if obj.kms_key_arn != CORPUS_KMS_KEY_ARN:
+        raise ValueError(f"{label}.kms_key_arn must match the dedicated corpus KMS key")
+
+
+def _validate_profile(profile: CorpusBuilderProfile) -> None:
+    if profile.profile_id != _PROFILE_ID:
+        raise ValueError("profile.profile_id drift")
+    if profile.region != "us-east-1":
+        raise ValueError("profile.region drift")
+    if profile.instance_type != "i4i.16xlarge":
+        raise ValueError("profile.instance_type drift")
+    for field, expected in (
+        ("vcpus", 64),
+        ("memory_mib", 524_288),
+        ("nvme_devices", 4),
+        ("nvme_total_gib", 15_000),
+        ("root_volume_gib", 200),
+        ("max_runtime_seconds", 86_400),
+        ("watchdog_shutdown_seconds", 84_600),
+    ):
+        if getattr(profile, field) != expected:
+            raise ValueError(f"profile.{field} drift")
+    if profile.max_hourly_usd != MAX_HOURLY_USD:
+        raise ValueError("profile.max_hourly_usd drift")
+    if profile.max_compute_usd != MAX_COMPUTE_USD:
+        raise ValueError("profile.max_compute_usd drift")
+    if profile.bucket_name != CORPUS_BUCKET:
+        raise ValueError("profile.bucket_name drift")
+    if profile.key_prefix != CORPUS_KEY_PREFIX:
+        raise ValueError("profile.key_prefix drift")
+
+
+def _validate_phase_receipt(receipt: PhaseReceipt) -> None:
+    if receipt.format != PHASE_RECEIPT_FORMAT:
+        raise ValueError("phase receipt.format drift")
+    if receipt.schema_version != 1:
+        raise ValueError("phase receipt.schema_version drift")
+    _sha256(receipt.build_id, label="phase receipt.build_id")
+    if not _PHASE_RE.fullmatch(receipt.phase):
+        raise ValueError("phase receipt.phase drift")
+    _sha256(receipt.package_sha256, label="phase receipt.package_sha256")
+    _sha256(receipt.source_lock_sha256, label="phase receipt.source_lock_sha256")
+    if not receipt.objects:
+        raise ValueError("phase receipt.objects must be non-empty")
+    uris = [obj.uri for obj in receipt.objects]
+    if len(uris) != len(set(uris)):
+        raise ValueError("phase receipt.objects repeats an object URI")
+    if uris != sorted(uris):
+        raise ValueError("phase receipt.objects must be sorted by URI")
+    for index, obj in enumerate(receipt.objects):
+        _validate_s3_object_version(
+            obj,
+            label=f"phase receipt.objects[{index}]",
+            expected_build_id=receipt.build_id,
+        )
+
+
+def _validate_launch_intent(intent: LaunchIntent) -> None:
+    if intent.format != LAUNCH_INTENT_FORMAT:
+        raise ValueError("launch intent.format drift")
+    if intent.schema_version != 1:
+        raise ValueError("launch intent.schema_version drift")
+    _sha256(intent.profile_sha256, label="launch intent.profile_sha256")
+    package_build_id = _extract_build_id(intent.package.uri, label="launch intent.package.uri")
+    manifest_build_id = _extract_build_id(
+        intent.source_manifest.uri,
+        label="launch intent.source_manifest.uri",
+    )
+    if package_build_id != manifest_build_id:
+        raise ValueError("launch intent package and source manifest build_id mismatch")
+    _validate_s3_object_version(intent.package, label="launch intent.package")
+    _validate_s3_object_version(intent.source_manifest, label="launch intent.source_manifest")
+    if not _AMI_RE.fullmatch(intent.ami_id):
+        raise ValueError("launch intent.ami_id drift")
+    if not _ACCOUNT_RE.fullmatch(intent.ami_owner_id):
+        raise ValueError("launch intent.ami_owner_id drift")
+    if not _LAUNCH_TEMPLATE_RE.fullmatch(intent.launch_template_id):
+        raise ValueError("launch intent.launch_template_id drift")
+    if not _TEMPLATE_VERSION_RE.fullmatch(intent.launch_template_version):
+        raise ValueError("launch intent.launch_template_version drift")
+    if not _SUBNET_RE.fullmatch(intent.subnet_id):
+        raise ValueError("launch intent.subnet_id drift")
+    if not _SECURITY_GROUP_RE.fullmatch(intent.security_group_id):
+        raise ValueError("launch intent.security_group_id drift")
+    if not _INSTANCE_PROFILE_ARN_RE.fullmatch(intent.instance_profile_arn):
+        raise ValueError("launch intent.instance_profile_arn drift")
+    if intent.hourly_usd > MAX_HOURLY_USD:
+        raise ValueError("launch intent.hourly_usd exceeds the approved profile ceiling")
+    if intent.max_compute_usd > MAX_COMPUTE_USD:
+        raise ValueError("launch intent.max_compute_usd exceeds the approved profile ceiling")
+    _utc_timestamp(intent.not_after, label="launch intent.not_after")
+
+
 def _s3_object_dict(obj: S3ObjectVersion) -> dict[str, object]:
     return {
         "bytes": obj.bytes,
@@ -280,9 +431,16 @@ def _s3_object_dict(obj: S3ObjectVersion) -> dict[str, object]:
     }
 
 
-def s3_object_version_from_dict(value: object) -> S3ObjectVersion:
+def s3_object_version_from_dict(
+    value: object,
+    *,
+    expected_build_id: str | None = None,
+) -> S3ObjectVersion:
     obj = _object(value, fields=_S3_OBJECT_FIELDS, label="S3 object version")
     uri = _validate_s3_uri(obj["uri"], label="S3 object version.uri")
+    build_id = _extract_build_id(uri, label="S3 object version.uri")
+    if expected_build_id is not None and build_id != expected_build_id:
+        raise ValueError("S3 object version.uri build_id does not match the receipt build_id")
     version_id = obj["version_id"]
     if not isinstance(version_id, str) or not version_id:
         raise ValueError("S3 object version.version_id must be non-empty")
@@ -293,36 +451,35 @@ def s3_object_version_from_dict(value: object) -> S3ObjectVersion:
         raise ValueError("S3 object version.etag must be a lowercase S3 ETag")
     sse_algorithm = obj["sse_algorithm"]
     kms_key_arn = obj["kms_key_arn"]
-    if sse_algorithm == "aws:kms":
-        if (
-            not isinstance(kms_key_arn, str)
-            or _KMS_ARN_RE.fullmatch(kms_key_arn) is None
-        ):
-            raise ValueError(
-                "S3 object version.kms_key_arn must be a KMS key ARN for aws:kms"
-            )
-    elif sse_algorithm == "AES256":
-        if kms_key_arn != "":
-            raise ValueError(
-                "S3 object version.kms_key_arn must be empty for AES256"
-            )
-    else:
-        raise ValueError("S3 object version.sse_algorithm is not approved")
-    return S3ObjectVersion(
+    if sse_algorithm != "aws:kms":
+        raise ValueError("S3 object version.sse_algorithm must be aws:kms")
+    if kms_key_arn != CORPUS_KMS_KEY_ARN:
+        raise ValueError("S3 object version.kms_key_arn must match the dedicated corpus KMS key")
+    parsed = S3ObjectVersion(
         uri=uri,
         version_id=version_id,
         bytes=byte_count,
         sha256=digest,
         etag=etag,
-        sse_algorithm=str(sse_algorithm),
-        kms_key_arn=str(kms_key_arn),
+        sse_algorithm="aws:kms",
+        kms_key_arn=CORPUS_KMS_KEY_ARN,
     )
+    _validate_s3_object_version(parsed, label="S3 object version", expected_build_id=expected_build_id)
+    return parsed
 
 
-def _parse_s3_objects(value: object, *, label: str) -> tuple[S3ObjectVersion, ...]:
+def _parse_s3_objects(
+    value: object,
+    *,
+    label: str,
+    expected_build_id: str,
+) -> tuple[S3ObjectVersion, ...]:
     if not isinstance(value, list) or not value:
         raise ValueError(f"{label} must be a non-empty list")
-    objects = tuple(s3_object_version_from_dict(item) for item in value)
+    objects = tuple(
+        s3_object_version_from_dict(item, expected_build_id=expected_build_id)
+        for item in value
+    )
     uris = [obj.uri for obj in objects]
     if len(uris) != len(set(uris)):
         raise ValueError(f"{label} repeats an object URI")
@@ -365,15 +522,17 @@ def _parse_profile(raw: object) -> CorpusBuilderProfile:
     )
     bucket_name = _exact_string(
         value["bucket_name"],
-        "memorysplit-corpus-056956104102-us-east-1",
+        CORPUS_BUCKET,
         label="profile.bucket_name",
     )
-    key_prefix = _exact_string(value["key_prefix"], "v2/builds", label="profile.key_prefix")
+    key_prefix = _exact_string(
+        value["key_prefix"], CORPUS_KEY_PREFIX, label="profile.key_prefix"
+    )
     if _REGION_RE.fullmatch(region) is None:
         raise ValueError("profile.region is not a valid explicit region")
     if _BUCKET_RE.fullmatch(bucket_name) is None:
         raise ValueError("profile.bucket_name is not a valid S3 bucket name")
-    return CorpusBuilderProfile(
+    profile = CorpusBuilderProfile(
         profile_id=profile_id,
         region=region,
         instance_type=instance_type,
@@ -389,6 +548,8 @@ def _parse_profile(raw: object) -> CorpusBuilderProfile:
         bucket_name=bucket_name,
         key_prefix=key_prefix,
     )
+    _validate_profile(profile)
+    return profile
 
 
 def _profile_dict(profile: CorpusBuilderProfile) -> dict[str, object]:
@@ -436,6 +597,7 @@ def load_corpus_builder_profile(path: Path | str) -> CorpusBuilderProfile:
 
 
 def corpus_builder_profile_to_bytes(profile: CorpusBuilderProfile) -> bytes:
+    _validate_profile(profile)
     return _canonical_json_bytes(_profile_dict(profile))
 
 
@@ -457,8 +619,12 @@ def _parse_phase_receipt(raw: object) -> PhaseReceipt:
     source_lock_sha256 = _sha256(
         value["source_lock_sha256"], label="phase receipt.source_lock_sha256"
     )
-    objects = _parse_s3_objects(value["objects"], label="phase receipt.objects")
-    return PhaseReceipt(
+    objects = _parse_s3_objects(
+        value["objects"],
+        label="phase receipt.objects",
+        expected_build_id=build_id,
+    )
+    receipt = PhaseReceipt(
         format=receipt_format,
         schema_version=schema_version,
         build_id=build_id,
@@ -467,6 +633,8 @@ def _parse_phase_receipt(raw: object) -> PhaseReceipt:
         source_lock_sha256=source_lock_sha256,
         objects=objects,
     )
+    _validate_phase_receipt(receipt)
+    return receipt
 
 
 def _phase_receipt_dict(receipt: PhaseReceipt) -> dict[str, object]:
@@ -501,6 +669,7 @@ def phase_receipt_from_bytes(payload: bytes) -> PhaseReceipt:
 
 
 def phase_receipt_to_bytes(receipt: PhaseReceipt) -> bytes:
+    _validate_phase_receipt(receipt)
     return _canonical_json_bytes(_phase_receipt_dict(receipt))
 
 
@@ -517,6 +686,13 @@ def _parse_launch_intent(raw: object) -> LaunchIntent:
     )
     package = s3_object_version_from_dict(value["package"])
     source_manifest = s3_object_version_from_dict(value["source_manifest"])
+    package_build_id = _extract_build_id(package.uri, label="launch intent.package.uri")
+    manifest_build_id = _extract_build_id(
+        source_manifest.uri,
+        label="launch intent.source_manifest.uri",
+    )
+    if package_build_id != manifest_build_id:
+        raise ValueError("launch intent package and source manifest build_id mismatch")
     ami_id = value["ami_id"]
     if not isinstance(ami_id, str) or _AMI_RE.fullmatch(ami_id) is None:
         raise ValueError("launch intent.ami_id must be an immutable AMI ID")
@@ -556,12 +732,18 @@ def _parse_launch_intent(raw: object) -> LaunchIntent:
         raise ValueError(
             "launch intent.instance_profile_arn must be an instance-profile ARN"
         )
-    hourly_usd = _decimal_string(value["hourly_usd"], label="launch intent.hourly_usd")
-    max_compute_usd = _decimal_string(
-        value["max_compute_usd"], label="launch intent.max_compute_usd"
+    hourly_usd = _bounded_price(
+        value["hourly_usd"],
+        label="launch intent.hourly_usd",
+        maximum=MAX_HOURLY_USD,
+    )
+    max_compute_usd = _bounded_price(
+        value["max_compute_usd"],
+        label="launch intent.max_compute_usd",
+        maximum=MAX_COMPUTE_USD,
     )
     not_after = _utc_timestamp(value["not_after"], label="launch intent.not_after")
-    return LaunchIntent(
+    intent = LaunchIntent(
         format=intent_format,
         schema_version=schema_version,
         profile_sha256=profile_sha256,
@@ -578,6 +760,8 @@ def _parse_launch_intent(raw: object) -> LaunchIntent:
         max_compute_usd=max_compute_usd,
         not_after=not_after,
     )
+    _validate_launch_intent(intent)
+    return intent
 
 
 def _launch_intent_dict(intent: LaunchIntent) -> dict[str, object]:
@@ -593,10 +777,10 @@ def _launch_intent_dict(intent: LaunchIntent) -> dict[str, object]:
         "not_after": intent.not_after,
         "package": _s3_object_dict(intent.package),
         "profile_sha256": intent.profile_sha256,
-        "schema_version": intent.schema_version,
         "security_group_id": intent.security_group_id,
         "source_manifest": _s3_object_dict(intent.source_manifest),
         "subnet_id": intent.subnet_id,
+        "schema_version": intent.schema_version,
     }
 
 
@@ -620,4 +804,5 @@ def launch_intent_from_bytes(payload: bytes) -> LaunchIntent:
 
 
 def launch_intent_to_bytes(intent: LaunchIntent) -> bytes:
+    _validate_launch_intent(intent)
     return _canonical_json_bytes(_launch_intent_dict(intent))
