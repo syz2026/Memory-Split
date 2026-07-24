@@ -1691,6 +1691,100 @@ def test_interruption_signals_both_rank_zero_processes_and_emits_paired_receipt(
     assert len(store.calls) == 4
 
 
+@pytest.mark.parametrize(
+    "profile_name",
+    ["aws-p5.48xlarge-v3", "aws-p6-b300.48xlarge-v3"],
+)
+def test_v3_interruption_uses_neutral_profile_bound_receipt_protocol(
+    tmp_path,
+    profile_name,
+):
+    legacy = _interruption_request(tmp_path)
+    profile = load_aws_p5_profile(
+        ROOT / "cluster" / "profiles" / f"{profile_name}.json"
+    )
+    values = dict(legacy.__dict__)
+    values.update(
+        {
+            "seed": 0,
+            "provider": profile.provider,
+            "profile_sha256": profile.sha256,
+            "instance_type": profile.instance_type,
+            "gres": profile.gres,
+            "assigned_seeds": profile.assigned_seeds,
+            "candidate_receipt_type": (
+                profile.interruption_candidate_receipt_type
+            ),
+            "interruption_receipt_type": profile.interruption_receipt_type,
+            "resume_commit_protocol": profile.resume_commit_protocol,
+        }
+    )
+    request = InterruptionRequest(**values)
+    mismatched = dict(values)
+    mismatched["candidate_receipt_type"] = "aws-p5-interruption-candidate"
+    with pytest.raises(ValueError, match="closed AWS GPU profile"):
+        InterruptionRequest(**mismatched)
+
+    def signal_process(pid, _signum):
+        arm = {101: "dense", 202: "split90"}[pid]
+        _atomic_checkpoint(
+            request.checkpoint_paths[arm],
+            f"{profile.profile_id}-{arm}-checkpoint".encode(),
+        )
+
+    store = _FakeStore()
+    result = handle_interruption(
+        request,
+        signal_process=signal_process,
+        object_store=store,
+        sleep=lambda _delay: None,
+    )
+
+    assert result.resumable is True
+    marker = json.loads(request.receipt_path.read_bytes())
+    assert marker["receipt_type"] == "aws-gpu-paired-interruption"
+    assert marker["protocol"] == "aws-gpu-resume-commit-v1"
+    assert marker["provider"] == request.provider
+    assert marker["profile_sha256"] == request.profile_sha256
+    assert marker["instance_type"] == request.instance_type
+    assert marker["gres"] == request.gres
+    candidate_bytes = next(
+        call[5] for call in store.calls if "/evidence/sha256/" in call[1]
+    )
+    candidate = json.loads(candidate_bytes)
+    assert candidate["receipt_type"] == "aws-gpu-interruption-candidate"
+    assert candidate["provider"] == request.provider
+    assert candidate["profile_sha256"] == request.profile_sha256
+    marker_bytes = next(
+        call[5] for call in store.calls if "/resume-commits/" in call[1]
+    )
+    checkpoint_objects = {
+        call[1]: call[5]
+        for call in store.calls
+        if "/checkpoints/" in call[1]
+    }
+    assert interruption_module.verify_resume_commit(
+        candidate_bytes=candidate_bytes,
+        marker_bytes=marker_bytes,
+        checkpoint_objects=checkpoint_objects,
+        expected_provider=request.provider,
+        expected_profile_sha256=request.profile_sha256,
+        expected_instance_type=request.instance_type,
+        expected_gres=request.gres,
+        expected_candidate_receipt_type=request.candidate_receipt_type,
+        expected_interruption_receipt_type=(
+            request.interruption_receipt_type
+        ),
+        expected_resume_commit_protocol=request.resume_commit_protocol,
+    )
+    with pytest.raises(ValueError):
+        interruption_module.verify_resume_commit(
+            candidate_bytes=candidate_bytes,
+            marker_bytes=marker_bytes,
+            checkpoint_objects=checkpoint_objects,
+        )
+
+
 def test_interruption_never_labels_failed_upload_resumable(tmp_path):
     request = _interruption_request(tmp_path)
     store = _FakeStore(fail_contains="/split90/")

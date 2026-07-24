@@ -53,6 +53,8 @@ AWS_RUN_STATE_KEYS = {
     "arm",
     "seed",
     "provider",
+    "instance_type",
+    "gres",
     "release_sha256",
     "run_manifest_sha256",
     "config_sha256",
@@ -107,6 +109,8 @@ EVALUATION_STATE_KEYS = {
 AWS_EVALUATION_STATE_KEYS = {
     "schema_version",
     "provider",
+    "instance_type",
+    "gres",
     "seed",
     "release_sha256",
     "run_manifest_sha256",
@@ -133,6 +137,9 @@ AWS_EVALUATION_STATE_KEYS = {
 AWS_PAIR_INTENT_KEYS = {
     "schema_version",
     "provider",
+    "instance_type",
+    "profile_sha256",
+    "gres",
     "run_manifest_sha256",
     "operation_id",
     "states",
@@ -168,6 +175,23 @@ RESOURCE_KEYS = {
 }
 STATUS_RE = re.compile(r"^[A-Z][A-Z0-9_]*$")
 _AWS_PROVIDER = "aws-p5.48xlarge"
+_AWS_PROFILE_CONTRACTS = {
+    _AWS_PROVIDER: {
+        "instance_type": "p5.48xlarge",
+        "gres": "gpu:h100:8",
+        "assigned_seeds": frozenset({1, 2, 3, 4}),
+    },
+    "aws-p5.48xlarge-v3": {
+        "instance_type": "p5.48xlarge",
+        "gres": "gpu:h100:8",
+        "assigned_seeds": frozenset(range(10)),
+    },
+    "aws-p6-b300.48xlarge-v3": {
+        "instance_type": "p6-b300.48xlarge",
+        "gres": "gpu:b300:8",
+        "assigned_seeds": frozenset(range(10)),
+    },
+}
 _AWS_INSTANCE_RE = re.compile(r"^i-[0-9a-f]{8,17}$")
 _AWS_COMMAND_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9-]{7,127}$")
 _AWS_AMI_RE = re.compile(r"^ami-[0-9a-f]{8,17}$")
@@ -270,7 +294,7 @@ def _validate_common(value: dict[str, object], *, operation: str) -> None:
 
 
 def _validate_run_state(value: dict[str, object], run_id: str) -> None:
-    if value.get("provider") == _AWS_PROVIDER:
+    if value.get("provider") in _AWS_PROFILE_CONTRACTS:
         _validate_aws_run_state(value, run_id)
         return
     operation = value.get("operation")
@@ -314,13 +338,17 @@ def _validate_aws_run_state(value: dict[str, object], run_id: str) -> None:
         value["schema_version"],
         label="AWS run state.schema_version",
     )
+    contract = _AWS_PROFILE_CONTRACTS.get(value["provider"])
     if (
-        operation not in {"submit", "resume"}
+        contract is None
+        or value["instance_type"] != contract["instance_type"]
+        or value["gres"] != contract["gres"]
+        or operation not in {"submit", "resume"}
         or value["run_id"] != run_id
         or RUN_ID_RE.fullmatch(run_id) is None
         or value["arm"] not in {"dense", "split90"}
         or isinstance(value["seed"], bool)
-        or value["seed"] not in {1, 2, 3, 4}
+        or value["seed"] not in contract["assigned_seeds"]
     ):
         raise MsctlError("STATE_CORRUPT", "AWS run identity is invalid")
     for field in (
@@ -396,7 +424,7 @@ def _validate_evaluation_state(
     value: dict[str, object],
     manifest_sha256: str,
 ) -> None:
-    if value.get("provider") == _AWS_PROVIDER:
+    if value.get("provider") in _AWS_PROFILE_CONTRACTS:
         require_exact_keys(
             value,
             AWS_EVALUATION_STATE_KEYS,
@@ -422,10 +450,14 @@ def _validate_evaluation_state(
                 value[field],
                 label=f"AWS evaluation state {field}",
             )
+        contract = _AWS_PROFILE_CONTRACTS.get(value["provider"])
         if (
-            value["run_manifest_sha256"] != manifest_sha256
+            contract is None
+            or value["instance_type"] != contract["instance_type"]
+            or value["gres"] != contract["gres"]
+            or value["run_manifest_sha256"] != manifest_sha256
             or isinstance(value["seed"], bool)
-            or value["seed"] not in {1, 2, 3, 4}
+            or value["seed"] not in contract["assigned_seeds"]
             or not isinstance(value["ami_id"], str)
             or _AWS_AMI_RE.fullmatch(value["ami_id"]) is None
             or not isinstance(value["container_digest"], str)
@@ -834,11 +866,18 @@ class StateStore:
             value["schema_version"],
             label="AWS pair intent.schema_version",
         )
+        contract = _AWS_PROFILE_CONTRACTS.get(value["provider"])
         if (
-            value["provider"] != _AWS_PROVIDER
+            contract is None
+            or value["instance_type"] != contract["instance_type"]
+            or value["gres"] != contract["gres"]
             or value["run_manifest_sha256"] != manifest_sha256
         ):
             raise MsctlError("STATE_CORRUPT", "AWS pair intent identity is invalid")
+        require_sha256(
+            value["profile_sha256"],
+            label="AWS pair profile SHA-256",
+        )
         require_sha256(value["operation_id"], label="AWS pair operation")
         states = value["states"]
         if not isinstance(states, list) or len(states) != 2:
@@ -853,6 +892,10 @@ class StateStore:
             if (
                 state["run_manifest_sha256"] != manifest_sha256
                 or state["operation_id"] != value["operation_id"]
+                or state["provider"] != value["provider"]
+                or state["instance_type"] != value["instance_type"]
+                or state["profile_sha256"] != value["profile_sha256"]
+                or state["gres"] != value["gres"]
                 or run_id in run_ids
             ):
                 raise MsctlError(

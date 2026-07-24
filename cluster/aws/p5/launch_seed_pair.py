@@ -2122,6 +2122,16 @@ def _production_interruption_handler(
             },
             timeout_seconds=120.0,
             upload_reserve_seconds=30.0,
+            provider=plan.profile.provider,
+            profile_sha256=plan.profile.sha256,
+            instance_type=plan.profile.instance_type,
+            gres=plan.profile.gres,
+            assigned_seeds=plan.profile.assigned_seeds,
+            candidate_receipt_type=(
+                plan.profile.interruption_candidate_receipt_type
+            ),
+            interruption_receipt_type=plan.profile.interruption_receipt_type,
+            resume_commit_protocol=plan.profile.resume_commit_protocol,
         )
         return handle_interruption(request, object_store=store)
 

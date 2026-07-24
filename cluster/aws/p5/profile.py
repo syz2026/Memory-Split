@@ -227,6 +227,24 @@ class AwsGpuProfile:
             return "aws-p5-bootstrap"
         return "aws-gpu-bootstrap"
 
+    @property
+    def interruption_candidate_receipt_type(self) -> str:
+        if self.profile_id == LEGACY_AWS_P5_PROFILE_ID:
+            return "aws-p5-interruption-candidate"
+        return "aws-gpu-interruption-candidate"
+
+    @property
+    def interruption_receipt_type(self) -> str:
+        if self.profile_id == LEGACY_AWS_P5_PROFILE_ID:
+            return "aws-p5-paired-interruption"
+        return "aws-gpu-paired-interruption"
+
+    @property
+    def resume_commit_protocol(self) -> str:
+        if self.profile_id == LEGACY_AWS_P5_PROFILE_ID:
+            return "aws-p5-resume-commit-v1"
+        return "aws-gpu-resume-commit-v1"
+
     def matches_gpu_name(self, name: str) -> bool:
         return isinstance(name, str) and any(
             re.fullmatch(pattern, name) is not None

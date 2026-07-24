@@ -51,6 +51,11 @@ _PROFILE_INSTANCE_TYPES = {
     "aws-p5.48xlarge-v3": "p5.48xlarge",
     "aws-p6-b300.48xlarge-v3": "p6-b300.48xlarge",
 }
+_PROFILE_GRES = {
+    "aws-p5.48xlarge": "gpu:h100:8",
+    "aws-p5.48xlarge-v3": "gpu:h100:8",
+    "aws-p6-b300.48xlarge-v3": "gpu:b300:8",
+}
 _PROFILE_SEEDS = {
     "aws-p5.48xlarge": (1, 2, 3, 4),
     "aws-p5.48xlarge-v3": tuple(range(10)),
@@ -60,6 +65,7 @@ _INSTANCE_ID_RE = re.compile(r"^i-[0-9a-f]{8,17}$")
 _COMMAND_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9-]{7,127}$")
 _REGION_RE = re.compile(r"^[a-z]{2}(?:-[a-z0-9]+)+-[0-9]+$")
 _AMI_RE = re.compile(r"^ami-[0-9a-f]{8,17}$")
+_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 _COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
 _BUCKET_RE = re.compile(
@@ -75,6 +81,7 @@ _ACTIVE_COMMAND_STATES = {"Pending", "InProgress", "Delayed"}
 _INSTANCE_FIELDS = {
     "instance_id",
     "instance_type",
+    "profile_instance_type",
     "state",
     "instance_profile_arn",
     "provider",
@@ -83,11 +90,12 @@ _INSTANCE_FIELDS = {
     "release_sha256",
     "dataset_sha256",
     "run_manifest_sha256",
+    "profile_sha256",
+    "gres",
 }
 _SELECTED_INSTANCE_FIELDS = _INSTANCE_FIELDS | {
     "ami_id",
     "container_digest",
-    "profile_sha256",
     "runtime_sha256",
     "terminate_at",
 }
@@ -113,6 +121,13 @@ vSeDCOUMYQR7R9LINYwouHIziqQYMAkGByqGSM44BAMDLwAwLAIUWXBlk40xTwSw
 7HX32MxXYruse9ACFBNGmdX2ZBrVNGrN9N2f6ROk0k9K
 -----END CERTIFICATE-----
 """
+# AWS currently publishes the same DSA trust anchor for these two Regions.
+# Keep both entries explicit so Region support cannot expand accidentally.
+_AWS_US_WEST_2_DSA_CERTIFICATE = _AWS_US_EAST_1_DSA_CERTIFICATE
+_AWS_DSA_CERTIFICATES = {
+    "us-east-1": _AWS_US_EAST_1_DSA_CERTIFICATE,
+    "us-west-2": _AWS_US_WEST_2_DSA_CERTIFICATE,
+}
 
 
 def _verify_instance_identity_pkcs7(
@@ -120,7 +135,8 @@ def _verify_instance_identity_pkcs7(
     pkcs7: str,
     region: str,
 ) -> bool:
-    if region != "us-east-1":
+    certificate_text = _AWS_DSA_CERTIFICATES.get(region)
+    if certificate_text is None:
         raise MsctlError(
             "ENVIRONMENT_RECEIPT_INVALID",
             "no pinned AWS PKCS7 trust anchor exists for the selected region",
@@ -138,7 +154,7 @@ def _verify_instance_identity_pkcs7(
         certificate = root / "aws-dsa.pem"
         signature.write_text(wrapped, encoding="ascii")
         certificate.write_text(
-            _AWS_US_EAST_1_DSA_CERTIFICATE,
+            certificate_text,
             encoding="ascii",
         )
         completed = subprocess.run(
@@ -277,6 +293,9 @@ def _validate_profile(profile: object) -> None:
         provider not in AWS_GPU_PROFILES
         or getattr(profile, "profile_id", None) != provider
         or getattr(profile, "instance_type", None) != expected_instance_type
+        or not isinstance(getattr(profile, "sha256", None), str)
+        or _SHA256_RE.fullmatch(profile.sha256) is None
+        or _profile_gres(profile) != _PROFILE_GRES.get(provider)
         or getattr(profile, "purchase_model", None) != "on_demand"
         or getattr(profile, "allocated_gpus", None) != 8
         or getattr(profile, "train_groups", None) != (4, 4)
@@ -300,6 +319,14 @@ def _validate_profile(profile: object) -> None:
             "PROFILE_INVALID",
             "AWS backend requires one exact known 4+4 GPU provider profile",
         )
+
+
+def _profile_gres(profile: object) -> str | None:
+    value = getattr(profile, "gres", None)
+    if value is None and getattr(profile, "provider", None) == AWS_P5_PROFILE:
+        # Compatibility for legacy in-process profile doubles.
+        return "gpu:h100:8"
+    return value if isinstance(value, str) else None
 
 
 def _validate_runtime(runtime: object) -> None:
@@ -356,6 +383,8 @@ def aws_resource_request(
     bindings: Mapping[str, object] | None = None,
     profile: object | None = None,
 ) -> dict[str, object]:
+    if profile is not None:
+        _validate_profile(profile)
     policy = {
         "submit": (1, 8, 1440, "scripts/run_train.py"),
         "resume": (1, 8, 1440, "scripts/run_train.py"),
@@ -374,7 +403,11 @@ def aws_resource_request(
         if requested_gpus
         else 0
     )
-    gres = getattr(profile, "gres", "gpu:h100:8") if gpus else "none"
+    gres = (
+        _profile_gres(profile)
+        if profile is not None and gpus
+        else ("gpu:h100:8" if gpus else "none")
+    )
     if (
         type(gpus) is not int
         or gpus != requested_gpus
@@ -494,6 +527,9 @@ class AwsP5Backend:
             )
         return {
             "provider": self.profile.provider,
+            "instance_type": self.profile.instance_type,
+            "profile_sha256": self.profile.sha256,
+            "gres": _profile_gres(self.profile),
             "region": self.runtime.region,
             **output,
         }
@@ -506,7 +542,7 @@ class AwsP5Backend:
             )
         runs = getattr(manifest, "runs", ())
         if (
-            getattr(manifest, "provider", None) != AWS_P5_PROFILE
+            getattr(manifest, "provider", None) != self.profile.provider
             or getattr(manifest, "seed", None)
             not in getattr(self.profile, "assigned_seeds", ())
             or len(runs) != 2
@@ -559,7 +595,7 @@ class AwsP5Backend:
 
     def _validate_release(self, release: object, manifest: object) -> None:
         if (
-            getattr(release, "provider", None) != AWS_P5_PROFILE
+            getattr(release, "provider", None) != self.profile.provider
             or getattr(release, "archive_sha256", None)
             != manifest.release_sha256
             or getattr(release, "source_commit", None)
@@ -571,7 +607,8 @@ class AwsP5Backend:
             )
 
     def _release_root(self, release: object) -> str:
-        return f"/mnt/memorysplit/releases/{release.archive_sha256}"
+        scratch_root = getattr(self.profile, "scratch_root", "/mnt/memorysplit")
+        return f"{scratch_root}/releases/{release.archive_sha256}"
 
     def _training_operation_intent(
         self,
@@ -604,7 +641,9 @@ class AwsP5Backend:
         for field, digest in lifecycle_evidence.items():
             require_sha256(digest, label=field)
         release_root = self._release_root(release)
-        staging = "/mnt/memorysplit/staging"
+        scratch_root = getattr(self.profile, "scratch_root", "/mnt/memorysplit")
+        staging = f"{scratch_root}/staging"
+        dataset_root = f"{scratch_root}/dataset"
         profile_name = f"{self.profile.profile_id}.json"
         steps: list[dict[str, object]] = []
         if operation == "submit":
@@ -658,7 +697,7 @@ class AwsP5Backend:
                             "-m",
                             "0700",
                             f"{staging}/releases/{release.archive_sha256}",
-                            "/mnt/memorysplit/dataset",
+                            dataset_root,
                         ],
                     },
                     {
@@ -738,7 +777,7 @@ class AwsP5Backend:
                             "s3",
                             "sync",
                             f"{self.runtime.s3_root}/dataset",
-                            "/mnt/memorysplit/dataset",
+                            dataset_root,
                             "--no-follow-symlinks",
                             "--only-show-errors",
                         ],
@@ -771,7 +810,7 @@ class AwsP5Backend:
                             manifest.release_sha256,
                         ),
                         "--dataset-receipt",
-                        "/mnt/memorysplit/dataset/receipt.json",
+                        f"{dataset_root}/receipt.json",
                         "--dataset-receipt-sha256",
                         manifest.dataset_sha256,
                         "--cohort-assignment",
@@ -803,10 +842,12 @@ class AwsP5Backend:
                     "argv": [
                         "/usr/bin/python3",
                         "/opt/memorysplit/msctl/aws_launch_manifest.py",
+                        "--profile",
+                        f"{release_root}/cluster/profiles/{profile_name}",
                         "--out",
                         f"{staging}/launcher-manifest-{manifest.sha256}.json",
                         "--scratch-root",
-                        "/mnt/memorysplit",
+                        scratch_root,
                         "--seed",
                         str(manifest.seed),
                         "--profile-sha256",
@@ -822,7 +863,7 @@ class AwsP5Backend:
                         "--bootstrap-receipt",
                         f"{staging}/bootstrap-receipt.json",
                         "--corpus-receipt",
-                        "/mnt/memorysplit/dataset/receipt.json",
+                        f"{dataset_root}/receipt.json",
                         *(
                             argument
                             for run in sorted(
@@ -936,7 +977,7 @@ class AwsP5Backend:
                 "--repo-root",
                 release_root,
                 "--scratch-root",
-                "/mnt/memorysplit",
+                scratch_root,
                 "--launcher",
                 f"{release_root}/cluster/aws/p5/launch_seed_pair.py",
                 "--checkpoint-receipt",
@@ -968,14 +1009,17 @@ class AwsP5Backend:
                 "--repo-root",
                 release_root,
                 "--scratch-root",
-                "/mnt/memorysplit",
+                scratch_root,
                 "--apply",
             ]
         steps.append({"name": "paired-launch", "argv": launcher_argv})
         return {
             "schema_version": 1,
             "operation": operation,
-            "provider": AWS_P5_PROFILE,
+            "provider": self.profile.provider,
+            "instance_type": self.profile.instance_type,
+            "profile_sha256": self.profile.sha256,
+            "gres": _profile_gres(self.profile),
             "seed": manifest.seed,
             "release_sha256": release.archive_sha256,
             "run_manifest_sha256": manifest.sha256,
@@ -1267,12 +1311,16 @@ class AwsP5Backend:
             "{instance_id:InstanceId,instance_type:InstanceType,"
             "state:State.Name,instance_profile_arn:IamInstanceProfile.Arn,"
             "provider:Tags[?Key=='MemorySplitProvider']|[0].Value,"
+            "profile_instance_type:"
+            "Tags[?Key=='MemorySplitInstanceType']|[0].Value,"
             "seed:to_number(Tags[?Key=='MemorySplitSeed']|[0].Value),"
             "cohort_sha256:Tags[?Key=='MemorySplitCohortSHA256']|[0].Value,"
             "release_sha256:Tags[?Key=='MemorySplitReleaseSHA256']|[0].Value,"
             "dataset_sha256:Tags[?Key=='MemorySplitDatasetSHA256']|[0].Value,"
             "run_manifest_sha256:"
-            "Tags[?Key=='MemorySplitRunManifestSHA256']|[0].Value}}"
+            "Tags[?Key=='MemorySplitRunManifestSHA256']|[0].Value,"
+            "profile_sha256:Tags[?Key=='MemorySplitProfileSHA256']|[0].Value,"
+            "gres:Tags[?Key=='MemorySplitGRES']|[0].Value}}"
         )
         return self._aws_argv(
             "ec2",
@@ -1293,6 +1341,8 @@ class AwsP5Backend:
             "state:State.Name,instance_profile_arn:IamInstanceProfile.Arn,"
             "ami_id:ImageId,"
             "provider:Tags[?Key=='MemorySplitProvider']|[0].Value,"
+            "profile_instance_type:"
+            "Tags[?Key=='MemorySplitInstanceType']|[0].Value,"
             "seed:to_number(Tags[?Key=='MemorySplitSeed']|[0].Value),"
             "cohort_sha256:Tags[?Key=='MemorySplitCohortSHA256']|[0].Value,"
             "release_sha256:Tags[?Key=='MemorySplitReleaseSHA256']|[0].Value,"
@@ -1303,6 +1353,7 @@ class AwsP5Backend:
             "runtime_sha256:Tags[?Key=='MemorySplitRuntimeSHA256']|[0].Value,"
             "container_digest:"
             "Tags[?Key=='MemorySplitContainerDigest']|[0].Value,"
+            "gres:Tags[?Key=='MemorySplitGRES']|[0].Value,"
             "terminate_at:Tags[?Key=='MemorySplitTerminateAt']|[0].Value}}"
         )
         return self._aws_argv(
@@ -1321,6 +1372,7 @@ class AwsP5Backend:
     ) -> dict[str, object]:
         return {
             "provider": self.profile.provider,
+            "profile_instance_type": self.profile.instance_type,
             "seed": manifest.seed,
             "cohort_sha256": manifest.cohort_assignment_sha256,
             "release_sha256": manifest.release_sha256,
@@ -1329,6 +1381,7 @@ class AwsP5Backend:
             "profile_sha256": self.profile.sha256,
             "runtime_sha256": self._runtime_sha256(),
             "container_digest": self.runtime.container_digest,
+            "gres": _profile_gres(self.profile),
             "terminate_at": terminate_at,
         }
 
@@ -1401,6 +1454,7 @@ class AwsP5Backend:
         )
         names = {
             "provider": "MemorySplitProvider",
+            "profile_instance_type": "MemorySplitInstanceType",
             "seed": "MemorySplitSeed",
             "cohort_sha256": "MemorySplitCohortSHA256",
             "release_sha256": "MemorySplitReleaseSHA256",
@@ -1409,6 +1463,7 @@ class AwsP5Backend:
             "profile_sha256": "MemorySplitProfileSHA256",
             "runtime_sha256": "MemorySplitRuntimeSHA256",
             "container_digest": "MemorySplitContainerDigest",
+            "gres": "MemorySplitGRES",
             "terminate_at": "MemorySplitTerminateAt",
         }
         return canonical_json(
@@ -1577,6 +1632,7 @@ class AwsP5Backend:
                 not isinstance(row["instance_id"], str)
                 or _INSTANCE_ID_RE.fullmatch(row["instance_id"]) is None
                 or row["instance_type"] != self.profile.instance_type
+                or row["profile_instance_type"] != self.profile.instance_type
                 or row["state"] not in _ACTIVE_INSTANCE_STATES
                 or row["instance_profile_arn"] != self.instance_profile_arn
                 or row["provider"] != self.profile.provider
@@ -1586,6 +1642,8 @@ class AwsP5Backend:
                 or row["release_sha256"] != manifest.release_sha256
                 or row["dataset_sha256"] != manifest.dataset_sha256
                 or row["run_manifest_sha256"] != manifest.sha256
+                or row["profile_sha256"] != self.profile.sha256
+                or row["gres"] != _profile_gres(self.profile)
             ):
                 raise MsctlError(
                     "INSTANCE_BINDING_MISMATCH",
@@ -1596,7 +1654,7 @@ class AwsP5Backend:
         if len(instances) > 1:
             raise MsctlError(
                 "DUPLICATE_ACTIVE_SEED",
-                "multiple active P5 instances claim the same seed",
+                "multiple active AWS GPU instances claim the same seed",
                 details={
                     "seed": manifest.seed,
                     "instance_ids": sorted(
@@ -1663,7 +1721,7 @@ class AwsP5Backend:
         if len(rows) != 1:
             raise MsctlError(
                 "SSM_UNAVAILABLE",
-                "exactly one managed P5 instance must be online",
+                "exactly one managed AWS GPU instance must be online",
             )
         row = _aws_output_object(
             rows[0],
@@ -1673,7 +1731,7 @@ class AwsP5Backend:
         if row != {"instance_id": instance_id, "ping_status": "Online"}:
             raise MsctlError(
                 "SSM_UNAVAILABLE",
-                "P5 instance is not online in Systems Manager",
+                "AWS GPU instance is not online in Systems Manager",
             )
 
     def _command_status(
@@ -1755,7 +1813,9 @@ class AwsP5Backend:
         command_id = state.get("command_id")
         return (
             run is not None
-            and state.get("provider") == AWS_P5_PROFILE
+            and state.get("provider") == self.profile.provider
+            and state.get("instance_type") == self.profile.instance_type
+            and state.get("gres") == _profile_gres(self.profile)
             and state.get("seed") == manifest.seed
             and state.get("arm") == run.arm
             and state.get("config_sha256") == run.config_sha256
@@ -1819,7 +1879,10 @@ class AwsP5Backend:
             terminate_at=terminate_at,
         )
         return {
-            "provider": AWS_P5_PROFILE,
+            "provider": self.profile.provider,
+            "instance_type": self.profile.instance_type,
+            "profile_sha256": self.profile.sha256,
+            "gres": _profile_gres(self.profile),
             "seed": manifest.seed,
             "release_sha256": manifest.release_sha256,
             "run_manifest_sha256": manifest.sha256,
@@ -1884,7 +1947,9 @@ class AwsP5Backend:
             "container_image": self.runtime.container_image,
             "container_digest": self.runtime.container_digest,
             "instance_id": instance_id,
+            "instance_type": self.profile.instance_type,
             "profile_sha256": self.profile.sha256,
+            "provider": self.profile.provider,
             "release_sha256": release.archive_sha256,
             "run_manifest_sha256": manifest.sha256,
             "runtime_sha256": self._runtime_sha256(),
@@ -2044,6 +2109,8 @@ class AwsP5Backend:
             )
         return {
             "provider": self.profile.provider,
+            "profile_sha256": self.profile.sha256,
+            "gres": _profile_gres(self.profile),
             "region": self.runtime.region,
             "instance_type": instance_type,
             "offered": True,
@@ -2141,10 +2208,12 @@ class AwsP5Backend:
         )
         if (
             pointer["schema_version"] != 1
-            or pointer["provider"] != AWS_P5_PROFILE
+            or pointer["provider"] != self.profile.provider
             or pointer["materialization"] != "s3"
-            or pointer["durable_uri_env"] != "MS_S3_ROOT"
-            or pointer["scratch_root"] != "/mnt/memorysplit"
+            or pointer["durable_uri_env"]
+            != getattr(self.profile, "durable_uri_env", "MS_S3_ROOT")
+            or pointer["scratch_root"]
+            != getattr(self.profile, "scratch_root", "/mnt/memorysplit")
             or pointer["required_receipt"] != "dataset/receipt.json"
         ):
             raise MsctlError(
@@ -2272,7 +2341,7 @@ class AwsP5Backend:
             evidence=evidence,
         )
         return {
-            "provider": AWS_P5_PROFILE,
+            "provider": self.profile.provider,
             "seed": manifest.seed,
             "release_sha256": release.archive_sha256,
             "run_manifest_sha256": manifest.sha256,
@@ -2315,7 +2384,7 @@ class AwsP5Backend:
                     next(iter(statuses)) if len(statuses) == 1 else "Mixed"
                 )
                 return {
-                    "provider": AWS_P5_PROFILE,
+                    "provider": self.profile.provider,
                     "seed": manifest.seed,
                     "instance_id": instance_id,
                     "command_id": command_id,
@@ -2330,7 +2399,7 @@ class AwsP5Backend:
                 state["updated_at"] = now
                 store.write_run(run.run_id, state)
             return {
-                "provider": AWS_P5_PROFILE,
+                "provider": self.profile.provider,
                 "seed": manifest.seed,
                 "instance_id": instance_id,
                 "command_id": command_id,
@@ -2379,7 +2448,7 @@ class AwsP5Backend:
         )
         if not apply:
             return {
-                "provider": AWS_P5_PROFILE,
+                "provider": self.profile.provider,
                 "s3_uri": f"s3://{bucket}/{key}",
                 "commands": [argv],
                 "verified": False,
@@ -2410,7 +2479,7 @@ class AwsP5Backend:
                 "S3 object metadata is invalid",
             )
         return {
-            "provider": AWS_P5_PROFILE,
+            "provider": self.profile.provider,
             "s3_uri": f"s3://{bucket}/{key}",
             "verified": True,
             "object": row,
@@ -2744,7 +2813,7 @@ class AwsP5Backend:
             for upload in (True, False)
         ]
         result = {
-            "provider": AWS_P5_PROFILE,
+            "provider": self.profile.provider,
             "receipt": receipt,
             "receipt_sha256": receipt_sha256,
             "receipt_path": str(receipt_path),
@@ -2923,7 +2992,7 @@ class AwsP5Backend:
                 )
             )
         result = {
-            "provider": AWS_P5_PROFILE,
+            "provider": self.profile.provider,
             "receipt_sha256": sha256_file(receipt_path),
             "ordered_stream_sha256": evidence.receipt[
                 "ordered_stream_sha256"
@@ -3004,7 +3073,7 @@ class AwsP5Backend:
         )
         if not apply:
             return {
-                "provider": AWS_P5_PROFILE,
+                "provider": self.profile.provider,
                 "s3_uri": f"s3://{bucket}/{key}",
                 "out": str(destination),
                 "commands": [argv],
@@ -3027,7 +3096,7 @@ class AwsP5Backend:
                 "AWS CLI did not materialize the requested regular file",
             )
         return {
-            "provider": AWS_P5_PROFILE,
+            "provider": self.profile.provider,
             "s3_uri": f"s3://{bucket}/{key}",
             "out": str(destination),
             "collected": 1,
@@ -3053,7 +3122,9 @@ class AwsP5Backend:
             "run_id": run.run_id,
             "arm": run.arm,
             "seed": run.seed,
-            "provider": AWS_P5_PROFILE,
+            "provider": self.profile.provider,
+            "instance_type": self.profile.instance_type,
+            "gres": _profile_gres(self.profile),
             "release_sha256": manifest.release_sha256,
             "run_manifest_sha256": manifest.sha256,
             "config_sha256": run.config_sha256,
@@ -3111,7 +3182,10 @@ class AwsP5Backend:
             manifest.sha256,
             {
                 "schema_version": 1,
-                "provider": AWS_P5_PROFILE,
+                "provider": self.profile.provider,
+                "instance_type": self.profile.instance_type,
+                "profile_sha256": self.profile.sha256,
+                "gres": _profile_gres(self.profile),
                 "run_manifest_sha256": manifest.sha256,
                 "operation_id": next(iter(operation_ids)),
                 "states": [dict(state) for state in states],
@@ -3128,6 +3202,16 @@ class AwsP5Backend:
         journal = store.read_aws_pair(manifest.sha256)
         if journal is None:
             return
+        if (
+            journal.get("provider") != self.profile.provider
+            or journal.get("instance_type") != self.profile.instance_type
+            or journal.get("profile_sha256") != self.profile.sha256
+            or journal.get("gres") != _profile_gres(self.profile)
+        ):
+            raise MsctlError(
+                "STATE_CORRUPT",
+                "AWS pair journal belongs to a different provider profile",
+            )
         expected = {
             str(state["run_id"]): state
             for state in journal["states"]
@@ -3458,7 +3542,7 @@ class AwsP5Backend:
                     if recovered is None:
                         if started or terminal:
                             return {
-                                "provider": AWS_P5_PROFILE,
+                                "provider": self.profile.provider,
                                 "seed": manifest.seed,
                                 "instance_id": instance_id,
                                 "operation_id": next(iter(operation_ids)),
@@ -3483,7 +3567,7 @@ class AwsP5Backend:
                         state["updated_at"] = now
                         store.write_run(run.run_id, state)
                     return {
-                        "provider": AWS_P5_PROFILE,
+                        "provider": self.profile.provider,
                         "seed": manifest.seed,
                         "instance_id": instance_id,
                         "command_id": command_id,
@@ -3505,7 +3589,7 @@ class AwsP5Backend:
                     state["updated_at"] = now
                     store.write_run(run.run_id, state)
                 return {
-                    "provider": AWS_P5_PROFILE,
+                    "provider": self.profile.provider,
                     "seed": manifest.seed,
                     "instance_id": instance_id,
                     "command_id": command_id,
@@ -3583,7 +3667,7 @@ class AwsP5Backend:
                 state["updated_at"] = now
             self._write_paired_states(store, manifest, new_states)
             return {
-                "provider": AWS_P5_PROFILE,
+                "provider": self.profile.provider,
                 "seed": manifest.seed,
                 "instance_id": instance_id,
                 "command_id": command_id,
@@ -3661,7 +3745,7 @@ class AwsP5Backend:
         )
         if not apply:
             return {
-                "provider": AWS_P5_PROFILE,
+                "provider": self.profile.provider,
                 "seed": manifest.seed,
                 "run_manifest_sha256": manifest.sha256,
                 "checkpoint_receipt_sha256": checkpoint_receipt.sha256,
@@ -3783,7 +3867,7 @@ class AwsP5Backend:
                     if recovered is None:
                         if started or terminal:
                             return {
-                                "provider": AWS_P5_PROFILE,
+                                "provider": self.profile.provider,
                                 "seed": manifest.seed,
                                 "instance_id": instance_id,
                                 "operation_id": operation_intent[
@@ -3810,7 +3894,7 @@ class AwsP5Backend:
                         state["updated_at"] = now
                         store.write_run(run.run_id, state)
                     return {
-                        "provider": AWS_P5_PROFILE,
+                        "provider": self.profile.provider,
                         "seed": manifest.seed,
                         "instance_id": instance_id,
                         "command_id": command_id,
@@ -3832,7 +3916,7 @@ class AwsP5Backend:
                     state["updated_at"] = now
                     store.write_run(run.run_id, state)
                 return {
-                    "provider": AWS_P5_PROFILE,
+                    "provider": self.profile.provider,
                     "seed": manifest.seed,
                     "instance_id": instance_id,
                     "command_id": command_id,
@@ -3929,7 +4013,7 @@ class AwsP5Backend:
                 state["updated_at"] = now
             self._write_paired_states(store, manifest, present)
             return {
-                "provider": AWS_P5_PROFILE,
+                "provider": self.profile.provider,
                 "seed": manifest.seed,
                 "instance_id": instance_id,
                 "command_id": command_id,
@@ -4000,7 +4084,7 @@ class AwsP5Backend:
         self._validate_release(release, manifest)
         if not apply:
             return {
-                "provider": AWS_P5_PROFILE,
+                "provider": self.profile.provider,
                 "seed": manifest.seed,
                 "operation": "cancel",
                 "run_ids": [run.run_id for run in manifest.runs],
@@ -4017,7 +4101,7 @@ class AwsP5Backend:
             states = self._paired_states(store, manifest)
             if {state.get("status") for state in states} == {"Cancelling"}:
                 return {
-                    "provider": AWS_P5_PROFILE,
+                    "provider": self.profile.provider,
                     "seed": manifest.seed,
                     "command_id": states[0]["command_id"],
                     "status": "Cancelling",
@@ -4059,7 +4143,7 @@ class AwsP5Backend:
                 state["updated_at"] = now
                 store.write_run(run.run_id, state)
             return {
-                "provider": AWS_P5_PROFILE,
+                "provider": self.profile.provider,
                 "seed": manifest.seed,
                 "command_id": command_id,
                 "status": "Cancelling",
@@ -4073,8 +4157,9 @@ class AwsP5Backend:
         manifest: object,
     ) -> list[list[str]]:
         release_root = self._release_root(release)
-        run_root = f"/mnt/memorysplit/runs/seed-{manifest.seed}"
-        evaluation_root = "/mnt/memorysplit/evaluations"
+        scratch_root = getattr(self.profile, "scratch_root", "/mnt/memorysplit")
+        run_root = f"{scratch_root}/runs/seed-{manifest.seed}"
+        evaluation_root = f"{scratch_root}/evaluations"
         return [
             [
                 "/usr/bin/docker",
@@ -4114,7 +4199,7 @@ class AwsP5Backend:
                 "--device",
                 "cuda",
                 "--output-dir",
-                f"/mnt/memorysplit/evaluations/{run.run_id}",
+                f"{evaluation_root}/{run.run_id}",
             ]
             for run in sorted(manifest.runs, key=lambda row: row.arm)
         ]
@@ -4139,7 +4224,10 @@ class AwsP5Backend:
         return {
             "schema_version": 1,
             "operation": "evaluate",
-            "provider": AWS_P5_PROFILE,
+            "provider": self.profile.provider,
+            "instance_type": self.profile.instance_type,
+            "profile_sha256": self.profile.sha256,
+            "gres": _profile_gres(self.profile),
             "seed": manifest.seed,
             "release_sha256": release.archive_sha256,
             "run_manifest_sha256": manifest.sha256,
@@ -4183,7 +4271,7 @@ class AwsP5Backend:
         )
         if not apply:
             return {
-                "provider": AWS_P5_PROFILE,
+                "provider": self.profile.provider,
                 "seed": manifest.seed,
                 "operation_intent": operation_intent,
                 "submitted": 0,
@@ -4282,7 +4370,10 @@ class AwsP5Backend:
             existing = store.read_evaluation(manifest.sha256)
             if existing is not None:
                 if (
-                    existing.get("provider") != AWS_P5_PROFILE
+                    existing.get("provider") != self.profile.provider
+                    or existing.get("instance_type")
+                    != self.profile.instance_type
+                    or existing.get("gres") != _profile_gres(self.profile)
                     or existing.get("release_sha256")
                     != manifest.release_sha256
                     or existing.get("dataset_sha256")
@@ -4328,7 +4419,7 @@ class AwsP5Backend:
                     if recovered is None:
                         if started or terminal:
                             return {
-                                "provider": AWS_P5_PROFILE,
+                                "provider": self.profile.provider,
                                 "seed": manifest.seed,
                                 "instance_id": instance_id,
                                 "operation_id": operation_intent[
@@ -4353,7 +4444,7 @@ class AwsP5Backend:
                     existing["updated_at"] = _timestamp()
                     store.write_evaluation(manifest.sha256, existing)
                     return {
-                        "provider": AWS_P5_PROFILE,
+                        "provider": self.profile.provider,
                         "seed": manifest.seed,
                         "instance_id": instance_id,
                         "command_id": command_id,
@@ -4368,7 +4459,7 @@ class AwsP5Backend:
                 existing["updated_at"] = _timestamp()
                 store.write_evaluation(manifest.sha256, existing)
                 return {
-                    "provider": AWS_P5_PROFILE,
+                    "provider": self.profile.provider,
                     "seed": manifest.seed,
                     "instance_id": instance_id,
                     "command_id": command_id,
@@ -4384,7 +4475,9 @@ class AwsP5Backend:
                 manifest.sha256,
                 {
                     "schema_version": 1,
-                    "provider": AWS_P5_PROFILE,
+                    "provider": self.profile.provider,
+                    "instance_type": self.profile.instance_type,
+                    "gres": _profile_gres(self.profile),
                     "seed": manifest.seed,
                     "release_sha256": manifest.release_sha256,
                     "dataset_sha256": manifest.dataset_sha256,
@@ -4434,7 +4527,7 @@ class AwsP5Backend:
             state["updated_at"] = _timestamp()
             store.write_evaluation(manifest.sha256, state)
             return {
-                "provider": AWS_P5_PROFILE,
+                "provider": self.profile.provider,
                 "seed": manifest.seed,
                 "instance_id": instance_id,
                 "command_id": command_id,
@@ -4455,7 +4548,7 @@ class AwsP5Backend:
         self._validate_release(release, manifest)
         if not apply:
             return {
-                "provider": AWS_P5_PROFILE,
+                "provider": self.profile.provider,
                 "seed": manifest.seed,
                 "release_sha256": release.archive_sha256,
                 "run_manifest_sha256": manifest.sha256,
@@ -4501,7 +4594,7 @@ class AwsP5Backend:
             )
             if {state.get("status") for state in states} == {"Terminating"}:
                 return {
-                    "provider": AWS_P5_PROFILE,
+                    "provider": self.profile.provider,
                     "seed": manifest.seed,
                     "instance_id": instance_id,
                     "status": "Terminating",
@@ -4587,7 +4680,7 @@ class AwsP5Backend:
                 state["updated_at"] = now
                 store.write_run(run.run_id, state)
             return {
-                "provider": AWS_P5_PROFILE,
+                "provider": self.profile.provider,
                 "seed": manifest.seed,
                 "instance_id": instance_id,
                 "status": row["current_state"],

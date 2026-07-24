@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Mapping, Sequence
 
-from cluster.aws.p5.profile import AwsGpuProfile
+from cluster.aws.p5.profile import AwsGpuProfile, AwsGpuRuntime
 
 
 CANARY_UPDATES = 100
@@ -31,6 +31,7 @@ _ROOT_FIELDS = frozenset(
         "profile",
         "hardware",
         "software",
+        "capabilities",
         "throughput",
     }
 )
@@ -59,6 +60,47 @@ _THROUGHPUT_FIELDS = frozenset(
     }
 )
 _ARM_FIELDS = frozenset({"arm", "gpu_ids", "update_seconds"})
+_CAPABILITY_FIELDS = frozenset(
+    {
+        "fabric_manager_nvlink",
+        "bf16",
+        "sdpa",
+        "torch_compile",
+        "fused_adamw",
+        "simultaneous_4_plus_4_nccl",
+        "one_step_training",
+        "checkpoint_resume",
+        "nvme_geometry",
+    }
+)
+_FABRIC_MANAGER_NVLINK_FIELDS = frozenset(
+    {
+        "passed",
+        "fabric_manager_active",
+        "nvlink_connected",
+        "gpu_ids",
+    }
+)
+_BF16_FIELDS = frozenset({"passed", "supported", "dtype", "gpu_ids"})
+_SDPA_FIELDS = frozenset(
+    {"passed", "forward", "backward", "dtype", "gpu_ids"}
+)
+_TORCH_COMPILE_FIELDS = frozenset(
+    {"passed", "compiled", "backend", "gpu_ids"}
+)
+_FUSED_ADAMW_FIELDS = frozenset({"passed", "fused", "gpu_ids"})
+_SIMULTANEOUS_NCCL_FIELDS = frozenset(
+    {"passed", "concurrent", "backend", "groups", "world_sizes"}
+)
+_ONE_STEP_TRAINING_FIELDS = frozenset(
+    {"passed", "arms", "updates", "gpu_groups"}
+)
+_CHECKPOINT_RESUME_FIELDS = frozenset(
+    {"passed", "checkpointed", "resumed", "arms", "gpu_groups"}
+)
+_NVME_GEOMETRY_FIELDS = frozenset(
+    {"passed", "model", "devices", "device_bytes", "raid_level"}
+)
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _VERSION_RE = re.compile(
     r"^R?([0-9]+(?:\.[0-9]+)*)(?:[-+._][A-Za-z0-9._+-]+)?$"
@@ -292,6 +334,150 @@ def _validate_software(
         )
 
 
+def _same_typed_value(actual: object, expected: object) -> bool:
+    if type(actual) is not type(expected):
+        return False
+    if isinstance(expected, dict):
+        return set(actual) == set(expected) and all(
+            _same_typed_value(actual[key], value)
+            for key, value in expected.items()
+        )
+    if isinstance(expected, list):
+        return len(actual) == len(expected) and all(
+            _same_typed_value(item, expected_item)
+            for item, expected_item in zip(actual, expected, strict=True)
+        )
+    return actual == expected
+
+
+def _exact_capability(
+    value: object,
+    *,
+    fields: frozenset[str],
+    expected: Mapping[str, object],
+    label: str,
+) -> None:
+    capability = _object(value, fields, label=label)
+    if capability.get("passed") is not True:
+        raise QualificationError(f"{label}.passed must be true")
+    if not _same_typed_value(dict(capability), dict(expected)):
+        raise QualificationError(
+            f"{label} evidence does not match the profile-bound contract"
+        )
+
+
+def _validate_capabilities(
+    value: object,
+    *,
+    profile: AwsGpuProfile,
+) -> None:
+    capabilities = _object(value, _CAPABILITY_FIELDS, label="capabilities")
+    gpu_ids = list(range(profile.allocated_gpus))
+    groups = [
+        list(range(0, profile.train_groups[0])),
+        list(
+            range(
+                profile.train_groups[0],
+                sum(profile.train_groups),
+            )
+        ),
+    ]
+    arms = list(_ARMS)
+    contracts = {
+        "fabric_manager_nvlink": (
+            _FABRIC_MANAGER_NVLINK_FIELDS,
+            {
+                "passed": True,
+                "fabric_manager_active": True,
+                "nvlink_connected": True,
+                "gpu_ids": gpu_ids,
+            },
+        ),
+        "bf16": (
+            _BF16_FIELDS,
+            {
+                "passed": True,
+                "supported": True,
+                "dtype": "bfloat16",
+                "gpu_ids": gpu_ids,
+            },
+        ),
+        "sdpa": (
+            _SDPA_FIELDS,
+            {
+                "passed": True,
+                "forward": True,
+                "backward": True,
+                "dtype": "bfloat16",
+                "gpu_ids": gpu_ids,
+            },
+        ),
+        "torch_compile": (
+            _TORCH_COMPILE_FIELDS,
+            {
+                "passed": True,
+                "compiled": True,
+                "backend": "inductor",
+                "gpu_ids": gpu_ids,
+            },
+        ),
+        "fused_adamw": (
+            _FUSED_ADAMW_FIELDS,
+            {
+                "passed": True,
+                "fused": True,
+                "gpu_ids": gpu_ids,
+            },
+        ),
+        "simultaneous_4_plus_4_nccl": (
+            _SIMULTANEOUS_NCCL_FIELDS,
+            {
+                "passed": True,
+                "concurrent": True,
+                "backend": "nccl",
+                "groups": groups,
+                "world_sizes": list(profile.train_groups),
+            },
+        ),
+        "one_step_training": (
+            _ONE_STEP_TRAINING_FIELDS,
+            {
+                "passed": True,
+                "arms": arms,
+                "updates": 1,
+                "gpu_groups": groups,
+            },
+        ),
+        "checkpoint_resume": (
+            _CHECKPOINT_RESUME_FIELDS,
+            {
+                "passed": True,
+                "checkpointed": True,
+                "resumed": True,
+                "arms": arms,
+                "gpu_groups": groups,
+            },
+        ),
+        "nvme_geometry": (
+            _NVME_GEOMETRY_FIELDS,
+            {
+                "passed": True,
+                "model": profile.instance_store_model,
+                "devices": profile.instance_store_devices,
+                "device_bytes": profile.instance_store_device_bytes,
+                "raid_level": profile.raid_level,
+            },
+        ),
+    }
+    for name, (fields, expected) in contracts.items():
+        _exact_capability(
+            capabilities[name],
+            fields=fields,
+            expected=expected,
+            label=f"capabilities.{name}",
+        )
+
+
 def validate_qualification_receipt(
     receipt: Mapping[str, object],
     profile: AwsGpuProfile,
@@ -301,7 +487,7 @@ def validate_qualification_receipt(
     root = _object(receipt, _ROOT_FIELDS, label="qualification receipt")
     _exact_int(
         root["schema_version"],
-        1,
+        2,
         label="qualification receipt.schema_version",
     )
     if root["receipt_type"] != "aws-gpu-qualification":
@@ -349,6 +535,7 @@ def validate_qualification_receipt(
         raise QualificationError("qualification receipt mixes GPU hardware")
 
     _validate_software(root["software"], profile=profile)
+    _validate_capabilities(root["capabilities"], profile=profile)
 
     throughput_value = _object(
         root["throughput"],
@@ -412,6 +599,201 @@ def validate_qualification_receipt(
         seed_pairs=SEED_PAIRS,
         eta_seconds=estimate_seed_pair_eta(throughput),
     )
+
+
+def _canary_container_argv(
+    *,
+    profile: AwsGpuProfile,
+    runtime: AwsGpuRuntime,
+    output_root: str,
+    phase: str,
+    arm: str | None,
+    gpu_ids: Sequence[int],
+    output_name: str,
+    extra: Sequence[str] = (),
+) -> list[str]:
+    ids = ",".join(str(gpu_id) for gpu_id in gpu_ids)
+    container_output = f"/qualification/{output_name}"
+    argv = [
+        "/usr/bin/docker",
+        "run",
+        "--rm",
+        "--read-only",
+        "--network=host",
+        "--ipc=host",
+        "--gpus",
+        f"device={ids}",
+        "--user",
+        f"{runtime.uid}:{runtime.gid}",
+        "--security-opt",
+        "no-new-privileges",
+        "--cap-drop",
+        "ALL",
+        "--mount",
+        f"type=bind,src={output_root},dst=/qualification",
+        runtime.container_image,
+        "/opt/conda/bin/python",
+        "/opt/memorysplit/cluster/aws/p5/canary_runtime.py",
+        phase,
+        "--provider",
+        profile.provider,
+        "--instance-type",
+        profile.instance_type,
+        "--profile-sha256",
+        profile.sha256,
+        "--gres",
+        profile.gres,
+        "--gpu-ids",
+        ids,
+    ]
+    if arm is not None:
+        argv.extend(["--arm", arm])
+    argv.extend(["--output", container_output, *extra])
+    return argv
+
+
+def render_canary_command_plan(
+    profile: AwsGpuProfile,
+    runtime: AwsGpuRuntime,
+) -> dict[str, object]:
+    """Render a deterministic remote qualification plan without executing it."""
+
+    if profile.provider != profile.profile_id:
+        raise QualificationError("canary profile provider identity is invalid")
+    if (
+        not isinstance(profile.sha256, str)
+        or _SHA256_RE.fullmatch(profile.sha256) is None
+    ):
+        raise QualificationError("canary profile SHA-256 is invalid")
+    digest_prefix, separator, image_digest = runtime.container_digest.partition(":")
+    if (
+        digest_prefix != "sha256"
+        or separator != ":"
+        or _SHA256_RE.fullmatch(image_digest) is None
+        or not runtime.container_image.endswith("@" + runtime.container_digest)
+    ):
+        raise QualificationError("canary container image is not digest pinned")
+    dense_ids = list(range(0, profile.train_groups[0]))
+    split90_ids = list(
+        range(profile.train_groups[0], sum(profile.train_groups))
+    )
+    all_ids = dense_ids + split90_ids
+    if (
+        len(all_ids) != profile.allocated_gpus
+        or dense_ids != [0, 1, 2, 3]
+        or split90_ids != [4, 5, 6, 7]
+    ):
+        raise QualificationError("canary command plan requires exact GPU groups 0-3 and 4-7")
+    output_root = (
+        f"{profile.scratch_root}/qualification/{profile.profile_id}/"
+        f"profile-{profile.sha256}/image-{image_digest}"
+    )
+    probe_commands = [
+        [
+            "/usr/bin/systemctl",
+            "is-active",
+            "nvidia-fabricmanager",
+        ],
+        [
+            "/usr/bin/nvidia-smi",
+            "--query-gpu=index,name",
+            "--format=csv,noheader",
+        ],
+        ["/usr/bin/nvidia-smi", "topo", "-m"],
+        [
+            "/usr/bin/lsblk",
+            "--json",
+            "--bytes",
+            "--output",
+            "NAME,PATH,TYPE,MODEL,SIZE,MOUNTPOINTS",
+        ],
+        _canary_container_argv(
+            profile=profile,
+            runtime=runtime,
+            output_root=output_root,
+            phase="probe",
+            arm=None,
+            gpu_ids=all_ids,
+            output_name="probes/capabilities.json",
+        ),
+    ]
+    training_commands = [
+        _canary_container_argv(
+            profile=profile,
+            runtime=runtime,
+            output_root=output_root,
+            phase="train",
+            arm=arm,
+            gpu_ids=gpu_ids,
+            output_name=f"training/{arm}.json",
+            extra=(
+                "--updates",
+                str(CANARY_UPDATES),
+                "--warmup-updates",
+                str(WARMUP_UPDATES),
+                "--tokens-per-update",
+                str(TOKENS_PER_UPDATE),
+            ),
+        )
+        for arm, gpu_ids in (("dense", dense_ids), ("split90", split90_ids))
+    ]
+    checkpoint_commands = [
+        command
+        for arm, gpu_ids in (("dense", dense_ids), ("split90", split90_ids))
+        for command in (
+            _canary_container_argv(
+                profile=profile,
+                runtime=runtime,
+                output_root=output_root,
+                phase="checkpoint",
+                arm=arm,
+                gpu_ids=gpu_ids,
+                output_name=f"checkpoints/{arm}.pt",
+            ),
+            _canary_container_argv(
+                profile=profile,
+                runtime=runtime,
+                output_root=output_root,
+                phase="resume",
+                arm=arm,
+                gpu_ids=gpu_ids,
+                output_name=f"resume/{arm}.json",
+                extra=(
+                    "--checkpoint",
+                    f"/qualification/checkpoints/{arm}.pt",
+                ),
+            ),
+        )
+    ]
+    return {
+        "schema_version": 1,
+        "provider": profile.provider,
+        "instance_type": profile.instance_type,
+        "profile_sha256": profile.sha256,
+        "container_digest": runtime.container_digest,
+        "output_root": output_root,
+        "gpu_groups": {
+            "dense": dense_ids,
+            "split90": split90_ids,
+        },
+        "phases": {
+            "probes": {
+                "concurrent": False,
+                "commands": probe_commands,
+            },
+            "training": {
+                "concurrent": True,
+                "commands": training_commands,
+            },
+            "checkpoint": {
+                "concurrent": False,
+                "commands": checkpoint_commands,
+            },
+        },
+    }
+
+
+render_remote_canary_plan = render_canary_command_plan
 
 
 def _unique_object(pairs: list[tuple[str, object]]) -> dict[str, object]:

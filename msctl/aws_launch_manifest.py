@@ -15,6 +15,10 @@ from pathlib import Path
 if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from cluster.aws.p5.profile import (
+    LEGACY_AWS_P5_PROFILE_ID,
+    load_aws_gpu_profile,
+)
 from msctl.jsonutil import canonical_json
 
 
@@ -100,10 +104,40 @@ def build_launcher_manifest(
     bootstrap_receipt: Path,
     corpus_receipt: Path,
     runs: Sequence[dict[str, object]],
+    profile: object | None = None,
 ) -> dict[str, object]:
     """Resolve dynamic receipt hashes into Task3/5's closed manifest schema."""
 
-    if type(seed) is not int or seed not in {1, 2, 3, 4}:
+    provider = getattr(profile, "provider", LEGACY_AWS_P5_PROFILE_ID)
+    instance_type = getattr(profile, "instance_type", "p5.48xlarge")
+    gres = getattr(profile, "gres", "gpu:h100:8")
+    assigned_seeds = tuple(
+        getattr(profile, "assigned_seeds", (1, 2, 3, 4))
+    )
+    cpu_affinity_halves = tuple(
+        getattr(profile, "cpu_affinity_halves", ((0, 95), (96, 191)))
+    )
+    receipt_type = getattr(profile, "bootstrap_receipt_type", "aws-p5-bootstrap")
+    if (
+        not isinstance(provider, str)
+        or not provider
+        or (
+            profile is not None
+            and getattr(profile, "profile_id", None) != provider
+        )
+        or not isinstance(instance_type, str)
+        or not instance_type
+        or not isinstance(gres, str)
+        or not gres.endswith(":8")
+        or len(cpu_affinity_halves) != 2
+        or any(len(group) != 2 for group in cpu_affinity_halves)
+        or (
+            profile is not None
+            and profile_sha256 != getattr(profile, "sha256", None)
+        )
+    ):
+        raise LaunchManifestError("profile launch geometry is invalid")
+    if type(seed) is not int or seed not in assigned_seeds:
         raise LaunchManifestError("seed must be assigned to AWS")
     for label, value in (
         ("profile", profile_sha256),
@@ -119,6 +153,20 @@ def build_launcher_manifest(
         bootstrap_receipt,
         label="bootstrap receipt",
     )
+    bootstrap = _load_object(bootstrap_receipt, label="bootstrap receipt")
+    if (
+        bootstrap.get("provider") != provider
+        or bootstrap.get("instance_type") != instance_type
+        or bootstrap.get("profile_sha256") != profile_sha256
+        or bootstrap.get("receipt_type") != receipt_type
+        or (
+            profile is not None
+            and bootstrap.get("scratch_root") != str(scratch)
+        )
+    ):
+        raise LaunchManifestError(
+            "bootstrap receipt does not bind the selected profile"
+        )
     corpus_hash = _hash_regular(corpus_receipt, label="corpus receipt")
     corpus = _load_object(corpus_receipt, label="corpus receipt")
     ordered_sha256 = _sha256(
@@ -150,8 +198,8 @@ def build_launcher_manifest(
     base_port = 29_500 + seed * 2
     launch_runs = []
     for arm, port, affinity in (
-        ("dense", base_port, [0, 95]),
-        ("split90", base_port + 1, [96, 191]),
+        ("dense", base_port, list(cpu_affinity_halves[0])),
+        ("split90", base_port + 1, list(cpu_affinity_halves[1])),
     ):
         binding = by_arm[arm]
         launch_runs.append(
@@ -190,7 +238,7 @@ def build_launcher_manifest(
             "sha256": corpus_hash,
         },
         "profile_sha256": profile_sha256,
-        "provider": "aws-p5.48xlarge",
+        "provider": provider,
         "release_members_sha256": release_members_sha256,
         "release_sha256": release_sha256,
         "runs": launch_runs,
@@ -230,6 +278,7 @@ def _run_binding(value: str) -> dict[str, object]:
 
 
 def _parser() -> argparse.ArgumentParser:
+    root = Path(__file__).resolve().parents[1]
     parser = argparse.ArgumentParser()
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--scratch-root", type=Path, required=True)
@@ -242,12 +291,18 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--bootstrap-receipt", type=Path, required=True)
     parser.add_argument("--corpus-receipt", type=Path, required=True)
     parser.add_argument("--run", type=_run_binding, action="append", required=True)
+    parser.add_argument(
+        "--profile",
+        type=Path,
+        default=root / "cluster" / "profiles" / "aws-p5.48xlarge.json",
+    )
     return parser
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     try:
         arguments = _parser().parse_args(argv)
+        profile = load_aws_gpu_profile(arguments.profile)
         manifest = build_launcher_manifest(
             out=arguments.out,
             scratch_root=arguments.scratch_root,
@@ -260,6 +315,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             bootstrap_receipt=arguments.bootstrap_receipt,
             corpus_receipt=arguments.corpus_receipt,
             runs=arguments.run,
+            profile=profile,
         )
         print(json.dumps(manifest, sort_keys=True, separators=(",", ":")))
         return 0

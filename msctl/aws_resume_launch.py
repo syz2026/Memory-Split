@@ -140,6 +140,14 @@ def bind_resume_checkpoints(
         checkpoint_receipt_sha256,
         label="checkpoint receipt",
     )
+    group_sizes = {
+        arm: size
+        for arm, size in zip(
+            _ARMS,
+            plan.profile.train_groups,
+            strict=True,
+        )
+    }
     if len(checkpoints) != 2:
         raise ResumeLaunchError("resume requires one complete checkpoint pair")
     by_arm: dict[str, Mapping[str, object]] = {}
@@ -155,7 +163,7 @@ def bind_resume_checkpoints(
             arm not in _ARMS
             or arm in by_arm
             or type(row["world_size"]) is not int
-            or row["world_size"] != 4
+            or row["world_size"] != group_sizes.get(arm)
         ):
             raise ResumeLaunchError(
                 "resume requires distinct Dense/Split90 world-size-4 checkpoints"
@@ -266,10 +274,11 @@ def prepare_resume_output_roots(
     *,
     seed: int,
     checkpoint_receipt_sha256: str,
+    assigned_seeds: Sequence[int] = (1, 2, 3, 4),
 ) -> Path:
     """Atomically archive a prior paired output before a resume attempt."""
 
-    if type(seed) is not int or seed not in {1, 2, 3, 4}:
+    if type(seed) is not int or seed not in assigned_seeds:
         raise ResumeLaunchError("resume seed is not assigned to AWS")
     receipt_sha256 = _sha256(
         checkpoint_receipt_sha256,
@@ -396,7 +405,7 @@ def _verify_checkpoint_receipt(
         raise ResumeLaunchError("checkpoint receipt fields do not match")
     if (
         receipt["schema_version"] != 2
-        or receipt["provider"] != "aws-p5.48xlarge"
+        or receipt["provider"] != plan.profile.provider
         or receipt["release_sha256"] != plan.release_sha256
         or receipt["run_manifest_sha256"] != manifest_sha256
         or receipt["dataset_sha256"] != plan.corpus_receipt_sha256
@@ -422,7 +431,8 @@ def _verify_checkpoint_receipt(
             or row["dataset_sha256"] != plan.corpus_receipt_sha256
             or row["source_commit"] != plan.code_commit
             or type(row["world_size"]) is not int
-            or row["world_size"] != 4
+            or row["world_size"]
+            != plan.profile.train_groups[_ARMS.index(str(arm))]
             or type(row["step"]) is not int
             or row["step"] <= 0
         ):
@@ -532,6 +542,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             checkpoint_receipt_sha256=(
                 arguments.checkpoint_receipt_sha256
             ),
+            assigned_seeds=plan.profile.assigned_seeds,
         )
         client = reviewed_launcher.ImdsV2Client()
         with reviewed_launcher.installed_shutdown_handlers() as shutdown_source:

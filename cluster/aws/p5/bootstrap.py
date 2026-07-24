@@ -28,6 +28,7 @@ from cluster.aws.p5.interruption_checkpoint import (
     S3ObjectStore,
 )
 from cluster.aws.p5.profile import (
+    LEGACY_AWS_P5_PROFILE_ID,
     AwsGpuProfile,
     AwsGpuRuntime,
     load_aws_p5_profile,
@@ -71,6 +72,8 @@ class BootstrapArtifacts:
     corpus_build_id: str
     cohort_assignment_sha256: str
     code_commit: str
+    provider: str = LEGACY_AWS_P5_PROFILE_ID
+    assigned_seeds: tuple[int, ...] = (1, 2, 3, 4)
 
 
 @dataclass(frozen=True)
@@ -661,6 +664,8 @@ def _verify_release_archive(
     *,
     expected_members_sha256: str,
     code_commit: str,
+    provider: str = LEGACY_AWS_P5_PROFILE_ID,
+    assigned_seeds: Sequence[int] = (1, 2, 3, 4),
 ) -> tuple[ReleaseMember, ...]:
     _required_sha256(
         expected_members_sha256,
@@ -767,15 +772,15 @@ def _verify_release_archive(
             or _canonical_pretty(metadata) != metadata_bytes
             or metadata.get("schema_version") != 1
             or metadata.get("package_format_version") != 1
-            or metadata.get("provider") != "aws-p5.48xlarge"
+            or metadata.get("provider") != provider
             or metadata.get("source")
             != {"commit": code_commit, "dirty": False}
             or metadata.get("seed_assignment")
             != {
                 "arms": ["dense", "split90"],
                 "cohort_id": "memorysplit-confirmatory-v2-360m-n5",
-                "provider": "aws-p5.48xlarge",
-                "seeds": [1, 2, 3, 4],
+                "provider": provider,
+                "seeds": list(assigned_seeds),
             }
         ):
             raise BootstrapError("release metadata identity does not match")
@@ -848,6 +853,7 @@ def verify_bootstrap_artifacts(
     cohort_assignment: Path,
     cohort_assignment_sha256: str,
     code_commit: str,
+    profile: AwsGpuProfile | None = None,
 ) -> BootstrapArtifacts:
     """Hash ZIP, release, dataset, and cohort bytes and cross-check bindings."""
 
@@ -915,6 +921,16 @@ def verify_bootstrap_artifacts(
             label="release receipt members",
         ),
         code_commit=code_commit,
+        provider=(
+            profile.provider
+            if profile is not None
+            else LEGACY_AWS_P5_PROFILE_ID
+        ),
+        assigned_seeds=(
+            profile.assigned_seeds
+            if profile is not None
+            else (1, 2, 3, 4)
+        ),
     )
     return BootstrapArtifacts(
         release_sha256=release_digest,
@@ -925,6 +941,16 @@ def verify_bootstrap_artifacts(
         corpus_build_id=corpus_build_id,
         cohort_assignment_sha256=cohort_digest,
         code_commit=code_commit,
+        provider=(
+            profile.provider
+            if profile is not None
+            else LEGACY_AWS_P5_PROFILE_ID
+        ),
+        assigned_seeds=(
+            profile.assigned_seeds
+            if profile is not None
+            else (1, 2, 3, 4)
+        ),
     )
 
 
@@ -951,6 +977,8 @@ def extract_verified_release(
         release_archive,
         expected_members_sha256=artifacts.release_members_sha256,
         code_commit=artifacts.code_commit,
+        provider=artifacts.provider,
+        assigned_seeds=artifacts.assigned_seeds,
     )
     if members != artifacts.release_members:
         raise BootstrapError("release member evidence changed before extraction")
@@ -1047,6 +1075,8 @@ def build_bootstrap_receipt(
         != Path(profile.scratch_root)
         / "releases"
         / artifacts.release_sha256
+        or artifacts.provider != profile.provider
+        or artifacts.assigned_seeds != profile.assigned_seeds
     ):
         raise BootstrapError("prepared release evidence does not match bootstrap")
     return {
@@ -1171,8 +1201,8 @@ def _parser() -> argparse.ArgumentParser:
 def main(argv: Sequence[str] | None = None) -> int:
     try:
         arguments = _parser().parse_args(argv)
-        # Compatibility names are deliberate patch points for the legacy P5
-        # harness; both aliases dispatch through the neutral closed contract.
+        # Keep the historical patch point while the alias loads every closed
+        # AWS GPU profile through the neutral implementation.
         profile = load_aws_p5_profile(arguments.profile)
         runtime = validate_runtime_environment(profile, os.environ)
         if (
@@ -1242,6 +1272,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             cohort_assignment=arguments.cohort_assignment,
             cohort_assignment_sha256=arguments.cohort_assignment_sha256,
             code_commit=arguments.code_commit,
+            profile=profile,
         )
         prepared_release = extract_verified_release(
             release_archive=arguments.release_archive,

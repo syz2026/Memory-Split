@@ -73,10 +73,30 @@ _BUCKET_RE = re.compile(
 )
 _NONCE_RE = re.compile(r"^[0-9a-f]{32}$")
 _SAFE_PATH = "/usr/local/bin:/usr/bin:/bin"
+_PROFILE_CONTRACTS = {
+    "aws-p5.48xlarge": {
+        "instance_type": "p5.48xlarge",
+        "gres": "gpu:h100:8",
+        "assigned_seeds": frozenset({1, 2, 3, 4}),
+    },
+    "aws-p5.48xlarge-v3": {
+        "instance_type": "p5.48xlarge",
+        "gres": "gpu:h100:8",
+        "assigned_seeds": frozenset(range(10)),
+    },
+    "aws-p6-b300.48xlarge-v3": {
+        "instance_type": "p6-b300.48xlarge",
+        "gres": "gpu:b300:8",
+        "assigned_seeds": frozenset(range(10)),
+    },
+}
 _BASE_FIELDS = {
     "schema_version",
     "operation",
     "provider",
+    "instance_type",
+    "profile_sha256",
+    "gres",
     "seed",
     "release_sha256",
     "run_manifest_sha256",
@@ -263,12 +283,22 @@ def _validate_intent(
     intent = _decode_object(payload, label="operation intent")
     if set(intent) != _BASE_FIELDS:
         raise RemoteIntentError("operation intent fields do not match the contract")
+    provider = intent["provider"]
+    profile_contract = (
+        _PROFILE_CONTRACTS.get(provider)
+        if isinstance(provider, str)
+        else None
+    )
     if (
         intent["schema_version"] != 1
         or intent["operation"] not in {"submit", "resume", "evaluate"}
-        or intent["provider"] != "aws-p5.48xlarge"
+        or profile_contract is None
+        or intent["instance_type"] != profile_contract["instance_type"]
+        or intent["gres"] != profile_contract["gres"]
+        or not isinstance(intent["profile_sha256"], str)
+        or _SHA256_RE.fullmatch(intent["profile_sha256"]) is None
         or isinstance(intent["seed"], bool)
-        or intent["seed"] not in {1, 2, 3, 4}
+        or intent["seed"] not in profile_contract["assigned_seeds"]
         or not isinstance(intent["instance_id"], str)
         or _INSTANCE_RE.fullmatch(intent["instance_id"]) is None
         or not isinstance(intent["terminate_at"], str)
@@ -405,6 +435,10 @@ def _receipt(
         "schema_version": 1,
         "receipt_type": "memorysplit-aws-operation-v1",
         "kind": kind,
+        "provider": intent["provider"],
+        "instance_type": intent["instance_type"],
+        "profile_sha256": intent["profile_sha256"],
+        "gres": intent["gres"],
         "operation_id": intent["operation_id"],
         "intent_sha256": intent_sha256,
         "instance_id": intent["instance_id"],
@@ -428,6 +462,10 @@ def _validate_receipt(
         "schema_version",
         "receipt_type",
         "kind",
+        "provider",
+        "instance_type",
+        "profile_sha256",
+        "gres",
         "operation_id",
         "intent_sha256",
         "instance_id",
@@ -442,6 +480,10 @@ def _validate_receipt(
         value["schema_version"] != 1
         or value["receipt_type"] != "memorysplit-aws-operation-v1"
         or value["kind"] != kind
+        or value["provider"] != intent["provider"]
+        or value["instance_type"] != intent["instance_type"]
+        or value["profile_sha256"] != intent["profile_sha256"]
+        or value["gres"] != intent["gres"]
         or value["operation_id"] != intent["operation_id"]
         or value["intent_sha256"] != intent_sha256
         or value["instance_id"] != intent["instance_id"]

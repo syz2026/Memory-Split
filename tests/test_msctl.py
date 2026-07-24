@@ -3218,6 +3218,7 @@ def _aws_profile_object():
         profile_id="aws-p5.48xlarge",
         provider="aws-p5.48xlarge",
         instance_type="p5.48xlarge",
+        gres="gpu:h100:8",
         purchase_model="on_demand",
         allocated_gpus=8,
         train_groups=(4, 4),
@@ -3437,6 +3438,9 @@ def test_aws_pair_journal_repairs_crash_after_first_arm_write(tmp_path):
             {
                 "schema_version": 1,
                 "provider": "aws-p5.48xlarge",
+                "instance_type": "p5.48xlarge",
+                "profile_sha256": backend.profile.sha256,
+                "gres": "gpu:h100:8",
                 "run_manifest_sha256": manifest.sha256,
                 "operation_id": intent["operation_id"],
                 "states": states,
@@ -3456,6 +3460,7 @@ def _bound_instance(
     return {
         "instance_id": instance_id,
         "instance_type": "p5.48xlarge",
+        "profile_instance_type": "p5.48xlarge",
         "state": "running",
         "instance_profile_arn": (
             "arn:aws:iam::123456789012:instance-profile/memorysplit-p5"
@@ -3466,6 +3471,8 @@ def _bound_instance(
         "release_sha256": release_sha256 or manifest.release_sha256,
         "dataset_sha256": manifest.dataset_sha256,
         "run_manifest_sha256": manifest.sha256,
+        "profile_sha256": _aws_profile_object().sha256,
+        "gres": "gpu:h100:8",
     }
 
 
@@ -3479,6 +3486,7 @@ def _selected_instance(
     profile = _aws_profile_object()
     tags = {
         "provider": "aws-p5.48xlarge",
+        "profile_instance_type": "p5.48xlarge",
         "seed": manifest.seed,
         "cohort_sha256": manifest.cohort_assignment_sha256,
         "release_sha256": manifest.release_sha256,
@@ -3499,6 +3507,7 @@ def _selected_instance(
             )
         ).hexdigest(),
         "container_digest": runtime.container_digest,
+        "gres": "gpu:h100:8",
         "terminate_at": _AWS_TERMINATE_AT,
     }
     if not bound:

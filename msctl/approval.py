@@ -20,7 +20,7 @@ from .jsonutil import (
     require_schema_version,
     require_sha256,
 )
-from .profile import IlluminaProfile
+from .profile import AWS_GPU_PROFILES, AWS_P5_PROFILE, IlluminaProfile
 from .slurm import resource_request
 
 
@@ -220,7 +220,7 @@ def verify_scope_approval(
     }
     expected_resource_fields = set(resources)
     extended_aws_operation = (
-        profile.provider == "aws-p5.48xlarge"
+        profile.provider in AWS_GPU_PROFILES
         and operation in {"submit", "resume", "evaluate", "cleanup"}
     )
     if extended_aws_operation:
@@ -229,7 +229,9 @@ def verify_scope_approval(
             "container_image",
             "container_digest",
             "instance_id",
+            "instance_type",
             "profile_sha256",
+            "provider",
             "release_sha256",
             "run_manifest_sha256",
             "runtime_sha256",
@@ -262,6 +264,9 @@ def verify_scope_approval(
             label="resource request.gpu_hours",
         )
         if extended_aws_operation:
+            profile_gres = getattr(profile, "gres", None)
+            if profile_gres is None and profile.provider == AWS_P5_PROFILE:
+                profile_gres = "gpu:h100:8"
             for field in (
                 "profile_sha256",
                 "release_sha256",
@@ -271,6 +276,20 @@ def verify_scope_approval(
                 require_sha256(
                     resources.get(field),
                     label=f"resource request.{field}",
+                )
+            if (
+                resources.get("provider") != profile.provider
+                or resources.get("instance_type")
+                != getattr(profile, "instance_type", None)
+                or resources.get("profile_sha256")
+                != getattr(profile, "sha256", None)
+                or resources.get("gres") != profile_gres
+                or resources.get("seed")
+                not in getattr(profile, "assigned_seeds", ())
+            ):
+                raise MsctlError(
+                    "APPROVAL_INVALID",
+                    "approval resources do not bind the selected AWS profile",
                 )
             if operation == "resume":
                 require_sha256(
