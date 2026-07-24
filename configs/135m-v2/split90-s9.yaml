@@ -1,0 +1,35 @@
+schema_version: 1
+cohort_id: memorysplit-confirmatory-v2-135m-n10
+run_id: d135m_split90_full_s9
+pair_id: d135m_full_s9
+model: d135m
+model_parameters: 134660880
+arm: split90
+seed: 9
+operator: mit-collaborator-b
+provider: mit-slurm
+ctx: 1024
+train_bin: dataset/packed/targets.bin
+train_mask: dataset/sidecars/split90_target_weights.bin
+total_tokens: 7120879616
+tokens_per_step: 524288
+max_steps: 13582
+micro_batch_size: 8
+lr: 0.0015
+warmup_steps: 300
+weight_decay: 0.1
+compile: true
+device: cuda
+out_dir: outputs/135m-v2/d135m_split90_full_s9
+log_every: 20
+eval_every: 250
+snap_frac: 0.1
+ckpt_minutes: 30
+checkpoint_updates: [1358, 3396, 6791, 10187, 13582]
+dataset:
+  contract_id: memorysplit-parallel-corpus-v2
+  pointer: DATASET-POINTER-SLURM-135M.json
+  complete_dataset: true
+  packed_targets: dataset/packed/targets.bin
+  target_weights: dataset/sidecars/split90_target_weights.bin
+  raw_target_tokens: 7120879616

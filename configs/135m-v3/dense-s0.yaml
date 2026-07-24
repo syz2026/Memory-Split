@@ -1,0 +1,49 @@
+schema_version: 1
+cohort_id: memorysplit-exploratory-v3-135m-aws-n10
+run_id: d135m_dense_reasoning_v3_s0
+pair_id: d135m_reasoning_v3_s0
+model: d135m
+model_parameters: 134660880
+arm: dense
+seed: 0
+operator: aws-operator
+provider: aws-parallelcluster
+ctx: 1024
+train_bin:
+- dataset/base/packed/targets.bin
+- dataset/extension/packed/targets.bin
+train_mask:
+- dataset/base/sidecars/dense_target_weights.bin
+- dataset/extension/sidecars/shared_target_weights.bin
+total_tokens: 8169455616
+tokens_per_step: 524288
+max_steps: 15582
+micro_batch_size: 8
+lr: 0.0015
+warmup_steps: 300
+weight_decay: 0.1
+compile: true
+device: cuda
+out_dir: outputs/135m-v3/d135m_dense_reasoning_v3_s0
+log_every: 20
+eval_every: 250
+snap_frac: 0.1
+ckpt_minutes: 30
+checkpoint_updates:
+- 1558
+- 3896
+- 7791
+- 11687
+- 15582
+dataset:
+  contract_id: memorysplit-reasoning-dataset-v3
+  pointer: DATASET-POINTER-AWS-135M-V3.json
+  complete_dataset: true
+  packed_targets:
+  - dataset/base/packed/targets.bin
+  - dataset/extension/packed/targets.bin
+  target_weights:
+  - dataset/base/sidecars/dense_target_weights.bin
+  - dataset/extension/sidecars/shared_target_weights.bin
+  raw_target_tokens: 8169455616
+  scientific_scope: successor_exploratory_unpreregistered

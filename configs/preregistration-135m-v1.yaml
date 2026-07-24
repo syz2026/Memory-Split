@@ -1,0 +1,145 @@
+schema_version: 1
+contract_status: frozen
+cohort_id: memorysplit-confirmatory-v2-135m-n10
+title: MemorySplit 135M complete-dataset paired confirmation
+canonical_hypothesis: >-
+  At fixed architecture, initialization, data order, complete-dataset horizon,
+  and optimization budget, Split90 improves the protected reasoning endpoint
+  relative to Dense by freeing capacity otherwise used to memorize fact values.
+interpretation_scope: fixed-full-dataset-135m
+protected_cohort:
+  model: d135m
+  model_parameters: 134660880
+  architecture:
+    n_layer: 10
+    d_model: 720
+    n_head: 12
+    context: 1024
+  arms:
+    - dense
+    - split90
+  seeds:
+    - 0
+    - 1
+    - 2
+    - 3
+    - 4
+    - 5
+    - 6
+    - 7
+    - 8
+    - 9
+  terminal_n_pairs: 10
+  replacement_seeds_allowed: false
+  outcome_based_stopping_allowed: false
+  cross_owner_pairs_allowed: false
+  dataset_contract_id: memorysplit-parallel-corpus-v2
+  complete_dataset_required: true
+  raw_target_tokens: 7120879616
+  targets_per_parameter: 52.88
+  targets_per_update: 524288
+  terminal_updates: 13582
+  checkpoint_updates:
+    - 1358
+    - 3396
+    - 6791
+    - 10187
+    - 13582
+  assignment_file: configs/cohort-assignment-135m-n10.json
+  run_config_directory: configs/135m-v2
+platforms:
+  provider_seeds:
+    farmshare-l40s:
+      - 0
+      - 1
+      - 2
+      - 5
+      - 6
+      - 7
+    mit-slurm:
+      - 3
+      - 4
+      - 8
+      - 9
+  effect_guardrail: positive_mean_delta_within_each_provider
+  hardware_pairing: same_allocation_same_gpu_model_one_gpu_per_arm
+external_launch_gates:
+  production_corpus_receipt:
+    status: unfrozen
+    required: true
+  farmshare_gpu_preflight:
+    status: pending_external
+    required: true
+  mit_gpu_preflight:
+    status: pending_external
+    required: true
+  required_site_canaries:
+    - one_update_functional
+    - exact_paired_resume
+    - one_hundred_update_throughput_oom
+analysis:
+  primary:
+    contrast_id: primary_omnibus_pair_and_proof__graph_non_path__composition_joint_ood__split90_minus_dense
+    estimand: mean_paired_accuracy_delta
+    test: exhaustive_paired_sign_flip
+    alternative: greater
+    alpha: 0.05
+  bootstrap:
+    hierarchy:
+      - fixed_provider_stratum
+      - seed
+      - world
+      - counterfactual_pair
+    n_resamples: 20000
+    rng_seed: 135010
+    confidence: 0.95
+  practical_equivalence:
+    contrast_id: primary_omnibus_pair_and_proof__graph_non_path__composition_joint_ood__split90_minus_dense
+    margin_absolute_pair_accuracy: 0.01
+    method: two_one_sided_90_percent_confidence_bounds
+    confidence: 0.90
+  secondary_families:
+    multiplicity: holm
+    alpha: 0.05
+    contrasts:
+      - graph
+      - non_path
+    broader_claim_requires_all_families: true
+  aulc:
+    status: secondary
+    checkpoints:
+      - 1358
+      - 3396
+      - 6791
+      - 10187
+      - 13582
+verdict:
+  supports_effect:
+    requires:
+      - protected_cohort_complete
+      - primary_exact_p_lte_0.05
+      - primary_95pct_interval_strictly_above_zero
+      - validity_gates_pass
+      - positive_provider_specific_mean_deltas
+  supports_practical_null:
+    requires:
+      - protected_cohort_complete
+      - validity_gates_pass
+      - primary_90pct_interval_strictly_inside_plus_or_minus_0.01
+  inconclusive: all_valid_results_meeting_neither_claim_rule
+  invalid: measured_protocol_or_provenance_failure
+power_sensitivity:
+  status: preregistered_fixed_n
+  n_pairs: 10
+  planning_effect_absolute_accuracy: 0.02
+  planning_paired_seed_sd: 0.02
+  approximate_power: 0.80
+  caveat: >-
+    This planning sensitivity is conditional, not a guarantee. Prospective
+    power of 0.90 or greater may not be claimed without independent pilot
+    evidence frozen before protected outcomes are inspected.
+reporting_constraints:
+  - no_finite_cohort_guarantees_a_binary_verdict
+  - report_complete_dataset_horizon_not_tokens_per_parameter_scaling
+  - report_all_exclusions_and_protocol_failures
+  - do_not_pool_platforms_without_provider_stratified_replay

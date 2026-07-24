@@ -1,7 +1,8 @@
 """Minimal decoder-only GPT: RMSNorm pre-norm, RoPE, SwiGLU, untied embeddings.
 
 Two entry points (contract shared with evals/):
-    forward(idx, targets=None)  -> (logits, loss | None)   # CE ignore_index=-100
+    forward(idx, targets=None, target_weights=None, loss_reduction="mean")
+        -> (logits, loss | None)
     forward_step(idx, cache)    -> (logits, cache)         # kv-cache greedy decode
 """
 
@@ -32,6 +33,7 @@ class GPTConfig:
 
 PRESETS: dict[str, GPTConfig] = {
     "toy": GPTConfig(n_layer=4, n_head=4, d_model=256),
+    "d135m": GPTConfig(n_layer=10, n_head=12, d_model=720, ctx=1024),
     "d160m": GPTConfig(n_layer=12, n_head=12, d_model=768),
     "d410m": GPTConfig(n_layer=24, n_head=16, d_model=1024),
     "d1b": GPTConfig(n_layer=22, n_head=14, d_model=1792),
@@ -167,7 +169,13 @@ class GPT(nn.Module):
     def num_params(self) -> int:
         return sum(p.numel() for p in self.parameters())
 
-    def forward(self, idx: torch.Tensor, targets: torch.Tensor | None = None):
+    def forward(
+        self,
+        idx: torch.Tensor,
+        targets: torch.Tensor | None = None,
+        target_weights: torch.Tensor | None = None,
+        loss_reduction: str = "mean",
+    ):
         B, T = idx.shape
         assert T <= self.cfg.ctx, f"sequence length {T} > ctx {self.cfg.ctx}"
         cos, sin = self.rope_cos[:T], self.rope_sin[:T]
@@ -178,11 +186,32 @@ class GPT(nn.Module):
         logits = self.lm_head(x)
         loss = None
         if targets is not None:
-            loss = F.cross_entropy(
-                logits.float().view(-1, logits.size(-1)),
-                targets.view(-1),
-                ignore_index=-100,
-            )
+            if loss_reduction not in {"mean", "sum"}:
+                raise ValueError("loss_reduction must be 'mean' or 'sum'")
+            if target_weights is None:
+                loss = F.cross_entropy(
+                    logits.float().view(-1, logits.size(-1)),
+                    targets.view(-1),
+                    ignore_index=-100,
+                    reduction=loss_reduction,
+                )
+            else:
+                if target_weights.shape != targets.shape:
+                    raise ValueError("target_weights shape must match targets")
+                per_token = F.cross_entropy(
+                    logits.float().view(-1, logits.size(-1)),
+                    targets.view(-1),
+                    ignore_index=-100,
+                    reduction="none",
+                ).view_as(targets)
+                valid_weights = torch.where(
+                    targets.ne(-100),
+                    target_weights,
+                    torch.zeros_like(target_weights),
+                )
+                loss = (per_token * valid_weights).sum()
+                if loss_reduction == "mean":
+                    loss = loss / targets.numel()
         return logits, loss
 
     @torch.no_grad()

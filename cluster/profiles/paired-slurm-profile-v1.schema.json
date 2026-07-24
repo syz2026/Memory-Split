@@ -1,0 +1,93 @@
+{
+  "$id": "https://memorysplit.invalid/schemas/paired-slurm-profile-v1.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "account": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "cpus": {
+      "maximum": 1024,
+      "minimum": 1,
+      "type": "integer"
+    },
+    "environment_allowlist": {
+      "items": {
+        "pattern": "^[A-Z][A-Z0-9_]{0,63}$",
+        "type": "string"
+      },
+      "minItems": 1,
+      "type": "array",
+      "uniqueItems": true
+    },
+    "gpu_name_regex": {
+      "type": "string"
+    },
+    "gpus_per_pair": {
+      "const": 2
+    },
+    "gres": {
+      "pattern": "^gpu(?::[A-Za-z0-9][A-Za-z0-9_.-]{0,63})?:2$",
+      "type": "string"
+    },
+    "memory_gb": {
+      "minimum": 1,
+      "type": "integer"
+    },
+    "partition": {
+      "type": "string"
+    },
+    "platform": {
+      "enum": [
+        "aws",
+        "farmshare",
+        "mit"
+      ]
+    },
+    "profile_id": {
+      "type": "string"
+    },
+    "python": {
+      "const": "${MS135_VENV}/bin/python"
+    },
+    "qos": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "schema_version": {
+      "const": 1
+    },
+    "site_id": {
+      "type": "string"
+    },
+    "wall_minutes": {
+      "maximum": 43200,
+      "minimum": 1,
+      "type": "integer"
+    }
+  },
+  "required": [
+    "schema_version",
+    "profile_id",
+    "platform",
+    "site_id",
+    "partition",
+    "account",
+    "qos",
+    "gres",
+    "gpu_name_regex",
+    "gpus_per_pair",
+    "cpus",
+    "memory_gb",
+    "wall_minutes",
+    "python",
+    "environment_allowlist"
+  ],
+  "title": "MemorySplit paired Slurm profile v1",
+  "type": "object"
+}
