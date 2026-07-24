@@ -2698,11 +2698,12 @@ class AwsP5Backend:
                     "runs": states,
                 }
             status = self._command_status(instance_id, command_id)
-            now = _timestamp()
-            for run, state in zip(manifest.runs, states):
-                state["status"] = status
-                state["updated_at"] = now
-                store.write_run(run.run_id, state)
+            states = self._refresh_paired_states(
+                store,
+                manifest,
+                states,
+                {"status": status},
+            )
             return {
                 "provider": AWS_P5_PROFILE,
                 "seed": manifest.seed,
@@ -4312,33 +4313,146 @@ class AwsP5Backend:
         manifest: object,
         states: Sequence[dict[str, object]],
     ) -> None:
-        if len(states) != 2 or len({state["run_id"] for state in states}) != 2:
+        manifest_runs = {
+            run.run_id: run
+            for run in manifest.runs
+            if isinstance(run.run_id, str)
+        }
+        state_by_id = {
+            str(state.get("run_id")): state
+            for state in states
+            if isinstance(state, dict)
+            and isinstance(state.get("run_id"), str)
+        }
+        if (
+            getattr(manifest, "provider", None) != AWS_P5_PROFILE
+            or len(manifest_runs) != 2
+            or {run.arm for run in manifest_runs.values()}
+            != {"dense", "split90"}
+            or len(state_by_id) != 2
+            or set(state_by_id) != set(manifest_runs)
+            or not all(
+                self._same_state_binding(state, manifest)
+                for state in state_by_id.values()
+            )
+        ):
             raise MsctlError(
                 "STATE_CORRUPT",
-                "AWS pair update must contain exactly two distinct arms",
+                "AWS pair update must bind the exact manifest run set",
             )
-        operation_ids = {state["operation_id"] for state in states}
-        if len(operation_ids) != 1:
+        ordered_states = [
+            dict(state_by_id[run.run_id]) for run in manifest.runs
+        ]
+        operation_ids = {state.get("operation_id") for state in ordered_states}
+        if (
+            len(operation_ids) != 1
+            or not isinstance(next(iter(operation_ids)), str)
+        ):
             raise MsctlError(
                 "STATE_CORRUPT",
                 "AWS pair update must bind one operation",
             )
-        store.write_aws_pair(
-            manifest.sha256,
-            {
-                "schema_version": (
-                    2
-                    if getattr(manifest, "schema_version", None) == 3
-                    else 1
-                ),
-                "provider": AWS_P5_PROFILE,
-                "run_manifest_sha256": manifest.sha256,
-                "operation_id": next(iter(operation_ids)),
-                "states": [dict(state) for state in states],
-            },
-        )
-        for state in states:
+        journal = {
+            "schema_version": (
+                2 if getattr(manifest, "schema_version", None) == 3 else 1
+            ),
+            "provider": AWS_P5_PROFILE,
+            "run_manifest_sha256": manifest.sha256,
+            "operation_id": next(iter(operation_ids)),
+            "states": ordered_states,
+        }
+        if getattr(manifest, "schema_version", None) == 3:
+            store.write_aws_pair_transaction(
+                manifest.sha256,
+                journal,
+                ordered_states,
+            )
+            return
+        store.write_aws_pair(manifest.sha256, journal)
+        for state in ordered_states:
             store.write_run(str(state["run_id"]), state)
+
+    def _refresh_paired_states(
+        self,
+        store: StateStore,
+        manifest: object,
+        states: Sequence[dict[str, object]],
+        updates: Mapping[str, object],
+    ) -> list[dict[str, object]]:
+        """Validate and uniformly refresh one already-durable run pair."""
+
+        if set(updates) - {"command_id", "send_attempted", "status"}:
+            raise MsctlError(
+                "STATE_CORRUPT",
+                "AWS pair refresh contains unsupported fields",
+            )
+        manifest_run_ids = {run.run_id for run in manifest.runs}
+        state_by_id = {
+            str(state.get("run_id")): state
+            for state in states
+            if isinstance(state, dict)
+        }
+        if (
+            len(manifest_run_ids) != 2
+            or len(state_by_id) != 2
+            or set(state_by_id) != manifest_run_ids
+            or not all(
+                self._same_state_binding(state, manifest)
+                for state in state_by_id.values()
+            )
+        ):
+            raise MsctlError(
+                "STATE_INCOMPLETE",
+                "AWS pair refresh does not bind the exact manifest run pair",
+            )
+        current = {
+            run_id: store.read_run(run_id)
+            for run_id in sorted(manifest_run_ids)
+        }
+        if any(
+            current[run_id] is None
+            or current[run_id] != state_by_id[run_id]
+            for run_id in manifest_run_ids
+        ):
+            raise MsctlError(
+                "STATE_CORRUPT",
+                "AWS pair refresh input differs from durable run state",
+            )
+        journal = store.read_aws_pair(manifest.sha256)
+        if journal is not None:
+            journal_by_id = {
+                str(state["run_id"]): state for state in journal["states"]
+            }
+            if journal_by_id != state_by_id:
+                raise MsctlError(
+                    "STATE_CORRUPT",
+                    "AWS pair refresh conflicts with its durable journal",
+                )
+        elif getattr(manifest, "schema_version", None) == 3:
+            raise MsctlError(
+                "STATE_INCOMPLETE",
+                "AWS v3 pair refresh requires its durable journal",
+            )
+
+        if all(
+            all(state.get(field) == value for field, value in updates.items())
+            for state in state_by_id.values()
+        ):
+            return [dict(state) for state in states]
+
+        now = _timestamp()
+        refreshed = []
+        for state in states:
+            next_state = dict(state)
+            next_state.update(updates)
+            next_state["updated_at"] = now
+            refreshed.append(next_state)
+        if journal is not None or getattr(manifest, "schema_version", None) == 3:
+            self._write_paired_states(store, manifest, refreshed)
+        else:
+            for state in refreshed:
+                store.write_run(str(state["run_id"]), state)
+        return refreshed
 
     def _repair_paired_states(
         self,
@@ -4347,6 +4461,17 @@ class AwsP5Backend:
     ) -> None:
         journal = store.read_aws_pair(manifest.sha256)
         if journal is None:
+            if (
+                getattr(manifest, "schema_version", None) == 3
+                and any(
+                    store.read_run(run.run_id) is not None
+                    for run in manifest.runs
+                )
+            ):
+                raise MsctlError(
+                    "STATE_INCOMPLETE",
+                    "AWS v3 run files exist without their pair journal",
+                )
             return
         expected = {
             str(state["run_id"]): state
@@ -4702,12 +4827,12 @@ class AwsP5Backend:
                         )
                     command_id = recovered["command_id"]
                     status = recovered["status"]
-                    now = _timestamp()
-                    for run, state in zip(manifest.runs, existing):
-                        state["command_id"] = command_id
-                        state["status"] = status
-                        state["updated_at"] = now
-                        store.write_run(run.run_id, state)
+                    existing = self._refresh_paired_states(
+                        store,
+                        manifest,
+                        existing,
+                        {"command_id": command_id, "status": status},
+                    )
                     return {
                         "provider": AWS_P5_PROFILE,
                         "seed": manifest.seed,
@@ -4725,11 +4850,12 @@ class AwsP5Backend:
                     )
                 command_id = str(next(iter(command_ids)))
                 status = self._command_status(instance_id, command_id)
-                now = _timestamp()
-                for run, state in zip(manifest.runs, existing):
-                    state["status"] = status
-                    state["updated_at"] = now
-                    store.write_run(run.run_id, state)
+                existing = self._refresh_paired_states(
+                    store,
+                    manifest,
+                    existing,
+                    {"status": status},
+                )
                 return {
                     "provider": AWS_P5_PROFILE,
                     "seed": manifest.seed,
@@ -4790,24 +4916,24 @@ class AwsP5Backend:
                 for run in manifest.runs
             ]
             self._write_paired_states(store, manifest, new_states)
-            now = _timestamp()
-            for state in new_states:
-                state["status"] = "SENDING"
-                state["send_attempted"] = True
-                state["updated_at"] = now
-            self._write_paired_states(store, manifest, new_states)
+            new_states = self._refresh_paired_states(
+                store,
+                manifest,
+                new_states,
+                {"send_attempted": True, "status": "SENDING"},
+            )
             command_id = self._send_operation_intent(
                 instance_id=instance_id,
                 intent=operation_intent,
                 published=published,
                 operation="submit",
             )
-            now = _timestamp()
-            for state in new_states:
-                state["command_id"] = command_id
-                state["status"] = "Pending"
-                state["updated_at"] = now
-            self._write_paired_states(store, manifest, new_states)
+            new_states = self._refresh_paired_states(
+                store,
+                manifest,
+                new_states,
+                {"command_id": command_id, "status": "Pending"},
+            )
             return {
                 "provider": AWS_P5_PROFILE,
                 "seed": manifest.seed,
@@ -5375,14 +5501,12 @@ class AwsP5Backend:
                         )
                     command_id = str(recovered["command_id"])
                     status = str(recovered["status"])
-                    now = _timestamp()
-                    for state in present:
-                        state["command_id"] = command_id
-                        state["status"] = status
-                        state["updated_at"] = now
-                    # Keep the durable pair journal bound to the refreshed
-                    # states so exact replay stays repeatable.
-                    self._write_paired_states(store, manifest, present)
+                    present = self._refresh_paired_states(
+                        store,
+                        manifest,
+                        present,
+                        {"command_id": command_id, "status": status},
+                    )
                     return {
                         "provider": AWS_P5_PROFILE,
                         "seed": manifest.seed,
@@ -5400,13 +5524,12 @@ class AwsP5Backend:
                     )
                 command_id = str(next(iter(command_ids)))
                 status = self._command_status(instance_id, command_id)
-                now = _timestamp()
-                for state in present:
-                    state["status"] = status
-                    state["updated_at"] = now
-                # Keep the durable pair journal bound to the refreshed
-                # states so exact replay stays repeatable.
-                self._write_paired_states(store, manifest, present)
+                present = self._refresh_paired_states(
+                    store,
+                    manifest,
+                    present,
+                    {"status": status},
+                )
                 return {
                     "provider": AWS_P5_PROFILE,
                     "seed": manifest.seed,
@@ -5457,6 +5580,7 @@ class AwsP5Backend:
                 )
             published = self._publish_operation_intent(operation_intent)
             now = _timestamp()
+            transitioned = []
             for state in present:
                 prior = list(state.get("prior_command_ids", []))
                 prior.append(previous_command)
@@ -5472,7 +5596,8 @@ class AwsP5Backend:
                         )
                     }
                 )
-                state.update(
+                next_state = dict(state)
+                next_state.update(
                     {
                         "command_id": None,
                         "operation": "resume",
@@ -5496,25 +5621,27 @@ class AwsP5Backend:
                         "updated_at": now,
                     }
                 )
-            self._write_paired_states(store, manifest, present)
-            now = _timestamp()
-            for state in present:
-                state["status"] = "SENDING"
-                state["send_attempted"] = True
-                state["updated_at"] = now
-            self._write_paired_states(store, manifest, present)
+                transitioned.append(next_state)
+            self._write_paired_states(store, manifest, transitioned)
+            present = transitioned
+            present = self._refresh_paired_states(
+                store,
+                manifest,
+                present,
+                {"send_attempted": True, "status": "SENDING"},
+            )
             command_id = self._send_operation_intent(
                 instance_id=instance_id,
                 intent=operation_intent,
                 published=published,
                 operation="resume",
             )
-            now = _timestamp()
-            for state in present:
-                state["command_id"] = command_id
-                state["status"] = "Pending"
-                state["updated_at"] = now
-            self._write_paired_states(store, manifest, present)
+            present = self._refresh_paired_states(
+                store,
+                manifest,
+                present,
+                {"command_id": command_id, "status": "Pending"},
+            )
             return {
                 "provider": AWS_P5_PROFILE,
                 "seed": manifest.seed,
@@ -5531,6 +5658,7 @@ class AwsP5Backend:
         store: StateStore,
         manifest: object,
     ) -> list[dict[str, object]]:
+        journal = store.read_aws_pair(manifest.sha256)
         states = [store.read_run(run.run_id) for run in manifest.runs]
         if any(state is None for state in states):
             raise MsctlError(
@@ -5538,6 +5666,27 @@ class AwsP5Backend:
                 "AWS lifecycle state is missing one paired arm",
             )
         present = [state for state in states if state is not None]
+        if journal is None:
+            if getattr(manifest, "schema_version", None) == 3:
+                raise MsctlError(
+                    "STATE_INCOMPLETE",
+                    "AWS v3 lifecycle state lacks its durable pair journal",
+                )
+        else:
+            journal_by_id = {
+                str(state["run_id"]): state for state in journal["states"]
+            }
+            present_by_id = {
+                str(state["run_id"]): state for state in present
+            }
+            if (
+                set(journal_by_id) != {run.run_id for run in manifest.runs}
+                or present_by_id != journal_by_id
+            ):
+                raise MsctlError(
+                    "STATE_CORRUPT",
+                    "AWS lifecycle state conflicts with its pair journal",
+                )
         if not all(
             self._same_state_binding(state, manifest) for state in present
         ):
@@ -5653,11 +5802,12 @@ class AwsP5Backend:
                 set(),
                 label="SSM cancel-command output",
             )
-            now = _timestamp()
-            for run, state in zip(manifest.runs, states):
-                state["status"] = "Cancelling"
-                state["updated_at"] = now
-                store.write_run(run.run_id, state)
+            states = self._refresh_paired_states(
+                store,
+                manifest,
+                states,
+                {"status": "Cancelling"},
+            )
             return {
                 "provider": AWS_P5_PROFILE,
                 "seed": manifest.seed,
@@ -6182,11 +6332,12 @@ class AwsP5Backend:
                     "INSTANCE_BINDING_MISMATCH",
                     "termination response has the wrong instance ID",
                 )
-            now = _timestamp()
-            for run, state in zip(manifest.runs, states):
-                state["status"] = "Terminating"
-                state["updated_at"] = now
-                store.write_run(run.run_id, state)
+            states = self._refresh_paired_states(
+                store,
+                manifest,
+                states,
+                {"status": "Terminating"},
+            )
             return {
                 "provider": AWS_P5_PROFILE,
                 "seed": manifest.seed,
