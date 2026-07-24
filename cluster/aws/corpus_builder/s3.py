@@ -621,6 +621,23 @@ def _receipt_version_matches(
     return True
 
 
+def _require_if_none_match_capability(s3: S3Client) -> None:
+    try:
+        meta = getattr(s3, "meta")
+        service_model = getattr(meta, "service_model")
+        operation = service_model.operation_model("PutObject")
+        input_shape = getattr(operation, "input_shape")
+        members = getattr(input_shape, "members")
+    except Exception as error:
+        raise PublicationError(
+            "S3 client must expose a PutObject service model with IfNoneMatch"
+        ) from error
+    if not isinstance(members, Mapping) or "IfNoneMatch" not in members:
+        raise PublicationError(
+            "S3 client PutObject service model lacks IfNoneMatch capability"
+        )
+
+
 def publish_phase_receipt(
     s3: S3Client,
     *,
@@ -654,6 +671,7 @@ def publish_phase_receipt(
         raise PublicationError(
             "phase receipt KMS key does not match its object authority"
         )
+    _require_if_none_match_capability(s3)
     versions, delete_markers = _list_exact_key_history(
         s3,
         bucket=bucket,

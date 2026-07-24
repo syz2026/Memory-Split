@@ -79,10 +79,37 @@ class FailingBody:
         pass
 
 
+class FakeInputShape:
+    def __init__(self, members: set[str]) -> None:
+        self.members = {name: object() for name in members}
+
+
+class FakeOperationModel:
+    def __init__(self, members: set[str]) -> None:
+        self.input_shape = FakeInputShape(members)
+
+
+class FakeServiceModel:
+    def __init__(self, put_object_members: set[str]) -> None:
+        self._put_object_members = put_object_members
+
+    def operation_model(self, name: str) -> FakeOperationModel:
+        assert name == "PutObject"
+        return FakeOperationModel(self._put_object_members)
+
+
+class FakeClientMeta:
+    def __init__(self, put_object_members: set[str]) -> None:
+        self.service_model = FakeServiceModel(put_object_members)
+
+
 class VersionedFakeS3:
     """In-memory, version-aware fake; no SDK or network dependency."""
 
     def __init__(self) -> None:
+        self.meta = FakeClientMeta(
+            {"Body", "Bucket", "IfNoneMatch", "Key"}
+        )
         self._counter = 0
         self._versions: dict[tuple[str, str], list[dict[str, object]]] = {}
         self.delete_markers: list[dict[str, object]] = []
@@ -598,6 +625,35 @@ def test_phase_receipt_rejects_kms_mismatch_before_any_s3_mutation(tmp_path):
             key=f"v2/builds/{_BUILD_ID}/phase-final.json",
             receipt=receipt,
             kms_key_arn=_OTHER_KMS_ARN,
+        )
+
+    assert (len(s3.put_calls), len(s3.list_calls)) == calls_before
+
+
+@pytest.mark.parametrize(
+    "capability",
+    ("missing-service-model", "missing-if-none-match"),
+)
+def test_phase_receipt_requires_if_none_match_operation_model_before_mutation(
+    tmp_path,
+    capability,
+):
+    s3 = VersionedFakeS3()
+    artifact = publish_exact_file(s3, **_artifact_request(tmp_path))
+    receipt = _phase_receipt((artifact,))
+    if capability == "missing-service-model":
+        s3.meta = object()
+    else:
+        s3.meta = FakeClientMeta({"Body", "Bucket", "Key"})
+    calls_before = (len(s3.put_calls), len(s3.list_calls))
+
+    with pytest.raises(PublicationError, match="IfNoneMatch|service model"):
+        publish_phase_receipt(
+            s3,
+            bucket=CORPUS_BUCKET,
+            key=f"v2/builds/{_BUILD_ID}/phase-final.json",
+            receipt=receipt,
+            kms_key_arn=_KMS_ARN,
         )
 
     assert (len(s3.put_calls), len(s3.list_calls)) == calls_before

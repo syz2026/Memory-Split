@@ -165,7 +165,7 @@ def _canonical(value: object) -> bytes:
 def _fixture_files() -> dict[str, bytes | str]:
     return {
         "README.md": "# intentionally outside the package allowlist\n",
-        "requirements.txt": "boto3>=1.34\npytest>=8.0\n",
+        "requirements.txt": "boto3>=1.43.54,<2\npytest>=8.0\n",
         "cluster/aws/corpus_builder/__init__.py": '"""fixture package"""\n',
         "cluster/aws/corpus_builder/contracts.py": "FORMAT = 'fixture-v1'\n",
         "cluster/aws/corpus_builder/package.py": PACKAGE_SOURCE.read_bytes(),
@@ -267,7 +267,7 @@ def test_live_cleanroom_dependency_is_declared_once():
     ]
     boto3 = [line for line in declarations if line.split(">", 1)[0] == "boto3"]
 
-    assert boto3 == ["boto3>=1.34"]
+    assert boto3 == ["boto3>=1.43.54,<2"]
 
 
 def test_builder_package_is_byte_identical_canonical_and_closed(tmp_path: Path):

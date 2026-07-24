@@ -377,3 +377,76 @@ Both were silent with exit code zero.
   Task 4. No other concern remains for Task 3.
 - No AWS/network call, package-index access, push, amend, brief edit, progress
   edit, other-worktree edit, or unrelated source change was performed.
+
+## Boto3 compatibility addendum
+
+This addendum supersedes the earlier `boto3>=1.34` floor. The authoritative
+dependency is now exactly `boto3>=1.43.54,<2`, whose S3 PutObject service model
+exposes the `IfNoneMatch` request member required by no-overwrite publication.
+
+Before any receipt LIST or PUT, `publish_phase_receipt` now obtains
+`s3.meta.service_model.operation_model("PutObject")` and requires
+`IfNoneMatch` in `input_shape.members`. A client without that service-model
+surface, or with an older model lacking the member, fails closed with
+`PublicationError` before S3 mutation. The protocol fake exposes an explicit
+supported operation model; focused mutations remove the service model or the
+member.
+
+### Compatibility RED/GREEN evidence
+
+Command:
+
+```bash
+python -m pytest -q \
+  tests/test_aws_corpus_builder_s3.py::test_phase_receipt_requires_if_none_match_operation_model_before_mutation \
+  tests/test_package_aws_corpus_builder.py::test_live_cleanroom_dependency_is_declared_once
+```
+
+Exact RED result: `3 failed in 0.20s`. Both unsupported-client cases performed
+receipt publication instead of raising, and the dependency assertion observed
+the stale `boto3>=1.34` declaration.
+
+After adding the runtime guard, explicit fake service model, and exact bounded
+dependency, the same command reported `3 passed in 0.09s`. Both capability
+failures assert unchanged PUT and LIST call counts.
+
+### Compatibility final verification
+
+```bash
+python -m pytest -q tests/test_aws_corpus_builder_s3.py
+```
+
+Exact result: `38 passed in 0.11s`.
+
+```bash
+python -m pytest -q tests/test_package_aws_corpus_builder.py
+```
+
+Exact result: `48 passed in 14.32s`.
+
+```bash
+python -m py_compile \
+  cluster/aws/corpus_builder/s3.py \
+  tests/test_aws_corpus_builder_s3.py \
+  tests/test_package_aws_corpus_builder.py
+git diff --check
+```
+
+Both static checks were silent with exit code zero. The package suite again ran
+outside the filesystem sandbox only to create local Git repositories under the
+system temporary directory. No AWS, network, package-index, push, or amend
+operation ran.
+
+### Compatibility scope and self-review
+
+- Modified only `requirements.txt`, Task 3 S3/runtime tests, the Task 2
+  dependency assertion/fixture, and this report.
+- The capability check is unconditional for receipt publication, including
+  exact-history reuse, because an unsupported client cannot safely guarantee
+  the absent-key conditional publication branch.
+- The existing build-ID and KMS preflight checks still precede all LIST/PUT
+  mutations; the capability check follows them and also precedes all LIST/PUT
+  mutations.
+- The compatibility implementation and report are committed together; the
+  resulting new commit hash is returned in the handoff without amending any
+  prior commit.
