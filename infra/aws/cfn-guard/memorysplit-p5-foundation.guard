@@ -1,0 +1,146 @@
+# MemorySplit Task 5A: static no-instance/private-foundation invariants.
+# Exact SSM canonical JSON identity and closed outputs are checked by pytest.
+
+let ec2_instances = Resources.*[ Type == 'AWS::EC2::Instance' ]
+let auto_scaling_groups = Resources.*[
+  Type == 'AWS::AutoScaling::AutoScalingGroup'
+]
+let ec2_fleets = Resources.*[ Type == 'AWS::EC2::EC2Fleet' ]
+let spot_fleets = Resources.*[ Type == 'AWS::EC2::SpotFleet' ]
+let capacity_reservations = Resources.*[
+  Type == 'AWS::EC2::CapacityReservation'
+]
+let capacity_reservation_fleets = Resources.*[
+  Type == 'AWS::EC2::CapacityReservationFleet'
+]
+
+let internet_gateways = Resources.*[ Type == 'AWS::EC2::InternetGateway' ]
+let nat_gateways = Resources.*[ Type == 'AWS::EC2::NatGateway' ]
+let elastic_ips = Resources.*[ Type == 'AWS::EC2::EIP' ]
+let gateway_attachments = Resources.*[
+  Type == 'AWS::EC2::VPCGatewayAttachment'
+]
+let public_routes = Resources.*[
+  Type == 'AWS::EC2::Route'
+  Properties.DestinationCidrBlock == '0.0.0.0/0'
+]
+
+let subnets = Resources.*[ Type == 'AWS::EC2::Subnet' ]
+let launch_templates = Resources.*[ Type == 'AWS::EC2::LaunchTemplate' ]
+let buckets = Resources.*[ Type == 'AWS::S3::Bucket' ]
+let repositories = Resources.*[ Type == 'AWS::ECR::Repository' ]
+
+rule no_ec2_instances {
+  %ec2_instances empty
+}
+
+rule no_auto_scaling_groups {
+  %auto_scaling_groups empty
+}
+
+rule no_ec2_fleets {
+  %ec2_fleets empty
+}
+
+rule no_spot_fleets {
+  %spot_fleets empty
+}
+
+rule no_capacity_reservations {
+  %capacity_reservations empty
+}
+
+rule no_capacity_reservation_fleets {
+  %capacity_reservation_fleets empty
+}
+
+rule no_internet_gateways {
+  %internet_gateways empty
+}
+
+rule no_nat_gateways {
+  %nat_gateways empty
+}
+
+rule no_elastic_ips {
+  %elastic_ips empty
+}
+
+rule no_public_gateway_attachments {
+  %gateway_attachments empty
+}
+
+rule no_default_public_routes {
+  %public_routes empty
+}
+
+rule all_subnets_disable_public_ip when %subnets !empty {
+  %subnets.Properties.MapPublicIpOnLaunch == false
+}
+
+rule train_security_group_has_zero_ingress {
+  Resources.TrainSecurityGroup.Type == 'AWS::EC2::SecurityGroup'
+  Resources.TrainSecurityGroup.Properties.SecurityGroupIngress empty
+}
+
+rule endpoint_ingress_is_https_only {
+  Resources.EndpointSecurityGroup.Properties.SecurityGroupIngress[*].FromPort == 443
+  Resources.EndpointSecurityGroup.Properties.SecurityGroupIngress[*].ToPort == 443
+  Resources.EndpointSecurityGroup.Properties.SecurityGroupIngress[*].IpProtocol == 'tcp'
+  Resources.EndpointSecurityGroup.Properties.SecurityGroupIngress[*].CidrIp !exists
+  Resources.EndpointSecurityGroup.Properties.SecurityGroupIngress[*].CidrIpv6 !exists
+}
+
+rule launch_template_is_private_imdsv2_p5 when %launch_templates !empty {
+  %launch_templates.Properties.LaunchTemplateData.InstanceType == 'p5.48xlarge'
+  %launch_templates.Properties.LaunchTemplateData.KeyName !exists
+  %launch_templates.Properties.LaunchTemplateData.MetadataOptions.HttpTokens == 'required'
+  %launch_templates.Properties.LaunchTemplateData.MetadataOptions.HttpEndpoint == 'enabled'
+  %launch_templates.Properties.LaunchTemplateData.MetadataOptions.HttpPutResponseHopLimit == 1
+  %launch_templates.Properties.LaunchTemplateData.NetworkInterfaces[*].AssociatePublicIpAddress == false
+  %launch_templates.Properties.LaunchTemplateData.BlockDeviceMappings[*].Ebs.Encrypted == true
+}
+
+rule retained_versioned_kms_bucket when %buckets !empty {
+  %buckets.DeletionPolicy == 'Retain'
+  %buckets.UpdateReplacePolicy == 'Retain'
+  %buckets.Properties.VersioningConfiguration.Status == 'Enabled'
+  %buckets.Properties.BucketEncryption.ServerSideEncryptionConfiguration[*].ServerSideEncryptionByDefault.SSEAlgorithm == 'aws:kms'
+  %buckets.Properties.PublicAccessBlockConfiguration.BlockPublicAcls == true
+  %buckets.Properties.PublicAccessBlockConfiguration.BlockPublicPolicy == true
+  %buckets.Properties.PublicAccessBlockConfiguration.IgnorePublicAcls == true
+  %buckets.Properties.PublicAccessBlockConfiguration.RestrictPublicBuckets == true
+}
+
+rule retained_symmetric_data_key {
+  Resources.DataKey.Type == 'AWS::KMS::Key'
+  Resources.DataKey.DeletionPolicy == 'Retain'
+  Resources.DataKey.UpdateReplacePolicy == 'Retain'
+  Resources.DataKey.Properties.KeySpec == 'SYMMETRIC_DEFAULT'
+  Resources.DataKey.Properties.KeyUsage == 'ENCRYPT_DECRYPT'
+  Resources.DataKey.Properties.EnableKeyRotation == true
+}
+
+rule retained_p384_approval_key {
+  Resources.ApprovalSigningKey.Type == 'AWS::KMS::Key'
+  Resources.ApprovalSigningKey.DeletionPolicy == 'Retain'
+  Resources.ApprovalSigningKey.UpdateReplacePolicy == 'Retain'
+  Resources.ApprovalSigningKey.Properties.KeySpec == 'ECC_NIST_P384'
+  Resources.ApprovalSigningKey.Properties.KeyUsage == 'SIGN_VERIFY'
+}
+
+rule immutable_kms_ecr when %repositories !empty {
+  %repositories.DeletionPolicy == 'Retain'
+  %repositories.UpdateReplacePolicy == 'Retain'
+  %repositories.Properties.ImageTagMutability == 'IMMUTABLE'
+  %repositories.Properties.ImageScanningConfiguration.ScanOnPush == true
+  %repositories.Properties.EncryptionConfiguration.EncryptionType == 'KMS'
+}
+
+rule separate_operation_roles {
+  Resources.TrainRole.Type == 'AWS::IAM::Role'
+  Resources.EvaluatorRole.Type == 'AWS::IAM::Role'
+  Resources.ControllerRole.Type == 'AWS::IAM::Role'
+  Resources.SignerRole.Type == 'AWS::IAM::Role'
+  Resources.TrainInstanceProfile.Type == 'AWS::IAM::InstanceProfile'
+}

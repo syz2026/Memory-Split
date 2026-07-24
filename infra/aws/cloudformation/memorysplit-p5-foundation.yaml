@@ -1,0 +1,1024 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  Retained, private, no-instance foundation for the MemorySplit AWS P5 study.
+  This stack creates no EC2 instance, fleet, capacity reservation, or other
+  paid accelerator capacity.
+
+Parameters:
+  P5AmiId:
+    Type: AWS::EC2::Image::Id
+    Description: Immutable AMI ID qualified separately for p5.48xlarge.
+  VpcCidr:
+    Type: String
+    Default: 10.42.0.0/16
+    AllowedPattern: '^(10\.[0-9]{1,3}|172\.(1[6-9]|2[0-9]|3[0-1])|192\.168)\.[0-9]{1,3}\.[0-9]{1,3}/(1[6-9]|2[0-8])$'
+    Description: RFC1918 IPv4 CIDR for the isolated VPC.
+  PrivateSubnetACidr:
+    Type: String
+    Default: 10.42.0.0/20
+    AllowedPattern: '^(10\.[0-9]{1,3}|172\.(1[6-9]|2[0-9]|3[0-1])|192\.168)\.[0-9]{1,3}\.[0-9]{1,3}/(1[6-9]|2[0-8])$'
+    Description: RFC1918 IPv4 CIDR for private subnet A.
+  PrivateSubnetBCidr:
+    Type: String
+    Default: 10.42.16.0/20
+    AllowedPattern: '^(10\.[0-9]{1,3}|172\.(1[6-9]|2[0-9]|3[0-1])|192\.168)\.[0-9]{1,3}\.[0-9]{1,3}/(1[6-9]|2[0-8])$'
+    Description: RFC1918 IPv4 CIDR for private subnet B.
+  RootVolumeSizeGiB:
+    Type: Number
+    Default: 500
+    MinValue: 100
+    MaxValue: 16384
+    Description: Encrypted launch-template root volume size in GiB.
+  MonthlyBudgetUsd:
+    Type: Number
+    Default: 5000
+    MinValue: 1
+    Description: Monthly cost budget in USD; this does not launch capacity.
+  BudgetAlertEmail:
+    Type: String
+    AllowedPattern: '^[^@\s]+@[^@\s]+\.[^@\s]+$'
+    ConstraintDescription: Must be a valid email address.
+    Description: Email address that confirms and receives AWS Budget alerts.
+
+Resources:
+  Vpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock:
+        Ref: VpcCidr
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      InstanceTenancy: default
+      Tags:
+        - Key: Name
+          Value:
+            Fn::Sub: ${AWS::StackName}-private
+        - Key: memorysplit:purpose
+          Value: p5-foundation
+
+  PrivateSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      AvailabilityZone:
+        Fn::Select:
+          - 0
+          - Fn::GetAZs: ""
+      CidrBlock:
+        Ref: PrivateSubnetACidr
+      MapPublicIpOnLaunch: false
+      VpcId:
+        Ref: Vpc
+      Tags:
+        - Key: Name
+          Value:
+            Fn::Sub: ${AWS::StackName}-private-a
+        - Key: memorysplit:network
+          Value: private
+
+  PrivateSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      AvailabilityZone:
+        Fn::Select:
+          - 1
+          - Fn::GetAZs: ""
+      CidrBlock:
+        Ref: PrivateSubnetBCidr
+      MapPublicIpOnLaunch: false
+      VpcId:
+        Ref: Vpc
+      Tags:
+        - Key: Name
+          Value:
+            Fn::Sub: ${AWS::StackName}-private-b
+        - Key: memorysplit:network
+          Value: private
+
+  PrivateRouteTableA:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId:
+        Ref: Vpc
+      Tags:
+        - Key: Name
+          Value:
+            Fn::Sub: ${AWS::StackName}-private-a
+
+  PrivateRouteTableB:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId:
+        Ref: Vpc
+      Tags:
+        - Key: Name
+          Value:
+            Fn::Sub: ${AWS::StackName}-private-b
+
+  PrivateSubnetRouteTableAssociationA:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId:
+        Ref: PrivateRouteTableA
+      SubnetId:
+        Ref: PrivateSubnetA
+
+  PrivateSubnetRouteTableAssociationB:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId:
+        Ref: PrivateRouteTableB
+      SubnetId:
+        Ref: PrivateSubnetB
+
+  TrainSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Zero-ingress security group for approved P5 launches.
+      SecurityGroupIngress: []
+      VpcId:
+        Ref: Vpc
+      Tags:
+        - Key: Name
+          Value:
+            Fn::Sub: ${AWS::StackName}-train-zero-ingress
+
+  EndpointSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: HTTPS ingress only from the train security group.
+      SecurityGroupIngress:
+        - Description: HTTPS from the zero-ingress train security group
+          FromPort: 443
+          IpProtocol: tcp
+          SourceSecurityGroupId:
+            Fn::GetAtt:
+              - TrainSecurityGroup
+              - GroupId
+          ToPort: 443
+      VpcId:
+        Ref: Vpc
+      Tags:
+        - Key: Name
+          Value:
+            Fn::Sub: ${AWS::StackName}-endpoints
+
+  DataKey:
+    Type: AWS::KMS::Key
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BypassPolicyLockoutSafetyCheck: false
+      Description: Symmetric data key for retained MemorySplit state.
+      EnableKeyRotation: true
+      Enabled: true
+      KeyPolicy:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: EnableAccountIAM
+            Effect: Allow
+            Principal:
+              AWS:
+                Fn::Sub: arn:${AWS::Partition}:iam::${AWS::AccountId}:root
+            Action: kms:*
+            Resource: "*"
+      KeySpec: SYMMETRIC_DEFAULT
+      KeyUsage: ENCRYPT_DECRYPT
+      MultiRegion: false
+      Origin: AWS_KMS
+      PendingWindowInDays: 30
+      Tags:
+        - Key: memorysplit:purpose
+          Value: retained-data
+
+  ApprovalSigningKey:
+    Type: AWS::KMS::Key
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BypassPolicyLockoutSafetyCheck: false
+      Description: Asymmetric approval key for signed MemorySplit operations.
+      Enabled: true
+      KeyPolicy:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: EnableAccountIAM
+            Effect: Allow
+            Principal:
+              AWS:
+                Fn::Sub: arn:${AWS::Partition}:iam::${AWS::AccountId}:root
+            Action: kms:*
+            Resource: "*"
+      KeySpec: ECC_NIST_P384
+      KeyUsage: SIGN_VERIFY
+      MultiRegion: false
+      Origin: AWS_KMS
+      PendingWindowInDays: 30
+      Tags:
+        - Key: memorysplit:purpose
+          Value: operation-approval
+
+  ArtifactBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - BucketKeyEnabled: true
+            ServerSideEncryptionByDefault:
+              KMSMasterKeyID:
+                Fn::GetAtt:
+                  - DataKey
+                  - Arn
+              SSEAlgorithm: aws:kms
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      Tags:
+        - Key: memorysplit:purpose
+          Value: durable-artifacts
+      VersioningConfiguration:
+        Status: Enabled
+
+  ArtifactBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket:
+        Ref: ArtifactBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: "*"
+            Action: s3:*
+            Resource:
+              - Fn::GetAtt:
+                  - ArtifactBucket
+                  - Arn
+              - Fn::Sub: ${ArtifactBucket.Arn}/*
+            Condition:
+              Bool:
+                aws:SecureTransport: "false"
+          - Sid: DenyUnexpectedEncryptionAlgorithm
+            Effect: Deny
+            Principal: "*"
+            Action: s3:PutObject
+            Resource:
+              Fn::Sub: ${ArtifactBucket.Arn}/*
+            Condition:
+              "Null":
+                s3:x-amz-server-side-encryption: "false"
+              StringNotEquals:
+                s3:x-amz-server-side-encryption: aws:kms
+          - Sid: DenyUnexpectedKmsKey
+            Effect: Deny
+            Principal: "*"
+            Action: s3:PutObject
+            Resource:
+              Fn::Sub: ${ArtifactBucket.Arn}/*
+            Condition:
+              "Null":
+                s3:x-amz-server-side-encryption-aws-kms-key-id: "false"
+              StringNotEquals:
+                s3:x-amz-server-side-encryption-aws-kms-key-id:
+                  Fn::GetAtt:
+                    - DataKey
+                    - Arn
+
+  ContainerRepository:
+    Type: AWS::ECR::Repository
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      EncryptionConfiguration:
+        EncryptionType: KMS
+        KmsKey:
+          Fn::GetAtt:
+            - DataKey
+            - Arn
+      ImageScanningConfiguration:
+        ScanOnPush: true
+      ImageTagMutability: IMMUTABLE
+      Tags:
+        - Key: memorysplit:purpose
+          Value: digest-pinned-runtime
+
+  TrainRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: Ec2AssumeRole
+            Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      Description: Instance role for approved MemorySplit training operations.
+      ManagedPolicyArns:
+        - Fn::Sub: arn:${AWS::Partition}:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Policies:
+        - PolicyName: TrainArtifactData
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: ListArtifactVersions
+                Effect: Allow
+                Action:
+                  - s3:GetBucketLocation
+                  - s3:ListBucket
+                  - s3:ListBucketVersions
+                Resource:
+                  Fn::GetAtt:
+                    - ArtifactBucket
+                    - Arn
+              - Sid: ReadWriteVersionedArtifacts
+                Effect: Allow
+                Action:
+                  - s3:AbortMultipartUpload
+                  - s3:GetObject
+                  - s3:GetObjectAttributes
+                  - s3:GetObjectTagging
+                  - s3:GetObjectVersion
+                  - s3:ListMultipartUploadParts
+                  - s3:PutObject
+                  - s3:PutObjectTagging
+                Resource:
+                  Fn::Sub: ${ArtifactBucket.Arn}/*
+              - Sid: UseDataKey
+                Effect: Allow
+                Action:
+                  - kms:Decrypt
+                  - kms:DescribeKey
+                  - kms:Encrypt
+                  - kms:GenerateDataKey
+                Resource:
+                  Fn::GetAtt:
+                    - DataKey
+                    - Arn
+              - Sid: VerifyApproval
+                Effect: Allow
+                Action:
+                  - kms:DescribeKey
+                  - kms:GetPublicKey
+                  - kms:Verify
+                Resource:
+                  Fn::GetAtt:
+                    - ApprovalSigningKey
+                    - Arn
+              - Sid: AuthorizeEcr
+                Effect: Allow
+                Action: ecr:GetAuthorizationToken
+                Resource: "*"
+              - Sid: PullImmutableRuntime
+                Effect: Allow
+                Action:
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:BatchGetImage
+                  - ecr:GetDownloadUrlForLayer
+                Resource:
+                  Fn::GetAtt:
+                    - ContainerRepository
+                    - Arn
+      Tags:
+        - Key: memorysplit:role
+          Value: train
+
+  EvaluatorRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AccountAssumeRole
+            Effect: Allow
+            Principal:
+              AWS:
+                Fn::Sub: arn:${AWS::Partition}:iam::${AWS::AccountId}:root
+            Action: sts:AssumeRole
+      Description: Separate role for sealed MemorySplit evaluation operations.
+      Policies:
+        - PolicyName: EvaluatorArtifacts
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: ListEvaluationInputs
+                Effect: Allow
+                Action:
+                  - s3:GetBucketLocation
+                  - s3:ListBucket
+                  - s3:ListBucketVersions
+                Resource:
+                  Fn::GetAtt:
+                    - ArtifactBucket
+                    - Arn
+              - Sid: ReadInputsAndWriteEvaluationReceipts
+                Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:GetObjectAttributes
+                  - s3:GetObjectVersion
+                  - s3:PutObject
+                  - s3:PutObjectTagging
+                Resource:
+                  Fn::Sub: ${ArtifactBucket.Arn}/*
+              - Sid: UseDataKey
+                Effect: Allow
+                Action:
+                  - kms:Decrypt
+                  - kms:DescribeKey
+                  - kms:Encrypt
+                  - kms:GenerateDataKey
+                Resource:
+                  Fn::GetAtt:
+                    - DataKey
+                    - Arn
+              - Sid: VerifyApproval
+                Effect: Allow
+                Action:
+                  - kms:DescribeKey
+                  - kms:GetPublicKey
+                  - kms:Verify
+                Resource:
+                  Fn::GetAtt:
+                    - ApprovalSigningKey
+                    - Arn
+              - Sid: AuthorizeEcr
+                Effect: Allow
+                Action: ecr:GetAuthorizationToken
+                Resource: "*"
+              - Sid: PullImmutableRuntime
+                Effect: Allow
+                Action:
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:BatchGetImage
+                  - ecr:GetDownloadUrlForLayer
+                Resource:
+                  Fn::GetAtt:
+                    - ContainerRepository
+                    - Arn
+      Tags:
+        - Key: memorysplit:role
+          Value: evaluator
+
+  ControllerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AccountAssumeRole
+            Effect: Allow
+            Principal:
+              AWS:
+                Fn::Sub: arn:${AWS::Partition}:iam::${AWS::AccountId}:root
+            Action: sts:AssumeRole
+      Description: Operator role for separately approved instance lifecycle actions.
+      Policies:
+        - PolicyName: ControllerOperations
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: InspectAndControlApprovedCapacity
+                Effect: Allow
+                Action:
+                  - ec2:CreateTags
+                  - ec2:DescribeAvailabilityZones
+                  - ec2:DescribeImages
+                  - ec2:DescribeInstances
+                  - ec2:DescribeInstanceStatus
+                  - ec2:DescribeInstanceTypeOfferings
+                  - ec2:DescribeLaunchTemplateVersions
+                  - ec2:DescribeLaunchTemplates
+                  - ec2:DescribeSecurityGroups
+                  - ec2:DescribeSubnets
+                  - ec2:RunInstances
+                  - ec2:StartInstances
+                  - ec2:StopInstances
+                  - ec2:TerminateInstances
+                Resource: "*"
+              - Sid: PassOnlyTrainRoleToEc2
+                Effect: Allow
+                Action: iam:PassRole
+                Resource:
+                  Fn::GetAtt:
+                    - TrainRole
+                    - Arn
+                Condition:
+                  StringEquals:
+                    iam:PassedToService: ec2.amazonaws.com
+              - Sid: SendCanonicalArgvDocument
+                Effect: Allow
+                Action:
+                  - ssm:GetDocument
+                  - ssm:SendCommand
+                Resource:
+                  - Fn::Sub: arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:document/MemorySplit-ArgvV1
+                  - Fn::Sub: arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:instance/*
+              - Sid: InspectCommandReceipts
+                Effect: Allow
+                Action:
+                  - ssm:GetCommandInvocation
+                  - ssm:ListCommandInvocations
+                  - ssm:ListCommands
+                Resource: "*"
+              - Sid: ReadWriteOperationIntents
+                Effect: Allow
+                Action:
+                  - s3:GetBucketLocation
+                  - s3:GetObject
+                  - s3:GetObjectAttributes
+                  - s3:GetObjectVersion
+                  - s3:ListBucket
+                  - s3:ListBucketVersions
+                  - s3:PutObject
+                  - s3:PutObjectTagging
+                Resource:
+                  - Fn::GetAtt:
+                      - ArtifactBucket
+                      - Arn
+                  - Fn::Sub: ${ArtifactBucket.Arn}/*
+              - Sid: UseDataKey
+                Effect: Allow
+                Action:
+                  - kms:Decrypt
+                  - kms:DescribeKey
+                  - kms:Encrypt
+                  - kms:GenerateDataKey
+                Resource:
+                  Fn::GetAtt:
+                    - DataKey
+                    - Arn
+              - Sid: VerifyApproval
+                Effect: Allow
+                Action:
+                  - kms:DescribeKey
+                  - kms:GetPublicKey
+                  - kms:Verify
+                Resource:
+                  Fn::GetAtt:
+                    - ApprovalSigningKey
+                    - Arn
+              - Sid: InspectFoundationAndBudget
+                Effect: Allow
+                Action:
+                  - budgets:ViewBudget
+                  - cloudformation:DescribeStacks
+                Resource: "*"
+      Tags:
+        - Key: memorysplit:role
+          Value: controller
+
+  SignerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AccountAssumeRole
+            Effect: Allow
+            Principal:
+              AWS:
+                Fn::Sub: arn:${AWS::Partition}:iam::${AWS::AccountId}:root
+            Action: sts:AssumeRole
+      Description: Isolated role that signs bounded MemorySplit approvals.
+      Policies:
+        - PolicyName: SignApprovals
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: SignWithApprovalKey
+                Effect: Allow
+                Action:
+                  - kms:DescribeKey
+                  - kms:GetPublicKey
+                  - kms:Sign
+                Resource:
+                  Fn::GetAtt:
+                    - ApprovalSigningKey
+                    - Arn
+      Tags:
+        - Key: memorysplit:role
+          Value: signer
+
+  TrainInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - Ref: TrainRole
+
+  ArgvDocument:
+    Type: AWS::SSM::Document
+    Properties:
+      Content:
+        description: Execute one content-addressed MemorySplit argv intent.
+        mainSteps:
+          - action: aws:runShellScript
+            inputs:
+              runCommand:
+                - "/usr/bin/python3 /opt/memorysplit/msctl/aws_argv.py --intent-uri '{{ IntentUri }}' --intent-sha256 '{{ IntentSHA256 }}'"
+              timeoutSeconds: "172800"
+            name: runContentAddressedArgv
+        parameters:
+          IntentSHA256:
+            allowedPattern: '^[0-9a-f]{64}$'
+            type: String
+          IntentUri:
+            allowedPattern: '^s3://[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]/[A-Za-z0-9._/-]+$'
+            type: String
+        schemaVersion: "2.2"
+      DocumentFormat: JSON
+      DocumentType: Command
+      Name: MemorySplit-ArgvV1
+      TargetType: /AWS::EC2::Instance
+      UpdateMethod: NewVersion
+
+  P5LaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateData:
+        BlockDeviceMappings:
+          - DeviceName: /dev/sda1
+            Ebs:
+              DeleteOnTermination: true
+              Encrypted: true
+              KmsKeyId:
+                Fn::GetAtt:
+                  - DataKey
+                  - Arn
+              VolumeSize:
+                Ref: RootVolumeSizeGiB
+              VolumeType: gp3
+        DisableApiTermination: true
+        EbsOptimized: true
+        IamInstanceProfile:
+          Arn:
+            Fn::GetAtt:
+              - TrainInstanceProfile
+              - Arn
+        ImageId:
+          Ref: P5AmiId
+        InstanceInitiatedShutdownBehavior: stop
+        InstanceType: p5.48xlarge
+        MetadataOptions:
+          HttpEndpoint: enabled
+          HttpProtocolIpv6: disabled
+          HttpPutResponseHopLimit: 1
+          HttpTokens: required
+          InstanceMetadataTags: disabled
+        Monitoring:
+          Enabled: true
+        NetworkInterfaces:
+          - AssociatePublicIpAddress: false
+            DeleteOnTermination: true
+            DeviceIndex: 0
+            Groups:
+              - Fn::GetAtt:
+                  - TrainSecurityGroup
+                  - GroupId
+        TagSpecifications:
+          - ResourceType: instance
+            Tags:
+              - Key: Name
+                Value:
+                  Fn::Sub: ${AWS::StackName}-approved-p5
+              - Key: memorysplit:managed
+                Value: "true"
+          - ResourceType: volume
+            Tags:
+              - Key: memorysplit:managed
+                Value: "true"
+      TagSpecifications:
+        - ResourceType: launch-template
+          Tags:
+            - Key: memorysplit:purpose
+              Value: approved-p5-template
+      VersionDescription: memorysplit-p5-foundation-v1
+
+  S3Endpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: MemorySplitBucketMetadata
+            Effect: Allow
+            Principal: "*"
+            Action:
+              - s3:GetBucketLocation
+              - s3:ListBucket
+              - s3:ListBucketVersions
+            Resource:
+              Fn::GetAtt:
+                - ArtifactBucket
+                - Arn
+          - Sid: MemorySplitVersionedObjects
+            Effect: Allow
+            Principal: "*"
+            Action:
+              - s3:AbortMultipartUpload
+              - s3:GetObject
+              - s3:GetObjectAttributes
+              - s3:GetObjectTagging
+              - s3:GetObjectVersion
+              - s3:ListMultipartUploadParts
+              - s3:PutObject
+              - s3:PutObjectTagging
+            Resource:
+              Fn::Sub: ${ArtifactBucket.Arn}/*
+          - Sid: EcrLayerDownloads
+            Effect: Allow
+            Principal: "*"
+            Action: s3:GetObject
+            Resource:
+              Fn::Sub: arn:${AWS::Partition}:s3:::prod-${AWS::Region}-starport-layer-bucket/*
+      RouteTableIds:
+        - Ref: PrivateRouteTableA
+        - Ref: PrivateRouteTableB
+      ServiceName:
+        Fn::Sub: com.amazonaws.${AWS::Region}.s3
+      VpcEndpointType: Gateway
+      VpcId:
+        Ref: Vpc
+
+  Ec2Endpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      PrivateDnsEnabled: true
+      SecurityGroupIds:
+        - Fn::GetAtt:
+            - EndpointSecurityGroup
+            - GroupId
+      ServiceName:
+        Fn::Sub: com.amazonaws.${AWS::Region}.ec2
+      SubnetIds:
+        - Ref: PrivateSubnetA
+        - Ref: PrivateSubnetB
+      VpcEndpointType: Interface
+      VpcId:
+        Ref: Vpc
+
+  Ec2MessagesEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      PrivateDnsEnabled: true
+      SecurityGroupIds:
+        - Fn::GetAtt:
+            - EndpointSecurityGroup
+            - GroupId
+      ServiceName:
+        Fn::Sub: com.amazonaws.${AWS::Region}.ec2messages
+      SubnetIds:
+        - Ref: PrivateSubnetA
+        - Ref: PrivateSubnetB
+      VpcEndpointType: Interface
+      VpcId:
+        Ref: Vpc
+
+  EcrApiEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      PrivateDnsEnabled: true
+      SecurityGroupIds:
+        - Fn::GetAtt:
+            - EndpointSecurityGroup
+            - GroupId
+      ServiceName:
+        Fn::Sub: com.amazonaws.${AWS::Region}.ecr.api
+      SubnetIds:
+        - Ref: PrivateSubnetA
+        - Ref: PrivateSubnetB
+      VpcEndpointType: Interface
+      VpcId:
+        Ref: Vpc
+
+  EcrDkrEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      PrivateDnsEnabled: true
+      SecurityGroupIds:
+        - Fn::GetAtt:
+            - EndpointSecurityGroup
+            - GroupId
+      ServiceName:
+        Fn::Sub: com.amazonaws.${AWS::Region}.ecr.dkr
+      SubnetIds:
+        - Ref: PrivateSubnetA
+        - Ref: PrivateSubnetB
+      VpcEndpointType: Interface
+      VpcId:
+        Ref: Vpc
+
+  KmsEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      PrivateDnsEnabled: true
+      SecurityGroupIds:
+        - Fn::GetAtt:
+            - EndpointSecurityGroup
+            - GroupId
+      ServiceName:
+        Fn::Sub: com.amazonaws.${AWS::Region}.kms
+      SubnetIds:
+        - Ref: PrivateSubnetA
+        - Ref: PrivateSubnetB
+      VpcEndpointType: Interface
+      VpcId:
+        Ref: Vpc
+
+  LogsEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      PrivateDnsEnabled: true
+      SecurityGroupIds:
+        - Fn::GetAtt:
+            - EndpointSecurityGroup
+            - GroupId
+      ServiceName:
+        Fn::Sub: com.amazonaws.${AWS::Region}.logs
+      SubnetIds:
+        - Ref: PrivateSubnetA
+        - Ref: PrivateSubnetB
+      VpcEndpointType: Interface
+      VpcId:
+        Ref: Vpc
+
+  SsmEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      PrivateDnsEnabled: true
+      SecurityGroupIds:
+        - Fn::GetAtt:
+            - EndpointSecurityGroup
+            - GroupId
+      ServiceName:
+        Fn::Sub: com.amazonaws.${AWS::Region}.ssm
+      SubnetIds:
+        - Ref: PrivateSubnetA
+        - Ref: PrivateSubnetB
+      VpcEndpointType: Interface
+      VpcId:
+        Ref: Vpc
+
+  SsmMessagesEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      PrivateDnsEnabled: true
+      SecurityGroupIds:
+        - Fn::GetAtt:
+            - EndpointSecurityGroup
+            - GroupId
+      ServiceName:
+        Fn::Sub: com.amazonaws.${AWS::Region}.ssmmessages
+      SubnetIds:
+        - Ref: PrivateSubnetA
+        - Ref: PrivateSubnetB
+      VpcEndpointType: Interface
+      VpcId:
+        Ref: Vpc
+
+  StsEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      PrivateDnsEnabled: true
+      SecurityGroupIds:
+        - Fn::GetAtt:
+            - EndpointSecurityGroup
+            - GroupId
+      ServiceName:
+        Fn::Sub: com.amazonaws.${AWS::Region}.sts
+      SubnetIds:
+        - Ref: PrivateSubnetA
+        - Ref: PrivateSubnetB
+      VpcEndpointType: Interface
+      VpcId:
+        Ref: Vpc
+
+  MonthlyBudget:
+    Type: AWS::Budgets::Budget
+    Properties:
+      Budget:
+        BudgetLimit:
+          Amount:
+            Ref: MonthlyBudgetUsd
+          Unit: USD
+        BudgetName:
+          Fn::Sub: ${AWS::StackName}-monthly-cost
+        BudgetType: COST
+        TimeUnit: MONTHLY
+      NotificationsWithSubscribers:
+        - Notification:
+            ComparisonOperator: GREATER_THAN
+            NotificationType: ACTUAL
+            Threshold: 50
+            ThresholdType: PERCENTAGE
+          Subscribers:
+            - Address:
+                Ref: BudgetAlertEmail
+              SubscriptionType: EMAIL
+        - Notification:
+            ComparisonOperator: GREATER_THAN
+            NotificationType: ACTUAL
+            Threshold: 80
+            ThresholdType: PERCENTAGE
+          Subscribers:
+            - Address:
+                Ref: BudgetAlertEmail
+              SubscriptionType: EMAIL
+        - Notification:
+            ComparisonOperator: GREATER_THAN
+            NotificationType: FORECASTED
+            Threshold: 100
+            ThresholdType: PERCENTAGE
+          Subscribers:
+            - Address:
+                Ref: BudgetAlertEmail
+              SubscriptionType: EMAIL
+
+Outputs:
+  VpcId:
+    Description: Private foundation VPC ID.
+    Value:
+      Ref: Vpc
+  PrivateSubnetIds:
+    Description: Comma-separated private subnet IDs approved for launches.
+    Value:
+      Fn::Join:
+        - ","
+        - - Ref: PrivateSubnetA
+          - Ref: PrivateSubnetB
+  ArtifactBucketName:
+    Description: Retained versioned SSE-KMS artifact bucket name.
+    Value:
+      Ref: ArtifactBucket
+  ContainerRepositoryUri:
+    Description: Immutable KMS-encrypted ECR repository URI.
+    Value:
+      Fn::GetAtt:
+        - ContainerRepository
+        - RepositoryUri
+  DataKeyArn:
+    Description: Symmetric retained data KMS key ARN.
+    Value:
+      Fn::GetAtt:
+        - DataKey
+        - Arn
+  ApprovalKeyArn:
+    Description: ECC NIST P-384 approval signing KMS key ARN.
+    Value:
+      Fn::GetAtt:
+        - ApprovalSigningKey
+        - Arn
+  TrainRoleArn:
+    Description: Training instance role ARN.
+    Value:
+      Fn::GetAtt:
+        - TrainRole
+        - Arn
+  EvaluatorRoleArn:
+    Description: Isolated evaluator role ARN.
+    Value:
+      Fn::GetAtt:
+        - EvaluatorRole
+        - Arn
+  ControllerRoleArn:
+    Description: Separately assumed controller role ARN.
+    Value:
+      Fn::GetAtt:
+        - ControllerRole
+        - Arn
+  SignerRoleArn:
+    Description: Separately assumed approval signer role ARN.
+    Value:
+      Fn::GetAtt:
+        - SignerRole
+        - Arn
+  TrainInstanceProfileArn:
+    Description: Training instance profile ARN for the launch template.
+    Value:
+      Fn::GetAtt:
+        - TrainInstanceProfile
+        - Arn
+  LaunchTemplateId:
+    Description: No-instance p5.48xlarge launch template ID.
+    Value:
+      Ref: P5LaunchTemplate
+  LaunchTemplateVersion:
+    Description: Explicit latest launch template version number.
+    Value:
+      Fn::GetAtt:
+        - P5LaunchTemplate
+        - LatestVersionNumber
+  ArgvDocumentName:
+    Description: Canonical SSM argv document name.
+    Value:
+      Ref: ArgvDocument
+  ArgvDocumentSha256:
+    Description: Canonical JSON SHA-256 for MemorySplit-ArgvV1 content.
+    Value: b022ab1f970289d8340e36cbf742a3195f894bdd97cd388590d9aa4acb8f6f2d

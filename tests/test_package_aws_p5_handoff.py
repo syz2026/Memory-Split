@@ -902,6 +902,39 @@ def test_archive_excludes_materialized_provider_and_sealed_content(tmp_path):
     assert not any(name.startswith("configs/360m-v2/") for name in names)
 
 
+def test_archive_excludes_tracked_infra_and_future_runtime_trees(tmp_path):
+    module = _load_module()
+    source = _minimal_repo(tmp_path)
+    excluded_members = {
+        "infra/aws/cloudformation/memorysplit-p5-foundation.yaml": (
+            "AWSTemplateFormatVersion: '2010-09-09'\n"
+        ),
+        "infra/aws/cfn-guard/memorysplit-p5-foundation.guard": (
+            "rule fixture { true }\n"
+        ),
+        "runtime/aws-p5/README.md": "# Future runtime fixture\n",
+        "runtime/aws-p5/runtime.lock": '{"schema_version":1}\n',
+    }
+    for relative, payload in excluded_members.items():
+        _write(source / relative, payload)
+    _commit(source, "add separately distributed infrastructure and runtime")
+
+    for relative in excluded_members:
+        assert module._classification(relative) == "excluded"
+    assert module._classification("requirements-aws-p5.lock") == "forbidden"
+
+    artifacts = _build(module, source, tmp_path / "out")
+    with zipfile.ZipFile(artifacts.archive) as archive:
+        names = set(archive.namelist())
+    assert not any(
+        name == "infra"
+        or name.startswith("infra/")
+        or name == "runtime"
+        or name.startswith("runtime/")
+        for name in names
+    )
+
+
 def test_zip_metadata_is_normalized_and_preserves_git_executable_modes(tmp_path):
     module = _load_module()
     source = _minimal_repo(tmp_path)
