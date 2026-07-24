@@ -1,14 +1,17 @@
 from __future__ import annotations
 
 import hashlib
+import inspect
 import json
 import os
-from collections.abc import Iterator, Mapping
+import sys
+import tracemalloc
+from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass, replace
 from fractions import Fraction
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Callable, cast
+from typing import cast
 
 import pytest
 
@@ -57,6 +60,7 @@ _GENERATED_LANES = {
     "synthetic_graph",
     "verified_synthetic_multihop",
 }
+_QUARANTINE_DIRECTORY = ".memorysplit-catalog-quarantine-v1"
 
 
 def _source_file(lock: SourceLock, source_id: str) -> tuple[str, SourceFile]:
@@ -87,20 +91,47 @@ class FixtureLane:
     records: int | None = None
     mutation: str | None = None
     finite: bool = True
+    started: int = 0
+    path_override: str | None = None
+    require_compact_lengths: bool = False
 
     @property
-    def training_edge_keys(self) -> tuple[str, ...]:
+    def training_edge_count(self) -> int:
         if self.lane_id != "wikidata_graph":
-            return ()
-        return ("edge-000000", "edge-000001")
+            raise AttributeError("only Wikidata graph has training-edge authority")
+        return 3 if self.mutation == "authority_extra" else 2
+
+    def iter_training_edge_keys(self, source_root: Path) -> Iterator[str]:
+        del source_root
+        if self.lane_id != "wikidata_graph":
+            raise RuntimeError("only Wikidata graph has training-edge authority")
+        if self.mutation == "authority_duplicate":
+            yield "edge-000000"
+            yield "edge-000000"
+            return
+        yield "edge-000000"
+        yield "edge-000001"
+        if self.mutation == "authority_extra":
+            yield "edge-000002"
 
     def iter_drafts(
         self,
         source_root: Path,
-        target_lengths: tuple[int, ...],
+        target_lengths: Sequence[int],
     ) -> Iterator[CatalogDraft]:
+        self.started += 1
+        if self.require_compact_lengths and (
+            isinstance(target_lengths, tuple)
+            or sys.getsizeof(target_lengths) > 256
+        ):
+            raise RuntimeError("target lengths were materialized")
         source_id = _LANE_SOURCE_IDS[self.lane_id]
         materialized_path, source_file = _source_file(self.lock, source_id)
+        if self.path_override is not None:
+            entry = next(row for row in self.lock.sources if row.source_id == source_id)
+            source_file = next(
+                row for row in entry.files if row.path == self.path_override
+            )
         count = len(target_lengths) if self.records is None else self.records
         indices = list(range(count))
         if self.order == "reverse":
@@ -124,13 +155,33 @@ class FixtureLane:
                 if self.lane_id in _GENERATED_LANES
                 else ()
             )
-            locator: tuple[tuple[str, str | int], ...] = (
+            locator_items: list[tuple[str, str | int]] = [
                 ("path", source_file.path),
                 ("row", index),
-            )
+            ]
+            if source_id == "wikidata5m":
+                locator_items.append(("split", "train"))
+            if self.lane_id == "wikidata_graph":
+                edge_index = index % 2
+                locator_items.append(
+                    ("training_edge_key", f"edge-{edge_index:06d}")
+                )
             if self.lane_id in _GENERATED_LANES:
-                seed = 0 if self.mutation == "reused_seed" else index
-                locator = (*locator, ("seed", seed))
+                lane_seed_base = LANE_ORDER.index(self.lane_id) * 1_000_000
+                seed = (
+                    lane_seed_base
+                    if self.mutation == "reused_seed"
+                    else lane_seed_base + index
+                )
+                if self.mutation == "alias_seed":
+                    locator_items.append(("seed", seed))
+                elif self.mutation != "missing_seed":
+                    locator_items.append(("generation_seed", seed))
+            elif self.mutation == "smuggled_seed" and index == 0:
+                locator_items.append(("generation_seed", index))
+            locator = tuple(
+                sorted(locator_items, key=lambda item: item[0].encode("utf-8"))
+            )
             semantic_facts = (_fact(self.lane_id, index),)
             draft = CatalogDraft(
                 lane_id=self.lane_id,
@@ -156,7 +207,42 @@ class FixtureLane:
             elif self.mutation == "sealed_path" and index == 0:
                 draft = replace(
                     draft,
-                    source_locator=(*locator, ("split", "evaluation/test")),
+                    source_locator=tuple(
+                        sorted(
+                            (*locator, ("member", "evaluation/train/test.json")),
+                            key=lambda item: item[0].encode("utf-8"),
+                        )
+                    ),
+                )
+            elif self.mutation == "missing_training_split" and index == 0:
+                draft = replace(
+                    draft,
+                    source_locator=tuple(
+                        item for item in locator if item[0] != "split"
+                    ),
+                )
+            elif self.mutation == "graph_all_revisit":
+                draft = replace(draft, semantic_flags=("graph-revisit",))
+            elif (
+                self.mutation == "graph_partial_before_revisit"
+                and index == 1
+            ):
+                draft = replace(draft, semantic_flags=("graph-revisit",))
+            elif (
+                self.mutation == "graph_duplicate_before_revisit"
+                and index == 1
+            ):
+                draft = replace(
+                    draft,
+                    source_locator=tuple(
+                        (
+                            key,
+                            "edge-000000"
+                            if key == "training_edge_key"
+                            else value,
+                        )
+                        for key, value in locator
+                    ),
                 )
             elif self.mutation == "non_nfc" and index == 0:
                 draft = replace(
@@ -206,6 +292,69 @@ class FixtureLane:
                 path = source_root / materialized_path / source_file.path
                 path.write_bytes(path.read_bytes() + b"drift")
             yield draft
+
+
+@dataclass
+class NoWikidataAuthority:
+    wrapped: FixtureLane
+    lane_id: LaneId = "wikidata_graph"
+    finite: bool = True
+
+    def iter_drafts(
+        self,
+        source_root: Path,
+        target_lengths: Sequence[int],
+    ) -> Iterator[CatalogDraft]:
+        return self.wrapped.iter_drafts(source_root, target_lengths)
+
+
+@dataclass
+class HighCardinalityWikidataLane:
+    lock: SourceLock
+    training_edge_count: int
+    lane_id: LaneId = "wikidata_graph"
+    finite: bool = True
+
+    def iter_training_edge_keys(self, source_root: Path) -> Iterator[str]:
+        del source_root
+        for index in range(self.training_edge_count):
+            yield f"edge-{index:08d}"
+
+    def iter_drafts(
+        self,
+        source_root: Path,
+        target_lengths: Sequence[int],
+    ) -> Iterator[CatalogDraft]:
+        del source_root
+        if isinstance(target_lengths, tuple) or sys.getsizeof(target_lengths) > 256:
+            raise RuntimeError("high-cardinality target lengths were materialized")
+        _materialized, source_file = _source_file(self.lock, "wikidata5m")
+        for index in range(len(target_lengths)):
+            revisit = index == self.training_edge_count
+            edge_index = 0 if revisit else index
+            fact = _fact("wikidata_graph", edge_index)
+            yield CatalogDraft(
+                lane_id="wikidata_graph",
+                source_id="wikidata5m",
+                source_key=(
+                    f"revisit-{edge_index:08d}"
+                    if revisit
+                    else f"edge-{edge_index:08d}"
+                ),
+                source_byte_sha256=source_file.sha256,
+                source_locator=(
+                    ("path", source_file.path),
+                    ("row", index),
+                    ("split", "train"),
+                    ("training_edge_key", f"edge-{edge_index:08d}"),
+                ),
+                semantic_flags=(
+                    ("graph-revisit",)
+                    if revisit
+                    else ("graph-training-edge",)
+                ),
+                semantic_facts=(fact,),
+            )
 
 
 class FlippingMapping(Mapping[LaneId, FixtureLane]):
@@ -272,6 +421,7 @@ def fixture_lane_sources(staged_fixture_sources):
         mutation_lane: LaneId | None = None,
         mutation: str | None = None,
         records: int | None = None,
+        require_compact_lengths: bool = False,
     ) -> dict[LaneId, FixtureLane]:
         lanes = LANE_ORDER if order == "forward" else tuple(reversed(LANE_ORDER))
         return {
@@ -281,6 +431,7 @@ def fixture_lane_sources(staged_fixture_sources):
                 order=order,
                 records=records if lane_id == mutation_lane else None,
                 mutation=mutation if lane_id == mutation_lane else None,
+                require_compact_lengths=require_compact_lengths,
             )
             for lane_id in lanes
         }
@@ -300,7 +451,45 @@ def _build(
         staged_fixture_sources.root,
         lane_sources,
         output_root,
+        expected_generator_commit=staged_fixture_sources.lock.generator_commit,
     )
+
+
+def _quarantine_entries(parent: Path) -> tuple[Path, ...]:
+    root = parent / _QUARANTINE_DIRECTORY
+    assert root.is_dir()
+    return tuple(sorted(root.iterdir(), key=lambda path: path.name))
+
+
+@pytest.mark.parametrize("forged_lock", [False, True])
+def test_catalog_requires_independent_generator_commit_authority_before_iteration(
+    tmp_path: Path,
+    tiny_geometry: BuildGeometry,
+    staged_fixture_sources,
+    fixture_lane_sources,
+    forged_lock: bool,
+):
+    sources = fixture_lane_sources()
+    lock = (
+        replace(staged_fixture_sources.lock, generator_commit="b" * 40)
+        if forged_lock
+        else staged_fixture_sources.lock
+    )
+    expected = (
+        staged_fixture_sources.lock.generator_commit
+        if forged_lock
+        else "b" * 40
+    )
+    with pytest.raises(ValueError, match="generator commit"):
+        build_input_catalog(
+            tiny_geometry,
+            lock,
+            staged_fixture_sources.root,
+            sources,
+            tmp_path / "stale-lock",
+            expected_generator_commit=expected,
+        )
+    assert all(source.started == 0 for source in sources.values())
 
 
 def test_catalog_is_canonical_exact_and_filesystem_order_independent(
@@ -420,7 +609,9 @@ def test_wikidata_graph_covers_every_training_edge_before_revisit(
         index for index, row in enumerate(rows) if "graph-revisit" in row.semantic_flags
     )
     assert {row.source_key for row in rows[:first_revisit]} == set(
-        sources["wikidata_graph"].training_edge_keys
+        sources["wikidata_graph"].iter_training_edge_keys(
+            staged_fixture_sources.root
+        )
     )
     assert all(
         "graph-revisit" in row.semantic_flags for row in rows[first_revisit:]
@@ -433,6 +624,9 @@ def test_wikidata_graph_covers_every_training_edge_before_revisit(
         ("fineweb_edu", "duplicate_source_key", "duplicate source key"),
         ("fineweb_edu", "duplicate_fact_id", "duplicate semantic fact"),
         ("synthetic_graph", "reused_seed", "seed.*reused"),
+        ("synthetic_graph", "missing_seed", "generation seed.*required"),
+        ("synthetic_graph", "alias_seed", "generation seed.*canonical"),
+        ("fineweb_edu", "smuggled_seed", "must not carry.*seed"),
         ("fineweb_edu", "bad_hash", "source byte.*hash"),
         ("wikidata_path_reasoning", "sealed_path", "sealed.*path"),
         ("fineweb_edu", "non_nfc", "NFC"),
@@ -460,6 +654,132 @@ def test_catalog_rejects_noncanonical_or_nonunique_drafts(
     with pytest.raises(ValueError, match=message):
         _build(tiny_geometry, staged_fixture_sources, sources, output)
     assert not output.exists()
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    [
+        ("graph_all_revisit", "before.*revisit"),
+        ("graph_partial_before_revisit", "every training edge"),
+        ("graph_duplicate_before_revisit", "exactly once"),
+        ("authority_duplicate", "duplicate.*training edge"),
+        ("authority_extra", "every training edge"),
+    ],
+)
+def test_wikidata_graph_requires_exact_complete_once_authority(
+    tmp_path: Path,
+    tiny_geometry: BuildGeometry,
+    staged_fixture_sources,
+    fixture_lane_sources,
+    mutation: str,
+    message: str,
+):
+    sources = fixture_lane_sources(
+        mutation_lane="wikidata_graph",
+        mutation=mutation,
+    )
+    with pytest.raises(ValueError, match=message):
+        _build(
+            tiny_geometry,
+            staged_fixture_sources,
+            sources,
+            tmp_path / mutation,
+        )
+
+
+def test_wikidata_graph_rejects_missing_training_edge_authority(
+    tmp_path: Path,
+    tiny_geometry: BuildGeometry,
+    staged_fixture_sources,
+    fixture_lane_sources,
+):
+    sources = fixture_lane_sources()
+    sources["wikidata_graph"] = cast(
+        FixtureLane,
+        NoWikidataAuthority(sources["wikidata_graph"]),
+    )
+    with pytest.raises(ValueError, match="training-edge authority.*required"):
+        _build(
+            tiny_geometry,
+            staged_fixture_sources,
+            sources,
+            tmp_path / "missing-edge-authority",
+        )
+
+
+def test_wikidata_source_requires_exact_training_split_authority(
+    tmp_path: Path,
+    tiny_geometry: BuildGeometry,
+    staged_fixture_sources,
+    fixture_lane_sources,
+):
+    sources = fixture_lane_sources(
+        mutation_lane="wikidata_path_reasoning",
+        mutation="missing_training_split",
+    )
+    with pytest.raises(ValueError, match="Wikidata.*training split"):
+        _build(
+            tiny_geometry,
+            staged_fixture_sources,
+            sources,
+            tmp_path / "missing-training-split",
+        )
+
+
+def test_reserved_path_cannot_hide_behind_train_component(
+    tmp_path: Path,
+    tiny_geometry: BuildGeometry,
+    fixture_source_lock: FixtureSourceLock,
+):
+    relative = "evaluation/train/test.json"
+    payload = b"must remain sealed"
+    entry = next(
+        row for row in fixture_source_lock.lock.sources if row.source_id == "clrs_text"
+    )
+    materialized = fixture_source_lock.download_root / entry.materialized_path
+    path = materialized / relative
+    path.parent.mkdir(parents=True)
+    path.write_bytes(payload)
+    extra = SourceFile(
+        path=relative,
+        bytes=len(payload),
+        sha256=hashlib.sha256(payload).hexdigest(),
+    )
+    changed_entry = replace(
+        entry,
+        files=tuple(
+            sorted((*entry.files, extra), key=lambda row: row.path.encode("utf-8"))
+        ),
+    )
+    changed_lock = replace(
+        fixture_source_lock.lock,
+        sources=tuple(
+            changed_entry if row.source_id == "clrs_text" else row
+            for row in fixture_source_lock.lock.sources
+        ),
+    )
+    source_root = stage_source_lock(
+        changed_lock,
+        fixture_source_lock.download_root,
+        tmp_path / "reserved-canonical",
+        expected_generator_commit=changed_lock.generator_commit,
+    )
+    sources = {
+        lane_id: FixtureLane(
+            lane_id=lane_id,
+            lock=changed_lock,
+            path_override=relative if lane_id == "relational_refinement" else None,
+        )
+        for lane_id in LANE_ORDER
+    }
+    staged = SimpleNamespace(lock=changed_lock, root=source_root)
+    with pytest.raises(ValueError, match="sealed or evaluation path"):
+        _build(
+            tiny_geometry,
+            staged,
+            sources,
+            tmp_path / "reserved-output",
+        )
 
 
 def test_catalog_rejects_missing_and_unknown_lane_sources(
@@ -528,31 +848,76 @@ def test_catalog_rejects_unstable_mapping_key_order(
         )
 
 
-def test_catalog_rejects_target_lengths_that_do_not_sum_to_lane_quota(
+def test_lane_sources_receive_compact_balanced_target_lengths(
     tmp_path: Path,
     tiny_geometry: BuildGeometry,
     staged_fixture_sources,
     fixture_lane_sources,
-    monkeypatch: pytest.MonkeyPatch,
 ):
-    original: Callable[[int, int], tuple[int, ...]] = (
-        catalog_module.balanced_record_lengths
+    catalog = _build(
+        tiny_geometry,
+        staged_fixture_sources,
+        fixture_lane_sources(require_compact_lengths=True),
+        tmp_path / "compact-lengths",
+    )
+    records = tuple(catalog.iter_records())
+    for lane_id, quota in tiny_geometry.lane_quotas:
+        assert tuple(
+            row.target_count for row in records if row.lane_id == lane_id
+        ) == balanced_record_lengths(
+            quota,
+            tiny_geometry.context_length,
+        )
+
+
+def test_high_cardinality_indexes_and_record_replay_remain_memory_bounded(
+    tmp_path: Path,
+    staged_fixture_sources,
+    fixture_lane_sources,
+):
+    edge_count = 2_000
+    lane_quotas = tuple(
+        (
+            lane_id,
+            edge_count + 1 if lane_id == "wikidata_graph" else 1,
+        )
+        for lane_id in LANE_ORDER
+    )
+    geometry = BuildGeometry(
+        profile="canary",
+        total_targets=sum(quota for _lane, quota in lane_quotas),
+        targets_per_update=1,
+        context_length=1,
+        shard_count=1,
+        allow_fewer_shards=True,
+        lane_quotas=lane_quotas,
+    )
+    sources = fixture_lane_sources()
+    sources["wikidata_graph"] = cast(
+        FixtureLane,
+        HighCardinalityWikidataLane(
+            lock=staged_fixture_sources.lock,
+            training_edge_count=edge_count,
+        ),
     )
 
-    def broken(targets: int, context_length: int) -> tuple[int, ...]:
-        lengths = original(targets, context_length)
-        if targets == tiny_geometry.lane_quotas[0][1]:
-            return (*lengths[:-1], lengths[-1] - 1)
-        return lengths
+    tracemalloc.start()
+    catalog = _build(
+        geometry,
+        staged_fixture_sources,
+        sources,
+        tmp_path / "high-cardinality",
+    )
+    _current, build_peak = tracemalloc.get_traced_memory()
+    tracemalloc.stop()
+    assert build_peak < 32 * 1024 * 1024
 
-    monkeypatch.setattr(catalog_module, "balanced_record_lengths", broken)
-    with pytest.raises(ValueError, match="target lengths.*lane quota"):
-        _build(
-            tiny_geometry,
-            staged_fixture_sources,
-            fixture_lane_sources(),
-            tmp_path / "bad-lengths",
-        )
+    tracemalloc.start()
+    replayed = sum(1 for _row in catalog.iter_records())
+    _current, replay_peak = tracemalloc.get_traced_memory()
+    tracemalloc.stop()
+    assert replayed == edge_count + len(LANE_ORDER)
+    assert replay_peak < 8 * 1024 * 1024
 
 
 def test_source_tree_is_reverified_after_lane_consumption(
@@ -571,7 +936,7 @@ def test_source_tree_is_reverified_after_lane_consumption(
     assert not output.exists()
 
 
-def test_catalog_publication_is_transactional_on_iterator_failure(
+def test_failed_stage_is_exact_inode_quarantined_without_path_deletion(
     tmp_path: Path,
     tiny_geometry: BuildGeometry,
     staged_fixture_sources,
@@ -586,9 +951,49 @@ def test_catalog_publication_is_transactional_on_iterator_failure(
         _build(tiny_geometry, staged_fixture_sources, sources, output)
     assert not output.exists()
     assert not tuple(tmp_path.glob(".transactional.tmp-*"))
+    retained = _quarantine_entries(tmp_path)
+    assert retained
+    assert any(
+        path.is_dir() and (path / ".catalog-spool.sqlite3").is_file()
+        for path in retained
+    )
+    source = inspect.getsource(catalog_module)
+    assert "os.unlink(" not in source
+    assert "os.rmdir(" not in source
 
 
-def test_catalog_publication_never_replaces_existing_output(
+def test_exact_existing_catalog_is_verified_reused_and_loser_quarantined(
+    tmp_path: Path,
+    tiny_geometry: BuildGeometry,
+    staged_fixture_sources,
+    fixture_lane_sources,
+):
+    output = tmp_path / "existing"
+    first = _build(
+        tiny_geometry,
+        staged_fixture_sources,
+        fixture_lane_sources(),
+        output,
+    )
+    before = _quarantine_entries(tmp_path)
+    second = _build(
+        tiny_geometry,
+        staged_fixture_sources,
+        fixture_lane_sources(order="reverse"),
+        output,
+    )
+    after = _quarantine_entries(tmp_path)
+    assert second.sha256 == first.sha256
+    assert second.to_bytes() == first.to_bytes()
+    assert second.records_path.read_bytes() == first.records_path.read_bytes()
+    assert len(after) >= len(before) + 2
+    assert sorted(path.name for path in output.iterdir()) == [
+        "catalog-index.json",
+        "catalog.jsonl",
+    ]
+
+
+def test_conflicting_existing_catalog_is_preserved_and_loser_quarantined(
     tmp_path: Path,
     tiny_geometry: BuildGeometry,
     staged_fixture_sources,
@@ -598,17 +1003,21 @@ def test_catalog_publication_never_replaces_existing_output(
     output.mkdir()
     sentinel = output / "sentinel"
     sentinel.write_bytes(b"keep")
-    with pytest.raises((FileExistsError, ValueError), match="already exists|no-replace"):
+    sources = fixture_lane_sources()
+    with pytest.raises(ValueError, match="conflicting catalog winner"):
         _build(
             tiny_geometry,
             staged_fixture_sources,
-            fixture_lane_sources(),
+            sources,
             output,
         )
     assert sentinel.read_bytes() == b"keep"
+    assert all(source.started == 1 for source in sources.values())
+    retained = _quarantine_entries(tmp_path)
+    assert any(path.is_dir() for path in retained)
 
 
-def test_catalog_publication_losing_race_keeps_winner_and_cleans_candidate(
+def test_catalog_publication_losing_race_rejects_empty_winner_and_quarantines_loser(
     tmp_path: Path,
     tiny_geometry: BuildGeometry,
     staged_fixture_sources,
@@ -616,6 +1025,8 @@ def test_catalog_publication_losing_race_keeps_winner_and_cleans_candidate(
     monkeypatch: pytest.MonkeyPatch,
 ):
     output = tmp_path / "race"
+    original = catalog_module.atomic_rename_noreplace
+    lost = False
 
     def lose_race(
         source_directory_fd: int,
@@ -623,12 +1034,24 @@ def test_catalog_publication_losing_race_keeps_winner_and_cleans_candidate(
         destination_directory_fd: int,
         destination_name: str,
     ) -> None:
-        del source_directory_fd, source_name
-        os.mkdir(destination_name, mode=0o700, dir_fd=destination_directory_fd)
-        raise FileExistsError(destination_name)
+        nonlocal lost
+        if destination_name == output.name and not lost:
+            lost = True
+            os.mkdir(
+                destination_name,
+                mode=0o700,
+                dir_fd=destination_directory_fd,
+            )
+            raise FileExistsError(destination_name)
+        original(
+            source_directory_fd,
+            source_name,
+            destination_directory_fd,
+            destination_name,
+        )
 
     monkeypatch.setattr(catalog_module, "atomic_rename_noreplace", lose_race)
-    with pytest.raises((FileExistsError, ValueError), match="no-replace|already exists"):
+    with pytest.raises(ValueError, match="conflicting catalog winner"):
         _build(
             tiny_geometry,
             staged_fixture_sources,
@@ -638,6 +1061,63 @@ def test_catalog_publication_losing_race_keeps_winner_and_cleans_candidate(
     assert output.is_dir()
     assert not tuple(output.iterdir())
     assert not tuple(tmp_path.glob(".race.tmp-*"))
+    retained = _quarantine_entries(tmp_path)
+    assert any(path.is_dir() for path in retained)
+
+
+def test_sqlite_spool_namespace_swap_fails_and_preserves_both_inodes(
+    tmp_path: Path,
+    tiny_geometry: BuildGeometry,
+    staged_fixture_sources,
+    fixture_lane_sources,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    swapped = False
+
+    def swap(
+        phase: str,
+        stage_fd: int,
+        name: str,
+        pinned_fd: int,
+    ) -> None:
+        nonlocal swapped
+        del pinned_fd
+        if phase != "before_sqlite_open" or swapped:
+            return
+        swapped = True
+        os.rename(
+            name,
+            ".attacker-original-spool",
+            src_dir_fd=stage_fd,
+            dst_dir_fd=stage_fd,
+        )
+        replacement = os.open(
+            name,
+            os.O_RDWR | os.O_CREAT | os.O_EXCL,
+            0o600,
+            dir_fd=stage_fd,
+        )
+        os.close(replacement)
+
+    monkeypatch.setattr(
+        catalog_module,
+        "_spool_open_hook",
+        swap,
+        raising=False,
+    )
+    output = tmp_path / "spool-swap"
+    with pytest.raises(ValueError, match="SQLite spool.*identity"):
+        _build(
+            tiny_geometry,
+            staged_fixture_sources,
+            fixture_lane_sources(),
+            output,
+        )
+    assert not output.exists()
+    retained = _quarantine_entries(tmp_path)
+    stage = next(path for path in retained if path.is_dir())
+    assert (stage / ".attacker-original-spool").is_file()
+    assert (stage / ".catalog-spool.sqlite3").is_file()
 
 
 def test_catalog_publication_rejects_symlinked_output_parent(

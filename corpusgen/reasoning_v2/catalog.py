@@ -9,6 +9,7 @@ import re
 import secrets
 import sqlite3
 import stat
+import threading
 import unicodedata
 from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
@@ -19,7 +20,6 @@ from typing import Any, NoReturn, Protocol, cast
 from corpusgen.parallel.canonical import canonical_json_bytes, sha256_hex
 from corpusgen.parallel.safeio import (
     atomic_rename_noreplace,
-    entry_exists,
     entry_lstat,
     fsync_directory,
     list_entries,
@@ -31,7 +31,6 @@ from corpusgen.reasoning_v2.contracts import (
     LANE_ORDER,
     BuildGeometry,
     LaneId,
-    balanced_record_lengths,
 )
 from corpusgen.reasoning_v2.source_lock import (
     SourceEntry,
@@ -42,9 +41,65 @@ from corpusgen.reasoning_v2.source_lock import (
 
 
 _CATALOG_FORMAT = "memorysplit-reasoning-v2-input-catalog-v1"
+_CATALOG_QUARANTINE_DIRECTORY = ".memorysplit-catalog-quarantine-v1"
+_CATALOG_SPOOL_NAME = ".catalog-spool.sqlite3"
+_COMMIT_RE = re.compile(r"[0-9a-f]{40}\Z")
 _SHA256_RE = re.compile(r"[0-9a-f]{64}\Z")
 _SEALED_PATH_TERMS = ("evaluation", "validation", "test", "sealed", "holdout")
 _PATH_LOCATOR_KEYS = frozenset({"file", "member", "path", "source_path", "split"})
+_GENERATION_SEED_KEY = "generation_seed"
+_GENERATED_LANES = frozenset(
+    {
+        "synthetic_graph",
+        "verified_synthetic_multihop",
+    }
+)
+_LANE_SOURCE_AUTHORITY: dict[LaneId, frozenset[str]] = {
+    "fineweb_edu": frozenset({"fineweb_edu"}),
+    "finemath": frozenset({"finemath"}),
+    "wikidata_graph": frozenset({"wikidata5m"}),
+    "synthetic_graph": frozenset(
+        {
+            "deepmind_mathematics_generator",
+            "reasoning_gym_exact_answer",
+        }
+    ),
+    "verified_synthetic_multihop": frozenset(
+        {
+            "deepmind_mathematics_generator",
+            "reasoning_gym_exact_answer",
+        }
+    ),
+    "wikidata_path_reasoning": frozenset({"wikidata5m"}),
+    "relational_refinement": frozenset(
+        {
+            "clrs_text",
+            "prontoqa",
+            "reasoning_gym_exact_answer",
+            "ruletaker",
+        }
+    ),
+    "objective_auxiliary": frozenset(
+        {
+            "arc_agi_1",
+            "arc_agi_2",
+            "clrs_text",
+            "conceptarc",
+            "deepmind_mathematics_generator",
+            "prontoqa",
+            "reasoning_gym_exact_answer",
+            "ruletaker",
+        }
+    ),
+}
+_FINEWEB_TRAINING_PATHS = frozenset(
+    {
+        "sample/10BT/000_00000.parquet",
+        "sample/10BT/001_00000.parquet",
+        "sample/10BT/002_00000.parquet",
+    }
+)
+_SQLITE_OPEN_LOCK = threading.Lock()
 _RECORD_FIELDS = {
     "lane_id",
     "ordinal",
@@ -165,9 +220,68 @@ class LaneCatalogSource(Protocol):
     def iter_drafts(
         self,
         source_root: Path,
-        target_lengths: tuple[int, ...],
+        target_lengths: "TargetLengths",
     ) -> Iterator[CatalogDraft]:
         raise RuntimeError("lane source must emit deterministic drafts")
+
+
+class TargetLengths(Protocol):
+    def __len__(self) -> int: ...
+
+    def __iter__(self) -> Iterator[int]: ...
+
+    def __getitem__(self, index: int) -> int: ...
+
+
+@dataclass(frozen=True, slots=True)
+class _BalancedTargetLengths:
+    targets: int
+    context_length: int
+    record_count: int
+    longer_count: int
+    longer_length: int
+    shorter_length: int
+
+    @classmethod
+    def create(
+        cls,
+        targets: int,
+        context_length: int,
+    ) -> "_BalancedTargetLengths":
+        if type(targets) is not int or targets <= 0:
+            raise ValueError("targets must be a positive integer")
+        if type(context_length) is not int or context_length <= 0:
+            raise ValueError("context_length must be a positive integer")
+        record_count = (targets + context_length - 1) // context_length
+        shorter_length, longer_count = divmod(targets, record_count)
+        longer_length = shorter_length + (1 if longer_count else 0)
+        return cls(
+            targets=targets,
+            context_length=context_length,
+            record_count=record_count,
+            longer_count=longer_count,
+            longer_length=longer_length,
+            shorter_length=shorter_length,
+        )
+
+    def __len__(self) -> int:
+        return self.record_count
+
+    def __iter__(self) -> Iterator[int]:
+        for index in range(self.record_count):
+            yield self[index]
+
+    def __getitem__(self, index: int) -> int:
+        if type(index) is not int:
+            raise TypeError("target length index must be an integer")
+        resolved = index + self.record_count if index < 0 else index
+        if resolved < 0 or resolved >= self.record_count:
+            raise IndexError("target length index out of range")
+        return (
+            self.longer_length
+            if resolved < self.longer_count
+            else self.shorter_length
+        )
 
 
 def _byte_key(value: str) -> bytes:
@@ -365,34 +479,51 @@ def _safe_relative_path(value: str, description: str) -> str:
     return value
 
 
-def _path_marks_training(value: str) -> bool:
-    parts = tuple(part.casefold() for part in PurePosixPath(value).parts)
-    return any(
-        part in {"train", "training"} or part.startswith("train-")
-        for part in parts
-    )
+def _has_reserved_path_term(value: str) -> bool:
+    lowered = value.casefold()
+    return any(term in lowered for term in _SEALED_PATH_TERMS)
 
 
-def _reject_sealed_locators(draft: CatalogDraft) -> None:
+def _reserved_training_override(entry: SourceEntry, row: SourceFile) -> bool:
+    if entry.source_id == "fineweb_edu":
+        return row.path in _FINEWEB_TRAINING_PATHS
+    if entry.source_id == "finemath":
+        proof = entry.finemath_selection
+        return proof is not None and row.path in proof.selected_paths
+    if entry.source_id in {"arc_agi_1", "arc_agi_2"}:
+        return row.path.startswith("data/training/")
+    return False
+
+
+def _reject_sealed_locators(
+    draft: CatalogDraft,
+    *,
+    manifest_path: str,
+    reserved_training_override: bool,
+) -> None:
     for key, value in draft.source_locator:
         if key not in _PATH_LOCATOR_KEYS or type(value) is not str:
             continue
-        lowered = value.casefold()
-        if not any(term in lowered for term in _SEALED_PATH_TERMS):
+        if not _has_reserved_path_term(value):
             continue
-        if key in {"path", "source_path"} and _path_marks_training(value):
+        if (
+            key in {"path", "source_path"}
+            and value == manifest_path
+            and reserved_training_override
+        ):
             continue
         raise ValueError(f"sealed or evaluation path is forbidden: {value}")
 
 
 def _manifest_file(
     draft: CatalogDraft,
-    entries: Mapping[str, SourceEntry],
-) -> SourceFile:
-    _reject_sealed_locators(draft)
-    entry = entries.get(draft.source_id)
-    if entry is None:
-        raise ValueError(f"catalog draft references unknown source: {draft.source_id}")
+    connection: sqlite3.Connection,
+) -> None:
+    if draft.source_id not in _LANE_SOURCE_AUTHORITY[draft.lane_id]:
+        raise ValueError(
+            f"source identity is not authorized for lane {draft.lane_id}: "
+            f"{draft.source_id}"
+        )
     locator = dict(draft.source_locator)
     path_value = locator.get("path", locator.get("source_path"))
     if type(path_value) is not str:
@@ -400,20 +531,37 @@ def _manifest_file(
     if "path" in locator and "source_path" in locator:
         raise ValueError("source locator has ambiguous source paths")
     path_text = _safe_relative_path(path_value, "source locator path")
-    prefix = f"{entry.materialized_path}/"
+    materialized_row = connection.execute(
+        "SELECT materialized_path FROM source_entries WHERE source_id = ?",
+        (_byte_key(draft.source_id),),
+    ).fetchone()
+    if materialized_row is None:
+        raise ValueError(f"catalog draft references unknown source: {draft.source_id}")
+    materialized_path = bytes(materialized_row[0]).decode("utf-8")
+    prefix = f"{materialized_path}/"
     relative = path_text[len(prefix) :] if path_text.startswith(prefix) else path_text
-    by_path = {row.path: row for row in entry.files}
-    source_file = by_path.get(relative)
-    if source_file is None:
+    manifest_row = connection.execute(
+        "SELECT sha256, reserved_training_override "
+        "FROM source_files WHERE source_id = ? AND path = ?",
+        (_byte_key(draft.source_id), _byte_key(relative)),
+    ).fetchone()
+    if manifest_row is None:
         raise ValueError(
             f"source locator path is not in the verified manifest: "
             f"{draft.source_id}:{path_text}"
         )
-    if draft.source_byte_sha256 != source_file.sha256:
+    expected_sha256 = str(manifest_row[0])
+    _reject_sealed_locators(
+        draft,
+        manifest_path=relative,
+        reserved_training_override=bool(manifest_row[1]),
+    )
+    if draft.source_id == "wikidata5m" and locator.get("split") != "train":
+        raise ValueError("Wikidata source locator requires the exact training split")
+    if draft.source_byte_sha256 != expected_sha256:
         raise ValueError(
-            f"source byte hash disagreement: {draft.source_id}:{source_file.path}"
+            f"source byte hash disagreement: {draft.source_id}:{relative}"
         )
-    return source_file
 
 
 def catalog_record_id(draft: CatalogDraft, target_count: int) -> str:
@@ -496,6 +644,15 @@ def _validated_lane_sources(
             raise ValueError(f"lane source finite flag is invalid: {lane_id}")
         if not callable(getattr(source, "iter_drafts", None)):
             raise ValueError(f"lane source iterator is missing: {lane_id}")
+        if lane_id == "wikidata_graph":
+            if (
+                type(getattr(source, "training_edge_count", None)) is not int
+                or getattr(source, "training_edge_count") <= 0
+                or not callable(getattr(source, "iter_training_edge_keys", None))
+            ):
+                raise ValueError(
+                    "Wikidata graph training-edge authority is required"
+                )
         result[lane_id] = cast(LaneCatalogSource, source)
     return result
 
@@ -503,18 +660,18 @@ def _validated_lane_sources(
 def _validated_lengths(
     quotas: tuple[tuple[LaneId, int], ...],
     context_length: int,
-) -> dict[LaneId, tuple[int, ...]]:
-    result: dict[LaneId, tuple[int, ...]] = {}
+) -> dict[LaneId, _BalancedTargetLengths]:
+    result: dict[LaneId, _BalancedTargetLengths] = {}
     for lane_id, quota in quotas:
-        lengths = balanced_record_lengths(quota, context_length)
-        if type(lengths) is not tuple or not lengths:
-            raise ValueError(f"{lane_id} target lengths must be a nonempty tuple")
-        if any(
-            type(length) is not int or length <= 0 or length > context_length
-            for length in lengths
+        lengths = _BalancedTargetLengths.create(quota, context_length)
+        if (
+            len(lengths) <= 0
+            or lengths.longer_length > context_length
+            or lengths.shorter_length <= 0
+            or lengths.longer_count * lengths.longer_length
+            + (len(lengths) - lengths.longer_count) * lengths.shorter_length
+            != quota
         ):
-            raise ValueError(f"{lane_id} target lengths are invalid")
-        if sum(lengths) != quota:
             raise ValueError(f"{lane_id} target lengths do not sum to lane quota")
         result[lane_id] = lengths
     return result
@@ -672,6 +829,18 @@ def _file_identity(metadata: os.stat_result) -> tuple[int, int, int, int, int, i
     )
 
 
+def _regular_inode_identity(
+    metadata: os.stat_result,
+) -> tuple[int, int, int, int, int]:
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_uid,
+        stat.S_IMODE(metadata.st_mode),
+        metadata.st_nlink,
+    )
+
+
 def _directory_identity(metadata: os.stat_result) -> tuple[int, int, int, int]:
     return (
         metadata.st_dev,
@@ -759,9 +928,9 @@ def _records_from_jsonl(
         digest = hashlib.sha256()
         record_count = 0
         target_count = 0
-        lane_rows: dict[LaneId, list[int]] = {
-            lane_id: [] for lane_id in LANE_ORDER
-        }
+        lane_position = 0
+        lane_record_count = 0
+        lane_target_count = 0
         with os.fdopen(os.dup(descriptor), "rb") as handle:
             for raw_line in handle:
                 if not raw_line.endswith(b"\n"):
@@ -775,9 +944,26 @@ def _records_from_jsonl(
                 record = _record_from_dict(value)
                 if record.ordinal != record_count:
                     raise ValueError("catalog record ordinals are not contiguous")
+                if expected_lanes is not None:
+                    if lane_position >= len(expected_lanes):
+                        raise ValueError("catalog contains excess lane records")
+                    expected_lane = expected_lanes[lane_position]
+                    if record.lane_id != expected_lane.lane_id:
+                        raise ValueError("catalog lane order disagreement")
+                    lane_record_count += 1
+                    lane_target_count += record.target_count
+                    if lane_record_count == expected_lane.record_count:
+                        if (
+                            lane_target_count != expected_lane.target_count
+                            or expected_lane.first_ordinal
+                            != record_count - lane_record_count + 1
+                        ):
+                            raise ValueError("catalog lane index disagreement")
+                        lane_position += 1
+                        lane_record_count = 0
+                        lane_target_count = 0
                 record_count += 1
                 target_count += record.target_count
-                lane_rows[record.lane_id].append(record.target_count)
                 yield record
         after = os.fstat(descriptor)
         named_after = entry_lstat(parent_fd, name)
@@ -799,16 +985,12 @@ def _records_from_jsonl(
         ):
             raise ValueError("catalog target count disagreement")
         if expected_lanes is not None:
-            first = 0
-            for lane in expected_lanes:
-                values = lane_rows[lane.lane_id]
-                if (
-                    lane.first_ordinal != first
-                    or lane.record_count != len(values)
-                    or lane.target_count != sum(values)
-                ):
-                    raise ValueError("catalog lane index disagreement")
-                first += len(values)
+            if (
+                lane_position != len(expected_lanes)
+                or lane_record_count != 0
+                or lane_target_count != 0
+            ):
+                raise ValueError("catalog lane index disagreement")
     except OSError as error:
         raise ValueError("catalog records are missing or unsafe") from error
     finally:
@@ -878,6 +1060,117 @@ def _verify_regular_at(
         raise ValueError(f"catalog artifact content drift: {name}")
 
 
+def _read_regular_at(
+    directory_fd: int,
+    name: str,
+    description: str,
+) -> bytes:
+    named = entry_lstat(directory_fd, name)
+    _require_owned_regular(named, description)
+    descriptor, opened = open_regular_file_at(directory_fd, name)
+    chunks = []
+    try:
+        _require_owned_regular(opened, description)
+        if _file_identity(named) != _file_identity(opened):
+            raise ValueError(f"{description} identity drift")
+        while True:
+            chunk = os.read(descriptor, 1 << 20)
+            if not chunk:
+                break
+            chunks.append(chunk)
+        after = os.fstat(descriptor)
+        named_after = entry_lstat(directory_fd, name)
+        if (
+            _file_identity(after) != _file_identity(opened)
+            or _file_identity(named_after) != _file_identity(opened)
+            or os.read(descriptor, 1)
+        ):
+            raise ValueError(f"{description} identity drift")
+    finally:
+        os.close(descriptor)
+    payload = b"".join(chunks)
+    if len(payload) != opened.st_size:
+        raise ValueError(f"{description} size drift")
+    return payload
+
+
+def _catalog_result(
+    output_root: Path,
+    source_lock_sha256: str,
+    records_sha256: str,
+    record_count: int,
+    target_count: int,
+    lanes: tuple[CatalogLaneIndex, ...],
+) -> InputCatalog:
+    return InputCatalog(
+        root=output_root,
+        records_path=output_root / "catalog.jsonl",
+        index_path=output_root / "catalog-index.json",
+        source_lock_sha256=source_lock_sha256,
+        sha256=records_sha256,
+        record_count=record_count,
+        target_count=target_count,
+        lanes=lanes,
+    )
+
+
+def _verify_exact_catalog_winner(
+    parent_fd: int,
+    final_name: str,
+    output_root: Path,
+    *,
+    expected_index_bytes: bytes,
+    expected_records_bytes: int,
+    expected_records_sha256: str,
+    source_lock_sha256: str,
+    record_count: int,
+    target_count: int,
+    lanes: tuple[CatalogLaneIndex, ...],
+) -> InputCatalog:
+    winner_fd = -1
+    try:
+        winner_fd, _created = open_directory_at(parent_fd, final_name)
+        opened = os.fstat(winner_fd)
+        named = entry_lstat(parent_fd, final_name)
+        _require_owned_directory(opened, "catalog winner")
+        winner_identity = _directory_identity(opened)
+        if _directory_identity(named) != winner_identity:
+            raise ValueError("catalog winner identity drift")
+        if list_entries(winner_fd) != ("catalog-index.json", "catalog.jsonl"):
+            raise ValueError("catalog winner file inventory differs")
+        winner_index = _read_regular_at(
+            winner_fd,
+            "catalog-index.json",
+            "catalog winner index",
+        )
+        if winner_index != expected_index_bytes:
+            raise ValueError("catalog winner index differs")
+        _verify_regular_at(
+            winner_fd,
+            "catalog.jsonl",
+            expected_bytes=expected_records_bytes,
+            expected_sha256=expected_records_sha256,
+        )
+        if _directory_identity(os.fstat(winner_fd)) != winner_identity:
+            raise ValueError("catalog winner identity drift")
+        named_after = entry_lstat(parent_fd, final_name)
+        if _directory_identity(named_after) != winner_identity:
+            raise ValueError("catalog winner identity drift")
+        return _catalog_result(
+            output_root,
+            source_lock_sha256,
+            expected_records_sha256,
+            record_count,
+            target_count,
+            lanes,
+        )
+    except (FileNotFoundError, OSError, ValueError) as error:
+        raise ValueError(f"conflicting catalog winner: {output_root}") from error
+    finally:
+        if winner_fd >= 0:
+            os.close(winner_fd)
+
+
 def _new_stage(
     parent_fd: int,
     final_name: str,
@@ -902,48 +1195,251 @@ def _new_stage(
     raise FileExistsError("could not allocate private catalog candidate")
 
 
-def _cleanup_stage(
+def _open_catalog_quarantine(
+    parent_fd: int,
+) -> tuple[int, tuple[int, int, int, int]]:
+    quarantine_fd, _created = open_directory_at(
+        parent_fd,
+        _CATALOG_QUARANTINE_DIRECTORY,
+        create=True,
+        mode=0o700,
+    )
+    metadata = os.fstat(quarantine_fd)
+    named = entry_lstat(parent_fd, _CATALOG_QUARANTINE_DIRECTORY)
+    _require_owned_directory(metadata, "catalog quarantine directory")
+    identity = _directory_identity(metadata)
+    if _directory_identity(named) != identity:
+        os.close(quarantine_fd)
+        raise ValueError("catalog quarantine directory identity drift")
+    return quarantine_fd, identity
+
+
+def _quarantine_stage(
     parent_fd: int,
     stage_name: str,
     stage_fd: int,
     stage_identity: tuple[int, int, int, int],
-) -> None:
+    quarantine_fd: int,
+) -> str:
     opened = os.fstat(stage_fd)
     named = entry_lstat(parent_fd, stage_name)
     if (
         _directory_identity(opened) != stage_identity
         or _directory_identity(named) != stage_identity
     ):
-        raise ValueError("private catalog candidate cleanup identity drift")
-    for name in list_entries(stage_fd):
-        metadata = entry_lstat(stage_fd, name)
-        _require_owned_regular(metadata, f"private catalog candidate {name}")
-        descriptor, opened_file = open_regular_file_at(stage_fd, name)
+        raise ValueError("private catalog candidate quarantine identity drift")
+    quarantine_name = ""
+    for _attempt in range(16):
+        candidate = f"stage-{secrets.token_hex(16)}"
         try:
-            if _file_identity(metadata) != _file_identity(opened_file):
-                raise ValueError(
-                    f"private catalog candidate file identity drift: {name}"
-                )
-        finally:
-            os.close(descriptor)
-        current = entry_lstat(stage_fd, name)
-        if _file_identity(current) != _file_identity(metadata):
-            raise ValueError(
-                f"private catalog candidate file identity drift: {name}"
+            atomic_rename_noreplace(
+                parent_fd,
+                stage_name,
+                quarantine_fd,
+                candidate,
             )
-        os.unlink(name, dir_fd=stage_fd)
-    fsync_directory(stage_fd)
-    if list_entries(stage_fd):
-        raise ValueError("private catalog candidate cleanup is incomplete")
-    os.rmdir(stage_name, dir_fd=parent_fd)
+        except FileExistsError:
+            continue
+        quarantine_name = candidate
+        break
+    if not quarantine_name:
+        raise FileExistsError("could not allocate catalog stage quarantine")
     fsync_directory(parent_fd)
+    fsync_directory(quarantine_fd)
+    quarantined_fd, _created = open_directory_at(
+        quarantine_fd,
+        quarantine_name,
+    )
+    try:
+        quarantined = os.fstat(quarantined_fd)
+        named_quarantined = entry_lstat(quarantine_fd, quarantine_name)
+        pinned_after = os.fstat(stage_fd)
+        if (
+            _directory_identity(quarantined) != stage_identity
+            or _directory_identity(named_quarantined) != stage_identity
+            or _directory_identity(pinned_after) != stage_identity
+        ):
+            raise ValueError("quarantined catalog stage identity drift")
+    finally:
+        os.close(quarantined_fd)
+    return quarantine_name
 
 
-def _create_spool(database_path: Path) -> sqlite3.Connection:
-    connection = sqlite3.connect(str(database_path))
+def _quarantine_spool(
+    stage_fd: int,
+    spool_name: str,
+    spool_fd: int,
+    spool_identity: tuple[int, int, int, int, int],
+    quarantine_fd: int,
+) -> str:
+    opened = os.fstat(spool_fd)
+    named = entry_lstat(stage_fd, spool_name)
+    if (
+        _regular_inode_identity(opened) != spool_identity
+        or _regular_inode_identity(named) != spool_identity
+    ):
+        raise ValueError("SQLite spool quarantine identity drift")
+    quarantine_name = ""
+    for _attempt in range(16):
+        candidate = f"spool-{secrets.token_hex(16)}.sqlite3"
+        try:
+            atomic_rename_noreplace(
+                stage_fd,
+                spool_name,
+                quarantine_fd,
+                candidate,
+            )
+        except FileExistsError:
+            continue
+        quarantine_name = candidate
+        break
+    if not quarantine_name:
+        raise FileExistsError("could not allocate SQLite spool quarantine")
+    fsync_directory(stage_fd)
+    fsync_directory(quarantine_fd)
+    quarantined_fd, quarantined = open_regular_file_at(
+        quarantine_fd,
+        quarantine_name,
+    )
+    try:
+        named_quarantined = entry_lstat(quarantine_fd, quarantine_name)
+        pinned_after = os.fstat(spool_fd)
+        if (
+            _regular_inode_identity(quarantined) != spool_identity
+            or _regular_inode_identity(named_quarantined) != spool_identity
+            or _regular_inode_identity(pinned_after) != spool_identity
+        ):
+            raise ValueError("quarantined SQLite spool identity drift")
+    finally:
+        os.close(quarantined_fd)
+    return quarantine_name
+
+
+def _spool_open_hook(
+    phase: str,
+    stage_fd: int,
+    name: str,
+    pinned_fd: int,
+) -> None:
+    del phase, stage_fd, name, pinned_fd
+
+
+@dataclass
+class _PinnedSpool:
+    connection: sqlite3.Connection
+    descriptor: int
+    identity: tuple[int, int, int, int, int]
+    name: str
+
+    def close_connection(self, stage_fd: int) -> None:
+        if self.connection is None:
+            return
+        quick_check = self.connection.execute("PRAGMA quick_check").fetchone()
+        if quick_check != ("ok",):
+            raise ValueError("SQLite spool integrity check failed")
+        self.connection.commit()
+        self.connection.close()
+        self.connection = cast(sqlite3.Connection, None)
+        pinned = os.fstat(self.descriptor)
+        named = entry_lstat(stage_fd, self.name)
+        if (
+            _regular_inode_identity(pinned) != self.identity
+            or _regular_inode_identity(named) != self.identity
+        ):
+            raise ValueError("SQLite spool identity drift after use")
+
+    def abort_connection(self) -> None:
+        if self.connection is not None:
+            self.connection.close()
+            self.connection = cast(sqlite3.Connection, None)
+
+    def close_descriptor(self) -> None:
+        if self.descriptor >= 0:
+            os.close(self.descriptor)
+            self.descriptor = -1
+
+
+def _create_spool(stage_fd: int) -> _PinnedSpool:
+    descriptor = os.open(
+        _CATALOG_SPOOL_NAME,
+        os.O_RDWR
+        | os.O_CREAT
+        | os.O_EXCL
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0),
+        0o600,
+        dir_fd=stage_fd,
+    )
+    connection: sqlite3.Connection | None = None
+    try:
+        pinned = os.fstat(descriptor)
+        named = entry_lstat(stage_fd, _CATALOG_SPOOL_NAME)
+        _require_owned_regular(pinned, "SQLite spool")
+        identity = _regular_inode_identity(pinned)
+        if _regular_inode_identity(named) != identity:
+            raise ValueError("SQLite spool identity drift before open")
+        _spool_open_hook(
+            "before_sqlite_open",
+            stage_fd,
+            _CATALOG_SPOOL_NAME,
+            descriptor,
+        )
+        named_before_open = entry_lstat(stage_fd, _CATALOG_SPOOL_NAME)
+        if _regular_inode_identity(named_before_open) != identity:
+            raise ValueError("SQLite spool namespace identity drift before open")
+        cwd_fd = os.open(
+            ".",
+            os.O_RDONLY
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_DIRECTORY", 0),
+        )
+        try:
+            with _SQLITE_OPEN_LOCK:
+                os.fchdir(stage_fd)
+                try:
+                    connection = sqlite3.connect(
+                        f"file:{_CATALOG_SPOOL_NAME}?mode=rw",
+                        uri=True,
+                    )
+                finally:
+                    os.fchdir(cwd_fd)
+        finally:
+            os.close(cwd_fd)
+        _spool_open_hook(
+            "after_sqlite_open",
+            stage_fd,
+            _CATALOG_SPOOL_NAME,
+            descriptor,
+        )
+        named_after_open = entry_lstat(stage_fd, _CATALOG_SPOOL_NAME)
+        if (
+            _regular_inode_identity(os.fstat(descriptor)) != identity
+            or _regular_inode_identity(named_after_open) != identity
+        ):
+            raise ValueError("SQLite spool namespace identity drift after open")
+    except BaseException:
+        if connection is not None:
+            connection.close()
+        os.close(descriptor)
+        raise
     connection.execute("PRAGMA journal_mode=OFF")
     connection.execute("PRAGMA synchronous=OFF")
     connection.execute("PRAGMA temp_store=FILE")
+    connection.execute(
+        "CREATE TABLE source_entries ("
+        "source_id BLOB NOT NULL PRIMARY KEY, "
+        "materialized_path BLOB NOT NULL"
+        ") WITHOUT ROWID"
+    )
+    connection.execute(
+        "CREATE TABLE source_files ("
+        "source_id BLOB NOT NULL, "
+        "path BLOB NOT NULL, "
+        "sha256 TEXT NOT NULL, "
+        "reserved_training_override INTEGER NOT NULL, "
+        "PRIMARY KEY (source_id, path)"
+        ") WITHOUT ROWID"
+    )
     connection.execute(
         "CREATE TABLE drafts ("
         "lane_rank INTEGER NOT NULL, "
@@ -967,11 +1463,128 @@ def _create_spool(database_path: Path) -> sqlite3.Connection:
     )
     connection.execute(
         "CREATE TABLE generated_seeds ("
-        "seed_key BLOB NOT NULL PRIMARY KEY, "
+        "seed INTEGER NOT NULL PRIMARY KEY, "
         "record_id BLOB NOT NULL"
         ") WITHOUT ROWID"
     )
-    return connection
+    connection.execute(
+        "CREATE TABLE wikidata_training_edges ("
+        "edge_key BLOB NOT NULL PRIMARY KEY, "
+        "seen_before_revisit INTEGER NOT NULL DEFAULT 0, "
+        "seen_total INTEGER NOT NULL DEFAULT 0"
+        ") WITHOUT ROWID"
+    )
+    return _PinnedSpool(
+        connection=connection,
+        descriptor=descriptor,
+        identity=identity,
+        name=_CATALOG_SPOOL_NAME,
+    )
+
+
+def _spool_source_authority(
+    connection: sqlite3.Connection,
+    source_lock: SourceLock,
+) -> None:
+    for entry in source_lock.sources:
+        connection.execute(
+            "INSERT INTO source_entries(source_id, materialized_path) "
+            "VALUES (?, ?)",
+            (
+                _byte_key(entry.source_id),
+                _byte_key(entry.materialized_path),
+            ),
+        )
+        for row in entry.files:
+            connection.execute(
+                "INSERT INTO source_files("
+                "source_id, path, sha256, reserved_training_override"
+                ") VALUES (?, ?, ?, ?)",
+                (
+                    _byte_key(entry.source_id),
+                    _byte_key(row.path),
+                    row.sha256,
+                    int(_reserved_training_override(entry, row)),
+                ),
+            )
+    connection.commit()
+
+
+def _spool_wikidata_training_edge_authority(
+    connection: sqlite3.Connection,
+    source: LaneCatalogSource,
+    source_root: Path,
+) -> int:
+    expected_count = getattr(source, "training_edge_count")
+    try:
+        iterator = iter(source.iter_training_edge_keys(source_root))
+    except Exception as error:
+        raise ValueError(
+            "Wikidata graph training-edge authority failed to start"
+        ) from error
+    for emitted in range(expected_count):
+        try:
+            edge_key = next(iterator)
+        except StopIteration as error:
+            raise ValueError(
+                "Wikidata graph training-edge authority ended early"
+            ) from error
+        except Exception as error:
+            raise ValueError(
+                "Wikidata graph training-edge authority failed"
+            ) from error
+        edge_key = _require_nfc_string(edge_key, "Wikidata training edge key")
+        try:
+            connection.execute(
+                "INSERT INTO wikidata_training_edges(edge_key) VALUES (?)",
+                (_byte_key(edge_key),),
+            )
+        except sqlite3.IntegrityError as error:
+            raise ValueError(
+                f"duplicate Wikidata training edge authority: {edge_key}"
+            ) from error
+    try:
+        next(iterator)
+    except StopIteration:
+        pass
+    except Exception as error:
+        raise ValueError(
+            "Wikidata graph training-edge authority failed"
+        ) from error
+    else:
+        raise ValueError(
+            "Wikidata graph training-edge authority exceeds declared count"
+        )
+    connection.commit()
+    return expected_count
+
+
+def _generation_seed(draft: CatalogDraft) -> int | None:
+    seed_keys = tuple(
+        key for key, _value in draft.source_locator if "seed" in key.casefold()
+    )
+    values = dict(draft.source_locator)
+    if draft.lane_id in _GENERATED_LANES:
+        if seed_keys != (_GENERATION_SEED_KEY,):
+            if not seed_keys:
+                raise ValueError(
+                    f"generation seed is required for lane {draft.lane_id}"
+                )
+            raise ValueError(
+                f"generation seed must use canonical key "
+                f"{_GENERATION_SEED_KEY!r}"
+            )
+        seed = values[_GENERATION_SEED_KEY]
+        if type(seed) is not int or seed < 0 or seed >= 1 << 63:
+            raise ValueError(
+                "generation seed must be a non-negative signed 64-bit integer"
+            )
+        return seed
+    if seed_keys:
+        raise ValueError(
+            f"non-generated lane {draft.lane_id} must not carry a seed"
+        )
+    return None
 
 
 def _spool_fact_metadata(
@@ -997,8 +1610,7 @@ def _spool_drafts(
     connection: sqlite3.Connection,
     lane_sources: Mapping[LaneId, LaneCatalogSource],
     source_root: Path,
-    lengths_by_lane: Mapping[LaneId, tuple[int, ...]],
-    entries: Mapping[str, SourceEntry],
+    lengths_by_lane: Mapping[LaneId, _BalancedTargetLengths],
 ) -> None:
     for lane_rank, lane_id in enumerate(LANE_ORDER):
         source = lane_sources[lane_id]
@@ -1024,7 +1636,8 @@ def _spool_drafts(
                     f"lane source emitted the wrong lane: "
                     f"expected={lane_id}, actual={draft.lane_id}"
                 )
-            _manifest_file(draft, entries)
+            _manifest_file(draft, connection)
+            _generation_seed(draft)
             for fact in draft.semantic_facts:
                 _spool_fact_metadata(connection, fact)
             try:
@@ -1044,24 +1657,18 @@ def _spool_drafts(
         connection.commit()
 
 
-def _seed_key(draft: CatalogDraft) -> bytes | None:
+def _wikidata_training_edge_key(draft: CatalogDraft) -> str:
     values = dict(draft.source_locator)
-    if "seed" not in values:
-        return None
-    return canonical_json_bytes(
-        {
-            "lane_id": draft.lane_id,
-            "seed": values["seed"],
-            "source_id": draft.source_id,
-        }
+    return _require_nfc_string(
+        values.get("training_edge_key"),
+        "Wikidata catalog training edge key",
     )
 
 
 def _write_records(
     connection: sqlite3.Connection,
     descriptor: int,
-    lengths_by_lane: Mapping[LaneId, tuple[int, ...]],
-    lane_sources: Mapping[LaneId, LaneCatalogSource],
+    lengths_by_lane: Mapping[LaneId, _BalancedTargetLengths],
 ) -> tuple[str, int, int, tuple[CatalogLaneIndex, ...]]:
     digest = hashlib.sha256()
     byte_count = 0
@@ -1070,7 +1677,6 @@ def _write_records(
     for lane_rank, lane_id in enumerate(LANE_ORDER):
         first_ordinal = ordinal
         lengths = lengths_by_lane[lane_id]
-        graph_training_keys: list[str] = []
         graph_revisit_seen = False
         rows = connection.execute(
             "SELECT payload FROM drafts "
@@ -1096,13 +1702,13 @@ def _write_records(
                 )
             except sqlite3.IntegrityError as error:
                 raise ValueError(f"duplicate catalog record ID: {record_id}") from error
-            seed_key = _seed_key(draft)
-            if seed_key is not None:
+            generation_seed = _generation_seed(draft)
+            if generation_seed is not None:
                 try:
                     connection.execute(
-                        "INSERT INTO generated_seeds(seed_key, record_id) "
+                        "INSERT INTO generated_seeds(seed, record_id) "
                         "VALUES (?, ?)",
-                        (seed_key, _byte_key(record_id)),
+                        (generation_seed, _byte_key(record_id)),
                     )
                 except sqlite3.IntegrityError as error:
                     raise ValueError(
@@ -1110,15 +1716,54 @@ def _write_records(
                         f"{draft.source_key}"
                     ) from error
             if lane_id == "wikidata_graph":
+                edge_key = _wikidata_training_edge_key(draft)
+                edge_row = connection.execute(
+                    "SELECT seen_before_revisit FROM wikidata_training_edges "
+                    "WHERE edge_key = ?",
+                    (_byte_key(edge_key),),
+                ).fetchone()
+                if edge_row is None:
+                    raise ValueError(
+                        f"Wikidata catalog edge is outside training authority: "
+                        f"{edge_key}"
+                    )
                 revisit = "graph-revisit" in draft.semantic_flags
                 if revisit:
+                    if not graph_revisit_seen:
+                        authority_count = connection.execute(
+                            "SELECT COUNT(*) FROM wikidata_training_edges"
+                        ).fetchone()[0]
+                        covered_count = connection.execute(
+                            "SELECT COUNT(*) FROM wikidata_training_edges "
+                            "WHERE seen_before_revisit = 1"
+                        ).fetchone()[0]
+                        if covered_count != authority_count:
+                            raise ValueError(
+                                "Wikidata graph must cover every training edge "
+                                "exactly once before the first revisit"
+                            )
                     graph_revisit_seen = True
+                    connection.execute(
+                        "UPDATE wikidata_training_edges "
+                        "SET seen_total = seen_total + 1 WHERE edge_key = ?",
+                        (_byte_key(edge_key),),
+                    )
                 elif graph_revisit_seen:
                     raise ValueError(
                         "Wikidata training edge appears after graph revisit"
                     )
                 else:
-                    graph_training_keys.append(draft.source_key)
+                    if int(edge_row[0]) != 0:
+                        raise ValueError(
+                            f"Wikidata training edge must appear exactly once "
+                            f"before revisit: {edge_key}"
+                        )
+                    connection.execute(
+                        "UPDATE wikidata_training_edges "
+                        "SET seen_before_revisit = 1, seen_total = seen_total + 1 "
+                        "WHERE edge_key = ?",
+                        (_byte_key(edge_key),),
+                    )
             record = CatalogRecord(
                 ordinal=ordinal,
                 record_id=record_id,
@@ -1140,24 +1785,18 @@ def _write_records(
         if local_count != len(lengths):
             raise LaneQuotaShortfall(lane_id, len(lengths), local_count)
         if lane_id == "wikidata_graph":
-            expected = getattr(
-                lane_sources[lane_id],
-                "training_edge_keys",
-                None,
-            )
-            if expected is not None:
-                if type(expected) not in {tuple, frozenset, set}:
-                    raise ValueError(
-                        "Wikidata training edge keys must be a finite collection"
-                    )
-                expected_keys = set(expected)
-                if any(type(key) is not str for key in expected_keys):
-                    raise ValueError("Wikidata training edge key type drift")
-                if set(graph_training_keys) != expected_keys:
-                    raise ValueError(
-                        "Wikidata graph does not cover every training edge "
-                        "before revisit"
-                    )
+            authority_count = connection.execute(
+                "SELECT COUNT(*) FROM wikidata_training_edges"
+            ).fetchone()[0]
+            covered_count = connection.execute(
+                "SELECT COUNT(*) FROM wikidata_training_edges "
+                "WHERE seen_before_revisit = 1"
+            ).fetchone()[0]
+            if covered_count != authority_count:
+                raise ValueError(
+                    "Wikidata graph does not cover every training edge "
+                    "exactly once before revisit"
+                )
         lanes.append(
             CatalogLaneIndex(
                 lane_id=lane_id,
@@ -1176,10 +1815,21 @@ def build_input_catalog(
     source_root: Path,
     lane_sources: Mapping[LaneId, LaneCatalogSource],
     output_root: Path,
+    *,
+    expected_generator_commit: str,
 ) -> InputCatalog:
     quotas = _validate_geometry(geometry)
     if not isinstance(source_lock, SourceLock):
         raise TypeError("source_lock must be a SourceLock")
+    if (
+        type(expected_generator_commit) is not str
+        or _COMMIT_RE.fullmatch(expected_generator_commit) is None
+    ):
+        raise ValueError(
+            "expected generator commit must be a lowercase 40-character commit"
+        )
+    if source_lock.generator_commit != expected_generator_commit:
+        raise ValueError("source lock generator commit does not match authority")
     if not isinstance(source_root, Path):
         raise TypeError("source_root must be a pathlib.Path")
     if not isinstance(output_root, Path):
@@ -1194,17 +1844,15 @@ def build_input_catalog(
     verify_source_tree(
         source_lock,
         source_root,
-        expected_generator_commit=source_lock.generator_commit,
+        expected_generator_commit=expected_generator_commit,
     )
-    entries = {entry.source_id: entry for entry in source_lock.sources}
-
     parent_fd = -1
+    quarantine_fd = -1
     stage_fd = -1
     records_fd = -1
-    connection: sqlite3.Connection | None = None
+    spool: _PinnedSpool | None = None
     stage_name = ""
     stage_identity: tuple[int, int, int, int] | None = None
-    published = False
     try:
         parent_fd, final_name = open_parent_directory(
             output_root,
@@ -1213,20 +1861,22 @@ def build_input_catalog(
         )
         parent_metadata = os.fstat(parent_fd)
         _require_owned_directory(parent_metadata, "catalog output parent")
-        if entry_exists(parent_fd, final_name):
-            raise FileExistsError(
-                f"catalog output already exists; no-replace publication required: "
-                f"{output_root}"
-            )
+        quarantine_fd, _quarantine_identity = _open_catalog_quarantine(
+            parent_fd
+        )
         stage_name, stage_fd, stage_identity = _new_stage(parent_fd, final_name)
-        stage_path = output_root.parent / stage_name
-        connection = _create_spool(stage_path / ".catalog-spool.sqlite3")
+        spool = _create_spool(stage_fd)
+        _spool_source_authority(spool.connection, source_lock)
+        _spool_wikidata_training_edge_authority(
+            spool.connection,
+            sources["wikidata_graph"],
+            source_root,
+        )
         _spool_drafts(
-            connection,
+            spool.connection,
             sources,
             source_root,
             lengths_by_lane,
-            entries,
         )
 
         records_fd = _open_new_regular(stage_fd, "catalog.jsonl")
@@ -1236,10 +1886,9 @@ def build_input_catalog(
             record_count,
             lanes,
         ) = _write_records(
-            connection,
+            spool.connection,
             records_fd,
             lengths_by_lane,
-            sources,
         )
         os.fsync(records_fd)
         os.close(records_fd)
@@ -1254,7 +1903,7 @@ def build_input_catalog(
         verify_source_tree(
             source_lock,
             source_root,
-            expected_generator_commit=source_lock.generator_commit,
+            expected_generator_commit=expected_generator_commit,
         )
         if tuple((lane.lane_id, lane.target_count) for lane in lanes) != quotas:
             raise ValueError("catalog lane target counts disagree with geometry")
@@ -1286,10 +1935,16 @@ def build_input_catalog(
             expected_sha256=sha256_hex(index_bytes),
         )
 
-        connection.close()
-        connection = None
-        os.unlink(".catalog-spool.sqlite3", dir_fd=stage_fd)
-        fsync_directory(stage_fd)
+        spool.close_connection(stage_fd)
+        _quarantine_spool(
+            stage_fd,
+            spool.name,
+            spool.descriptor,
+            spool.identity,
+            quarantine_fd,
+        )
+        spool.close_descriptor()
+        spool = None
         if list_entries(stage_fd) != ("catalog-index.json", "catalog.jsonl"):
             raise ValueError("private catalog candidate inventory drift")
         current_stage = os.fstat(stage_fd)
@@ -1307,63 +1962,78 @@ def build_input_catalog(
                 parent_fd,
                 final_name,
             )
-        except FileExistsError as error:
-            raise FileExistsError(
-                f"catalog no-replace publication lost race: {output_root}"
-            ) from error
+        except FileExistsError:
+            winner = _verify_exact_catalog_winner(
+                parent_fd,
+                final_name,
+                output_root,
+                expected_index_bytes=index_bytes,
+                expected_records_bytes=records_bytes,
+                expected_records_sha256=records_sha256,
+                source_lock_sha256=source_lock.sha256,
+                record_count=record_count,
+                target_count=target_count,
+                lanes=lanes,
+            )
+            _quarantine_stage(
+                parent_fd,
+                stage_name,
+                stage_fd,
+                stage_identity,
+                quarantine_fd,
+            )
+            stage_name = ""
+            return winner
+        stage_name = ""
         fsync_directory(parent_fd)
         final_named = entry_lstat(parent_fd, final_name)
         if _directory_identity(final_named) != stage_identity:
             raise ValueError("published catalog identity drift")
-        stage_name = ""
-        published = True
-        return InputCatalog(
-            root=output_root,
-            records_path=output_root / "catalog.jsonl",
-            index_path=output_root / "catalog-index.json",
-            source_lock_sha256=source_lock.sha256,
-            sha256=records_sha256,
-            record_count=record_count,
-            target_count=target_count,
-            lanes=lanes,
+        return _catalog_result(
+            output_root,
+            source_lock.sha256,
+            records_sha256,
+            record_count,
+            target_count,
+            lanes,
         )
     except BaseException as build_error:
-        cleanup_error: BaseException | None = None
-        if connection is not None:
-            connection.close()
-            connection = None
         if records_fd >= 0:
             os.close(records_fd)
             records_fd = -1
+        if spool is not None:
+            spool.abort_connection()
         if (
-            not published
-            and parent_fd >= 0
+            parent_fd >= 0
+            and quarantine_fd >= 0
             and stage_fd >= 0
             and stage_name
             and stage_identity is not None
         ):
             try:
-                _cleanup_stage(
+                _quarantine_stage(
                     parent_fd,
                     stage_name,
                     stage_fd,
                     stage_identity,
+                    quarantine_fd,
                 )
                 stage_name = ""
-            except BaseException as error:
-                cleanup_error = error
-        if cleanup_error is not None:
-            raise ValueError(
-                "catalog build failed and private candidate cleanup failed"
-            ) from build_error
+            except BaseException as quarantine_error:
+                raise ValueError(
+                    "catalog build failed and exact-inode stage quarantine failed"
+                ) from build_error
         raise
     finally:
-        if connection is not None:
-            connection.close()
         if records_fd >= 0:
             os.close(records_fd)
+        if spool is not None:
+            spool.abort_connection()
+            spool.close_descriptor()
         if stage_fd >= 0:
             os.close(stage_fd)
+        if quarantine_fd >= 0:
+            os.close(quarantine_fd)
         if parent_fd >= 0:
             os.close(parent_fd)
 
