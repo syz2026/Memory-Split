@@ -17,6 +17,7 @@ from corpusgen.reasoning_expansion import (
     TaskSpec,
     _compile_extension,
     _ExactSubsetAccumulator,
+    _PrefetchingRecordGenerator,
     _probe_generator,
     load_expansion_recipe,
 )
@@ -65,8 +66,11 @@ def test_reasoning_v3_recipe_is_integral_and_additive():
     assert recipe.extension_updates == 2000
     assert recipe.composite_tokens == recipe.base_tokens + recipe.extension_tokens
     assert recipe.composite_updates == 15_582
-    assert len(recipe.tasks) == 16
-    assert len({task.dataset for task in recipe.tasks}) == 16
+    assert len(recipe.tasks) == 14
+    assert len({task.dataset for task in recipe.tasks}) == 14
+    assert {"ransom_note", "largest_island", "count_primes"} <= {
+        task.dataset for task in recipe.tasks
+    }
 
 
 def test_exact_subset_returns_source_ordered_solution():
@@ -85,10 +89,12 @@ def test_exact_subset_returns_source_ordered_solution():
 
 def test_tiny_extension_hits_exact_horizon_without_padding(tmp_path):
     path = tmp_path / "targets.bin"
+    manifest_path = tmp_path / "manifest.bin"
     report = _compile_extension(
         _tiny_recipe(),
         _FixtureGenerator(),
         path,
+        manifest_path,
         finish_window=80,
         max_finish_candidates=256,
     )
@@ -98,9 +104,36 @@ def test_tiny_extension_hits_exact_horizon_without_padding(tmp_path):
     assert report["record_count"] > 0
     assert sum(item["emitted_tokens"] for item in report["task_stats"]) == 1000
     assert all(item["emitted_records"] > 0 for item in report["task_stats"])
+    assert {item["target_quota"] for item in report["task_stats"]} == {500}
+    assert manifest_path.stat().st_size == report["manifest_bytes"]
     assert (
         hashlib.sha256(path.read_bytes()).hexdigest() == report["packed_stream_sha256"]
     )
+
+
+def test_prefetch_preserves_serial_task_streams():
+    recipe = _tiny_recipe()
+    expected = {
+        task.dataset: [
+            _FixtureGenerator().generate(task.dataset, index)
+            for index in range(37)
+        ]
+        for task in recipe.tasks
+    }
+    with _PrefetchingRecordGenerator(
+        _FixtureGenerator(),
+        recipe.tasks,
+        batch_size=8,
+    ) as generator:
+        actual = {
+            task.dataset: [
+                generator.generate(task.dataset, index)
+                for index in range(37)
+            ]
+            for task in reversed(recipe.tasks)
+        }
+
+    assert actual == expected
 
 
 @pytest.mark.skipif(

@@ -13,98 +13,40 @@
   },
   "contract_id": "memorysplit-reasoning-dataset-v3",
   "extension": {
-    "format": "memorysplit-reasoning-extension-v1",
+    "format": "memorysplit-reasoning-extension-v2",
     "max_record_tokens": 1024,
     "raw_target_tokens": 1048576000,
     "tasks": [
       {
         "config": {
-          "allow_reuse": true,
-          "max_inputs": 5,
-          "max_terms": 7,
-          "min_inputs": 2,
-          "min_terms": 4,
-          "neg_prob": 0.35
+          "max_cycle_length": 7,
+          "max_num_courses": 18,
+          "max_num_prerequisites": 3,
+          "min_cycle_length": 3,
+          "min_num_courses": 10,
+          "min_num_prerequisites": 1,
+          "p_solvable": 0.5
         },
-        "dataset": "circuit_logic",
-        "module": "logic.circuit_logic",
-        "weight": 1
-      },
-      {
-        "config": {},
-        "dataset": "self_reference",
-        "module": "logic.self_reference",
-        "weight": 1
-      },
-      {
-        "config": {},
-        "dataset": "syllogism",
-        "module": "logic.syllogisms",
-        "weight": 1
-      },
-      {
-        "config": {},
-        "dataset": "family_relationships",
-        "module": "graphs.family_relationships",
-        "weight": 1
-      },
-      {
-        "config": {},
         "dataset": "course_schedule",
         "module": "graphs.course_schedule",
         "weight": 1
       },
       {
-        "config": {},
-        "dataset": "largest_island",
-        "module": "graphs.largest_island",
-        "weight": 1
-      },
-      {
-        "config": {},
-        "dataset": "path_star",
-        "module": "graphs.path_star",
-        "weight": 1
-      },
-      {
         "config": {
-          "height": 30,
-          "max_rectangles": 12,
-          "width": 30
-        },
-        "dataset": "rectangle_count",
-        "module": "cognition.rectangle_count",
-        "weight": 1
-      },
-      {
-        "config": {
-          "max_divisor": 17,
-          "max_holes": 5,
-          "max_target": 9,
-          "size_x": 12,
-          "size_y": 12
-        },
-        "dataset": "modulo_grid",
-        "module": "cognition.modulo_grid",
-        "weight": 1
-      },
-      {
-        "config": {
-          "max_string_len": 12,
-          "max_substring_palindrome_len": 5,
-          "min_string_len": 7,
-          "min_substring_palindrome_len": 1
-        },
-        "dataset": "palindrome_partitioning",
-        "module": "algorithmic.palindrome_partitioning",
-        "weight": 1
-      },
-      {
-        "config": {
-          "max_n": 20,
+          "max_n": 14,
           "min_n": 10,
-          "p_oranges": 0.85,
-          "p_rotten": 0.1
+          "p_zero": 0.15
+        },
+        "dataset": "binary_matrix",
+        "module": "algorithmic.binary_matrix",
+        "weight": 1
+      },
+      {
+        "config": {
+          "max_n": 18,
+          "min_n": 12,
+          "p_oranges": 0.9,
+          "p_rotten": 0.06
         },
         "dataset": "rotten_oranges",
         "module": "algorithmic.rotten_oranges",
@@ -112,38 +54,120 @@
       },
       {
         "config": {
-          "max_disks": 6,
-          "max_pegs": 4,
-          "min_disks": 4,
-          "min_pegs": 3,
-          "visualize": false
+          "max_board_size": 4,
+          "max_difficulty": 3,
+          "min_board_size": 4,
+          "min_difficulty": 2
         },
-        "dataset": "tower_of_hanoi",
-        "module": "games.tower_of_hanoi",
+        "dataset": "futoshiki",
+        "module": "games.futoshiki",
         "weight": 1
       },
       {
-        "config": {},
-        "dataset": "mahjong_puzzle",
-        "module": "games.mahjong",
+        "config": {
+          "max_magazine_length": 200,
+          "max_note_length": 80,
+          "min_magazine_length": 81,
+          "min_note_length": 20,
+          "p_solvable": 0.5
+        },
+        "dataset": "ransom_note",
+        "module": "algorithmic.ransom_note",
         "weight": 1
       },
       {
-        "config": {},
-        "dataset": "quantum_lock",
-        "module": "graphs.quantum_lock",
+        "config": {
+          "max_dice_size": 50,
+          "num_dice": 7
+        },
+        "dataset": "dice",
+        "module": "arithmetic.dice",
         "weight": 1
       },
       {
-        "config": {},
-        "dataset": "kakurasu",
-        "module": "games.kakurasu",
+        "config": {
+          "max_initial_machines": 300,
+          "max_iterations": 1050,
+          "min_initial_machines": 20
+        },
+        "dataset": "string_splitting",
+        "module": "algorithmic.string_splitting",
         "weight": 1
       },
       {
-        "config": {},
-        "dataset": "mini_sudoku",
-        "module": "games.mini_sudoku",
+        "config": {
+          "degree": 4,
+          "max_path_length": 8,
+          "min_path_length": 4,
+          "node_range": 1000000000,
+          "reversed": false
+        },
+        "dataset": "path_star",
+        "module": "graphs.path_star",
+        "weight": 1
+      },
+      {
+        "config": {
+          "max_cols": 18,
+          "max_island_size": 20,
+          "max_num_islands": 8,
+          "max_rows": 18,
+          "min_cols": 12,
+          "min_island_size": 4,
+          "min_num_islands": 3,
+          "min_rows": 12
+        },
+        "dataset": "largest_island",
+        "module": "graphs.largest_island",
+        "weight": 1
+      },
+      {
+        "config": {
+          "max_n": 10,
+          "max_rotations": 3,
+          "min_n": 8,
+          "min_rotations": 1
+        },
+        "dataset": "rotate_matrix",
+        "module": "algorithmic.rotate_matrix",
+        "weight": 1
+      },
+      {
+        "config": {
+          "max_n": 16,
+          "min_n": 8
+        },
+        "dataset": "spiral_matrix",
+        "module": "algorithmic.spiral_matrix",
+        "weight": 1
+      },
+      {
+        "config": {
+          "max_value": 50000000,
+          "min_value": 100000
+        },
+        "dataset": "prime_factorization",
+        "module": "arithmetic.prime_factorization",
+        "weight": 1
+      },
+      {
+        "config": {
+          "max_base": 36,
+          "max_value": 1000000000000,
+          "min_base": 2,
+          "min_value": 0
+        },
+        "dataset": "base_conversion",
+        "module": "algorithmic.base_conversion",
+        "weight": 1
+      },
+      {
+        "config": {
+          "max_n": 100000,
+          "min_n": 1000
+        },
+        "dataset": "count_primes",
+        "module": "algorithmic.count_primes",
         "weight": 1
       }
     ],
@@ -155,7 +179,16 @@
     "staged_relative_path": "objective_auxiliary/reasoning_gym_exact_answer/reasoning_gym",
     "version": "0.1.19"
   },
-  "schema_version": 1,
+  "runtime_lock": {
+    "byteorder": "little",
+    "python_cache_tag": "cpython-312",
+    "python_hash_seed": "0",
+    "python_implementation": "CPython",
+    "python_version": "3.12.3",
+    "tiktoken_version": "0.13.0",
+    "tokenizer_sha256": "96edc08ae20a0e7d545d3fab086eefe17e9908db6c8722085ff2521074c54126"
+  },
+  "schema_version": 2,
   "scientific_scope": {
     "may_replace_frozen_v2_n10_dataset": false,
     "status": "successor_exploratory_unpreregistered",
