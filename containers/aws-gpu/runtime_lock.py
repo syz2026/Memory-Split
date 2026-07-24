@@ -384,6 +384,88 @@ def _hash_map(value: object, *, label: str) -> None:
             _sha256(item, label=f"{label}.{key}")
 
 
+def _file_commitments(value: object, *, label: str) -> list[dict[str, str]]:
+    if not isinstance(value, list) or not value:
+        raise RuntimeArtifactError(f"{label} must be a nonempty file list")
+    paths: list[str] = []
+    for item in value:
+        if not isinstance(item, dict) or set(item) != {
+            "path",
+            "type",
+            "commitment_sha256",
+        }:
+            raise RuntimeArtifactError(f"{label} file fields do not match schema")
+        if (
+            not isinstance(item["path"], str)
+            or not item["path"].startswith("/")
+            or item["type"] not in {"regular", "symlink", "directory"}
+        ):
+            raise RuntimeArtifactError(f"{label} file identity is invalid")
+        _sha256(item["commitment_sha256"], label=f"{label} file")
+        paths.append(item["path"])
+    if paths != sorted(set(paths)):
+        raise RuntimeArtifactError(f"{label} files are not unique and sorted")
+    return value
+
+
+def _os_package_inventory(value: object) -> None:
+    if not isinstance(value, dict) or set(value) != {
+        "manager",
+        "database_root",
+        "database_files",
+        "database_tree_sha256",
+        "packages",
+        "package_count",
+    }:
+        raise RuntimeArtifactError("runtime SBOM OS inventory fields do not match")
+    if (
+        value["manager"] != "dpkg"
+        or value["database_root"] != "/var/lib/dpkg"
+        or not isinstance(value["packages"], list)
+        or not value["packages"]
+        or type(value["package_count"]) is not int
+        or value["package_count"] != len(value["packages"])
+    ):
+        raise RuntimeArtifactError("runtime SBOM OS inventory identity is invalid")
+    database_files = _file_commitments(
+        value["database_files"],
+        label="runtime SBOM dpkg database",
+    )
+    if value["database_tree_sha256"] != hashlib.sha256(
+        canonical_json(database_files)
+    ).hexdigest():
+        raise RuntimeArtifactError("runtime SBOM dpkg database hash is invalid")
+    names: list[str] = []
+    for package in value["packages"]:
+        if not isinstance(package, dict) or set(package) != {
+            "name",
+            "version",
+            "architecture",
+            "status",
+            "installed_files",
+            "installed_files_sha256",
+        }:
+            raise RuntimeArtifactError("runtime SBOM OS package fields do not match")
+        name = package["name"]
+        if (
+            not isinstance(name, str)
+            or not name
+            or package["status"] != "ii"
+        ):
+            raise RuntimeArtifactError("runtime SBOM OS package name is invalid")
+        names.append(name)
+        files = _file_commitments(
+            package["installed_files"],
+            label=f"runtime SBOM OS package {name}",
+        )
+        if package["installed_files_sha256"] != hashlib.sha256(
+            canonical_json(files)
+        ).hexdigest():
+            raise RuntimeArtifactError("runtime SBOM OS package hash is invalid")
+    if names != sorted(set(names)):
+        raise RuntimeArtifactError("runtime SBOM OS packages are not sorted")
+
+
 def parse_runtime_sbom_bytes(data: bytes) -> dict[str, object]:
     """Parse the closed full runtime SBOM emitted beside the legacy lock."""
 
@@ -422,6 +504,7 @@ def parse_runtime_sbom_bytes(data: bytes) -> dict[str, object]:
     if not isinstance(project["packages"], list):
         raise RuntimeArtifactError("runtime SBOM dependency packages must be a list")
     dependency_names: list[str] = []
+    dependency_bindings: dict[str, tuple[str, set[str]]] = {}
     for package in project["packages"]:
         if not isinstance(package, dict) or set(package) != {
             "name",
@@ -435,7 +518,7 @@ def parse_runtime_sbom_bytes(data: bytes) -> dict[str, object]:
         if not isinstance(name, str) or not name:
             raise RuntimeArtifactError("runtime SBOM dependency name is invalid")
         dependency_names.append(name)
-        _fixed_version(
+        version = _fixed_version(
             package["version"],
             label=f"runtime SBOM dependency {name}",
         )
@@ -444,6 +527,7 @@ def parse_runtime_sbom_bytes(data: bytes) -> dict[str, object]:
             raise RuntimeArtifactError("runtime SBOM dependency hashes are empty")
         for digest in hashes:
             _sha256(digest, label=f"runtime SBOM dependency {name} hash")
+        dependency_bindings[name] = (version, set(hashes))
     if dependency_names != sorted(set(dependency_names)):
         raise RuntimeArtifactError("runtime SBOM dependency packages are not sorted")
 
@@ -487,6 +571,7 @@ def parse_runtime_sbom_bytes(data: bytes) -> dict[str, object]:
         "image_digest",
         "versions",
         "os_release",
+        "os_packages",
         "python",
         "installed_python_packages",
         "inventory_method",
@@ -525,11 +610,15 @@ def parse_runtime_sbom_bytes(data: bytes) -> dict[str, object]:
         container["os_release"]
     ) != {"id", "version_id", "pretty_name"}:
         raise RuntimeArtifactError("runtime SBOM OS release is invalid")
+    _os_package_inventory(container["os_packages"])
     if not isinstance(container["python"], dict) or set(container["python"]) != {
         "implementation",
         "version",
+        "executable",
     }:
         raise RuntimeArtifactError("runtime SBOM Python identity is invalid")
+    if container["python"]["executable"] != "/opt/conda/bin/python":
+        raise RuntimeArtifactError("runtime SBOM did not use the pinned DLC Python")
     installed = container["installed_python_packages"]
     if (
         not isinstance(installed, list)
@@ -539,14 +628,18 @@ def parse_runtime_sbom_bytes(data: bytes) -> dict[str, object]:
     ):
         raise RuntimeArtifactError("runtime SBOM installed inventory is invalid")
     installed_names: list[str] = []
+    installed_project_names: set[str] = set()
     for package in installed:
         if not isinstance(package, dict) or set(package) != {
             "name",
             "version",
             "installer",
-            "archive_sha256",
-            "record_sha256",
-            "wheel_metadata_sha256",
+            "provenance",
+            "metadata_file_sha256",
+            "record_file_sha256",
+            "wheel_file_sha256",
+            "installed_files",
+            "installed_files_sha256",
         }:
             raise RuntimeArtifactError(
                 "runtime SBOM installed package fields do not match schema"
@@ -559,15 +652,66 @@ def parse_runtime_sbom_bytes(data: bytes) -> dict[str, object]:
             package["version"],
             label=f"runtime SBOM installed {name}",
         )
-        for field in (
-            "archive_sha256",
-            "record_sha256",
-            "wheel_metadata_sha256",
+        provenance = package["provenance"]
+        if not isinstance(provenance, dict) or provenance.get("kind") not in {
+            "project-wheel",
+            "inherited-base-image",
+        }:
+            raise RuntimeArtifactError(
+                f"runtime SBOM installed {name} provenance is invalid"
+            )
+        if provenance["kind"] == "project-wheel":
+            if set(provenance) != {"kind", "archive_sha256"}:
+                raise RuntimeArtifactError("runtime SBOM wheel provenance is open")
+            _sha256(
+                provenance["archive_sha256"],
+                label=f"runtime SBOM installed {name} archive",
+            )
+            expected = dependency_bindings.get(name)
+            if (
+                expected is None
+                or expected[0] != package["version"]
+                or provenance["archive_sha256"] not in expected[1]
+            ):
+                raise RuntimeArtifactError(
+                    f"runtime SBOM project archive differs from lock: {name}"
+                )
+            installed_project_names.add(name)
+        elif (
+            set(provenance) != {"kind", "base_image_digest"}
+            or provenance["base_image_digest"] != container["base_image_digest"]
         ):
-            digest = package[field]
-            if digest is not None:
-                _sha256(digest, label=f"runtime SBOM installed {name} {field}")
-    if installed_names != sorted(set(installed_names)) or "torch" not in installed_names:
+            raise RuntimeArtifactError("runtime SBOM base provenance is invalid")
+        metadata_hashes: list[str] = []
+        for field in (
+            "metadata_file_sha256",
+            "record_file_sha256",
+            "wheel_file_sha256",
+        ):
+            metadata_hashes.append(
+                _sha256(
+                    package[field],
+                    label=f"runtime SBOM installed {name} {field}",
+                )
+            )
+        files = _file_commitments(
+            package["installed_files"],
+            label=f"runtime SBOM installed {name}",
+        )
+        if (
+            package["installed_files_sha256"]
+            != hashlib.sha256(canonical_json(files)).hexdigest()
+            or not set(metadata_hashes)
+            <= {item["commitment_sha256"] for item in files}
+        ):
+            raise RuntimeArtifactError(
+                f"runtime SBOM installed {name} file hash is invalid"
+            )
+    if (
+        installed_names != sorted(set(installed_names))
+        or "torch" not in installed_names
+        or installed_project_names != set(dependency_bindings)
+    ):
         raise RuntimeArtifactError(
             "runtime SBOM installed inventory is incomplete or unsorted"
         )
@@ -687,6 +831,7 @@ def produce_runtime_artifacts(
             "image_digest": binding["container_image_digest"],
             "versions": dict(container_versions),
             "os_release": dict(inspection["os_release"]),
+            "os_packages": dict(inspection["os_packages"]),
             "python": dict(inspection["python"]),
             "installed_python_packages": list(
                 inspection["installed_python_packages"]

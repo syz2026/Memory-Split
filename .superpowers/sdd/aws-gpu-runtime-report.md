@@ -5,7 +5,8 @@
 DONE on `feat/aws-gpu-runtime-build`, based exactly on
 `b3471e0969ca2a997d33acf60d2e777720afa1c4`. The original implementation is
 `c70f4cead3b1c921bfac931ac9033ef29f8b7d36`; this report includes the
-pinned-runtime review fixes layered on that commit.
+pinned-runtime review fixes in `213bf0b4ee69dac6b9997163f75740019d40c274`
+and the second re-review fixes layered on that commit.
 
 ## Delivered
 
@@ -32,6 +33,9 @@ pinned-runtime review fixes layered on that commit.
   `--pull never`, `--gpus all`, a read-only root, and the exact digest. Python
   3.12, PyTorch 2.9.0, CUDA 13.0, cuDNN, NCCL, and inherited entrypoint/CMD
   must remain exact.
+- Every framework and inventory probe uses `/opt/conda/bin/python`. Apply
+  separately proves that executable exists in the base, local, and final
+  digest images; `/usr/bin/python3` cannot supply container evidence.
 - Added the immutable host candidate
   `ami-0260c4d597dcc8641` / owner `898082745236`, its supplied CUDA 13.2,
   driver 595.71.05, kernel 6.17, EFA 1.47.0, and OFI-NCCL 1.18.0 facts, and the
@@ -44,10 +48,17 @@ pinned-runtime review fixes layered on that commit.
   Manager, Docker, NVIDIA runtime, AWS CLI, CUDA toolkit, kernel, EFA, and
   OFI-NCCL remain host measurements.
 - The selected-profile evidence contract rejects P5/P6 mixing, requires eight
-  exact H100 or B300 identities, and independently checks the official P6-B300
-  CUDA 13.0, R580, kernel 6.1, EFA 1.44.0, and OFI-NCCL 1.17.1 floors.
+  identical approved H100 or B300 identities, and independently checks the
+  official P6-B300 CUDA 13.0, R580, kernel 6.1, EFA 1.44.0, OFI-NCCL 1.17.1,
+  and NVLSM R580 floors.
   P6-B300 requires Base DLAMI `ami-0260c4d597dcc8641`, owner `898082745236`;
   framework DLAMI `ami-0b39828e6910b0bb8` is rejected.
+- P6 evidence measures `/usr/bin/nvlsm --version` and requires the driver,
+  Fabric Manager, and NVLSM branches to agree. Missing, below-floor, and forged
+  NVLink-manager evidence fail closed.
+- One shared launcher-facing product-name contract permits only
+  `NVIDIA H100 80GB` and `NVIDIA H100 80GB HBM3` for P5, and only
+  `NVIDIA B300` for P6. Prefixes, arbitrary suffixes, and mixed names fail.
 - Replaced the dependency-only “SBOM” with a closed tool-produced inspection
   contract. It binds base/final image digests, OS release, Python runtime,
   complete installed Python inventory (including inherited DLC packages),
@@ -55,6 +66,13 @@ pinned-runtime review fixes layered on that commit.
   pip report, dependency-lock provenance, build/source/command provenance,
   inherited entrypoint, and runtime-lock hash. Runtime-lock bytes still
   round-trip through the current `parse_runtime_lock_bytes`.
+- Inspection schema v2 inventories every fully installed dpkg package, every
+  dpkg database file, every package-owned path, every Python distribution, and
+  every RECORD-listed path with type-aware content commitments. It records
+  exact METADATA, RECORD, and WHEEL file hashes. Project wheels carry the exact
+  pip-report archive hash; inherited DLC distributions carry the immutable
+  base-image digest and installed-file commitments, never a null or mislabeled
+  archive hash.
 
 ## TDD Evidence
 
@@ -84,16 +102,27 @@ pinned-runtime review fixes layered on that commit.
 - Closed SBOM parser, supported-host pin, explicit full-inventory method,
   pre-apply repository check, and final local image-ID verification each had a
   focused RED followed by GREEN.
+- DLC Python RED: selected attestation failed because no exact interpreter
+  existence/probe API existed; GREEN: 11 focused build/inspection/attestation
+  tests. The pinned inspector shebang had its own RED then GREEN.
+- H100-name RED: 2 failures for the absent shared allowed-name API; GREEN: 7
+  acceptance, prefix, mixing, parser, and cross-profile tests.
+- NVLSM RED: 3 failures for absent evidence/floor handling; GREEN: 9 measured,
+  below-floor, missing, forged, and parser tests.
+- SBOM v2 RED: 6 failures for absent dpkg/file/provenance closure; GREEN: 6
+  focused inspection/build/runtime tests. A forged project archive had an
+  independent RED then passed after lock cross-checking.
 
 ## Verification
 
 ```text
-241 passed in 22.86s
+387 passed in 78.48s
 ```
 
 The focused command covered `tests/test_aws_gpu_runtime.py`,
 `tests/test_aws_environment_receipt.py`, `tests/test_aws_contract_roundtrip.py`,
-`tests/test_aws_canary.py`, and `tests/test_aws_p5_profile.py`.
+`tests/test_aws_canary.py`, `tests/test_aws_p5_profile.py`, and
+`tests/test_aws_p5_launcher.py`.
 
 - Changed-file `python -m py_compile`: passed.
 - `git diff --check`: passed.
@@ -137,3 +166,5 @@ Modified for the review fix:
   `/opt/amazon/efa_installed_packages` and
   `/opt/amazon/ofi-nccl/lib/libnccl-net.so`. Their exact presence remains a live
   Base-DLAMI qualification check.
+- `/usr/bin/nvlsm` and the complete dpkg/Python inventories are fixture-tested
+  offline; their real Base-DLAMI output remains part of deferred qualification.

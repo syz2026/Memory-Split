@@ -31,7 +31,9 @@ from msctl.aws_contracts import (
     AWS_GPU_ATTESTATION_EVIDENCE_V1_FIELDS,
     AWS_RUNTIME_LOCK_FIELDS,
     AWS_RUNTIME_VERSION_FIELDS,
+    allowed_gpu_product_names,
     validate_digest_pinned_oci_image,
+    validate_gpu_product_names,
 )
 
 
@@ -39,6 +41,7 @@ PROVIDER = "aws-p5.48xlarge"
 PROFILE_ID = PROFILE_ID_V3
 RECEIPT_TYPE = "memorysplit-aws-environment-v2"
 GPU_EVIDENCE_TYPE = "memorysplit-aws-gpu-attestation-v1"
+CONTAINER_PYTHON = "/opt/conda/bin/python"
 IMDS_DOCUMENT_PATH = "/latest/dynamic/instance-identity/document"
 IMDS_PKCS7_PATH = "/latest/dynamic/instance-identity/pkcs7"
 TRUSTED_PYTHON_BINARY = "/usr/bin/python3"
@@ -128,6 +131,7 @@ SELECTED_HOST_VERSION_COMMANDS = {
         "/usr/bin/strings",
         "/opt/amazon/ofi-nccl/lib/libnccl-net.so",
     ),
+    "nvlsm": ("/usr/bin/nvlsm", "--version"),
 }
 _CONTAINER_FACT_FIELDS = {"python", "pytorch", "cuda", "cudnn", "nccl"}
 _SELECTED_HOST_FACT_FIELDS = set(SELECTED_HOST_VERSION_COMMANDS)
@@ -144,6 +148,7 @@ _P6_FLOORS = {
     "kernel": "6.1",
     "efa": "1.44.0",
     "ofi_nccl": "1.17.1",
+    "nvlsm": "580.0",
 }
 _CONTAINER_FACT_SCRIPT = (
     "import json,platform,torch;"
@@ -708,12 +713,32 @@ def container_facts_argv(image: str) -> tuple[str, ...]:
         "--workdir",
         "/",
         "--entrypoint",
-        "/usr/bin/python3",
+        CONTAINER_PYTHON,
         image,
         "-I",
         "-P",
         "-c",
         _CONTAINER_FACT_SCRIPT,
+    )
+
+
+def container_python_exists_argv(image: str) -> tuple[str, ...]:
+    """Verify the exact AWS DLC Python exists without pulling the image."""
+
+    return (
+        "/usr/bin/docker",
+        "run",
+        "--rm",
+        "--network",
+        "none",
+        "--pull",
+        "never",
+        "--read-only",
+        "--entrypoint",
+        "/usr/bin/test",
+        image,
+        "-x",
+        CONTAINER_PYTHON,
     )
 
 
@@ -926,6 +951,26 @@ def _require_floor(actual: object, minimum: str, *, label: str) -> None:
         raise AttestationError(f"{label} is below the official P6-B300 floor")
 
 
+def _validate_p6_host_floors(host_facts: Mapping[str, object]) -> None:
+    for field, minimum in _P6_FLOORS.items():
+        _require_floor(
+            host_facts[field],
+            minimum,
+            label=f"P6-B300 host {field}",
+        )
+    branches = {
+        _version_tuple(
+            host_facts[field],
+            label=f"P6-B300 host {field}",
+        )[0]
+        for field in ("nvidia_driver", "fabric_manager", "nvlsm")
+    }
+    if len(branches) != 1:
+        raise AttestationError(
+            "P6-B300 driver, Fabric Manager, and NVLSM branches are not coherent"
+        )
+
+
 def _selected_profile_values(profile: object) -> dict[str, object]:
     fields = {
         name: getattr(profile, name, None)
@@ -964,6 +1009,13 @@ def _selected_profile_values(profile: object) -> dict[str, object]:
         or _SHA256_RE.fullmatch(fields["sha256"]) is None
     ):
         raise AttestationError("selected GPU profile identity is not supported")
+    try:
+        allowed_names = allowed_gpu_product_names(profile_id)
+    except ValueError as error:
+        raise AttestationError("selected GPU profile has no name contract") from error
+    if fields["gpu_model"] not in allowed_names:
+        raise AttestationError("selected GPU model is outside its name contract")
+    fields["allowed_gpu_names"] = allowed_names
     if profile_id == _P6_PROFILE_ID:
         supplied_floors = dict(getattr(profile, "software_floors", ()))
         expected_floors = {
@@ -971,6 +1023,7 @@ def _selected_profile_values(profile: object) -> dict[str, object]:
             "efa": "1.44.0",
             "kernel": "6.1",
             "nvidia_driver": "R580",
+            "nvlink": "R580",
             "ofi_nccl": "1.17.1",
         }
         if any(
@@ -1001,7 +1054,7 @@ def _selected_runtime_facts(
     command_reader: object,
     lock: Mapping[str, object],
     profile: Mapping[str, object],
-) -> tuple[dict[str, str], dict[str, str]]:
+) -> tuple[dict[str, str], dict[str, str], str]:
     run = getattr(command_reader, "run", None)
     if not callable(run):
         raise AttestationError("selected GPU command reader is unavailable")
@@ -1023,11 +1076,16 @@ def _selected_runtime_facts(
         ]
     except UnicodeDecodeError as error:
         raise AttestationError("GPU identity output is not UTF-8") from error
-    if (
-        len(gpu_names) != profile["allocated_gpus"]
-        or any(name != profile["gpu_model"] for name in gpu_names)
-    ):
-        raise AttestationError("measured GPU identity differs from selected profile")
+    try:
+        measured_gpu_name = validate_gpu_product_names(
+            profile["profile_id"],
+            gpu_names,
+            expected_count=profile["allocated_gpus"],
+        )
+    except ValueError as error:
+        raise AttestationError(
+            "measured GPU identity differs from selected profile"
+        ) from error
 
     image = str(lock["container_image"])
     inspect_output = _run_selected_command(
@@ -1046,6 +1104,11 @@ def _selected_runtime_facts(
     ):
         raise AttestationError("exact digest-pinned container is not present locally")
 
+    _run_selected_command(
+        run,
+        container_python_exists_argv(image),
+        label="pinned DLC Python existence",
+    )
     container_output = _run_selected_command(
         run,
         container_facts_argv(image),
@@ -1065,12 +1128,7 @@ def _selected_runtime_facts(
         for field in sorted(_CONTAINER_FACT_FIELDS)
     }
     if profile["profile_id"] == _P6_PROFILE_ID:
-        for field, minimum in _P6_FLOORS.items():
-            _require_floor(
-                host_facts[field],
-                minimum,
-                label=f"P6-B300 host {field}",
-            )
+        _validate_p6_host_floors(host_facts)
     expected_lock_versions = {
         **normalized_container,
         "nvidia_driver": host_facts["nvidia_driver"],
@@ -1083,7 +1141,7 @@ def _selected_runtime_facts(
         raise AttestationError(
             "measured host/container versions drift from the runtime lock"
         )
-    return host_facts, normalized_container
+    return host_facts, normalized_container, measured_gpu_name
 
 
 def parse_gpu_evidence_bytes(data: bytes) -> dict[str, object]:
@@ -1153,15 +1211,20 @@ def parse_gpu_evidence_bytes(data: bytes) -> dict[str, object]:
         or evidence["gpu_count"] != 8
     ):
         raise AttestationError("GPU evidence duplicated identities are inconsistent")
-    expected_profile = {
-        "aws-p5.48xlarge-v3": (
-            "aws-p5.48xlarge",
-            "NVIDIA H100 80GB",
-        ),
-        _P6_PROFILE_ID: (_P6_PROVIDER, _P6_GPU_MODEL),
+    expected_provider = {
+        "aws-p5.48xlarge-v3": "aws-p5.48xlarge",
+        _P6_PROFILE_ID: _P6_PROVIDER,
     }[evidence["profile_id"]]
+    try:
+        validate_gpu_product_names(
+            evidence["profile_id"],
+            [evidence["gpu_model"]] * 8,
+            expected_count=8,
+        )
+    except ValueError as error:
+        raise AttestationError("GPU evidence profile identity is inconsistent") from error
     if (
-        (evidence["provider"], evidence["gpu_model"]) != expected_profile
+        evidence["provider"] != expected_provider
         or not isinstance(evidence["ami_owner_id"], str)
         or re.fullmatch(r"[0-9]{12}", evidence["ami_owner_id"]) is None
     ):
@@ -1172,12 +1235,7 @@ def parse_gpu_evidence_bytes(data: bytes) -> dict[str, object]:
             or evidence["ami_owner_id"] != _P6_AMI_OWNER_ID
         ):
             raise AttestationError("GPU evidence is not the supported P6-B300 tuple")
-        for field, minimum in _P6_FLOORS.items():
-            _require_floor(
-                host_facts[field],
-                minimum,
-                label=f"P6-B300 host {field}",
-            )
+        _validate_p6_host_floors(host_facts)
     boot_id = evidence["boot_id"]
     if not isinstance(boot_id, str) or _UUID_RE.fullmatch(boot_id) is None:
         raise AttestationError("GPU evidence boot ID is invalid")
@@ -1492,7 +1550,7 @@ def attest_selected_gpu_environment(
     if _UUID_RE.fullmatch(boot_id) is None:
         raise AttestationError("kernel boot ID is not a lowercase UUID")
 
-    host_facts, container_facts = _selected_runtime_facts(
+    host_facts, container_facts, measured_gpu_name = _selected_runtime_facts(
         command_reader or SubprocessCommandReader(),
         lock,
         profile,
@@ -1512,7 +1570,7 @@ def attest_selected_gpu_environment(
         "ami_id": lock["ami_id"],
         "ami_owner_id": lock["ami_owner_id"],
         "instance_type": profile["instance_type"],
-        "gpu_model": profile["gpu_model"],
+        "gpu_model": measured_gpu_name,
         "gpu_count": profile["allocated_gpus"],
         "host_facts": host_facts,
         "container_facts": container_facts,

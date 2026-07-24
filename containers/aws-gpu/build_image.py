@@ -19,6 +19,7 @@ from typing import Protocol
 PLATFORM = "linux/amd64"
 DEFAULT_DOCKER_BINARY = "/usr/bin/docker"
 DEFAULT_GIT_BINARY = "/usr/bin/git"
+DLC_PYTHON = "/opt/conda/bin/python"
 BASE_REGISTRY = (
     "763104351884.dkr.ecr.us-east-1.amazonaws.com/pytorch-training"
 )
@@ -50,6 +51,8 @@ _PLAN_FIELDS = {
 }
 _COMMAND_FIELDS = {
     "build",
+    "python_base",
+    "python_local",
     "inspect_base",
     "inspect_local",
     "facts_base",
@@ -306,6 +309,28 @@ def final_image_inspect_argv(
     return image_inspect_argv(image, docker_binary=docker_binary)
 
 
+def container_python_exists_argv(
+    image: str,
+    *,
+    docker_binary: str = DEFAULT_DOCKER_BINARY,
+) -> tuple[str, ...]:
+    return (
+        docker_binary,
+        "run",
+        "--rm",
+        "--network",
+        "none",
+        "--pull",
+        "never",
+        "--read-only",
+        "--entrypoint",
+        "/usr/bin/test",
+        image,
+        "-x",
+        DLC_PYTHON,
+    )
+
+
 def container_facts_argv(
     image: str,
     *,
@@ -329,7 +354,7 @@ def container_facts_argv(
         "--workdir",
         "/",
         "--entrypoint",
-        "/usr/bin/python3",
+        DLC_PYTHON,
         image,
         "-I",
         "-P",
@@ -361,7 +386,7 @@ def container_inspection_argv(
         "--workdir",
         "/",
         "--entrypoint",
-        "/usr/bin/python3",
+        DLC_PYTHON,
         image,
         "-I",
         "-P",
@@ -628,6 +653,18 @@ def render_build_plan(
                 staging_tag,
                 root,
             ],
+            "python_base": list(
+                container_python_exists_argv(
+                    BASE_IMAGE,
+                    docker_binary=executable,
+                )
+            ),
+            "python_local": list(
+                container_python_exists_argv(
+                    staging_tag,
+                    docker_binary=executable,
+                )
+            ),
             "inspect_base": list(
                 image_inspect_argv(BASE_IMAGE, docker_binary=executable)
             ),
@@ -719,6 +756,12 @@ def _validated_plan(plan: object) -> dict[str, object]:
             staging_tag,
             root,
         ],
+        "python_base": list(
+            container_python_exists_argv(BASE_IMAGE, docker_binary=executable)
+        ),
+        "python_local": list(
+            container_python_exists_argv(staging_tag, docker_binary=executable)
+        ),
         "inspect_base": list(
             image_inspect_argv(BASE_IMAGE, docker_binary=executable)
         ),
@@ -871,6 +914,90 @@ def _dependency_lock_packages(data: bytes) -> dict[str, tuple[str, set[str]]]:
     return packages
 
 
+def _file_commitments(value: object, *, label: str) -> list[dict[str, str]]:
+    if not isinstance(value, list) or not value:
+        raise BuildPlanError(f"{label} must be a nonempty file commitment list")
+    paths: list[str] = []
+    for item in value:
+        if not isinstance(item, dict) or set(item) != {
+            "path",
+            "type",
+            "commitment_sha256",
+        }:
+            raise BuildPlanError(f"{label} file fields are not closed")
+        if (
+            not isinstance(item["path"], str)
+            or not item["path"].startswith("/")
+            or item["type"] not in {"regular", "symlink", "directory"}
+            or not isinstance(item["commitment_sha256"], str)
+            or re.fullmatch(r"[0-9a-f]{64}", item["commitment_sha256"])
+            is None
+        ):
+            raise BuildPlanError(f"{label} file commitment is invalid")
+        paths.append(item["path"])
+    if paths != sorted(set(paths)):
+        raise BuildPlanError(f"{label} files are not unique and sorted")
+    return value
+
+
+def _os_package_inventory(value: object) -> None:
+    if not isinstance(value, dict) or set(value) != {
+        "manager",
+        "database_root",
+        "database_files",
+        "database_tree_sha256",
+        "packages",
+        "package_count",
+    }:
+        raise BuildPlanError("OS package inventory fields are not closed")
+    if (
+        value["manager"] != "dpkg"
+        or value["database_root"] != "/var/lib/dpkg"
+        or not isinstance(value["packages"], list)
+        or not value["packages"]
+        or type(value["package_count"]) is not int
+        or value["package_count"] != len(value["packages"])
+    ):
+        raise BuildPlanError("OS package inventory identity is invalid")
+    database_files = _file_commitments(
+        value["database_files"],
+        label="dpkg database",
+    )
+    if value["database_tree_sha256"] != hashlib.sha256(
+        canonical_json(database_files)
+    ).hexdigest():
+        raise BuildPlanError("dpkg database commitment is invalid")
+    names: list[str] = []
+    for package in value["packages"]:
+        if not isinstance(package, dict) or set(package) != {
+            "name",
+            "version",
+            "architecture",
+            "status",
+            "installed_files",
+            "installed_files_sha256",
+        }:
+            raise BuildPlanError("OS package fields are not closed")
+        name = package["name"]
+        if (
+            not isinstance(name, str)
+            or not name
+            or package["status"] != "ii"
+        ):
+            raise BuildPlanError("OS package name is invalid")
+        names.append(name)
+        files = _file_commitments(
+            package["installed_files"],
+            label=f"OS package {name}",
+        )
+        if package["installed_files_sha256"] != hashlib.sha256(
+            canonical_json(files)
+        ).hexdigest():
+            raise BuildPlanError("OS package file commitment is invalid")
+    if names != sorted(set(names)):
+        raise BuildPlanError("OS packages are not unique and sorted")
+
+
 def _inspection_artifact(
     data: bytes,
     *,
@@ -882,6 +1009,7 @@ def _inspection_artifact(
         "schema_version",
         "artifact_type",
         "os_release",
+        "os_packages",
         "python",
         "container_facts",
         "installed_python_packages",
@@ -892,14 +1020,15 @@ def _inspection_artifact(
         raise BuildPlanError("container inspection artifact is not closed canonical JSON")
     if (
         type(value["schema_version"]) is not int
-        or value["schema_version"] != 1
-        or value["artifact_type"] != "memorysplit-container-inspection-v1"
+        or value["schema_version"] != 2
+        or value["artifact_type"] != "memorysplit-container-inspection-v2"
         or value["container_facts"] != dict(expected_facts)
         or not isinstance(value["os_release"], dict)
         or set(value["os_release"]) != {"id", "version_id", "pretty_name"}
         or not isinstance(value["python"], dict)
-        or set(value["python"]) != {"implementation", "version"}
+        or set(value["python"]) != {"implementation", "version", "executable"}
         or value["python"]["version"] != expected_facts["python"]
+        or value["python"]["executable"] != DLC_PYTHON
         or not isinstance(value["installed_python_packages"], list)
         or value["inventory_method"] != "importlib.metadata.distributions"
         or type(value["installed_distribution_count"]) is not int
@@ -913,33 +1042,76 @@ def _inspection_artifact(
         is None
     ):
         raise BuildPlanError("container inspection artifact identity is invalid")
+    _os_package_inventory(value["os_packages"])
     installed: dict[str, dict[str, object]] = {}
     for package in value["installed_python_packages"]:
         if not isinstance(package, dict) or set(package) != {
             "name",
             "version",
             "installer",
-            "archive_sha256",
-            "record_sha256",
-            "wheel_metadata_sha256",
+            "provenance",
+            "metadata_file_sha256",
+            "record_file_sha256",
+            "wheel_file_sha256",
+            "installed_files",
+            "installed_files_sha256",
         }:
             raise BuildPlanError("installed package inventory is not closed")
         name = package["name"]
         if not isinstance(name, str) or name in installed:
             raise BuildPlanError("installed package inventory repeats a name")
-        for field in (
-            "archive_sha256",
-            "record_sha256",
-            "wheel_metadata_sha256",
-        ):
-            digest = package[field]
-            if digest is not None and (
-                not isinstance(digest, str)
-                or re.fullmatch(r"[0-9a-f]{64}", digest) is None
+        provenance = package["provenance"]
+        if not isinstance(provenance, dict) or provenance.get("kind") not in {
+            "project-wheel",
+            "inherited-base-image",
+        }:
+            raise BuildPlanError("installed package provenance is malformed")
+        if provenance["kind"] == "project-wheel":
+            if (
+                set(provenance) != {"kind", "archive_sha256"}
+                or not isinstance(provenance["archive_sha256"], str)
+                or re.fullmatch(r"[0-9a-f]{64}", provenance["archive_sha256"])
+                is None
             ):
-                raise BuildPlanError("installed package hash is malformed")
+                raise BuildPlanError("project wheel archive provenance is invalid")
+        elif (
+            set(provenance) != {"kind", "base_image_digest"}
+            or provenance["base_image_digest"] != BASE_DIGEST
+        ):
+            raise BuildPlanError("inherited package base provenance is invalid")
+        metadata_hashes = {
+            package[field]
+            for field in (
+                "metadata_file_sha256",
+                "record_file_sha256",
+                "wheel_file_sha256",
+            )
+            if isinstance(package[field], str)
+            and re.fullmatch(r"[0-9a-f]{64}", package[field]) is not None
+        }
+        if len(metadata_hashes) != 3:
+            raise BuildPlanError("installed package metadata hashes are malformed")
+        files = _file_commitments(
+            package["installed_files"],
+            label=f"installed package {name}",
+        )
+        if (
+            package["installed_files_sha256"]
+            != hashlib.sha256(canonical_json(files)).hexdigest()
+            or not metadata_hashes
+            <= {item["commitment_sha256"] for item in files}
+        ):
+            raise BuildPlanError("installed package file commitments are invalid")
         installed[name] = package
-    if list(installed) != sorted(installed) or "torch" not in installed:
+    if (
+        list(installed) != sorted(installed)
+        or "torch" not in installed
+        or installed["torch"]["provenance"]
+        != {
+            "kind": "inherited-base-image",
+            "base_image_digest": BASE_DIGEST,
+        }
+    ):
         raise BuildPlanError(
             "installed inventory is incomplete, unsorted, or lacks inherited Torch"
         )
@@ -949,7 +1121,8 @@ def _inspection_artifact(
         if (
             package is None
             or package["version"] != version
-            or package["archive_sha256"] not in allowed_hashes
+            or package["provenance"].get("kind") != "project-wheel"
+            or package["provenance"].get("archive_sha256") not in allowed_hashes
         ):
             raise BuildPlanError(
                 "installed project package is not bound to its selected lock hash"
@@ -1017,12 +1190,15 @@ def parse_image_binding_bytes(
     command_transcripts = value["command_transcript_sha256"]
     expected_commands = {
         "build",
+        "python_base",
+        "python_local",
         "inspect_base",
         "inspect_local",
         "facts_base",
         "facts_local",
         "inspection_local",
         "push",
+        "python_final",
         "inspect_final",
         "facts_final",
         "inspection_final",
@@ -1121,6 +1297,8 @@ def execute_build_plan(
             return output
 
         run_bound("build", commands["build"])
+        run_bound("python_base", commands["python_base"])
+        run_bound("python_local", commands["python_local"])
         base_inspect = _image_inspection(
             run_bound("inspect_base", commands["inspect_base"]),
             label="base image inspection",
@@ -1157,6 +1335,10 @@ def execute_build_plan(
         digest = _push_digest(push_output)
         final_image = f"{repository}@{digest}"
         docker_binary = commands["build"][0]
+        final_python_argv = container_python_exists_argv(
+            final_image,
+            docker_binary=docker_binary,
+        )
         final_inspect_argv = final_image_inspect_argv(
             final_image,
             docker_binary=docker_binary,
@@ -1169,6 +1351,7 @@ def execute_build_plan(
             final_image,
             docker_binary=docker_binary,
         )
+        run_bound("python_final", final_python_argv)
         final_inspect = _image_inspection(
             run_bound("inspect_final", final_inspect_argv),
             label="final digest image inspection",

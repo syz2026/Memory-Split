@@ -46,6 +46,7 @@ CONTAINER_FACTS = {
     "cudnn": "9.10.2",
     "nccl": "2.28.3",
 }
+DLC_PYTHON = "/opt/conda/bin/python"
 
 
 def _locked_requirements(data: str) -> dict[str, tuple[str, ...]]:
@@ -182,14 +183,46 @@ def _locked_packages(data: str) -> list[dict[str, object]]:
             continue
         requirement, *hashes = pending.split()
         name, version = requirement.split("==", 1)
+        normalized_name = name.replace("_", "-").lower()
+        files = [
+            {
+                "path": f"/opt/conda/lib/python3.12/site-packages/{normalized_name}.py",
+                "type": "regular",
+                "commitment_sha256": "9" * 64,
+            },
+            {
+                "path": f"/opt/conda/lib/python3.12/site-packages/{normalized_name}.dist-info/METADATA",
+                "type": "regular",
+                "commitment_sha256": "4" * 64,
+            },
+            {
+                "path": f"/opt/conda/lib/python3.12/site-packages/{normalized_name}.dist-info/RECORD",
+                "type": "regular",
+                "commitment_sha256": "5" * 64,
+            },
+            {
+                "path": f"/opt/conda/lib/python3.12/site-packages/{normalized_name}.dist-info/WHEEL",
+                "type": "regular",
+                "commitment_sha256": "6" * 64,
+            },
+        ]
+        files.sort(key=lambda item: item["path"])
         packages.append(
             {
-                "name": name.replace("_", "-").lower(),
+                "name": normalized_name,
                 "version": version,
                 "installer": "pip",
-                "archive_sha256": hashes[0].removeprefix("--hash=sha256:"),
-                "record_sha256": "4" * 64,
-                "wheel_metadata_sha256": "5" * 64,
+                "provenance": {
+                    "kind": "project-wheel",
+                    "archive_sha256": hashes[0].removeprefix("--hash=sha256:"),
+                },
+                "metadata_file_sha256": "4" * 64,
+                "record_file_sha256": "5" * 64,
+                "wheel_file_sha256": "6" * 64,
+                "installed_files": files,
+                "installed_files_sha256": hashlib.sha256(
+                    _canonical(files)
+                ).hexdigest(),
             }
         )
         pending = ""
@@ -198,26 +231,121 @@ def _locked_packages(data: str) -> list[dict[str, object]]:
             "name": "torch",
             "version": "2.9.0+cu130",
             "installer": "pip",
-            "archive_sha256": None,
-            "record_sha256": "6" * 64,
-            "wheel_metadata_sha256": "7" * 64,
+            "provenance": {
+                "kind": "inherited-base-image",
+                "base_image_digest": BASE_DIGEST,
+            },
+            "metadata_file_sha256": "a" * 64,
+            "record_file_sha256": "b" * 64,
+            "wheel_file_sha256": "c" * 64,
+            "installed_files": [
+                {
+                    "path": "/opt/conda/lib/python3.12/site-packages/torch.dist-info/METADATA",
+                    "type": "regular",
+                    "commitment_sha256": "a" * 64,
+                },
+                {
+                    "path": "/opt/conda/lib/python3.12/site-packages/torch.dist-info/RECORD",
+                    "type": "regular",
+                    "commitment_sha256": "b" * 64,
+                },
+                {
+                    "path": "/opt/conda/lib/python3.12/site-packages/torch.dist-info/WHEEL",
+                    "type": "regular",
+                    "commitment_sha256": "c" * 64,
+                },
+                {
+                    "path": "/opt/conda/lib/python3.12/site-packages/torch.py",
+                    "type": "regular",
+                    "commitment_sha256": "d" * 64,
+                },
+            ],
+            "installed_files_sha256": hashlib.sha256(
+                _canonical(
+                    [
+                        {
+                            "path": "/opt/conda/lib/python3.12/site-packages/torch.dist-info/METADATA",
+                            "type": "regular",
+                            "commitment_sha256": "a" * 64,
+                        },
+                        {
+                            "path": "/opt/conda/lib/python3.12/site-packages/torch.dist-info/RECORD",
+                            "type": "regular",
+                            "commitment_sha256": "b" * 64,
+                        },
+                        {
+                            "path": "/opt/conda/lib/python3.12/site-packages/torch.dist-info/WHEEL",
+                            "type": "regular",
+                            "commitment_sha256": "c" * 64,
+                        },
+                        {
+                            "path": (
+                                "/opt/conda/lib/python3.12/site-packages/torch.py"
+                            ),
+                            "type": "regular",
+                            "commitment_sha256": "d" * 64,
+                        },
+                    ]
+                )
+            ).hexdigest(),
         }
     )
     return sorted(packages, key=lambda item: item["name"])
 
 
+def _os_package_inventory() -> dict[str, object]:
+    database_files = [
+        {
+            "path": "/var/lib/dpkg/status",
+            "type": "regular",
+            "commitment_sha256": "e" * 64,
+        }
+    ]
+    installed_files = [
+        {
+            "path": "/usr/bin/bash",
+            "type": "regular",
+            "commitment_sha256": "f" * 64,
+        }
+    ]
+    packages = [
+        {
+            "name": "bash",
+            "version": "5.2.21-2ubuntu4",
+            "architecture": "amd64",
+            "status": "ii",
+            "installed_files": installed_files,
+            "installed_files_sha256": hashlib.sha256(
+                _canonical(installed_files)
+            ).hexdigest(),
+        }
+    ]
+    return {
+        "manager": "dpkg",
+        "database_root": "/var/lib/dpkg",
+        "database_files": database_files,
+        "database_tree_sha256": hashlib.sha256(
+            _canonical(database_files)
+        ).hexdigest(),
+        "packages": packages,
+        "package_count": len(packages),
+    }
+
+
 def _inspection_artifact() -> dict[str, object]:
     return {
-        "schema_version": 1,
-        "artifact_type": "memorysplit-container-inspection-v1",
+        "schema_version": 2,
+        "artifact_type": "memorysplit-container-inspection-v2",
         "os_release": {
             "id": "ubuntu",
             "version_id": "24.04",
             "pretty_name": "Ubuntu 24.04.4 LTS",
         },
+        "os_packages": _os_package_inventory(),
         "python": {
             "implementation": "CPython",
             "version": "3.12.11",
+            "executable": DLC_PYTHON,
         },
         "container_facts": dict(CONTAINER_FACTS),
         "installed_python_packages": _locked_packages(
@@ -257,12 +385,15 @@ def _apply_outputs(digest: str) -> list[bytes]:
     inspection = _canonical(_inspection_artifact())
     return [
         b"image built\n",
+        b"",
+        b"",
         _docker_inspect(repo_digests=[BASE_IMAGE]),
         _docker_inspect(repo_digests=[]),
         facts,
         facts,
         inspection,
         f"source: digest: {digest} size: 2048\n".encode("ascii"),
+        b"",
         _docker_inspect(repo_digests=[f"{PRIVATE_REPOSITORY}@{digest}"]),
         facts,
         inspection,
@@ -308,12 +439,15 @@ def _image_binding() -> dict[str, object]:
             for index, name in enumerate(
                 (
                     "build",
+                    "python_base",
+                    "python_local",
                     "inspect_base",
                     "inspect_local",
                     "facts_base",
                     "facts_local",
                     "inspection_local",
                     "push",
+                    "python_final",
                     "inspect_final",
                     "facts_final",
                     "inspection_final",
@@ -353,6 +487,9 @@ def test_dockerfile_uses_only_the_approved_digest_pinned_base():
     assert "--ignore-installed" not in text
     assert "--report=/opt/memorysplit/project-install-report.json" in text
     assert "inspect_container.py" in text
+    assert "RUN /opt/conda/bin/python -m pip install" in text
+    assert "/opt/conda/bin/python -c" in text
+    assert re.search(r"(?m)^RUN python\b", text) is None
     assert re.search(r"(?m)^USER 10001:10001$", text)
     assert "# syntax=" not in text
     assert "ARG APP_UID" not in text
@@ -402,17 +539,42 @@ def test_docker_context_is_a_closed_dependency_only_allowlist():
     ]
 
 
-def test_container_inspection_contract_includes_inherited_and_selected_packages():
+def test_container_inspection_contract_includes_inherited_and_selected_packages(
+    tmp_path,
+):
+    assert INSPECT_SCRIPT.read_text(encoding="utf-8").startswith(
+        "#!/opt/conda/bin/python\n"
+    )
     module = _load_script(INSPECT_SCRIPT)
 
     class Distribution:
-        def __init__(self, name, version, files):
+        def __init__(self, name, version, texts, files):
             self.metadata = {"Name": name}
             self.version = version
-            self.files = files
+            self.texts = texts
+            self.files = tuple(files)
 
         def read_text(self, name):
-            return self.files.get(name)
+            return self.texts.get(name)
+
+        def locate_file(self, name):
+            return tmp_path / str(name)
+
+    for relative, content in {
+        "numpy.py": b"numpy installed bytes\n",
+        "torch.py": b"torch installed bytes\n",
+        "numpy-2.5.1.dist-info/METADATA": b"Name: numpy\nVersion: 2.5.1\n",
+        "numpy-2.5.1.dist-info/RECORD": b"numpy.py,sha256=x,1\n",
+        "numpy-2.5.1.dist-info/WHEEL": b"Wheel-Version: 1.0\n",
+        "torch-2.9.0.dist-info/METADATA": (
+            b"Name: torch\nVersion: 2.9.0+cu130\n"
+        ),
+        "torch-2.9.0.dist-info/RECORD": b"torch.py,sha256=y,1\n",
+        "torch-2.9.0.dist-info/WHEEL": b"Wheel-Version: 1.0\n",
+    }.items():
+        path = tmp_path / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(content)
 
     selected_hash = "a" * 64
     install_report = _canonical(
@@ -439,45 +601,119 @@ def test_container_inspection_contract_includes_inherited_and_selected_packages(
                 "2.5.1",
                 {
                     "INSTALLER": "pip\n",
+                    "METADATA": "Name: numpy\nVersion: 2.5.1\n",
                     "RECORD": "numpy.py,sha256=x,1\n",
                     "WHEEL": "Wheel-Version: 1.0\n",
                 },
+                [
+                    "numpy.py",
+                    "numpy-2.5.1.dist-info/METADATA",
+                    "numpy-2.5.1.dist-info/RECORD",
+                    "numpy-2.5.1.dist-info/WHEEL",
+                ],
             ),
             Distribution(
                 "torch",
                 "2.9.0+cu130",
                 {
                     "INSTALLER": "pip\n",
+                    "METADATA": "Name: torch\nVersion: 2.9.0+cu130\n",
                     "RECORD": "torch.py,sha256=y,1\n",
                     "WHEEL": "Wheel-Version: 1.0\n",
                 },
+                [
+                    "torch.py",
+                    "torch-2.9.0.dist-info/METADATA",
+                    "torch-2.9.0.dist-info/RECORD",
+                    "torch-2.9.0.dist-info/WHEEL",
+                ],
             ),
         ),
+        os_package_inventory=_os_package_inventory(),
+        base_image_digest=BASE_DIGEST,
         container_facts=CONTAINER_FACTS,
         python_version=CONTAINER_FACTS["python"],
         python_implementation="CPython",
+        python_executable=DLC_PYTHON,
     )
 
     assert artifact["os_release"]["version_id"] == "24.04"
     assert artifact["python"] == {
         "implementation": "CPython",
         "version": CONTAINER_FACTS["python"],
+        "executable": DLC_PYTHON,
     }
     packages = {
         package["name"]: package
         for package in artifact["installed_python_packages"]
     }
     assert set(packages) == {"numpy", "torch"}
+    assert artifact["os_packages"] == _os_package_inventory()
     assert artifact["inventory_method"] == "importlib.metadata.distributions"
     assert artifact["installed_distribution_count"] == 2
-    assert packages["numpy"]["archive_sha256"] == selected_hash
-    assert packages["torch"]["archive_sha256"] is None
-    assert packages["torch"]["record_sha256"] == hashlib.sha256(
+    assert packages["numpy"]["provenance"] == {
+        "kind": "project-wheel",
+        "archive_sha256": selected_hash,
+    }
+    assert packages["torch"]["provenance"] == {
+        "kind": "inherited-base-image",
+        "base_image_digest": BASE_DIGEST,
+    }
+    assert packages["torch"]["record_file_sha256"] == hashlib.sha256(
         b"torch.py,sha256=y,1\n"
     ).hexdigest()
+    assert packages["torch"]["metadata_file_sha256"] == hashlib.sha256(
+        b"Name: torch\nVersion: 2.9.0+cu130\n"
+    ).hexdigest()
+    torch_files = {
+        item["path"]: item
+        for item in packages["torch"]["installed_files"]
+    }
+    assert torch_files[str(tmp_path / "torch.py")] == {
+        "path": str(tmp_path / "torch.py"),
+        "type": "regular",
+        "commitment_sha256": hashlib.sha256(
+            b"torch installed bytes\n"
+        ).hexdigest(),
+    }
+    assert all(
+        value is not None
+        for package in packages.values()
+        for value in package.values()
+    )
     assert module.parse_inspection_artifact_bytes(
         module.canonical_json(artifact)
     ) == artifact
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ["missing-os-package", "missing-python-file", "forged-inherited-base"],
+)
+def test_container_inspection_rejects_missing_or_forged_inventory(mutation):
+    module = _load_script(INSPECT_SCRIPT)
+    artifact = _inspection_artifact()
+    if mutation == "missing-os-package":
+        artifact["os_packages"]["packages"] = []
+        artifact["os_packages"]["package_count"] = 0
+    elif mutation == "missing-python-file":
+        package = artifact["installed_python_packages"][0]
+        package["installed_files"] = []
+        package["installed_files_sha256"] = hashlib.sha256(
+            _canonical([])
+        ).hexdigest()
+    elif mutation == "forged-inherited-base":
+        torch = next(
+            package
+            for package in artifact["installed_python_packages"]
+            if package["name"] == "torch"
+        )
+        torch["provenance"]["base_image_digest"] = "sha256:" + "0" * 64
+    else:
+        raise AssertionError(mutation)
+
+    with pytest.raises(module.InspectionError, match="package|file|base|inventory"):
+        module.parse_inspection_artifact_bytes(_canonical(artifact))
 
 
 def test_build_plan_is_dry_run_and_does_not_inherit_secrets(monkeypatch, tmp_path):
@@ -558,6 +794,8 @@ def test_explicit_apply_builds_then_pushes_and_emits_digest_binding(tmp_path):
         tuple(plan["commands"][name])
         for name in (
             "build",
+                "python_base",
+                "python_local",
             "inspect_base",
             "inspect_local",
             "facts_base",
@@ -566,6 +804,7 @@ def test_explicit_apply_builds_then_pushes_and_emits_digest_binding(tmp_path):
             "push",
         )
     ] + [
+        tuple(module.container_python_exists_argv(f"{PRIVATE_REPOSITORY}@{digest}")),
         tuple(module.final_image_inspect_argv(f"{PRIVATE_REPOSITORY}@{digest}")),
         tuple(module.container_facts_argv(f"{PRIVATE_REPOSITORY}@{digest}")),
         tuple(module.container_inspection_argv(f"{PRIVATE_REPOSITORY}@{digest}")),
@@ -583,12 +822,15 @@ def test_explicit_apply_builds_then_pushes_and_emits_digest_binding(tmp_path):
     assert binding["build_inputs"] == plan["inputs"]
     assert set(binding["command_transcript_sha256"]) == {
         "build",
+        "python_base",
+        "python_local",
         "inspect_base",
         "inspect_local",
         "facts_base",
         "facts_local",
         "inspection_local",
         "push",
+        "python_final",
         "inspect_final",
         "facts_final",
         "inspection_final",
@@ -683,7 +925,13 @@ def test_apply_holds_and_rehashes_build_inputs_before_push(tmp_path):
 
 @pytest.mark.parametrize(
     "mutation",
-    ["entrypoint", "local-facts", "final-facts", "final-image-id"],
+    [
+        "entrypoint",
+        "local-facts",
+        "final-facts",
+        "final-image-id",
+        "system-python-inspection",
+    ],
 )
 def test_apply_rejects_unmeasured_or_changed_container_runtime(
     tmp_path,
@@ -693,23 +941,27 @@ def test_apply_rejects_unmeasured_or_changed_container_runtime(
     digest = "sha256:" + "9" * 64
     outputs = _apply_outputs(digest)
     if mutation == "entrypoint":
-        outputs[2] = _docker_inspect(
+        outputs[4] = _docker_inspect(
             repo_digests=[],
             entrypoint=["/unreviewed-entrypoint"],
         )
     elif mutation == "local-facts":
         facts = dict(CONTAINER_FACTS)
         facts["cuda"] = "12.9"
-        outputs[4] = _canonical(facts)
+        outputs[6] = _canonical(facts)
     elif mutation == "final-facts":
         facts = dict(CONTAINER_FACTS)
         facts["pytorch"] = "2.9.1+cu130"
-        outputs[8] = _canonical(facts)
+        outputs[11] = _canonical(facts)
     elif mutation == "final-image-id":
-        outputs[7] = _docker_inspect(
+        outputs[10] = _docker_inspect(
             repo_digests=[f"{PRIVATE_REPOSITORY}@{digest}"],
             image_id="sha256:" + "c" * 64,
         )
+    elif mutation == "system-python-inspection":
+        inspection = _inspection_artifact()
+        inspection["python"]["executable"] = "/usr/bin/python3"
+        outputs[7] = _canonical(inspection)
     else:
         raise AssertionError(mutation)
     plan = module.render_build_plan(
@@ -882,7 +1134,9 @@ def test_runtime_lock_and_sbom_are_deterministic_and_parser_compatible():
     assert sbom["container"]["base_image_digest"] == BASE_DIGEST
     assert sbom["container"]["image"] == lock["container_image"]
     assert sbom["container"]["os_release"]["id"] == "ubuntu"
+    assert sbom["container"]["os_packages"] == _os_package_inventory()
     assert sbom["container"]["python"]["version"] == CONTAINER_FACTS["python"]
+    assert sbom["container"]["python"]["executable"] == DLC_PYTHON
     assert sbom["container"]["inherited_entrypoint"] == {
         "entrypoint": ["/usr/local/bin/dlc-entrypoint"],
         "command": ["bash"],
@@ -897,10 +1151,11 @@ def test_runtime_lock_and_sbom_are_deterministic_and_parser_compatible():
         item["name"] for item in packages
     }
     assert all(
-        item["archive_sha256"] is not None
+        item["provenance"]["kind"]
+        in {"project-wheel", "inherited-base-image"}
         for item in packages
-        if item["name"] != "torch"
     )
+    assert all(item["installed_files"] for item in packages)
     assert sbom["container"]["inspection_artifact_sha256"] == hashlib.sha256(
         _canonical(_inspection_artifact())
     ).hexdigest()
@@ -913,6 +1168,17 @@ def test_runtime_lock_and_sbom_are_deterministic_and_parser_compatible():
     wrong_host_sbom["host"]["ami_id"] = "ami-0b39828e6910b0bb8"
     with pytest.raises(module.RuntimeArtifactError, match="host|AMI|reviewed"):
         module.parse_runtime_sbom_bytes(_canonical(wrong_host_sbom))
+    wrong_archive_sbom = copy.deepcopy(sbom)
+    project_package = next(
+        package
+        for package in wrong_archive_sbom["container"][
+            "installed_python_packages"
+        ]
+        if package["provenance"]["kind"] == "project-wheel"
+    )
+    project_package["provenance"]["archive_sha256"] = "0" * 64
+    with pytest.raises(module.RuntimeArtifactError, match="archive|lock|project"):
+        module.parse_runtime_sbom_bytes(_canonical(wrong_archive_sbom))
 
 
 @pytest.mark.parametrize(

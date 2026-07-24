@@ -750,6 +750,7 @@ SELECTED_HOST_FACTS = {
     "kernel": "6.17",
     "efa": "1.47.0",
     "ofi_nccl": "1.18.0",
+    "nvlsm": "595.71.05",
 }
 P6_AMI_ID = "ami-0260c4d597dcc8641"
 P6_AMI_OWNER = "898082745236"
@@ -828,6 +829,7 @@ class _SelectedCommands:
         host_facts: dict[str, str] | None = None,
         container_facts: dict[str, str] | None = None,
         gpu_names: list[str] | None = None,
+        missing_host_field: str | None = None,
     ) -> None:
         self.module = module
         self.host_facts = dict(
@@ -841,6 +843,7 @@ class _SelectedCommands:
         self.gpu_names = list(
             ["NVIDIA B300"] * 8 if gpu_names is None else gpu_names
         )
+        self.missing_host_field = missing_host_field
         self.calls: list[tuple[tuple[str, ...], dict[str, str]]] = []
 
     def run(self, argv, *, environment) -> bytes:
@@ -848,11 +851,15 @@ class _SelectedCommands:
         self.calls.append((rendered, dict(environment)))
         for field, expected in self.module.SELECTED_HOST_VERSION_COMMANDS.items():
             if rendered == tuple(expected):
+                if field == self.missing_host_field:
+                    raise OSError("synthetic missing host measurement")
                 return (self.host_facts[field] + "\n").encode("ascii")
         if rendered == tuple(self.module.gpu_names_argv()):
             return ("\n".join(self.gpu_names) + "\n").encode("utf-8")
         if rendered == tuple(self.module.container_inspect_argv(IMAGE)):
             return _canonical([IMAGE])
+        if rendered == tuple(self.module.container_python_exists_argv(IMAGE)):
+            return b""
         if rendered == tuple(self.module.container_facts_argv(IMAGE)):
             return _canonical(self.container_facts)
         raise AssertionError(f"unexpected selected-GPU command: {rendered!r}")
@@ -928,6 +935,10 @@ def test_selected_gpu_attestation_measures_framework_only_in_locked_container(
     assert evidence["gpu_model"] == "NVIDIA B300"
     assert evidence["gpu_count"] == 8
     assert evidence["host_facts"] == SELECTED_HOST_FACTS
+    assert module.SELECTED_HOST_VERSION_COMMANDS["nvlsm"] == (
+        "/usr/bin/nvlsm",
+        "--version",
+    )
     assert evidence["container_facts"] == SELECTED_CONTAINER_FACTS
     assert module.parse_gpu_evidence_bytes(
         module.canonical_gpu_evidence(evidence)
@@ -949,10 +960,13 @@ def test_selected_gpu_attestation_measures_framework_only_in_locked_container(
     assert "all" in container_argv
     assert "--entrypoint" in container_argv
     assert container_argv[container_argv.index("--entrypoint") + 1] == (
-        "/usr/bin/python3"
+        "/opt/conda/bin/python"
     )
     assert IMAGE in container_argv
     assert tuple(module.container_inspect_argv(IMAGE)) in [
+        argv for argv, _ in commands.calls
+    ]
+    assert tuple(module.container_python_exists_argv(IMAGE)) in [
         argv for argv, _ in commands.calls
     ]
     host_commands = {
@@ -973,6 +987,7 @@ def test_selected_gpu_attestation_measures_framework_only_in_locked_container(
         ("kernel", "6.0"),
         ("efa", "1.43.9"),
         ("ofi_nccl", "1.17.0"),
+        ("nvlsm", "579.99"),
     ],
 )
 def test_p6_attestation_rejects_measured_host_facts_below_official_floor(
@@ -1019,6 +1034,30 @@ def test_p6_attestation_requires_exact_b300_identity_and_supported_base_ami(tmp_
         _attest_selected(wrong_ami, identity=identity)
 
 
+def test_p6_attestation_rejects_missing_or_forged_nvlsm_evidence(tmp_path):
+    module = _load_module()
+    missing = _selected_case(tmp_path, module, profile_kind="p6")
+    with pytest.raises(module.AttestationError, match="nvlsm|NVLink|command"):
+        _attest_selected(
+            missing,
+            commands=_SelectedCommands(module, missing_host_field="nvlsm"),
+        )
+
+    forged = _selected_case(
+        tmp_path,
+        module,
+        profile_kind="p6",
+        name="selected-p6-forged-nvlsm",
+    )
+    host_facts = dict(SELECTED_HOST_FACTS)
+    host_facts["nvlsm"] = "600.1.1"
+    with pytest.raises(module.AttestationError, match="nvlsm|NVLink|driver|coherent"):
+        _attest_selected(
+            forged,
+            commands=_SelectedCommands(module, host_facts=host_facts),
+        )
+
+
 def test_selected_gpu_attestation_rejects_cross_profile_evidence(tmp_path):
     module = _load_module()
 
@@ -1032,6 +1071,62 @@ def test_selected_gpu_attestation_rejects_cross_profile_evidence(tmp_path):
         _attest_selected(
             p5,
             commands=_SelectedCommands(module, gpu_names=["NVIDIA B300"] * 8),
+        )
+
+
+@pytest.mark.parametrize(
+    "gpu_name",
+    ["NVIDIA H100 80GB", "NVIDIA H100 80GB HBM3"],
+)
+def test_p5_attestation_accepts_only_established_exact_h100_names(
+    tmp_path,
+    gpu_name,
+):
+    from msctl.aws_contracts import (
+        allowed_gpu_product_names,
+        validate_gpu_product_names,
+    )
+
+    module = _load_module()
+    case = _selected_case(
+        tmp_path,
+        module,
+        profile_kind="p5",
+        name="p5-" + gpu_name.replace(" ", "-"),
+    )
+    evidence = _attest_selected(
+        case,
+        commands=_SelectedCommands(module, gpu_names=[gpu_name] * 8),
+    )
+
+    assert evidence["gpu_model"] == gpu_name
+    assert allowed_gpu_product_names("aws-p5.48xlarge-v3") == (
+        "NVIDIA H100 80GB",
+        "NVIDIA H100 80GB HBM3",
+    )
+    assert validate_gpu_product_names(
+        "aws-p5.48xlarge-v3",
+        [gpu_name] * 8,
+        expected_count=8,
+    ) == gpu_name
+
+
+@pytest.mark.parametrize(
+    "gpu_names",
+    [
+        ["NVIDIA H100"] * 8,
+        ["NVIDIA H100 80GB HBM3 Engineering"] * 8,
+        ["NVIDIA H100 80GB"] * 7 + ["NVIDIA H100 80GB HBM3"],
+    ],
+)
+def test_p5_attestation_rejects_prefixes_and_mixed_h100_names(tmp_path, gpu_names):
+    module = _load_module()
+    case = _selected_case(tmp_path, module, profile_kind="p5")
+
+    with pytest.raises(module.AttestationError, match="GPU|profile|product"):
+        _attest_selected(
+            case,
+            commands=_SelectedCommands(module, gpu_names=gpu_names),
         )
 
 

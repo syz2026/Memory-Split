@@ -89,6 +89,13 @@ AWS_GPU_ATTESTATION_EVIDENCE_V1_FIELDS: Final = (
     "region",
     "boot_id",
 )
+AWS_GPU_PRODUCT_NAME_CONTRACT: Final = (
+    (
+        "aws-p5.48xlarge-v3",
+        ("NVIDIA H100 80GB", "NVIDIA H100 80GB HBM3"),
+    ),
+    ("aws-p6-b300.48xlarge-v3", ("NVIDIA B300",)),
+)
 
 EXPECTED_CONFIG_PATHS: Final = tuple(
     f"{CONFIG_ROOT}/{arm}-s{seed}.yaml"
@@ -110,6 +117,43 @@ def expected_config_paths() -> tuple[str, ...]:
     """Return the exact ordered v3 run-config paths."""
 
     return EXPECTED_CONFIG_PATHS
+
+
+def allowed_gpu_product_names(profile_id: object) -> tuple[str, ...]:
+    """Return the exact nvidia-smi names allowed by one selected profile."""
+
+    if not isinstance(profile_id, str):
+        raise ValueError("GPU profile ID must be a string")
+    matches = tuple(
+        names
+        for candidate, names in AWS_GPU_PRODUCT_NAME_CONTRACT
+        if candidate == profile_id
+    )
+    if len(matches) != 1:
+        raise ValueError("GPU profile has no closed product-name contract")
+    return matches[0]
+
+
+def validate_gpu_product_names(
+    profile_id: object,
+    names: object,
+    *,
+    expected_count: object,
+) -> str:
+    """Validate an exact identical GPU set and return its measured name."""
+
+    allowed = allowed_gpu_product_names(profile_id)
+    if (
+        type(expected_count) is not int
+        or expected_count <= 0
+        or not isinstance(names, (list, tuple))
+        or len(names) != expected_count
+        or any(not isinstance(name, str) for name in names)
+        or len(set(names)) != 1
+        or names[0] not in allowed
+    ):
+        raise ValueError("measured GPU product names do not match selected profile")
+    return names[0]
 
 
 def validate_sha256(value: object) -> str:
@@ -238,6 +282,7 @@ __all__ = [
     "ARMS",
     "AWS_ENVIRONMENT_RECEIPT_V2_FIELDS",
     "AWS_GPU_ATTESTATION_EVIDENCE_V1_FIELDS",
+    "AWS_GPU_PRODUCT_NAME_CONTRACT",
     "AWS_RUNTIME_LOCK_FIELDS",
     "AWS_RUNTIME_VERSION_FIELDS",
     "COHORT_ASSIGNMENT_PATH",
@@ -257,9 +302,11 @@ __all__ = [
     "checkpoint_receipt_key",
     "dataset_receipt_key",
     "expected_config_paths",
+    "allowed_gpu_product_names",
     "release_archive_key",
     "release_checksum_key",
     "release_receipt_key",
     "validate_digest_pinned_oci_image",
+    "validate_gpu_product_names",
     "validate_sha256",
 ]
