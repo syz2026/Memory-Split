@@ -21,6 +21,7 @@ import sys
 import tempfile
 from array import array
 from collections.abc import Mapping, Sequence
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -2443,6 +2444,7 @@ class _ObjectiveSource(_RecordSource):
         objective_python: Path,
         work_root: Path,
         expected_runtime: Mapping[str, Any],
+        prefetch: bool = True,
     ) -> None:
         procedural, puzzles = _objective_component_roots(stage_root, lock)
         self.clients: dict[str, _ObjectiveWorkerClient] = {}
@@ -2468,6 +2470,43 @@ class _ObjectiveSource(_RecordSource):
             provider: client.runtime for provider, client in self.clients.items()
         }
         self.expected_runtime = expected_runtime
+        self._executor = (
+            ThreadPoolExecutor(
+                max_workers=len(self.clients),
+                thread_name_prefix="objective-prefetch",
+            )
+            if prefetch
+            else None
+        )
+        self._pending: dict[str, tuple[int, Future[dict[str, Any]]]] = {}
+
+    def _ensure_prefetch(
+        self,
+        provider: str,
+        index: int,
+    ) -> Future[dict[str, Any]]:
+        if self._executor is None:
+            raise AssertionError("prefetch requested in serial objective mode")
+        existing = self._pending.get(provider)
+        if existing is not None:
+            existing_index, future = existing
+            if existing_index == index:
+                return future
+            # Sequential callers never take this branch. Keep direct uses
+            # fail-safe if they replace a cursor on one live source instance.
+            future.result()
+        future = self._executor.submit(self.clients[provider].generate, index)
+        self._pending[provider] = (index, future)
+        return future
+
+    def _generate_procedural(self, provider: str, index: int) -> dict[str, Any]:
+        if self._executor is None:
+            return self.clients[provider].generate(index)
+        future = self._ensure_prefetch(provider, index)
+        native = future.result()
+        self._pending.pop(provider)
+        self._ensure_prefetch(provider, index + 1)
+        return native
 
     def next(self, cursor: Mapping[str, Any]) -> tuple[LaneRecord, dict[str, Any]]:
         state = {
@@ -2483,13 +2522,16 @@ class _ObjectiveSource(_RecordSource):
             "puzzle_exhausted": list(cursor.get("puzzle_exhausted", [])),
             "puzzle_tokens": int(cursor.get("puzzle_tokens", 0)),
         }
+        if self._executor is not None:
+            for provider in self.clients:
+                self._ensure_prefetch(provider, state["indices"][provider])
         exhausted = set(state["puzzle_exhausted"])
         for _ in range(100_000):
             provider = self.providers[state["next_provider"] % len(self.providers)]
             state["next_provider"] = (state["next_provider"] + 1) % len(self.providers)
             index = state["indices"][provider]
             if provider in self.clients:
-                native = self.clients[provider].generate(index)
+                native = self._generate_procedural(provider, index)
                 state["indices"][provider] = index + 1
             else:
                 if provider in exhausted:
@@ -2564,6 +2606,9 @@ class _ObjectiveSource(_RecordSource):
         )
 
     def close(self) -> None:
+        if self._executor is not None:
+            self._executor.shutdown(wait=True, cancel_futures=True)
+            self._pending.clear()
         for client in self.clients.values():
             client.close()
 

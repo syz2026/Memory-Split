@@ -4,6 +4,7 @@ import json
 import sqlite3
 import subprocess
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from fractions import Fraction
 from pathlib import Path
 
@@ -31,6 +32,7 @@ from corpusgen.v2_materialize import (
     _encode_record,
     _generated_lock_payloads,
     _LaneWriter,
+    _ObjectiveSource,
     _ParquetTextSource,
     _RecordSource,
     _RelationalRefinementSource,
@@ -385,6 +387,67 @@ def test_prontoqa_fails_closed_after_all_seed_depth_combinations():
         assert {
             calls[depth_pass * 128 + attempt][0] for depth_pass in range(5)
         } == {2, 3, 4, 5, 6}
+
+
+def test_objective_prefetch_preserves_serial_record_and_cursor_order():
+    providers = tuple(f"provider-{index}" for index in range(5))
+
+    class _Client:
+        runtime = {"python": "fixture"}
+
+        def __init__(self, provider):
+            self.provider = provider
+            self.calls = []
+
+        def generate(self, index):
+            self.calls.append(index)
+            return {
+                "answer": f"answer-{self.provider}-{index}",
+                "metadata": {"provider": self.provider},
+                "question": f"question-{self.provider}-{index}",
+            }
+
+        def close(self):
+            return None
+
+    def _source(prefetch):
+        source = _ObjectiveSource.__new__(_ObjectiveSource)
+        source.clients = {provider: _Client(provider) for provider in providers}
+        source.puzzles = {}
+        source.providers = providers
+        source.tok = get_tok()
+        source.runtime = {
+            provider: client.runtime for provider, client in source.clients.items()
+        }
+        source.expected_runtime = {
+            provider: {"probe_record_sha256s": []} for provider in providers
+        }
+        source._executor = (
+            ThreadPoolExecutor(max_workers=len(providers)) if prefetch else None
+        )
+        source._pending = {}
+        return source
+
+    serial = _source(False)
+    parallel = _source(True)
+    serial_cursor = {}
+    parallel_cursor = {}
+    try:
+        for _ in range(30):
+            serial_record, serial_cursor = serial.next(serial_cursor)
+            parallel_record, parallel_cursor = parallel.next(parallel_cursor)
+            assert parallel_record == serial_record
+            assert parallel_cursor == serial_cursor
+    finally:
+        serial.close()
+        parallel.close()
+
+    assert {
+        provider: client.calls for provider, client in serial.clients.items()
+    } == {
+        provider: client.calls[:6]
+        for provider, client in parallel.clients.items()
+    }
 
 
 def test_deepmind_adapter_removes_object_hash_order_before_seeded_shuffle(
