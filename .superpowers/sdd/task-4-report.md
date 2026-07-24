@@ -6,6 +6,7 @@
 - Branch: `feat/farmshare-v2-task-4-semantic`.
 - Exact base: `0b7bd5657f99c0f4d6ec35671c507afacabc4623`.
 - Implementation commit: `f21277c` (`feat: add v2 semantic sidecar routing`).
+- Review-fix commit: `944ddb6` (`fix: close Task 4 semantic review findings`).
 - Scope: `semantic.py`, semantic tests, and reviewed package exports only.
 
 ## Delivered behavior
@@ -23,16 +24,30 @@
 - Dense/Split90 audits enforce ordered bounded spans, role-safe overlap, binary
   masks, payload-only zeroing, every declared routed occurrence, and
   answer/proof surface closure.
+- Independent occurrence ledgers now bind reviewed character-level closure to
+  exact token occurrences. Sidecar derivation rejects missing, extra, or
+  mislabeled payload spans and records the plan/ledger hashes and counts.
+- SQLite opens use absolute private paths without process-wide cwd changes.
+  Descriptor, path, parent, `PRAGMA database_list`, and SQLite inode evidence
+  reject file and parent-directory ABA replacement.
+- Route artifacts bind index bytes and SHA-256 in the manifest; `open_index()`
+  verifies that commitment before opening and requires the exact BINARY schema.
+- Dose reports and semantic leak records are recursively immutable, and
+  overlapping spans require a common non-null fact ID and compatible role.
 
 ## TDD and verification
 
 - Initial RED: semantic test collection failed on the absent Task 4 exports.
 - Focused RED/GREEN: exact route-index winner tampering and post-open SQLite
   cleanup each failed for the intended reason before their fixes, then passed.
+- Review RED/GREEN cycles covered absent independent authority, omitted and
+  mislabeled occurrences, cwd-based opens, file/parent ABA, creation hooks,
+  missing index commitments, NOCASE/custom/index schema drift, null-fact
+  overlap, and mutable nested evidence.
 - Exact-base regression baseline: `158 passed in 16.57s`.
-- Semantic suite: `42 passed in 0.43s`.
+- Review-fixed semantic suite: `60 passed`.
 - Required semantic/catalog/foundations/routing/parallel matrix:
-  `200 passed in 11.70s`.
+  `218 passed in 21.24s`.
 - `py_compile`, Ruff, and `git diff --check` passed.
 
 ## Concern
