@@ -177,3 +177,68 @@ CUDA/PKCS7 path was not exercised against physical hardware. Tests use the same
 injected verifier/probe seams as the hardware authority suites; production
 publication itself rejects those test-only adapter paths and requires observed
 CUDA plus the authenticated receipt.
+
+## Snapshot-evaluator re-review remediation
+
+Re-review status: `DONE_WITH_CONCERNS`.
+
+Re-review base: `aff46ffc76aa8fd4d4b6431727841e60ce01b2fb`.
+
+Re-review fix:
+`c7c39a53c37f7abab773a314da86eb363d69bc65`.
+
+### Important findings closed
+
+1. `StudyLockV3` now records the exact training-config SHA and fingerprint,
+   model-config hash and model identity, full data-provenance hash, dataset
+   receipt/build/ordered-stream commitments, run/arm identity, world size,
+   update size, and provider-selection identity. All five steps of one
+   seed/arm must share the complete invariant tuple. Dense/Split90 pairs must
+   share model, base data, source-transitive runtime, selection,
+   qualification, and evaluator invariants; cohort-wide matched fields are
+   also exact. Only the frozen step-derived token count plus snapshot
+   object/version and paired-receipt identities may vary across steps.
+   `Trainer.save_snapshot` emits and validates the expanded identity while
+   historical snapshot schemas remain readable and writable.
+2. V3 output publication now hashes and descriptor-validates every staged
+   artifact, captures exact installed file content and metadata, then runs one
+   composite final authority operation that verifies the pinned parent,
+   parent-name-to-installed-directory descriptor, exact membership, file
+   identity, metadata, and content. A deterministic hook proves replacing the
+   output after all prior checks cannot return success. Every failed pinned
+   staging or installed tree is atomically renamed to an intact quarantine;
+   the V3 authority path performs no pathname deletion. The returned SHA-256
+   of `output.json` is `authoritative_commitment`; `output_dir` is marked
+   `informational_reopen_required`.
+3. Direct execution bootstraps the repository root before importing project
+   modules in both `__main__.py` and `runner.py`. Clean subprocesses with no
+   `PYTHONPATH` now produce the same one-object machine contract for
+   `python -m evals.confirmatory`, direct package-main execution, and direct
+   runner execution from outside the repository.
+
+### Re-review RED to GREEN evidence
+
+- Cross-step config/model/data mutations and cross-arm model/base-data
+  mutations were accepted before the new lock-level invariant registries.
+- An installed-directory replacement after previous checks returned success,
+  and a staged write failure called pathname deletion instead of preserving a
+  quarantine.
+- Direct package-main and runner subprocesses failed before argument parsing
+  with `ModuleNotFoundError` for `evals` or `cluster`.
+
+Final verification:
+
+```text
+expanded focused planning/lock/runner/sealing suite: 217 passed
+bounded confirmatory v2/v3 regressions:              139 passed
+hardware authority/profile/cohort regressions:       240 passed
+aws contracts including model snapshot keys:          14 passed
+complete Trainer provenance/compatibility suite:      85 passed
+clean direct/module CLI subprocess matrix:              3 passed
+python -m py_compile:                                  passed
+git diff --check:                                      passed
+```
+
+The only remaining concern is unchanged: this host has no physical CUDA GPU or
+live AWS environment, so production CUDA/PKCS7 enforcement is covered through
+the authenticated injected seams rather than a paid hardware execution.
