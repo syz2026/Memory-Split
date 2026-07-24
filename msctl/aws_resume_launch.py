@@ -18,6 +18,7 @@ if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from cluster.aws.p5 import launch_seed_pair as reviewed_launcher
+from msctl.contracts import parse_paired_checkpoint_receipt_v3
 from msctl.errors import MsctlError
 from msctl.fsutil import open_directory, rename_noreplace_at
 
@@ -28,6 +29,18 @@ _CHECKPOINT_FIELDS = {
     "arm",
     "resume_path",
     "resume_sha256",
+    "world_size",
+}
+_CHECKPOINT_V3_FIELDS = {
+    "arm",
+    "bytes",
+    "config_fingerprint",
+    "config_sha256",
+    "resume_path",
+    "resume_sha256",
+    "step",
+    "uri",
+    "version_id",
     "world_size",
 }
 _RECEIPT_FIELDS = {
@@ -147,8 +160,12 @@ def bind_resume_checkpoints(
     checkpoint_root = (
         Path(plan.scratch_root) / "staging" / "resume" / receipt_sha256
     ).resolve(strict=True)
+    v3 = bool(checkpoints) and set(checkpoints[0]) == _CHECKPOINT_V3_FIELDS
     for row in checkpoints:
-        if not isinstance(row, Mapping) or set(row) != _CHECKPOINT_FIELDS:
+        expected_fields = (
+            _CHECKPOINT_V3_FIELDS if v3 else _CHECKPOINT_FIELDS
+        )
+        if not isinstance(row, Mapping) or set(row) != expected_fields:
             raise ResumeLaunchError("checkpoint binding fields do not match")
         arm = row["arm"]
         if (
@@ -178,6 +195,29 @@ def bind_resume_checkpoints(
             raise ResumeLaunchError("checkpoint path is unsafe for a bind mount")
         if _hash_regular(resolved, label=f"{arm} checkpoint") != digest:
             raise ResumeLaunchError(f"{arm} checkpoint SHA-256 does not match")
+        if v3 and (
+            type(row["bytes"]) is not int
+            or row["bytes"] != resolved.stat(follow_symlinks=False).st_size
+            or type(row["step"]) is not int
+            or not 0 <= row["step"] <= 13_582
+            or _sha256(
+                row["config_sha256"],
+                label=f"{arm} config",
+            )
+            != row["config_sha256"]
+            or _sha256(
+                row["config_fingerprint"],
+                label=f"{arm} config fingerprint",
+            )
+            != row["config_fingerprint"]
+            or not isinstance(row["uri"], str)
+            or not row["uri"].startswith("s3://")
+            or not isinstance(row["version_id"], str)
+            or row["version_id"] in {"", "null"}
+        ):
+            raise ResumeLaunchError(
+                f"{arm} versioned checkpoint binding is invalid"
+            )
         if make_read_only:
             os.chmod(resolved, 0o444)
         by_arm[str(arm)] = row
@@ -362,6 +402,8 @@ def _verify_checkpoint_receipt(
     run_manifest_sha256: str,
     plan: reviewed_launcher.LaunchPlan,
     checkpoints: Sequence[Mapping[str, object]],
+    receipt_uri: str | None = None,
+    receipt_version_id: str | None = None,
 ) -> None:
     expected = _sha256(expected_sha256, label="checkpoint receipt")
     manifest_sha256 = _sha256(
@@ -378,6 +420,95 @@ def _verify_checkpoint_receipt(
         raise ResumeLaunchError("checkpoint receipt is unavailable") from error
     if hashlib.sha256(payload).hexdigest() != expected:
         raise ResumeLaunchError("checkpoint receipt SHA-256 does not match")
+    if receipt_uri is not None or receipt_version_id is not None:
+        if (
+            not isinstance(receipt_uri, str)
+            or not isinstance(receipt_version_id, str)
+            or receipt_version_id in {"", "null"}
+            or plan.run_manifest_sha256 is None
+            or plan.release_receipt_sha256 is None
+            or plan.environment_receipt_sha256 is None
+            or plan.source_tree is None
+        ):
+            raise ResumeLaunchError(
+                "v3 checkpoint receipt version binding is incomplete"
+            )
+        try:
+            receipt = parse_paired_checkpoint_receipt_v3(
+                payload,
+                receipt_uri=receipt_uri,
+                receipt_sha256=expected,
+                receipt_version_id=receipt_version_id,
+            )
+        except MsctlError as error:
+            raise ResumeLaunchError(str(error)) from error
+        if (
+            receipt.seed != plan.seed
+            or receipt.profile_sha256 != plan.profile.sha256
+            or receipt.environment_receipt_sha256
+            != plan.environment_receipt_sha256
+            or receipt.release_sha256 != plan.release_sha256
+            or receipt.release_receipt_sha256
+            != plan.release_receipt_sha256
+            or receipt.run_manifest_sha256 != manifest_sha256
+            or receipt.run_manifest_sha256 != plan.run_manifest_sha256
+            or receipt.dataset_receipt_sha256
+            != plan.dataset_receipt_sha256
+            or receipt.dataset_build_id != plan.dataset_build_id
+            or receipt.ordered_stream_sha256
+            != plan.ordered_stream_sha256
+            or receipt.source_commit != plan.code_commit
+            or receipt.source_tree != plan.source_tree
+            or receipt.instance_id != plan.instance_id
+            or receipt.boot_id != plan.boot_id
+        ):
+            raise ResumeLaunchError(
+                "v3 checkpoint receipt does not bind the reviewed launch plan"
+            )
+        binding_by_arm = {
+            str(row.get("arm")): row for row in checkpoints
+        }
+        launch_by_arm = {launch.arm: launch for launch in plan.arms}
+        if (
+            len(binding_by_arm) != 2
+            or set(binding_by_arm) != set(_ARMS)
+        ):
+            raise ResumeLaunchError(
+                "v3 checkpoint executable binding is incomplete"
+            )
+        for checkpoint, arm in zip(
+            receipt.checkpoints,
+            _ARMS,
+            strict=True,
+        ):
+            binding = binding_by_arm[arm]
+            launch = launch_by_arm.get(arm)
+            if (
+                launch is None
+                or checkpoint.run_id
+                != launch.runtime_config.get("run_id")
+                or checkpoint.config_sha256 != launch.config_sha256
+                or checkpoint.object.sha256
+                != binding.get("resume_sha256")
+                or checkpoint.object.bytes != binding.get("bytes")
+                or checkpoint.object.uri != binding.get("uri")
+                or checkpoint.object.version_id
+                != binding.get("version_id")
+                or checkpoint.step != binding.get("step")
+                or checkpoint.world_size != binding.get("world_size")
+                or checkpoint.config_sha256
+                != binding.get("config_sha256")
+                or checkpoint.config_fingerprint
+                != binding.get("config_fingerprint")
+            ):
+                raise ResumeLaunchError(
+                    "v3 checkpoint receipt differs from executable binding"
+                )
+        return
+    if getattr(plan, "run_manifest_sha256", None) is not None:
+        raise ResumeLaunchError(
+            "v3 resume requires receipt URI and version ID"
+        )
     try:
         receipt = json.loads(
             payload.decode("utf-8"),
@@ -462,6 +593,8 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--launcher", type=Path, required=True)
     parser.add_argument("--checkpoint-receipt", type=Path, required=True)
     parser.add_argument("--checkpoint-receipt-sha256", required=True)
+    parser.add_argument("--checkpoint-receipt-uri")
+    parser.add_argument("--checkpoint-receipt-version-id")
     parser.add_argument("--run-manifest-sha256", required=True)
     parser.add_argument(
         "--checkpoint",
@@ -508,6 +641,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             repo_root=arguments.repo_root,
             scratch_root=arguments.scratch_root,
             environment=os.environ,
+            allow_existing_outputs=True,
         )
         _verify_checkpoint_receipt(
             arguments.checkpoint_receipt,
@@ -515,6 +649,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             run_manifest_sha256=arguments.run_manifest_sha256,
             plan=plan,
             checkpoints=arguments.checkpoint,
+            receipt_uri=arguments.checkpoint_receipt_uri,
+            receipt_version_id=arguments.checkpoint_receipt_version_id,
         )
         plan = bind_resume_checkpoints(
             plan,

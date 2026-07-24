@@ -166,7 +166,10 @@ def build_parser() -> JsonArgumentParser:
             leaf.add_argument("--instance-id")
             leaf.add_argument("--terminate-at")
         if name == "resume":
-            leaf.add_argument("--checkpoint-receipt", required=True)
+            leaf.add_argument("--checkpoint-receipt")
+            leaf.add_argument("--checkpoint-receipt-uri")
+            leaf.add_argument("--checkpoint-receipt-sha256")
+            leaf.add_argument("--checkpoint-receipt-version-id")
         leaf.add_argument("--apply", action="store_true")
 
     status = _leaf(commands, "status", help_text="reconcile run status")
@@ -293,7 +296,17 @@ def dispatch(
     command = _command_name(args)
     default_profile_loader = (
         _load_cli_profile
-        if command in {"runs instantiate", "env ensure", "canary run"}
+        if command
+        in {
+            "runs instantiate",
+            "runs render",
+            "submit",
+            "resume",
+            "status",
+            "cancel",
+            "env ensure",
+            "canary run",
+        }
         else load_profile
     )
     profile = (profile_loader or default_profile_loader)(args.profile)
@@ -391,6 +404,8 @@ def dispatch(
             environ=environment,
         )
         return backend.dispatch(command, args)
+    if command == "resume":
+        _require_cli_values(args, "checkpoint_receipt")
     if command in {"runs render", "submit", "resume", "evaluate"}:
         _require_cli_values(args, "dataset_pointer", "shared_root")
         if (args.dataset_root is None) == (args.dataset_verification is None):

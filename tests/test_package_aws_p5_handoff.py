@@ -310,6 +310,7 @@ def _minimal_repo(
         "cluster/aws/p5/canary.py": (
             "#!/usr/bin/env python3\nraise SystemExit(0)\n"
         ),
+        "cluster/aws/p5/checkpoint_mirror.py": "MIRROR_FORMAT = 3\n",
         "cluster/aws/p5/corpus_contract.py": "FORMAT = 2\n",
         "cluster/aws/p5/profile.py": (
             "def parse_aws_p5_profile_bytes(data):\n"
@@ -327,10 +328,19 @@ def _minimal_repo(
         "msctl/__init__.py": '"""fixture contracts"""\n',
         "msctl/__main__.py": "raise SystemExit(0)\n",
         "msctl/aws_p5.py": "PROVIDER = 'aws-p5.48xlarge'\n",
+        "msctl/aws_argv.py": "ARGV_FORMAT = 2\n",
+        "msctl/aws_launch_manifest.py": "MANIFEST_FORMAT = 2\n",
+        "msctl/aws_resume_launch.py": "RESUME_FORMAT = 3\n",
         "msctl/aws_contracts.py": (
             REPO_ROOT / "msctl" / "aws_contracts.py"
         ).read_bytes(),
+        "msctl/contracts.py": "CHECKPOINT_FORMAT = 3\n",
         "msctl/dataset.py": "DATASET_CONTRACT = 'receipt-v2'\n",
+        "msctl/errors.py": "class MsctlError(Exception): pass\n",
+        "msctl/fsutil.py": "SAFE_IO = True\n",
+        "msctl/jsonutil.py": "CANONICAL_JSON = True\n",
+        "msctl/profile.py": "AWS_PROFILE = True\n",
+        "msctl/state.py": "STATE_FORMAT = 2\n",
         "corpusgen/__init__.py": "",
         "corpusgen/parallel/__init__.py": "",
         "corpusgen/parallel/publication.py": "FORMAT = 2\n",

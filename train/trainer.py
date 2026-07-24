@@ -907,6 +907,7 @@ class Trainer:
         linked_snapshot_targets = set()
         allowed_root = {
             "ckpt.pt",
+            "ckpt.meta.json",
             "config.yaml",
             "log.jsonl",
             "snapshots",
@@ -922,6 +923,7 @@ class Trainer:
             match = _ATOMIC_TEMPORARY_NAME.fullmatch(name)
             if match is None or match.group("target") not in {
                 "ckpt.pt",
+                "ckpt.meta.json",
                 "log.jsonl",
             }:
                 raise ValueError(
@@ -1482,6 +1484,54 @@ class Trainer:
             self._output.root.write_atomic(
                 "ckpt.pt",
                 lambda handle: torch.save(state, handle),
+                replace=True,
+            )
+            installed = self._output.root.entry_metadata(
+                "ckpt.pt",
+                label="installed checkpoint",
+            )
+            provenance = self.data.provenance
+            metadata = {
+                "checkpoint_version": 3,
+                "config_fingerprint": self.config_fingerprint,
+                "data": {
+                    "build_id": provenance.get("build_id"),
+                    "global_cursor": data_states[0]["global_cursor"],
+                    "ordered_stream_sha256": provenance.get(
+                        "ordered_stream_sha256"
+                    ),
+                    "receipt_sha256": provenance.get("receipt_sha256"),
+                    "sidecar_name": provenance.get("sidecar_name"),
+                },
+                "installed": {
+                    "bytes": installed.st_size,
+                    "ctime_ns": installed.st_ctime_ns,
+                    "device": installed.st_dev,
+                    "gid": installed.st_gid,
+                    "inode": installed.st_ino,
+                    "links": installed.st_nlink,
+                    "mode": installed.st_mode,
+                    "mtime_ns": installed.st_mtime_ns,
+                    "uid": installed.st_uid,
+                },
+                "receipt_type": "memorysplit-trainer-checkpoint-v1",
+                "schema_version": 1,
+                "step": self.step,
+                "world_size": self.world_size,
+            }
+            metadata_bytes = (
+                json.dumps(
+                    metadata,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    ensure_ascii=True,
+                    allow_nan=False,
+                )
+                + "\n"
+            ).encode("ascii")
+            self._output.root.write_bytes(
+                "ckpt.meta.json",
+                metadata_bytes,
                 replace=True,
             )
 

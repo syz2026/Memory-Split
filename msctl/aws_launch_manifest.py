@@ -103,8 +103,12 @@ def build_launcher_manifest(
     profile_sha256: str,
     release_sha256: str,
     release_members_sha256: str,
+    release_receipt_sha256: str | None = None,
+    environment_receipt_sha256: str | None = None,
+    run_manifest_sha256: str | None = None,
     cohort_assignment_sha256: str,
     code_commit: str,
+    source_tree: str | None = None,
     bootstrap_receipt: Path,
     corpus_receipt: Path,
     runs: Sequence[dict[str, object]],
@@ -122,6 +126,30 @@ def build_launcher_manifest(
         _sha256(value, label=label)
     if not isinstance(code_commit, str) or _COMMIT_RE.fullmatch(code_commit) is None:
         raise LaunchManifestError("code commit must be a full lowercase Git commit")
+    v3_values = {
+        "environment_receipt_sha256": environment_receipt_sha256,
+        "release_receipt_sha256": release_receipt_sha256,
+        "run_manifest_sha256": run_manifest_sha256,
+        "source_tree": source_tree,
+    }
+    if any(value is not None for value in v3_values.values()):
+        if any(value is None for value in v3_values.values()):
+            raise LaunchManifestError(
+                "v3 launcher mirror context must be complete"
+            )
+        for label, digest in (
+            ("release receipt", release_receipt_sha256),
+            ("environment receipt", environment_receipt_sha256),
+            ("run manifest", run_manifest_sha256),
+        ):
+            _sha256(digest, label=label)
+        if (
+            not isinstance(source_tree, str)
+            or _COMMIT_RE.fullmatch(source_tree) is None
+        ):
+            raise LaunchManifestError(
+                "source tree must be a full lowercase Git object"
+            )
     scratch = scratch_root.resolve(strict=True)
     bootstrap_hash = _hash_regular(
         bootstrap_receipt,
@@ -217,9 +245,19 @@ def build_launcher_manifest(
         "release_members_sha256": release_members_sha256,
         "release_sha256": release_sha256,
         "runs": launch_runs,
-        "schema_version": 1,
+        "schema_version": 2 if source_tree is not None else 1,
         "seed": seed,
     }
+    if source_tree is not None:
+        manifest.update(
+            {
+                "dataset_receipt_sha256": corpus_hash,
+                "environment_receipt_sha256": environment_receipt_sha256,
+                "release_receipt_sha256": release_receipt_sha256,
+                "run_manifest_sha256": run_manifest_sha256,
+                "source_tree": source_tree,
+            }
+        )
     out.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     descriptor = os.open(
         out,
@@ -260,8 +298,12 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--profile-sha256", required=True)
     parser.add_argument("--release-sha256", required=True)
     parser.add_argument("--release-members-sha256", required=True)
+    parser.add_argument("--release-receipt-sha256")
+    parser.add_argument("--environment-receipt-sha256")
+    parser.add_argument("--run-manifest-sha256")
     parser.add_argument("--cohort-assignment-sha256", required=True)
     parser.add_argument("--code-commit", required=True)
+    parser.add_argument("--source-tree")
     parser.add_argument("--bootstrap-receipt", type=Path, required=True)
     parser.add_argument("--corpus-receipt", type=Path, required=True)
     parser.add_argument("--run", type=_run_binding, action="append", required=True)
@@ -278,8 +320,14 @@ def main(argv: Sequence[str] | None = None) -> int:
             profile_sha256=arguments.profile_sha256,
             release_sha256=arguments.release_sha256,
             release_members_sha256=arguments.release_members_sha256,
+            release_receipt_sha256=arguments.release_receipt_sha256,
+            environment_receipt_sha256=(
+                arguments.environment_receipt_sha256
+            ),
+            run_manifest_sha256=arguments.run_manifest_sha256,
             cohort_assignment_sha256=arguments.cohort_assignment_sha256,
             code_commit=arguments.code_commit,
+            source_tree=arguments.source_tree,
             bootstrap_receipt=arguments.bootstrap_receipt,
             corpus_receipt=arguments.corpus_receipt,
             runs=arguments.run,

@@ -11,7 +11,9 @@ import re
 import stat
 import zipfile
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from .aws_contracts import (
     ARMS as AWS_ARMS,
@@ -32,6 +34,7 @@ from .fsutil import hash_fd, open_directory, open_regular_at, read_fd
 from .jsonutil import (
     COMMIT_RE,
     RUN_ID_RE,
+    canonical_json,
     canonical_sha256,
     load_json,
     portable_relative,
@@ -143,9 +146,78 @@ class CheckpointReceipt:
     value: dict[str, object]
 
 
+@dataclass(frozen=True)
+class AwsCheckpointDataV3:
+    receipt_sha256: str
+    build_id: str
+    ordered_stream_sha256: str
+    global_cursor: int
+    sidecar_name: str
+
+
+@dataclass(frozen=True)
+class AwsCheckpointObjectV3:
+    uri: str
+    sha256: str
+    bytes: int
+    version_id: str
+
+
+@dataclass(frozen=True)
+class AwsCheckpointV3:
+    run_id: str
+    arm: str
+    seed: int
+    checkpoint_version: int
+    step: int
+    world_size: int
+    config_sha256: str
+    config_fingerprint: str
+    data: AwsCheckpointDataV3
+    object: AwsCheckpointObjectV3
+
+
+@dataclass(frozen=True)
+class AwsPairedCheckpointReceiptV3:
+    schema_version: int
+    receipt_type: str
+    provider: str
+    cohort_id: str
+    seed: int
+    reason: str
+    request_id: str
+    instance_id: str
+    boot_id: str
+    profile_sha256: str
+    environment_receipt_sha256: str
+    release_sha256: str
+    release_receipt_sha256: str
+    run_manifest_sha256: str
+    dataset_receipt_sha256: str
+    dataset_build_id: str
+    ordered_stream_sha256: str
+    source_commit: str
+    source_tree: str
+    requested_at: str
+    deadline_at: str
+    staged_at: str
+    checkpoints: tuple[AwsCheckpointV3, AwsCheckpointV3]
+    resumable: bool
+    uri: str
+    sha256: str
+    version_id: str
+    bytes: int
+    value: dict[str, object]
+
+
 _GIT_OBJECT_RE = re.compile(r"^[0-9a-f]{40}(?:[0-9a-f]{24})?$")
 _GIT_SHA1_RE = re.compile(r"^[0-9a-f]{40}$")
 _RUNTIME_RECEIPT_FIELDS = list(AWS_ENVIRONMENT_RECEIPT_V2_FIELDS)
+_CHECKPOINT_REQUEST_ID_RE = re.compile(r"^[0-9a-f]{32}$")
+_CANONICAL_UTC_RE = re.compile(
+    r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T"
+    r"[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"
+)
 
 
 def same_typed_value(actual: object, expected: object) -> bool:
@@ -1654,6 +1726,11 @@ def verify_checkpoint_receipt(
     release: Release,
     manifest: RunManifest,
 ) -> CheckpointReceipt:
+    if getattr(manifest, "schema_version", None) == 3:
+        raise MsctlError(
+            "CHECKPOINT_PROVENANCE_MISMATCH",
+            "legacy local checkpoint receipts are audit-only for schema-3 v3 manifests",
+        )
     receipt_path = Path(path)
     value = require_object(
         load_json(receipt_path, label="checkpoint receipt"),
@@ -1812,3 +1889,507 @@ def verify_checkpoint_receipt(
         ),
         value=value,
     )
+
+
+def _checkpoint_v3_error(message: str) -> MsctlError:
+    return MsctlError("CHECKPOINT_PROVENANCE_MISMATCH", message)
+
+
+def _checkpoint_v3_time(value: object, *, label: str) -> datetime:
+    if (
+        not isinstance(value, str)
+        or _CANONICAL_UTC_RE.fullmatch(value) is None
+    ):
+        raise _checkpoint_v3_error(
+            f"paired checkpoint {label} is not canonical UTC RFC3339"
+        )
+    try:
+        parsed = datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ").replace(
+            tzinfo=timezone.utc
+        )
+    except ValueError as error:
+        raise _checkpoint_v3_error(
+            f"paired checkpoint {label} is not canonical UTC RFC3339"
+        ) from error
+    if parsed.strftime("%Y-%m-%dT%H:%M:%SZ") != value:
+        raise _checkpoint_v3_error(
+            f"paired checkpoint {label} is not canonical UTC RFC3339"
+        )
+    return parsed
+
+
+def parse_paired_checkpoint_receipt_v3(
+    payload: bytes,
+    *,
+    receipt_uri: str,
+    receipt_sha256: str,
+    receipt_version_id: str,
+) -> AwsPairedCheckpointReceiptV3:
+    """Parse exact canonical bytes for one version-pinned AWS v3 pair."""
+
+    if not isinstance(payload, bytes) or not payload:
+        raise _checkpoint_v3_error("paired checkpoint receipt bytes are missing")
+
+    def unique_object(
+        pairs: list[tuple[str, object]],
+    ) -> dict[str, object]:
+        result: dict[str, object] = {}
+        for key, item in pairs:
+            if key in result:
+                raise _checkpoint_v3_error(
+                    "paired checkpoint receipt repeats a field"
+                )
+            result[key] = item
+        return result
+
+    try:
+        parsed = json.loads(
+            payload.decode("ascii"),
+            object_pairs_hook=unique_object,
+            parse_constant=lambda constant: (_ for _ in ()).throw(
+                _checkpoint_v3_error(
+                    "paired checkpoint receipt contains "
+                    f"non-finite {constant}"
+                )
+            ),
+        )
+    except MsctlError:
+        raise
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise _checkpoint_v3_error(
+            "paired checkpoint receipt is not valid canonical JSON"
+        ) from error
+    value = require_object(parsed, label="paired checkpoint receipt")
+    if canonical_json(value) + b"\n" != payload:
+        raise _checkpoint_v3_error(
+            "paired checkpoint receipt bytes are not canonical"
+        )
+    try:
+        expected_sha256 = require_sha256(
+            receipt_sha256,
+            label="paired checkpoint receipt SHA-256",
+        )
+    except MsctlError as error:
+        raise _checkpoint_v3_error(
+            "paired checkpoint receipt SHA-256 is invalid"
+        ) from error
+    if hashlib.sha256(payload).hexdigest() != expected_sha256:
+        raise _checkpoint_v3_error(
+            "paired checkpoint receipt hash does not match bytes"
+        )
+    if (
+        not isinstance(receipt_version_id, str)
+        or receipt_version_id in {"", "null"}
+    ):
+        raise _checkpoint_v3_error(
+            "paired checkpoint receipt version ID is invalid"
+        )
+    receipt_suffix = (
+        f"/receipts/checkpoints/seed-{value.get('seed')}/sha256/"
+        f"{expected_sha256}.json"
+    )
+    parsed_uri = urlsplit(receipt_uri)
+    if (
+        not isinstance(receipt_uri, str)
+        or parsed_uri.scheme != "s3"
+        or not parsed_uri.netloc
+        or parsed_uri.query
+        or parsed_uri.fragment
+        or not receipt_uri.endswith(receipt_suffix)
+    ):
+        raise _checkpoint_v3_error(
+            "paired checkpoint receipt URI is invalid"
+        )
+    object_root = receipt_uri[: -len(receipt_suffix)]
+    top_fields = {
+        "boot_id",
+        "checkpoints",
+        "cohort_id",
+        "dataset_build_id",
+        "dataset_receipt_sha256",
+        "environment_receipt_sha256",
+        "freshness",
+        "instance_id",
+        "ordered_stream_sha256",
+        "profile_sha256",
+        "provider",
+        "reason",
+        "receipt_type",
+        "release_receipt_sha256",
+        "release_sha256",
+        "request_id",
+        "resumable",
+        "run_manifest_sha256",
+        "schema_version",
+        "seed",
+        "source_commit",
+        "source_tree",
+    }
+    require_exact_keys(
+        value,
+        top_fields,
+        label="paired checkpoint receipt",
+    )
+    seed = value["seed"]
+    if (
+        type(value["schema_version"]) is not int
+        or value["schema_version"] != 3
+        or value["receipt_type"]
+        != "memorysplit-aws-paired-checkpoint-v3"
+        or value["provider"] != AWS_P5_PROFILE
+        or value["cohort_id"] != AWS_COHORT_ID
+        or type(seed) is not int
+        or seed not in AWS_SEEDS
+        or value["reason"] not in {"periodic", "interruption"}
+        or not isinstance(value["request_id"], str)
+        or _CHECKPOINT_REQUEST_ID_RE.fullmatch(value["request_id"]) is None
+        or not isinstance(value["instance_id"], str)
+        or not value["instance_id"]
+        or not isinstance(value["boot_id"], str)
+        or not value["boot_id"]
+        or value["resumable"] is not True
+        or not isinstance(value["source_commit"], str)
+        or _GIT_SHA1_RE.fullmatch(value["source_commit"]) is None
+        or not isinstance(value["source_tree"], str)
+        or _GIT_SHA1_RE.fullmatch(value["source_tree"]) is None
+    ):
+        raise _checkpoint_v3_error(
+            "paired checkpoint receipt identity is invalid"
+        )
+    hashes: dict[str, str] = {}
+    for field in (
+        "profile_sha256",
+        "environment_receipt_sha256",
+        "release_sha256",
+        "release_receipt_sha256",
+        "run_manifest_sha256",
+        "dataset_receipt_sha256",
+        "dataset_build_id",
+        "ordered_stream_sha256",
+    ):
+        try:
+            hashes[field] = require_sha256(
+                value[field],
+                label=f"paired checkpoint receipt {field}",
+            )
+        except MsctlError as error:
+            raise _checkpoint_v3_error(
+                f"paired checkpoint receipt {field} is invalid"
+            ) from error
+    freshness = require_object(
+        value["freshness"],
+        label="paired checkpoint freshness",
+    )
+    require_exact_keys(
+        freshness,
+        {
+            "deadline_at",
+            "max_age_seconds",
+            "requested_at",
+            "staged_at",
+        },
+        label="paired checkpoint freshness",
+    )
+    requested = _checkpoint_v3_time(
+        freshness["requested_at"],
+        label="requested_at",
+    )
+    deadline = _checkpoint_v3_time(
+        freshness["deadline_at"],
+        label="deadline_at",
+    )
+    staged = _checkpoint_v3_time(
+        freshness["staged_at"],
+        label="staged_at",
+    )
+    if (
+        type(freshness["max_age_seconds"]) is not int
+        or freshness["max_age_seconds"] != 1200
+        or (deadline - requested).total_seconds() != 1200
+        or not requested <= staged <= deadline
+    ):
+        raise _checkpoint_v3_error(
+            "paired checkpoint freshness window is invalid"
+        )
+    raw_checkpoints = value["checkpoints"]
+    if not isinstance(raw_checkpoints, list) or len(raw_checkpoints) != 2:
+        raise _checkpoint_v3_error(
+            "paired checkpoint receipt must contain both arms"
+        )
+    checkpoints: list[AwsCheckpointV3] = []
+    for index, arm in enumerate(AWS_ARMS):
+        row = require_object(
+            raw_checkpoints[index],
+            label=f"paired checkpoint[{index}]",
+        )
+        require_exact_keys(
+            row,
+            {
+                "arm",
+                "checkpoint_version",
+                "config_fingerprint",
+                "config_sha256",
+                "data",
+                "object",
+                "run_id",
+                "seed",
+                "step",
+                "world_size",
+            },
+            label=f"paired checkpoint[{index}]",
+        )
+        step = row["step"]
+        if (
+            row["arm"] != arm
+            or not isinstance(row["run_id"], str)
+            or RUN_ID_RE.fullmatch(row["run_id"]) is None
+            or type(row["seed"]) is not int
+            or row["seed"] != seed
+            or type(row["checkpoint_version"]) is not int
+            or row["checkpoint_version"] != 3
+            or type(step) is not int
+            or not 0 <= step <= 13_582
+            or type(row["world_size"]) is not int
+            or row["world_size"] != 4
+        ):
+            raise _checkpoint_v3_error(
+                f"paired checkpoint[{index}] identity is invalid"
+            )
+        try:
+            config_sha256 = require_sha256(
+                row["config_sha256"],
+                label=f"paired checkpoint[{index}] config",
+            )
+            config_fingerprint = require_sha256(
+                row["config_fingerprint"],
+                label=f"paired checkpoint[{index}] fingerprint",
+            )
+        except MsctlError as error:
+            raise _checkpoint_v3_error(
+                f"paired checkpoint[{index}] config binding is invalid"
+            ) from error
+        data_value = require_object(
+            row["data"],
+            label=f"paired checkpoint[{index}] data",
+        )
+        require_exact_keys(
+            data_value,
+            {
+                "build_id",
+                "global_cursor",
+                "ordered_stream_sha256",
+                "receipt_sha256",
+                "sidecar_name",
+            },
+            label=f"paired checkpoint[{index}] data",
+        )
+        try:
+            data_receipt = require_sha256(
+                data_value["receipt_sha256"],
+                label=f"paired checkpoint[{index}] data receipt",
+            )
+            data_build = require_sha256(
+                data_value["build_id"],
+                label=f"paired checkpoint[{index}] data build",
+            )
+            data_ordered = require_sha256(
+                data_value["ordered_stream_sha256"],
+                label=f"paired checkpoint[{index}] ordered stream",
+            )
+        except MsctlError as error:
+            raise _checkpoint_v3_error(
+                f"paired checkpoint[{index}] data binding is invalid"
+            ) from error
+        expected_sidecar = (
+            "dense_target_weights"
+            if arm == "dense"
+            else "split90_target_weights"
+        )
+        if (
+            data_receipt != hashes["dataset_receipt_sha256"]
+            or data_build != hashes["dataset_build_id"]
+            or data_ordered != hashes["ordered_stream_sha256"]
+            or type(data_value["global_cursor"]) is not int
+            or data_value["global_cursor"] != step * 524_288
+            or data_value["sidecar_name"] != expected_sidecar
+        ):
+            raise _checkpoint_v3_error(
+                f"paired checkpoint[{index}] data provenance is invalid"
+            )
+        object_value = require_object(
+            row["object"],
+            label=f"paired checkpoint[{index}] object",
+        )
+        require_exact_keys(
+            object_value,
+            {"bytes", "sha256", "uri", "version_id"},
+            label=f"paired checkpoint[{index}] object",
+        )
+        try:
+            object_sha256 = require_sha256(
+                object_value["sha256"],
+                label=f"paired checkpoint[{index}] object",
+            )
+        except MsctlError as error:
+            raise _checkpoint_v3_error(
+                f"paired checkpoint[{index}] object hash is invalid"
+            ) from error
+        expected_uri = (
+            f"{object_root}/checkpoints/seed-{seed}/{arm}/sha256/"
+            f"{object_sha256}.pt"
+        )
+        if (
+            object_value["uri"] != expected_uri
+            or type(object_value["bytes"]) is not int
+            or object_value["bytes"] <= 0
+            or not isinstance(object_value["version_id"], str)
+            or object_value["version_id"] in {"", "null"}
+        ):
+            raise _checkpoint_v3_error(
+                f"paired checkpoint[{index}] object identity is invalid"
+            )
+        checkpoints.append(
+            AwsCheckpointV3(
+                run_id=row["run_id"],
+                arm=arm,
+                seed=seed,
+                checkpoint_version=3,
+                step=step,
+                world_size=4,
+                config_sha256=config_sha256,
+                config_fingerprint=config_fingerprint,
+                data=AwsCheckpointDataV3(
+                    receipt_sha256=data_receipt,
+                    build_id=data_build,
+                    ordered_stream_sha256=data_ordered,
+                    global_cursor=data_value["global_cursor"],
+                    sidecar_name=expected_sidecar,
+                ),
+                object=AwsCheckpointObjectV3(
+                    uri=expected_uri,
+                    sha256=object_sha256,
+                    bytes=object_value["bytes"],
+                    version_id=object_value["version_id"],
+                ),
+            )
+        )
+    return AwsPairedCheckpointReceiptV3(
+        schema_version=3,
+        receipt_type="memorysplit-aws-paired-checkpoint-v3",
+        provider=AWS_P5_PROFILE,
+        cohort_id=AWS_COHORT_ID,
+        seed=seed,
+        reason=value["reason"],
+        request_id=value["request_id"],
+        instance_id=value["instance_id"],
+        boot_id=value["boot_id"],
+        profile_sha256=hashes["profile_sha256"],
+        environment_receipt_sha256=hashes[
+            "environment_receipt_sha256"
+        ],
+        release_sha256=hashes["release_sha256"],
+        release_receipt_sha256=hashes["release_receipt_sha256"],
+        run_manifest_sha256=hashes["run_manifest_sha256"],
+        dataset_receipt_sha256=hashes["dataset_receipt_sha256"],
+        dataset_build_id=hashes["dataset_build_id"],
+        ordered_stream_sha256=hashes["ordered_stream_sha256"],
+        source_commit=value["source_commit"],
+        source_tree=value["source_tree"],
+        requested_at=freshness["requested_at"],
+        deadline_at=freshness["deadline_at"],
+        staged_at=freshness["staged_at"],
+        checkpoints=(checkpoints[0], checkpoints[1]),
+        resumable=True,
+        uri=receipt_uri,
+        sha256=expected_sha256,
+        version_id=receipt_version_id,
+        bytes=len(payload),
+        value=value,
+    )
+
+
+def verify_aws_checkpoint_receipt_v3(
+    receipt: AwsPairedCheckpointReceiptV3,
+    *,
+    release: object,
+    manifest: object,
+    environment_receipt_sha256: str,
+    instance_id: str | None = None,
+    boot_id: str | None = None,
+) -> AwsPairedCheckpointReceiptV3:
+    """Bind a parsed v3 pair to the exact reviewed launch identities."""
+
+    try:
+        environment_sha256 = require_sha256(
+            environment_receipt_sha256,
+            label="AWS environment receipt",
+        )
+    except MsctlError as error:
+        raise _checkpoint_v3_error(
+            "paired checkpoint environment provenance is invalid"
+        ) from error
+    if (
+        not isinstance(receipt, AwsPairedCheckpointReceiptV3)
+        or getattr(manifest, "schema_version", None) != 3
+        or receipt.provider != getattr(manifest, "provider", None)
+        or receipt.cohort_id != getattr(manifest, "cohort_id", None)
+        or receipt.seed != getattr(manifest, "seed", None)
+        or receipt.profile_sha256
+        != getattr(manifest, "profile_sha256", None)
+        or receipt.environment_receipt_sha256 != environment_sha256
+        or receipt.release_sha256
+        != getattr(manifest, "release_sha256", None)
+        or receipt.release_receipt_sha256
+        != getattr(manifest, "release_receipt_sha256", None)
+        or receipt.run_manifest_sha256 != getattr(manifest, "sha256", None)
+        or receipt.dataset_receipt_sha256
+        != getattr(manifest, "dataset_receipt_sha256", None)
+        or receipt.dataset_build_id
+        != getattr(manifest, "dataset_build_id", None)
+        or receipt.ordered_stream_sha256
+        != getattr(manifest, "ordered_stream_sha256", None)
+        or receipt.source_commit != getattr(manifest, "source_commit", None)
+        or receipt.source_tree != getattr(manifest, "source_tree", None)
+        or receipt.release_sha256
+        != getattr(release, "archive_sha256", None)
+        or receipt.release_receipt_sha256
+        != getattr(release, "receipt_sha256", None)
+        or receipt.source_commit != getattr(release, "source_commit", None)
+        or receipt.source_tree != getattr(release, "source_tree", None)
+        or (instance_id is not None and receipt.instance_id != instance_id)
+        or (boot_id is not None and receipt.boot_id != boot_id)
+    ):
+        raise _checkpoint_v3_error(
+            "paired checkpoint provenance does not match reviewed inputs"
+        )
+    runs = getattr(manifest, "runs", ())
+    if not isinstance(runs, tuple) or len(runs) != 2:
+        raise _checkpoint_v3_error(
+            "paired checkpoint manifest is not a complete pair"
+        )
+    by_arm = {getattr(run, "arm", None): run for run in runs}
+    if set(by_arm) != set(AWS_ARMS):
+        raise _checkpoint_v3_error(
+            "paired checkpoint manifest arms are incomplete"
+        )
+    for checkpoint, arm in zip(receipt.checkpoints, AWS_ARMS, strict=True):
+        run = by_arm[arm]
+        if (
+            checkpoint.arm != arm
+            or checkpoint.run_id != getattr(run, "run_id", None)
+            or checkpoint.seed != getattr(run, "seed", None)
+            or checkpoint.seed != receipt.seed
+            or checkpoint.world_size != 4
+            or checkpoint.checkpoint_version != 3
+            or checkpoint.config_sha256
+            != getattr(run, "config_sha256", None)
+            or checkpoint.data.receipt_sha256
+            != receipt.dataset_receipt_sha256
+            or checkpoint.data.build_id != receipt.dataset_build_id
+            or checkpoint.data.ordered_stream_sha256
+            != receipt.ordered_stream_sha256
+        ):
+            raise _checkpoint_v3_error(
+                f"paired checkpoint {arm} provenance does not match its run"
+            )
+    return receipt

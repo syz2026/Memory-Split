@@ -84,6 +84,48 @@ AWS_RESUME_STATE_KEYS = AWS_RUN_STATE_KEYS | {
     "checkpoint_receipt_sha256",
     "prior_command_ids",
 }
+AWS_V3_RUN_STATE_KEYS = {
+    "schema_version",
+    "run_id",
+    "arm",
+    "seed",
+    "provider",
+    "release_sha256",
+    "release_receipt_sha256",
+    "run_manifest_sha256",
+    "config_sha256",
+    "dataset_pointer_sha256",
+    "dataset_receipt_sha256",
+    "dataset_build_id",
+    "ordered_stream_sha256",
+    "dataset_verification_sha256",
+    "environment_receipt_sha256",
+    "cohort_assignment_sha256",
+    "preregistration_sha256",
+    "source_commit",
+    "source_tree",
+    "profile_sha256",
+    "runtime_sha256",
+    "ami_id",
+    "container_digest",
+    "instance_id",
+    "terminate_at",
+    "operation_id",
+    "intent_sha256",
+    "intent_uri",
+    "command_id",
+    "operation",
+    "status",
+    "attempt",
+    "send_attempted",
+    "created_at",
+    "updated_at",
+}
+AWS_V3_RESUME_STATE_KEYS = AWS_V3_RUN_STATE_KEYS | {
+    "checkpoint_receipt",
+    "checkpoint_objects",
+    "prior_command_ids",
+}
 RESUME_STATE_KEYS = RUN_STATE_KEYS | {
     "checkpoint_receipt_sha256",
     "prior_job_ids",
@@ -307,6 +349,9 @@ def _validate_run_state(value: dict[str, object], run_id: str) -> None:
 
 
 def _validate_aws_run_state(value: dict[str, object], run_id: str) -> None:
+    if value.get("schema_version") == 2:
+        _validate_aws_v3_run_state(value, run_id)
+        return
     operation = value.get("operation")
     keys = AWS_RESUME_STATE_KEYS if operation == "resume" else AWS_RUN_STATE_KEYS
     require_exact_keys(value, keys, label="AWS run state")
@@ -390,6 +435,164 @@ def _validate_aws_run_state(value: dict[str, object], run_id: str) -> None:
                 "STATE_CORRUPT",
                 "AWS prior command IDs are invalid",
             )
+
+
+def _validate_aws_v3_run_state(
+    value: dict[str, object],
+    run_id: str,
+) -> None:
+    operation = value.get("operation")
+    keys = (
+        AWS_V3_RESUME_STATE_KEYS
+        if operation == "resume"
+        else AWS_V3_RUN_STATE_KEYS
+    )
+    require_exact_keys(value, keys, label="AWS v3 run state")
+    if (
+        type(value["schema_version"]) is not int
+        or value["schema_version"] != 2
+        or operation not in {"submit", "resume"}
+        or value["run_id"] != run_id
+        or RUN_ID_RE.fullmatch(run_id) is None
+        or value["arm"] not in {"dense", "split90"}
+        or type(value["seed"]) is not int
+        or value["seed"] not in range(10)
+        or value["provider"] != _AWS_PROVIDER
+    ):
+        raise MsctlError("STATE_CORRUPT", "AWS v3 run identity is invalid")
+    for field in (
+        "release_sha256",
+        "release_receipt_sha256",
+        "run_manifest_sha256",
+        "config_sha256",
+        "dataset_pointer_sha256",
+        "dataset_receipt_sha256",
+        "dataset_build_id",
+        "ordered_stream_sha256",
+        "dataset_verification_sha256",
+        "environment_receipt_sha256",
+        "cohort_assignment_sha256",
+        "preregistration_sha256",
+        "profile_sha256",
+        "runtime_sha256",
+        "operation_id",
+        "intent_sha256",
+    ):
+        require_sha256(value[field], label=f"AWS v3 run state {field}")
+    if (
+        not isinstance(value["source_commit"], str)
+        or _COMMIT_RE.fullmatch(value["source_commit"]) is None
+        or not isinstance(value["source_tree"], str)
+        or _COMMIT_RE.fullmatch(value["source_tree"]) is None
+        or not isinstance(value["ami_id"], str)
+        or _AWS_AMI_RE.fullmatch(value["ami_id"]) is None
+        or not isinstance(value["container_digest"], str)
+        or _AWS_DIGEST_RE.fullmatch(value["container_digest"]) is None
+        or not isinstance(value["instance_id"], str)
+        or _AWS_INSTANCE_RE.fullmatch(value["instance_id"]) is None
+        or not isinstance(value["terminate_at"], str)
+        or not value["terminate_at"].endswith("Z")
+        or not isinstance(value["intent_uri"], str)
+        or not value["intent_uri"].startswith("s3://")
+    ):
+        raise MsctlError(
+            "STATE_CORRUPT",
+            "AWS v3 execution binding is invalid",
+        )
+    command_id = value["command_id"]
+    if command_id is not None and (
+        not isinstance(command_id, str)
+        or _AWS_COMMAND_RE.fullmatch(command_id) is None
+    ):
+        raise MsctlError("STATE_CORRUPT", "AWS v3 command ID is invalid")
+    if value["status"] not in _AWS_STATUSES:
+        raise MsctlError("STATE_CORRUPT", "AWS v3 run status is invalid")
+    attempt = require_nonnegative_int(
+        value["attempt"],
+        label="AWS v3 run attempt",
+    )
+    if attempt < 1 or not isinstance(value["send_attempted"], bool):
+        raise MsctlError("STATE_CORRUPT", "AWS v3 send attempt is invalid")
+    for field in ("created_at", "updated_at"):
+        _require_string(value[field], label=f"AWS v3 state {field}")
+    if operation != "resume":
+        return
+    receipt = require_object(
+        value["checkpoint_receipt"],
+        label="AWS v3 checkpoint receipt state",
+    )
+    require_exact_keys(
+        receipt,
+        {"sha256", "uri", "version_id"},
+        label="AWS v3 checkpoint receipt state",
+    )
+    require_sha256(
+        receipt["sha256"],
+        label="AWS v3 checkpoint receipt state hash",
+    )
+    if (
+        not isinstance(receipt["uri"], str)
+        or not receipt["uri"].startswith("s3://")
+        or not isinstance(receipt["version_id"], str)
+        or receipt["version_id"] in {"", "null"}
+    ):
+        raise MsctlError(
+            "STATE_CORRUPT",
+            "AWS v3 checkpoint receipt state is invalid",
+        )
+    objects = value["checkpoint_objects"]
+    if not isinstance(objects, list) or len(objects) != 2:
+        raise MsctlError(
+            "STATE_CORRUPT",
+            "AWS v3 checkpoint object state is incomplete",
+        )
+    arms = set()
+    for raw in objects:
+        row = require_object(raw, label="AWS v3 checkpoint object state")
+        require_exact_keys(
+            row,
+            {"arm", "bytes", "sha256", "uri", "version_id"},
+            label="AWS v3 checkpoint object state",
+        )
+        require_sha256(
+            row["sha256"],
+            label="AWS v3 checkpoint object state hash",
+        )
+        if (
+            row["arm"] not in {"dense", "split90"}
+            or row["arm"] in arms
+            or type(row["bytes"]) is not int
+            or row["bytes"] <= 0
+            or not isinstance(row["uri"], str)
+            or not row["uri"].startswith("s3://")
+            or not isinstance(row["version_id"], str)
+            or row["version_id"] in {"", "null"}
+        ):
+            raise MsctlError(
+                "STATE_CORRUPT",
+                "AWS v3 checkpoint object state is invalid",
+            )
+        arms.add(row["arm"])
+    if arms != {"dense", "split90"}:
+        raise MsctlError(
+            "STATE_CORRUPT",
+            "AWS v3 checkpoint object state arms are incomplete",
+        )
+    prior = value["prior_command_ids"]
+    if (
+        not isinstance(prior, list)
+        or not prior
+        or any(
+            not isinstance(item, str)
+            or _AWS_COMMAND_RE.fullmatch(item) is None
+            for item in prior
+        )
+        or len(prior) != len(set(prior))
+    ):
+        raise MsctlError(
+            "STATE_CORRUPT",
+            "AWS v3 prior command IDs are invalid",
+        )
 
 
 def _validate_evaluation_state(
@@ -830,10 +1033,12 @@ class StateStore:
         manifest_sha256: str,
     ) -> None:
         require_exact_keys(value, AWS_PAIR_INTENT_KEYS, label="AWS pair intent")
-        require_schema_version(
-            value["schema_version"],
-            label="AWS pair intent.schema_version",
-        )
+        schema_version = value["schema_version"]
+        if type(schema_version) is not int or schema_version not in {1, 2}:
+            raise MsctlError(
+                "STATE_CORRUPT",
+                "AWS pair intent schema version is invalid",
+            )
         if (
             value["provider"] != _AWS_PROVIDER
             or value["run_manifest_sha256"] != manifest_sha256
@@ -851,7 +1056,8 @@ class StateStore:
                 raise MsctlError("STATE_CORRUPT", "AWS pair run ID is invalid")
             _validate_aws_run_state(state, run_id)
             if (
-                state["run_manifest_sha256"] != manifest_sha256
+                state["schema_version"] != schema_version
+                or state["run_manifest_sha256"] != manifest_sha256
                 or state["operation_id"] != value["operation_id"]
                 or run_id in run_ids
             ):

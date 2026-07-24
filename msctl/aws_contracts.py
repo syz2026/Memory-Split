@@ -188,6 +188,26 @@ def dataset_receipt_key() -> str:
     return DATASET_RECEIPT_PATH
 
 
+def checkpoint_object_key(seed: object, arm: object, sha256: object) -> str:
+    """Return one content-addressed v3 checkpoint object key."""
+
+    if type(seed) is not int or seed not in SEEDS:
+        raise ValueError("checkpoint seed must be an exact integer from 0 to 9")
+    if arm not in ARMS:
+        raise ValueError("checkpoint arm must be dense or split90")
+    digest = validate_sha256(sha256)
+    return f"checkpoints/seed-{seed}/{arm}/sha256/{digest}.pt"
+
+
+def checkpoint_receipt_key(seed: object, sha256: object) -> str:
+    """Return one content-addressed v3 pair-receipt object key."""
+
+    if type(seed) is not int or seed not in SEEDS:
+        raise ValueError("checkpoint seed must be an exact integer from 0 to 9")
+    digest = validate_sha256(sha256)
+    return f"receipts/checkpoints/seed-{seed}/sha256/{digest}.json"
+
+
 __all__ = [
     "ARMS",
     "AWS_ENVIRONMENT_RECEIPT_V2_FIELDS",
@@ -206,6 +226,8 @@ __all__ = [
     "PROVIDER",
     "SEEDS",
     "SNAPSHOT_STEPS",
+    "checkpoint_object_key",
+    "checkpoint_receipt_key",
     "dataset_receipt_key",
     "expected_config_paths",
     "release_archive_key",

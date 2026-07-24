@@ -605,5 +605,6 @@ def test_cpu_gloo_update_matches_single_process_and_resume_is_exact(tmp_path):
         "log.jsonl",
         "snapshots",
         "ckpt.pt",
+        "ckpt.meta.json",
     }
     assert len(list((ddp_out / "snapshots").glob("*.pt"))) == 1

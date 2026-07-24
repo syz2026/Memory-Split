@@ -96,6 +96,7 @@ _BASE_FIELDS = {
     "started_receipt_uri",
     "terminal_receipt_uri",
 }
+_V3_BASE_FIELDS = _BASE_FIELDS | {"boot_id"}
 _ENVIRONMENT_FIELDS = {
     "AWS_REGION",
     "MS_AWS_AMI_ID",
@@ -110,6 +111,25 @@ _CHECKPOINT_FIELDS = {
     "arm",
     "resume_path",
     "resume_sha256",
+    "world_size",
+}
+_CHECKPOINT_RECEIPT_V3_FIELDS = {
+    "bytes",
+    "checkpoints",
+    "sha256",
+    "uri",
+    "version_id",
+}
+_CHECKPOINT_V3_FIELDS = {
+    "arm",
+    "bytes",
+    "config_fingerprint",
+    "config_sha256",
+    "resume_path",
+    "resume_sha256",
+    "step",
+    "uri",
+    "version_id",
     "world_size",
 }
 _FORBIDDEN_ENVIRONMENT = {
@@ -225,8 +245,18 @@ def _s3_uri(value: object, *, root: str | None = None) -> str:
     return value
 
 
-def _validate_checkpoint_receipt(value: object) -> None:
-    if not isinstance(value, dict) or set(value) != _CHECKPOINT_RECEIPT_FIELDS:
+def _validate_checkpoint_receipt(
+    value: object,
+    *,
+    is_v3: bool,
+    seed: int,
+) -> None:
+    expected_fields = (
+        _CHECKPOINT_RECEIPT_V3_FIELDS
+        if is_v3
+        else _CHECKPOINT_RECEIPT_FIELDS
+    )
+    if not isinstance(value, dict) or set(value) != expected_fields:
         raise RemoteIntentError(
             "checkpoint receipt fields do not match the contract"
         )
@@ -234,6 +264,19 @@ def _validate_checkpoint_receipt(value: object) -> None:
         value["sha256"],
         label="checkpoint receipt",
     )
+    if is_v3 and (
+        type(value["bytes"]) is not int
+        or value["bytes"] <= 0
+        or not isinstance(value["version_id"], str)
+        or value["version_id"] in {"", "null"}
+        or not _s3_uri(value["uri"]).endswith(
+            f"/receipts/checkpoints/seed-{seed}/sha256/"
+            f"{receipt_sha256}.json"
+        )
+    ):
+        raise RemoteIntentError(
+            "checkpoint receipt version identity is invalid"
+        )
     checkpoints = value["checkpoints"]
     if not isinstance(checkpoints, list) or len(checkpoints) != 2:
         raise RemoteIntentError(
@@ -241,7 +284,8 @@ def _validate_checkpoint_receipt(value: object) -> None:
         )
     arms: set[str] = set()
     for row in checkpoints:
-        if not isinstance(row, dict) or set(row) != _CHECKPOINT_FIELDS:
+        row_fields = _CHECKPOINT_V3_FIELDS if is_v3 else _CHECKPOINT_FIELDS
+        if not isinstance(row, dict) or set(row) != row_fields:
             raise RemoteIntentError(
                 "checkpoint binding fields do not match the contract"
             )
@@ -261,6 +305,31 @@ def _validate_checkpoint_receipt(value: object) -> None:
             or type(row["world_size"]) is not int
             or row["world_size"] != 4
             or not digest
+            or (
+                is_v3
+                and (
+                    type(row["bytes"]) is not int
+                    or row["bytes"] <= 0
+                    or type(row["step"]) is not int
+                    or not 0 <= row["step"] <= 13_582
+                    or _sha256(
+                        row["config_sha256"],
+                        label=f"{arm} checkpoint config",
+                    )
+                    != row["config_sha256"]
+                    or _sha256(
+                        row["config_fingerprint"],
+                        label=f"{arm} checkpoint fingerprint",
+                    )
+                    != row["config_fingerprint"]
+                    or not isinstance(row["version_id"], str)
+                    or row["version_id"] in {"", "null"}
+                    or not _s3_uri(row["uri"]).endswith(
+                        f"/checkpoints/seed-{seed}/{arm}/sha256/"
+                        f"{digest}.pt"
+                    )
+                )
+            )
         ):
             raise RemoteIntentError(
                 "checkpoint binding identity is invalid"
@@ -281,17 +350,23 @@ def _validate_intent(
     ):
         raise RemoteIntentError("operation intent SHA-256 mismatch")
     intent = _decode_object(payload, label="operation intent")
-    if set(intent) != _BASE_FIELDS:
+    schema_version = intent.get("schema_version")
+    is_v3 = schema_version == 2
+    if set(intent) != (_V3_BASE_FIELDS if is_v3 else _BASE_FIELDS):
         raise RemoteIntentError("operation intent fields do not match the contract")
     operation = intent["operation"]
     is_canary = operation == "canary"
     if (
-        intent["schema_version"] != 1
+        schema_version not in {1, 2}
         or operation not in {"submit", "resume", "evaluate", "canary"}
         or intent["provider"] != "aws-p5.48xlarge"
         or isinstance(intent["seed"], bool)
         or intent["seed"]
-        not in (set(range(10)) if is_canary else {1, 2, 3, 4})
+        not in (
+            set(range(10))
+            if is_canary or is_v3
+            else {1, 2, 3, 4}
+        )
         or not isinstance(intent["instance_id"], str)
         or _INSTANCE_RE.fullmatch(intent["instance_id"]) is None
         or (
@@ -312,6 +387,13 @@ def _validate_intent(
         or (
             operation != "resume"
             and intent["checkpoint_receipt"] is not None
+        )
+        or (
+            is_v3
+            and (
+                not isinstance(intent["boot_id"], str)
+                or not intent["boot_id"]
+            )
         )
     ):
         raise RemoteIntentError("operation intent identity is invalid")
@@ -335,7 +417,11 @@ def _validate_intent(
                 "operation termination deadline is expired or non-UTC"
             )
     if operation == "resume":
-        _validate_checkpoint_receipt(intent["checkpoint_receipt"])
+        _validate_checkpoint_receipt(
+            intent["checkpoint_receipt"],
+            is_v3=is_v3,
+            seed=intent["seed"],
+        )
     for field in (
         "release_sha256",
         "run_manifest_sha256",
@@ -378,6 +464,11 @@ def _validate_intent(
             "operation container image is not pinned to its digest"
         ) from error
     s3_root = _s3_uri(environment["MS_S3_ROOT"])
+    if operation == "resume" and is_v3:
+        checkpoint_receipt = intent["checkpoint_receipt"]
+        _s3_uri(checkpoint_receipt["uri"], root=s3_root)
+        for checkpoint in checkpoint_receipt["checkpoints"]:
+            _s3_uri(checkpoint["uri"], root=s3_root)
     started_receipt_uri = _s3_uri(intent["started_receipt_uri"], root=s3_root)
     terminal_receipt_uri = _s3_uri(intent["terminal_receipt_uri"], root=s3_root)
     receipt_root = (

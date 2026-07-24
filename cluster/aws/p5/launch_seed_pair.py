@@ -17,6 +17,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from datetime import datetime, timedelta, timezone
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
@@ -32,6 +33,14 @@ from cluster.aws.p5.interruption_checkpoint import (
     InterruptionResult,
     S3ObjectStore,
     handle_interruption,
+)
+from cluster.aws.p5.checkpoint_mirror import (
+    CheckpointMirrorRequest,
+    CheckpointMirrorScheduler,
+    CheckpointStaleError,
+    ForkedCheckpointMirrorAttempt,
+    S3VersionedObjectStore,
+    publish_paired_checkpoint,
 )
 from cluster.aws.p5.corpus_contract import (
     CorpusContractError,
@@ -82,6 +91,13 @@ _MANIFEST_FIELDS = frozenset(
         "runs",
     }
 )
+_MANIFEST_V2_FIELDS = _MANIFEST_FIELDS | {
+    "dataset_receipt_sha256",
+    "environment_receipt_sha256",
+    "release_receipt_sha256",
+    "run_manifest_sha256",
+    "source_tree",
+}
 _RUN_FIELDS = frozenset(
     {
         "arm",
@@ -201,6 +217,15 @@ class LaunchPlan:
     release_members_sha256: str
     corpus_receipt_sha256: str
     code_commit: str
+    source_tree: str | None
+    run_manifest_sha256: str | None
+    release_receipt_sha256: str | None
+    environment_receipt_sha256: str | None
+    dataset_receipt_sha256: str
+    dataset_build_id: str
+    ordered_stream_sha256: str
+    instance_id: str
+    boot_id: str
     container_image: str
     runtime_uid: int
     runtime_gid: int
@@ -1021,6 +1046,7 @@ def load_launch_plan(
     ]
     | None = None,
     enforce_profile_scratch: bool = True,
+    allow_existing_outputs: bool = False,
 ) -> LaunchPlan:
     """Validate all trust roots and return an immutable paired launch plan."""
 
@@ -1081,6 +1107,8 @@ def load_launch_plan(
     scratch = Path(scratch_root).resolve(strict=True)
     if not isinstance(enforce_profile_scratch, bool):
         raise LaunchError("scratch enforcement flag must be boolean")
+    if not isinstance(allow_existing_outputs, bool):
+        raise LaunchError("existing output allowance must be boolean")
     if enforce_profile_scratch and scratch != Path(
         os.path.abspath(profile.scratch_root)
     ):
@@ -1090,8 +1118,18 @@ def load_launch_plan(
     manifest_file = Path(manifest_path)
     manifest_digest = _hash_regular(manifest_file, label="run manifest")
     manifest = _load_json(manifest_file, label="run manifest")
-    _exact_fields(manifest, _MANIFEST_FIELDS, label="run manifest")
-    _exact_int(manifest["schema_version"], 1, label="manifest schema version")
+    manifest_schema = manifest.get("schema_version")
+    if type(manifest_schema) is not int or manifest_schema not in {1, 2}:
+        raise LaunchError("manifest schema version must be exact integer 1 or 2")
+    _exact_fields(
+        manifest,
+        (
+            _MANIFEST_V2_FIELDS
+            if manifest_schema == 2
+            else _MANIFEST_FIELDS
+        ),
+        label="run manifest",
+    )
     if manifest["provider"] != PROVIDER:
         raise LaunchError("run manifest provider must be aws-p5.48xlarge")
     if manifest["cohort_id"] != COHORT_ID:
@@ -1144,6 +1182,34 @@ def load_launch_plan(
         corpus_binding["ordered_stream_sha256"],
         label="manifest ordered stream",
     )
+    source_tree = None
+    run_manifest_sha256 = None
+    release_receipt_sha256 = None
+    environment_receipt_sha256 = None
+    if manifest_schema == 2:
+        source_tree = _commit(manifest["source_tree"])
+        run_manifest_sha256 = _sha256(
+            manifest["run_manifest_sha256"],
+            label="manifest source run manifest",
+        )
+        release_receipt_sha256 = _sha256(
+            manifest["release_receipt_sha256"],
+            label="manifest release receipt",
+        )
+        environment_receipt_sha256 = _sha256(
+            manifest["environment_receipt_sha256"],
+            label="manifest environment receipt",
+        )
+        if (
+            _sha256(
+                manifest["dataset_receipt_sha256"],
+                label="manifest dataset receipt",
+            )
+            != corpus_sha256
+        ):
+            raise LaunchError(
+                "manifest dataset receipt SHA-256 differs from corpus binding"
+            )
     corpus_path = _inside_existing(
         scratch, corpus_relative, label="corpus receipt"
     )
@@ -1244,7 +1310,15 @@ def load_launch_plan(
             scratch, out_relative, label=f"{arm} output"
         )
         if out_dir.exists() or out_dir.is_symlink():
-            raise LaunchError(f"{arm} output already exists")
+            if not allow_existing_outputs:
+                raise LaunchError(f"{arm} output already exists")
+            output_metadata = out_dir.stat(follow_symlinks=False)
+            if out_dir.is_symlink() or not stat.S_ISDIR(
+                output_metadata.st_mode
+            ):
+                raise LaunchError(
+                    f"{arm} existing output is symlinked or unsafe"
+                )
 
         port = run["master_port"]
         if type(port) is not int or port < 1024 or port > 65_535:
@@ -1466,6 +1540,15 @@ def load_launch_plan(
         release_members_sha256=release_members_sha256,
         corpus_receipt_sha256=corpus_sha256,
         code_commit=code_commit,
+        source_tree=source_tree,
+        run_manifest_sha256=run_manifest_sha256,
+        release_receipt_sha256=release_receipt_sha256,
+        environment_receipt_sha256=environment_receipt_sha256,
+        dataset_receipt_sha256=corpus_sha256,
+        dataset_build_id=corpus_build_id,
+        ordered_stream_sha256=ordered_sha256,
+        instance_id=actual_instance_id,
+        boot_id=actual_boot_id,
         container_image=str(bootstrap_receipt["container_image"]),
         runtime_uid=int(bootstrap_receipt["runtime_uid"]),
         runtime_gid=int(bootstrap_receipt["runtime_gid"]),
@@ -2025,6 +2108,17 @@ def supervise_pair(
     ]
     | None = None,
     shutdown_source: Callable[[], int | None] | None = None,
+    checkpoint_scheduler_factory: Callable[
+        [
+            LaunchPlan,
+            Mapping[str, int],
+        ],
+        tuple[
+            CheckpointMirrorScheduler,
+            Callable[[str], CheckpointMirrorRequest],
+        ],
+    ]
+    | None = None,
 ) -> SupervisionResult:
     """Hold the host-wide lock while supervising exactly one seed pair."""
 
@@ -2039,6 +2133,7 @@ def supervise_pair(
             trainer_preflight=trainer_preflight,
             rank_zero_resolver=rank_zero_resolver,
             shutdown_source=shutdown_source,
+            checkpoint_scheduler_factory=checkpoint_scheduler_factory,
         )
     finally:
         fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
@@ -2061,6 +2156,17 @@ def _supervise_pair_locked(
     ]
     | None = None,
     shutdown_source: Callable[[], int | None] | None = None,
+    checkpoint_scheduler_factory: Callable[
+        [
+            LaunchPlan,
+            Mapping[str, int],
+        ],
+        tuple[
+            CheckpointMirrorScheduler,
+            Callable[[str], CheckpointMirrorRequest],
+        ],
+    ]
+    | None = None,
 ) -> SupervisionResult:
     """Launch both arms, then accept only paired zero exit status."""
 
@@ -2128,6 +2234,19 @@ def _supervise_pair_locked(
         ):
             _terminate_all(tuple(processes.values()))
             raise LaunchError("both pre-existing rank-zero PID files are required")
+        checkpoint_scheduler = None
+        checkpoint_request_factory = None
+        if checkpoint_scheduler_factory is not None:
+            try:
+                (
+                    checkpoint_scheduler,
+                    checkpoint_request_factory,
+                ) = checkpoint_scheduler_factory(plan, rank_zero_pids)
+            except Exception as error:
+                _terminate_all(tuple(processes.values()))
+                raise LaunchError(
+                    "checkpoint mirror scheduler initialization failed"
+                ) from error
 
         while True:
             requested_signal = (
@@ -2141,6 +2260,25 @@ def _supervise_pair_locked(
                     child_pids=child_pids,
                     peer_terminated=True,
                 )
+            if (
+                checkpoint_scheduler is not None
+                and checkpoint_request_factory is not None
+            ):
+                mirror_now = time.monotonic()
+                try:
+                    checkpoint_scheduler.maybe_start(
+                        checkpoint_request_factory("periodic"),
+                        now=mirror_now,
+                    )
+                    checkpoint_scheduler.poll(now=mirror_now)
+                except CheckpointStaleError:
+                    _terminate_all(tuple(processes.values()))
+                    return SupervisionResult(
+                        status="CHECKPOINT_STALE",
+                        returncode=74,
+                        child_pids=child_pids,
+                        peer_terminated=True,
+                    )
             if notice_source is not None:
                 try:
                     notice = notice_source()
@@ -2150,6 +2288,73 @@ def _supervise_pair_locked(
                         "interruption notice polling failed; pair was stopped"
                     ) from error
                 if notice is not None:
+                    if (
+                        checkpoint_scheduler is not None
+                        and checkpoint_request_factory is not None
+                    ):
+                        last_complete = checkpoint_scheduler.latest
+                        if (
+                            last_complete is not None
+                            and not checkpoint_scheduler.active
+                        ):
+                            _terminate_all(tuple(processes.values()))
+                            return SupervisionResult(
+                                status="interrupted",
+                                returncode=75,
+                                child_pids=child_pids,
+                                peer_terminated=True,
+                                resumable=True,
+                                interruption_receipt=(
+                                    last_complete.receipt.uri
+                                ),
+                            )
+                        notice_deadline = (
+                            time.monotonic() + 120.0
+                        )
+                        while time.monotonic() < notice_deadline:
+                            now = time.monotonic()
+                            try:
+                                checkpoint_scheduler.maybe_start(
+                                    checkpoint_request_factory(
+                                        "interruption"
+                                    ),
+                                    now=now,
+                                    immediate=True,
+                                )
+                                completed = checkpoint_scheduler.poll(
+                                    now=now
+                                )
+                            except CheckpointStaleError:
+                                completed = None
+                            if completed is not None:
+                                last_complete = completed
+                                break
+                            statuses = {
+                                arm: process.poll()
+                                for arm, process in processes.items()
+                            }
+                            if any(
+                                status is not None
+                                for status in statuses.values()
+                            ):
+                                break
+                            sleep(0.25)
+                        checkpoint_scheduler.cancel_active()
+                        _terminate_all(tuple(processes.values()))
+                        return SupervisionResult(
+                            status="interrupted",
+                            returncode=(
+                                75 if last_complete is not None else 74
+                            ),
+                            child_pids=child_pids,
+                            peer_terminated=True,
+                            resumable=last_complete is not None,
+                            interruption_receipt=(
+                                None
+                                if last_complete is None
+                                else last_complete.receipt.uri
+                            ),
+                        )
                     if interruption_handler is None:
                         _terminate_all(tuple(processes.values()))
                         return SupervisionResult(
@@ -2330,6 +2535,98 @@ def _production_interruption_handler(
         return handle_interruption(request, object_store=store)
 
 
+def _production_checkpoint_scheduler(
+    plan: LaunchPlan,
+    rank_zero_pids: Mapping[str, int],
+) -> tuple[
+    CheckpointMirrorScheduler,
+    Callable[[str], CheckpointMirrorRequest],
+]:
+    """Build the v3 periodic/interruption scheduler around one publisher."""
+
+    if (
+        plan.run_manifest_sha256 is None
+        or plan.release_receipt_sha256 is None
+        or plan.environment_receipt_sha256 is None
+        or plan.source_tree is None
+    ):
+        raise LaunchError("v3 checkpoint mirror context is incomplete")
+    staging_root = plan.scratch_root / "staging" / "checkpoint-mirror"
+    aws_home = plan.scratch_root / "staging" / "checkpoint-aws-home"
+    aws_home.mkdir(parents=True, exist_ok=True, mode=0o700)
+    os.chmod(aws_home, 0o700)
+    object_store = S3VersionedObjectStore(
+        region=plan.runtime.region,
+        environment={
+            "AWS_REGION": plan.runtime.region,
+            "HOME": str(aws_home),
+            "LANG": "C.UTF-8",
+            "LC_ALL": "C.UTF-8",
+            "PATH": "/usr/local/bin:/usr/bin:/bin",
+        },
+    )
+    monotonic_origin = time.monotonic()
+    wall_origin = datetime.now(timezone.utc).replace(microsecond=0)
+    scheduler: CheckpointMirrorScheduler
+
+    def request(reason: str) -> CheckpointMirrorRequest:
+        requested = wall_origin + timedelta(
+            seconds=scheduler.fresh_at - monotonic_origin
+        )
+        deadline = requested + timedelta(seconds=1200)
+        launches = {launch.arm: launch for launch in plan.arms}
+        return CheckpointMirrorRequest(
+            seed=plan.seed,
+            reason=reason,
+            request_id=secrets.token_hex(16),
+            requested_at=requested.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            deadline_at=deadline.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            instance_id=plan.instance_id,
+            boot_id=plan.boot_id,
+            profile_sha256=plan.profile.sha256,
+            environment_receipt_sha256=(
+                plan.environment_receipt_sha256
+            ),
+            release_sha256=plan.release_sha256,
+            release_receipt_sha256=plan.release_receipt_sha256,
+            run_manifest_sha256=plan.run_manifest_sha256,
+            dataset_receipt_sha256=plan.dataset_receipt_sha256,
+            dataset_build_id=plan.dataset_build_id,
+            ordered_stream_sha256=plan.ordered_stream_sha256,
+            source_commit=plan.code_commit,
+            source_tree=plan.source_tree,
+            rank_zero_pids=dict(rank_zero_pids),
+            checkpoint_paths={
+                arm: launches[arm].checkpoint_path for arm in _ARMS
+            },
+            config_sha256={
+                arm: launches[arm].config_sha256 for arm in _ARMS
+            },
+            run_ids={
+                arm: str(launches[arm].runtime_config["run_id"])
+                for arm in _ARMS
+            },
+            s3_root=plan.runtime.s3_root,
+        )
+
+    def start_attempt(
+        mirror_request: CheckpointMirrorRequest,
+    ) -> ForkedCheckpointMirrorAttempt:
+        return ForkedCheckpointMirrorAttempt(
+            lambda: publish_paired_checkpoint(
+                mirror_request,
+                object_store=object_store,
+                staging_root=staging_root,
+            )
+        )
+
+    scheduler = CheckpointMirrorScheduler(
+        start_attempt,
+        started_at=monotonic_origin,
+    )
+    return scheduler, request
+
+
 def _parser() -> argparse.ArgumentParser:
     root = Path(__file__).resolve().parents[3]
     parser = argparse.ArgumentParser()
@@ -2368,6 +2665,11 @@ def main(argv: Sequence[str] | None = None) -> int:
                 notice_source=client.interruption_notice,
                 interruption_handler=_production_interruption_handler,
                 shutdown_source=shutdown_source,
+                checkpoint_scheduler_factory=(
+                    _production_checkpoint_scheduler
+                    if plan.run_manifest_sha256 is not None
+                    else None
+                ),
             )
         report = {
             "child_pids": dict(sorted(result.child_pids.items())),

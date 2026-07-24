@@ -40,7 +40,10 @@ from .contracts import (
     bind_release,
     load_release,
     load_run_manifest,
+    parse_paired_checkpoint_receipt_v3,
+    validate_aws_dataset_pointer_contract,
     validate_runtime_attested_contract,
+    verify_aws_checkpoint_receipt_v3,
     verify_checkpoint_receipt,
     verify_release_member,
 )
@@ -550,6 +553,10 @@ class AwsP5Backend:
 
     def _validate_manifest(self, manifest: object) -> None:
         runs = getattr(manifest, "runs", ())
+        is_v3_profile = (
+            getattr(self.profile, "profile_id", None) == _V3_PROFILE_ID
+        )
+        expected_schema = 3 if is_v3_profile else 2
         if (
             getattr(manifest, "provider", None) != AWS_P5_PROFILE
             or getattr(manifest, "seed", None)
@@ -565,21 +572,38 @@ class AwsP5Backend:
                 "AWS lifecycle requires one owned Dense/Split90 seed pair",
             )
         if (
-            getattr(manifest, "schema_version", None) != 2
+            getattr(manifest, "schema_version", None) != expected_schema
             or not isinstance(getattr(manifest, "source_commit", None), str)
             or _COMMIT_RE.fullmatch(manifest.source_commit) is None
         ):
             raise MsctlError(
                 "RUN_MANIFEST_INVALID",
-                "AWS lifecycle requires a v2 source-bound run manifest",
+                "AWS lifecycle requires its exact source-bound run manifest",
             )
-        for field in (
-            "release_sha256",
-            "dataset_sha256",
-            "cohort_assignment_sha256",
-            "study_lock_sha256",
-            "sha256",
-        ):
+        hash_fields = (
+            (
+                "release_sha256",
+                "release_receipt_sha256",
+                "profile_sha256",
+                "dataset_pointer_sha256",
+                "dataset_receipt_sha256",
+                "dataset_build_id",
+                "ordered_stream_sha256",
+                "cohort_assignment_sha256",
+                "preregistration_sha256",
+                "sealed_evaluation_release_sha256",
+                "sha256",
+            )
+            if is_v3_profile
+            else (
+                "release_sha256",
+                "dataset_sha256",
+                "cohort_assignment_sha256",
+                "study_lock_sha256",
+                "sha256",
+            )
+        )
+        for field in hash_fields:
             try:
                 require_sha256(
                     getattr(manifest, field, None),
@@ -590,6 +614,18 @@ class AwsP5Backend:
                     "RUN_MANIFEST_INVALID",
                     "AWS run manifest is missing a hash binding",
                 ) from error
+        if is_v3_profile and (
+            getattr(manifest, "profile_sha256", None)
+            != getattr(self.profile, "sha256", None)
+            or getattr(manifest, "cohort_id", None)
+            != "memorysplit-confirmatory-v3-360m-n10-aws"
+            or not isinstance(getattr(manifest, "source_tree", None), str)
+            or _COMMIT_RE.fullmatch(manifest.source_tree) is None
+        ):
+            raise MsctlError(
+                "RUN_MANIFEST_INVALID",
+                "AWS v3 manifest identity does not match the frozen profile",
+            )
         for run in runs:
             try:
                 require_sha256(
@@ -603,12 +639,22 @@ class AwsP5Backend:
                 ) from error
 
     def _validate_release(self, release: object, manifest: object) -> None:
+        is_v3 = getattr(manifest, "schema_version", None) == 3
         if (
             getattr(release, "provider", None) != AWS_P5_PROFILE
             or getattr(release, "archive_sha256", None)
             != manifest.release_sha256
             or getattr(release, "source_commit", None)
             != manifest.source_commit
+            or (
+                is_v3
+                and (
+                    getattr(release, "receipt_sha256", None)
+                    != manifest.release_receipt_sha256
+                    or getattr(release, "source_tree", None)
+                    != manifest.source_tree
+                )
+            )
         ):
             raise MsctlError(
                 "RELEASE_RUN_MISMATCH",
@@ -627,27 +673,59 @@ class AwsP5Backend:
         terminate_at: str | None = None,
         checkpoints: Mapping[str, object] | None = None,
         checkpoint_receipt_sha256: str | None = None,
+        checkpoint_receipt_uri: str | None = None,
+        checkpoint_receipt_version_id: str | None = None,
+        checkpoint_receipt_bytes: int | None = None,
         evidence: Mapping[str, str] | None = None,
     ) -> dict[str, object]:
+        is_v3 = getattr(manifest, "schema_version", None) == 3
+        dataset_receipt_sha256 = (
+            manifest.dataset_receipt_sha256
+            if is_v3
+            else manifest.dataset_sha256
+        )
         lifecycle_evidence = dict(
             evidence
             or {
-                "dataset_pointer_sha256": manifest.dataset_sha256,
-                "dataset_verification_sha256": manifest.dataset_sha256,
+                "dataset_pointer_sha256": (
+                    manifest.dataset_pointer_sha256
+                    if is_v3
+                    else manifest.dataset_sha256
+                ),
+                "dataset_verification_sha256": dataset_receipt_sha256,
                 "environment_receipt_sha256": self._runtime_sha256(),
             }
         )
-        if set(lifecycle_evidence) != {
+        expected_evidence_fields = {
             "dataset_pointer_sha256",
             "dataset_verification_sha256",
             "environment_receipt_sha256",
-        }:
+            *({"instance_id", "boot_id"} if is_v3 else set()),
+        }
+        if set(lifecycle_evidence) != expected_evidence_fields:
             raise MsctlError(
                 "LIFECYCLE_EVIDENCE_INVALID",
                 "AWS lifecycle evidence fields do not match the contract",
             )
-        for field, digest in lifecycle_evidence.items():
-            require_sha256(digest, label=field)
+        for field in (
+            "dataset_pointer_sha256",
+            "dataset_verification_sha256",
+            "environment_receipt_sha256",
+        ):
+            require_sha256(lifecycle_evidence[field], label=field)
+        if is_v3 and (
+            not isinstance(lifecycle_evidence["instance_id"], str)
+            or _INSTANCE_ID_RE.fullmatch(
+                lifecycle_evidence["instance_id"]
+            )
+            is None
+            or not isinstance(lifecycle_evidence["boot_id"], str)
+            or not lifecycle_evidence["boot_id"]
+        ):
+            raise MsctlError(
+                "LIFECYCLE_EVIDENCE_INVALID",
+                "AWS v3 lifecycle instance and boot identities are invalid",
+            )
         release_root = self._release_root(release)
         staging = "/mnt/memorysplit/staging"
         steps: list[dict[str, object]] = []
@@ -676,7 +754,8 @@ class AwsP5Backend:
                 f"releases/{release.archive_sha256}/RELEASE.json"
             )
             cohort_bucket, cohort_key = self._s3_location(
-                f"releases/{release.archive_sha256}/cohort-assignment-v2.json"
+                f"releases/{release.archive_sha256}/"
+                f"cohort-assignment-{'v3' if is_v3 else 'v2'}.json"
             )
             steps.extend(
                 [
@@ -767,7 +846,7 @@ class AwsP5Backend:
                             "ENABLED",
                             (
                                 f"{staging}/releases/{release.archive_sha256}/"
-                                "cohort-assignment-v2.json"
+                                f"cohort-assignment-{'v3' if is_v3 else 'v2'}.json"
                             ),
                         ],
                     },
@@ -793,7 +872,14 @@ class AwsP5Backend:
                         "/usr/bin/python3",
                         "/opt/memorysplit/cluster/aws/p5/bootstrap.py",
                         "--profile",
-                        "/opt/memorysplit/cluster/profiles/aws-p5.48xlarge.json",
+                        (
+                            "/opt/memorysplit/cluster/profiles/"
+                            + (
+                                "aws-p5.48xlarge-v3.json"
+                                if is_v3
+                                else "aws-p5.48xlarge.json"
+                            )
+                        ),
                         "--container-image",
                         self.runtime.container_image,
                         "--release-archive",
@@ -817,11 +903,11 @@ class AwsP5Backend:
                         "--dataset-receipt",
                         "/mnt/memorysplit/dataset/receipt.json",
                         "--dataset-receipt-sha256",
-                        manifest.dataset_sha256,
+                        dataset_receipt_sha256,
                         "--cohort-assignment",
                         (
                             f"{staging}/releases/{release.archive_sha256}/"
-                            "cohort-assignment-v2.json"
+                            f"cohort-assignment-{'v3' if is_v3 else 'v2'}.json"
                         ),
                         "--cohort-assignment-sha256",
                         manifest.cohort_assignment_sha256,
@@ -859,6 +945,22 @@ class AwsP5Backend:
                         release.archive_sha256,
                         "--release-members-sha256",
                         getattr(release, "members_sha256", ""),
+                        *(
+                            [
+                                "--release-receipt-sha256",
+                                release.receipt_sha256,
+                                "--environment-receipt-sha256",
+                                lifecycle_evidence[
+                                    "environment_receipt_sha256"
+                                ],
+                                "--run-manifest-sha256",
+                                manifest.sha256,
+                                "--source-tree",
+                                manifest.source_tree,
+                            ]
+                            if is_v3
+                            else []
+                        ),
                         "--cohort-assignment-sha256",
                         manifest.cohort_assignment_sha256,
                         "--code-commit",
@@ -894,22 +996,73 @@ class AwsP5Backend:
                 label="checkpoint receipt",
             )
             resume_root = f"{staging}/resume/{receipt_sha256}"
-            receipt_bucket, receipt_key = self._s3_location(
-                f"checkpoints/receipts/{receipt_sha256}.json"
-            )
-            checkpoint_rows = [
-                {
-                    "arm": arm,
-                    "resume_path": f"{resume_root}/{arm}.pt",
-                    "resume_sha256": checkpoints[arm].sha256,
-                    "world_size": checkpoints[arm].world_size,
+            if is_v3:
+                if (
+                    not isinstance(checkpoint_receipt_uri, str)
+                    or not checkpoint_receipt_uri.startswith(
+                        self.runtime.s3_root.rstrip("/") + "/"
+                    )
+                    or not isinstance(
+                        checkpoint_receipt_version_id,
+                        str,
+                    )
+                    or checkpoint_receipt_version_id in {"", "null"}
+                    or type(checkpoint_receipt_bytes) is not int
+                    or checkpoint_receipt_bytes <= 0
+                ):
+                    raise MsctlError(
+                        "CHECKPOINT_PROVENANCE_MISMATCH",
+                        "v3 resume receipt identity is incomplete",
+                    )
+                relative_receipt = checkpoint_receipt_uri.removeprefix(
+                    self.runtime.s3_root.rstrip("/") + "/"
+                )
+                receipt_bucket, receipt_key = self._s3_location(
+                    relative_receipt
+                )
+                checkpoint_rows = []
+                for arm in ("dense", "split90"):
+                    checkpoint = checkpoints[arm]
+                    checkpoint_rows.append(
+                        {
+                            "arm": arm,
+                            "bytes": checkpoint.object.bytes,
+                            "config_fingerprint": (
+                                checkpoint.config_fingerprint
+                            ),
+                            "config_sha256": checkpoint.config_sha256,
+                            "resume_path": f"{resume_root}/{arm}.pt",
+                            "resume_sha256": checkpoint.object.sha256,
+                            "step": checkpoint.step,
+                            "uri": checkpoint.object.uri,
+                            "version_id": checkpoint.object.version_id,
+                            "world_size": checkpoint.world_size,
+                        }
+                    )
+                checkpoint_binding = {
+                    "bytes": checkpoint_receipt_bytes,
+                    "checkpoints": checkpoint_rows,
+                    "sha256": receipt_sha256,
+                    "uri": checkpoint_receipt_uri,
+                    "version_id": checkpoint_receipt_version_id,
                 }
-                for arm in ("dense", "split90")
-            ]
-            checkpoint_binding = {
-                "sha256": receipt_sha256,
-                "checkpoints": checkpoint_rows,
-            }
+            else:
+                receipt_bucket, receipt_key = self._s3_location(
+                    f"checkpoints/receipts/{receipt_sha256}.json"
+                )
+                checkpoint_rows = [
+                    {
+                        "arm": arm,
+                        "resume_path": f"{resume_root}/{arm}.pt",
+                        "resume_sha256": checkpoints[arm].sha256,
+                        "world_size": checkpoints[arm].world_size,
+                    }
+                    for arm in ("dense", "split90")
+                ]
+                checkpoint_binding = {
+                    "sha256": receipt_sha256,
+                    "checkpoints": checkpoint_rows,
+                }
             steps.append(
                 {
                     "name": "prepare-resume-staging",
@@ -937,6 +1090,14 @@ class AwsP5Backend:
                         receipt_bucket,
                         "--key",
                         receipt_key,
+                        *(
+                            [
+                                "--version-id",
+                                str(checkpoint_receipt_version_id),
+                            ]
+                            if is_v3
+                            else []
+                        ),
                         "--checksum-mode",
                         "ENABLED",
                         f"{resume_root}/receipt.json",
@@ -944,9 +1105,15 @@ class AwsP5Backend:
                 }
             )
             for row in checkpoint_rows:
-                bucket, key = self._s3_location(
-                    f"checkpoints/sha256/{row['resume_sha256']}.pt"
-                )
+                if is_v3:
+                    relative_checkpoint = str(row["uri"]).removeprefix(
+                        self.runtime.s3_root.rstrip("/") + "/"
+                    )
+                    bucket, key = self._s3_location(relative_checkpoint)
+                else:
+                    bucket, key = self._s3_location(
+                        f"checkpoints/sha256/{row['resume_sha256']}.pt"
+                    )
                 steps.append(
                     {
                         "name": f"materialize-resume-{row['arm']}",
@@ -962,6 +1129,14 @@ class AwsP5Backend:
                             bucket,
                             "--key",
                             key,
+                            *(
+                                [
+                                    "--version-id",
+                                    str(row["version_id"]),
+                                ]
+                                if is_v3
+                                else []
+                            ),
                             "--checksum-mode",
                             "ENABLED",
                             row["resume_path"],
@@ -976,7 +1151,14 @@ class AwsP5Backend:
                 "--manifest",
                 f"{staging}/launcher-manifest-{manifest.sha256}.json",
                 "--profile",
-                f"{release_root}/cluster/profiles/aws-p5.48xlarge.json",
+                (
+                    f"{release_root}/cluster/profiles/"
+                    + (
+                        "aws-p5.48xlarge-v3.json"
+                        if is_v3
+                        else "aws-p5.48xlarge.json"
+                    )
+                ),
                 "--repo-root",
                 release_root,
                 "--scratch-root",
@@ -987,6 +1169,16 @@ class AwsP5Backend:
                 f"{resume_root}/receipt.json",
                 "--checkpoint-receipt-sha256",
                 receipt_sha256,
+                *(
+                    [
+                        "--checkpoint-receipt-uri",
+                        str(checkpoint_receipt_uri),
+                        "--checkpoint-receipt-version-id",
+                        str(checkpoint_receipt_version_id),
+                    ]
+                    if is_v3
+                    else []
+                ),
                 "--run-manifest-sha256",
                 manifest.sha256,
                 *(
@@ -1008,7 +1200,14 @@ class AwsP5Backend:
                 "--manifest",
                 f"{staging}/launcher-manifest-{manifest.sha256}.json",
                 "--profile",
-                f"{release_root}/cluster/profiles/aws-p5.48xlarge.json",
+                (
+                    f"{release_root}/cluster/profiles/"
+                    + (
+                        "aws-p5.48xlarge-v3.json"
+                        if is_v3
+                        else "aws-p5.48xlarge.json"
+                    )
+                ),
                 "--repo-root",
                 release_root,
                 "--scratch-root",
@@ -1017,13 +1216,13 @@ class AwsP5Backend:
             ]
         steps.append({"name": "paired-launch", "argv": launcher_argv})
         return {
-            "schema_version": 1,
+            "schema_version": 2 if is_v3 else 1,
             "operation": operation,
             "provider": AWS_P5_PROFILE,
             "seed": manifest.seed,
             "release_sha256": release.archive_sha256,
             "run_manifest_sha256": manifest.sha256,
-            "dataset_sha256": manifest.dataset_sha256,
+            "dataset_sha256": dataset_receipt_sha256,
             **lifecycle_evidence,
             "runtime_sha256": self._runtime_sha256(),
             "environment": {
@@ -1361,12 +1560,17 @@ class AwsP5Backend:
         *,
         terminate_at: str,
     ) -> dict[str, object]:
+        dataset_sha256 = getattr(
+            manifest,
+            "dataset_receipt_sha256",
+            getattr(manifest, "dataset_sha256", None),
+        )
         return {
             "provider": AWS_P5_PROFILE,
             "seed": manifest.seed,
             "cohort_sha256": manifest.cohort_assignment_sha256,
             "release_sha256": manifest.release_sha256,
-            "dataset_sha256": manifest.dataset_sha256,
+            "dataset_sha256": dataset_sha256,
             "run_manifest_sha256": manifest.sha256,
             "profile_sha256": self.profile.sha256,
             "runtime_sha256": self._runtime_sha256(),
@@ -1626,7 +1830,12 @@ class AwsP5Backend:
                 or row["cohort_sha256"]
                 != manifest.cohort_assignment_sha256
                 or row["release_sha256"] != manifest.release_sha256
-                or row["dataset_sha256"] != manifest.dataset_sha256
+                or row["dataset_sha256"]
+                != getattr(
+                    manifest,
+                    "dataset_receipt_sha256",
+                    getattr(manifest, "dataset_sha256", None),
+                )
                 or row["run_manifest_sha256"] != manifest.sha256
             ):
                 raise MsctlError(
@@ -1794,6 +2003,32 @@ class AwsP5Backend:
         run = by_id.get(state.get("run_id"))
         instance_id = state.get("instance_id")
         command_id = state.get("command_id")
+        is_v3 = getattr(manifest, "schema_version", None) == 3
+        provenance_matches = (
+            (
+                state.get("schema_version") == 2
+                and state.get("release_receipt_sha256")
+                == manifest.release_receipt_sha256
+                and state.get("dataset_pointer_sha256")
+                == manifest.dataset_pointer_sha256
+                and state.get("dataset_receipt_sha256")
+                == manifest.dataset_receipt_sha256
+                and state.get("dataset_build_id")
+                == manifest.dataset_build_id
+                and state.get("ordered_stream_sha256")
+                == manifest.ordered_stream_sha256
+                and state.get("preregistration_sha256")
+                == manifest.preregistration_sha256
+                and state.get("source_tree") == manifest.source_tree
+            )
+            if is_v3
+            else (
+                state.get("schema_version") == 1
+                and state.get("dataset_sha256") == manifest.dataset_sha256
+                and state.get("study_lock_sha256")
+                == manifest.study_lock_sha256
+            )
+        )
         return (
             run is not None
             and state.get("provider") == AWS_P5_PROFILE
@@ -1801,11 +2036,10 @@ class AwsP5Backend:
             and state.get("arm") == run.arm
             and state.get("config_sha256") == run.config_sha256
             and state.get("release_sha256") == manifest.release_sha256
-            and state.get("dataset_sha256") == manifest.dataset_sha256
+            and provenance_matches
             and state.get("run_manifest_sha256") == manifest.sha256
             and state.get("cohort_assignment_sha256")
             == manifest.cohort_assignment_sha256
-            and state.get("study_lock_sha256") == manifest.study_lock_sha256
             and state.get("source_commit") == manifest.source_commit
             and state.get("profile_sha256") == self.profile.sha256
             and state.get("runtime_sha256") == self._runtime_sha256()
@@ -1852,13 +2086,15 @@ class AwsP5Backend:
         release: object,
         instance_id: str,
         terminate_at: str,
+        operation_intent: Mapping[str, object] | None = None,
     ) -> dict[str, object]:
-        operation_intent = self._training_operation_intent(
-            operation="submit",
-            release=release,
-            manifest=manifest,
-            terminate_at=terminate_at,
-        )
+        if operation_intent is None:
+            operation_intent = self._training_operation_intent(
+                operation="submit",
+                release=release,
+                manifest=manifest,
+                terminate_at=terminate_at,
+            )
         return {
             "provider": AWS_P5_PROFILE,
             "seed": manifest.seed,
@@ -1976,7 +2212,31 @@ class AwsP5Backend:
         instance_id: str,
         terminate_at: str,
         checkpoint_receipt_sha256: str,
+        checkpoint_receipt: object | None = None,
+        checkpoints: Mapping[str, object] | None = None,
     ) -> dict[str, object]:
+        versioned_bindings: dict[str, object] = {}
+        if getattr(manifest, "schema_version", None) == 3:
+            if checkpoint_receipt is None or checkpoints is None:
+                raise MsctlError(
+                    "CHECKPOINT_PROVENANCE_MISMATCH",
+                    "v3 resume approval lacks versioned checkpoint bindings",
+                )
+            versioned_bindings = {
+                "checkpoint_receipt_uri": checkpoint_receipt.uri,
+                "checkpoint_receipt_version_id": (
+                    checkpoint_receipt.version_id
+                ),
+                "checkpoint_objects": [
+                    {
+                        "arm": arm,
+                        "sha256": checkpoints[arm].object.sha256,
+                        "uri": checkpoints[arm].object.uri,
+                        "version_id": checkpoints[arm].object.version_id,
+                    }
+                    for arm in ("dense", "split90")
+                ],
+            }
         return aws_resource_request(
             "resume",
             bindings={
@@ -1987,6 +2247,7 @@ class AwsP5Backend:
                     terminate_at=terminate_at,
                 ),
                 "checkpoint_receipt_sha256": checkpoint_receipt_sha256,
+                **versioned_bindings,
             },
         )
 
@@ -2126,16 +2387,32 @@ class AwsP5Backend:
                 local_path=Path(repo_root) / run.config,
                 label="run config",
             )
+        is_v3 = getattr(manifest, "schema_version", None) == 3
         cohort_member = release.members.get(
-            "configs/cohort-assignment-v2.json"
+            (
+                "configs/cohort-assignment-v3.json"
+                if is_v3
+                else "configs/cohort-assignment-v2.json"
+            )
         )
-        study_member = release.members.get("configs/preregistration-v2.yaml")
+        study_member = release.members.get(
+            (
+                "configs/preregistration-v3.yaml"
+                if is_v3
+                else "configs/preregistration-v2.yaml"
+            )
+        )
+        expected_study_sha256 = (
+            manifest.preregistration_sha256
+            if is_v3
+            else manifest.study_lock_sha256
+        )
         if (
             cohort_member is None
             or cohort_member.get("sha256")
             != manifest.cohort_assignment_sha256
             or study_member is None
-            or study_member.get("sha256") != manifest.study_lock_sha256
+            or study_member.get("sha256") != expected_study_sha256
         ):
             raise MsctlError(
                 "RELEASE_COHORT_MISMATCH",
@@ -2158,35 +2435,44 @@ class AwsP5Backend:
             load_json(pointer_path, label="AWS dataset pointer"),
             label="AWS dataset pointer",
         )
-        require_exact_keys(
-            pointer,
-            {
-                "schema_version",
-                "dataset_id",
-                "provider",
-                "materialization",
-                "durable_uri_env",
-                "scratch_root",
-                "relative_path",
-                "required_receipt",
-                "required_sidecars",
-                "source_lock_manifest",
-                "full_corpus_in_release",
-            },
-            label="AWS dataset pointer",
-        )
-        if (
-            pointer["schema_version"] != 1
-            or pointer["provider"] != AWS_P5_PROFILE
-            or pointer["materialization"] != "s3"
-            or pointer["durable_uri_env"] != "MS_S3_ROOT"
-            or pointer["scratch_root"] != "/mnt/memorysplit"
-            or pointer["required_receipt"] != "dataset/receipt.json"
-        ):
-            raise MsctlError(
-                "DATASET_POINTER_INVALID",
-                "AWS lifecycle requires the canonical immutable dataset pointer",
+        is_v3 = getattr(manifest, "schema_version", None) == 3
+        if is_v3:
+            validate_aws_dataset_pointer_contract(pointer)
+            if sha256_file(pointer_path) != manifest.dataset_pointer_sha256:
+                raise MsctlError(
+                    "DATASET_POINTER_INVALID",
+                    "AWS v3 dataset pointer does not match the run manifest",
+                )
+        else:
+            require_exact_keys(
+                pointer,
+                {
+                    "schema_version",
+                    "dataset_id",
+                    "provider",
+                    "materialization",
+                    "durable_uri_env",
+                    "scratch_root",
+                    "relative_path",
+                    "required_receipt",
+                    "required_sidecars",
+                    "source_lock_manifest",
+                    "full_corpus_in_release",
+                },
+                label="AWS dataset pointer",
             )
+            if (
+                pointer["schema_version"] != 1
+                or pointer["provider"] != AWS_P5_PROFILE
+                or pointer["materialization"] != "s3"
+                or pointer["durable_uri_env"] != "MS_S3_ROOT"
+                or pointer["scratch_root"] != "/mnt/memorysplit"
+                or pointer["required_receipt"] != "dataset/receipt.json"
+            ):
+                raise MsctlError(
+                    "DATASET_POINTER_INVALID",
+                    "AWS lifecycle requires the canonical immutable dataset pointer",
+                )
         if (dataset_root is None) == (dataset_verification is None):
             raise MsctlError(
                 "CLI_USAGE",
@@ -2223,7 +2509,12 @@ class AwsP5Backend:
                     "DATASET_VERIFICATION_INVALID",
                     "AWS dataset verification identity does not match content",
                 )
-        if receipt_sha256 != manifest.dataset_sha256:
+        expected_dataset_sha256 = (
+            manifest.dataset_receipt_sha256
+            if is_v3
+            else manifest.dataset_sha256
+        )
+        if receipt_sha256 != expected_dataset_sha256:
             raise MsctlError(
                 "DATASET_PROVENANCE_MISMATCH",
                 "AWS dataset evidence does not match the run manifest",
@@ -2231,6 +2522,53 @@ class AwsP5Backend:
 
         environment_path = Path(environment_receipt)
         environment_bytes = environment_path.read_bytes()
+        if is_v3:
+            try:
+                environment = parse_environment_receipt_bytes(
+                    environment_bytes
+                )
+            except AttestationError as error:
+                raise MsctlError(
+                    "ENVIRONMENT_RECEIPT_INVALID",
+                    "AWS v3 environment receipt is invalid",
+                ) from error
+            if (
+                environment["profile_sha256"] != self.profile.sha256
+                or environment["source_commit"] != manifest.source_commit
+                or environment["source_tree"] != manifest.source_tree
+                or environment["container_image_digest"]
+                != self.runtime.container_digest
+                or environment["ami_id"] != self.runtime.ami_id
+                or environment["region"] != self.runtime.region
+                or (
+                    expected_instance_id is not None
+                    and environment["instance_id"] != expected_instance_id
+                )
+                or not self.identity_verifier(
+                    environment["aws_instance_identity_document"],
+                    "".join(
+                        str(
+                            environment[
+                                "aws_instance_identity_pkcs7"
+                            ]
+                        ).split()
+                    ),
+                    self.runtime.region,
+                )
+            ):
+                raise MsctlError(
+                    "ENVIRONMENT_RECEIPT_INVALID",
+                    "AWS v3 environment receipt does not bind the selected runtime",
+                )
+            return {
+                "dataset_pointer_sha256": sha256_file(pointer_path),
+                "dataset_verification_sha256": source_sha256,
+                "environment_receipt_sha256": hashlib.sha256(
+                    environment_bytes
+                ).hexdigest(),
+                "instance_id": str(environment["instance_id"]),
+                "boot_id": str(environment["boot_id"]),
+            }
         environment = require_object(
             load_json(environment_path, label="AWS environment receipt"),
             label="AWS environment receipt",
@@ -3841,9 +4179,91 @@ class AwsP5Backend:
         published: Mapping[str, object],
         attempt: int,
         checkpoint_receipt_sha256: str | None = None,
+        checkpoint_receipt: object | None = None,
+        checkpoints: Mapping[str, object] | None = None,
         prior_command_ids: list[str] | None = None,
     ) -> dict[str, object]:
         now = _timestamp()
+        is_v3 = getattr(manifest, "schema_version", None) == 3
+        if is_v3:
+            state = {
+                "schema_version": 2,
+                "run_id": run.run_id,
+                "arm": run.arm,
+                "seed": run.seed,
+                "provider": AWS_P5_PROFILE,
+                "release_sha256": manifest.release_sha256,
+                "release_receipt_sha256": (
+                    manifest.release_receipt_sha256
+                ),
+                "run_manifest_sha256": manifest.sha256,
+                "config_sha256": run.config_sha256,
+                "dataset_pointer_sha256": (
+                    manifest.dataset_pointer_sha256
+                ),
+                "dataset_receipt_sha256": (
+                    manifest.dataset_receipt_sha256
+                ),
+                "dataset_build_id": manifest.dataset_build_id,
+                "ordered_stream_sha256": (
+                    manifest.ordered_stream_sha256
+                ),
+                "dataset_verification_sha256": intent[
+                    "dataset_verification_sha256"
+                ],
+                "environment_receipt_sha256": intent[
+                    "environment_receipt_sha256"
+                ],
+                "cohort_assignment_sha256": (
+                    manifest.cohort_assignment_sha256
+                ),
+                "preregistration_sha256": (
+                    manifest.preregistration_sha256
+                ),
+                "source_commit": manifest.source_commit,
+                "source_tree": manifest.source_tree,
+                "profile_sha256": self.profile.sha256,
+                "runtime_sha256": self._runtime_sha256(),
+                "ami_id": self.runtime.ami_id,
+                "container_digest": self.runtime.container_digest,
+                "instance_id": instance_id,
+                "terminate_at": terminate_at,
+                "operation_id": intent["operation_id"],
+                "intent_sha256": published["intent_sha256"],
+                "intent_uri": published["intent_uri"],
+                "command_id": None,
+                "operation": operation,
+                "status": "INTENT_PUBLISHED",
+                "attempt": attempt,
+                "send_attempted": False,
+                "created_at": now,
+                "updated_at": now,
+            }
+            if operation == "resume":
+                if checkpoint_receipt is None or checkpoints is None:
+                    raise MsctlError(
+                        "STATE_INCOMPLETE",
+                        "v3 resume state requires versioned checkpoint bindings",
+                    )
+                state["checkpoint_receipt"] = {
+                    "sha256": checkpoint_receipt.sha256,
+                    "uri": checkpoint_receipt.uri,
+                    "version_id": checkpoint_receipt.version_id,
+                }
+                state["checkpoint_objects"] = [
+                    {
+                        "arm": arm,
+                        "bytes": checkpoints[arm].object.bytes,
+                        "sha256": checkpoints[arm].object.sha256,
+                        "uri": checkpoints[arm].object.uri,
+                        "version_id": checkpoints[arm].object.version_id,
+                    }
+                    for arm in ("dense", "split90")
+                ]
+                state["prior_command_ids"] = list(
+                    prior_command_ids or []
+                )
+            return state
         state: dict[str, object] = {
             "schema_version": 1,
             "run_id": run.run_id,
@@ -3906,7 +4326,11 @@ class AwsP5Backend:
         store.write_aws_pair(
             manifest.sha256,
             {
-                "schema_version": 1,
+                "schema_version": (
+                    2
+                    if getattr(manifest, "schema_version", None) == 3
+                    else 1
+                ),
                 "provider": AWS_P5_PROFILE,
                 "run_manifest_sha256": manifest.sha256,
                 "operation_id": next(iter(operation_ids)),
@@ -3937,6 +4361,11 @@ class AwsP5Backend:
         for run_id, state in expected.items():
             current = store.read_run(run_id)
             if current is None:
+                if getattr(manifest, "schema_version", None) == 3:
+                    raise MsctlError(
+                        "STATE_INCOMPLETE",
+                        "v3 paired state is partial and cannot be repaired",
+                    )
                 store.write_run(run_id, dict(state))
             elif current != state:
                 raise MsctlError(
@@ -4155,6 +4584,7 @@ class AwsP5Backend:
                 release=release,
                 instance_id=instance_id,
                 terminate_at=terminate_at,
+                operation_intent=operation_intent,
             )
             plan["operation_intent"] = operation_intent
             plan["operation_id"] = operation_intent["operation_id"]
@@ -4389,6 +4819,210 @@ class AwsP5Backend:
                 "idempotent": False,
             }
 
+    @staticmethod
+    def _v3_checkpoint_metadata(
+        receipt: object,
+        checkpoint: object,
+    ) -> dict[str, str]:
+        return {
+            "arm": checkpoint.arm,
+            "checkpoint-version": str(checkpoint.checkpoint_version),
+            "config-fingerprint": checkpoint.config_fingerprint,
+            "config-sha256": checkpoint.config_sha256,
+            "data-build-id": checkpoint.data.build_id,
+            "data-receipt-sha256": checkpoint.data.receipt_sha256,
+            "global-cursor": str(checkpoint.data.global_cursor),
+            "ordered-stream-sha256": (
+                checkpoint.data.ordered_stream_sha256
+            ),
+            "request-id": receipt.request_id,
+            "run-id": checkpoint.run_id,
+            "seed": str(checkpoint.seed),
+            "sha256": checkpoint.object.sha256,
+            "sidecar-name": checkpoint.data.sidecar_name,
+            "step": str(checkpoint.step),
+            "world-size": str(checkpoint.world_size),
+        }
+
+    def _fetch_checkpoint_receipt_v3(
+        self,
+        *,
+        receipt_uri: str,
+        receipt_sha256: str,
+        receipt_version_id: str,
+        release: object,
+        manifest: object,
+        evidence: Mapping[str, str],
+    ):
+        """GET one exact receipt version and HEAD both exact checkpoints."""
+
+        expected_evidence = {
+            "environment_receipt_sha256",
+            "instance_id",
+            "boot_id",
+        }
+        if set(evidence) != expected_evidence:
+            raise MsctlError(
+                "CHECKPOINT_PROVENANCE_MISMATCH",
+                "v3 checkpoint environment evidence is incomplete",
+            )
+        receipt_digest = require_sha256(
+            receipt_sha256,
+            label="v3 checkpoint receipt",
+        )
+        if (
+            not isinstance(receipt_version_id, str)
+            or receipt_version_id in {"", "null"}
+        ):
+            raise MsctlError(
+                "CHECKPOINT_PROVENANCE_MISMATCH",
+                "v3 checkpoint receipt version ID is invalid",
+            )
+        prefix = self.runtime.s3_root.rstrip("/") + "/"
+        if (
+            not isinstance(receipt_uri, str)
+            or not receipt_uri.startswith(prefix)
+        ):
+            raise MsctlError(
+                "CHECKPOINT_PROVENANCE_MISMATCH",
+                "v3 checkpoint receipt is outside the pinned S3 root",
+            )
+        receipt_bucket, receipt_key = self._s3_location(
+            receipt_uri.removeprefix(prefix)
+        )
+        expected_checksum = base64.b64encode(
+            bytes.fromhex(receipt_digest)
+        ).decode("ascii")
+        with tempfile.TemporaryDirectory(
+            prefix="memorysplit-checkpoint-receipt-",
+            dir=Path(tempfile.gettempdir()).resolve(),
+        ) as temporary:
+            destination = Path(temporary) / "receipt.json"
+            output = _aws_output_object(
+                self._run(
+                    self._aws_argv(
+                        "s3api",
+                        "get-object",
+                        "--bucket",
+                        receipt_bucket,
+                        "--key",
+                        receipt_key,
+                        "--version-id",
+                        receipt_version_id,
+                        "--checksum-mode",
+                        "ENABLED",
+                        str(destination),
+                        query=(
+                            "{receipt:{checksum_sha256:ChecksumSHA256,"
+                            "version_id:VersionId}}"
+                        ),
+                    ),
+                    operation="fetch v3 checkpoint receipt",
+                ),
+                {"receipt"},
+                label="v3 checkpoint receipt download",
+            )
+            receipt_output = _aws_output_object(
+                output["receipt"],
+                {"checksum_sha256", "version_id"},
+                label="v3 checkpoint receipt object",
+            )
+            try:
+                payload = read_regular_input(
+                    destination,
+                    label="v3 checkpoint receipt",
+                    maximum_bytes=16 * 1024 * 1024,
+                )
+            except (AttestationError, OSError) as error:
+                raise MsctlError(
+                    "CHECKPOINT_PROVENANCE_MISMATCH",
+                    "downloaded v3 checkpoint receipt is unsafe",
+                ) from error
+        if (
+            receipt_output["checksum_sha256"] != expected_checksum
+            or receipt_output["version_id"] != receipt_version_id
+            or hashlib.sha256(payload).hexdigest() != receipt_digest
+        ):
+            raise MsctlError(
+                "CHECKPOINT_PROVENANCE_MISMATCH",
+                "downloaded v3 checkpoint receipt identity differs",
+            )
+        receipt = parse_paired_checkpoint_receipt_v3(
+            payload,
+            receipt_uri=receipt_uri,
+            receipt_sha256=receipt_digest,
+            receipt_version_id=receipt_version_id,
+        )
+        verify_aws_checkpoint_receipt_v3(
+            receipt,
+            release=release,
+            manifest=manifest,
+            environment_receipt_sha256=evidence[
+                "environment_receipt_sha256"
+            ],
+            instance_id=evidence["instance_id"],
+            boot_id=evidence["boot_id"],
+        )
+        for checkpoint in receipt.checkpoints:
+            checkpoint_uri = checkpoint.object.uri
+            if not checkpoint_uri.startswith(prefix):
+                raise MsctlError(
+                    "CHECKPOINT_PROVENANCE_MISMATCH",
+                    "v3 checkpoint object is outside the pinned S3 root",
+                )
+            bucket, key = self._s3_location(
+                checkpoint_uri.removeprefix(prefix)
+            )
+            head_output = _aws_output_object(
+                self._run(
+                    self._aws_argv(
+                        "s3api",
+                        "head-object",
+                        "--bucket",
+                        bucket,
+                        "--key",
+                        key,
+                        "--version-id",
+                        checkpoint.object.version_id,
+                        "--checksum-mode",
+                        "ENABLED",
+                        query=(
+                            "{object:{checksum_sha256:ChecksumSHA256,"
+                            "content_length:ContentLength,"
+                            "metadata:Metadata,version_id:VersionId}}"
+                        ),
+                    ),
+                    operation=f"verify v3 {checkpoint.arm} checkpoint",
+                ),
+                {"object"},
+                label=f"v3 {checkpoint.arm} checkpoint head",
+            )
+            head = _aws_output_object(
+                head_output["object"],
+                {
+                    "checksum_sha256",
+                    "content_length",
+                    "metadata",
+                    "version_id",
+                },
+                label=f"v3 {checkpoint.arm} checkpoint object",
+            )
+            checkpoint_checksum = base64.b64encode(
+                bytes.fromhex(checkpoint.object.sha256)
+            ).decode("ascii")
+            if (
+                head["checksum_sha256"] != checkpoint_checksum
+                or head["content_length"] != checkpoint.object.bytes
+                or head["metadata"]
+                != self._v3_checkpoint_metadata(receipt, checkpoint)
+                or head["version_id"] != checkpoint.object.version_id
+            ):
+                raise MsctlError(
+                    "CHECKPOINT_PROVENANCE_MISMATCH",
+                    f"v3 {checkpoint.arm} checkpoint version differs",
+                )
+        return receipt
+
     def _checkpoint_map(
         self,
         manifest: object,
@@ -4396,6 +5030,38 @@ class AwsP5Backend:
     ) -> dict[str, object]:
         checkpoints = getattr(receipt, "checkpoints", ())
         by_run = {run.run_id: run for run in manifest.runs}
+        if getattr(manifest, "schema_version", None) == 3:
+            if (
+                getattr(receipt, "schema_version", None) != 3
+                or len(checkpoints) != 2
+                or {checkpoint.run_id for checkpoint in checkpoints}
+                != set(by_run)
+            ):
+                raise MsctlError(
+                    "CHECKPOINT_PROVENANCE_MISMATCH",
+                    "AWS v3 resume requires one complete versioned pair",
+                )
+            by_arm = {}
+            for checkpoint in checkpoints:
+                run = by_run[checkpoint.run_id]
+                if (
+                    checkpoint.arm != run.arm
+                    or checkpoint.seed != manifest.seed
+                    or checkpoint.world_size != 4
+                    or checkpoint.config_sha256 != run.config_sha256
+                    or checkpoint.object.version_id in {"", "null"}
+                ):
+                    raise MsctlError(
+                        "CHECKPOINT_PROVENANCE_MISMATCH",
+                        "AWS v3 checkpoint does not match its seed arm provenance",
+                    )
+                by_arm[checkpoint.arm] = checkpoint
+            if set(by_arm) != {"dense", "split90"}:
+                raise MsctlError(
+                    "CHECKPOINT_PROVENANCE_MISMATCH",
+                    "AWS v3 checkpoint pair is incomplete",
+                )
+            return by_arm
         if (
             getattr(receipt, "schema_version", None) != 2
             or len(checkpoints) != 2
@@ -4441,11 +5107,49 @@ class AwsP5Backend:
     ) -> dict[str, object]:
         self._validate_manifest(manifest)
         self._validate_release(release, manifest)
+        is_v3 = getattr(manifest, "schema_version", None) == 3
+        if is_v3:
+            if evidence is None or set(evidence) != {
+                "dataset_pointer_sha256",
+                "dataset_verification_sha256",
+                "environment_receipt_sha256",
+                "instance_id",
+                "boot_id",
+            }:
+                raise MsctlError(
+                    "CHECKPOINT_PROVENANCE_MISMATCH",
+                    "AWS v3 resume evidence is incomplete",
+                )
+            verify_aws_checkpoint_receipt_v3(
+                checkpoint_receipt,
+                release=release,
+                manifest=manifest,
+                environment_receipt_sha256=evidence[
+                    "environment_receipt_sha256"
+                ],
+                instance_id=evidence["instance_id"],
+                boot_id=evidence["boot_id"],
+            )
         checkpoints = self._checkpoint_map(manifest, checkpoint_receipt)
-        checkpoint_publication = self._checkpoint_publication(
-            checkpoint_receipt=checkpoint_receipt,
-            checkpoints=checkpoints,
-            apply=False,
+        checkpoint_publication = (
+            {
+                "commands": [],
+                "objects": [
+                    {
+                        "arm": arm,
+                        "sha256": checkpoints[arm].object.sha256,
+                        "uri": checkpoints[arm].object.uri,
+                        "version_id": checkpoints[arm].object.version_id,
+                    }
+                    for arm in ("dense", "split90")
+                ],
+            }
+            if is_v3
+            else self._checkpoint_publication(
+                checkpoint_receipt=checkpoint_receipt,
+                checkpoints=checkpoints,
+                apply=False,
+            )
         )
         operation_intent = self._training_operation_intent(
             operation="resume",
@@ -4453,6 +5157,15 @@ class AwsP5Backend:
             manifest=manifest,
             checkpoints=checkpoints,
             checkpoint_receipt_sha256=checkpoint_receipt.sha256,
+            checkpoint_receipt_uri=(
+                checkpoint_receipt.uri if is_v3 else None
+            ),
+            checkpoint_receipt_version_id=(
+                checkpoint_receipt.version_id if is_v3 else None
+            ),
+            checkpoint_receipt_bytes=(
+                checkpoint_receipt.bytes if is_v3 else None
+            ),
             evidence=evidence,
         )
         if not apply:
@@ -4461,6 +5174,16 @@ class AwsP5Backend:
                 "seed": manifest.seed,
                 "run_manifest_sha256": manifest.sha256,
                 "checkpoint_receipt_sha256": checkpoint_receipt.sha256,
+                **(
+                    {
+                        "checkpoint_receipt_uri": checkpoint_receipt.uri,
+                        "checkpoint_receipt_version_id": (
+                            checkpoint_receipt.version_id
+                        ),
+                    }
+                    if is_v3
+                    else {}
+                ),
                 "checkpoint_commands": checkpoint_publication["commands"],
                 "checkpoint_objects": checkpoint_publication["objects"],
                 "operation_intent": operation_intent,
@@ -4527,6 +5250,10 @@ class AwsP5Backend:
                 instance_id=instance_id,
                 terminate_at=terminate_at,
                 checkpoint_receipt_sha256=checkpoint_receipt.sha256,
+                checkpoint_receipt=(
+                    checkpoint_receipt if is_v3 else None
+                ),
+                checkpoints=checkpoints if is_v3 else None,
             )
             resume_resources.update(
                 {
@@ -4551,10 +5278,56 @@ class AwsP5Backend:
                 terminate_at=terminate_at,
             )
 
+            v3_receipt_binding = (
+                {
+                    "sha256": checkpoint_receipt.sha256,
+                    "uri": checkpoint_receipt.uri,
+                    "version_id": checkpoint_receipt.version_id,
+                }
+                if is_v3
+                else None
+            )
+            v3_object_bindings = (
+                [
+                    {
+                        "arm": arm,
+                        "bytes": checkpoints[arm].object.bytes,
+                        "sha256": checkpoints[arm].object.sha256,
+                        "uri": checkpoints[arm].object.uri,
+                        "version_id": checkpoints[arm].object.version_id,
+                    }
+                    for arm in ("dense", "split90")
+                ]
+                if is_v3
+                else None
+            )
+            if is_v3 and any(
+                state.get("operation") == "resume"
+                and (
+                    state.get("checkpoint_receipt")
+                    != v3_receipt_binding
+                    or state.get("checkpoint_objects")
+                    != v3_object_bindings
+                )
+                for state in present
+            ):
+                raise MsctlError(
+                    "CHECKPOINT_PROVENANCE_MISMATCH",
+                    "v3 resume state binds a different receipt version",
+                )
             repeated = all(
                 state.get("operation") == "resume"
-                and state.get("checkpoint_receipt_sha256")
-                == checkpoint_receipt.sha256
+                and (
+                    (
+                        state.get("checkpoint_receipt")
+                        == v3_receipt_binding
+                        and state.get("checkpoint_objects")
+                        == v3_object_bindings
+                    )
+                    if is_v3
+                    else state.get("checkpoint_receipt_sha256")
+                    == checkpoint_receipt.sha256
+                )
                 for state in present
             )
             if repeated:
@@ -4669,16 +5442,29 @@ class AwsP5Backend:
             self._require_ssm_online(instance_id)
             self._ensure_argv_document()
             attempt = max(int(state.get("attempt", 1)) for state in present) + 1
-            self._checkpoint_publication(
-                checkpoint_receipt=checkpoint_receipt,
-                checkpoints=checkpoints,
-                apply=True,
-            )
+            if not is_v3:
+                self._checkpoint_publication(
+                    checkpoint_receipt=checkpoint_receipt,
+                    checkpoints=checkpoints,
+                    apply=True,
+                )
             published = self._publish_operation_intent(operation_intent)
             now = _timestamp()
             for state in present:
                 prior = list(state.get("prior_command_ids", []))
                 prior.append(previous_command)
+                checkpoint_state = (
+                    {
+                        "checkpoint_receipt": v3_receipt_binding,
+                        "checkpoint_objects": v3_object_bindings,
+                    }
+                    if is_v3
+                    else {
+                        "checkpoint_receipt_sha256": (
+                            checkpoint_receipt.sha256
+                        )
+                    }
+                )
                 state.update(
                     {
                         "command_id": None,
@@ -4698,9 +5484,7 @@ class AwsP5Backend:
                             "environment_receipt_sha256"
                         ],
                         "send_attempted": False,
-                        "checkpoint_receipt_sha256": (
-                            checkpoint_receipt.sha256
-                        ),
+                        **checkpoint_state,
                         "prior_command_ids": prior,
                         "updated_at": now,
                     }
@@ -4772,12 +5556,25 @@ class AwsP5Backend:
                 "STATE_INCOMPLETE",
                 "AWS paired lifecycle state diverges between arms",
             )
-        if present[0].get("operation") == "resume" and len(
-            {
-                state.get("checkpoint_receipt_sha256")
-                for state in present
-            }
-        ) != 1:
+        checkpoint_bindings = {
+            canonical_json(
+                {
+                    "receipt": state.get("checkpoint_receipt"),
+                    "objects": state.get("checkpoint_objects"),
+                }
+                if state.get("schema_version") == 2
+                else {
+                    "sha256": state.get(
+                        "checkpoint_receipt_sha256"
+                    )
+                }
+            )
+            for state in present
+        }
+        if (
+            present[0].get("operation") == "resume"
+            and len(checkpoint_bindings) != 1
+        ):
             raise MsctlError(
                 "STATE_INCOMPLETE",
                 "AWS paired resume state binds different checkpoints",
@@ -5528,6 +6325,17 @@ class AwsP5Backend:
                 manifest_path=manifest_path,
                 repo_root=args.repo_root,
             )
+            if (
+                getattr(manifest, "schema_version", None) == 3
+                and (
+                    command == "evaluate"
+                    or command.startswith("cleanup")
+                )
+            ):
+                raise MsctlError(
+                    "OPERATION_UNSUPPORTED",
+                    "AWS v3 evaluation is outside the checkpoint/resume task",
+                )
             evidence = None
             if command in {"runs render", "submit", "resume", "evaluate"}:
                 dataset_pointer = getattr(args, "dataset_pointer", None)
@@ -5587,11 +6395,52 @@ class AwsP5Backend:
                     cached=args.cached,
                 )
             if command == "resume":
-                receipt = verify_checkpoint_receipt(
-                    args.checkpoint_receipt,
-                    release=release,
-                    manifest=manifest,
+                remote_values = (
+                    getattr(args, "checkpoint_receipt_uri", None),
+                    getattr(args, "checkpoint_receipt_sha256", None),
+                    getattr(args, "checkpoint_receipt_version_id", None),
                 )
+                if getattr(manifest, "schema_version", None) == 3:
+                    if getattr(args, "checkpoint_receipt", None) is not None:
+                        raise MsctlError(
+                            "CLI_USAGE",
+                            "schema-3 v3 resume rejects legacy local checkpoint receipts",
+                        )
+                    if any(value is None for value in remote_values):
+                        raise MsctlError(
+                            "CLI_USAGE",
+                            "v3 resume requires the complete checkpoint receipt URI/hash/version triple",
+                        )
+                    assert evidence is not None
+                    receipt = self._fetch_checkpoint_receipt_v3(
+                        receipt_uri=str(remote_values[0]),
+                        receipt_sha256=str(remote_values[1]),
+                        receipt_version_id=str(remote_values[2]),
+                        release=release,
+                        manifest=manifest,
+                        evidence={
+                            field: evidence[field]
+                            for field in (
+                                "environment_receipt_sha256",
+                                "instance_id",
+                                "boot_id",
+                            )
+                        },
+                    )
+                else:
+                    if (
+                        getattr(args, "checkpoint_receipt", None) is None
+                        or any(value is not None for value in remote_values)
+                    ):
+                        raise MsctlError(
+                            "CLI_USAGE",
+                            "legacy AWS resume requires only --checkpoint-receipt",
+                        )
+                    receipt = verify_checkpoint_receipt(
+                        args.checkpoint_receipt,
+                        release=release,
+                        manifest=manifest,
+                    )
                 return not args.apply, self.resume(
                     release=release,
                     manifest=manifest,

@@ -806,6 +806,56 @@ def test_durable_config_checkpoint_and_snapshot_fsync_files_and_directories(
     trainer.close()
 
 
+def test_checkpoint_metadata_binds_installed_generation(tmp_path):
+    bp, mp = write_corpus(tmp_path, n=64)
+    cfg = tiny_cfg(tmp_path, bp, mp)
+    trainer = Trainer(cfg)
+
+    trainer.save_ckpt()
+
+    metadata_path = trainer.out_dir / "ckpt.meta.json"
+    payload = metadata_path.read_bytes()
+    metadata = json.loads(payload)
+    checkpoint_stat = trainer.ckpt_path.stat(follow_symlinks=False)
+    assert payload == (
+        json.dumps(
+            metadata,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+            allow_nan=False,
+        )
+        + "\n"
+    ).encode("ascii")
+    assert metadata == {
+        "checkpoint_version": 3,
+        "config_fingerprint": trainer.config_fingerprint,
+        "data": {
+            "build_id": None,
+            "global_cursor": 0,
+            "ordered_stream_sha256": None,
+            "receipt_sha256": None,
+            "sidecar_name": None,
+        },
+        "installed": {
+            "bytes": checkpoint_stat.st_size,
+            "ctime_ns": checkpoint_stat.st_ctime_ns,
+            "device": checkpoint_stat.st_dev,
+            "gid": checkpoint_stat.st_gid,
+            "inode": checkpoint_stat.st_ino,
+            "links": checkpoint_stat.st_nlink,
+            "mode": checkpoint_stat.st_mode,
+            "mtime_ns": checkpoint_stat.st_mtime_ns,
+            "uid": checkpoint_stat.st_uid,
+        },
+        "receipt_type": "memorysplit-trainer-checkpoint-v1",
+        "schema_version": 1,
+        "step": 0,
+        "world_size": 1,
+    }
+    trainer.close()
+
+
 def test_checkpoint_and_snapshot_writes_reject_symlink_swaps(tmp_path):
     bp, mp = write_corpus(tmp_path, n=64)
     cfg = base_cfg(tmp_path, bp, mp)
