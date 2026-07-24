@@ -605,3 +605,139 @@ Both static checks were silent with exit code zero.
 The unrelated pre-existing full-suite failures recorded earlier remain outside
 this task's ownership. All requested focused, source-lock, compilation, and
 diff checks are green.
+
+## Quarantine-race and duplicate-close closure
+
+Status: `DONE_WITH_CONCERNS`
+
+Implementation commit:
+`a209ff7c34aa7b1f43fd3b56ca00a5f0fc06a7e4` —
+`fix: close Wikidata quarantine race gaps`.
+
+### Remaining findings addressed
+
+1. The retained mode-0700 quarantine marker is now allocated and explicitly
+   name-bound before the final sealed-candidate verification. The no-replace
+   publication call follows that verification without an intervening
+   filesystem mutation.
+2. Exchange quarantine name-binds both the final candidate and retained marker
+   immediately before the atomic exchange. Afterward, it independently checks
+   both names against the retained descriptors.
+3. If the failed candidate reached `marker.name` but a substituted entry
+   reached the final name, no rollback occurs: the failed candidate stays
+   quarantined and the substituted/concurrent final entry is preserved.
+4. If the candidate did not move while the exact marker reached the final
+   name, rollback first opens and name-binds the exchanged wrong source, then
+   atomically exchanges back and verifies both the restored source and marker.
+   No other post-exchange state permits rollback.
+5. `_open_sort_run_descriptor` now routes validation-failure closure through
+   the exhaustive close helper. Archive envelope, parser, and materialization
+   duplicates use shared helpers that safely cover duplicate, seek, fdopen,
+   body, handle-close, and descriptor-close failures. Primary integrity/body
+   errors remain primary; close failures surface only when there is no primary
+   error or are attached as notes.
+
+### Review-fix TDD evidence
+
+Six named adversarial tests were written before the production changes.
+
+Initial direct RED selection:
+
+```bash
+python -m pytest -q tests/test_reasoning_v2_wikidata_source.py \
+  -k 'marker_is_bound_before or marker_substitution_keeps or \
+sort_run_open_validation_close or archive_envelope_duplicate_close or \
+archive_parser_fdopen_close or archive_materialization_fdopen_close'
+```
+
+Initial result:
+
+```text
+FF.FFF                                                                   [100%]
+5 failed, 1 passed, 67 deselected in 0.68s
+```
+
+The five failures directly exposed late marker allocation, unconditional
+rollback, and three direct archive closes. The provisional sort-run test passed
+because a later descriptor reuse could satisfy its first close assertion. The
+test was strengthened, still before production changes, to distinguish a
+direct `os.close` of the exact opened inode from helper-mediated closure:
+
+```text
+F                                                                        [100%]
+1 failed in 0.37s
+```
+
+Its expected failure was `assert not direct_close_seen`. After implementation,
+the complete six-test selection was GREEN:
+
+```text
+......                                                                   [100%]
+6 passed, 67 deselected in 0.42s
+```
+
+### Final verification
+
+```bash
+python -m pytest -q tests/test_reasoning_v2_wikidata_source.py
+```
+
+```text
+........................................................................ [ 98%]
+.                                                                        [100%]
+73 passed in 2.61s
+```
+
+```bash
+python -m pytest -q \
+  tests/test_reasoning_v2_source_lock.py \
+  tests/test_current_sources.py
+```
+
+```text
+........................................................................ [ 64%]
+.......................................                                  [100%]
+111 passed in 14.73s
+```
+
+The regression command used unrestricted local filesystem execution only
+because its fixtures create temporary Git repositories. No network or AWS
+access was enabled or used.
+
+```bash
+python -m py_compile \
+  corpusgen/reasoning_v2/wikidata_source.py \
+  tests/test_reasoning_v2_wikidata_source.py
+git diff --check
+```
+
+Both static checks were silent with exit code zero.
+
+### Bounded-memory and self-review
+
+- The final verification still streams descriptor hashing in fixed-size chunks;
+  marker ordering and exchange adjudication retain only fixed-size identities.
+  No corpus-sized read or collection was introduced.
+- Archive duplicates remain streaming file objects. `closefd=False` leaves
+  descriptor ownership with the exhaustive helper, so a handle-close failure
+  cannot skip the underlying descriptor-close attempt.
+- The marker-substitution test reproduces the reviewer sequence and checks all
+  three inode outcomes: the failed root remains at the quarantine name, the
+  substitute remains at the final name, and the displaced retained marker is
+  not deleted through a stale name.
+- The existing final-substitution race test covers the complementary matrix
+  branch: only an exact marker-at-final state permits rollback, and the
+  descriptor-bound exchanged winner is restored and verified.
+- Task 1/Task 2 public interfaces, schema/format v1, external-sort bounds,
+  deterministic stream/index/receipt bytes, and content-address naming are
+  unchanged.
+- The implementation commit contains exactly the two authorized Wikidata
+  code/test files. This appendix is the only report change. No amend, push,
+  source mutation, AWS operation, network operation, or other worktree edit
+  occurred.
+
+### Concern
+
+The unrelated pre-existing full-suite failures recorded earlier remain outside
+this task's ownership. All requested focused, source-lock, compilation, and
+diff gates are green.
