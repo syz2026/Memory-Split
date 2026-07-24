@@ -7,6 +7,7 @@ import json
 import math
 import os
 import re
+import secrets
 import stat
 from collections.abc import Sequence
 from contextlib import contextmanager
@@ -21,6 +22,7 @@ from .fsutil import (
     open_directory_at,
     open_regular_at,
     read_fd,
+    rename_noreplace_at,
 )
 from .jsonutil import (
     RUN_ID_RE,
@@ -1399,22 +1401,98 @@ class StateStore:
         _, _, _, intents_fd = self._require_locked()
         name = self._aws_v3_identity_name(manifest_sha256)
         try:
-            raw = load_json_at(
+            data = self._read_state_bytes(
                 intents_fd,
                 name,
                 label="AWS v3 state identity",
             )
         except MsctlError as error:
-            if error.code == "FILE_NOT_FOUND":
-                return None
             raise MsctlError(
                 "STATE_CORRUPT",
                 "AWS v3 state identity is unreadable",
                 details={"manifest_sha256": manifest_sha256},
             ) from error
-        value = require_object(raw, label="AWS v3 state identity")
-        self._validate_aws_v3_identity(value, manifest_sha256)
+        if data is None:
+            return None
+        try:
+            value = require_object(
+                json.loads(data),
+                label="AWS v3 state identity",
+            )
+            self._validate_aws_v3_identity(value, manifest_sha256)
+        except (
+            UnicodeDecodeError,
+            json.JSONDecodeError,
+            MsctlError,
+        ) as error:
+            raise MsctlError(
+                "STATE_CORRUPT",
+                "AWS v3 state identity is invalid",
+                details={"manifest_sha256": manifest_sha256},
+            ) from error
+        if data != canonical_json(value) + b"\n":
+            raise MsctlError(
+                "STATE_CORRUPT",
+                "AWS v3 state identity bytes are not canonical",
+                details={"manifest_sha256": manifest_sha256},
+            )
         return value
+
+    @staticmethod
+    def _aws_v3_identity_temp_pattern(identity_name: str) -> re.Pattern[str]:
+        return re.compile(
+            rf"^\.{re.escape(identity_name)}\.[0-9a-f]{{24}}\.tmp$"
+        )
+
+    def _remove_aws_v3_identity_temp(
+        self,
+        intents_fd: int,
+        name: str,
+        *,
+        expected_identity: tuple[int, int] | None = None,
+    ) -> bool:
+        try:
+            metadata = os.stat(
+                name,
+                dir_fd=intents_fd,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            return False
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or (
+                expected_identity is not None
+                and (metadata.st_dev, metadata.st_ino) != expected_identity
+            )
+        ):
+            raise MsctlError(
+                "UNSAFE_STATE",
+                "AWS v3 identity temporary is unsafe",
+                details={"path": name},
+            )
+        os.unlink(name, dir_fd=intents_fd)
+        return True
+
+    def _clean_aws_v3_identity_temps(
+        self,
+        intents_fd: int,
+        identity_name: str,
+    ) -> None:
+        pattern = self._aws_v3_identity_temp_pattern(identity_name)
+        removed = False
+        for name in os.listdir(intents_fd):
+            if pattern.fullmatch(name) is None:
+                continue
+            removed = (
+                self._remove_aws_v3_identity_temp(
+                    intents_fd,
+                    name,
+                )
+                or removed
+            )
+        if removed:
+            os.fsync(intents_fd)
 
     def _write_aws_v3_identity(
         self,
@@ -1426,6 +1504,8 @@ class StateStore:
             manifest_sha256,
             states,
         )
+        name = self._aws_v3_identity_name(manifest_sha256)
+        self._clean_aws_v3_identity_temps(intents_fd, name)
         existing = self._load_aws_v3_identity(manifest_sha256)
         if existing is not None:
             if existing != desired:
@@ -1434,7 +1514,8 @@ class StateStore:
                     "AWS v3 state identity conflicts with its run set",
                 )
             return existing
-        name = self._aws_v3_identity_name(manifest_sha256)
+        data = canonical_json(desired) + b"\n"
+        temporary = f".{name}.{secrets.token_hex(12)}.tmp"
         flags = (
             os.O_WRONLY
             | os.O_CREAT
@@ -1442,26 +1523,64 @@ class StateStore:
             | getattr(os, "O_NOFOLLOW", 0)
             | getattr(os, "O_CLOEXEC", 0)
         )
+        temporary_identity: tuple[int, int] | None = None
+        published = False
         try:
-            descriptor = os.open(name, flags, 0o600, dir_fd=intents_fd)
-        except FileExistsError:
-            existing = self._load_aws_v3_identity(manifest_sha256)
-            if existing != desired:
-                raise MsctlError(
-                    "STATE_CORRUPT",
-                    "AWS v3 state identity changed during publication",
+            descriptor = os.open(
+                temporary,
+                flags,
+                0o600,
+                dir_fd=intents_fd,
+            )
+            try:
+                metadata = os.fstat(descriptor)
+                temporary_identity = (metadata.st_dev, metadata.st_ino)
+                view = memoryview(data)
+                while view:
+                    written = os.write(descriptor, view)
+                    if written <= 0:
+                        raise OSError(
+                            "identity temporary write made no progress"
+                        )
+                    view = view[written:]
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
+            try:
+                rename_noreplace_at(
+                    intents_fd,
+                    temporary,
+                    intents_fd,
+                    name,
                 )
-            return desired
-        try:
-            data = canonical_json(desired) + b"\n"
-            view = memoryview(data)
-            while view:
-                written = os.write(descriptor, view)
-                view = view[written:]
-            os.fsync(descriptor)
-        finally:
-            os.close(descriptor)
-        os.fsync(intents_fd)
+                published = True
+            except FileExistsError:
+                if self._remove_aws_v3_identity_temp(
+                    intents_fd,
+                    temporary,
+                    expected_identity=temporary_identity,
+                ):
+                    os.fsync(intents_fd)
+                existing = self._load_aws_v3_identity(manifest_sha256)
+                if existing != desired:
+                    raise MsctlError(
+                        "STATE_CORRUPT",
+                        "AWS v3 state identity conflicts during publication",
+                    )
+                return desired
+            os.fsync(intents_fd)
+        except Exception:
+            if (
+                not published
+                and temporary_identity is not None
+                and self._remove_aws_v3_identity_temp(
+                    intents_fd,
+                    temporary,
+                    expected_identity=temporary_identity,
+                )
+            ):
+                os.fsync(intents_fd)
+            raise
         return desired
 
     def _find_aws_v3_runs(

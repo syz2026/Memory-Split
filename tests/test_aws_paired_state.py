@@ -3,6 +3,8 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import os
+import stat
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -369,6 +371,50 @@ def _write_raw_json(path: Path, value: object) -> None:
     from msctl.jsonutil import canonical_json
 
     path.write_bytes(canonical_json(value) + b"\n")
+
+
+def _identity_publication_case(tmp_path: Path):
+    from msctl.state import StateStore
+
+    fixture = _v3_pair(tmp_path / "source")
+    state_root = tmp_path / "target"
+    return SimpleNamespace(
+        backend=fixture.backend,
+        identity_path=(
+            state_root
+            / "intents"
+            / f"aws-{fixture.manifest.sha256}.v3-identity"
+        ),
+        manifest=fixture.manifest,
+        state_root=state_root,
+        states=copy.deepcopy(fixture.states),
+        store=StateStore(state_root),
+    )
+
+
+def _publish_identity_case(case) -> None:
+    with case.store.locked():
+        case.backend._write_paired_states(
+            case.store,
+            case.manifest,
+            copy.deepcopy(case.states),
+        )
+
+
+def _identity_bytes(case) -> bytes:
+    from msctl.jsonutil import canonical_json
+
+    value = case.store._aws_v3_identity_value(
+        case.manifest.sha256,
+        case.states,
+    )
+    return canonical_json(value) + b"\n"
+
+
+def _owned_identity_temp(case, token: str = "a" * 24) -> Path:
+    return case.identity_path.with_name(
+        f".{case.identity_path.name}.{token}.tmp"
+    )
 
 
 def _transition_to_resume(fixture) -> list[dict[str, object]]:
@@ -794,6 +840,291 @@ def test_v3_initial_pair_failure_can_retry_same_durable_identity(
 
     assert journal is not None
     assert {state["run_id"]: state for state in journal["states"]} == runs
+
+
+@pytest.mark.parametrize(
+    "boundary",
+    [
+        "write",
+        "partial_write",
+        "file_fsync",
+        "rename",
+        "directory_fsync",
+    ],
+)
+def test_v3_identity_publication_fault_allows_exact_reopen_retry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    boundary: str,
+) -> None:
+    import msctl.fsutil as fsutil
+    import msctl.state as state_module
+    from msctl.state import StateStore
+
+    case = _identity_publication_case(tmp_path)
+    original_write = os.write
+    original_fsync = os.fsync
+    original_rename = fsutil.rename_noreplace_at
+    injected = False
+
+    if boundary in {"write", "partial_write"}:
+
+        def fail_write(descriptor, data):
+            nonlocal injected
+            if not injected:
+                injected = True
+                if boundary == "partial_write":
+                    original_write(descriptor, data[:7])
+                raise OSError(f"injected identity {boundary} failure")
+            return original_write(descriptor, data)
+
+        monkeypatch.setattr(state_module.os, "write", fail_write)
+    elif boundary in {"file_fsync", "directory_fsync"}:
+
+        def fail_fsync(descriptor):
+            nonlocal injected
+            is_directory = stat.S_ISDIR(os.fstat(descriptor).st_mode)
+            expected_directory = boundary == "directory_fsync"
+            if not injected and is_directory == expected_directory:
+                injected = True
+                raise OSError(f"injected identity {boundary} failure")
+            return original_fsync(descriptor)
+
+        monkeypatch.setattr(state_module.os, "fsync", fail_fsync)
+    else:
+
+        def fail_rename(*_args, **_kwargs):
+            nonlocal injected
+            injected = True
+            raise OSError("injected identity rename failure")
+
+        monkeypatch.setattr(
+            state_module,
+            "rename_noreplace_at",
+            fail_rename,
+            raising=False,
+        )
+
+    with pytest.raises(Exception, match="identity|injected|state"):
+        _publish_identity_case(case)
+    assert injected is True
+    if boundary != "directory_fsync":
+        assert not case.identity_path.exists()
+
+    monkeypatch.setattr(state_module.os, "write", original_write)
+    monkeypatch.setattr(state_module.os, "fsync", original_fsync)
+    monkeypatch.setattr(
+        state_module,
+        "rename_noreplace_at",
+        original_rename,
+        raising=False,
+    )
+    reopened = SimpleNamespace(
+        **{
+            **vars(case),
+            "store": StateStore(case.state_root),
+        }
+    )
+    _publish_identity_case(reopened)
+
+    assert case.identity_path.read_bytes() == _identity_bytes(case)
+    assert not list(
+        case.identity_path.parent.glob(
+            f".{case.identity_path.name}.*.tmp"
+        )
+    )
+
+
+def test_v3_identity_competing_exact_writer_is_accepted(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import msctl.state as state_module
+
+    case = _identity_publication_case(tmp_path)
+    desired = _identity_bytes(case)
+    called = False
+
+    def competing_rename(
+        _source_fd,
+        _source_name,
+        destination_fd,
+        destination_name,
+    ):
+        nonlocal called
+        called = True
+        descriptor = os.open(
+            destination_name,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+            0o600,
+            dir_fd=destination_fd,
+        )
+        try:
+            view = memoryview(desired)
+            while view:
+                written = os.write(descriptor, view)
+                view = view[written:]
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+        os.fsync(destination_fd)
+        raise FileExistsError(destination_name)
+
+    monkeypatch.setattr(
+        state_module,
+        "rename_noreplace_at",
+        competing_rename,
+        raising=False,
+    )
+    _publish_identity_case(case)
+
+    assert called is True
+    assert case.identity_path.read_bytes() == desired
+    assert not list(
+        case.identity_path.parent.glob(
+            f".{case.identity_path.name}.*.tmp"
+        )
+    )
+
+
+def test_v3_identity_competing_conflict_fails_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import msctl.state as state_module
+    from msctl.jsonutil import canonical_json
+
+    case = _identity_publication_case(tmp_path)
+    conflicting = canonical_json(
+        {
+            "schema_version": 1,
+            "provider": "aws-p5.48xlarge",
+            "run_manifest_sha256": case.manifest.sha256,
+            "runs": [
+                {"run_id": "conflict-dense", "arm": "dense"},
+                {"run_id": "conflict-split90", "arm": "split90"},
+            ],
+        }
+    ) + b"\n"
+    called = False
+
+    def competing_rename(
+        _source_fd,
+        _source_name,
+        destination_fd,
+        destination_name,
+    ):
+        nonlocal called
+        called = True
+        descriptor = os.open(
+            destination_name,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+            0o600,
+            dir_fd=destination_fd,
+        )
+        try:
+            os.write(descriptor, conflicting)
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+        os.fsync(destination_fd)
+        raise FileExistsError(destination_name)
+
+    monkeypatch.setattr(
+        state_module,
+        "rename_noreplace_at",
+        competing_rename,
+        raising=False,
+    )
+    with pytest.raises(Exception, match="identity|conflict|state"):
+        _publish_identity_case(case)
+
+    assert called is True
+    assert case.identity_path.read_bytes() == conflicting
+    monkeypatch.undo()
+    with pytest.raises(Exception, match="identity|conflict|state"):
+        _publish_identity_case(case)
+    assert case.identity_path.read_bytes() == conflicting
+
+
+@pytest.mark.parametrize("final_kind", ["partial", "noncanonical"])
+def test_v3_identity_bad_final_is_never_overwritten(
+    tmp_path: Path,
+    final_kind: str,
+) -> None:
+    case = _identity_publication_case(tmp_path)
+    with case.store.locked():
+        pass
+    bad_bytes = (
+        b'{"schema_version":'
+        if final_kind == "partial"
+        else _identity_bytes(case) + b" "
+    )
+    case.identity_path.write_bytes(bad_bytes)
+
+    with pytest.raises(Exception, match="identity|JSON|state"):
+        _publish_identity_case(case)
+
+    assert case.identity_path.read_bytes() == bad_bytes
+
+
+def test_v3_identity_stale_owned_temp_is_cleaned_on_reopen(
+    tmp_path: Path,
+) -> None:
+    from msctl.state import StateStore
+
+    case = _identity_publication_case(tmp_path)
+    with case.store.locked():
+        pass
+    temporary = _owned_identity_temp(case)
+    temporary.write_bytes(b'{"interrupted":')
+    reopened = SimpleNamespace(
+        **{
+            **vars(case),
+            "store": StateStore(case.state_root),
+        }
+    )
+
+    _publish_identity_case(reopened)
+
+    assert not temporary.exists()
+    assert case.identity_path.read_bytes() == _identity_bytes(case)
+
+
+def test_v3_identity_unsafe_owned_temp_fails_closed(
+    tmp_path: Path,
+) -> None:
+    case = _identity_publication_case(tmp_path)
+    with case.store.locked():
+        pass
+    outside = tmp_path / "outside"
+    outside.write_text("outside\n")
+    temporary = _owned_identity_temp(case)
+    temporary.symlink_to(outside)
+
+    with pytest.raises(Exception, match="identity|unsafe|state"):
+        _publish_identity_case(case)
+
+    assert outside.read_text() == "outside\n"
+    assert temporary.is_symlink()
+    assert not case.identity_path.exists()
+
+
+def test_v3_identity_unowned_temp_is_ignored(
+    tmp_path: Path,
+) -> None:
+    case = _identity_publication_case(tmp_path)
+    with case.store.locked():
+        pass
+    unrelated = case.identity_path.with_name(
+        f".{case.identity_path.name}.not-owned.tmp"
+    )
+    unrelated.write_text("unrelated\n")
+
+    _publish_identity_case(case)
+
+    assert unrelated.read_text() == "unrelated\n"
+    assert case.identity_path.read_bytes() == _identity_bytes(case)
 
 
 def test_v3_failed_rollback_poison_is_observed_before_lifecycle_use(
