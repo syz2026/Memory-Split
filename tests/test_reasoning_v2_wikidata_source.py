@@ -1244,20 +1244,19 @@ def test_reusable_marker_slot_rejects_same_inode_aba(
     )
     marker_inode = initial_marker.stat().st_ino
     attacked = False
-    original_list = wikidata_source_module.list_entries
+    original_probe = wikidata_source_module._require_marker_pool_slot_empty
 
     def mutate_and_restore_marker(descriptor):
         nonlocal attacked
-        entries = original_list(descriptor)
+        original_probe(descriptor)
         if not attacked and os.fstat(descriptor).st_ino == marker_inode:
             attacked = True
             os.mkdir(".marker-aba", mode=0o700, dir_fd=descriptor)
             os.rmdir(".marker-aba", dir_fd=descriptor)
-        return entries
 
     monkeypatch.setattr(
         wikidata_source_module,
-        "list_entries",
+        "_require_marker_pool_slot_empty",
         mutate_and_restore_marker,
     )
 
@@ -2938,7 +2937,7 @@ def test_repeated_original_state_exhaustion_refreshes_marker(
     assert len(quarantines) == 1
 
 
-def test_repeated_fresh_marker_bind_failures_keep_resources_bounded(
+def test_fresh_marker_bind_failure_uses_emergency_with_resources_bounded(
     archive_authority: _AuthorityFixture,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -3099,9 +3098,9 @@ def test_repeated_fresh_marker_bind_failures_keep_resources_bounded(
     ) as raised:
         _build_view(archive_authority, output_root)
 
-    assert fresh_bind_succeeded
-    assert fresh_checks == bind_failures + 1
-    assert observations == [(1, count) for count in range(2, 6)]
+    assert not fresh_bind_succeeded
+    assert fresh_checks == 1
+    assert observations == []
     assert close_failure_injected
     notes = getattr(raised.value, "__notes__", ())
     assert any(
@@ -3128,13 +3127,14 @@ def test_repeated_fresh_marker_bind_failures_keep_resources_bounded(
         and path.stat().st_ino == candidate_inode
     )
     assert len(quarantines) == 1
+    assert quarantines[0].name == f".wikidata-marker-{final_name}-7"
     pooled_entries = tuple(
         path
         for path in namespace.iterdir()
         if path.name.startswith(f".wikidata-marker-{final_name}-")
     )
-    assert len(pooled_entries) == 7
-    assert sum(not tuple(path.iterdir()) for path in pooled_entries) == 6
+    assert len(pooled_entries) == 3
+    assert sum(not tuple(path.iterdir()) for path in pooled_entries) == 2
 
 
 def test_quarantine_allocation_failures_consume_marker_pool(
@@ -3156,7 +3156,6 @@ def test_quarantine_allocation_failures_consume_marker_pool(
         tuple[int, wikidata_source_module._CreationIdentity]
     ] = []
     original_create = wikidata_source_module._create_private_directory
-    original_list = wikidata_source_module.list_entries
 
     def marker_is_open(
         descriptor: int,
@@ -3174,7 +3173,7 @@ def test_quarantine_allocation_failures_consume_marker_pool(
             created.append((descriptor, identity))
         return descriptor, identity
 
-    def fail_marker_inventory(descriptor):
+    def fail_marker_inventory_probe(descriptor):
         if any(
             candidate == descriptor
             and wikidata_source_module._creation_identity(
@@ -3184,7 +3183,6 @@ def test_quarantine_allocation_failures_consume_marker_pool(
             for candidate, identity in created
         ):
             raise ValueError("injected marker allocation validation failure")
-        return original_list(descriptor)
 
     monkeypatch.setattr(
         wikidata_source_module,
@@ -3193,8 +3191,8 @@ def test_quarantine_allocation_failures_consume_marker_pool(
     )
     monkeypatch.setattr(
         wikidata_source_module,
-        "list_entries",
-        fail_marker_inventory,
+        "_require_marker_pool_slot_empty",
+        fail_marker_inventory_probe,
     )
 
     try:
@@ -3215,8 +3213,11 @@ def test_quarantine_allocation_failures_consume_marker_pool(
                 f".wikidata-marker-{published_name}-"
             )
         )
-        assert len(pooled_entries) == 8
+        assert len(pooled_entries) == 7
         assert all(not tuple(path.iterdir()) for path in pooled_entries)
+        assert not (
+            namespace / f".wikidata-marker-{published_name}-7"
+        ).exists()
 
         with pytest.raises(ValueError, match="marker pool allocation exhausted"):
             wikidata_source_module._allocate_quarantine_marker(
@@ -3224,11 +3225,11 @@ def test_quarantine_allocation_failures_consume_marker_pool(
                 published_name,
                 pool,
             )
-        assert len(tuple(namespace.iterdir())) == 8
+        assert len(tuple(namespace.iterdir())) == 7
     finally:
         os.close(namespace_fd)
 
-    assert len(created) == 8
+    assert len(created) == 7
 
 
 def test_marker_detach_restores_substitute_without_rmdir(
@@ -3393,7 +3394,7 @@ def test_lost_marker_attempts_exhaust_deterministic_pool(
     ] = []
 
     try:
-        for slot in range(8):
+        for slot in range(7):
             marker = wikidata_source_module._allocate_quarantine_marker(
                 namespace_fd,
                 published_name,
@@ -3423,7 +3424,7 @@ def test_lost_marker_attempts_exhaust_deterministic_pool(
     finally:
         os.close(namespace_fd)
 
-    assert len(tuple(namespace.iterdir())) == 8
+    assert len(tuple(namespace.iterdir())) == 7
     assert not tuple(
         path
         for path in namespace.iterdir()
@@ -3509,7 +3510,10 @@ def test_seven_failed_candidates_block_eighth_before_publication(
             for descriptor, identity in allocated
         )
 
-    with pytest.raises(ValueError, match="marker pool.*capacity|exhausted"):
+    with pytest.raises(
+        ValueError,
+        match="emergency marker slot|marker pool.*capacity|exhausted",
+    ):
         _build_view(archive_authority, output_root)
 
     assert postpublication_failures == 7
@@ -3525,7 +3529,421 @@ def test_seven_failed_candidates_block_eighth_before_publication(
     assert len(slots) == 8
     assert sum(bool(tuple(path.iterdir())) for path in slots) == 7
     assert sum(not tuple(path.iterdir()) for path in slots) == 1
+    emergency = namespace / f".wikidata-marker-{published_name}-7"
+    assert emergency.is_dir()
+    assert tuple(emergency.iterdir())
     assert not any(
         marker_is_open(descriptor, identity)
         for descriptor, identity in allocated
     )
+
+
+def test_marker_loss_exhaustion_uses_emergency_quarantine(
+    archive_authority: _AuthorityFixture,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    output_root = tmp_path / "derived"
+    final_name: str | None = None
+    candidate_inode: int | None = None
+    initial_marker_name: str | None = None
+    initial_marker_lost = False
+    fresh_losses = 0
+    classifications = 0
+    allocated: list[
+        tuple[int, wikidata_source_module._CreationIdentity]
+    ] = []
+    original_allocate = wikidata_source_module._allocate_quarantine_marker
+    original_check = wikidata_source_module._check_named_derived_directory
+    original_classify = wikidata_source_module._classify_quarantine_exchange
+
+    def marker_is_open(
+        descriptor: int,
+        identity: wikidata_source_module._CreationIdentity,
+    ) -> bool:
+        try:
+            metadata = os.fstat(descriptor)
+        except OSError:
+            return False
+        return wikidata_source_module._creation_identity(metadata) == identity
+
+    def record_allocation(*args, **kwargs):
+        nonlocal initial_marker_name
+        marker = original_allocate(*args, **kwargs)
+        if initial_marker_name is None:
+            initial_marker_name = marker.name
+        allocated.append((marker.descriptor, marker.identity))
+        return marker
+
+    def lose_fresh_marker(
+        parent_fd,
+        name,
+        descriptor,
+        identity,
+        description,
+    ):
+        nonlocal fresh_losses
+        if description == "fresh quarantine marker":
+            fresh_losses += 1
+            os.rename(
+                name,
+                f"lost-fresh-marker-{fresh_losses}",
+                src_dir_fd=parent_fd,
+                dst_dir_fd=parent_fd,
+            )
+            raise ValueError("injected fresh marker authority loss")
+        return original_check(
+            parent_fd,
+            name,
+            descriptor,
+            identity,
+            description,
+        )
+
+    def fail_and_lose_initial_marker(phase, _authority, receipt_sha256):
+        nonlocal final_name, candidate_inode, initial_marker_lost
+        if phase == "before_postpublish_verify":
+            final_name = receipt_sha256
+            candidate_inode = (
+                output_root / "wikidata" / receipt_sha256
+            ).stat().st_ino
+            raise RuntimeError("forced emergency quarantine failure")
+        if phase != "before_quarantine_exchange" or initial_marker_lost:
+            return
+        assert initial_marker_name is not None
+        initial_marker_lost = True
+        namespace = output_root / "wikidata"
+        (namespace / initial_marker_name).rename(
+            namespace / "lost-initial-marker"
+        )
+
+    def bound_classification(*args, **kwargs):
+        nonlocal classifications
+        classifications += 1
+        if classifications > 20:
+            raise AssertionError("quarantine retry did not terminate")
+        return original_classify(*args, **kwargs)
+
+    monkeypatch.setattr(
+        wikidata_source_module,
+        "_allocate_quarantine_marker",
+        record_allocation,
+    )
+    monkeypatch.setattr(
+        wikidata_source_module,
+        "_check_named_derived_directory",
+        lose_fresh_marker,
+    )
+    monkeypatch.setattr(
+        wikidata_source_module,
+        "_classify_quarantine_exchange",
+        bound_classification,
+    )
+    monkeypatch.setattr(
+        wikidata_source_module,
+        "_derived_view_build_hook",
+        fail_and_lose_initial_marker,
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match="forced emergency quarantine failure",
+    ):
+        _build_view(archive_authority, output_root)
+
+    assert initial_marker_lost
+    assert fresh_losses == 1
+    assert classifications <= 20
+    assert final_name is not None
+    assert candidate_inode is not None
+    namespace = output_root / "wikidata"
+    final = namespace / final_name
+    emergency = namespace / f".wikidata-marker-{final_name}-7"
+    assert not final.exists()
+    assert emergency.is_dir()
+    assert emergency.stat().st_ino == candidate_inode
+    assert not any(
+        marker_is_open(descriptor, identity)
+        for descriptor, identity in allocated
+    )
+
+
+def test_transient_occupied_emergency_slot_retries_boundedly(
+    archive_authority: _AuthorityFixture,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    output_root = tmp_path / "derived"
+    final_name: str | None = None
+    candidate_inode: int | None = None
+    failure_count = 0
+    emergency_attempts = 0
+    classifications = 0
+    original_rename = wikidata_source_module.atomic_rename_noreplace
+    original_classify = wikidata_source_module._classify_quarantine_exchange
+
+    def fail_after_publish(phase, _authority, receipt_sha256):
+        nonlocal final_name, candidate_inode, failure_count
+        if phase != "before_postpublish_verify":
+            return
+        final_name = receipt_sha256
+        candidate_inode = (
+            output_root / "wikidata" / receipt_sha256
+        ).stat().st_ino
+        failure_count += 1
+        raise RuntimeError("forced occupied-emergency failure")
+
+    def occupy_once(
+        source_directory_fd,
+        source_name,
+        destination_directory_fd,
+        destination_name,
+    ):
+        nonlocal emergency_attempts
+        is_emergency = (
+            failure_count == 7
+            and final_name is not None
+            and source_name == final_name
+            and destination_name
+            == f".wikidata-marker-{final_name}-7"
+        )
+        if not is_emergency:
+            return original_rename(
+                source_directory_fd,
+                source_name,
+                destination_directory_fd,
+                destination_name,
+            )
+        emergency_attempts += 1
+        if emergency_attempts == 1:
+            os.mkdir(
+                destination_name,
+                mode=0o700,
+                dir_fd=destination_directory_fd,
+            )
+            try:
+                return original_rename(
+                    source_directory_fd,
+                    source_name,
+                    destination_directory_fd,
+                    destination_name,
+                )
+            finally:
+                os.rmdir(
+                    destination_name,
+                    dir_fd=destination_directory_fd,
+                )
+        return original_rename(
+            source_directory_fd,
+            source_name,
+            destination_directory_fd,
+            destination_name,
+        )
+
+    def bound_classification(*args, **kwargs):
+        nonlocal classifications
+        classifications += 1
+        if classifications > 20:
+            raise AssertionError("occupied-emergency retry did not terminate")
+        return original_classify(*args, **kwargs)
+
+    monkeypatch.setattr(
+        wikidata_source_module,
+        "_derived_view_build_hook",
+        fail_after_publish,
+    )
+    monkeypatch.setattr(
+        wikidata_source_module,
+        "atomic_rename_noreplace",
+        occupy_once,
+    )
+    monkeypatch.setattr(
+        wikidata_source_module,
+        "_classify_quarantine_exchange",
+        bound_classification,
+    )
+
+    for _failure in range(7):
+        with pytest.raises(
+            RuntimeError,
+            match="forced occupied-emergency failure",
+        ):
+            _build_view(archive_authority, output_root)
+
+    assert emergency_attempts == 2
+    assert classifications <= 20
+    assert final_name is not None
+    assert candidate_inode is not None
+    namespace = output_root / "wikidata"
+    emergency = namespace / f".wikidata-marker-{final_name}-7"
+    assert not (namespace / final_name).exists()
+    assert emergency.stat().st_ino == candidate_inode
+
+
+def test_emergency_quarantine_restores_substituted_source(
+    archive_authority: _AuthorityFixture,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    output_root = tmp_path / "derived"
+    final_name: str | None = None
+    candidate_inode: int | None = None
+    replacement_inode: int | None = None
+    failure_count = 0
+    raced = False
+    classifications = 0
+    original_rename = wikidata_source_module.atomic_rename_noreplace
+    original_classify = wikidata_source_module._classify_quarantine_exchange
+
+    def fail_after_publish(phase, _authority, receipt_sha256):
+        nonlocal final_name, candidate_inode, failure_count
+        if phase != "before_postpublish_verify":
+            return
+        final_name = receipt_sha256
+        candidate_inode = (
+            output_root / "wikidata" / receipt_sha256
+        ).stat().st_ino
+        failure_count += 1
+        raise RuntimeError("forced emergency source race")
+
+    def substitute_source(
+        source_directory_fd,
+        source_name,
+        destination_directory_fd,
+        destination_name,
+    ):
+        nonlocal raced, replacement_inode
+        is_emergency = (
+            not raced
+            and failure_count == 7
+            and final_name is not None
+            and source_name == final_name
+            and destination_name
+            == f".wikidata-marker-{final_name}-7"
+        )
+        if is_emergency:
+            raced = True
+            namespace = output_root / "wikidata"
+            final = namespace / final_name
+            displaced = namespace / "emergency-candidate-displaced"
+            final.rename(displaced)
+            final.mkdir(mode=0o700)
+            replacement_inode = final.stat().st_ino
+        return original_rename(
+            source_directory_fd,
+            source_name,
+            destination_directory_fd,
+            destination_name,
+        )
+
+    def bound_classification(*args, **kwargs):
+        nonlocal classifications
+        classifications += 1
+        if classifications > 20:
+            raise AssertionError("emergency source-race retry did not terminate")
+        return original_classify(*args, **kwargs)
+
+    monkeypatch.setattr(
+        wikidata_source_module,
+        "_derived_view_build_hook",
+        fail_after_publish,
+    )
+    monkeypatch.setattr(
+        wikidata_source_module,
+        "atomic_rename_noreplace",
+        substitute_source,
+    )
+    monkeypatch.setattr(
+        wikidata_source_module,
+        "_classify_quarantine_exchange",
+        bound_classification,
+    )
+
+    for _failure in range(7):
+        with pytest.raises(
+            RuntimeError,
+            match="forced emergency source race",
+        ):
+            _build_view(archive_authority, output_root)
+
+    assert raced
+    assert classifications <= 20
+    assert final_name is not None
+    assert candidate_inode is not None
+    assert replacement_inode is not None
+    namespace = output_root / "wikidata"
+    final = namespace / final_name
+    displaced = namespace / "emergency-candidate-displaced"
+    emergency = namespace / f".wikidata-marker-{final_name}-7"
+    assert final.is_dir()
+    assert final.stat().st_ino == replacement_inode
+    assert displaced.stat().st_ino == candidate_inode
+    assert not emergency.exists()
+
+
+def test_marker_slot_inventory_probe_is_one_entry_bounded(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    namespace = tmp_path / "wikidata"
+    namespace.mkdir(mode=0o700)
+    namespace_fd = os.open(
+        namespace,
+        os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+    )
+    published_name = "c" * 64
+    pool = wikidata_source_module._QuarantineMarkerPool(
+        namespace_fd=namespace_fd,
+        published_name=published_name,
+    )
+    slot = namespace / f".wikidata-marker-{published_name}-0"
+    slot.mkdir(mode=0o700)
+    next_calls = 0
+    close_calls = 0
+    scanned_descriptor = -1
+
+    class HugeAdversarialInventory:
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            nonlocal next_calls
+            next_calls += 1
+            if next_calls > 1:
+                raise AssertionError("marker inventory was read past one entry")
+            return object()
+
+        def close(self):
+            nonlocal close_calls
+            close_calls += 1
+
+    def huge_scandir(descriptor):
+        nonlocal scanned_descriptor
+        scanned_descriptor = descriptor
+        return HugeAdversarialInventory()
+
+    def forbid_materialized_inventory(_descriptor):
+        raise AssertionError("marker inventory was materialized")
+
+    monkeypatch.setattr(
+        wikidata_source_module.os,
+        "scandir",
+        huge_scandir,
+    )
+    monkeypatch.setattr(
+        wikidata_source_module,
+        "list_entries",
+        forbid_materialized_inventory,
+    )
+
+    try:
+        with pytest.raises(ValueError, match="marker pool slot is not empty"):
+            wikidata_source_module._open_marker_pool_slot(pool, 0)
+    finally:
+        os.close(namespace_fd)
+
+    assert next_calls == 1
+    assert close_calls == 1
+    assert scanned_descriptor >= 0
+    with pytest.raises(OSError):
+        os.fstat(scanned_descriptor)

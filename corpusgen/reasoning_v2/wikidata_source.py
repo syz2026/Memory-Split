@@ -4630,6 +4630,9 @@ def _verify_sealed_private_build(
 
 _QUARANTINE_SAME_STATE_RETRIES = 1
 _MARKER_POOL_SIZE = 8
+_MARKER_REGULAR_SLOT_COUNT = 7
+_MARKER_EMERGENCY_SLOT = 7
+_EMERGENCY_QUARANTINE_ATTEMPTS = 4
 _MARKER_POOL_PREFIX = ".wikidata-marker-"
 
 
@@ -4667,6 +4670,32 @@ def _marker_pool_slot_name(
     if not 0 <= slot_index < _MARKER_POOL_SIZE:
         raise ValueError("Wikidata marker pool slot is invalid")
     return f"{_MARKER_POOL_PREFIX}{pool.published_name}-{slot_index}"
+
+
+def _require_marker_pool_slot_empty(descriptor: int) -> None:
+    iterator = None
+    primary_error: BaseException | None = None
+    try:
+        iterator = os.scandir(descriptor)
+        try:
+            next(iterator)
+        except StopIteration:
+            return
+        raise ValueError("Wikidata marker pool slot is not empty")
+    except BaseException as error:
+        primary_error = error
+        raise
+    finally:
+        if iterator is not None:
+            try:
+                iterator.close()
+            except BaseException as close_error:
+                if primary_error is None:
+                    raise
+                primary_error.add_note(
+                    "marker pool inventory iterator close also failed: "
+                    f"{close_error!r}"
+                )
 
 
 def _open_marker_pool_slot(
@@ -4722,8 +4751,7 @@ def _open_marker_pool_slot(
                 identity,
                 description,
             )
-            if list_entries(descriptor):
-                raise ValueError("Wikidata marker pool slot is not empty")
+            _require_marker_pool_slot_empty(descriptor)
             opened_after = os.fstat(descriptor)
             named_after = entry_lstat(pool.namespace_fd, name)
             _require_derived_mode(
@@ -4785,7 +4813,7 @@ def _allocate_quarantine_marker(
         raise ValueError("Wikidata marker pool authority mismatch")
 
     attempt_errors: list[BaseException] = []
-    for slot_index in range(_MARKER_POOL_SIZE):
+    for slot_index in range(_MARKER_REGULAR_SLOT_COUNT):
         if slot_index in pool.attempted_slots:
             continue
         pool.attempted_slots.add(slot_index)
@@ -4802,10 +4830,25 @@ def _allocate_quarantine_marker(
 
 def _reserve_quarantine_detach_slot(
     marker: _QuarantineMarker,
-) -> str:
+) -> str | None:
     pool = marker.pool
+    emergency_name = _marker_pool_slot_name(
+        pool,
+        _MARKER_EMERGENCY_SLOT,
+    )
+    try:
+        entry_lstat(pool.namespace_fd, emergency_name)
+    except FileNotFoundError:
+        pass
+    except OSError as error:
+        raise ValueError(
+            "Wikidata emergency marker slot availability check failed"
+        ) from error
+    else:
+        raise ValueError("Wikidata emergency marker slot is occupied")
+
     pool.reserved_detach_slot = None
-    for slot_index in range(_MARKER_POOL_SIZE):
+    for slot_index in range(_MARKER_REGULAR_SLOT_COUNT):
         if slot_index in pool.attempted_slots:
             continue
         name = _marker_pool_slot_name(pool, slot_index)
@@ -4816,7 +4859,7 @@ def _reserve_quarantine_detach_slot(
             return name
         except OSError:
             continue
-    raise ValueError("Wikidata marker pool detach capacity exhausted")
+    return None
 
 
 def _detach_quarantine_marker(
@@ -4834,7 +4877,7 @@ def _detach_quarantine_marker(
                     if pool.reserved_detach_slot is not None
                     else ()
                 ),
-                *range(_MARKER_POOL_SIZE),
+                *range(_MARKER_REGULAR_SLOT_COUNT),
             )
         )
     )
@@ -4943,6 +4986,192 @@ def _detach_quarantine_marker(
                     f"{close_error!r}"
                 )
     raise ValueError("Wikidata marker pool detach exhausted")
+
+
+def _restore_emergency_wrong_source(
+    pool: _QuarantineMarkerPool,
+    emergency_name: str,
+    published_name: str,
+) -> None:
+    moved_fd = -1
+    primary_error: BaseException | None = None
+    try:
+        moved_named = entry_lstat(pool.namespace_fd, emergency_name)
+        _require_derived_mode(
+            moved_named,
+            directory=True,
+            description="emergency-quarantined wrong source",
+        )
+        moved_fd, _created = open_directory_at(
+            pool.namespace_fd,
+            emergency_name,
+        )
+        moved_opened = os.fstat(moved_fd)
+        _require_derived_mode(
+            moved_opened,
+            directory=True,
+            description="emergency-quarantined wrong source",
+        )
+        moved_identity = _creation_identity(moved_opened)
+        if _creation_identity(moved_named) != moved_identity:
+            raise ValueError("emergency wrong-source identity drift")
+        _check_named_derived_directory(
+            pool.namespace_fd,
+            emergency_name,
+            moved_fd,
+            moved_identity,
+            "emergency wrong source before restoration",
+        )
+        atomic_rename_noreplace(
+            pool.namespace_fd,
+            emergency_name,
+            pool.namespace_fd,
+            published_name,
+        )
+        _check_named_derived_directory(
+            pool.namespace_fd,
+            published_name,
+            moved_fd,
+            moved_identity,
+            "restored emergency wrong source",
+        )
+        fsync_directory(pool.namespace_fd)
+        _check_named_derived_directory(
+            pool.namespace_fd,
+            published_name,
+            moved_fd,
+            moved_identity,
+            "restored emergency wrong source after sync",
+        )
+    except BaseException as error:
+        primary_error = error
+        raise
+    finally:
+        close_error = _close_descriptors_exhaustively((moved_fd,))
+        if close_error is not None:
+            if primary_error is None:
+                raise close_error
+            primary_error.add_note(
+                "emergency wrong-source descriptor close also failed: "
+                f"{close_error!r}"
+            )
+
+
+def _emergency_quarantine_published_candidate(
+    authority: _PrivateBuildAuthority,
+    published_name: str,
+    pool: _QuarantineMarkerPool,
+) -> str:
+    if (
+        pool.namespace_fd != authority.namespace_fd
+        or pool.published_name != published_name
+    ):
+        raise ValueError("Wikidata emergency marker pool authority mismatch")
+    emergency_name = _marker_pool_slot_name(
+        pool,
+        _MARKER_EMERGENCY_SLOT,
+    )
+    last_error: BaseException | None = None
+
+    for _attempt in range(_EMERGENCY_QUARANTINE_ATTEMPTS):
+        if not _named_derived_directory_matches(
+            authority.namespace_fd,
+            published_name,
+            authority.descriptor,
+            authority.identity,
+            "failed candidate before emergency quarantine",
+        ):
+            fsync_directory(authority.namespace_fd)
+            if not _named_derived_directory_matches(
+                authority.namespace_fd,
+                published_name,
+                authority.descriptor,
+                authority.identity,
+                "failed candidate after emergency source race",
+            ):
+                return emergency_name
+            continue
+
+        try:
+            atomic_rename_noreplace(
+                authority.namespace_fd,
+                published_name,
+                authority.namespace_fd,
+                emergency_name,
+            )
+        except FileExistsError as error:
+            last_error = error
+            continue
+        except OSError as error:
+            last_error = error
+            if _named_derived_directory_matches(
+                authority.namespace_fd,
+                published_name,
+                authority.descriptor,
+                authority.identity,
+                "failed candidate after emergency rename error",
+            ):
+                continue
+            fsync_directory(authority.namespace_fd)
+            return emergency_name
+
+        if _named_derived_directory_matches(
+            authority.namespace_fd,
+            emergency_name,
+            authority.descriptor,
+            authority.identity,
+            "emergency-quarantined failed candidate",
+        ):
+            fsync_directory(authority.namespace_fd)
+            _check_named_derived_directory(
+                authority.namespace_fd,
+                emergency_name,
+                authority.descriptor,
+                authority.identity,
+                "retained emergency-quarantined failed candidate",
+            )
+            try:
+                entry_lstat(authority.namespace_fd, published_name)
+            except FileNotFoundError:
+                return emergency_name
+            raise ValueError(
+                "Wikidata final name was reoccupied after emergency quarantine"
+            )
+
+        try:
+            _restore_emergency_wrong_source(
+                pool,
+                emergency_name,
+                published_name,
+            )
+        except BaseException as error:
+            last_error = error
+            if _named_derived_directory_matches(
+                authority.namespace_fd,
+                published_name,
+                authority.descriptor,
+                authority.identity,
+                "failed candidate after emergency restoration failure",
+            ):
+                continue
+            fsync_directory(authority.namespace_fd)
+            return emergency_name
+
+        if _named_derived_directory_matches(
+            authority.namespace_fd,
+            published_name,
+            authority.descriptor,
+            authority.identity,
+            "failed candidate after emergency wrong-source restoration",
+        ):
+            continue
+        fsync_directory(authority.namespace_fd)
+        return emergency_name
+
+    exhausted = ValueError("Wikidata emergency quarantine retry exhausted")
+    if last_error is not None:
+        exhausted.add_note(f"last emergency quarantine error: {last_error!r}")
+    raise exhausted
 
 
 def _release_owned_quarantine_marker(
@@ -5179,6 +5408,12 @@ def _exchange_quarantine_published_candidate(
 ) -> str:
     secondary_error: BaseException | None = None
     repeated_original_state = 0
+    if marker.pool.reserved_detach_slot is None:
+        return _emergency_quarantine_published_candidate(
+            authority,
+            published_name,
+            marker.pool,
+        )
     try:
         _check_named_derived_directory(
             authority.namespace_fd,
@@ -5220,6 +5455,12 @@ def _exchange_quarantine_published_candidate(
         )
 
         if state.candidate_at_final:
+            if marker.pool.reserved_detach_slot is None:
+                return _emergency_quarantine_published_candidate(
+                    authority,
+                    published_name,
+                    marker.pool,
+                )
             if (
                 state.marker_at_marker
                 and repeated_original_state
@@ -5236,13 +5477,23 @@ def _exchange_quarantine_published_candidate(
                 except BaseException as error:
                     if secondary_error is None:
                         secondary_error = error
-                    if not state.marker_at_marker:
-                        continue
+                    _emergency_quarantine_published_candidate(
+                        authority,
+                        published_name,
+                        marker.pool,
+                    )
+                    raise
                 else:
                     if refresh_error is not None and secondary_error is None:
                         secondary_error = refresh_error
                     repeated_original_state = 0
 
+            if marker.pool.reserved_detach_slot is None:
+                return _emergency_quarantine_published_candidate(
+                    authority,
+                    published_name,
+                    marker.pool,
+                )
             try:
                 _check_named_derived_directory(
                     authority.namespace_fd,
@@ -5276,6 +5527,50 @@ def _exchange_quarantine_published_candidate(
             except BaseException as error:
                 if secondary_error is None:
                     secondary_error = error
+                try:
+                    _check_named_derived_directory(
+                        authority.namespace_fd,
+                        marker.name,
+                        authority.descriptor,
+                        authority.identity,
+                        "failed candidate before emergency restoration",
+                    )
+                    _check_named_derived_directory(
+                        marker.namespace_fd,
+                        published_name,
+                        marker.descriptor,
+                        marker.identity,
+                        "marker before emergency restoration",
+                    )
+                    _atomic_exchange_directories(
+                        authority.namespace_fd,
+                        published_name,
+                        marker.name,
+                    )
+                    fsync_directory(authority.namespace_fd)
+                    _check_named_derived_directory(
+                        authority.namespace_fd,
+                        published_name,
+                        authority.descriptor,
+                        authority.identity,
+                        "failed candidate restored for emergency quarantine",
+                    )
+                    _check_named_derived_directory(
+                        marker.namespace_fd,
+                        marker.name,
+                        marker.descriptor,
+                        marker.identity,
+                        "marker restored before emergency quarantine",
+                    )
+                    marker.entry_name = marker.name
+                    return _emergency_quarantine_published_candidate(
+                        authority,
+                        published_name,
+                        marker.pool,
+                    )
+                except BaseException as emergency_error:
+                    if secondary_error is None:
+                        secondary_error = emergency_error
                 continue
 
         one_sided_wrong_source = (
