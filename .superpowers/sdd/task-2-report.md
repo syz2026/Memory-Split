@@ -241,3 +241,146 @@ changed.
    integration revision must replace that fail-closed path before AWS launch.
 3. The complete repository suite is not green for the three out-of-scope
    failures recorded above. Task 2's 354-test focused regression is green.
+
+## Review-fix addendum
+
+This addendum supersedes concerns 1 and 2 above. `requirements.txt` is now the
+sole dependency declaration, and the current branch is deliberately blocked by
+the production-pipeline gate until the planned Task 4 completion surface
+exists.
+
+### Review-fix commit and scope
+
+- Implementation and focused tests:
+  `e3492b64a6f58ebf149cb83307c0192f938b930e` —
+  `fix: close corpus package review gaps`.
+- Modified only `cluster/aws/corpus_builder/package.py` and
+  `tests/test_package_aws_corpus_builder.py` before this report addendum.
+- No Task 1 file, brief, progress file, scientific corpus file, other worktree,
+  AWS resource, prior commit, or remote branch was changed.
+
+### Review RED evidence
+
+Command:
+
+```bash
+python -m pytest -q tests/test_package_aws_corpus_builder.py
+```
+
+Exact pre-fix summary:
+
+```text
+17 failed, 26 passed in 12.69s
+```
+
+The failures exercised removal of `pyproject.toml`, case-normalized artifact
+prefixes, missing production modules/symbols, the unsupported renderer, lazy
+fetch protection, a committed foreign member, required completion authorities,
+physical path aliases/ancestors, and both post-write rechecks.
+
+The coded-error regression was also observed failing before the rendering
+change:
+
+```text
+1 failed in 0.46s
+```
+
+It expected the rendered exception to begin with
+`INCOMPLETE_PRODUCTION_PIPELINE:` but received only the uncoded detail.
+
+### Review GREEN and regression evidence
+
+Final Task 2 test command:
+
+```bash
+python -m pytest -q tests/test_package_aws_corpus_builder.py
+```
+
+Exact result:
+
+```text
+43 passed in 16.37s
+```
+
+Focused Task 2 regression:
+
+```bash
+python -m pytest -q \
+  tests/test_package_aws_corpus_builder.py \
+  tests/test_aws_corpus_builder_contracts.py \
+  tests/test_parallel_corpus.py \
+  tests/test_reasoning_v2_contracts_strict.py \
+  tests/test_reasoning_v2_contracts.py \
+  tests/test_reasoning_v2_catalog.py \
+  tests/test_reasoning_v2_source_lock.py
+```
+
+Exact result:
+
+```text
+369 passed in 29.99s
+```
+
+These commands were silent with exit code zero:
+
+```bash
+python -m py_compile \
+  cluster/aws/corpus_builder/package.py \
+  scripts/package_aws_corpus_builder.py \
+  tests/test_package_aws_corpus_builder.py
+git diff --check
+```
+
+### Expected clean-branch gate
+
+At clean commit `e3492b64a6f58ebf149cb83307c0192f938b930e`:
+
+```bash
+python scripts/package_aws_corpus_builder.py \
+  --source-root . \
+  --output-dir /tmp/memorysplit-corpus-package-review-gate-e3492b6
+```
+
+exited `1` with:
+
+```text
+PackageError: INCOMPLETE_PRODUCTION_PIPELINE: required production pipeline still exposes the unsupported renderer
+```
+
+This is the required current-branch result. No new real-tree package, byte
+count, member count, or SHA-256 is claimed. The fixture repository contains the
+planned Wikidata derived-view, production catalog-adapter, and renderer public
+surface; its two independent builds remain byte-identical in the 43-test suite.
+Task 9 owns the real-tree two-build identity check after Task 4 removes this
+gate.
+
+### Review-fix self-review
+
+- `PackageError.code` and rendered error text identify
+  `INCOMPLETE_PRODUCTION_PIPELINE`; the gate scans committed production Python
+  blobs for the unsupported renderer before it accepts the exact required
+  Wikidata view, catalog-adapter, and renderer symbols.
+- `pyproject.toml` is absent from `REQUIRED_FILES`; no replacement dependency
+  declaration was added.
+- Every Git subprocess uses the centralized sanitized environment containing
+  `GIT_NO_LAZY_FETCH=1`; a wrapper test observes all package Git calls.
+- Artifact rejection is case-insensitive and recognizes bounded
+  artifact/cache/checkpoint/output/pilot prefixes such as `Checkpoint-100` and
+  `PILOT-v2`, without rejecting source or tokenizer files merely for `.bin`.
+- Package selection is bound to an explicit reviewed member inventory. A
+  committed `scripts/unreviewed.py` under an otherwise eligible prefix fails
+  with `UNREVIEWED_PACKAGE_MEMBER`.
+- Source and output are compared using physical paths in both ancestor
+  directions. Output location and source cleanliness are rechecked after all
+  three writes and before return.
+- Existing sorted-path, normalized tar/gzip metadata, committed-blob reads,
+  canonical manifest, checksum, secret scanning, and atomic writes remain
+  covered.
+
+### Remaining concerns
+
+1. Task 4 must remove `UnsupportedProductionRenderer` and provide the exact
+   reviewed Wikidata derived-view, `WikidataGraphCatalogSource`, and
+   `WikidataGraphRenderer` surface before any real package can be emitted.
+2. The three previously recorded out-of-scope full-suite failures were not
+   rerun in this review-fix wave; the requested 369-test Task 2 matrix is green.
