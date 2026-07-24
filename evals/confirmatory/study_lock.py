@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from enum import StrEnum
 import re
 from typing import Any, ClassVar
+from urllib.parse import urlsplit
 
 from evals.confirmatory.contracts import (
     CONTRACT_VERSION,
@@ -17,12 +18,18 @@ from evals.confirmatory.contracts import (
     canonical_sha256,
 )
 from msctl.aws_contracts import ARMS, SEEDS, SNAPSHOT_STEPS
-from msctl.aws_contracts import checkpoint_receipt_key, snapshot_object_key
+from msctl.aws_contracts import (
+    checkpoint_receipt_key,
+    collection_receipt_key,
+    run_receipt_key,
+    snapshot_object_key,
+)
 from msctl.aws_hardware import (
     AWS_HARDWARE_AMENDMENT_SHA256,
     PROVIDER_SELECTION_S3_KEY,
     AuthenticatedSelectionBinding,
 )
+from msctl.aws_lifecycle import ProviderLifecycleBinding
 
 
 STUDY_LOCK_SCHEMA = "memorysplit.confirmatory.study-lock.v2"
@@ -78,7 +85,22 @@ REQUIRED_RECEIPTS = (
     *(f"control:{control_id}" for control_id in REQUIRED_CONTROL_IDS),
 )
 _SHA256_RE = re.compile(r"[0-9a-f]{64}")
+_GIT_SHA1_RE = re.compile(r"[0-9a-f]{40}")
 _MAX_S3_VERSION_ID_LENGTH = 1_024
+# Placement, runtime SBOM, objective controls, and source identity must be
+# constant across the ten sequential seeds; only seed, boot, run-manifest,
+# per-arm operational-config, and receipt identities may vary per seed.
+COHORT_UNIFORM_LIFECYCLE_FIELDS = (
+    "account_id",
+    "availability_zone",
+    "instance_id",
+    "objective_controls_contract_sha256",
+    "purchase_model",
+    "region",
+    "runtime_sbom_sha256",
+    "source_commit",
+    "source_tree",
+)
 _STUDY_COHORT_ID_V3 = "memorysplit-confirmatory-v3-360m-n10-aws"
 _ELIGIBLE_PROFILE_IDENTITIES_V3 = frozenset(
     {
@@ -136,6 +158,44 @@ def _integer(value: object, name: str) -> int:
     if type(value) is not int or value < 0:
         raise ValueError(f"{name} must be a non-negative integer")
     return value
+
+
+def _git_sha1(value: object, name: str) -> str:
+    if not isinstance(value, str) or _GIT_SHA1_RE.fullmatch(value) is None:
+        raise ValueError(f"{name} must be a lowercase Git SHA-1")
+    return value
+
+
+def _positive_bytes(value: object, name: str) -> int:
+    if type(value) is not int or value <= 0:
+        raise ValueError(f"{name} bytes must be a positive exact integer")
+    return value
+
+
+def _receipt_object_uri(value: object, *, expected_key: str, name: str) -> str:
+    """Validate one immutable s3:// receipt URI and return its object root."""
+
+    suffix = f"/{expected_key}"
+    if not isinstance(value, str) or not value.endswith(suffix):
+        raise ValueError(f"{name} URI does not use its canonical key")
+    root = value[: -len(suffix)]
+    try:
+        parsed = urlsplit(root)
+        port = parsed.port
+    except ValueError as exc:
+        raise ValueError(f"{name} URI root is not a safe s3:// root") from exc
+    if (
+        parsed.scheme != "s3"
+        or parsed.hostname is None
+        or parsed.netloc != parsed.hostname
+        or port is not None
+        or parsed.query
+        or parsed.fragment
+        or "\\" in value
+        or any(part in {".", ".."} for part in parsed.path.split("/"))
+    ):
+        raise ValueError(f"{name} URI root is not a safe s3:// root")
+    return root
 
 
 def _schema(value: object, name: str) -> int:
@@ -353,6 +413,241 @@ class ProviderSelectionBinding:
                 self.approval_public_key_sha256
             ),
         }
+
+
+@dataclass(frozen=True)
+class SeedLifecycleBinding:
+    """Per-seed training lifecycle, receipt, and placement commitments."""
+
+    seed: int
+    account_id: str
+    availability_zone: str
+    boot_id: str
+    instance_id: str
+    region: str
+    purchase_model: str
+    runtime_sbom_sha256: str
+    objective_controls_contract_sha256: str
+    source_commit: str
+    source_tree: str
+    run_manifest_sha256: str
+    dense_operational_config_sha256: str
+    split90_operational_config_sha256: str
+    finalization_receipt_sha256: str
+    finalization_receipt_s3_uri: str
+    finalization_receipt_bytes: int
+    finalization_receipt_s3_version_id: str
+    collection_receipt_sha256: str
+    collection_receipt_s3_uri: str
+    collection_receipt_s3_version_id: str
+
+    FIELDS: ClassVar[frozenset[str]] = frozenset(
+        {
+            "seed",
+            "account_id",
+            "availability_zone",
+            "boot_id",
+            "instance_id",
+            "region",
+            "purchase_model",
+            "runtime_sbom_sha256",
+            "objective_controls_contract_sha256",
+            "source_commit",
+            "source_tree",
+            "run_manifest_sha256",
+            "dense_operational_config_sha256",
+            "split90_operational_config_sha256",
+            "finalization_receipt_sha256",
+            "finalization_receipt_s3_uri",
+            "finalization_receipt_bytes",
+            "finalization_receipt_s3_version_id",
+            "collection_receipt_sha256",
+            "collection_receipt_s3_uri",
+            "collection_receipt_s3_version_id",
+        }
+    )
+
+    def __post_init__(self) -> None:
+        if type(self.seed) is not int or self.seed not in SEEDS:
+            raise ValueError(
+                "seed lifecycle seed must be an exact integer from 0 to 9"
+            )
+        for field in (
+            "account_id",
+            "availability_zone",
+            "boot_id",
+            "instance_id",
+            "region",
+            "purchase_model",
+        ):
+            _string(getattr(self, field), f"seed lifecycle {field}")
+        for field in (
+            "runtime_sbom_sha256",
+            "objective_controls_contract_sha256",
+            "run_manifest_sha256",
+            "dense_operational_config_sha256",
+            "split90_operational_config_sha256",
+        ):
+            _hash(getattr(self, field), f"seed lifecycle {field}")
+        _git_sha1(self.source_commit, "seed lifecycle source_commit")
+        _git_sha1(self.source_tree, "seed lifecycle source_tree")
+        finalization_sha256 = _hash(
+            self.finalization_receipt_sha256,
+            "seed lifecycle finalization receipt SHA-256",
+        )
+        finalization_root = _receipt_object_uri(
+            self.finalization_receipt_s3_uri,
+            expected_key=run_receipt_key(self.seed, finalization_sha256),
+            name="seed lifecycle finalization receipt",
+        )
+        _positive_bytes(
+            self.finalization_receipt_bytes,
+            "seed lifecycle finalization receipt",
+        )
+        _s3_version_id(
+            self.finalization_receipt_s3_version_id,
+            "seed lifecycle finalization receipt S3 version ID",
+        )
+        collection_sha256 = _hash(
+            self.collection_receipt_sha256,
+            "seed lifecycle collection receipt SHA-256",
+        )
+        collection_root = _receipt_object_uri(
+            self.collection_receipt_s3_uri,
+            expected_key=collection_receipt_key(
+                self.seed,
+                collection_sha256,
+            ),
+            name="seed lifecycle collection receipt",
+        )
+        _s3_version_id(
+            self.collection_receipt_s3_version_id,
+            "seed lifecycle collection receipt S3 version ID",
+        )
+        if finalization_root != collection_root:
+            raise ValueError(
+                "seed lifecycle receipts do not share one durable object root"
+            )
+
+    @property
+    def object_root(self) -> str:
+        return _receipt_object_uri(
+            self.collection_receipt_s3_uri,
+            expected_key=collection_receipt_key(
+                self.seed,
+                self.collection_receipt_sha256,
+            ),
+            name="seed lifecycle collection receipt",
+        )
+
+    def operational_config_sha256(self, arm: StudyArm | str) -> str:
+        try:
+            value = StudyArm(arm)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "seed lifecycle arm must be dense or split90"
+            ) from exc
+        if value is StudyArm.DENSE:
+            return self.dense_operational_config_sha256
+        return self.split90_operational_config_sha256
+
+    @classmethod
+    def from_dict(cls, raw: Mapping[str, Any]) -> "SeedLifecycleBinding":
+        return cls(
+            **dict(_strict_fields(raw, cls.FIELDS, "seed lifecycle binding"))
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "account_id": self.account_id,
+            "availability_zone": self.availability_zone,
+            "boot_id": self.boot_id,
+            "collection_receipt_s3_uri": self.collection_receipt_s3_uri,
+            "collection_receipt_s3_version_id": (
+                self.collection_receipt_s3_version_id
+            ),
+            "collection_receipt_sha256": self.collection_receipt_sha256,
+            "dense_operational_config_sha256": (
+                self.dense_operational_config_sha256
+            ),
+            "finalization_receipt_bytes": self.finalization_receipt_bytes,
+            "finalization_receipt_s3_uri": (
+                self.finalization_receipt_s3_uri
+            ),
+            "finalization_receipt_s3_version_id": (
+                self.finalization_receipt_s3_version_id
+            ),
+            "finalization_receipt_sha256": (
+                self.finalization_receipt_sha256
+            ),
+            "instance_id": self.instance_id,
+            "objective_controls_contract_sha256": (
+                self.objective_controls_contract_sha256
+            ),
+            "purchase_model": self.purchase_model,
+            "region": self.region,
+            "run_manifest_sha256": self.run_manifest_sha256,
+            "runtime_sbom_sha256": self.runtime_sbom_sha256,
+            "seed": self.seed,
+            "source_commit": self.source_commit,
+            "source_tree": self.source_tree,
+            "split90_operational_config_sha256": (
+                self.split90_operational_config_sha256
+            ),
+        }
+
+
+def _reconstructed_lifecycle_binding(
+    selection: ProviderSelectionBinding,
+    lifecycle: SeedLifecycleBinding,
+) -> ProviderLifecycleBinding:
+    """Rebuild the exact training provider lifecycle authority for one seed."""
+
+    try:
+        return ProviderLifecycleBinding(
+            cohort_id=selection.cohort_id,
+            provider=selection.selected_provider,
+            profile_id=selection.profile_id,
+            profile_sha256=selection.profile_sha256,
+            hardware_amendment_sha256=selection.hardware_amendment_sha256,
+            provider_selection_sha256=selection.provider_selection_sha256,
+            provider_selection_version_id=(
+                selection.provider_selection_s3_version_id
+            ),
+            runtime_lock_sha256=selection.runtime_lock_sha256,
+            runtime_sbom_sha256=lifecycle.runtime_sbom_sha256,
+            qualification_evidence_sha256=(
+                selection.qualification_evidence_sha256
+            ),
+            qualification_environment_receipt_sha256=(
+                selection.environment_receipt_sha256
+            ),
+            qualification_canary_receipt_sha256=(
+                selection.canary_receipt_sha256
+            ),
+            qualification_approval_receipt_sha256=(
+                selection.approval_receipt_sha256
+            ),
+            qualification_approval_public_key_sha256=(
+                selection.approval_public_key_sha256
+            ),
+            objective_controls_contract_sha256=(
+                lifecycle.objective_controls_contract_sha256
+            ),
+            account_id=lifecycle.account_id,
+            instance_id=lifecycle.instance_id,
+            boot_id=lifecycle.boot_id,
+            region=lifecycle.region,
+            availability_zone=lifecycle.availability_zone,
+            purchase_model=lifecycle.purchase_model,
+            seed=lifecycle.seed,
+            arms=("dense", "split90"),
+        )
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            "seed lifecycle cannot reconstruct one authenticated provider "
+            "lifecycle binding"
+        ) from exc
 
 
 @dataclass(frozen=True)
@@ -624,6 +919,7 @@ class StudyLockV3:
     sealed_evaluation_release_sha256: str
     provider_selection: ProviderSelectionBinding
     snapshots: tuple[StudySnapshotBinding, ...]
+    seed_lifecycles: tuple[SeedLifecycleBinding, ...]
 
     FIELDS: ClassVar[frozenset[str]] = frozenset(
         {
@@ -633,6 +929,7 @@ class StudyLockV3:
             "sealed_evaluation_release_sha256",
             "provider_selection",
             "snapshots",
+            "seed_lifecycles",
         }
     )
 
@@ -769,33 +1066,80 @@ class StudyLockV3:
                 "v3 study lock rejects checkpoint alias or object reuse "
                 "across slots"
             )
-        receipt_by_seed_step: dict[
-            tuple[int, int],
-            tuple[str, str, str],
-        ] = {}
+        receipt_by_seed: dict[int, tuple[str, str, str]] = {}
         for snapshot in snapshots:
-            seed_step = snapshot.seed, snapshot.optimizer_step
             receipt = (
                 snapshot.checkpoint_receipt_sha256,
                 snapshot.checkpoint_receipt_s3_object_key,
                 snapshot.checkpoint_receipt_s3_version_id,
             )
-            previous = receipt_by_seed_step.setdefault(seed_step, receipt)
+            previous = receipt_by_seed.setdefault(snapshot.seed, receipt)
             if previous != receipt:
                 raise ValueError(
-                    "paired snapshot slots disagree on checkpoint receipt"
+                    "snapshot slots disagree on their one collected "
+                    "per-seed checkpoint receipt"
                 )
         receipt_content_identities = tuple(
-            (receipt_sha256, receipt_key)
-            for receipt_sha256, receipt_key, _version_id
-            in receipt_by_seed_step.values()
+            receipt_sha256
+            for receipt_sha256, _receipt_key, _version_id
+            in receipt_by_seed.values()
         )
         if len(set(receipt_content_identities)) != len(
             receipt_content_identities
         ):
             raise ValueError(
-                "checkpoint receipt content is reused across seed/step slots"
+                "checkpoint receipt content is reused across seed slots"
             )
+        if not isinstance(self.seed_lifecycles, (list, tuple)):
+            raise ValueError("v3 study lock seed lifecycles must be ordered")
+        lifecycles = tuple(
+            lifecycle
+            if isinstance(lifecycle, SeedLifecycleBinding)
+            else SeedLifecycleBinding.from_dict(lifecycle)
+            for lifecycle in self.seed_lifecycles
+        )
+        if tuple(
+            lifecycle.seed for lifecycle in lifecycles
+        ) != tuple(SEEDS):
+            raise ValueError(
+                "v3 study lock requires exactly ten seed lifecycles with "
+                "seeds 0 through 9 ascending"
+            )
+        for field in COHORT_UNIFORM_LIFECYCLE_FIELDS:
+            if len({
+                getattr(lifecycle, field) for lifecycle in lifecycles
+            }) != 1:
+                raise ValueError(
+                    f"seed lifecycle {field} must stay cohort-uniform "
+                    "across the ten sequential seeds"
+                )
+        if len({
+            lifecycle.object_root for lifecycle in lifecycles
+        }) != 1:
+            raise ValueError(
+                "seed lifecycle receipts must share one durable object root"
+            )
+        receipt_hashes = tuple(
+            digest
+            for lifecycle in lifecycles
+            for digest in (
+                lifecycle.finalization_receipt_sha256,
+                lifecycle.collection_receipt_sha256,
+            )
+        )
+        manifest_hashes = tuple(
+            lifecycle.run_manifest_sha256 for lifecycle in lifecycles
+        )
+        if (
+            len(set(receipt_hashes)) != len(receipt_hashes)
+            or len(set(manifest_hashes)) != len(manifest_hashes)
+        ):
+            raise ValueError(
+                "seed lifecycle receipt or run-manifest content is "
+                "reused (aliased) across seeds"
+            )
+        for lifecycle in lifecycles:
+            _reconstructed_lifecycle_binding(selection, lifecycle)
         object.__setattr__(self, "preregistration_sha256", preregistration)
         object.__setattr__(
             self,
@@ -804,6 +1148,19 @@ class StudyLockV3:
         )
         object.__setattr__(self, "provider_selection", selection)
         object.__setattr__(self, "snapshots", snapshots)
+        object.__setattr__(self, "seed_lifecycles", lifecycles)
+
+    def lifecycle_binding(self, seed: object) -> ProviderLifecycleBinding:
+        """Reconstruct one seed's authenticated provider lifecycle binding."""
+
+        if type(seed) is not int or seed not in SEEDS:
+            raise ValueError(
+                "lifecycle binding seed must be an exact integer from 0 to 9"
+            )
+        return _reconstructed_lifecycle_binding(
+            self.provider_selection,
+            self.seed_lifecycles[seed],
+        )
 
     @classmethod
     def from_dict(cls, raw: Mapping[str, Any]) -> "StudyLockV3":
@@ -817,6 +1174,7 @@ class StudyLockV3:
             ],
             provider_selection=value["provider_selection"],
             snapshots=value["snapshots"],
+            seed_lifecycles=value["seed_lifecycles"],
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -830,6 +1188,9 @@ class StudyLockV3:
             "provider_selection": self.provider_selection.to_dict(),
             "snapshots": [
                 snapshot.to_dict() for snapshot in self.snapshots
+            ],
+            "seed_lifecycles": [
+                lifecycle.to_dict() for lifecycle in self.seed_lifecycles
             ],
         }
 

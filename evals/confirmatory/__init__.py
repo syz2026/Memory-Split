@@ -9,6 +9,7 @@ from evals.confirmatory.actions import (
 )
 from evals.confirmatory.aggregate import (
     RUN_BINDING_SCHEMA_V3,
+    CollectionReceiptEvidence,
     RunBindingV3,
     SnapshotEvaluationPlan,
     plan_snapshot_evaluations,
@@ -130,6 +131,7 @@ from evals.confirmatory.study_lock import (
     ReceiptCommitment,
     ReceiptState,
     ReleaseBinding,
+    SeedLifecycleBinding,
     StudyLock,
     StudyLockV3,
     StudySnapshotBinding,
@@ -204,6 +206,7 @@ __all__ = [
     "ArtifactReport",
     "BootstrapEstimate",
     "CheckpointRecord",
+    "CollectionReceiptEvidence",
     "ConditionId",
     "CompositionSplit",
     "ContractBundle",
@@ -232,6 +235,7 @@ __all__ = [
     "RunBindingV3",
     "ScientificStatus",
     "SealedGoldRecord",
+    "SeedLifecycleBinding",
     "SolverError",
     "StoreRecord",
     "StoreRow",

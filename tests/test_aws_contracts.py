@@ -109,6 +109,19 @@ def test_sha256_validation_rejects_malformed_or_path_like_values(value):
             derive(value)
 
 
+def test_snapshot_object_key_has_exactly_one_live_unpadded_definition():
+    import inspect
+
+    contract = _contracts()
+    source = inspect.getsource(contract)
+
+    assert source.count("def snapshot_object_key(") == 1
+    assert "step-{optimizer_step:07d}" not in source
+    assert contract.snapshot_object_key(0, "dense", 1_358, "a" * 64) == (
+        f"snapshots/seed-0/dense/step-1358/sha256/{'a' * 64}.pt"
+    )
+
+
 def test_run_finalization_keys_are_exact_for_every_seed_arm_and_step():
     contract = _contracts()
     digest = "0123456789abcdef" * 4

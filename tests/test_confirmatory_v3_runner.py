@@ -17,7 +17,11 @@ from evals.confirmatory import sealing
 from evals.confirmatory import __main__ as runner_cli
 import evals.confirmatory.runner as runner_module
 from evals.confirmatory.actions import ActionSlot
-from evals.confirmatory.aggregate import plan_snapshot_evaluations
+from evals.confirmatory.aggregate import (
+    CollectionReceiptEvidence,
+    RunBindingV3,
+    plan_snapshot_evaluations,
+)
 from evals.confirmatory.contracts import (
     STUDY_CONTRACT_VERSION,
     canonical_json_bytes,
@@ -48,6 +52,14 @@ from msctl.aws_hardware import (
     AWS_HARDWARE_AMENDMENT_SHA256,
     PROVIDER_SELECTION_S3_KEY,
 )
+from msctl.aws_lifecycle import lifecycle_operational_metadata
+from tests.study_lock_fixtures import (
+    DENSE_OPERATIONAL_CONFIG_SHA256,
+    SOURCE_COMMIT,
+    SOURCE_TREE,
+    build_seed_lifecycles,
+    expected_lifecycle_binding,
+)
 from train.tokenizer import get_tok
 from train.trainer import Trainer
 
@@ -67,6 +79,9 @@ class _V3Fixture:
     run_binding: dict
     item_ids: tuple[str, ...]
     submissions: dict[str, Submission]
+    snapshots: tuple[dict, ...]
+    selection: dict
+    receipts: tuple[CollectionReceiptEvidence, ...]
 
 
 def _jsonl(records: list[dict]) -> bytes:
@@ -114,6 +129,7 @@ def _digest(value: str) -> str:
 def _write_execution_inputs(
     run: Path,
     repository_root: Path,
+    mutate_environment=None,
 ) -> dict[str, str]:
     profile_data = repository_root.joinpath(
         "cluster/profiles/aws-p5.48xlarge-v3.json"
@@ -178,6 +194,8 @@ def _write_execution_inputs(
         "boot_id": "12345678-1234-4abc-8def-1234567890ab",
         "runtime_facts": runtime_facts,
     }
+    if mutate_environment is not None:
+        mutate_environment(environment)
     environment_bytes = canonical_json_bytes(environment)
     run.joinpath("evaluator-environment-receipt.json").write_bytes(
         environment_bytes
@@ -190,9 +208,48 @@ def _write_execution_inputs(
     }
 
 
+def _provider_selection(execution: dict[str, str]) -> dict:
+    return {
+        "cohort_id": "memorysplit-confirmatory-v3-360m-n10-aws",
+        "provider_selection_s3_key": PROVIDER_SELECTION_S3_KEY,
+        "provider_selection_sha256": "a" * 64,
+        "provider_selection_s3_version_id": (
+            "provider-selection-version-p5"
+        ),
+        "hardware_amendment_sha256": AWS_HARDWARE_AMENDMENT_SHA256,
+        "selected_provider": "aws-p5.48xlarge",
+        "profile_id": "aws-p5.48xlarge-v3",
+        "profile_sha256": P5_PROFILE_SHA256,
+        "runtime_lock_sha256": execution["runtime_lock_sha256"],
+        "qualification_evidence_sha256": "c" * 64,
+        "environment_receipt_sha256": execution[
+            "environment_receipt_sha256"
+        ],
+        "canary_receipt_sha256": "e" * 64,
+        "approval_receipt_sha256": "f" * 64,
+        "approval_public_key_sha256": "1" * 64,
+    }
+
+
+def _selected_operational_metadata(selection: dict) -> dict[str, object]:
+    return lifecycle_operational_metadata(
+        expected_lifecycle_binding(selection, 0),
+        run_id="memorysplit-v3-360m-s0-dense",
+        arm="dense",
+        config_sha256=DENSE_OPERATIONAL_CONFIG_SHA256,
+        dataset_receipt_sha256=_digest("data-receipt"),
+        dataset_build_id=_digest("data-build"),
+        ordered_stream_sha256=_digest("ordered-stream"),
+        source_commit=SOURCE_COMMIT,
+        source_tree=SOURCE_TREE,
+    )
+
+
 def _write_trainer_snapshot(
     root: Path,
     destination: Path,
+    *,
+    operational_metadata: dict[str, object],
 ) -> tuple[bytes, dict]:
     root.mkdir()
     tokens = np.zeros(524_288, dtype=np.uint16)
@@ -225,6 +282,7 @@ def _write_trainer_snapshot(
         "condition": "dense",
         "model": model_config,
         "seed": 0,
+        "operational_metadata": operational_metadata,
         "train_bin": str(token_path),
         "train_mask": str(mask_path),
         "out_dir": str(root / "trainer-output"),
@@ -275,7 +333,7 @@ def _write_trainer_snapshot(
     return content, state
 
 
-def _build_v3_fixture(tmp_path: Path) -> _V3Fixture:
+def _build_v3_fixture(tmp_path: Path, *, mutate_environment=None) -> _V3Fixture:
     source = tmp_path / "source"
     source.mkdir(mode=0o700)
     source.chmod(0o700)
@@ -300,15 +358,21 @@ def _build_v3_fixture(tmp_path: Path) -> _V3Fixture:
 
     run = tmp_path / "run"
     run.mkdir()
-    execution = _write_execution_inputs(run, repository_root)
+    execution = _write_execution_inputs(
+        run,
+        repository_root,
+        mutate_environment=mutate_environment,
+    )
+    selection = _provider_selection(execution)
     snapshot_path = run / "snapshots" / "step0001358.pt"
     snapshot_bytes, snapshot_state = _write_trainer_snapshot(
         tmp_path / "snapshot-source",
         snapshot_path,
+        operational_metadata=_selected_operational_metadata(selection),
     )
     selected_snapshot_sha256 = hashlib.sha256(snapshot_bytes).hexdigest()
-    selection_sha256 = "a" * 64
-    selection_version = "provider-selection-version-p5"
+    selection_sha256 = selection["provider_selection_sha256"]
+    selection_version = selection["provider_selection_s3_version_id"]
     snapshots = []
     for seed in SEEDS:
         for arm in ARMS:
@@ -320,7 +384,7 @@ def _build_v3_fixture(tmp_path: Path) -> _V3Fixture:
                     if selected
                     else _digest(f"snapshot:{seed}:{arm}:{step}")
                 )
-                receipt_sha256 = _digest(f"receipt:{seed}:{step}")
+                receipt_sha256 = _digest(f"receipt:{seed}")
                 snapshots.append(
                     {
                         "seed": seed,
@@ -339,7 +403,7 @@ def _build_v3_fixture(tmp_path: Path) -> _V3Fixture:
                             checkpoint_receipt_key(seed, receipt_sha256)
                         ),
                         "checkpoint_receipt_s3_version_id": (
-                            f"receipt-version-{seed}-{step}"
+                            f"receipt-version-{seed}"
                         ),
                         "provider_selection_sha256": selection_sha256,
                         "provider_selection_s3_version_id": selection_version,
@@ -381,44 +445,12 @@ def _build_v3_fixture(tmp_path: Path) -> _V3Fixture:
                         "tokens_per_step": 524_288,
                     }
                 )
-    lock = StudyLockV3.from_dict(
-        {
-            "record_type": STUDY_LOCK_SCHEMA_V3,
-            "schema_version": STUDY_CONTRACT_VERSION,
-            "preregistration_sha256": FROZEN_PREREGISTRATION_SHA256_V3,
-            "sealed_evaluation_release_sha256": sealed.release_sha256,
-            "provider_selection": {
-                "cohort_id": "memorysplit-confirmatory-v3-360m-n10-aws",
-                "provider_selection_s3_key": PROVIDER_SELECTION_S3_KEY,
-                "provider_selection_sha256": selection_sha256,
-                "provider_selection_s3_version_id": selection_version,
-                "hardware_amendment_sha256": AWS_HARDWARE_AMENDMENT_SHA256,
-                "selected_provider": "aws-p5.48xlarge",
-                "profile_id": "aws-p5.48xlarge-v3",
-                "profile_sha256": P5_PROFILE_SHA256,
-                "runtime_lock_sha256": execution[
-                    "runtime_lock_sha256"
-                ],
-                "qualification_evidence_sha256": "c" * 64,
-                "environment_receipt_sha256": execution[
-                    "environment_receipt_sha256"
-                ],
-                "canary_receipt_sha256": "e" * 64,
-                "approval_receipt_sha256": "f" * 64,
-                "approval_public_key_sha256": "1" * 64,
-            },
-            "snapshots": snapshots,
-        }
+    lock, lock_sha256, receipts, plan = _lock_receipts_and_plan(
+        run,
+        snapshots=snapshots,
+        selection=selection,
+        sealed_evaluation_release_sha256=sealed.release_sha256,
     )
-    lock_sha256 = canonical_sha256(lock.to_dict())
-    run.joinpath("study-lock.json").write_bytes(
-        canonical_json_bytes(lock.to_dict())
-    )
-    plan = plan_snapshot_evaluations(
-        study_lock=lock,
-        study_lock_sha256=lock_sha256,
-    )[0]
-    run.joinpath("run.json").write_bytes(plan.run_json_bytes)
 
     gold_records = [json.loads(line) for line in gold_bytes.splitlines()]
     submissions = {
@@ -446,7 +478,56 @@ def _build_v3_fixture(tmp_path: Path) -> _V3Fixture:
         run_binding=plan.binding.to_dict(),
         item_ids=item_ids,
         submissions=submissions,
+        snapshots=tuple(snapshots),
+        selection=selection,
+        receipts=receipts,
     )
+
+
+def _lock_receipts_and_plan(
+    run: Path,
+    *,
+    snapshots: list[dict],
+    selection: dict,
+    sealed_evaluation_release_sha256: str,
+):
+    lifecycles, raw_receipts = build_seed_lifecycles(
+        snapshots=snapshots,
+        provider_selection=selection,
+    )
+    lock = StudyLockV3.from_dict(
+        {
+            "record_type": STUDY_LOCK_SCHEMA_V3,
+            "schema_version": STUDY_CONTRACT_VERSION,
+            "preregistration_sha256": FROZEN_PREREGISTRATION_SHA256_V3,
+            "sealed_evaluation_release_sha256": (
+                sealed_evaluation_release_sha256
+            ),
+            "provider_selection": selection,
+            "snapshots": snapshots,
+            "seed_lifecycles": lifecycles,
+        }
+    )
+    lock_sha256 = canonical_sha256(lock.to_dict())
+    receipts = tuple(
+        CollectionReceiptEvidence(
+            payload=payload,
+            uri=uri,
+            sha256=sha256,
+            version_id=version_id,
+        )
+        for payload, uri, sha256, version_id in raw_receipts
+    )
+    run.joinpath("study-lock.json").write_bytes(
+        canonical_json_bytes(lock.to_dict())
+    )
+    plan = plan_snapshot_evaluations(
+        study_lock=lock,
+        study_lock_sha256=lock_sha256,
+        collection_receipts=receipts,
+    )[0]
+    run.joinpath("run.json").write_bytes(plan.run_json_bytes)
+    return lock, lock_sha256, receipts, plan
 
 
 def _rewrite_run(fixture: _V3Fixture, **changes) -> None:
@@ -459,8 +540,8 @@ def _rebind_snapshot(fixture: _V3Fixture, state: dict) -> _V3Fixture:
     path = fixture.run.joinpath(fixture.run_binding["snapshot_path"])
     torch.save(state, path)
     snapshot_sha256 = hashlib.sha256(path.read_bytes()).hexdigest()
-    raw_lock = fixture.lock.to_dict()
-    selected = raw_lock["snapshots"][0]
+    snapshots = [dict(slot) for slot in fixture.snapshots]
+    selected = snapshots[0]
     assert (selected["seed"], selected["arm"], selected["optimizer_step"]) == (
         0,
         "dense",
@@ -473,53 +554,22 @@ def _rebind_snapshot(fixture: _V3Fixture, state: dict) -> _V3Fixture:
         1_358,
         snapshot_sha256,
     )
-    lock = StudyLockV3.from_dict(raw_lock)
-    lock_sha256 = canonical_sha256(lock.to_dict())
-    fixture.run.joinpath("study-lock.json").write_bytes(
-        canonical_json_bytes(lock.to_dict())
+    lock, lock_sha256, receipts, plan = _lock_receipts_and_plan(
+        fixture.run,
+        snapshots=snapshots,
+        selection=fixture.selection,
+        sealed_evaluation_release_sha256=(
+            fixture.lock.sealed_evaluation_release_sha256
+        ),
     )
-    plan = plan_snapshot_evaluations(
-        study_lock=lock,
-        study_lock_sha256=lock_sha256,
-    )[0]
-    fixture.run.joinpath("run.json").write_bytes(plan.run_json_bytes)
     return replace(
         fixture,
         lock=lock,
         lock_sha256=lock_sha256,
         run_binding=plan.binding.to_dict(),
         output=fixture.output.parent / plan.output_name,
-    )
-
-
-def _rebind_environment_receipt(
-    fixture: _V3Fixture,
-    environment: dict,
-) -> _V3Fixture:
-    path = fixture.run / "evaluator-environment-receipt.json"
-    content = canonical_json_bytes(environment)
-    path.write_bytes(content)
-    environment_sha256 = hashlib.sha256(content).hexdigest()
-    raw_lock = fixture.lock.to_dict()
-    raw_lock["provider_selection"][
-        "environment_receipt_sha256"
-    ] = environment_sha256
-    lock = StudyLockV3.from_dict(raw_lock)
-    lock_sha256 = canonical_sha256(lock.to_dict())
-    fixture.run.joinpath("study-lock.json").write_bytes(
-        canonical_json_bytes(lock.to_dict())
-    )
-    plan = plan_snapshot_evaluations(
-        study_lock=lock,
-        study_lock_sha256=lock_sha256,
-    )[0]
-    fixture.run.joinpath("run.json").write_bytes(plan.run_json_bytes)
-    return replace(
-        fixture,
-        lock=lock,
-        lock_sha256=lock_sha256,
-        run_binding=plan.binding.to_dict(),
-        output=fixture.output.parent / plan.output_name,
+        snapshots=tuple(snapshots),
+        receipts=receipts,
     )
 
 
@@ -589,6 +639,7 @@ def test_v3_preflight_rejects_optimizer_rng_full_checkpoints(tmp_path):
         ("model_cfg", "model.*config"),
         ("data", "data.*provenance"),
         ("world_size", "world.size"),
+        ("lifecycle", "operational|selection|lifecycle"),
     ],
 )
 def test_v3_preflight_rejects_crossed_snapshot_provenance(
@@ -609,6 +660,8 @@ def test_v3_preflight_rejects_crossed_snapshot_provenance(
         state["model_cfg"]["ctx"] += 1
     elif mutation == "data":
         state["data_provenance"]["token_count"] += 1
+    elif mutation == "lifecycle":
+        state["boot_id"] = "87654321-4321-4cba-8fed-1234567890ab"
     else:
         state["world_size"] = 8
     fixture = _rebind_snapshot(fixture, state)
@@ -619,6 +672,135 @@ def test_v3_preflight_rejects_crossed_snapshot_provenance(
             sealed_release=fixture.release,
             expected_study_lock_sha256=fixture.lock_sha256,
         )
+
+
+def test_v3_selected_evaluation_rejects_study_only_snapshots(tmp_path):
+    from msctl.aws_lifecycle import OPERATIONAL_METADATA_FIELDS
+
+    fixture = _build_v3_fixture(tmp_path)
+    path = fixture.run.joinpath(fixture.run_binding["snapshot_path"])
+    state = torch.load(path, map_location="cpu", weights_only=True)
+    for field in OPERATIONAL_METADATA_FIELDS:
+        del state[field]
+    assert set(state) == {
+        "config_fingerprint",
+        "data_provenance",
+        "model",
+        "model_cfg",
+        "snapshot_version",
+        "step",
+        "study_identity",
+        "world_size",
+    }
+    fixture = _rebind_snapshot(fixture, state)
+
+    with pytest.raises(
+        ValueError,
+        match="lifecycle|operational",
+    ):
+        preflight(
+            run=fixture.run,
+            sealed_release=fixture.release,
+            expected_study_lock_sha256=fixture.lock_sha256,
+        )
+    with pytest.raises(
+        ValueError,
+        match="lifecycle|operational",
+    ):
+        evaluate(
+            run=fixture.run,
+            sealed_release=fixture.release,
+            expected_study_lock_sha256=fixture.lock_sha256,
+            output_dir=fixture.output,
+            model_adapter=DeterministicFixtureAdapter(fixture.submissions),
+        )
+    assert not fixture.output.exists()
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("account_id", "210987654321"),
+        ("boot_id", "87654321-4321-4cba-8fed-1234567890ab"),
+        ("availability_zone", "us-east-1a"),
+        ("purchase_model", "spot"),
+        ("runtime_sbom_sha256", "2" * 64),
+        ("objective_controls_contract_sha256", "3" * 64),
+        ("source_commit", "e" * 40),
+        ("source_tree", "1" * 40),
+        ("operational_config_sha256", "4" * 64),
+        (
+            "finalization_receipt_s3_version_id",
+            "forged-finalization-version",
+        ),
+        (
+            "collection_receipt_s3_version_id",
+            "forged-collection-version",
+        ),
+        ("finalization_receipt_bytes", 999_999, ),
+    ],
+)
+def test_v3_preflight_rejects_run_lifecycle_fields_crossing_the_lock(
+    tmp_path,
+    field,
+    value,
+):
+    fixture = _build_v3_fixture(tmp_path)
+    _rewrite_run(fixture, **{field: value})
+
+    with pytest.raises(
+        ValueError,
+        match="lifecycle",
+    ):
+        preflight(
+            run=fixture.run,
+            sealed_release=fixture.release,
+            expected_study_lock_sha256=fixture.lock_sha256,
+        )
+
+
+def test_v3_output_records_bind_extended_run_identity(tmp_path):
+    fixture = _build_v3_fixture(tmp_path)
+
+    evaluate(
+        run=fixture.run,
+        sealed_release=fixture.release,
+        expected_study_lock_sha256=fixture.lock_sha256,
+        output_dir=fixture.output,
+        model_adapter=DeterministicFixtureAdapter(fixture.submissions),
+    )
+
+    published_run = fixture.output.joinpath("run.json").read_bytes()
+    binding = RunBindingV3.from_dict(json.loads(published_run))
+    lifecycle = fixture.lock.seed_lifecycles[binding.seed]
+    assert binding.account_id == lifecycle.account_id
+    assert binding.availability_zone == lifecycle.availability_zone
+    assert binding.boot_id == lifecycle.boot_id
+    assert binding.instance_id == lifecycle.instance_id
+    assert binding.region == lifecycle.region
+    assert binding.purchase_model == lifecycle.purchase_model
+    assert binding.runtime_sbom_sha256 == lifecycle.runtime_sbom_sha256
+    assert binding.objective_controls_contract_sha256 == (
+        lifecycle.objective_controls_contract_sha256
+    )
+    assert binding.source_commit == lifecycle.source_commit
+    assert binding.source_tree == lifecycle.source_tree
+    assert binding.operational_config_sha256 == (
+        lifecycle.dense_operational_config_sha256
+    )
+    assert binding.finalization_receipt_sha256 == (
+        lifecycle.finalization_receipt_sha256
+    )
+    assert binding.collection_receipt_sha256 == (
+        lifecycle.collection_receipt_sha256
+    )
+    manifest = json.loads(fixture.output.joinpath("output.json").read_bytes())
+    assert manifest["run_binding_sha256"] == hashlib.sha256(
+        published_run
+    ).hexdigest()
+    assert binding.lifecycle_binding() == fixture.lock.lifecycle_binding(
+        binding.seed
+    )
 
 
 @pytest.mark.parametrize(
@@ -1205,17 +1387,18 @@ def test_provider_qualified_output_rejects_invalid_aws_identity_fields(
     monkeypatch,
     mutation,
 ):
-    fixture = _build_v3_fixture(tmp_path)
-    path = fixture.run / "evaluator-environment-receipt.json"
-    environment = json.loads(path.read_bytes())
-    if mutation == "unknown":
-        environment["aws_instance_identity_document"]["unexpected"] = "forged"
-    elif mutation == "account":
-        environment["aws_instance_identity_document"]["accountId"] = "bad"
-        environment["account_id"] = "bad"
-    else:
-        environment["boot_id"] = "not-a-boot-id"
-    fixture = _rebind_environment_receipt(fixture, environment)
+    def mutate(environment: dict) -> None:
+        if mutation == "unknown":
+            environment["aws_instance_identity_document"][
+                "unexpected"
+            ] = "forged"
+        elif mutation == "account":
+            environment["aws_instance_identity_document"]["accountId"] = "bad"
+            environment["account_id"] = "bad"
+        else:
+            environment["boot_id"] = "not-a-boot-id"
+
+    fixture = _build_v3_fixture(tmp_path, mutate_environment=mutate)
     _patch_production_repository_adapter(monkeypatch, fixture)
 
     with pytest.raises(ValueError, match="AWS identity|identity.*fields"):

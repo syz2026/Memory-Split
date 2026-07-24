@@ -812,6 +812,7 @@ def _admit_arm_evidence(
             state = parse_model_snapshot_bytes(
                 payload,
                 expected_operational_metadata=expected_metadata,
+                require_study_identity=True,
             )
         except ValueError as error:
             raise _fail(f"{arm} snapshot step {step} is invalid") from error

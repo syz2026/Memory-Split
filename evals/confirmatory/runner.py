@@ -96,18 +96,6 @@ _V3_OUTPUT_ARTIFACTS = (
     "stores.jsonl",
     "study-lock.json",
 )
-_MODEL_SNAPSHOT_FIELDS_V2 = frozenset(
-    {
-        "config_fingerprint",
-        "data_provenance",
-        "model",
-        "model_cfg",
-        "snapshot_version",
-        "step",
-        "study_identity",
-        "world_size",
-    }
-)
 _MODEL_SNAPSHOT_IDENTITY_FIELDS_V2 = frozenset(
     {
         "arm",
@@ -660,7 +648,11 @@ class RepositoryGPTAdapter:
             != binding.snapshot_sha256
         ):
             raise ValueError("model snapshot hash mismatch while loading model")
-        state = _parse_bound_model_snapshot(snapshot_content, binding)
+        state = _parse_bound_model_snapshot(
+            snapshot_content,
+            binding,
+            lifecycle=binding.lifecycle_binding(),
+        )
         raw_model_config = state["model_cfg"]
         try:
             expected_config = GPTConfig(**dict(raw_model_config))
@@ -1010,31 +1002,41 @@ def _canonical_structure_sha256(value: object, name: str) -> str:
     return hashlib.sha256(payload).hexdigest()
 
 
+def _expected_snapshot_operational_metadata(
+    binding: RunBindingV3,
+    lifecycle,
+) -> dict[str, Any]:
+    """Derive the exact expected snapshot-embedded lifecycle metadata."""
+
+    from msctl.aws_lifecycle import lifecycle_operational_metadata
+
+    return lifecycle_operational_metadata(
+        lifecycle,
+        run_id=binding.training_run_id,
+        arm=binding.arm.value,
+        config_sha256=binding.operational_config_sha256,
+        dataset_receipt_sha256=binding.data_receipt_sha256,
+        dataset_build_id=binding.data_build_id,
+        ordered_stream_sha256=binding.ordered_stream_sha256,
+        source_commit=binding.source_commit,
+        source_tree=binding.source_tree,
+    )
+
+
 def _parse_bound_model_snapshot(
     content: bytes,
     binding: RunBindingV3,
+    *,
+    lifecycle,
 ) -> Mapping[str, Any]:
-    import torch
+    from train.trainer import parse_model_snapshot_bytes
 
-    try:
-        state = torch.load(
-            io.BytesIO(content),
-            map_location="cpu",
-            weights_only=True,
-        )
-    except Exception as exc:
-        raise ValueError(
-            "model snapshot could not be safely loaded with weights_only"
-        ) from exc
-    if type(state) is not dict:
-        raise ValueError("model snapshot must be an exact dictionary")
-    fields = set(state)
-    if fields != _MODEL_SNAPSHOT_FIELDS_V2:
-        if fields & {"cfg", "data", "opt", "rng_by_rank"}:
-            raise ValueError(
-                "full optimizer/RNG checkpoint is not a model-only snapshot"
-            )
-        raise ValueError("model snapshot fields are not exact")
+    expected = _expected_snapshot_operational_metadata(binding, lifecycle)
+    state = parse_model_snapshot_bytes(
+        content,
+        expected_operational_metadata=expected,
+        require_study_identity=True,
+    )
     if (
         type(state["snapshot_version"]) is not int
         or state["snapshot_version"] != binding.snapshot_version
@@ -2943,6 +2945,38 @@ def _validate_v3_selection_binding(lock, binding: RunBindingV3) -> None:
             raise ValueError(
                 f"run/provider selection mismatch: {run_field}"
             )
+    lifecycle = lock.seed_lifecycles[binding.seed]
+    for field in (
+        "account_id",
+        "availability_zone",
+        "boot_id",
+        "instance_id",
+        "region",
+        "purchase_model",
+        "runtime_sbom_sha256",
+        "objective_controls_contract_sha256",
+        "source_commit",
+        "source_tree",
+        "finalization_receipt_sha256",
+        "finalization_receipt_s3_uri",
+        "finalization_receipt_bytes",
+        "finalization_receipt_s3_version_id",
+        "collection_receipt_sha256",
+        "collection_receipt_s3_uri",
+        "collection_receipt_s3_version_id",
+    ):
+        if getattr(binding, field) != getattr(lifecycle, field):
+            raise ValueError(f"run/seed lifecycle mismatch: {field}")
+    if binding.operational_config_sha256 != (
+        lifecycle.operational_config_sha256(binding.arm)
+    ):
+        raise ValueError(
+            "run/seed lifecycle mismatch: operational_config_sha256"
+        )
+    if binding.lifecycle_binding() != lock.lifecycle_binding(binding.seed):
+        raise ValueError(
+            "run binding lifecycle authority differs from the study lock"
+        )
 
 
 def _prepare_evaluation_v3(
@@ -3000,7 +3034,11 @@ def _prepare_evaluation_v3(
         != binding.snapshot_sha256
     ):
         raise ValueError("model snapshot hash disagrees with run binding")
-    _parse_bound_model_snapshot(snapshot_content, binding)
+    _parse_bound_model_snapshot(
+        snapshot_content,
+        binding,
+        lifecycle=lock.lifecycle_binding(binding.seed),
+    )
 
     visible_preflight = sealing.preflight_model_visible_release(
         release_dir=release,

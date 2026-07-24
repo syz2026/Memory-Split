@@ -171,6 +171,293 @@ def test_production_model_snapshot_is_self_authenticating_and_legacy_is_explicit
     )["step"] == 1
 
 
+def _selected_study_cfg(tmp_path, *, out_name="selected-study"):
+    tokens = np.zeros(524_288, dtype=np.uint16)
+    mask = np.ones(524_288, dtype=np.uint8)
+    token_path = tmp_path / f"{out_name}-train.bin"
+    mask_path = tmp_path / f"{out_name}-train.mask.bin"
+    tokens.tofile(token_path)
+    mask.tofile(mask_path)
+    return {
+        "schema_version": 2,
+        "cohort_id": "memorysplit-confirmatory-v3-360m-n10-aws",
+        "run_id": "memorysplit-v3-360m-s0-dense",
+        "condition": "dense",
+        "model": {
+            "n_layer": 0,
+            "n_head": 1,
+            "d_model": 8,
+            "vocab_size": 50304,
+            "ctx": 512,
+        },
+        "seed": 0,
+        "train_bin": str(token_path),
+        "train_mask": str(mask_path),
+        "out_dir": str(tmp_path / out_name),
+        "micro_batch_size": 2,
+        "tokens_per_step": 524_288,
+        "max_steps": 1_358,
+        "lr": 1e-3,
+        "warmup_steps": 5,
+        "weight_decay": 0.1,
+        "compile": False,
+        "device": "cpu",
+        "log_every": 20,
+        "eval_every": 250,
+        "snapshot_steps": [1_358],
+        "ckpt_minutes": 999,
+    }
+
+
+def _selected_study_snapshot(tmp_path, *, out_name="selected-study"):
+    cfg = _selected_study_cfg(tmp_path, out_name=out_name)
+    cfg["operational_metadata"] = _operational_metadata()
+    trainer = Trainer(cfg)
+    trainer.data.provenance.update(
+        {
+            "receipt_sha256": "c" * 64,
+            "build_id": "d" * 64,
+            "ordered_stream_sha256": "e" * 64,
+        }
+    )
+    trainer.step = 1_358
+    trainer.world_size = 4
+    trainer.save_snapshot()
+    payload = (
+        Path(cfg["out_dir"]) / "snapshots" / "step0001358.pt"
+    ).read_bytes()
+    return trainer, cfg, payload
+
+
+class _NotAWeight:
+    def __init__(self) -> None:
+        self.marker = "arbitrary non-tensor object graph"
+
+
+def test_parse_model_snapshot_rejects_non_weights_pickles(tmp_path):
+    state = {
+        "model": {"weight": _NotAWeight()},
+        "model_cfg": {"ctx": 4},
+        "data_provenance": {"receipt_sha256": "c" * 64},
+        "step": 1,
+        "world_size": 1,
+    }
+    buffer = trainer_module.io.BytesIO()
+    torch.save(state, buffer)
+
+    with pytest.raises(ValueError, match="malformed|weights"):
+        trainer_module.parse_model_snapshot_bytes(
+            buffer.getvalue(),
+            allow_legacy=True,
+        )
+
+
+def test_parse_model_snapshot_rejects_full_checkpoint_fields(tmp_path):
+    bp, mp = write_corpus(tmp_path, n=256)
+    legacy_cfg = tiny_cfg(tmp_path, bp, mp, out_name="full-checkpoint")
+    trainer = Trainer(legacy_cfg)
+    trainer.step = 1
+    trainer.save_snapshot()
+    trainer.close()
+    payload = (
+        tmp_path / "full-checkpoint" / "snapshots" / "step0000001.pt"
+    ).read_bytes()
+    state = torch.load(
+        trainer_module.io.BytesIO(payload),
+        map_location="cpu",
+        weights_only=True,
+    )
+    state.update(
+        {
+            "cfg": {"condition": "dense", "seed": 7},
+            "data": {},
+            "opt": {},
+            "rng_by_rank": [],
+        }
+    )
+    buffer = trainer_module.io.BytesIO()
+    torch.save(state, buffer)
+
+    with pytest.raises(
+        ValueError,
+        match="full optimizer/RNG checkpoint is not a model-only snapshot",
+    ):
+        trainer_module.parse_model_snapshot_bytes(
+            buffer.getvalue(),
+            allow_legacy=True,
+        )
+
+
+def test_parse_model_snapshot_requires_study_identity_when_demanded(tmp_path):
+    bp, mp = write_corpus(tmp_path, n=256)
+    operational_cfg = tiny_cfg(tmp_path, bp, mp, out_name="operational-only")
+    operational_cfg["seed"] = 0
+    operational_cfg["operational_metadata"] = _operational_metadata()
+    operational = Trainer(operational_cfg)
+    operational.step = 1
+    operational.save_snapshot()
+    operational.close()
+    operational_payload = (
+        tmp_path / "operational-only" / "snapshots" / "step0000001.pt"
+    ).read_bytes()
+
+    assert trainer_module.parse_model_snapshot_bytes(
+        operational_payload,
+        expected_operational_metadata=operational_cfg[
+            "operational_metadata"
+        ],
+    )["step"] == 1
+    with pytest.raises(ValueError, match="study identity"):
+        trainer_module.parse_model_snapshot_bytes(
+            operational_payload,
+            expected_operational_metadata=operational_cfg[
+                "operational_metadata"
+            ],
+            require_study_identity=True,
+        )
+
+    legacy_cfg = tiny_cfg(tmp_path, bp, mp, out_name="legacy-no-identity")
+    legacy = Trainer(legacy_cfg)
+    legacy.step = 1
+    legacy.save_snapshot()
+    legacy.close()
+    legacy_payload = (
+        tmp_path / "legacy-no-identity" / "snapshots" / "step0000001.pt"
+    ).read_bytes()
+    with pytest.raises(ValueError, match="study identity"):
+        trainer_module.parse_model_snapshot_bytes(
+            legacy_payload,
+            allow_legacy=True,
+            require_study_identity=True,
+        )
+
+
+def test_parse_model_snapshot_rejects_shapes_missing_expected_lifecycle(
+    tmp_path,
+):
+    expected = _operational_metadata()
+    bp, mp = write_corpus(tmp_path, n=256)
+    legacy_cfg = tiny_cfg(tmp_path, bp, mp, out_name="legacy-expected")
+    legacy = Trainer(legacy_cfg)
+    legacy.step = 1
+    legacy.save_snapshot()
+    legacy.close()
+    legacy_payload = (
+        tmp_path / "legacy-expected" / "snapshots" / "step0000001.pt"
+    ).read_bytes()
+
+    with pytest.raises(ValueError, match="operational|lifecycle"):
+        trainer_module.parse_model_snapshot_bytes(
+            legacy_payload,
+            allow_legacy=True,
+            expected_operational_metadata=expected,
+        )
+
+    study_cfg = _selected_study_cfg(tmp_path, out_name="study-only-expected")
+    study = Trainer(study_cfg)
+    study.data.provenance.update(
+        {
+            "receipt_sha256": "c" * 64,
+            "build_id": "d" * 64,
+            "ordered_stream_sha256": "e" * 64,
+        }
+    )
+    study.step = 1_358
+    study.world_size = 4
+    study.save_snapshot()
+    study.close()
+    study_payload = (
+        tmp_path / "study-only-expected" / "snapshots" / "step0001358.pt"
+    ).read_bytes()
+
+    assert trainer_module.parse_model_snapshot_bytes(
+        study_payload,
+        require_study_identity=True,
+    )["snapshot_version"] == 2
+    with pytest.raises(ValueError, match="operational|lifecycle"):
+        trainer_module.parse_model_snapshot_bytes(
+            study_payload,
+            expected_operational_metadata=expected,
+        )
+
+
+def test_selected_study_snapshot_is_combined_and_lifecycle_mutations_fail(
+    tmp_path,
+):
+    from msctl.aws_lifecycle import OPERATIONAL_METADATA_FIELDS
+
+    trainer, cfg, payload = _selected_study_snapshot(tmp_path)
+    expected_fields = (
+        {
+            "data_provenance",
+            "model",
+            "model_cfg",
+            "step",
+            "world_size",
+            "config_fingerprint",
+            "snapshot_version",
+            "study_identity",
+        }
+        | OPERATIONAL_METADATA_FIELDS
+    )
+    state = torch.load(
+        trainer_module.io.BytesIO(payload),
+        map_location="cpu",
+        weights_only=True,
+    )
+    assert set(state) == expected_fields
+
+    parsed = trainer_module.parse_model_snapshot_bytes(
+        payload,
+        expected_operational_metadata=cfg["operational_metadata"],
+        require_study_identity=True,
+    )
+    assert parsed["study_identity"]["run_id"] == (
+        "memorysplit-v3-360m-s0-dense"
+    )
+    assert parsed["snapshot_version"] == 2
+
+    mutated = copy.deepcopy(state)
+    mutated["boot_id"] = "87654321-4321-4cba-8fed-0987654321ba"
+    buffer = trainer_module.io.BytesIO()
+    torch.save(mutated, buffer)
+    with pytest.raises(ValueError, match="operational|selection|lifecycle"):
+        trainer_module.parse_model_snapshot_bytes(
+            buffer.getvalue(),
+            expected_operational_metadata=cfg["operational_metadata"],
+            require_study_identity=True,
+        )
+
+    stripped = copy.deepcopy(state)
+    del stripped["snapshot_version"]
+    del stripped["study_identity"]
+    stripped_buffer = trainer_module.io.BytesIO()
+    torch.save(stripped, stripped_buffer)
+    with pytest.raises(ValueError, match="study identity"):
+        trainer_module.parse_model_snapshot_bytes(
+            stripped_buffer.getvalue(),
+            expected_operational_metadata=cfg["operational_metadata"],
+            require_study_identity=True,
+        )
+
+    resume_error = pytest.raises(
+        ValueError,
+        match="resume snapshot is malformed",
+    )
+    with resume_error:
+        trainer._validate_snapshot_bytes(
+            stripped_buffer.getvalue(),
+            expected_step=1_358,
+            name="step0001358.pt",
+        )
+    assert trainer._validate_snapshot_bytes(
+        payload,
+        expected_step=1_358,
+        name="step0001358.pt",
+    ) is None
+    trainer.close()
+
+
 def test_run_train_capabilities_json_is_strict_and_does_not_require_config():
     root = Path(__file__).resolve().parents[1]
     environment = dict(os.environ)

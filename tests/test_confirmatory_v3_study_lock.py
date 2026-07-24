@@ -10,6 +10,7 @@ from evals.confirmatory.study_lock import (
     FROZEN_PREREGISTRATION_SHA256_V3,
     STUDY_LOCK_SCHEMA_V3,
     ProviderSelectionBinding,
+    SeedLifecycleBinding,
     StudyLockV3,
 )
 from msctl.aws_hardware import (
@@ -23,6 +24,11 @@ from msctl.aws_contracts import (
     SNAPSHOT_STEPS,
     checkpoint_receipt_key,
     snapshot_object_key,
+)
+from msctl.aws_lifecycle import ProviderLifecycleBinding
+from tests.study_lock_fixtures import (
+    build_seed_lifecycles,
+    expected_lifecycle_binding,
 )
 
 
@@ -60,7 +66,7 @@ def _snapshots() -> list[dict]:
             for step in SNAPSHOT_STEPS:
                 digest = _digest(seed, arm, step)
                 receipt_digest = hashlib.sha256(
-                    f"receipt:{seed}:{step}".encode("ascii")
+                    f"receipt:{seed}".encode("ascii")
                 ).hexdigest()
                 snapshots.append(
                     {
@@ -80,7 +86,7 @@ def _snapshots() -> list[dict]:
                             checkpoint_receipt_key(seed, receipt_digest)
                         ),
                         "checkpoint_receipt_s3_version_id": (
-                            f"receipt-version-{seed}-{step}"
+                            f"receipt-version-{seed}"
                         ),
                         "provider_selection_sha256": "a" * 64,
                         "provider_selection_s3_version_id": (
@@ -119,14 +125,35 @@ def _snapshots() -> list[dict]:
     return snapshots
 
 
+def _seed_lifecycles(
+    selection: dict | None = None,
+    **kwargs,
+) -> list[dict]:
+    lifecycles, _receipts = build_seed_lifecycles(
+        snapshots=_snapshots(),
+        provider_selection=(
+            _provider_selection() if selection is None else selection
+        ),
+        **kwargs,
+    )
+    return lifecycles
+
+
 def _lock(**changes) -> dict:
+    snapshots = changes.pop("snapshots", None)
+    selection = changes.pop("provider_selection", None)
+    if snapshots is None:
+        snapshots = _snapshots()
+    if selection is None:
+        selection = _provider_selection()
     value = {
         "record_type": STUDY_LOCK_SCHEMA_V3,
         "schema_version": 3,
         "preregistration_sha256": FROZEN_PREREGISTRATION_SHA256_V3,
         "sealed_evaluation_release_sha256": "f" * 64,
-        "provider_selection": _provider_selection(),
-        "snapshots": _snapshots(),
+        "provider_selection": selection,
+        "snapshots": snapshots,
+        "seed_lifecycles": _seed_lifecycles(selection=selection),
     }
     value.update(changes)
     return value
@@ -251,12 +278,11 @@ def test_v3_study_lock_rejects_non_real_version_id_candidates(
 def test_v3_study_lock_accepts_bounded_printable_opaque_version_ids():
     snapshots = _snapshots()
     snapshots[0]["s3_version_id"] = "opaque-A+/=._~:1"
-    snapshots[0][
-        "checkpoint_receipt_s3_version_id"
-    ] = "opaque-receipt-A+/=._~:1"
-    snapshots[len(SNAPSHOT_STEPS)][
-        "checkpoint_receipt_s3_version_id"
-    ] = "opaque-receipt-A+/=._~:1"
+    for slot in snapshots:
+        if slot["seed"] == 0:
+            slot[
+                "checkpoint_receipt_s3_version_id"
+            ] = "opaque-receipt-A+/=._~:1"
 
     lock = StudyLockV3.from_dict(_lock(snapshots=snapshots))
 
@@ -277,30 +303,33 @@ def test_v3_study_lock_rejects_wrong_checkpoint_receipt_reference():
         StudyLockV3.from_dict(_lock(snapshots=snapshots))
 
 
-def test_v3_study_lock_rejects_receipt_content_alias_with_new_version():
-    snapshots = _snapshots()
-    source_dense = 0
-    source_split90 = len(SNAPSHOT_STEPS)
-    target_dense = 1
-    target_split90 = len(SNAPSHOT_STEPS) + 1
-    assert (
-        snapshots[source_dense]["checkpoint_receipt_sha256"]
-        == snapshots[source_split90]["checkpoint_receipt_sha256"]
+def test_v3_study_lock_requires_one_collected_receipt_per_seed():
+    diverging = _snapshots()
+    diverging[1]["checkpoint_receipt_s3_version_id"] = (
+        "different-version-cannot-split-the-seed-receipt"
     )
+    with pytest.raises(
+        ValueError,
+        match="disagree.*per-seed checkpoint receipt",
+    ):
+        StudyLockV3.from_dict(_lock(snapshots=diverging))
 
-    for target in (target_dense, target_split90):
-        snapshots[target]["checkpoint_receipt_sha256"] = snapshots[
-            source_dense
-        ]["checkpoint_receipt_sha256"]
-        snapshots[target]["checkpoint_receipt_s3_object_key"] = snapshots[
-            source_dense
-        ]["checkpoint_receipt_s3_object_key"]
-        snapshots[target][
+    cross_seed = _snapshots()
+    per_seed = 2 * len(SNAPSHOT_STEPS)
+    for slot in cross_seed[per_seed : 2 * per_seed]:
+        assert slot["seed"] == 1
+        slot["checkpoint_receipt_sha256"] = cross_seed[0][
+            "checkpoint_receipt_sha256"
+        ]
+        slot["checkpoint_receipt_s3_object_key"] = checkpoint_receipt_key(
+            1,
+            cross_seed[0]["checkpoint_receipt_sha256"],
+        )
+        slot[
             "checkpoint_receipt_s3_version_id"
         ] = "different-version-cannot-disguise-content-alias"
-
     with pytest.raises(ValueError, match="receipt.*(reuse|alias|content)"):
-        StudyLockV3.from_dict(_lock(snapshots=snapshots))
+        StudyLockV3.from_dict(_lock(snapshots=cross_seed))
 
 
 def test_v3_study_lock_binds_frozen_preregistration_and_sealed_release_hashes():
@@ -408,6 +437,193 @@ def test_v3_study_lock_rejects_cross_profile_or_unbound_evidence(changes):
         StudyLockV3.from_dict(
             _lock(provider_selection=_provider_selection(**changes))
         )
+
+
+def test_v3_study_lock_binds_ten_seed_lifecycles_and_reconstructs_authority():
+    lock = StudyLockV3.from_dict(_lock())
+
+    assert lock.to_dict() == _lock()
+    assert len(lock.seed_lifecycles) == 10
+    assert all(
+        isinstance(lifecycle, SeedLifecycleBinding)
+        for lifecycle in lock.seed_lifecycles
+    )
+    assert tuple(
+        lifecycle.seed for lifecycle in lock.seed_lifecycles
+    ) == tuple(range(10))
+    for seed in SEEDS:
+        binding = lock.lifecycle_binding(seed)
+        assert isinstance(binding, ProviderLifecycleBinding)
+        assert binding == expected_lifecycle_binding(
+            _provider_selection(),
+            seed,
+        )
+    with pytest.raises(ValueError, match="seed"):
+        lock.lifecycle_binding(10)
+    with pytest.raises(FrozenInstanceError):
+        lock.seed_lifecycles[0].boot_id = "0" * 32
+
+
+def test_v3_study_lock_fails_closed_for_pre_bridge_lock_shapes():
+    pre_bridge = _lock()
+    del pre_bridge["seed_lifecycles"]
+
+    with pytest.raises(ValueError, match="exact"):
+        StudyLockV3.from_dict(pre_bridge)
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ["missing", "duplicate", "reordered", "foreign-seed"],
+)
+def test_v3_study_lock_requires_exactly_ten_ascending_seed_lifecycles(
+    mutation,
+):
+    lifecycles = _seed_lifecycles()
+    if mutation == "missing":
+        lifecycles.pop()
+    elif mutation == "duplicate":
+        lifecycles[1] = dict(lifecycles[0])
+    elif mutation == "reordered":
+        lifecycles[0], lifecycles[1] = lifecycles[1], lifecycles[0]
+    else:
+        lifecycles[9] = dict(lifecycles[9], seed=0)
+
+    with pytest.raises(ValueError, match="seed|ten|ascending|exact"):
+        StudyLockV3.from_dict(_lock(seed_lifecycles=lifecycles))
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("account_id", "210987654321"),
+        ("availability_zone", "us-east-1a"),
+        ("instance_id", "i-0fedcba9876543210"),
+        ("region", "us-west-2"),
+        ("purchase_model", "spot"),
+        ("runtime_sbom_sha256", "8" * 64),
+        ("objective_controls_contract_sha256", "7" * 64),
+        ("source_commit", "e" * 40),
+        ("source_tree", "1" * 40),
+    ],
+)
+def test_v3_study_lock_rejects_cohort_uniform_lifecycle_drift(field, value):
+    lifecycles = _seed_lifecycles()
+    lifecycles[3] = dict(lifecycles[3], **{field: value})
+
+    with pytest.raises(ValueError, match="uniform|cohort|constant"):
+        StudyLockV3.from_dict(_lock(seed_lifecycles=lifecycles))
+
+
+def test_v3_study_lock_accepts_boot_only_lifecycle_drift():
+    reboot = "87654321-4321-4cba-8fed-1234567890ab"
+    lifecycles = _seed_lifecycles(
+        boot_ids={4: reboot},
+    )
+
+    lock = StudyLockV3.from_dict(_lock(seed_lifecycles=lifecycles))
+
+    assert lock.seed_lifecycles[4].boot_id == reboot
+    assert lock.lifecycle_binding(4).boot_id == reboot
+    assert lock.lifecycle_binding(3).boot_id != reboot
+
+
+def test_v3_study_lock_allows_arm_scoped_operational_config_hashes():
+    lifecycles = _seed_lifecycles()
+    assert all(
+        lifecycle["dense_operational_config_sha256"]
+        != lifecycle["split90_operational_config_sha256"]
+        for lifecycle in lifecycles
+    )
+    for seed, lifecycle in enumerate(lifecycles):
+        lifecycle["dense_operational_config_sha256"] = hashlib.sha256(
+            f"dense-config:{seed}".encode("ascii")
+        ).hexdigest()
+        lifecycle["split90_operational_config_sha256"] = hashlib.sha256(
+            f"split90-config:{seed}".encode("ascii")
+        ).hexdigest()
+
+    lock = StudyLockV3.from_dict(_lock(seed_lifecycles=lifecycles))
+
+    assert (
+        lock.seed_lifecycles[0].dense_operational_config_sha256
+        != lock.seed_lifecycles[0].split90_operational_config_sha256
+    )
+    assert (
+        lock.seed_lifecycles[0].dense_operational_config_sha256
+        != lock.seed_lifecycles[1].dense_operational_config_sha256
+    )
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        (
+            "finalization_receipt_s3_uri",
+            "s3://memorysplit-prod/receipts/other.json",
+            "finalization.*(key|URI)",
+        ),
+        (
+            "collection_receipt_s3_uri",
+            "s3://memorysplit-prod/receipts/other.json",
+            "collection.*(key|URI)",
+        ),
+        ("finalization_receipt_sha256", "0" * 64, "finalization"),
+        ("collection_receipt_sha256", "0" * 64, "collection"),
+        ("finalization_receipt_s3_version_id", "null", "version"),
+        ("collection_receipt_s3_version_id", "", "version"),
+        ("finalization_receipt_bytes", 0, "bytes"),
+        ("finalization_receipt_bytes", -3, "bytes"),
+        ("boot_id", "not-a-boot-id", "lifecycle|boot"),
+        ("run_manifest_sha256", "not-a-hash", "manifest"),
+        ("source_commit", "z" * 40, "commit"),
+    ],
+)
+def test_v3_seed_lifecycle_rejects_invalid_receipt_and_identity_fields(
+    field,
+    value,
+    message,
+):
+    lifecycles = _seed_lifecycles()
+    lifecycles[0] = dict(lifecycles[0], **{field: value})
+
+    with pytest.raises(ValueError, match=message):
+        StudyLockV3.from_dict(_lock(seed_lifecycles=lifecycles))
+
+
+def test_v3_seed_lifecycle_rejects_receipt_identity_aliases_across_seeds():
+    lifecycles = _seed_lifecycles()
+    lifecycles[2] = dict(
+        lifecycles[2],
+        collection_receipt_sha256=lifecycles[1][
+            "collection_receipt_sha256"
+        ],
+        collection_receipt_s3_uri=(
+            "s3://memorysplit-prod/confirmatory-v3/"
+            "receipts/collections/seed-2/sha256/"
+            + lifecycles[1]["collection_receipt_sha256"]
+            + ".json"
+        ),
+    )
+
+    with pytest.raises(ValueError, match="alias|reuse|unique"):
+        StudyLockV3.from_dict(_lock(seed_lifecycles=lifecycles))
+
+
+def test_v3_seed_lifecycle_rejects_crossed_object_roots():
+    lifecycles = _seed_lifecycles()
+    foreign_root = "s3://memorysplit-other/confirmatory-v3"
+    lifecycles[5] = dict(
+        lifecycles[5],
+        collection_receipt_s3_uri=(
+            f"{foreign_root}/receipts/collections/seed-5/sha256/"
+            + lifecycles[5]["collection_receipt_sha256"]
+            + ".json"
+        ),
+    )
+
+    with pytest.raises(ValueError, match="root"):
+        StudyLockV3.from_dict(_lock(seed_lifecycles=lifecycles))
 
 
 def test_provider_selection_binding_copies_authenticated_admission_fields():

@@ -48,6 +48,7 @@ from msctl.aws_hardware import (
     AWS_HARDWARE_AMENDMENT_SHA256,
     PROVIDER_SELECTION_S3_KEY,
 )
+from tests.study_lock_fixtures import build_seed_lifecycles
 
 
 STEP = 1_358
@@ -171,7 +172,7 @@ def _study_lock() -> StudyLockV3:
             for step in SNAPSHOT_STEPS:
                 digest = _snapshot_digest(seed, arm, step)
                 receipt_digest = hashlib.sha256(
-                    f"receipt:{seed}:{step}".encode("ascii")
+                    f"receipt:{seed}".encode("ascii")
                 ).hexdigest()
                 snapshots.append(
                     {
@@ -191,7 +192,7 @@ def _study_lock() -> StudyLockV3:
                             checkpoint_receipt_key(seed, receipt_digest)
                         ),
                         "checkpoint_receipt_s3_version_id": (
-                            f"receipt-version-{seed}-{step}"
+                            f"receipt-version-{seed}"
                         ),
                         "provider_selection_sha256": selection_sha256,
                         "provider_selection_s3_version_id": (
@@ -227,31 +228,37 @@ def _study_lock() -> StudyLockV3:
                         "tokens_per_step": 524_288,
                     }
                 )
+    provider_selection = {
+        "cohort_id": "memorysplit-confirmatory-v3-360m-n10-aws",
+        "provider_selection_s3_key": PROVIDER_SELECTION_S3_KEY,
+        "provider_selection_sha256": selection_sha256,
+        "provider_selection_s3_version_id": selection_version_id,
+        "hardware_amendment_sha256": AWS_HARDWARE_AMENDMENT_SHA256,
+        "selected_provider": "aws-p5.48xlarge",
+        "profile_id": "aws-p5.48xlarge-v3",
+        "profile_sha256": (
+            "2207bfbad5e8fa9fc804770b582d0b21f8b6ed109b2e3f3b5c0474c732c53543"
+        ),
+        "runtime_lock_sha256": "7" * 64,
+        "qualification_evidence_sha256": "8" * 64,
+        "environment_receipt_sha256": "9" * 64,
+        "canary_receipt_sha256": "a" * 64,
+        "approval_receipt_sha256": "b" * 64,
+        "approval_public_key_sha256": "c" * 64,
+    }
+    seed_lifecycles, _receipts = build_seed_lifecycles(
+        snapshots=snapshots,
+        provider_selection=provider_selection,
+    )
     return StudyLockV3.from_dict(
         {
             "record_type": STUDY_LOCK_SCHEMA_V3,
             "schema_version": STUDY_CONTRACT_VERSION,
             "preregistration_sha256": FROZEN_PREREGISTRATION_SHA256_V3,
             "sealed_evaluation_release_sha256": "f" * 64,
-            "provider_selection": {
-                "cohort_id": "memorysplit-confirmatory-v3-360m-n10-aws",
-                "provider_selection_s3_key": PROVIDER_SELECTION_S3_KEY,
-                "provider_selection_sha256": selection_sha256,
-                "provider_selection_s3_version_id": selection_version_id,
-                "hardware_amendment_sha256": AWS_HARDWARE_AMENDMENT_SHA256,
-                "selected_provider": "aws-p5.48xlarge",
-                "profile_id": "aws-p5.48xlarge-v3",
-                "profile_sha256": (
-                    "2207bfbad5e8fa9fc804770b582d0b21f8b6ed109b2e3f3b5c0474c732c53543"
-                ),
-                "runtime_lock_sha256": "7" * 64,
-                "qualification_evidence_sha256": "8" * 64,
-                "environment_receipt_sha256": "9" * 64,
-                "canary_receipt_sha256": "a" * 64,
-                "approval_receipt_sha256": "b" * 64,
-                "approval_public_key_sha256": "c" * 64,
-            },
+            "provider_selection": provider_selection,
             "snapshots": snapshots,
+            "seed_lifecycles": seed_lifecycles,
         }
     )
 

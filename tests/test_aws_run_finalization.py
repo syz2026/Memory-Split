@@ -382,6 +382,18 @@ def _expected_metadata(plan, launch) -> dict[str, object]:
     )
 
 
+def _identity_hash(value: object) -> str:
+    return hashlib.sha256(
+        json.dumps(
+            value,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+            allow_nan=False,
+        ).encode("utf-8")
+    ).hexdigest()
+
+
 def _snapshot_state(
     plan,
     launch,
@@ -389,16 +401,36 @@ def _snapshot_state(
     *,
     fingerprint: str = FINGERPRINT,
     metadata: dict[str, object] | None = None,
+    study_identity: bool = True,
 ) -> dict[str, object]:
-    return {
+    model_cfg = {"ctx": 1024}
+    data_provenance = {"receipt_sha256": plan.dataset_receipt_sha256}
+    state = {
         "model": {"weight": [0.0]},
-        "model_cfg": {"ctx": 1024},
-        "data_provenance": {"receipt_sha256": plan.dataset_receipt_sha256},
+        "model_cfg": model_cfg,
+        "data_provenance": data_provenance,
         "step": step,
         "world_size": 4,
         "config_fingerprint": fingerprint,
         **(metadata if metadata is not None else _expected_metadata(plan, launch)),
     }
+    if study_identity:
+        state["snapshot_version"] = 2
+        state["study_identity"] = {
+            "arm": launch.arm,
+            "cohort_id": "memorysplit-confirmatory-v3-360m-n10-aws",
+            "config_sha256": launch.config_sha256,
+            "data_build_id": plan.dataset_build_id,
+            "data_provenance_sha256": _identity_hash(data_provenance),
+            "data_receipt_sha256": plan.dataset_receipt_sha256,
+            "model_cfg_sha256": _identity_hash(model_cfg),
+            "model_identity": "d360m",
+            "ordered_stream_sha256": plan.ordered_stream_sha256,
+            "run_id": str(launch.runtime_config["run_id"]),
+            "seed": plan.seed,
+            "tokens_per_step": 524_288,
+        }
+    return state
 
 
 def _log_row(step: int) -> dict[str, object]:
@@ -1153,6 +1185,36 @@ def test_snapshot_fingerprint_must_match_the_checkpoint_receipt(
     with pytest.raises(finalization.FinalizationError, match="fingerprint"):
         _finalize(fixture, plan, pair=pair, store=store)
     assert store.put_order == []
+
+
+def test_finalization_rejects_selected_snapshots_without_study_identity(
+    tmp_path,
+    monkeypatch,
+):
+    fixture, plan, pair, store = _prepared(tmp_path, monkeypatch)
+    _install_admit(monkeypatch, [fixture["lifecycle"]])
+    launches = {launch.arm: launch for launch in plan.arms}
+    dense_snapshots = (
+        Path(launches["dense"].checkpoint_path).parent / "snapshots"
+    )
+    path = dense_snapshots / "step0003396.pt"
+    with path.open("wb") as handle:
+        torch.save(
+            _snapshot_state(
+                plan,
+                launches["dense"],
+                3_396,
+                study_identity=False,
+            ),
+            handle,
+        )
+    path.chmod(0o600)
+    os.chown(path, -1, os.getgid())
+
+    with pytest.raises(finalization.FinalizationError, match="invalid"):
+        _finalize(fixture, plan, pair=pair, store=store)
+    assert store.put_order == []
+    assert _receipt_uris(store) == []
 
 
 def test_checkpoint_receipt_is_required_and_identity_bound(

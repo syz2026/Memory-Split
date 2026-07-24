@@ -433,6 +433,7 @@ def parse_model_snapshot_bytes(
     *,
     expected_operational_metadata: dict[str, object] | None = None,
     allow_legacy: bool = False,
+    require_study_identity: bool = False,
 ) -> dict[str, object]:
     """Parse strict production snapshot bytes with explicit legacy opt-in."""
 
@@ -440,21 +441,35 @@ def parse_model_snapshot_bytes(
         raise ValueError("model snapshot bytes are missing")
     if type(allow_legacy) is not bool:
         raise ValueError("allow_legacy must be boolean")
+    if type(require_study_identity) is not bool:
+        raise ValueError("require_study_identity must be boolean")
     try:
         state = torch.load(
             io.BytesIO(payload),
             map_location="cpu",
-            weights_only=False,
+            weights_only=True,
         )
     except BaseException as error:
         raise ValueError("model snapshot bytes are malformed") from error
     if not isinstance(state, dict):
         raise ValueError("model snapshot must contain one mapping")
     fields = set(state)
+    if fields & {"cfg", "data", "opt", "rng_by_rank"}:
+        raise ValueError(
+            "full optimizer/RNG checkpoint is not a model-only snapshot"
+        )
     if fields == _LEGACY_SNAPSHOT_FIELDS:
         if not allow_legacy:
             raise ValueError(
                 "legacy model snapshot requires explicit legacy admission"
+            )
+        if expected_operational_metadata is not None:
+            raise ValueError(
+                "model snapshot is missing provider lifecycle metadata"
+            )
+        if require_study_identity:
+            raise ValueError(
+                "model snapshot is missing its protected study identity"
             )
     elif fields in (
         _SNAPSHOT_FIELDS,
@@ -487,9 +502,19 @@ def parse_model_snapshot_bytes(
             if (
                 type(state["snapshot_version"]) is not int
                 or state["snapshot_version"] != 2
-                or type(identity) is not dict
+            ):
+                raise ValueError(
+                    "model snapshot study version must be integer 2"
+                )
+            if (
+                type(identity) is not dict
                 or set(identity) != _STUDY_IDENTITY_FIELDS
-                or identity["cohort_id"] != _STUDY_COHORT_ID
+            ):
+                raise ValueError(
+                    "model snapshot study identity fields are not exact"
+                )
+            if (
+                identity["cohort_id"] != _STUDY_COHORT_ID
                 or type(identity["seed"]) is not int
                 or identity["seed"] not in _STUDY_SEEDS
                 or identity["arm"] not in _STUDY_ARMS
@@ -499,12 +524,27 @@ def parse_model_snapshot_bytes(
                     f"{identity['arm']}"
                 )
                 or identity["tokens_per_step"] != _STUDY_TOKENS_PER_STEP
-                or identity["model_cfg_sha256"]
-                != _canonical_json_hash(state["model_cfg"])
-                or identity["data_provenance_sha256"]
-                != _canonical_json_hash(state["data_provenance"])
             ):
-                raise ValueError("model snapshot study identity is invalid")
+                raise ValueError(
+                    "model snapshot study seed/arm/run/cohort identity "
+                    "is invalid"
+                )
+            if identity["model_cfg_sha256"] != _canonical_json_hash(
+                state["model_cfg"]
+            ):
+                raise ValueError(
+                    "model snapshot study model config hash is invalid"
+                )
+            if identity["data_provenance_sha256"] != _canonical_json_hash(
+                state["data_provenance"]
+            ):
+                raise ValueError(
+                    "model snapshot study data provenance hash is invalid"
+                )
+        elif require_study_identity:
+            raise ValueError(
+                "model snapshot is missing its protected study identity"
+            )
     else:
         raise ValueError("model snapshot fields are foreign")
     if (
@@ -1413,6 +1453,9 @@ class Trainer:
                 payload,
                 expected_operational_metadata=self.operational_metadata,
                 allow_legacy=self.operational_metadata is None,
+                require_study_identity=(
+                    self.cfg.get("cohort_id") == _STUDY_COHORT_ID
+                ),
             )
         except ValueError as error:
             raise ValueError(f"resume snapshot is malformed: {name}") from error
