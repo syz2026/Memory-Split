@@ -104,6 +104,7 @@ EXPECTED_CONFIG_PATHS: Final = tuple(
 )
 
 _SHA256_PATTERN = re.compile(r"[0-9a-f]{64}")
+_INSTANCE_ID_PATTERN = re.compile(r"i-[0-9a-f]{8,17}")
 _OCI_DIGEST_PATTERN = re.compile(r"sha256:[0-9a-f]{64}")
 _OCI_REGISTRY_LABEL_PATTERN = re.compile(
     r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?"
@@ -258,6 +259,19 @@ def dataset_receipt_key() -> str:
     return DATASET_RECEIPT_PATH
 
 
+def bootstrap_receipt_key(instance_id: object) -> str:
+    """Return the canonical per-instance durable bootstrap receipt key."""
+
+    if (
+        not isinstance(instance_id, str)
+        or _INSTANCE_ID_PATTERN.fullmatch(instance_id) is None
+    ):
+        raise ValueError(
+            "bootstrap receipt instance ID must be one exact EC2 instance ID"
+        )
+    return f"receipts/bootstrap/{instance_id}.json"
+
+
 def checkpoint_object_key(seed: object, arm: object, sha256: object) -> str:
     """Return one content-addressed v3 checkpoint object key."""
 
@@ -336,6 +350,7 @@ __all__ = [
     "PROVIDER",
     "SEEDS",
     "SNAPSHOT_STEPS",
+    "bootstrap_receipt_key",
     "checkpoint_object_key",
     "checkpoint_receipt_key",
     "dataset_receipt_key",

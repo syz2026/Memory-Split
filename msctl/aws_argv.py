@@ -97,6 +97,56 @@ _BASE_FIELDS = {
     "terminal_receipt_uri",
 }
 _V3_BASE_FIELDS = _BASE_FIELDS | {"boot_id"}
+# Frozen copy of msctl.aws_lifecycle.LIFECYCLE_BINDING_FIELDS: the remote
+# wrapper must stay importable with only its packaged leaf dependencies, so
+# the authority module is mirrored here and pinned by a cross-check test.
+_SELECTED_LIFECYCLE_FIELDS = (
+    "account_id",
+    "arms",
+    "availability_zone",
+    "boot_id",
+    "cohort_id",
+    "hardware_amendment_sha256",
+    "instance_id",
+    "objective_controls_contract_sha256",
+    "profile_id",
+    "profile_sha256",
+    "provider",
+    "provider_selection_sha256",
+    "provider_selection_version_id",
+    "purchase_model",
+    "qualification_approval_public_key_sha256",
+    "qualification_approval_receipt_sha256",
+    "qualification_canary_receipt_sha256",
+    "qualification_environment_receipt_sha256",
+    "qualification_evidence_sha256",
+    "region",
+    "runtime_lock_sha256",
+    "runtime_sbom_sha256",
+    "seed",
+)
+_SELECTED_BASE_FIELDS = (
+    _V3_BASE_FIELDS
+    | set(_SELECTED_LIFECYCLE_FIELDS)
+    | {"bootstrap", "lease_unit"}
+)
+_SELECTED_PROVIDER_PROFILES = {
+    "aws-p5.48xlarge": "aws-p5.48xlarge-v3",
+    "aws-p6-b300.48xlarge": "aws-p6-b300.48xlarge-v3",
+}
+_SELECTED_LIFECYCLE_SHA256_FIELDS = (
+    "hardware_amendment_sha256",
+    "objective_controls_contract_sha256",
+    "profile_sha256",
+    "provider_selection_sha256",
+    "qualification_approval_public_key_sha256",
+    "qualification_approval_receipt_sha256",
+    "qualification_canary_receipt_sha256",
+    "qualification_environment_receipt_sha256",
+    "qualification_evidence_sha256",
+    "runtime_lock_sha256",
+    "runtime_sbom_sha256",
+)
 _ENVIRONMENT_FIELDS = {
     "AWS_REGION",
     "MS_AWS_AMI_ID",
@@ -106,6 +156,39 @@ _ENVIRONMENT_FIELDS = {
     "MS_RUNTIME_UID",
     "MS_S3_ROOT",
 }
+_SELECTED_ENVIRONMENT_BINDINGS = {
+    "MS_HARDWARE_AMENDMENT_SHA256": "hardware_amendment_sha256",
+    "MS_OBJECTIVE_CONTROLS_SHA256": "objective_controls_contract_sha256",
+    "MS_PROFILE_ID": "profile_id",
+    "MS_PROFILE_SHA256": "profile_sha256",
+    "MS_PROVIDER": "provider",
+    "MS_PROVIDER_SELECTION_SHA256": "provider_selection_sha256",
+    "MS_PROVIDER_SELECTION_VERSION_ID": "provider_selection_version_id",
+    "MS_QUALIFICATION_EVIDENCE_SHA256": "qualification_evidence_sha256",
+    "MS_RUNTIME_LOCK_SHA256": "runtime_lock_sha256",
+    "MS_RUNTIME_SBOM_SHA256": "runtime_sbom_sha256",
+}
+_SELECTED_ENVIRONMENT_FIELDS = _ENVIRONMENT_FIELDS | set(
+    _SELECTED_ENVIRONMENT_BINDINGS
+)
+_LEASE_UNIT_RE = re.compile(r"^memorysplit-auto-terminate-[0-9a-f]{64}$")
+_LEASE_RESET_ARGV = (
+    "/usr/bin/systemctl",
+    "stop",
+    "memorysplit-auto-terminate*.timer",
+    "memorysplit-auto-terminate*.service",
+)
+_ACCOUNT_RE = re.compile(r"^[0-9]{12}$")
+_BOOT_RE = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-"
+    r"[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+)
+_SELECTED_RESUME_MATERIALIZATION_STEPS = (
+    "prepare-resume-staging",
+    "materialize-resume-receipt",
+    "materialize-resume-dense",
+    "materialize-resume-split90",
+)
 _CHECKPOINT_RECEIPT_FIELDS = {"sha256", "checkpoints"}
 _CHECKPOINT_FIELDS = {
     "arm",
@@ -351,15 +434,33 @@ def _validate_intent(
         raise RemoteIntentError("operation intent SHA-256 mismatch")
     intent = _decode_object(payload, label="operation intent")
     schema_version = intent.get("schema_version")
-    is_v3 = schema_version == 2
-    if set(intent) != (_V3_BASE_FIELDS if is_v3 else _BASE_FIELDS):
+    is_selected = schema_version == 3
+    is_v3 = schema_version in {2, 3}
+    expected_fields = (
+        _SELECTED_BASE_FIELDS
+        if is_selected
+        else _V3_BASE_FIELDS
+        if is_v3
+        else _BASE_FIELDS
+    )
+    if set(intent) != expected_fields:
         raise RemoteIntentError("operation intent fields do not match the contract")
     operation = intent["operation"]
     is_canary = operation == "canary"
+    allowed_operations = (
+        {"submit", "resume"}
+        if is_selected
+        else {"submit", "resume", "evaluate", "canary"}
+    )
+    allowed_providers = (
+        set(_SELECTED_PROVIDER_PROFILES)
+        if is_selected
+        else {"aws-p5.48xlarge"}
+    )
     if (
-        schema_version not in {1, 2}
-        or operation not in {"submit", "resume", "evaluate", "canary"}
-        or intent["provider"] != "aws-p5.48xlarge"
+        schema_version not in {1, 2, 3}
+        or operation not in allowed_operations
+        or intent["provider"] not in allowed_providers
         or isinstance(intent["seed"], bool)
         or intent["seed"]
         not in (
@@ -393,10 +494,67 @@ def _validate_intent(
             and (
                 not isinstance(intent["boot_id"], str)
                 or not intent["boot_id"]
+                or (
+                    is_selected
+                    and _BOOT_RE.fullmatch(intent["boot_id"]) is None
+                )
             )
         )
     ):
         raise RemoteIntentError("operation intent identity is invalid")
+    if is_selected:
+        arms = intent["arms"]
+        if (
+            _SELECTED_PROVIDER_PROFILES[intent["provider"]]
+            != intent["profile_id"]
+            or not isinstance(intent["account_id"], str)
+            or _ACCOUNT_RE.fullmatch(intent["account_id"]) is None
+            or arms != ["dense", "split90"]
+            or not isinstance(
+                intent["provider_selection_version_id"],
+                str,
+            )
+            or intent["provider_selection_version_id"] in {"", "null"}
+            or any(
+                not isinstance(intent[field], str) or not intent[field]
+                for field in (
+                    "availability_zone",
+                    "cohort_id",
+                    "purchase_model",
+                )
+            )
+            or _REGION_RE.fullmatch(str(intent["region"])) is None
+        ):
+            raise RemoteIntentError(
+                "selected lifecycle authority binding is invalid"
+            )
+        for field in _SELECTED_LIFECYCLE_SHA256_FIELDS:
+            _sha256(intent[field], label=f"selected lifecycle {field}")
+        bootstrap = intent["bootstrap"]
+        if (
+            not isinstance(bootstrap, dict)
+            or set(bootstrap) != {"mode", "receipt_sha256"}
+            or bootstrap["mode"] not in {"bootstrap", "reuse"}
+            or (
+                bootstrap["mode"] == "bootstrap"
+                and bootstrap["receipt_sha256"] is not None
+            )
+        ):
+            raise RemoteIntentError(
+                "selected bootstrap binding is invalid"
+            )
+        if bootstrap["mode"] == "reuse":
+            _sha256(
+                bootstrap["receipt_sha256"],
+                label="selected bootstrap reuse receipt",
+            )
+        if (
+            not isinstance(intent["lease_unit"], str)
+            or _LEASE_UNIT_RE.fullmatch(intent["lease_unit"]) is None
+        ):
+            raise RemoteIntentError(
+                "selected termination lease unit is invalid"
+            )
     if not is_canary:
         try:
             deadline = datetime.fromisoformat(
@@ -447,14 +605,24 @@ def _validate_intent(
     if hashlib.sha256(canonical_json(identity)).hexdigest() != intent["operation_id"]:
         raise RemoteIntentError("operation ID does not match canonical intent identity")
     environment = intent["environment"]
+    expected_environment_fields = (
+        _SELECTED_ENVIRONMENT_FIELDS if is_selected else _ENVIRONMENT_FIELDS
+    )
     if (
         not isinstance(environment, dict)
-        or set(environment) != _ENVIRONMENT_FIELDS
+        or set(environment) != expected_environment_fields
         or set(environment) & _FORBIDDEN_ENVIRONMENT
         or not all(isinstance(value, str) and value for value in environment.values())
         or _REGION_RE.fullmatch(str(environment["AWS_REGION"])) is None
     ):
         raise RemoteIntentError("operation environment is not closed and credential-free")
+    if is_selected and any(
+        environment[name] != intent[field]
+        for name, field in _SELECTED_ENVIRONMENT_BINDINGS.items()
+    ):
+        raise RemoteIntentError(
+            "selected environment does not mirror the lifecycle authority"
+        )
     image = str(environment["MS_CONTAINER_IMAGE"])
     digest = str(environment["MS_CONTAINER_DIGEST"])
     try:
@@ -512,7 +680,50 @@ def _validate_intent(
         ):
             raise RemoteIntentError("operation step is not one safe absolute argv")
         names.append(name)
-    if operation == "submit":
+    if is_selected:
+        bootstrap_steps = (
+            [
+                "prepare-aws-private-home",
+                "bootstrap",
+                "build-launcher-manifest",
+            ]
+            if intent["bootstrap"]["mode"] == "bootstrap"
+            else ["verify-bootstrap-reuse"]
+            + (["build-launcher-manifest"] if operation == "submit" else [])
+        )
+        expected_names = [
+            "reset-termination-leases",
+            "auto-termination",
+            *bootstrap_steps,
+            *(
+                _SELECTED_RESUME_MATERIALIZATION_STEPS
+                if operation == "resume"
+                else ()
+            ),
+            "paired-launch",
+        ]
+        if names != expected_names:
+            raise RemoteIntentError(
+                "selected operation steps do not match the frozen order"
+            )
+        if steps[0]["argv"] != list(_LEASE_RESET_ARGV):
+            raise RemoteIntentError(
+                "selected lease reset step is not the exact frozen argv"
+            )
+        if steps[1]["argv"] != [
+            "/usr/bin/systemd-run",
+            "--unit",
+            intent["lease_unit"],
+            "--on-calendar",
+            intent["terminate_at"],
+            "/sbin/shutdown",
+            "-h",
+            "now",
+        ]:
+            raise RemoteIntentError(
+                "selected lease installation does not bind the exact unit"
+            )
+    elif operation == "submit":
         if (
             names[0] != "auto-termination"
             or "prepare-aws-private-home" not in names

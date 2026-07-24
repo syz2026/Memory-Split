@@ -138,8 +138,15 @@ AWS_V3_RESUME_STATE_KEYS = AWS_V3_RUN_STATE_KEYS | {
     "checkpoint_objects",
     "prior_command_ids",
 }
+AWS_SELECTED_TRANSITION_KEYS = {
+    "bootstrap_mode",
+    "bootstrap_receipt_sha256",
+    "prior_run_receipt",
+}
 AWS_SELECTED_RUN_STATE_KEYS = (
-    AWS_V3_RUN_STATE_KEYS | set(LIFECYCLE_BINDING_FIELDS)
+    AWS_V3_RUN_STATE_KEYS
+    | set(LIFECYCLE_BINDING_FIELDS)
+    | AWS_SELECTED_TRANSITION_KEYS
 )
 AWS_SELECTED_RESUME_STATE_KEYS = AWS_SELECTED_RUN_STATE_KEYS | {
     "checkpoint_receipt",
@@ -291,6 +298,16 @@ _AWS_PAIR_RESUME_TRANSITION_FIELDS = {
     "status",
     "updated_at",
 }
+# Selected resume transitions additionally rebind the fresh operator lease
+# and the per-boot bootstrap decision; the prior-seed receipt stays frozen.
+_AWS_PAIR_SELECTED_RESUME_TRANSITION_FIELDS = (
+    _AWS_PAIR_RESUME_TRANSITION_FIELDS
+    | {
+        "bootstrap_mode",
+        "bootstrap_receipt_sha256",
+        "terminate_at",
+    }
+)
 
 
 def _require_string(value: object, *, label: str) -> str:
@@ -590,6 +607,52 @@ def _validate_aws_v3_run_state(
                 "STATE_CORRUPT",
                 "AWS selected lifecycle binding is invalid",
             ) from error
+        if value["bootstrap_mode"] not in {"bootstrap", "reuse"}:
+            raise MsctlError(
+                "STATE_CORRUPT",
+                "AWS selected bootstrap mode is invalid",
+            )
+        if value["bootstrap_mode"] == "reuse":
+            require_sha256(
+                value["bootstrap_receipt_sha256"],
+                label="AWS selected bootstrap receipt",
+            )
+        elif value["bootstrap_receipt_sha256"] is not None:
+            raise MsctlError(
+                "STATE_CORRUPT",
+                "AWS selected bootstrap mode forbids a reused receipt hash",
+            )
+        prior_run_receipt = value["prior_run_receipt"]
+        if value["seed"] == 0:
+            if prior_run_receipt is not None:
+                raise MsctlError(
+                    "STATE_CORRUPT",
+                    "AWS selected seed 0 forbids a prior run receipt",
+                )
+        else:
+            prior = require_object(
+                prior_run_receipt,
+                label="AWS selected prior run receipt",
+            )
+            require_exact_keys(
+                prior,
+                {"uri", "sha256", "version_id"},
+                label="AWS selected prior run receipt",
+            )
+            require_sha256(
+                prior["sha256"],
+                label="AWS selected prior run receipt hash",
+            )
+            if (
+                not isinstance(prior["uri"], str)
+                or not prior["uri"].startswith("s3://")
+                or not isinstance(prior["version_id"], str)
+                or prior["version_id"] in {"", "null"}
+            ):
+                raise MsctlError(
+                    "STATE_CORRUPT",
+                    "AWS selected prior run receipt is invalid",
+                )
     for field in (
         "release_sha256",
         "release_receipt_sha256",
@@ -1899,6 +1962,33 @@ class StateStore:
             )
         return value
 
+    def read_all_aws_pairs(self) -> dict[str, dict[str, object]]:
+        """Return every validated AWS pair journal keyed by manifest SHA."""
+
+        _, _, _, intents_fd = self._require_locked()
+        journals: dict[str, dict[str, object]] = {}
+        for name in sorted(os.listdir(intents_fd)):
+            match = _AWS_PAIR_FILE_RE.fullmatch(name)
+            if match is None:
+                continue
+            manifest_sha256 = match.group(1)
+            try:
+                journal = self.read_aws_pair(manifest_sha256)
+            except MsctlError as error:
+                raise MsctlError(
+                    "STATE_CORRUPT",
+                    "AWS pair journal scan found an invalid journal",
+                    details={"manifest_sha256": manifest_sha256},
+                ) from error
+            if journal is None:
+                raise MsctlError(
+                    "STATE_CORRUPT",
+                    "AWS pair journal disappeared during the scan",
+                    details={"manifest_sha256": manifest_sha256},
+                )
+            journals[manifest_sha256] = journal
+        return journals
+
     def write_aws_pair(
         self,
         manifest_sha256: str,
@@ -2088,9 +2178,14 @@ class StateStore:
             previous_command = str(next(iter(current_commands)))
             for run_id, current in current_by_id.items():
                 following = next_by_id[run_id]
+                transition_fields = (
+                    _AWS_PAIR_SELECTED_RESUME_TRANSITION_FIELDS
+                    if "provider_selection_sha256" in current
+                    else _AWS_PAIR_RESUME_TRANSITION_FIELDS
+                )
                 for field in set(current) | set(following):
                     if (
-                        field not in _AWS_PAIR_RESUME_TRANSITION_FIELDS
+                        field not in transition_fields
                         and current.get(field) != following.get(field)
                     ):
                         raise MsctlError(

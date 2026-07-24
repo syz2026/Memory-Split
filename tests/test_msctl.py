@@ -2747,6 +2747,256 @@ def test_aws_cli_submit_requires_instance_selection_and_deadline(tmp_path):
     ]
 
 
+def _selected_cli_profile():
+    return SimpleNamespace(
+        schema_version=1,
+        profile_id="aws-p5.48xlarge-v3",
+        provider="aws-p5.48xlarge",
+        instance_type="p5.48xlarge",
+        purchase_model="on_demand",
+        allocated_gpus=8,
+        train_groups=(4, 4),
+        assigned_seeds=tuple(range(10)),
+        sha256="7" * 64,
+    )
+
+
+def _selected_authority_cli_arguments(tmp_path) -> list[str]:
+    approval_key = tmp_path / "approval.pem"
+    if not approval_key.exists():
+        approval_key.write_bytes(
+            b"-----BEGIN PUBLIC KEY-----\nfixture\n-----END PUBLIC KEY-----\n"
+        )
+        os.chmod(approval_key, 0o600)
+    return [
+        "--authority-root",
+        str(tmp_path / "authority"),
+        "--runtime-lock",
+        str(tmp_path / "runtime-lock.json"),
+        "--runtime-evidence",
+        str(tmp_path / "runtime-evidence.json"),
+        "--runtime-sbom",
+        str(tmp_path / "runtime-sbom.json"),
+        "--objective-controls-amendment",
+        str(tmp_path / "objective-controls.yaml"),
+        "--selection-version-id",
+        "selection-version-1",
+        "--selection-bucket",
+        "memorysplit-authority",
+        "--selection-region",
+        "us-east-1",
+        "--selection-staging-root",
+        str(tmp_path / "staging"),
+        "--account-id",
+        "123456789012",
+        "--instance-id",
+        "i-0123456789abcdef0",
+        "--boot-id",
+        "12345678-1234-4abc-8def-1234567890ab",
+        "--approval-public-key",
+        str(tmp_path / "approval.pem"),
+        "--approval-public-key-sha256",
+        "8" * 64,
+    ]
+
+
+@pytest.mark.parametrize(
+    ("command_arguments", "expected_command"),
+    [
+        (
+            [
+                "submit",
+                "--dataset-pointer",
+                "DATASET-POINTER-AWS.json",
+                "--dataset-verification",
+                "dataset-verification.json",
+                "--environment-receipt",
+                "AWS-ENVIRONMENT.json",
+                "--terminate-at",
+                "2099-01-01T00:00:00Z",
+                "--bootstrap-mode",
+                "bootstrap",
+            ],
+            "submit",
+        ),
+        (
+            [
+                "resume",
+                "--dataset-pointer",
+                "DATASET-POINTER-AWS.json",
+                "--dataset-verification",
+                "dataset-verification.json",
+                "--environment-receipt",
+                "AWS-ENVIRONMENT.json",
+                "--terminate-at",
+                "2099-01-01T00:00:00Z",
+                "--bootstrap-mode",
+                "reuse",
+                "--checkpoint-receipt-uri",
+                "s3://bucket/receipt.json",
+                "--checkpoint-receipt-sha256",
+                "a" * 64,
+                "--checkpoint-receipt-version-id",
+                "receipt-version-1",
+            ],
+            "resume",
+        ),
+        (["status"], "status"),
+        (["cancel"], "cancel"),
+    ],
+)
+def test_selected_dispatch_uses_fixed_authority_and_selected_constructor(
+    tmp_path,
+    command_arguments,
+    expected_command,
+):
+    from msctl.cli import build_parser, dispatch
+
+    manifest_path = _write_json(
+        tmp_path / "runs-s3.json",
+        {"schema_version": 3, "seed": 3},
+    )
+    captured = {}
+
+    class Backend:
+        def dispatch(self, command, args):
+            captured["command"] = command
+            captured["args"] = args
+            return True, {"routed": command}
+
+    def selected_factory(**kwargs):
+        captured["selected_factory"] = kwargs
+        return Backend()
+
+    args = build_parser().parse_args(
+        [
+            "--profile",
+            str(tmp_path / "aws-v3.json"),
+            command_arguments[0],
+            "--release",
+            str(tmp_path / "RELEASE.json"),
+            "--manifest",
+            str(manifest_path),
+            *command_arguments[1:],
+            *_selected_authority_cli_arguments(tmp_path),
+        ]
+    )
+    dry_run, result = dispatch(
+        args,
+        profile_loader=lambda _: _selected_cli_profile(),
+        aws_backend_factory=lambda **_: pytest.fail(
+            "selected dispatch must not build the legacy backend"
+        ),
+        selected_backend_factory=selected_factory,
+        environ={
+            "AWS_REGION": "us-east-1",
+            "MS_AWS_INSTANCE_PROFILE_ARN": (
+                "arn:aws:iam::123456789012:instance-profile/"
+                "MemorySplitSelected"
+            ),
+        },
+    )
+
+    assert result == {"routed": expected_command}
+    assert captured["command"] == expected_command
+    factory_kwargs = captured["selected_factory"]
+    assert factory_kwargs["seed"] == 3
+    assert factory_kwargs["account_id"] == "123456789012"
+    assert factory_kwargs["instance_id"] == "i-0123456789abcdef0"
+    assert factory_kwargs["boot_id"] == (
+        "12345678-1234-4abc-8def-1234567890ab"
+    )
+    assert factory_kwargs["expected_selection_version_id"] == (
+        "selection-version-1"
+    )
+    assert factory_kwargs["trusted_qualification_public_key_sha256"] == (
+        "8" * 64
+    )
+    assert factory_kwargs["instance_profile_arn"] == (
+        "arn:aws:iam::123456789012:instance-profile/MemorySplitSelected"
+    )
+    assert factory_kwargs["state_root"] == ".msctl-state"
+    del dry_run
+
+
+def test_selected_dispatch_rejects_partial_authority_groups(tmp_path):
+    from msctl.cli import build_parser, dispatch
+
+    manifest_path = _write_json(
+        tmp_path / "runs-s3.json",
+        {"schema_version": 3, "seed": 3},
+    )
+    args = build_parser().parse_args(
+        [
+            "--profile",
+            str(tmp_path / "aws-v3.json"),
+            "status",
+            "--release",
+            str(tmp_path / "RELEASE.json"),
+            "--manifest",
+            str(manifest_path),
+            "--authority-root",
+            str(tmp_path / "authority"),
+        ]
+    )
+
+    with pytest.raises(Exception) as caught:
+        dispatch(
+            args,
+            profile_loader=lambda _: _selected_cli_profile(),
+            aws_backend_factory=lambda **_: pytest.fail(
+                "partial authority must not reach any backend"
+            ),
+            selected_backend_factory=lambda **_: pytest.fail(
+                "partial authority must not build the selected backend"
+            ),
+            environ={"AWS_REGION": "us-east-1"},
+        )
+
+    assert getattr(caught.value, "code", None) == "CLI_USAGE"
+    assert "--runtime-lock" in caught.value.details["missing"]
+
+
+def test_selected_arguments_are_forbidden_for_legacy_manifests(tmp_path):
+    from msctl.aws_p5 import AwsP5Backend
+
+    backend = AwsP5Backend(
+        profile=_aws_profile_object(),
+        runtime=_aws_runtime_object(),
+        instance_profile_arn=(
+            "arn:aws:iam::123456789012:instance-profile/memorysplit-p5"
+        ),
+        state_root=tmp_path / "state",
+        runner=_FakeAwsRunner(),
+    )
+    manifest = _aws_manifest_object()
+    release = _aws_release_object()
+
+    with pytest.raises(Exception) as caught:
+        backend.submit(
+            release=release,
+            manifest=manifest,
+            instance_id="i-0123456789abcdef0",
+            terminate_at=_AWS_TERMINATE_AT,
+            approval_path=None,
+            apply=False,
+            bootstrap_mode="bootstrap",
+        )
+    assert getattr(caught.value, "code", None) == "CLI_USAGE"
+
+    with pytest.raises(Exception) as caught:
+        backend.resume(
+            release=release,
+            manifest=manifest,
+            checkpoint_receipt=SimpleNamespace(sha256="a" * 64),
+            approval_path=None,
+            apply=False,
+            terminate_at=_AWS_TERMINATE_AT,
+            bootstrap_mode="reuse",
+        )
+    assert getattr(caught.value, "code", None) == "CLI_USAGE"
+
+
 def test_unknown_provider_is_rejected_before_provider_specific_parsing(tmp_path):
     profile_value = _aws_profile_value()
     profile_value["profile_id"] = "unknown-provider"

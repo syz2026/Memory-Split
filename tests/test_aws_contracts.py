@@ -196,3 +196,44 @@ def test_run_finalization_keys_reject_malformed_sha256(value):
         contract.log_object_key(0, "dense", value)
     with pytest.raises(ValueError, match="SHA-256"):
         contract.run_receipt_key(0, value)
+
+
+def test_bootstrap_receipt_key_is_exact_and_instance_scoped():
+    contract = _contracts()
+
+    assert contract.bootstrap_receipt_key("i-0123456789abcdef0") == (
+        "receipts/bootstrap/i-0123456789abcdef0.json"
+    )
+    assert "bootstrap_receipt_key" in contract.__all__
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "i-XYZ",
+        "i-0123456",
+        "0123456789abcdef0",
+        "i-0123456789abcdef0/../escape",
+        "i-0123456789ABCDEF0",
+        "",
+        None,
+        b"i-0123456789abcdef0",
+        7,
+    ],
+    ids=[
+        "non-hex",
+        "short",
+        "unprefixed",
+        "path-traversal",
+        "uppercase",
+        "empty",
+        "none",
+        "bytes",
+        "int",
+    ],
+)
+def test_bootstrap_receipt_key_rejects_foreign_instance_ids(value):
+    contract = _contracts()
+
+    with pytest.raises(ValueError, match="instance"):
+        contract.bootstrap_receipt_key(value)

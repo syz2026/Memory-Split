@@ -11,7 +11,7 @@ from pathlib import Path
 
 from cluster.aws.p5.profile import load_aws_p5_profile
 
-from .aws_p5 import build_aws_backend
+from .aws_p5 import AwsP5Backend, build_aws_backend
 from .aws_hardware import (
     AwsCliVersionedSelectionStore,
     OpenSslQualificationApprovalVerifier,
@@ -51,6 +51,27 @@ DEFAULT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_PROFILE = (
     DEFAULT_ROOT / "cluster" / "profiles" / "illumina-usfc-prd.json"
 )
+_SELECTED_PROFILE_IDS = {
+    "aws-p5.48xlarge-v3",
+    "aws-p6-b300.48xlarge-v3",
+}
+_SELECTED_LIFECYCLE_COMMANDS = {"submit", "resume", "status", "cancel"}
+_SELECTED_AUTHORITY_ARGUMENTS = (
+    "authority_root",
+    "runtime_lock",
+    "runtime_evidence",
+    "runtime_sbom",
+    "objective_controls_amendment",
+    "selection_version_id",
+    "selection_bucket",
+    "selection_region",
+    "selection_staging_root",
+    "account_id",
+    "instance_id",
+    "boot_id",
+    "approval_public_key",
+    "approval_public_key_sha256",
+)
 
 
 class _HelpRequested(Exception):
@@ -79,6 +100,30 @@ def _leaf(
     help_text: str,
 ) -> argparse.ArgumentParser:
     return subparsers.add_parser(name, help=help_text)
+
+
+def _add_selected_authority_arguments(
+    parser: argparse.ArgumentParser,
+    *,
+    include_instance_id: bool = True,
+) -> None:
+    """Add the fixed selected-provider authority argument group."""
+
+    parser.add_argument("--authority-root")
+    parser.add_argument("--runtime-lock")
+    parser.add_argument("--runtime-evidence")
+    parser.add_argument("--runtime-sbom")
+    parser.add_argument("--objective-controls-amendment")
+    parser.add_argument("--selection-version-id")
+    parser.add_argument("--selection-bucket")
+    parser.add_argument("--selection-region")
+    parser.add_argument("--selection-staging-root")
+    parser.add_argument("--account-id")
+    if include_instance_id:
+        parser.add_argument("--instance-id")
+    parser.add_argument("--boot-id")
+    parser.add_argument("--approval-public-key")
+    parser.add_argument("--approval-public-key-sha256")
 
 
 def build_parser() -> JsonArgumentParser:
@@ -184,17 +229,31 @@ def build_parser() -> JsonArgumentParser:
         if name == "submit":
             leaf.add_argument("--instance-id")
             leaf.add_argument("--terminate-at")
+            leaf.add_argument("--bootstrap-mode")
+            leaf.add_argument("--prior-run-receipt-uri")
+            leaf.add_argument("--prior-run-receipt-sha256")
+            leaf.add_argument("--prior-run-receipt-version-id")
+            _add_selected_authority_arguments(
+                leaf,
+                include_instance_id=False,
+            )
         if name == "resume":
             leaf.add_argument("--checkpoint-receipt")
             leaf.add_argument("--checkpoint-receipt-uri")
             leaf.add_argument("--checkpoint-receipt-sha256")
             leaf.add_argument("--checkpoint-receipt-version-id")
+            leaf.add_argument("--terminate-at")
+            leaf.add_argument("--bootstrap-mode")
+            _add_selected_authority_arguments(leaf)
+        if name == "cancel":
+            _add_selected_authority_arguments(leaf)
         leaf.add_argument("--apply", action="store_true")
 
     status = _leaf(commands, "status", help_text="reconcile run status")
     status.add_argument("--release", required=True)
     status.add_argument("--manifest", required=True)
     status.add_argument("--cached", action="store_true")
+    _add_selected_authority_arguments(status)
 
     canary = _leaf(commands, "canary", help_text="P5 qualification canary")
     canary_sub = canary.add_subparsers(dest="action", required=True)
@@ -304,12 +363,98 @@ def _auth_check(profile) -> dict[str, object]:
     }
 
 
+def _dispatch_selected_lifecycle(
+    args: argparse.Namespace,
+    *,
+    command: str,
+    environment: dict[str, str],
+    selected_backend_factory: Callable[..., object],
+) -> tuple[bool, dict[str, object]]:
+    """Build one authenticated selected controller and route the command."""
+
+    if command == "submit":
+        _require_cli_values(args, "instance_id", "terminate_at")
+    if command in {"submit", "resume"}:
+        _require_cli_values(args, "dataset_pointer", "environment_receipt")
+        if (args.dataset_root is None) == (
+            args.dataset_verification is None
+        ):
+            raise MsctlError(
+                "CLI_USAGE",
+                "AWS requires exactly one dataset source",
+                details={
+                    "required_one_of": [
+                        "--dataset-root",
+                        "--dataset-verification",
+                    ]
+                },
+            )
+    manifest_value = require_object(
+        load_json(args.manifest, label="run manifest"),
+        label="run manifest",
+    )
+    seed = manifest_value.get("seed")
+    if type(seed) is not int or seed not in range(10):
+        raise MsctlError(
+            "CLI_USAGE",
+            "selected dispatch requires one exact manifest seed 0 through 9",
+        )
+    instance_profile_arn = environment.get("MS_AWS_INSTANCE_PROFILE_ARN")
+    if instance_profile_arn is None:
+        raise MsctlError(
+            "AWS_RUNTIME_INVALID",
+            "MS_AWS_INSTANCE_PROFILE_ARN is required",
+        )
+    command_environment = {
+        name: environment[name]
+        for name in ("HOME", "LANG", "LC_ALL", "PATH")
+        if name in environment
+    }
+    command_environment["AWS_REGION"] = args.selection_region
+    selection_store = AwsCliVersionedSelectionStore(
+        bucket=args.selection_bucket,
+        region=args.selection_region,
+        environment=command_environment,
+        staging_root=args.selection_staging_root,
+    )
+    approval_verifier = OpenSslQualificationApprovalVerifier(
+        public_key_path=args.approval_public_key,
+        environment=command_environment,
+    )
+    backend = selected_backend_factory(
+        authority_root=args.authority_root,
+        repo_root=args.repo_root,
+        runtime_lock_path=args.runtime_lock,
+        runtime_evidence_path=args.runtime_evidence,
+        runtime_sbom_path=args.runtime_sbom,
+        objective_controls_amendment_path=(
+            args.objective_controls_amendment
+        ),
+        selection_store=selection_store,
+        account_id=args.account_id,
+        instance_id=args.instance_id,
+        boot_id=args.boot_id,
+        seed=seed,
+        expected_selection_version_id=args.selection_version_id,
+        selection_identity_verifier=verify_aws_instance_identity_pkcs7,
+        qualification_approval_verifier=approval_verifier,
+        trusted_qualification_public_key_sha256=(
+            args.approval_public_key_sha256
+        ),
+        runtime_environment=environment,
+        instance_profile_arn=instance_profile_arn,
+        state_root=args.state_root,
+    )
+    return backend.dispatch(command, args)
+
+
 def dispatch(
     args: argparse.Namespace,
     *,
     profile_loader: Callable[[Path | str], object] | None = None,
     cohort_loader: Callable[[Path | str], object] | None = None,
     aws_backend_factory: Callable[..., object] = build_aws_backend,
+    selected_backend_factory: Callable[..., object] | None = None,
     environ: dict[str, str] | None = None,
 ) -> tuple[bool, dict[str, object]]:
     command = _command_name(args)
@@ -427,6 +572,43 @@ def dispatch(
             cohort_loader=cohort_loader,
             **selected_inputs,
         )
+    if (
+        command in _SELECTED_LIFECYCLE_COMMANDS
+        and getattr(profile, "profile_id", None) in _SELECTED_PROFILE_IDS
+    ):
+        provided = {
+            name: getattr(args, name, None)
+            for name in _SELECTED_AUTHORITY_ARGUMENTS
+        }
+        given = [name for name, value in provided.items() if value is not None]
+        if given and len(given) != len(_SELECTED_AUTHORITY_ARGUMENTS):
+            raise MsctlError(
+                "CLI_USAGE",
+                "the fixed selected authority argument group must be complete",
+                details={
+                    "missing": [
+                        f"--{name.replace('_', '-')}"
+                        for name, value in provided.items()
+                        if value is None
+                    ]
+                },
+            )
+        if given:
+            return _dispatch_selected_lifecycle(
+                args,
+                command=command,
+                environment=environment,
+                selected_backend_factory=(
+                    selected_backend_factory
+                    or AwsP5Backend.from_authenticated_selection
+                ),
+            )
+        if provider != AWS_P5_PROFILE:
+            raise MsctlError(
+                "CLI_USAGE",
+                "selected P6 lifecycle requires the fixed authority "
+                "argument group",
+            )
     if provider == AWS_P5_PROFILE:
         if (
             command == "env ensure"

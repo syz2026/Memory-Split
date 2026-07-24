@@ -655,6 +655,8 @@ def test_controller_constructor_reenters_selected_authority_and_binds_intent(
         manifest=manifest,
         terminate_at="2026-07-25T00:00:00Z",
         evidence=evidence,
+        attempt=1,
+        bootstrap_mode="bootstrap",
     )
     assert core["schema_version"] == 3
     assert core["provider_selection_sha256"] == (
@@ -662,6 +664,11 @@ def test_controller_constructor_reenters_selected_authority_and_binds_intent(
     )
     assert core["environment"]["MS_PROVIDER"] == profile.provider
     assert core["environment"]["MS_RUNTIME_SBOM_SHA256"] == "9" * 64
+    assert core["bootstrap"] == {
+        "mode": "bootstrap",
+        "receipt_sha256": None,
+    }
+    assert core["lease_unit"].startswith("memorysplit-auto-terminate-")
 
     envelope = backend._operation_envelope(
         core,
@@ -684,6 +691,7 @@ def test_controller_constructor_reenters_selected_authority_and_binds_intent(
                 ),
             },
             attempt=1,
+            bootstrap_mode="bootstrap",
         )
         for run in runs
     ]

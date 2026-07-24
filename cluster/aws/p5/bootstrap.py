@@ -65,6 +65,50 @@ _H100_RE = re.compile(r"^NVIDIA H100 80GB(?: HBM3)?$")
 _CONTAINER_IMAGE_RE = re.compile(
     r"^[A-Za-z0-9][A-Za-z0-9./:_-]*@sha256:[0-9a-f]{64}$"
 )
+BOOTSTRAP_RECEIPT_FIELDS = (
+    "account_id",
+    "ami_id",
+    "boot_id",
+    "code_commit",
+    "cohort_assignment_sha256",
+    "container_image",
+    "container_digest",
+    "corpus_build_id",
+    "corpus_ordered_stream_sha256",
+    "corpus_receipt_sha256",
+    "durable_upload_verified",
+    "instance_id",
+    "instance_store",
+    "instance_type",
+    "profile_sha256",
+    "provider",
+    "receipt_type",
+    "region",
+    "release_members_sha256",
+    "release_root",
+    "release_sha256",
+    "role_arn",
+    "role_name",
+    "runtime_gid",
+    "runtime_uid",
+    "schema_version",
+    "scratch_root",
+)
+_FULL_BOOTSTRAP_ARGUMENTS = (
+    "container_image",
+    "release_archive",
+    "release_sha256",
+    "release_receipt",
+    "release_receipt_sha256",
+    "dataset_receipt",
+    "dataset_receipt_sha256",
+    "cohort_assignment",
+    "cohort_assignment_sha256",
+    "code_commit",
+    "owner_uid",
+    "owner_gid",
+    "aws_private_home",
+)
 
 
 class BootstrapError(ValueError):
@@ -1615,6 +1659,164 @@ def build_bootstrap_receipt(
     }
 
 
+def _descriptor_read(
+    path: Path,
+    *,
+    label: str,
+    max_bytes: int,
+) -> bytes:
+    """Read one descriptor-pinned regular file without following links."""
+
+    if type(max_bytes) is not int or max_bytes <= 0:
+        raise BootstrapError(f"{label} byte limit must be positive")
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+    )
+    try:
+        descriptor = os.open(str(path), flags)
+    except OSError as error:
+        raise BootstrapError(f"{label} is missing or linked") from error
+    try:
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode):
+            raise BootstrapError(f"{label} must be a regular file")
+        if metadata.st_size > max_bytes:
+            raise BootstrapError(f"{label} exceeds its byte limit")
+        chunks: list[bytes] = []
+        while True:
+            chunk = os.read(descriptor, 1024 * 1024)
+            if not chunk:
+                break
+            chunks.append(chunk)
+    finally:
+        os.close(descriptor)
+    payload = b"".join(chunks)
+    if len(payload) != metadata.st_size:
+        raise BootstrapError(f"{label} changed while being read")
+    return payload
+
+
+def verify_bootstrap_reuse(
+    *,
+    profile: AwsP5Profile,
+    runtime: AwsP5Runtime,
+    receipt_path: Path | str,
+    expected_receipt_sha256: str,
+    metadata_get: Callable[[str], str | None],
+    boot_id_get: Callable[[], str] = _default_boot_id,
+    scratch_root: Path | str | None = None,
+    is_mounted: Callable[[str], bool] = os.path.ismount,
+) -> dict[str, object]:
+    """Prove one exact bootstrap receipt still matches this boot, mutating
+    nothing."""
+
+    _required_sha256(
+        expected_receipt_sha256,
+        label="expected bootstrap receipt",
+    )
+    payload = _descriptor_read(
+        Path(receipt_path),
+        label="bootstrap reuse receipt",
+        max_bytes=1024 * 1024,
+    )
+    if hashlib.sha256(payload).hexdigest() != expected_receipt_sha256:
+        raise BootstrapError("bootstrap reuse receipt SHA-256 mismatch")
+    value = _strict_json_object(payload, label="bootstrap reuse receipt")
+    _exact_fields(
+        value,
+        set(BOOTSTRAP_RECEIPT_FIELDS),
+        label="bootstrap reuse receipt",
+    )
+    if (
+        type(value["schema_version"]) is not int
+        or value["schema_version"] != 2
+        or value["receipt_type"] != "aws-p5-bootstrap"
+        or value["durable_upload_verified"] is not True
+    ):
+        raise BootstrapError("bootstrap reuse receipt identity is invalid")
+    instance_id = _metadata_value(metadata_get, "meta-data/instance-id")
+    if value["instance_id"] != instance_id:
+        raise BootstrapError(
+            "bootstrap reuse receipt instance differs from IMDSv2"
+        )
+    boot_id = boot_id_get()
+    if (
+        not isinstance(boot_id, str)
+        or not boot_id
+        or value["boot_id"] != boot_id
+    ):
+        raise BootstrapError(
+            "bootstrap reuse receipt boot differs from the current kernel"
+        )
+    if (
+        value["profile_sha256"] != profile.sha256
+        or value["provider"] != profile.provider
+        or value["instance_type"] != profile.instance_type
+        or value["scratch_root"] != profile.scratch_root
+        or value["region"] != runtime.region
+        or value["ami_id"] != runtime.ami_id
+        or value["container_image"] != runtime.container_image
+        or value["container_digest"] != runtime.container_digest
+        or value["runtime_uid"] != runtime.uid
+        or value["runtime_gid"] != runtime.gid
+    ):
+        raise BootstrapError(
+            "bootstrap reuse receipt does not match this exact runtime"
+        )
+    release_sha256 = _required_sha256(
+        value["release_sha256"],
+        label="bootstrap reuse release",
+    )
+    if value["release_root"] != f"releases/{release_sha256}":
+        raise BootstrapError(
+            "bootstrap reuse receipt release root is not content addressed"
+        )
+    scratch = Path(
+        scratch_root if scratch_root is not None else profile.scratch_root
+    )
+    if scratch.is_symlink() or not scratch.is_dir():
+        raise BootstrapError("scratch root must be a real directory")
+    if not is_mounted(str(scratch)):
+        raise BootstrapError("scratch root is not a mounted filesystem")
+    metadata = os.stat(scratch)
+    if (
+        stat.S_IMODE(metadata.st_mode) != 0o700
+        or metadata.st_uid != value["runtime_uid"]
+        or metadata.st_gid != value["runtime_gid"]
+    ):
+        raise BootstrapError(
+            "scratch root owner or mode differs from the receipt runtime"
+        )
+    release_root = scratch / "releases" / release_sha256
+    if release_root.is_symlink() or not release_root.is_dir():
+        raise BootstrapError(
+            "receipted release directory is missing from the scratch root"
+        )
+    dataset_payload = _descriptor_read(
+        scratch / "dataset" / "receipt.json",
+        label="bootstrap reuse dataset receipt",
+        max_bytes=16 * 1024 * 1024,
+    )
+    if (
+        hashlib.sha256(dataset_payload).hexdigest()
+        != value["corpus_receipt_sha256"]
+    ):
+        raise BootstrapError(
+            "dataset receipt hash differs from the bootstrap receipt"
+        )
+    return {
+        "ok": True,
+        "mode": "reuse",
+        "boot_id": boot_id,
+        "instance_id": instance_id,
+        "receipt_sha256": expected_receipt_sha256,
+        "release_sha256": release_sha256,
+        "schema_version": 1,
+    }
+
+
 def bootstrap_authenticated_gpu_environment(
     *,
     authority_root: Path | str,
@@ -1756,31 +1958,90 @@ def _parser() -> argparse.ArgumentParser:
         type=Path,
         default=root / "profiles" / "aws-p5.48xlarge-v3.json",
     )
-    parser.add_argument("--container-image", required=True)
-    parser.add_argument("--release-archive", type=Path, required=True)
-    parser.add_argument("--release-sha256", required=True)
-    parser.add_argument("--release-receipt", type=Path, required=True)
-    parser.add_argument("--release-receipt-sha256", required=True)
-    parser.add_argument("--dataset-receipt", type=Path, required=True)
-    parser.add_argument("--dataset-receipt-sha256", required=True)
-    parser.add_argument("--cohort-assignment", type=Path, required=True)
-    parser.add_argument("--cohort-assignment-sha256", required=True)
-    parser.add_argument("--code-commit", required=True)
+    parser.add_argument("--container-image")
+    parser.add_argument("--release-archive", type=Path)
+    parser.add_argument("--release-sha256")
+    parser.add_argument("--release-receipt", type=Path)
+    parser.add_argument("--release-receipt-sha256")
+    parser.add_argument("--dataset-receipt", type=Path)
+    parser.add_argument("--dataset-receipt-sha256")
+    parser.add_argument("--cohort-assignment", type=Path)
+    parser.add_argument("--cohort-assignment-sha256")
+    parser.add_argument("--code-commit")
     parser.add_argument("--receipt", type=Path)
-    parser.add_argument("--owner-uid", type=int, required=True)
-    parser.add_argument("--owner-gid", type=int, required=True)
-    parser.add_argument("--aws-private-home", type=Path, required=True)
+    parser.add_argument("--owner-uid", type=int)
+    parser.add_argument("--owner-gid", type=int)
+    parser.add_argument("--aws-private-home", type=Path)
     parser.add_argument(
         "--authorize-destructive-instance-store",
         action="store_true",
     )
+    parser.add_argument("--verify-reuse", action="store_true")
+    parser.add_argument("--expected-receipt-sha256")
     parser.add_argument("--apply", action="store_true")
     return parser
+
+
+def _run_verify_reuse(arguments: argparse.Namespace) -> int:
+    if (
+        arguments.receipt is None
+        or arguments.expected_receipt_sha256 is None
+    ):
+        raise BootstrapError(
+            "verify-reuse requires --receipt and --expected-receipt-sha256"
+        )
+    if arguments.apply or arguments.authorize_destructive_instance_store:
+        raise BootstrapError(
+            "verify-reuse performs no mutation and forbids apply flags"
+        )
+    provided = [
+        name
+        for name in _FULL_BOOTSTRAP_ARGUMENTS
+        if getattr(arguments, name) is not None
+    ]
+    if provided:
+        raise BootstrapError(
+            "verify-reuse rejects full-bootstrap arguments"
+        )
+    profile = load_aws_p5_profile(arguments.profile)
+    runtime = validate_runtime_environment(profile, os.environ)
+    client = ImdsV2Client()
+    result = verify_bootstrap_reuse(
+        profile=profile,
+        runtime=runtime,
+        receipt_path=arguments.receipt,
+        expected_receipt_sha256=arguments.expected_receipt_sha256,
+        metadata_get=client.get,
+        boot_id_get=_default_boot_id,
+    )
+    print(
+        json.dumps(
+            result,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+    )
+    return 0
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     try:
         arguments = _parser().parse_args(argv)
+        if arguments.verify_reuse:
+            return _run_verify_reuse(arguments)
+        if arguments.expected_receipt_sha256 is not None:
+            raise BootstrapError(
+                "expected receipt SHA-256 is a verify-reuse argument"
+            )
+        missing = [
+            f"--{name.replace('_', '-')}"
+            for name in _FULL_BOOTSTRAP_ARGUMENTS
+            if getattr(arguments, name) is None
+        ]
+        if missing:
+            raise BootstrapError(
+                "bootstrap requires " + ", ".join(missing)
+            )
         profile = load_aws_p5_profile(arguments.profile)
         runtime = validate_runtime_environment(profile, os.environ)
         if (

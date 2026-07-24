@@ -34,6 +34,7 @@ from cluster.aws.gpu_profile import (
 )
 
 from .approval import verify_scope_approval
+from .aws_contracts import bootstrap_receipt_key
 from .aws_lifecycle import (
     AuthenticatedProviderLifecycle,
     LIFECYCLE_BINDING_FIELDS,
@@ -44,6 +45,11 @@ from .aws_argv import (
     ARGV_DOCUMENT_CONTENT,
     ARGV_DOCUMENT_NAME,
     ARGV_DOCUMENT_SHA256,
+)
+from .aws_seed_transition import (
+    PriorRunReceiptRef,
+    SeedTransitionError,
+    admit_prior_seed_finalization,
 )
 from .contracts import (
     bind_release,
@@ -107,6 +113,71 @@ _SELECTED_INSTANCE_FIELDS = _INSTANCE_FIELDS | {
     "runtime_sha256",
     "terminate_at",
 }
+_TERMINAL_COMMAND_STATES = {"Success", "Failed", "Cancelled", "TimedOut"}
+_BOOT_ID_RE = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-"
+    r"[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+)
+# Cohort-wide identity-only EC2 tags for selected manifests: never seed,
+# run-manifest, or terminate-at, which live in signed approval, immutable
+# operation intents, and atomic paired state instead.
+_SELECTED_IDENTITY_TAG_NAMES = {
+    "provider": "MemorySplitProvider",
+    "cohort_sha256": "MemorySplitCohortSHA256",
+    "release_sha256": "MemorySplitReleaseSHA256",
+    "dataset_sha256": "MemorySplitDatasetSHA256",
+    "profile_sha256": "MemorySplitProfileSHA256",
+    "runtime_sha256": "MemorySplitRuntimeSHA256",
+    "container_digest": "MemorySplitContainerDigest",
+    "selection_sha256": "MemorySplitSelectionSHA256",
+    "selection_version_id": "MemorySplitSelectionVersionId",
+}
+_SELECTED_IDENTITY_INSTANCE_FIELDS = {
+    "instance_id",
+    "instance_type",
+    "state",
+    "instance_profile_arn",
+    "ami_id",
+    *_SELECTED_IDENTITY_TAG_NAMES,
+}
+_LEASE_RESET_ARGV = (
+    "/usr/bin/systemctl",
+    "stop",
+    "memorysplit-auto-terminate*.timer",
+    "memorysplit-auto-terminate*.service",
+)
+# Frozen copy of cluster.aws.p5.bootstrap.BOOTSTRAP_RECEIPT_FIELDS: the
+# controller must not import the on-instance bootstrap module, so the field
+# closure is mirrored here and pinned by a cross-check test.
+_BOOTSTRAP_RECEIPT_FIELDS = (
+    "account_id",
+    "ami_id",
+    "boot_id",
+    "code_commit",
+    "cohort_assignment_sha256",
+    "container_image",
+    "container_digest",
+    "corpus_build_id",
+    "corpus_ordered_stream_sha256",
+    "corpus_receipt_sha256",
+    "durable_upload_verified",
+    "instance_id",
+    "instance_store",
+    "instance_type",
+    "profile_sha256",
+    "provider",
+    "receipt_type",
+    "region",
+    "release_members_sha256",
+    "release_root",
+    "release_sha256",
+    "role_arn",
+    "role_name",
+    "runtime_gid",
+    "runtime_uid",
+    "schema_version",
+    "scratch_root",
+)
 _SAFE_PATH = "/usr/local/bin:/usr/bin:/bin"
 _MAX_PAID_RUNTIME = timedelta(minutes=1440)
 _AWS_PRIVATE_HOME = "/var/lib/memorysplit/aws-private-home"
@@ -721,6 +792,18 @@ class AwsP5Backend:
                 "selected manifest differs from authenticated provider authority",
             )
 
+    @staticmethod
+    def _selected_manifest_lifecycle(manifest: object) -> bool:
+        return (
+            getattr(manifest, "schema_version", None) == 3
+            and getattr(
+                manifest,
+                "provider_selection_sha256",
+                None,
+            )
+            is not None
+        )
+
     def _validate_manifest(self, manifest: object) -> None:
         self._require_provider_lifecycle(manifest)
         runs = getattr(manifest, "runs", ())
@@ -880,6 +963,76 @@ class AwsP5Backend:
     def _release_root(self, release: object) -> str:
         return f"/mnt/memorysplit/releases/{release.archive_sha256}"
 
+    def _launcher_manifest_step(
+        self,
+        *,
+        release: object,
+        manifest: object,
+        lifecycle_evidence: Mapping[str, object],
+        is_v3: bool,
+        staging: str,
+    ) -> dict[str, object]:
+        return {
+            "name": "build-launcher-manifest",
+            "argv": [
+                "/usr/bin/python3",
+                "/opt/memorysplit/msctl/aws_launch_manifest.py",
+                "--out",
+                f"{staging}/launcher-manifest-{manifest.sha256}.json",
+                "--scratch-root",
+                "/mnt/memorysplit",
+                "--seed",
+                str(manifest.seed),
+                "--profile-sha256",
+                self.profile.sha256,
+                "--release-sha256",
+                release.archive_sha256,
+                "--release-members-sha256",
+                getattr(release, "members_sha256", ""),
+                *(
+                    [
+                        "--release-receipt-sha256",
+                        release.receipt_sha256,
+                        "--environment-receipt-sha256",
+                        lifecycle_evidence[
+                            "environment_receipt_sha256"
+                        ],
+                        "--run-manifest-sha256",
+                        manifest.sha256,
+                        "--source-tree",
+                        manifest.source_tree,
+                    ]
+                    if is_v3
+                    else []
+                ),
+                "--cohort-assignment-sha256",
+                manifest.cohort_assignment_sha256,
+                "--code-commit",
+                manifest.source_commit,
+                "--bootstrap-receipt",
+                f"{staging}/bootstrap-receipt.json",
+                "--corpus-receipt",
+                "/mnt/memorysplit/dataset/receipt.json",
+                *(
+                    argument
+                    for run in sorted(
+                        manifest.runs,
+                        key=lambda row: row.arm,
+                    )
+                    for argument in (
+                        "--run",
+                        canonical_json(
+                            {
+                                "arm": run.arm,
+                                "config": run.config,
+                                "config_sha256": run.config_sha256,
+                            }
+                        ).decode("ascii"),
+                    )
+                ),
+            ],
+        }
+
     def _training_operation_intent(
         self,
         *,
@@ -893,6 +1046,9 @@ class AwsP5Backend:
         checkpoint_receipt_version_id: str | None = None,
         checkpoint_receipt_bytes: int | None = None,
         evidence: Mapping[str, str] | None = None,
+        attempt: int | None = None,
+        bootstrap_mode: str | None = None,
+        bootstrap_receipt_sha256: str | None = None,
     ) -> dict[str, object]:
         is_v3 = getattr(manifest, "schema_version", None) == 3
         dataset_receipt_sha256 = (
@@ -944,8 +1100,180 @@ class AwsP5Backend:
             )
         release_root = self._release_root(release)
         staging = "/mnt/memorysplit/staging"
+        selected_lifecycle = (
+            is_v3
+            and getattr(
+                manifest,
+                "provider_selection_sha256",
+                None,
+            )
+            is not None
+        )
+        launch_profile_name = (
+            f"{self.profile.profile_id}.json"
+            if selected_lifecycle
+            else ("aws-p5.48xlarge-v3.json" if is_v3 else "aws-p5.48xlarge.json")
+        )
         steps: list[dict[str, object]] = []
-        if operation == "submit":
+        if selected_lifecycle:
+            if operation not in {"submit", "resume"}:
+                raise MsctlError(
+                    "OPERATION_UNSUPPORTED",
+                    "selected intents exist only for submit and resume",
+                )
+            if (
+                not isinstance(terminate_at, str)
+                or type(attempt) is not int
+                or attempt < 1
+                or bootstrap_mode not in {"bootstrap", "reuse"}
+                or (bootstrap_mode == "reuse")
+                != (bootstrap_receipt_sha256 is not None)
+            ):
+                raise MsctlError(
+                    "BOOTSTRAP_REUSE_INVALID",
+                    "selected intents require one exact lease and bootstrap binding",
+                )
+            if bootstrap_receipt_sha256 is not None:
+                require_sha256(
+                    bootstrap_receipt_sha256,
+                    label="bootstrap reuse receipt",
+                )
+            lease_unit = "memorysplit-auto-terminate-" + canonical_sha256(
+                {
+                    "attempt": attempt,
+                    "operation": operation,
+                    "run_manifest_sha256": manifest.sha256,
+                    "seed": manifest.seed,
+                    "terminate_at": terminate_at,
+                }
+            )
+            steps.append(
+                {
+                    "name": "reset-termination-leases",
+                    "argv": list(_LEASE_RESET_ARGV),
+                }
+            )
+            steps.append(
+                {
+                    "name": "auto-termination",
+                    "argv": [
+                        "/usr/bin/systemd-run",
+                        "--unit",
+                        lease_unit,
+                        "--on-calendar",
+                        terminate_at,
+                        "/sbin/shutdown",
+                        "-h",
+                        "now",
+                    ],
+                }
+            )
+            if bootstrap_mode == "bootstrap":
+                steps.append(
+                    {
+                        "name": "prepare-aws-private-home",
+                        "argv": [
+                            "/usr/bin/install",
+                            "-d",
+                            "-m",
+                            "0700",
+                            "-o",
+                            "0",
+                            "-g",
+                            "0",
+                            _AWS_PRIVATE_HOME,
+                        ],
+                    }
+                )
+                # Full bootstrap syncs the release and dataset from S3 by
+                # itself after mounting the fresh RAID scratch root, so the
+                # legacy controller pre-staging steps (which a later mount
+                # would shadow) are intentionally absent.
+                steps.append(
+                    {
+                        "name": "bootstrap",
+                        "argv": [
+                            "/usr/bin/python3",
+                            "/opt/memorysplit/cluster/aws/p5/bootstrap.py",
+                            "--profile",
+                            (
+                                "/opt/memorysplit/cluster/profiles/"
+                                + launch_profile_name
+                            ),
+                            "--container-image",
+                            self.runtime.container_image,
+                            "--release-archive",
+                            (
+                                f"{staging}/releases/"
+                                f"{release.archive_sha256}/release.zip"
+                            ),
+                            "--release-sha256",
+                            release.archive_sha256,
+                            "--release-receipt",
+                            (
+                                f"{staging}/releases/"
+                                f"{release.archive_sha256}/RELEASE.json"
+                            ),
+                            "--release-receipt-sha256",
+                            release.receipt_sha256,
+                            "--dataset-receipt",
+                            "/mnt/memorysplit/dataset/receipt.json",
+                            "--dataset-receipt-sha256",
+                            dataset_receipt_sha256,
+                            "--cohort-assignment",
+                            (
+                                f"{staging}/releases/"
+                                f"{release.archive_sha256}/"
+                                "cohort-assignment-v3.json"
+                            ),
+                            "--cohort-assignment-sha256",
+                            manifest.cohort_assignment_sha256,
+                            "--code-commit",
+                            manifest.source_commit,
+                            "--receipt",
+                            f"{staging}/bootstrap-receipt.json",
+                            "--owner-uid",
+                            str(getattr(self.runtime, "uid", 1000)),
+                            "--owner-gid",
+                            str(getattr(self.runtime, "gid", 1000)),
+                            "--aws-private-home",
+                            _AWS_PRIVATE_HOME,
+                            "--authorize-destructive-instance-store",
+                            "--apply",
+                        ],
+                    }
+                )
+            else:
+                steps.append(
+                    {
+                        "name": "verify-bootstrap-reuse",
+                        "argv": [
+                            "/usr/bin/python3",
+                            "/opt/memorysplit/cluster/aws/p5/bootstrap.py",
+                            "--profile",
+                            (
+                                "/opt/memorysplit/cluster/profiles/"
+                                + launch_profile_name
+                            ),
+                            "--verify-reuse",
+                            "--receipt",
+                            f"{staging}/bootstrap-receipt.json",
+                            "--expected-receipt-sha256",
+                            str(bootstrap_receipt_sha256),
+                        ],
+                    }
+                )
+            if bootstrap_mode == "bootstrap" or operation == "submit":
+                steps.append(
+                    self._launcher_manifest_step(
+                        release=release,
+                        manifest=manifest,
+                        lifecycle_evidence=lifecycle_evidence,
+                        is_v3=is_v3,
+                        staging=staging,
+                    )
+                )
+        elif operation == "submit":
             assert terminate_at is not None
             steps.append(
                 {
@@ -962,7 +1290,7 @@ class AwsP5Backend:
                     ],
                 }
             )
-        if operation in {"render", "submit"}:
+        if not selected_lifecycle and operation in {"render", "submit"}:
             release_bucket, release_prefix = self._s3_location(
                 f"releases/{release.archive_sha256}/release.zip"
             )
@@ -1144,66 +1472,13 @@ class AwsP5Backend:
                 ]
             )
             steps.append(
-                {
-                    "name": "build-launcher-manifest",
-                    "argv": [
-                        "/usr/bin/python3",
-                        "/opt/memorysplit/msctl/aws_launch_manifest.py",
-                        "--out",
-                        f"{staging}/launcher-manifest-{manifest.sha256}.json",
-                        "--scratch-root",
-                        "/mnt/memorysplit",
-                        "--seed",
-                        str(manifest.seed),
-                        "--profile-sha256",
-                        self.profile.sha256,
-                        "--release-sha256",
-                        release.archive_sha256,
-                        "--release-members-sha256",
-                        getattr(release, "members_sha256", ""),
-                        *(
-                            [
-                                "--release-receipt-sha256",
-                                release.receipt_sha256,
-                                "--environment-receipt-sha256",
-                                lifecycle_evidence[
-                                    "environment_receipt_sha256"
-                                ],
-                                "--run-manifest-sha256",
-                                manifest.sha256,
-                                "--source-tree",
-                                manifest.source_tree,
-                            ]
-                            if is_v3
-                            else []
-                        ),
-                        "--cohort-assignment-sha256",
-                        manifest.cohort_assignment_sha256,
-                        "--code-commit",
-                        manifest.source_commit,
-                        "--bootstrap-receipt",
-                        f"{staging}/bootstrap-receipt.json",
-                        "--corpus-receipt",
-                        "/mnt/memorysplit/dataset/receipt.json",
-                        *(
-                            argument
-                            for run in sorted(
-                                manifest.runs,
-                                key=lambda row: row.arm,
-                            )
-                            for argument in (
-                                "--run",
-                                canonical_json(
-                                    {
-                                        "arm": run.arm,
-                                        "config": run.config,
-                                        "config_sha256": run.config_sha256,
-                                    }
-                                ).decode("ascii"),
-                            )
-                        ),
-                    ],
-                }
+                self._launcher_manifest_step(
+                    release=release,
+                    manifest=manifest,
+                    lifecycle_evidence=lifecycle_evidence,
+                    is_v3=is_v3,
+                    staging=staging,
+                )
             )
         checkpoint_binding = None
         if checkpoints is not None:
@@ -1367,14 +1642,7 @@ class AwsP5Backend:
                 "--manifest",
                 f"{staging}/launcher-manifest-{manifest.sha256}.json",
                 "--profile",
-                (
-                    f"{release_root}/cluster/profiles/"
-                    + (
-                        "aws-p5.48xlarge-v3.json"
-                        if is_v3
-                        else "aws-p5.48xlarge.json"
-                    )
-                ),
+                f"{release_root}/cluster/profiles/{launch_profile_name}",
                 "--repo-root",
                 release_root,
                 "--scratch-root",
@@ -1416,14 +1684,7 @@ class AwsP5Backend:
                 "--manifest",
                 f"{staging}/launcher-manifest-{manifest.sha256}.json",
                 "--profile",
-                (
-                    f"{release_root}/cluster/profiles/"
-                    + (
-                        "aws-p5.48xlarge-v3.json"
-                        if is_v3
-                        else "aws-p5.48xlarge.json"
-                    )
-                ),
+                f"{release_root}/cluster/profiles/{launch_profile_name}",
                 "--repo-root",
                 release_root,
                 "--scratch-root",
@@ -1431,15 +1692,6 @@ class AwsP5Backend:
                 "--apply",
             ]
         steps.append({"name": "paired-launch", "argv": launcher_argv})
-        selected_lifecycle = (
-            is_v3
-            and getattr(
-                manifest,
-                "provider_selection_sha256",
-                None,
-            )
-            is not None
-        )
         lifecycle_fields = (
             {
                 field: (
@@ -1478,8 +1730,20 @@ class AwsP5Backend:
             if selected_lifecycle
             else {}
         )
+        selected_bindings = (
+            {
+                "bootstrap": {
+                    "mode": bootstrap_mode,
+                    "receipt_sha256": bootstrap_receipt_sha256,
+                },
+                "lease_unit": lease_unit,
+            }
+            if selected_lifecycle
+            else {}
+        )
         return {
             **lifecycle_fields,
+            **selected_bindings,
             "schema_version": 3 if selected_lifecycle else 2 if is_v3 else 1,
             "operation": operation,
             "provider": getattr(
@@ -2073,6 +2337,282 @@ class AwsP5Backend:
             )
         return row
 
+    def _selected_identity_binding(self, manifest: object) -> dict[str, object]:
+        return {
+            "provider": manifest.provider,
+            "cohort_sha256": manifest.cohort_assignment_sha256,
+            "release_sha256": manifest.release_sha256,
+            "dataset_sha256": manifest.dataset_receipt_sha256,
+            "profile_sha256": self.profile.sha256,
+            "runtime_sha256": self._runtime_sha256(),
+            "container_digest": self.runtime.container_digest,
+            "selection_sha256": manifest.provider_selection_sha256,
+            "selection_version_id": (
+                manifest.provider_selection_version_id
+            ),
+        }
+
+    def _selected_identity_tags(self, manifest: object) -> str:
+        binding = self._selected_identity_binding(manifest)
+        return canonical_json(
+            [
+                {"Key": name, "Value": str(binding[field])}
+                for field, name in _SELECTED_IDENTITY_TAG_NAMES.items()
+            ]
+        ).decode("ascii")
+
+    @staticmethod
+    def _selected_identity_query() -> str:
+        tag_selectors = ",".join(
+            f"{field}:Tags[?Key=='{name}']|[0].Value"
+            for field, name in _SELECTED_IDENTITY_TAG_NAMES.items()
+        )
+        return (
+            "{instances:Reservations[].Instances[]."
+            "{instance_id:InstanceId,instance_type:InstanceType,"
+            "state:State.Name,instance_profile_arn:IamInstanceProfile.Arn,"
+            "ami_id:ImageId," + tag_selectors + "}}"
+        )
+
+    def _selected_identity_discover_argv(self, manifest: object) -> list[str]:
+        return self._aws_argv(
+            "ec2",
+            "describe-instances",
+            "--filters",
+            f"Name=tag:MemorySplitProvider,Values={manifest.provider}",
+            (
+                "Name=tag:MemorySplitReleaseSHA256,"
+                f"Values={manifest.release_sha256}"
+            ),
+            (
+                "Name=tag:MemorySplitSelectionSHA256,"
+                f"Values={manifest.provider_selection_sha256}"
+            ),
+            "Name=instance-state-name,Values=pending,running,stopping",
+            query=self._selected_identity_query(),
+        )
+
+    def _selected_identity_instance_argv(self, instance_id: str) -> list[str]:
+        if _INSTANCE_ID_RE.fullmatch(instance_id) is None:
+            raise MsctlError(
+                "INSTANCE_BINDING_MISMATCH",
+                "EC2 instance ID is invalid",
+            )
+        return self._aws_argv(
+            "ec2",
+            "describe-instances",
+            "--instance-ids",
+            instance_id,
+            query=self._selected_identity_query(),
+        )
+
+    def _parse_selected_identity_instance(
+        self,
+        output: object,
+        manifest: object,
+        *,
+        instance_id: str,
+        require_bound: bool,
+    ) -> dict[str, object]:
+        root = _aws_output_object(
+            output,
+            {"instances"},
+            label="selected identity instance output",
+        )
+        rows = _aws_output_list(
+            root["instances"],
+            label="selected identity instances",
+        )
+        if len(rows) != 1:
+            raise MsctlError(
+                "INSTANCE_BINDING_MISMATCH",
+                "selected cohort must resolve to exactly one instance",
+            )
+        row = _aws_output_object(
+            rows[0],
+            _SELECTED_IDENTITY_INSTANCE_FIELDS,
+            label="selected identity instance",
+        )
+        if (
+            row["instance_id"] != instance_id
+            or row["instance_type"] != self.profile.instance_type
+            or row["state"] != "running"
+            or row["instance_profile_arn"] != self.instance_profile_arn
+            or row["ami_id"] != self.runtime.ami_id
+        ):
+            raise MsctlError(
+                "INSTANCE_BINDING_MISMATCH",
+                "selected instance has the wrong immutable runtime",
+            )
+        expected = self._selected_identity_binding(manifest)
+        observed = {field: row[field] for field in expected}
+        if require_bound:
+            valid = observed == expected
+        else:
+            valid = observed == expected or all(
+                value is None for value in observed.values()
+            )
+        if not valid:
+            raise MsctlError(
+                "INSTANCE_BINDING_MISMATCH",
+                "selected instance has conflicting identity tags",
+            )
+        return row
+
+    def _discover_selected_identity_instances(
+        self,
+        manifest: object,
+    ) -> list[dict[str, object]]:
+        root = _aws_output_object(
+            self._run(
+                self._selected_identity_discover_argv(manifest),
+                operation="selected instance discovery",
+            ),
+            {"instances"},
+            label="selected identity discovery output",
+        )
+        expected = self._selected_identity_binding(manifest)
+        instances: list[dict[str, object]] = []
+        for index, raw in enumerate(
+            _aws_output_list(
+                root["instances"],
+                label="selected identity instances",
+            )
+        ):
+            row = _aws_output_object(
+                raw,
+                _SELECTED_IDENTITY_INSTANCE_FIELDS,
+                label=f"selected identity instance[{index}]",
+            )
+            if (
+                not isinstance(row["instance_id"], str)
+                or _INSTANCE_ID_RE.fullmatch(row["instance_id"]) is None
+                or row["instance_type"] != self.profile.instance_type
+                or row["state"] not in _ACTIVE_INSTANCE_STATES
+                or row["instance_profile_arn"] != self.instance_profile_arn
+                or any(
+                    row[field] != value for field, value in expected.items()
+                )
+            ):
+                raise MsctlError(
+                    "INSTANCE_BINDING_MISMATCH",
+                    "discovered instance does not match the cohort identity",
+                    details={"index": index},
+                )
+            instances.append(row)
+        if len(instances) > 1:
+            raise MsctlError(
+                "DUPLICATE_ACTIVE_SEED",
+                "multiple active instances claim one selected cohort",
+                details={
+                    "instance_ids": sorted(
+                        str(row["instance_id"]) for row in instances
+                    ),
+                },
+            )
+        return instances
+
+    def _bind_selected_identity_instance(
+        self,
+        manifest: object,
+        *,
+        instance_id: str,
+    ) -> dict[str, object]:
+        selected_argv = self._selected_identity_instance_argv(instance_id)
+        self._parse_selected_identity_instance(
+            self._run(selected_argv, operation="validate selected instance"),
+            manifest,
+            instance_id=instance_id,
+            require_bound=False,
+        )
+        modify = self._aws_argv(
+            "ec2",
+            "modify-instance-attribute",
+            "--instance-id",
+            instance_id,
+            "--instance-initiated-shutdown-behavior",
+            "Value=terminate",
+            query="{}",
+        )
+        _aws_output_object(
+            self._run(modify, operation="bind termination behavior"),
+            set(),
+            label="EC2 modify-instance-attribute output",
+        )
+        tag = self._aws_argv(
+            "ec2",
+            "create-tags",
+            "--resources",
+            instance_id,
+            "--tags",
+            self._selected_identity_tags(manifest),
+            query="{}",
+        )
+        _aws_output_object(
+            self._run(tag, operation="bind selected instance"),
+            set(),
+            label="EC2 create-tags output",
+        )
+        row = self._parse_selected_identity_instance(
+            self._run(selected_argv, operation="verify selected instance"),
+            manifest,
+            instance_id=instance_id,
+            require_bound=True,
+        )
+        self._require_terminate_shutdown_behavior(instance_id)
+        return row
+
+    def _require_terminate_shutdown_behavior(self, instance_id: str) -> None:
+        attribute = self._aws_argv(
+            "ec2",
+            "describe-instance-attribute",
+            "--instance-id",
+            instance_id,
+            "--attribute",
+            "instanceInitiatedShutdownBehavior",
+            query=(
+                "{attribute:{instance_id:InstanceId,"
+                "shutdown_behavior:InstanceInitiatedShutdownBehavior.Value}}"
+            ),
+        )
+        output = _aws_output_object(
+            self._run(attribute, operation="verify termination behavior"),
+            {"attribute"},
+            label="EC2 instance attribute output",
+        )
+        exact = _aws_output_object(
+            output["attribute"],
+            {"instance_id", "shutdown_behavior"},
+            label="EC2 shutdown behavior",
+        )
+        if exact != {
+            "instance_id": instance_id,
+            "shutdown_behavior": "terminate",
+        }:
+            raise MsctlError(
+                "INSTANCE_BINDING_MISMATCH",
+                "instance auto-termination behavior is not enforceable",
+            )
+
+    def _validate_selected_identity_instance(
+        self,
+        manifest: object,
+        *,
+        instance_id: str,
+        operation: str,
+    ) -> dict[str, object]:
+        row = self._parse_selected_identity_instance(
+            self._run(
+                self._selected_identity_instance_argv(instance_id),
+                operation=f"verify {operation} instance",
+            ),
+            manifest,
+            instance_id=instance_id,
+            require_bound=True,
+        )
+        self._require_terminate_shutdown_behavior(instance_id)
+        return row
+
     def _parse_instances(
         self,
         output: object,
@@ -2132,6 +2672,8 @@ class AwsP5Backend:
 
     def discover_instances(self, manifest: object) -> list[dict[str, object]]:
         self._validate_manifest(manifest)
+        if self._selected_manifest_lifecycle(manifest):
+            return self._discover_selected_identity_instances(manifest)
         return self._parse_instances(
             self._run(
                 self._discover_argv(manifest),
@@ -4474,6 +5016,361 @@ class AwsP5Backend:
             "collected": 1,
         }
 
+    def _selected_prior_run_receipt(
+        self,
+        manifest: object,
+        prior_run_receipt: Mapping[str, object] | None,
+    ) -> PriorRunReceiptRef | None:
+        """Validate the operator prior-receipt triple before any AWS call."""
+
+        if manifest.seed == 0:
+            if prior_run_receipt is not None:
+                raise MsctlError(
+                    "SEED_TRANSITION_BLOCKED",
+                    "seed 0 forbids a prior-seed finalization receipt",
+                )
+            return None
+        if (
+            not isinstance(prior_run_receipt, Mapping)
+            or set(prior_run_receipt) != {"uri", "sha256", "version_id"}
+        ):
+            raise MsctlError(
+                "SEED_TRANSITION_BLOCKED",
+                "seeds 1 through 9 require the exact prior receipt triple",
+            )
+        try:
+            return PriorRunReceiptRef(
+                uri=prior_run_receipt["uri"],
+                sha256=prior_run_receipt["sha256"],
+                version_id=prior_run_receipt["version_id"],
+            )
+        except SeedTransitionError as error:
+            raise MsctlError(
+                "SEED_TRANSITION_BLOCKED",
+                f"prior receipt triple is invalid: {error}",
+            ) from error
+
+    def _require_sequential_seed_transition(
+        self,
+        store: StateStore,
+        manifest: object,
+    ) -> None:
+        """Enforce one active pair and strictly increasing seeds."""
+
+        for manifest_sha256, journal in sorted(
+            store.read_all_aws_pairs().items()
+        ):
+            if manifest_sha256 == manifest.sha256:
+                continue
+            states = [
+                state
+                for state in journal["states"]
+                if isinstance(state, dict)
+            ]
+            if any(
+                state.get("status") not in _TERMINAL_COMMAND_STATES
+                for state in states
+            ):
+                raise MsctlError(
+                    "SEQUENTIAL_PAIR_ACTIVE",
+                    "another AWS pair is still active on this controller",
+                    details={"manifest_sha256": manifest_sha256},
+                )
+            if any(
+                isinstance(state.get("seed"), int)
+                and not isinstance(state.get("seed"), bool)
+                and state["seed"] >= manifest.seed
+                for state in states
+            ):
+                raise MsctlError(
+                    "SEED_TRANSITION_BLOCKED",
+                    "a later or equal seed already holds durable pair state",
+                    details={"manifest_sha256": manifest_sha256},
+                )
+
+    def _admit_selected_prior_finalization(
+        self,
+        manifest: object,
+        ref: PriorRunReceiptRef,
+    ) -> object:
+        """GET and authenticate the prior receipt, then HEAD all 14 objects."""
+
+        prefix = self.runtime.s3_root.rstrip("/") + "/"
+        if not ref.uri.startswith(prefix):
+            raise MsctlError(
+                "SEED_TRANSITION_BLOCKED",
+                "prior receipt is outside the pinned S3 root",
+            )
+        bucket, key = self._s3_location(ref.uri.removeprefix(prefix))
+        expected_checksum = base64.b64encode(
+            bytes.fromhex(ref.sha256)
+        ).decode("ascii")
+        with tempfile.TemporaryDirectory(
+            prefix="memorysplit-prior-receipt-",
+            dir=Path(tempfile.gettempdir()).resolve(),
+        ) as temporary:
+            destination = Path(temporary) / "receipt.json"
+            try:
+                output = _aws_output_object(
+                    self._run(
+                        self._aws_argv(
+                            "s3api",
+                            "get-object",
+                            "--bucket",
+                            bucket,
+                            "--key",
+                            key,
+                            "--version-id",
+                            ref.version_id,
+                            "--checksum-mode",
+                            "ENABLED",
+                            str(destination),
+                            query=(
+                                "{receipt:{checksum_sha256:ChecksumSHA256,"
+                                "version_id:VersionId}}"
+                            ),
+                        ),
+                        operation="fetch prior run finalization",
+                    ),
+                    {"receipt"},
+                    label="prior run receipt download",
+                )
+            except MsctlError as error:
+                if error.code == "AWS_COMMAND_FAILED":
+                    raise MsctlError(
+                        "SEED_TRANSITION_BLOCKED",
+                        "prior run finalization receipt is unavailable",
+                    ) from error
+                raise
+            row = _aws_output_object(
+                output["receipt"],
+                {"checksum_sha256", "version_id"},
+                label="prior run receipt object",
+            )
+            try:
+                payload = read_regular_input(
+                    destination,
+                    label="prior run receipt",
+                    maximum_bytes=16 * 1024 * 1024,
+                )
+            except (AttestationError, OSError) as error:
+                raise MsctlError(
+                    "SEED_TRANSITION_BLOCKED",
+                    "downloaded prior run receipt is unsafe",
+                ) from error
+        if (
+            row["checksum_sha256"] != expected_checksum
+            or row["version_id"] != ref.version_id
+            or hashlib.sha256(payload).hexdigest() != ref.sha256
+        ):
+            raise MsctlError(
+                "SEED_TRANSITION_BLOCKED",
+                "downloaded prior run receipt identity differs",
+            )
+        try:
+            admitted = admit_prior_seed_finalization(
+                payload,
+                ref=ref,
+                binding=self.lifecycle_binding,
+                release_sha256=manifest.release_sha256,
+                release_receipt_sha256=manifest.release_receipt_sha256,
+                dataset_receipt_sha256=manifest.dataset_receipt_sha256,
+                dataset_build_id=manifest.dataset_build_id,
+                ordered_stream_sha256=manifest.ordered_stream_sha256,
+                source_commit=manifest.source_commit,
+                source_tree=manifest.source_tree,
+                instance_id=manifest.instance_id,
+            )
+        except SeedTransitionError as error:
+            raise MsctlError(
+                "SEED_TRANSITION_BLOCKED",
+                str(error),
+            ) from error
+        for item in admitted.evidence:
+            if not item.uri.startswith(prefix):
+                raise MsctlError(
+                    "SEED_TRANSITION_BLOCKED",
+                    "prior evidence object is outside the pinned S3 root",
+                )
+            bucket, key = self._s3_location(item.uri.removeprefix(prefix))
+            try:
+                head_output = _aws_output_object(
+                    self._run(
+                        self._aws_argv(
+                            "s3api",
+                            "head-object",
+                            "--bucket",
+                            bucket,
+                            "--key",
+                            key,
+                            "--version-id",
+                            item.version_id,
+                            "--checksum-mode",
+                            "ENABLED",
+                            query=(
+                                "{object:{checksum_sha256:ChecksumSHA256,"
+                                "content_length:ContentLength,"
+                                "version_id:VersionId}}"
+                            ),
+                        ),
+                        operation="verify prior evidence object",
+                    ),
+                    {"object"},
+                    label="prior evidence head",
+                )
+            except MsctlError as error:
+                if error.code == "AWS_COMMAND_FAILED":
+                    raise MsctlError(
+                        "SEED_TRANSITION_BLOCKED",
+                        "prior evidence object is unavailable",
+                    ) from error
+                raise
+            head = _aws_output_object(
+                head_output["object"],
+                {"checksum_sha256", "content_length", "version_id"},
+                label="prior evidence object",
+            )
+            if (
+                head["checksum_sha256"]
+                != base64.b64encode(bytes.fromhex(item.sha256)).decode(
+                    "ascii"
+                )
+                or (
+                    item.bytes is not None
+                    and head["content_length"] != item.bytes
+                )
+                or head["version_id"] != item.version_id
+            ):
+                raise MsctlError(
+                    "SEED_TRANSITION_BLOCKED",
+                    "prior evidence object version or checksum differs",
+                    details={"uri": item.uri},
+                )
+        return admitted
+
+    def _resolve_selected_bootstrap_mode(
+        self,
+        release: object,
+        manifest: object,
+        *,
+        boot_id: str,
+    ) -> tuple[str, str | None]:
+        """Resolve bootstrap-once-per-boot from the durable S3 receipt."""
+
+        bucket, key = self._s3_location(
+            bootstrap_receipt_key(manifest.instance_id)
+        )
+        with tempfile.TemporaryDirectory(
+            prefix="memorysplit-bootstrap-receipt-",
+            dir=Path(tempfile.gettempdir()).resolve(),
+        ) as temporary:
+            destination = Path(temporary) / "bootstrap-receipt.json"
+            try:
+                self._run(
+                    self._aws_argv(
+                        "s3api",
+                        "get-object",
+                        "--bucket",
+                        bucket,
+                        "--key",
+                        key,
+                        "--checksum-mode",
+                        "ENABLED",
+                        str(destination),
+                        query=(
+                            "{receipt:{content_length:ContentLength,"
+                            "version_id:VersionId}}"
+                        ),
+                    ),
+                    operation="resolve bootstrap receipt",
+                )
+            except MsctlError as error:
+                if error.code == "AWS_COMMAND_FAILED":
+                    return "bootstrap", None
+                raise
+            try:
+                payload = read_regular_input(
+                    destination,
+                    label="durable bootstrap receipt",
+                    maximum_bytes=1024 * 1024,
+                )
+            except (AttestationError, OSError) as error:
+                raise MsctlError(
+                    "BOOTSTRAP_REUSE_INVALID",
+                    "downloaded bootstrap receipt is unsafe",
+                ) from error
+        try:
+            value = json.loads(
+                payload.decode("utf-8"),
+                object_pairs_hook=_strict_json_object,
+                parse_constant=lambda constant: (_ for _ in ()).throw(
+                    ValueError(f"non-finite JSON value: {constant}")
+                ),
+            )
+        except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as error:
+            raise MsctlError(
+                "BOOTSTRAP_REUSE_INVALID",
+                "durable bootstrap receipt is not valid JSON",
+            ) from error
+        if (
+            not isinstance(value, dict)
+            or set(value) != set(_BOOTSTRAP_RECEIPT_FIELDS)
+        ):
+            raise MsctlError(
+                "BOOTSTRAP_REUSE_INVALID",
+                "durable bootstrap receipt fields do not match the contract",
+            )
+        expected = {
+            "schema_version": 2,
+            "receipt_type": "aws-p5-bootstrap",
+            "instance_id": manifest.instance_id,
+            "profile_sha256": self.profile.sha256,
+            "provider": self.profile.provider,
+            "instance_type": self.profile.instance_type,
+            "scratch_root": self.profile.scratch_root,
+            "region": self.runtime.region,
+            "ami_id": self.runtime.ami_id,
+            "container_image": self.runtime.container_image,
+            "container_digest": self.runtime.container_digest,
+            "runtime_uid": getattr(self.runtime, "uid", 1000),
+            "runtime_gid": getattr(self.runtime, "gid", 1000),
+            "release_sha256": manifest.release_sha256,
+            "release_members_sha256": getattr(
+                release,
+                "members_sha256",
+                None,
+            ),
+            "release_root": f"releases/{manifest.release_sha256}",
+            "cohort_assignment_sha256": manifest.cohort_assignment_sha256,
+            "code_commit": manifest.source_commit,
+            "corpus_receipt_sha256": manifest.dataset_receipt_sha256,
+            "corpus_build_id": manifest.dataset_build_id,
+            "corpus_ordered_stream_sha256": manifest.ordered_stream_sha256,
+            "durable_upload_verified": True,
+        }
+        mismatched = sorted(
+            field
+            for field, expected_value in expected.items()
+            if value.get(field) != expected_value
+        )
+        if mismatched:
+            raise MsctlError(
+                "BOOTSTRAP_REUSE_INVALID",
+                "durable bootstrap receipt does not match this cohort",
+                details={"fields": mismatched},
+            )
+        if (
+            not isinstance(value["boot_id"], str)
+            or _BOOT_ID_RE.fullmatch(value["boot_id"]) is None
+        ):
+            raise MsctlError(
+                "BOOTSTRAP_REUSE_INVALID",
+                "durable bootstrap receipt boot identity is invalid",
+            )
+        if value["boot_id"] != boot_id:
+            return "bootstrap", None
+        return "reuse", hashlib.sha256(payload).hexdigest()
+
     def _new_aws_run_state(
         self,
         *,
@@ -4489,6 +5386,9 @@ class AwsP5Backend:
         checkpoint_receipt: object | None = None,
         checkpoints: Mapping[str, object] | None = None,
         prior_command_ids: list[str] | None = None,
+        bootstrap_mode: str | None = None,
+        bootstrap_receipt_sha256: str | None = None,
+        prior_run_receipt: Mapping[str, object] | None = None,
     ) -> dict[str, object]:
         now = _timestamp()
         is_v3 = getattr(manifest, "schema_version", None) == 3
@@ -4510,6 +5410,21 @@ class AwsP5Backend:
                             else getattr(manifest, field)
                         )
                         for field in LIFECYCLE_BINDING_FIELDS
+                    }
+                    if selected_lifecycle
+                    else {}
+                ),
+                **(
+                    {
+                        "bootstrap_mode": bootstrap_mode,
+                        "bootstrap_receipt_sha256": (
+                            bootstrap_receipt_sha256
+                        ),
+                        "prior_run_receipt": (
+                            dict(prior_run_receipt)
+                            if prior_run_receipt is not None
+                            else None
+                        ),
                     }
                     if selected_lifecycle
                     else {}
@@ -5037,23 +5952,81 @@ class AwsP5Backend:
         approval_path: Path | str | None,
         apply: bool,
         evidence: Mapping[str, str] | None = None,
+        bootstrap_mode: str | None = None,
+        prior_run_receipt: Mapping[str, object] | None = None,
     ) -> dict[str, object]:
         self._validate_manifest(manifest)
         self._validate_release(release, manifest)
+        selected = self._selected_manifest_lifecycle(manifest)
+        if not selected and (
+            bootstrap_mode is not None or prior_run_receipt is not None
+        ):
+            raise MsctlError(
+                "CLI_USAGE",
+                "bootstrap modes and prior receipts are selected-manifest "
+                "arguments",
+            )
         self._validate_submit_selection(instance_id, terminate_at)
-        core = self._training_operation_intent(
-            operation="submit",
-            release=release,
-            manifest=manifest,
-            terminate_at=terminate_at,
-            evidence=evidence,
-        )
-        operation_intent = self._operation_envelope(
-            core,
-            instance_id=instance_id,
-            terminate_at=terminate_at,
-        )
+        prior_ref: PriorRunReceiptRef | None = None
+        if selected:
+            if instance_id != manifest.instance_id:
+                raise MsctlError(
+                    "INSTANCE_BINDING_MISMATCH",
+                    "selected submit must target the authenticated cohort "
+                    "instance",
+                )
+            if bootstrap_mode not in {"bootstrap", "reuse"}:
+                raise MsctlError(
+                    "CLI_USAGE",
+                    "selected submit requires --bootstrap-mode bootstrap "
+                    "or reuse",
+                )
+            if evidence is None:
+                raise MsctlError(
+                    "LIFECYCLE_EVIDENCE_INVALID",
+                    "selected submit requires complete lifecycle evidence",
+                )
+            prior_ref = self._selected_prior_run_receipt(
+                manifest,
+                prior_run_receipt,
+            )
+        core: dict[str, object] | None = None
+        operation_intent: dict[str, object] | None = None
+        if not selected:
+            core = self._training_operation_intent(
+                operation="submit",
+                release=release,
+                manifest=manifest,
+                terminate_at=terminate_at,
+                evidence=evidence,
+            )
+            operation_intent = self._operation_envelope(
+                core,
+                instance_id=instance_id,
+                terminate_at=terminate_at,
+            )
         if not apply:
+            if selected:
+                return {
+                    "provider": manifest.provider,
+                    "seed": manifest.seed,
+                    "release_sha256": manifest.release_sha256,
+                    "run_manifest_sha256": manifest.sha256,
+                    "instance_id": instance_id,
+                    "terminate_at": terminate_at,
+                    "bootstrap_mode": bootstrap_mode,
+                    "prior_run_receipt": (
+                        dict(prior_run_receipt)
+                        if prior_run_receipt is not None
+                        else None
+                    ),
+                    "commands": [
+                        self._selected_identity_discover_argv(manifest),
+                        self._selected_identity_instance_argv(instance_id),
+                    ],
+                    "submitted": 0,
+                    "idempotent": False,
+                }
             plan = self._submission_plan(
                 manifest,
                 release=release,
@@ -5070,18 +6043,47 @@ class AwsP5Backend:
             instance_id=instance_id,
             terminate_at=terminate_at,
         )
-        resources.update(
-            {
-                field: core[field]
-                for field in (
-                    "dataset_pointer_sha256",
-                    "dataset_verification_sha256",
-                    "environment_receipt_sha256",
-                    *LIFECYCLE_BINDING_FIELDS,
-                )
-                if field in core
-            }
-        )
+        if selected:
+            resources.update(
+                {
+                    "dataset_pointer_sha256": evidence[
+                        "dataset_pointer_sha256"
+                    ],
+                    "dataset_verification_sha256": evidence[
+                        "dataset_verification_sha256"
+                    ],
+                    "environment_receipt_sha256": evidence[
+                        "environment_receipt_sha256"
+                    ],
+                    **{
+                        field: (
+                            list(manifest.arms)
+                            if field == "arms"
+                            else getattr(manifest, field)
+                        )
+                        for field in LIFECYCLE_BINDING_FIELDS
+                    },
+                    "bootstrap_mode": bootstrap_mode,
+                    "prior_run_receipt": (
+                        dict(prior_run_receipt)
+                        if prior_run_receipt is not None
+                        else None
+                    ),
+                }
+            )
+        else:
+            resources.update(
+                {
+                    field: core[field]
+                    for field in (
+                        "dataset_pointer_sha256",
+                        "dataset_verification_sha256",
+                        "environment_receipt_sha256",
+                        *LIFECYCLE_BINDING_FIELDS,
+                    )
+                    if field in core
+                }
+            )
         self._verify_approval(
             approval_path,
             operation="submit",
@@ -5103,6 +6105,55 @@ class AwsP5Backend:
                     raise MsctlError(
                         "STATE_INCOMPLETE",
                         "AWS paired lifecycle state is incomplete or conflicting",
+                    )
+                if selected:
+                    stored_modes = {
+                        state.get("bootstrap_mode") for state in existing
+                    }
+                    stored_priors = {
+                        canonical_json(state.get("prior_run_receipt"))
+                        for state in existing
+                    }
+                    declared_prior = (
+                        dict(prior_run_receipt)
+                        if prior_run_receipt is not None
+                        else None
+                    )
+                    if (
+                        stored_modes != {bootstrap_mode}
+                        or stored_priors
+                        != {canonical_json(declared_prior)}
+                    ):
+                        raise MsctlError(
+                            "BOOTSTRAP_REUSE_INVALID",
+                            "paired state binds a different bootstrap or "
+                            "prior receipt",
+                        )
+                    stored_receipt_hashes = {
+                        state.get("bootstrap_receipt_sha256")
+                        for state in existing
+                    }
+                    if len(stored_receipt_hashes) != 1:
+                        raise MsctlError(
+                            "STATE_INCOMPLETE",
+                            "paired state binds divergent bootstrap receipts",
+                        )
+                    core = self._training_operation_intent(
+                        operation="submit",
+                        release=release,
+                        manifest=manifest,
+                        terminate_at=terminate_at,
+                        evidence=evidence,
+                        attempt=1,
+                        bootstrap_mode=bootstrap_mode,
+                        bootstrap_receipt_sha256=next(
+                            iter(stored_receipt_hashes)
+                        ),
+                    )
+                    operation_intent = self._operation_envelope(
+                        core,
+                        instance_id=instance_id,
+                        terminate_at=terminate_at,
                     )
                 instance_ids = {state.get("instance_id") for state in existing}
                 deadlines = {state.get("terminate_at") for state in existing}
@@ -5219,6 +6270,46 @@ class AwsP5Backend:
                     "active": status in _ACTIVE_COMMAND_STATES,
                 }
 
+            bootstrap_receipt_sha256: str | None = None
+            if selected:
+                self._require_sequential_seed_transition(store, manifest)
+                if prior_ref is not None:
+                    self._admit_selected_prior_finalization(
+                        manifest,
+                        prior_ref,
+                    )
+                resolved_mode, bootstrap_receipt_sha256 = (
+                    self._resolve_selected_bootstrap_mode(
+                        release,
+                        manifest,
+                        boot_id=str(evidence["boot_id"]),
+                    )
+                )
+                if resolved_mode != bootstrap_mode:
+                    raise MsctlError(
+                        "BOOTSTRAP_REUSE_INVALID",
+                        "declared bootstrap mode differs from the resolved "
+                        "durable receipt",
+                        details={
+                            "declared": bootstrap_mode,
+                            "resolved": resolved_mode,
+                        },
+                    )
+                core = self._training_operation_intent(
+                    operation="submit",
+                    release=release,
+                    manifest=manifest,
+                    terminate_at=terminate_at,
+                    evidence=evidence,
+                    attempt=1,
+                    bootstrap_mode=bootstrap_mode,
+                    bootstrap_receipt_sha256=bootstrap_receipt_sha256,
+                )
+                operation_intent = self._operation_envelope(
+                    core,
+                    instance_id=instance_id,
+                    terminate_at=terminate_at,
+                )
             discovered = self.discover_instances(manifest)
             if discovered:
                 if discovered[0]["instance_id"] != instance_id:
@@ -5230,29 +6321,47 @@ class AwsP5Backend:
                             "discovered_instance_id": discovered[0]["instance_id"],
                         },
                     )
-                raise MsctlError(
-                    "RUN_ALREADY_ACTIVE",
-                    "an active instance already claims this seed without paired state",
-                    details={"instance_id": discovered[0]["instance_id"]},
+                if not selected:
+                    raise MsctlError(
+                        "RUN_ALREADY_ACTIVE",
+                        "an active instance already claims this seed without paired state",
+                        details={"instance_id": discovered[0]["instance_id"]},
+                    )
+            if selected:
+                self._parse_selected_identity_instance(
+                    self._run(
+                        self._selected_identity_instance_argv(instance_id),
+                        operation="preflight selected instance",
+                    ),
+                    manifest,
+                    instance_id=instance_id,
+                    require_bound=False,
                 )
-            selected_argv = self._selected_instance_argv(instance_id)
-            self._parse_selected_instance(
-                self._run(
-                    selected_argv,
-                    operation="preflight selected instance",
-                ),
-                manifest,
-                instance_id=instance_id,
-                terminate_at=terminate_at,
-                require_bound=False,
-            )
+            else:
+                selected_argv = self._selected_instance_argv(instance_id)
+                self._parse_selected_instance(
+                    self._run(
+                        selected_argv,
+                        operation="preflight selected instance",
+                    ),
+                    manifest,
+                    instance_id=instance_id,
+                    terminate_at=terminate_at,
+                    require_bound=False,
+                )
             self._require_ssm_online(instance_id)
             self._ensure_argv_document()
-            self._bind_selected_instance(
-                manifest,
-                instance_id=instance_id,
-                terminate_at=terminate_at,
-            )
+            if selected:
+                self._bind_selected_identity_instance(
+                    manifest,
+                    instance_id=instance_id,
+                )
+            else:
+                self._bind_selected_instance(
+                    manifest,
+                    instance_id=instance_id,
+                    terminate_at=terminate_at,
+                )
             published = self._publish_operation_intent(operation_intent)
             new_states = [
                 self._new_aws_run_state(
@@ -5264,6 +6373,9 @@ class AwsP5Backend:
                         intent=operation_intent,
                         published=published,
                         attempt=1,
+                        bootstrap_mode=bootstrap_mode,
+                        bootstrap_receipt_sha256=bootstrap_receipt_sha256,
+                        prior_run_receipt=prior_run_receipt,
                 )
                 for run in manifest.runs
             ]
@@ -5613,9 +6725,39 @@ class AwsP5Backend:
         approval_path: Path | str | None,
         apply: bool,
         evidence: Mapping[str, str] | None = None,
+        terminate_at: str | None = None,
+        bootstrap_mode: str | None = None,
     ) -> dict[str, object]:
         self._validate_manifest(manifest)
         self._validate_release(release, manifest)
+        selected = self._selected_manifest_lifecycle(manifest)
+        if not selected and (
+            terminate_at is not None or bootstrap_mode is not None
+        ):
+            raise MsctlError(
+                "CLI_USAGE",
+                "fresh deadlines and bootstrap modes are selected-manifest "
+                "arguments",
+            )
+        fresh_deadline: str | None = None
+        if selected:
+            if not isinstance(terminate_at, str):
+                raise MsctlError(
+                    "TERMINATION_DEADLINE_INVALID",
+                    "selected resume requires a fresh operator termination "
+                    "deadline",
+                )
+            if bootstrap_mode not in {"bootstrap", "reuse"}:
+                raise MsctlError(
+                    "CLI_USAGE",
+                    "selected resume requires --bootstrap-mode bootstrap "
+                    "or reuse",
+                )
+            self._validate_submit_selection(
+                manifest.instance_id,
+                terminate_at,
+            )
+            fresh_deadline = terminate_at
         is_v3 = getattr(manifest, "schema_version", None) == 3
         if is_v3:
             if evidence is None or set(evidence) != {
@@ -5660,24 +6802,42 @@ class AwsP5Backend:
                 apply=False,
             )
         )
-        operation_intent = self._training_operation_intent(
-            operation="resume",
-            release=release,
-            manifest=manifest,
-            checkpoints=checkpoints,
-            checkpoint_receipt_sha256=checkpoint_receipt.sha256,
-            checkpoint_receipt_uri=(
-                checkpoint_receipt.uri if is_v3 else None
-            ),
-            checkpoint_receipt_version_id=(
-                checkpoint_receipt.version_id if is_v3 else None
-            ),
-            checkpoint_receipt_bytes=(
-                checkpoint_receipt.bytes if is_v3 else None
-            ),
-            evidence=evidence,
-        )
+        operation_intent: dict[str, object] | None = None
+        if not selected:
+            operation_intent = self._training_operation_intent(
+                operation="resume",
+                release=release,
+                manifest=manifest,
+                checkpoints=checkpoints,
+                checkpoint_receipt_sha256=checkpoint_receipt.sha256,
+                checkpoint_receipt_uri=(
+                    checkpoint_receipt.uri if is_v3 else None
+                ),
+                checkpoint_receipt_version_id=(
+                    checkpoint_receipt.version_id if is_v3 else None
+                ),
+                checkpoint_receipt_bytes=(
+                    checkpoint_receipt.bytes if is_v3 else None
+                ),
+                evidence=evidence,
+            )
         if not apply:
+            if selected:
+                return {
+                    "provider": manifest.provider,
+                    "seed": manifest.seed,
+                    "run_manifest_sha256": manifest.sha256,
+                    "checkpoint_receipt_sha256": checkpoint_receipt.sha256,
+                    "checkpoint_receipt_uri": checkpoint_receipt.uri,
+                    "checkpoint_receipt_version_id": (
+                        checkpoint_receipt.version_id
+                    ),
+                    "checkpoint_objects": checkpoint_publication["objects"],
+                    "terminate_at": fresh_deadline,
+                    "bootstrap_mode": bootstrap_mode,
+                    "submitted": 0,
+                    "idempotent": False,
+                }
             return {
                 "provider": AWS_P5_PROFILE,
                 "seed": manifest.seed,
@@ -5704,6 +6864,45 @@ class AwsP5Backend:
                 "APPROVAL_REQUIRED",
                 "resume apply requires an explicit signed approval receipt",
             )
+        if selected:
+            resume_resources = self._resume_resources(
+                release=release,
+                manifest=manifest,
+                instance_id=manifest.instance_id,
+                terminate_at=str(fresh_deadline),
+                checkpoint_receipt_sha256=checkpoint_receipt.sha256,
+                checkpoint_receipt=checkpoint_receipt,
+                checkpoints=checkpoints,
+            )
+            resume_resources.update(
+                {
+                    "dataset_pointer_sha256": evidence[
+                        "dataset_pointer_sha256"
+                    ],
+                    "dataset_verification_sha256": evidence[
+                        "dataset_verification_sha256"
+                    ],
+                    "environment_receipt_sha256": evidence[
+                        "environment_receipt_sha256"
+                    ],
+                    **{
+                        field: (
+                            list(manifest.arms)
+                            if field == "arms"
+                            else getattr(manifest, field)
+                        )
+                        for field in LIFECYCLE_BINDING_FIELDS
+                    },
+                    "bootstrap_mode": bootstrap_mode,
+                }
+            )
+            self._verify_approval(
+                approval_path,
+                operation="resume",
+                release=release,
+                manifest=manifest,
+                resources=resume_resources,
+            )
 
         store = StateStore(self.state_root)
         with store.locked():
@@ -5722,9 +6921,14 @@ class AwsP5Backend:
                     "RUN_ID_CONFLICT",
                     "AWS resume state has different provenance",
                 )
+            expected_environment_receipt = (
+                str(evidence["environment_receipt_sha256"])
+                if selected
+                else operation_intent["environment_receipt_sha256"]
+            )
             if {
                 state.get("environment_receipt_sha256") for state in present
-            } != {operation_intent["environment_receipt_sha256"]}:
+            } != {expected_environment_receipt}:
                 raise MsctlError(
                     "ENVIRONMENT_RECEIPT_MISMATCH",
                     "AWS resume must reuse the authenticated launch receipt",
@@ -5736,58 +6940,66 @@ class AwsP5Backend:
                     "AWS paired state does not bind one instance",
                 )
             instance_id = str(next(iter(instance_ids)))
-            deadlines = {state.get("terminate_at") for state in present}
-            if len(deadlines) != 1 or not isinstance(
-                next(iter(deadlines)),
-                str,
-            ):
-                raise MsctlError(
-                    "SUBMISSION_UNCERTAIN",
-                    "AWS resume requires one bound termination deadline",
-                )
-            terminate_at = str(next(iter(deadlines)))
-            self._validate_submit_selection(instance_id, terminate_at)
-            self._validate_selected_instance_binding(
-                manifest,
-                instance_id=instance_id,
-                terminate_at=terminate_at,
-                operation="resume",
-            )
-            resume_resources = self._resume_resources(
-                release=release,
-                manifest=manifest,
-                instance_id=instance_id,
-                terminate_at=terminate_at,
-                checkpoint_receipt_sha256=checkpoint_receipt.sha256,
-                checkpoint_receipt=(
-                    checkpoint_receipt if is_v3 else None
-                ),
-                checkpoints=checkpoints if is_v3 else None,
-            )
-            resume_resources.update(
-                {
-                    field: operation_intent[field]
-                    for field in (
-                        "dataset_pointer_sha256",
-                        "dataset_verification_sha256",
-                        "environment_receipt_sha256",
-                        *LIFECYCLE_BINDING_FIELDS,
+            if selected:
+                if instance_id != manifest.instance_id:
+                    raise MsctlError(
+                        "INSTANCE_BINDING_MISMATCH",
+                        "paired state binds a different cohort instance",
                     )
-                    if field in operation_intent
-                }
-            )
-            self._verify_approval(
-                approval_path,
-                operation="resume",
-                release=release,
-                manifest=manifest,
-                resources=resume_resources,
-            )
-            operation_intent = self._operation_envelope(
-                operation_intent,
-                instance_id=instance_id,
-                terminate_at=terminate_at,
-            )
+                terminate_at = str(fresh_deadline)
+            else:
+                deadlines = {state.get("terminate_at") for state in present}
+                if len(deadlines) != 1 or not isinstance(
+                    next(iter(deadlines)),
+                    str,
+                ):
+                    raise MsctlError(
+                        "SUBMISSION_UNCERTAIN",
+                        "AWS resume requires one bound termination deadline",
+                    )
+                terminate_at = str(next(iter(deadlines)))
+                self._validate_submit_selection(instance_id, terminate_at)
+                self._validate_selected_instance_binding(
+                    manifest,
+                    instance_id=instance_id,
+                    terminate_at=terminate_at,
+                    operation="resume",
+                )
+                resume_resources = self._resume_resources(
+                    release=release,
+                    manifest=manifest,
+                    instance_id=instance_id,
+                    terminate_at=terminate_at,
+                    checkpoint_receipt_sha256=checkpoint_receipt.sha256,
+                    checkpoint_receipt=(
+                        checkpoint_receipt if is_v3 else None
+                    ),
+                    checkpoints=checkpoints if is_v3 else None,
+                )
+                resume_resources.update(
+                    {
+                        field: operation_intent[field]
+                        for field in (
+                            "dataset_pointer_sha256",
+                            "dataset_verification_sha256",
+                            "environment_receipt_sha256",
+                            *LIFECYCLE_BINDING_FIELDS,
+                        )
+                        if field in operation_intent
+                    }
+                )
+                self._verify_approval(
+                    approval_path,
+                    operation="resume",
+                    release=release,
+                    manifest=manifest,
+                    resources=resume_resources,
+                )
+                operation_intent = self._operation_envelope(
+                    operation_intent,
+                    instance_id=instance_id,
+                    terminate_at=terminate_at,
+                )
 
             v3_receipt_binding = (
                 {
@@ -5841,7 +7053,50 @@ class AwsP5Backend:
                 )
                 for state in present
             )
+            if selected:
+                repeated = repeated and all(
+                    state.get("terminate_at") == terminate_at
+                    and state.get("bootstrap_mode") == bootstrap_mode
+                    for state in present
+                )
             if repeated:
+                if selected:
+                    attempts = {state.get("attempt") for state in present}
+                    receipt_hashes = {
+                        state.get("bootstrap_receipt_sha256")
+                        for state in present
+                    }
+                    if (
+                        len(attempts) != 1
+                        or len(receipt_hashes) != 1
+                        or type(next(iter(attempts))) is not int
+                    ):
+                        raise MsctlError(
+                            "STATE_INCOMPLETE",
+                            "paired resume state binds divergent replays",
+                        )
+                    core = self._training_operation_intent(
+                        operation="resume",
+                        release=release,
+                        manifest=manifest,
+                        terminate_at=terminate_at,
+                        checkpoints=checkpoints,
+                        checkpoint_receipt_sha256=checkpoint_receipt.sha256,
+                        checkpoint_receipt_uri=checkpoint_receipt.uri,
+                        checkpoint_receipt_version_id=(
+                            checkpoint_receipt.version_id
+                        ),
+                        checkpoint_receipt_bytes=checkpoint_receipt.bytes,
+                        evidence=evidence,
+                        attempt=next(iter(attempts)),
+                        bootstrap_mode=bootstrap_mode,
+                        bootstrap_receipt_sha256=next(iter(receipt_hashes)),
+                    )
+                    operation_intent = self._operation_envelope(
+                        core,
+                        instance_id=instance_id,
+                        terminate_at=terminate_at,
+                    )
                 self._require_state_intent_binding(
                     present,
                     operation_intent,
@@ -5922,6 +7177,46 @@ class AwsP5Backend:
                     "idempotent": True,
                 }
 
+            resolved_receipt_sha256: str | None = None
+            if selected:
+                self._require_sequential_seed_transition(store, manifest)
+                stored_prior = present[0].get("prior_run_receipt")
+                if manifest.seed > 0:
+                    stored_ref = self._selected_prior_run_receipt(
+                        manifest,
+                        stored_prior,
+                    )
+                    self._admit_selected_prior_finalization(
+                        manifest,
+                        stored_ref,
+                    )
+                elif stored_prior is not None:
+                    raise MsctlError(
+                        "SEED_TRANSITION_BLOCKED",
+                        "seed 0 state must not bind a prior run receipt",
+                    )
+                resolved_mode, resolved_receipt_sha256 = (
+                    self._resolve_selected_bootstrap_mode(
+                        release,
+                        manifest,
+                        boot_id=str(evidence["boot_id"]),
+                    )
+                )
+                if resolved_mode != bootstrap_mode:
+                    raise MsctlError(
+                        "BOOTSTRAP_REUSE_INVALID",
+                        "declared bootstrap mode differs from the resolved "
+                        "durable receipt",
+                        details={
+                            "declared": bootstrap_mode,
+                            "resolved": resolved_mode,
+                        },
+                    )
+                self._validate_selected_identity_instance(
+                    manifest,
+                    instance_id=instance_id,
+                    operation="resume",
+                )
             previous_commands = {
                 state.get("command_id") for state in present
             }
@@ -5954,6 +7249,29 @@ class AwsP5Backend:
             self._require_ssm_online(instance_id)
             self._ensure_argv_document()
             attempt = max(int(state.get("attempt", 1)) for state in present) + 1
+            if selected:
+                core = self._training_operation_intent(
+                    operation="resume",
+                    release=release,
+                    manifest=manifest,
+                    terminate_at=terminate_at,
+                    checkpoints=checkpoints,
+                    checkpoint_receipt_sha256=checkpoint_receipt.sha256,
+                    checkpoint_receipt_uri=checkpoint_receipt.uri,
+                    checkpoint_receipt_version_id=(
+                        checkpoint_receipt.version_id
+                    ),
+                    checkpoint_receipt_bytes=checkpoint_receipt.bytes,
+                    evidence=evidence,
+                    attempt=attempt,
+                    bootstrap_mode=bootstrap_mode,
+                    bootstrap_receipt_sha256=resolved_receipt_sha256,
+                )
+                operation_intent = self._operation_envelope(
+                    core,
+                    instance_id=instance_id,
+                    terminate_at=terminate_at,
+                )
             if not is_v3:
                 self._checkpoint_publication(
                     checkpoint_receipt=checkpoint_receipt,
@@ -5999,6 +7317,17 @@ class AwsP5Backend:
                         ],
                         "send_attempted": False,
                         **checkpoint_state,
+                        **(
+                            {
+                                "terminate_at": terminate_at,
+                                "bootstrap_mode": bootstrap_mode,
+                                "bootstrap_receipt_sha256": (
+                                    resolved_receipt_sha256
+                                ),
+                            }
+                            if selected
+                            else {}
+                        ),
                         "prior_command_ids": prior,
                         "updated_at": now,
                     }
@@ -6921,6 +8250,57 @@ class AwsP5Backend:
                     evidence=evidence,
                 )
             if command == "submit":
+                selected = self._selected_manifest_lifecycle(manifest)
+                prior_values = (
+                    getattr(args, "prior_run_receipt_uri", None),
+                    getattr(args, "prior_run_receipt_sha256", None),
+                    getattr(args, "prior_run_receipt_version_id", None),
+                )
+                declared_mode = getattr(args, "bootstrap_mode", None)
+                if not selected and (
+                    declared_mode is not None
+                    or any(value is not None for value in prior_values)
+                ):
+                    raise MsctlError(
+                        "CLI_USAGE",
+                        "bootstrap and prior-receipt arguments require a "
+                        "selected manifest",
+                    )
+                if selected and declared_mode is None:
+                    raise MsctlError(
+                        "CLI_USAGE",
+                        "selected submit requires --bootstrap-mode",
+                    )
+                prior_run_receipt = None
+                if any(value is not None for value in prior_values):
+                    if any(value is None for value in prior_values):
+                        raise MsctlError(
+                            "CLI_USAGE",
+                            "the prior receipt triple requires URI, SHA-256, "
+                            "and version ID together",
+                        )
+                    prior_run_receipt = {
+                        "uri": str(prior_values[0]),
+                        "sha256": str(prior_values[1]),
+                        "version_id": str(prior_values[2]),
+                    }
+                if (
+                    selected
+                    and manifest.seed > 0
+                    and prior_run_receipt is None
+                ):
+                    raise MsctlError(
+                        "CLI_USAGE",
+                        "selected seeds 1 through 9 require the prior "
+                        "receipt triple",
+                        details={
+                            "missing": [
+                                "--prior-run-receipt-uri",
+                                "--prior-run-receipt-sha256",
+                                "--prior-run-receipt-version-id",
+                            ]
+                        },
+                    )
                 return not args.apply, self.submit(
                     release=release,
                     manifest=manifest,
@@ -6929,6 +8309,8 @@ class AwsP5Backend:
                     approval_path=args.approval,
                     apply=args.apply,
                     evidence=evidence,
+                    bootstrap_mode=declared_mode,
+                    prior_run_receipt=prior_run_receipt,
                 )
             if command == "status":
                 return False, self.status(
@@ -6983,6 +8365,35 @@ class AwsP5Backend:
                         release=release,
                         manifest=manifest,
                     )
+                selected = self._selected_manifest_lifecycle(manifest)
+                resume_deadline = getattr(args, "terminate_at", None)
+                resume_mode = getattr(args, "bootstrap_mode", None)
+                if not selected and (
+                    resume_deadline is not None or resume_mode is not None
+                ):
+                    raise MsctlError(
+                        "CLI_USAGE",
+                        "fresh deadlines and bootstrap modes require a "
+                        "selected manifest",
+                    )
+                if selected and (
+                    resume_deadline is None or resume_mode is None
+                ):
+                    raise MsctlError(
+                        "CLI_USAGE",
+                        "selected resume requires fresh --terminate-at and "
+                        "--bootstrap-mode",
+                        details={
+                            "missing": [
+                                name
+                                for name, value in (
+                                    ("--terminate-at", resume_deadline),
+                                    ("--bootstrap-mode", resume_mode),
+                                )
+                                if value is None
+                            ]
+                        },
+                    )
                 return not args.apply, self.resume(
                     release=release,
                     manifest=manifest,
@@ -6990,6 +8401,8 @@ class AwsP5Backend:
                     approval_path=args.approval,
                     apply=args.apply,
                     evidence=evidence,
+                    terminate_at=resume_deadline,
+                    bootstrap_mode=resume_mode,
                 )
             if command == "cancel":
                 return not args.apply, self.cancel(

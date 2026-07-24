@@ -137,6 +137,26 @@ def test_run_finalization_and_its_runtime_dependencies_are_required():
     )
 
 
+def test_seed_transition_and_bootstrap_closure_is_required():
+    module = _load_module()
+
+    transition_members = {
+        "msctl/aws_seed_transition.py",
+        # On-instance bootstrap executed and reuse-verified by selected
+        # schema-3 intents.
+        "cluster/aws/p5/bootstrap.py",
+        # Runtime dependencies imported by the transition module.
+        "cluster/aws/p5/run_finalization.py",
+        "msctl/aws_contracts.py",
+        "msctl/aws_lifecycle.py",
+    }
+    assert transition_members <= module.REQUIRED_MEMBERS
+    assert all(
+        module._classification(path) == "included"
+        for path in transition_members
+    )
+
+
 def test_authenticated_package_metadata_comes_only_from_fixed_authority(
     tmp_path,
     monkeypatch,
@@ -504,6 +524,9 @@ def _minimal_repo(
         "cluster/profiles/aws-p5.48xlarge-v3.json": _canonical_json(_profile()),
         "cluster/profiles/aws-p5.48xlarge.json": _canonical_json(_v2_profile()),
         "cluster/aws/p5/bootstrap.sh": "#!/bin/sh\nset -eu\n",
+        "cluster/aws/p5/bootstrap.py": (
+            "#!/usr/bin/env python3\nraise SystemExit(0)\n"
+        ),
         "cluster/aws/p5/attest_environment.py": (
             "#!/usr/bin/env python3\nraise SystemExit(0)\n"
         ),
@@ -534,6 +557,7 @@ def _minimal_repo(
         "msctl/aws_argv.py": "ARGV_FORMAT = 2\n",
         "msctl/aws_launch_manifest.py": "MANIFEST_FORMAT = 2\n",
         "msctl/aws_resume_launch.py": "RESUME_FORMAT = 3\n",
+        "msctl/aws_seed_transition.py": "TRANSITION_FORMAT = 1\n",
         "msctl/aws_contracts.py": (
             REPO_ROOT / "msctl" / "aws_contracts.py"
         ).read_bytes(),
