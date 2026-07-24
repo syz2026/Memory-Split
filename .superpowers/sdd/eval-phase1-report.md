@@ -187,3 +187,52 @@ corpus-generation, IaC, packaging, or runbook file was added or changed.
 At final review verification the host volume had 13 GiB available and reported
 94% utilization, so the earlier phase-one storage concern is no longer active.
 There are no remaining review-fix concerns.
+
+## Second re-review addendum
+
+- Second re-review status: `DONE`.
+- Fix commit: `d1c6921c59bec549f766f4f52dcb2a4a2e2d777e`.
+
+### Gaps closed
+
+1. Restored the shared v2 `PairMetricSummary` validation to its historical
+   `sum(rate.value) / 4` floating aggregation, preserving valid serialized v2
+   bytes. The separate `exact_primary_accuracy` property remains the
+   authoritative rational path for v3 paired deltas. The `(0, 0, 1, 2/3)`
+   regression proves the legacy float differs from `float(Fraction(5, 12))`
+   and that both paths retain their intended identities.
+2. `PracticalEquivalenceBounds` now recomputes the frozen exact nearest-rank
+   90% interval from all 20,000 replicates and requires the claimed bounds to
+   match. Its existing contract checks continue to bind PCG64, RNG seed 0,
+   draw count 20,000, and confidence 0.90.
+3. Checkpoint receipt uniqueness now ignores version-ID differences and
+   compares the content-addressed `(receipt_sha256, receipt_key)` identity.
+   A new version ID therefore cannot disguise reuse at another seed/step.
+
+### Second re-review RED to GREEN
+
+```text
+legacy v2 floating aggregation
+RED: 1 failed in 0.16s
+GREEN: 1 passed in 0.12s
+
+recomputed practical-equivalence bounds
+RED: 1 failed in 0.18s
+GREEN: 1 passed in 0.20s
+
+receipt content alias with a different version
+RED: 1 failed in 0.15s
+GREEN: 1 passed in 0.10s
+
+focused v3 suite plus three regressions
+62 passed in 7.04s
+
+bounded v2 confirmatory + aws_contracts regressions
+156 passed in 30.56s
+```
+
+`python -m py_compile` passed for the three changed production modules and
+three focused test modules. `git diff --check` passed. Changes remained within
+`inference.py`, `metrics.py`, `study_lock.py`, and their three focused tests;
+the phase-one exclusions remained untouched. There are no second re-review
+concerns.
