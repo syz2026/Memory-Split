@@ -1378,39 +1378,69 @@ def _create_spool(stage_fd: int) -> _PinnedSpool:
         identity = _regular_inode_identity(pinned)
         if _regular_inode_identity(named) != identity:
             raise ValueError("SQLite spool identity drift before open")
-        _spool_open_hook(
-            "before_sqlite_open",
-            stage_fd,
-            _CATALOG_SPOOL_NAME,
-            descriptor,
-        )
         named_before_open = entry_lstat(stage_fd, _CATALOG_SPOOL_NAME)
         if _regular_inode_identity(named_before_open) != identity:
             raise ValueError("SQLite spool namespace identity drift before open")
-        cwd_fd = os.open(
-            ".",
-            os.O_RDONLY
-            | getattr(os, "O_CLOEXEC", 0)
-            | getattr(os, "O_DIRECTORY", 0),
-        )
-        try:
-            with _SQLITE_OPEN_LOCK:
+        with _SQLITE_OPEN_LOCK:
+            _spool_open_hook(
+                "before_sqlite_open",
+                stage_fd,
+                _CATALOG_SPOOL_NAME,
+                descriptor,
+            )
+            _spool_open_hook(
+                "before_cwd_snapshot",
+                stage_fd,
+                _CATALOG_SPOOL_NAME,
+                descriptor,
+            )
+            cwd_fd = os.open(
+                ".",
+                os.O_RDONLY
+                | getattr(os, "O_CLOEXEC", 0)
+                | getattr(os, "O_DIRECTORY", 0),
+            )
+            _spool_open_hook(
+                "after_cwd_snapshot",
+                stage_fd,
+                _CATALOG_SPOOL_NAME,
+                descriptor,
+            )
+            try:
                 os.fchdir(stage_fd)
+                _spool_open_hook(
+                    "after_stage_fchdir",
+                    stage_fd,
+                    _CATALOG_SPOOL_NAME,
+                    descriptor,
+                )
+                connection = sqlite3.connect(
+                    f"file:{_CATALOG_SPOOL_NAME}?mode=rw",
+                    uri=True,
+                )
+                _spool_open_hook(
+                    "sqlite_opened",
+                    stage_fd,
+                    _CATALOG_SPOOL_NAME,
+                    descriptor,
+                )
+            finally:
                 try:
-                    connection = sqlite3.connect(
-                        f"file:{_CATALOG_SPOOL_NAME}?mode=rw",
-                        uri=True,
-                    )
-                finally:
                     os.fchdir(cwd_fd)
-        finally:
-            os.close(cwd_fd)
-        _spool_open_hook(
-            "after_sqlite_open",
-            stage_fd,
-            _CATALOG_SPOOL_NAME,
-            descriptor,
-        )
+                finally:
+                    os.close(cwd_fd)
+                _spool_open_hook(
+                    "cwd_restored",
+                    stage_fd,
+                    _CATALOG_SPOOL_NAME,
+                    descriptor,
+                )
+            _spool_open_hook(
+                "after_sqlite_open",
+                stage_fd,
+                _CATALOG_SPOOL_NAME,
+                descriptor,
+            )
         named_after_open = entry_lstat(stage_fd, _CATALOG_SPOOL_NAME)
         if (
             _regular_inode_identity(os.fstat(descriptor)) != identity

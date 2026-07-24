@@ -5,6 +5,7 @@ import inspect
 import json
 import os
 import sys
+import threading
 import tracemalloc
 from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass, replace
@@ -1118,6 +1119,272 @@ def test_sqlite_spool_namespace_swap_fails_and_preserves_both_inodes(
     stage = next(path for path in retained if path.is_dir())
     assert (stage / ".attacker-original-spool").is_file()
     assert (stage / ".catalog-spool.sqlite3").is_file()
+
+
+def test_concurrent_spool_open_cannot_snapshot_another_stage_cwd(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    origin = tmp_path / "origin"
+    stage_a = tmp_path / "stage-a"
+    stage_b = tmp_path / "stage-b"
+    origin.mkdir()
+    stage_a.mkdir()
+    stage_b.mkdir()
+    monkeypatch.chdir(origin)
+    origin_fd = os.open(".", os.O_RDONLY | os.O_DIRECTORY)
+    stage_fds = {
+        "spool-a": os.open(stage_a, os.O_RDONLY | os.O_DIRECTORY),
+        "spool-b": os.open(stage_b, os.O_RDONLY | os.O_DIRECTORY),
+    }
+    original_connect = catalog_module.sqlite3.connect
+    original_open = catalog_module.os.open
+    first_inside_sqlite = threading.Event()
+    release_first = threading.Event()
+    second_lock_attempt = threading.Event()
+    second_snapshotted_cwd = threading.Event()
+    spools: dict[str, object] = {}
+    marker_results: dict[str, tuple[str]] = {}
+    errors: list[BaseException] = []
+
+    def blocking_connect(*args, **kwargs):
+        if threading.current_thread().name == "spool-a":
+            first_inside_sqlite.set()
+            if not release_first.wait(5):
+                raise RuntimeError("timed out releasing first SQLite open")
+        return original_connect(*args, **kwargs)
+
+    def tracking_open(path, *args, **kwargs):
+        if path == "." and threading.current_thread().name == "spool-b":
+            second_snapshotted_cwd.set()
+        return original_open(path, *args, **kwargs)
+
+    def worker() -> None:
+        name = threading.current_thread().name
+        try:
+            spool = catalog_module._create_spool(stage_fds[name])
+            spool.connection.execute(
+                "CREATE TABLE thread_marker(value TEXT NOT NULL)"
+            )
+            spool.connection.execute(
+                "INSERT INTO thread_marker(value) VALUES (?)",
+                (name,),
+            )
+            spool.connection.commit()
+            marker_results[name] = spool.connection.execute(
+                "SELECT value FROM thread_marker"
+            ).fetchone()
+            spool.abort_connection()
+            spools[name] = spool
+        except BaseException as error:
+            errors.append(error)
+
+    monkeypatch.setattr(catalog_module.sqlite3, "connect", blocking_connect)
+    monkeypatch.setattr(catalog_module.os, "open", tracking_open)
+    monkeypatch.setattr(
+        catalog_module,
+        "_SQLITE_OPEN_LOCK",
+        ObservedThreadLock({"spool-b": second_lock_attempt}),
+    )
+    first = threading.Thread(target=worker, name="spool-a")
+    second = threading.Thread(target=worker, name="spool-b")
+    try:
+        first.start()
+        assert first_inside_sqlite.wait(5)
+        second.start()
+        assert second_lock_attempt.wait(5)
+        assert not second_snapshotted_cwd.is_set()
+        release_first.set()
+        first.join(5)
+        second.join(5)
+        assert not first.is_alive()
+        assert not second.is_alive()
+        assert errors == []
+        assert os.fstat(origin_fd).st_ino == os.stat(".").st_ino
+        for name, stage_fd in stage_fds.items():
+            spool = spools[name]
+            assert os.fstat(spool.descriptor).st_ino == os.stat(
+                ".catalog-spool.sqlite3",
+                dir_fd=stage_fd,
+                follow_symlinks=False,
+            ).st_ino
+            assert marker_results[name] == (name,)
+        assert os.fstat(spools["spool-a"].descriptor).st_ino != os.fstat(
+            spools["spool-b"].descriptor
+        ).st_ino
+        Path("relative-after-spools.txt").write_text(
+            "origin",
+            encoding="utf-8",
+        )
+        assert (origin / "relative-after-spools.txt").read_text(
+            encoding="utf-8"
+        ) == "origin"
+        assert not (stage_a / "relative-after-spools.txt").exists()
+        assert not (stage_b / "relative-after-spools.txt").exists()
+    finally:
+        release_first.set()
+        if first.ident is not None:
+            first.join(5)
+        if second.ident is not None:
+            second.join(5)
+        os.fchdir(origin_fd)
+        for spool in spools.values():
+            spool.abort_connection()
+            spool.close_descriptor()
+        for descriptor in stage_fds.values():
+            os.close(descriptor)
+        os.close(origin_fd)
+
+
+_SQLITE_CWD_HOOK_PHASES = (
+    "before_sqlite_open",
+    "before_cwd_snapshot",
+    "after_cwd_snapshot",
+    "after_stage_fchdir",
+    "sqlite_opened",
+    "cwd_restored",
+    "after_sqlite_open",
+)
+
+
+class ObservedThreadLock:
+    def __init__(self, attempts: Mapping[str, threading.Event]) -> None:
+        self._lock = threading.Lock()
+        self._attempts = attempts
+
+    def __enter__(self):
+        event = self._attempts.get(threading.current_thread().name)
+        if event is not None:
+            event.set()
+        self._lock.acquire()
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback) -> None:
+        self._lock.release()
+
+
+@pytest.mark.parametrize("pause_phase", _SQLITE_CWD_HOOK_PHASES)
+def test_concurrent_spool_hooks_keep_cwd_transition_serialized(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    pause_phase: str,
+):
+    origin = tmp_path / f"origin-{pause_phase}"
+    stage_a = tmp_path / f"stage-a-{pause_phase}"
+    stage_b = tmp_path / f"stage-b-{pause_phase}"
+    origin.mkdir()
+    stage_a.mkdir()
+    stage_b.mkdir()
+    monkeypatch.chdir(origin)
+    origin_fd = os.open(".", os.O_RDONLY | os.O_DIRECTORY)
+    origin_inode = os.fstat(origin_fd).st_ino
+    stage_fds = {
+        "hook-a": os.open(stage_a, os.O_RDONLY | os.O_DIRECTORY),
+        "hook-b": os.open(stage_b, os.O_RDONLY | os.O_DIRECTORY),
+    }
+    stage_inodes = {
+        name: os.fstat(descriptor).st_ino
+        for name, descriptor in stage_fds.items()
+    }
+    paused = threading.Event()
+    release = threading.Event()
+    second_lock_attempt = threading.Event()
+    second_before_open = threading.Event()
+    second_before_snapshot = threading.Event()
+    records: list[tuple[str, str, int]] = []
+    record_lock = threading.Lock()
+    spools: dict[str, object] = {}
+    errors: list[BaseException] = []
+
+    def hook(phase: str, stage_fd: int, name: str, pinned_fd: int) -> None:
+        del stage_fd, name, pinned_fd
+        thread_name = threading.current_thread().name
+        cwd_inode = os.stat(".").st_ino
+        with record_lock:
+            records.append((thread_name, phase, cwd_inode))
+        if thread_name == "hook-b" and phase == "before_sqlite_open":
+            second_before_open.set()
+        if thread_name == "hook-b" and phase == "before_cwd_snapshot":
+            second_before_snapshot.set()
+        if thread_name == "hook-a" and phase == pause_phase:
+            paused.set()
+            if not release.wait(5):
+                raise RuntimeError(f"timed out at hook {phase}")
+
+    def worker() -> None:
+        name = threading.current_thread().name
+        try:
+            spool = catalog_module._create_spool(stage_fds[name])
+            spool.abort_connection()
+            spools[name] = spool
+        except BaseException as error:
+            errors.append(error)
+
+    monkeypatch.setattr(catalog_module, "_spool_open_hook", hook)
+    monkeypatch.setattr(
+        catalog_module,
+        "_SQLITE_OPEN_LOCK",
+        ObservedThreadLock({"hook-b": second_lock_attempt}),
+    )
+    first = threading.Thread(target=worker, name="hook-a")
+    second = threading.Thread(target=worker, name="hook-b")
+    try:
+        first.start()
+        assert paused.wait(5)
+        second.start()
+        assert second_lock_attempt.wait(5)
+        assert not second_before_open.is_set()
+        assert not second_before_snapshot.is_set()
+        release.set()
+        assert second_before_open.wait(5)
+        first.join(5)
+        second.join(5)
+        assert not first.is_alive()
+        assert not second.is_alive()
+        assert errors == []
+        assert os.stat(".").st_ino == origin_inode
+        for name in ("hook-a", "hook-b"):
+            phases = tuple(
+                phase
+                for thread_name, phase, _cwd_inode in records
+                if thread_name == name
+            )
+            assert phases == _SQLITE_CWD_HOOK_PHASES
+            by_phase = {
+                phase: cwd_inode
+                for thread_name, phase, cwd_inode in records
+                if thread_name == name
+            }
+            assert by_phase["before_sqlite_open"] == origin_inode
+            assert by_phase["before_cwd_snapshot"] == origin_inode
+            assert by_phase["after_cwd_snapshot"] == origin_inode
+            assert by_phase["after_stage_fchdir"] == stage_inodes[name]
+            assert by_phase["sqlite_opened"] == stage_inodes[name]
+            assert by_phase["cwd_restored"] == origin_inode
+            assert by_phase["after_sqlite_open"] == origin_inode
+            spool = spools[name]
+            assert os.fstat(spool.descriptor).st_ino == os.stat(
+                ".catalog-spool.sqlite3",
+                dir_fd=stage_fds[name],
+                follow_symlinks=False,
+            ).st_ino
+        Path("relative-hook-result.txt").write_text("origin", encoding="utf-8")
+        assert (origin / "relative-hook-result.txt").is_file()
+        assert not (stage_a / "relative-hook-result.txt").exists()
+        assert not (stage_b / "relative-hook-result.txt").exists()
+    finally:
+        release.set()
+        if first.ident is not None:
+            first.join(5)
+        if second.ident is not None:
+            second.join(5)
+        os.fchdir(origin_fd)
+        for spool in spools.values():
+            spool.abort_connection()
+            spool.close_descriptor()
+        for descriptor in stage_fds.values():
+            os.close(descriptor)
+        os.close(origin_fd)
 
 
 def test_catalog_publication_rejects_symlinked_output_parent(
