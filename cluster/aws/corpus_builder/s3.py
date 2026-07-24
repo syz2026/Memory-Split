@@ -377,6 +377,7 @@ def _put_exact(
     digest: str,
     kms_key_arn: str,
     metadata: Mapping[str, str],
+    require_absent: bool = False,
 ) -> S3ObjectVersion:
     uri = _prototype(
         bucket=bucket,
@@ -386,16 +387,19 @@ def _put_exact(
         kms_key_arn=kms_key_arn,
     )
     uploaded_metadata = _validated_metadata(metadata, digest)
+    request: dict[str, object] = {
+        "Body": body,
+        "Bucket": bucket,
+        "ContentLength": byte_count,
+        "Key": key,
+        "Metadata": uploaded_metadata,
+        "SSEKMSKeyId": kms_key_arn,
+        "ServerSideEncryption": "aws:kms",
+    }
+    if require_absent:
+        request["IfNoneMatch"] = "*"
     try:
-        response = s3.put_object(
-            Body=body,
-            Bucket=bucket,
-            ContentLength=byte_count,
-            Key=key,
-            Metadata=uploaded_metadata,
-            SSEKMSKeyId=kms_key_arn,
-            ServerSideEncryption="aws:kms",
-        )
+        response = s3.put_object(**request)
     except Exception as error:
         raise PublicationError("S3 exact-version upload failed") from error
     if not isinstance(response, Mapping):
@@ -649,6 +653,7 @@ def publish_phase_receipt(
             digest=digest,
             kms_key_arn=kms_key_arn,
             metadata={},
+            require_absent=True,
         )
 
     expected_metadata = {"sha256": digest}

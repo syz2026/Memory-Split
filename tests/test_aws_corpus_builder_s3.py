@@ -92,6 +92,7 @@ class VersionedFakeS3:
         self.get_body_override: bytes | None = None
         self.on_get_read: Callable[[], None] | None = None
         self.fail_get_stream = False
+        self.conditional_race: tuple[bytes, str, Mapping[str, str]] | None = None
 
     def _entry(self, bucket: str, key: str, version_id: str) -> dict[str, object]:
         for entry in self._versions.get((bucket, key), []):
@@ -106,6 +107,19 @@ class VersionedFakeS3:
         body = kwargs["Body"]
         assert isinstance(bucket, str)
         assert isinstance(key, str)
+        if kwargs.get("IfNoneMatch") == "*":
+            if self.conditional_race is not None:
+                payload, kms_key_arn, metadata = self.conditional_race
+                self.conditional_race = None
+                self.install(
+                    bucket=bucket,
+                    key=key,
+                    payload=payload,
+                    kms_key_arn=kms_key_arn,
+                    metadata=metadata,
+                )
+            if self._versions.get((bucket, key)):
+                raise FakeClientError("PreconditionFailed")
         assert not isinstance(body, (bytes, bytearray))
         assert hasattr(body, "read")
         if self.before_put_read is not None:
@@ -491,6 +505,7 @@ def test_phase_receipt_publish_is_canonical_no_overwrite_and_exactly_reusable(
     assert second == first
     assert len(s3.put_calls) == puts_before_receipt + 1
     assert len(s3.list_calls) == 2
+    assert s3.put_calls[-1]["IfNoneMatch"] == "*"
     receipt_entry = s3._entry(
         CORPUS_BUCKET,
         f"v2/builds/{_BUILD_ID}/phase-final.json",
@@ -535,6 +550,31 @@ def test_phase_receipt_rejects_any_conflicting_history_without_put_or_delete(
     assert len(s3.put_calls) == put_count
     assert s3._entry(CORPUS_BUCKET, key, exact.version_id)
     assert s3._entry(CORPUS_BUCKET, key, foreign_version)
+
+
+def test_phase_receipt_conditional_put_cannot_overwrite_a_racing_winner(tmp_path):
+    s3 = VersionedFakeS3()
+    artifact = publish_exact_file(s3, **_artifact_request(tmp_path))
+    receipt = _phase_receipt((artifact,))
+    key = f"v2/builds/{_BUILD_ID}/phase-final.json"
+    racing_payload = b'{"racing":"winner"}\n'
+    s3.conditional_race = (
+        racing_payload,
+        _KMS_ARN,
+        {"sha256": hashlib.sha256(racing_payload).hexdigest()},
+    )
+
+    with pytest.raises(PublicationError, match="upload|condition|conflict"):
+        publish_phase_receipt(
+            s3,
+            bucket=CORPUS_BUCKET,
+            key=key,
+            receipt=receipt,
+            kms_key_arn=_KMS_ARN,
+        )
+
+    versions = s3._versions[(CORPUS_BUCKET, key)]
+    assert [entry["BodyBytes"] for entry in versions] == [racing_payload]
 
 
 def test_phase_receipt_reuse_fails_closed_on_fake_client_stream_error(tmp_path):
