@@ -7,7 +7,9 @@
     "cuda": "13.0",
     "gid": 10001,
     "operating_system": "Amazon Linux 2023",
+    "python": "3.11",
     "pytorch": "2.12.1",
+    "requirements_sha256": "236ac66261c7dad568c7f236d99b82338c741cf2a8fc9fc4a848acd481a74d32",
     "uid": 10001,
     "user": "memorysplit"
   },

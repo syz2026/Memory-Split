@@ -37,6 +37,8 @@ _LOCK_RUNTIME_FIELDS = {
     "pytorch",
     "cuda",
     "operating_system",
+    "python",
+    "requirements_sha256",
     "user",
     "uid",
     "gid",
@@ -122,6 +124,13 @@ def _load_lock(context: Path) -> tuple[dict[str, object], bytes]:
             "pytorch": "2.12.1",
             "cuda": "13.0",
             "operating_system": "Amazon Linux 2023",
+            "python": "3.11",
+            "requirements_sha256": hashlib.sha256(
+                _regular_bytes(
+                    context / "requirements.lock",
+                    label="runtime dependency lock",
+                )
+            ).hexdigest(),
             "user": "memorysplit",
             "uid": 10001,
             "gid": 10001,
@@ -132,20 +141,25 @@ def _load_lock(context: Path) -> tuple[dict[str, object], bytes]:
 
 
 def build_context_sha256(context_dir: Path | str = DEFAULT_CONTEXT) -> str:
-    """Hash the only two files admitted to the image build context."""
+    """Hash the only three files admitted to the image build context."""
 
     context = _context_path(context_dir)
     names = {entry.name for entry in context.iterdir()}
-    if names != {"Dockerfile", "image.lock.json"}:
+    if names != {"Dockerfile", "image.lock.json", "requirements.lock"}:
         raise ImageBuildError(
-            "AWS GPU build context may contain only Dockerfile and image.lock.json"
+            "AWS GPU build context may contain only Dockerfile and its two locks"
         )
     dockerfile = _regular_bytes(context / "Dockerfile", label="Dockerfile")
+    requirements = _regular_bytes(
+        context / "requirements.lock",
+        label="runtime dependency lock",
+    )
     _lock, lock_payload = _load_lock(context)
     digest = hashlib.sha256()
     for name, payload in (
         ("Dockerfile", dockerfile),
         ("image.lock.json", lock_payload),
+        ("requirements.lock", requirements),
     ):
         digest.update(name.encode("ascii"))
         digest.update(b"\0")

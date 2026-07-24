@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 from pathlib import Path
 
 import pytest
@@ -139,6 +140,92 @@ def _receipt(profile, *, dense_seconds=2.0, split_seconds=4.0):
             ],
         },
     }
+
+
+def _v3_receipt(profile):
+    receipt = _receipt(profile)
+    digest = "sha256:" + "d" * 64
+    receipt["schema_version"] = 3
+    receipt["provenance"] = {
+        "instance_id": "i-0123456789abcdef0",
+        "boot_id": "12345678-1234-4234-9234-123456789abc",
+        "region": "us-west-2",
+        "ami_id": "ami-0123456789abcdef0",
+        "ami_owner_id": "099720109477",
+        "release_sha256": "e" * 64,
+        "container_image": (
+            "123456789012.dkr.ecr.us-west-2.amazonaws.com/"
+            f"memorysplit/aws-gpu@{digest}"
+        ),
+        "container_digest": digest,
+        "provider_selection_sha256": "1" * 64,
+        "environment_receipt_sha256": "2" * 64,
+        "qualified_at": "2026-07-24T01:00:00Z",
+        "command_plan_sha256": "3" * 64,
+    }
+    receipt["raw_output_sha256"] = {
+        "device_topology_software": "4" * 64,
+        "bf16": "5" * 64,
+        "sdpa": "6" * 64,
+        "torch_compile": "7" * 64,
+        "fused_adamw": "8" * 64,
+        "simultaneous_4_plus_4_nccl": "9" * 64,
+        "one_step_training": "a" * 64,
+        "checkpoint_resume": "b" * 64,
+        "nvme": "c" * 64,
+        "throughput": "d" * 64,
+    }
+    return receipt
+
+
+def test_v3_qualification_requires_complete_cross_runtime_provenance():
+    profile = _profile("aws-p5.48xlarge-v3")
+    receipt = _v3_receipt(profile)
+    provenance = receipt["provenance"]
+
+    report = validate_qualification_receipt(
+        receipt,
+        profile,
+        expected_instance_id=provenance["instance_id"],
+        expected_boot_id=provenance["boot_id"],
+        expected_provider_selection_sha256=provenance[
+            "provider_selection_sha256"
+        ],
+        expected_environment_receipt_sha256=provenance[
+            "environment_receipt_sha256"
+        ],
+        expected_region=provenance["region"],
+        expected_ami_id=provenance["ami_id"],
+        expected_ami_owner_id=provenance["ami_owner_id"],
+        expected_release_sha256=provenance["release_sha256"],
+        expected_container_image=provenance["container_image"],
+        expected_container_digest=provenance["container_digest"],
+        expected_command_plan_sha256=provenance["command_plan_sha256"],
+    )
+    assert report.provenance == provenance
+
+    missing = copy.deepcopy(receipt)
+    del missing["provenance"]["boot_id"]
+    with pytest.raises(QualificationError, match="missing"):
+        validate_qualification_receipt(missing, profile)
+
+    with pytest.raises(QualificationError, match="stale or cross-runtime"):
+        validate_qualification_receipt(
+            receipt,
+            profile,
+            expected_boot_id="aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        )
+    with pytest.raises(QualificationError, match="stale or cross-runtime"):
+        validate_qualification_receipt(
+            receipt,
+            profile,
+            expected_release_sha256="f" * 64,
+        )
+
+    unknown_raw = copy.deepcopy(receipt)
+    unknown_raw["raw_output_sha256"]["self_authored_pass"] = "e" * 64
+    with pytest.raises(QualificationError, match="unknown"):
+        validate_qualification_receipt(unknown_raw, profile)
 
 
 @pytest.mark.parametrize(
@@ -346,6 +433,10 @@ def _runtime(profile):
         {
             "AWS_REGION": "us-west-2",
             "MS_S3_ROOT": "s3://memorysplit-prod/qualification",
+            "MS_S3_KMS_KEY_ID": (
+                "arn:aws:kms:us-west-2:123456789012:"
+                "key/12345678-1234-4234-9234-123456789abc"
+            ),
             "MS_AWS_AMI_ID": "ami-0123456789abcdef0",
             "MS_CONTAINER_DIGEST": digest,
             "MS_CONTAINER_IMAGE": (
@@ -365,16 +456,25 @@ def _runtime(profile):
 def test_canary_command_plan_is_digest_bound_and_shell_free(profile_name):
     profile = _profile(profile_name)
     runtime = _runtime(profile)
-    plan = render_canary_command_plan(profile, runtime)
+    release_sha256 = "b" * 64
+    release_root = f"{profile.scratch_root}/releases/{release_sha256}"
+    plan = render_canary_command_plan(
+        profile,
+        runtime,
+        release_sha256=release_sha256,
+        release_root=release_root,
+    )
     image_digest = runtime.container_digest.removeprefix("sha256:")
 
     assert plan["provider"] == profile.provider
     assert plan["instance_type"] == profile.instance_type
     assert plan["profile_sha256"] == profile.sha256
+    assert plan["release_sha256"] == release_sha256
+    assert plan["release_root"] == release_root
     assert plan["container_digest"] == runtime.container_digest
     assert plan["output_root"] == (
         f"{profile.scratch_root}/qualification/{profile.profile_id}/"
-        f"profile-{profile.sha256}/image-{image_digest}"
+        f"release-{release_sha256}/profile-{profile.sha256}/image-{image_digest}"
     )
     assert plan["gpu_groups"] == {
         "dense": [0, 1, 2, 3],
@@ -382,9 +482,17 @@ def test_canary_command_plan_is_digest_bound_and_shell_free(profile_name):
     }
 
     phases = plan["phases"]
-    assert phases["probes"]["concurrent"] is False
-    assert phases["training"]["concurrent"] is True
-    assert phases["checkpoint"]["concurrent"] is False
+    assert set(phases) == {
+        "prepare",
+        "serial",
+        "one_step_training",
+        "checkpoint_resume",
+        "throughput",
+    }
+    assert phases["serial"]["concurrent"] is False
+    assert phases["one_step_training"]["concurrent"] is True
+    assert phases["checkpoint_resume"]["concurrent"] is False
+    assert phases["throughput"]["concurrent"] is True
     commands = [
         command
         for phase in phases.values()
@@ -403,33 +511,13 @@ def test_canary_command_plan_is_digest_bound_and_shell_free(profile_name):
         for executable in command[:1]
     )
 
-    probes = phases["probes"]["commands"]
-    assert probes[:4] == [
-        [
-            "/usr/bin/systemctl",
-            "is-active",
-            "nvidia-fabricmanager",
-        ],
-        [
-            "/usr/bin/nvidia-smi",
-            "--query-gpu=index,name",
-            "--format=csv,noheader",
-        ],
-        ["/usr/bin/nvidia-smi", "topo", "-m"],
-        [
-            "/usr/bin/lsblk",
-            "--json",
-            "--bytes",
-            "--output",
-            "NAME,PATH,TYPE,MODEL,SIZE,MOUNTPOINTS",
-        ],
+    assert phases["prepare"]["commands"][0][0:4] == [
+        "/usr/bin/install",
+        "-d",
+        "-m",
+        "0700",
     ]
-    probe = probes[4]
-    assert probe[probe.index("--gpus") + 1] == "device=0,1,2,3,4,5,6,7"
-    assert probe[probe.index("--gpu-ids") + 1] == "0,1,2,3,4,5,6,7"
-    assert probe[probe.index("--output") + 1] == (
-        "/qualification/probes/capabilities.json"
-    )
+    assert len(phases["serial"]["commands"]) == 7
 
     container_commands = [
         command for command in commands if command[0] == "/usr/bin/docker"
@@ -439,6 +527,15 @@ def test_canary_command_plan_is_digest_bound_and_shell_free(profile_name):
         assert command[command.index("--mount") + 1] == (
             f"type=bind,src={plan['output_root']},dst=/qualification"
         )
+        assert (
+            f"type=bind,src={release_root},dst=/workspace,readonly"
+            in command
+        )
+        tmpfs = command[command.index("--tmpfs") + 1]
+        assert "exec" in tmpfs.split(",")
+        assert "noexec" not in tmpfs.split(",")
+        assert "/opt/venv/bin/python" in command
+        assert "/workspace/cluster/aws/p5/canary_runtime.py" in command
         assert command[command.index("--provider") + 1] == profile.provider
         assert command[command.index("--instance-type") + 1] == (
             profile.instance_type
@@ -446,9 +543,13 @@ def test_canary_command_plan_is_digest_bound_and_shell_free(profile_name):
         assert command[command.index("--profile-sha256") + 1] == (
             profile.sha256
         )
+        assert command[command.index("--release-sha256") + 1] == (
+            release_sha256
+        )
+        assert command[command.index("--release-root") + 1] == "/workspace"
         assert command[command.index("--gres") + 1] == profile.gres
 
-    training = phases["training"]["commands"]
+    training = phases["one_step_training"]["commands"]
     assert len(training) == 2
     for command, arm, ids in zip(
         training,
@@ -467,18 +568,22 @@ def test_canary_command_plan_is_digest_bound_and_shell_free(profile_name):
         assert command[command.index("--gpus") + 1] == f"device={ids}"
         assert command[command.index("--arm") + 1] == arm
         assert command[command.index("--gpu-ids") + 1] == ids
-        assert command[command.index("--updates") + 1] == "100"
-        assert command[command.index("--warmup-updates") + 1] == "10"
         assert command[command.index("--output") + 1] == (
-            f"/qualification/training/{arm}.json"
+            f"/qualification/receipts/one-step-training-{arm}.json"
         )
 
-    checkpoints = phases["checkpoint"]["commands"]
+    throughput = phases["throughput"]["commands"]
+    assert len(throughput) == 2
+    for command in throughput:
+        assert command[command.index("--updates") + 1] == "100"
+        assert command[command.index("--warmup-updates") + 1] == "10"
+
+    checkpoints = phases["checkpoint_resume"]["commands"]
     assert [
         (
             command[command.index("--arm") + 1],
             command[
-                command.index("/opt/memorysplit/cluster/aws/p5/canary_runtime.py")
+                command.index("/workspace/cluster/aws/p5/canary_runtime.py")
                 + 1
             ],
             command[command.index("--gpu-ids") + 1],
@@ -493,8 +598,8 @@ def test_canary_command_plan_is_digest_bound_and_shell_free(profile_name):
     assert [
         command[command.index("--output") + 1] for command in checkpoints
     ] == [
-        "/qualification/checkpoints/dense.pt",
+        "/qualification/receipts/checkpoint-dense.json",
         "/qualification/resume/dense.json",
-        "/qualification/checkpoints/split90.pt",
+        "/qualification/receipts/checkpoint-split90.json",
         "/qualification/resume/split90.json",
     ]

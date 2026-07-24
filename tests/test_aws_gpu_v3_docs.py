@@ -34,10 +34,14 @@ def test_operator_docs_cover_closed_profiles_and_complete_lifecycle() -> None:
         "explicit instance id",
         "six 29m diagnostics",
         "provider-selection receipt",
+        "readiness create",
+        "protected_launch_allowed",
         "environment",
         "export ms_aws_ami_id",
         "export ms_container_image",
         "bootstrap",
+        "control install",
+        "aws-runshellscript",
         "canary",
         "100 updates",
         "10 warmup",
@@ -53,6 +57,12 @@ def test_operator_docs_cover_closed_profiles_and_complete_lifecycle() -> None:
         "teardown",
         "non-cancellable",
         "exact price",
+        "fleet advance",
+        "apply-time mutation inventory",
+        "/opt/venv/bin/python",
+        "ms_s3_kms_key_id",
+        "o_nofollow",
+        "--if-none-match '*'",
     ):
         assert required in lowered
 
@@ -61,8 +71,15 @@ def test_operator_docs_cover_closed_profiles_and_complete_lifecycle() -> None:
     assert "never purchases a capacity block" in lowered
     assert "all ten pairs run sequentially" in lowered
     assert "seeds 0/4/8, 1/5/9, 2/6, and 3/7" in lowered
-    assert 'operator/environment-${instance_id}.json' in lowered
+    assert '$operator_root/receipts/environment-${instance_id}.json' in lowered
     assert "never reuse a receipt from another fleet id" in lowered
+    assert "manual or external tag deletion is never progression evidence" in lowered
+    assert '"markettype": "capacity-block"' in lowered
+    assert '"capacityreservationtarget"' in lowered
+    assert "separately controlled evaluator release" in lowered
+    assert "actual `study-lock.json` bytes" in lowered
+    assert "outside the reviewed source checkout" in lowered
+    assert "aws s3 sync /mnt/memorysplit/runs" not in lowered
     assert "--start-date-range replace_with_earliest_start" in lowered
     assert "--end-date-range replace_with_latest_end" in lowered
     for static_key_name in (
@@ -84,9 +101,10 @@ def test_paid_and_mutating_runbook_steps_are_reviewed_before_apply() -> None:
         "provider select",
         "purchase-capacity-block",
         "run-instances",
-        "bootstrap.sh",
+        "control install",
         "runs instantiate",
         "fleet plan",
+        "fleet advance",
         "\n  submit ",
         "\n  resume ",
         "\n  evaluate ",
@@ -117,6 +135,7 @@ def test_paid_and_mutating_runbook_steps_are_reviewed_before_apply() -> None:
     assert "PAID APPLY" in text
     assert "exact-price approval" in text
     assert "do not redirect either packaging report into the repository" in lowered
+    assert "never in the source checkout" in lowered
     assert "package-plan.json" not in text
     assert "package-result.json" not in text
 
@@ -148,18 +167,26 @@ def test_access_request_is_temporary_least_privilege_and_complete() -> None:
     for action in (
         "ec2:DescribeImages",
         "ec2:DescribeInstances",
+        "ec2:DescribeInstanceAttribute",
         "ec2:DescribeInstanceTypes",
         "ec2:DescribeInstanceTypeOfferings",
         "ec2:DescribeCapacityBlockOfferings",
         "ec2:PurchaseCapacityBlock",
         "ec2:RunInstances",
         "ec2:CreateTags",
+        "ec2:DeleteTags",
+        "ec2:ModifyInstanceAttribute",
         "ec2:StartInstances",
         "ec2:StopInstances",
         "ec2:TerminateInstances",
         "ssm:SendCommand",
+        "ssm:GetParameter",
+        "ssm:GetDocument",
+        "ssm:ListDocuments",
+        "ssm:CreateDocument",
         "ssm:GetCommandInvocation",
         "ssm:ListCommandInvocations",
+        "ssm:CancelCommand",
         "ssmmessages:OpenDataChannel",
         "ecr:GetAuthorizationToken",
         "ecr:InitiateLayerUpload",

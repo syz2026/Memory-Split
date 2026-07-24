@@ -39,6 +39,14 @@ _RECEIPT_FIELDS = {
     "source_commit",
     "checkpoints",
 }
+_V3_PROVENANCE_FIELDS = {
+    "cohort_assignment_sha256",
+    "preregistration_sha256",
+    "hardware_amendment_sha256",
+    "provider_selection_sha256",
+    "profile_sha256",
+    "sealed_evaluation_sha256",
+}
 _RECEIPT_CHECKPOINT_FIELDS = {
     "run_id",
     "arm",
@@ -401,10 +409,21 @@ def _verify_checkpoint_receipt(
         raise ResumeLaunchError(
             "checkpoint receipt is not valid UTF-8 JSON"
         ) from error
-    if not isinstance(receipt, dict) or set(receipt) != _RECEIPT_FIELDS:
+    if not isinstance(receipt, dict):
+        raise ResumeLaunchError("checkpoint receipt must be one JSON object")
+    schema_version = receipt.get("schema_version")
+    fields = (
+        _RECEIPT_FIELDS | _V3_PROVENANCE_FIELDS
+        if schema_version == 3
+        else _RECEIPT_FIELDS
+    )
+    if set(receipt) != fields:
         raise ResumeLaunchError("checkpoint receipt fields do not match")
+    launcher_manifest = _load_launcher_manifest(plan.manifest_path)
+    expected_launcher_schema = 3 if schema_version == 3 else 1
     if (
-        receipt["schema_version"] != 2
+        schema_version not in {2, 3}
+        or launcher_manifest.get("schema_version") != expected_launcher_schema
         or receipt["provider"] != plan.profile.provider
         or receipt["release_sha256"] != plan.release_sha256
         or receipt["run_manifest_sha256"] != manifest_sha256
@@ -414,6 +433,30 @@ def _verify_checkpoint_receipt(
         raise ResumeLaunchError(
             "checkpoint receipt does not bind the reviewed launch plan"
         )
+    if schema_version == 3:
+        canonical = (
+            json.dumps(
+                receipt,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=True,
+                allow_nan=False,
+            )
+            + "\n"
+        ).encode("ascii")
+        if payload != canonical:
+            raise ResumeLaunchError(
+                "schema-v3 checkpoint receipt must be canonical JSON"
+            )
+        for field in _V3_PROVENANCE_FIELDS:
+            digest = _sha256(
+                receipt[field],
+                label=f"checkpoint receipt {field}",
+            )
+            if launcher_manifest.get(field) != digest:
+                raise ResumeLaunchError(
+                    "schema-v3 checkpoint provenance differs from the launcher"
+                )
     rows = receipt["checkpoints"]
     if not isinstance(rows, list) or len(rows) != 2:
         raise ResumeLaunchError("checkpoint receipt pair is incomplete")
@@ -460,6 +503,27 @@ def _verify_checkpoint_receipt(
             raise ResumeLaunchError(
                 "checkpoint receipt differs from the executable binding"
             )
+
+
+def _load_launcher_manifest(path: Path) -> dict[str, object]:
+    try:
+        if path.is_symlink() or not path.is_file():
+            raise ResumeLaunchError("launcher manifest must be a regular file")
+        payload = path.read_bytes()
+        value = json.loads(
+            payload.decode("utf-8"),
+            object_pairs_hook=_strict_object,
+            parse_constant=lambda constant: (_ for _ in ()).throw(
+                ResumeLaunchError(
+                    f"launcher manifest contains non-finite {constant}"
+                )
+            ),
+        )
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ResumeLaunchError("launcher manifest is invalid") from error
+    if not isinstance(value, dict):
+        raise ResumeLaunchError("launcher manifest must contain an object")
+    return value
 
 
 def _parser() -> argparse.ArgumentParser:

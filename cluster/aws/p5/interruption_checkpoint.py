@@ -63,6 +63,11 @@ RESUMABLE_EXIT_CODE = 75
 NON_RESUMABLE_EXIT_CODE = 74
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
+_KMS_KEY_ARN_RE = re.compile(
+    r"^arn:aws:kms:(?P<region>us-(?:east-1|west-2)):[0-9]{12}:"
+    r"key/[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-"
+    r"[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+)
 _ARMS = ("dense", "split90")
 _IMDS_ROOT = "http://169.254.169.254/latest"
 
@@ -298,12 +303,23 @@ class S3ObjectStore:
         *,
         region: str,
         environment: Mapping[str, str],
+        kms_key_id: str | None = None,
         runner: Callable[
             [Sequence[str], Mapping[str, str], float], CommandResult
         ] = _default_runner,
     ) -> None:
         if not isinstance(region, str) or not region:
             raise ValueError("S3 region must be non-empty")
+        if kms_key_id is not None:
+            kms_match = (
+                _KMS_KEY_ARN_RE.fullmatch(kms_key_id)
+                if isinstance(kms_key_id, str)
+                else None
+            )
+            if kms_match is None or kms_match.group("region") != region:
+                raise ValueError(
+                    "S3 KMS key must be an immutable key ARN in the upload region"
+                )
         expected_environment = {
             "AWS_REGION",
             "HOME",
@@ -338,6 +354,7 @@ class S3ObjectStore:
         ):
             raise ValueError("S3 private HOME must be owned, mode 0700, and empty")
         self._region = region
+        self._kms_key_id = kms_key_id
         self._environment = dict(environment)
         self._runner = runner
 
@@ -400,6 +417,16 @@ class S3ObjectStore:
         )
         if remaining <= 0:
             return None
+        encryption_argv = (
+            [
+                "--server-side-encryption",
+                "aws:kms",
+                "--ssekms-key-id",
+                self._kms_key_id,
+            ]
+            if self._kms_key_id is not None
+            else []
+        )
         put = None
         try:
             put = self._runner(
@@ -421,6 +448,7 @@ class S3ObjectStore:
                     f"sha256={digest}",
                     "--if-none-match",
                     "*",
+                    *encryption_argv,
                     "--region",
                     self._region,
                     "--output",
@@ -468,11 +496,22 @@ class S3ObjectStore:
         except (OSError, subprocess.SubprocessError):
             return None
         head_value = _load_json_output(head)
+        encryption_matches = (
+            head_value is not None
+            and (
+                self._kms_key_id is None
+                or (
+                    head_value.get("ServerSideEncryption") == "aws:kms"
+                    and head_value.get("SSEKMSKeyId") == self._kms_key_id
+                )
+            )
+        )
         if (
             head_value is None
             or head_value.get("ChecksumSHA256") != checksum
             or head_value.get("ContentLength") != size
             or head_value.get("Metadata") != {"sha256": digest}
+            or not encryption_matches
             or _remaining_seconds(
                 deadline=deadline,
                 monotonic=monotonic,
@@ -906,7 +945,7 @@ def _checkpoint_uri(
 def _evidence_uri(request: InterruptionRequest, digest: str) -> str:
     return (
         f"{request.s3_root.rstrip('/')}/receipts/interruption/evidence/"
-        f"sha256/{digest}.json"
+        f"seed-{request.seed}/sha256/{digest}.json"
     )
 
 
@@ -1383,7 +1422,8 @@ def verify_resume_commit(
         or candidate_ref["sha256"] != candidate_digest
         or not isinstance(candidate_ref["uri"], str)
         or not candidate_ref["uri"].endswith(
-            f"/evidence/sha256/{candidate_digest}.json"
+            f"/evidence/seed-{candidate.get('seed')}/sha256/"
+            f"{candidate_digest}.json"
         )
     ):
         raise ValueError("resume candidate hash binding does not match")
@@ -1615,6 +1655,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         region = os.environ.get("AWS_REGION", "")
         store = S3ObjectStore(
             region=region,
+            kms_key_id=os.environ.get("MS_S3_KMS_KEY_ID") or None,
             environment={
                 name: os.environ[name]
                 for name in ("AWS_REGION", "HOME", "LANG", "LC_ALL", "PATH")

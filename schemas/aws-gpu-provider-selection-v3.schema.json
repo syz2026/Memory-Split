@@ -11,6 +11,15 @@
         "instance_type": {
           "const": "p5.48xlarge"
         },
+        "purchase_model": {
+          "const": "on_demand"
+        },
+        "capacity_reservation_id": {
+          "type": "null"
+        },
+        "capacity_block_offering_id": {
+          "type": "null"
+        },
         "provider": {
           "const": "aws-p5.48xlarge-v3"
         },
@@ -22,7 +31,10 @@
         "selected_profile_id",
         "provider",
         "instance_type",
-        "gpu_model"
+        "gpu_model",
+        "purchase_model",
+        "capacity_reservation_id",
+        "capacity_block_offering_id"
       ]
     },
     {
@@ -33,6 +45,17 @@
         "instance_type": {
           "const": "p6-b300.48xlarge"
         },
+        "purchase_model": {
+          "const": "capacity_block"
+        },
+        "capacity_reservation_id": {
+          "pattern": "^[a-z]{2,4}-[A-Za-z0-9-]{8,64}$",
+          "type": "string"
+        },
+        "capacity_block_offering_id": {
+          "pattern": "^[a-z]{2,4}-[A-Za-z0-9-]{8,64}$",
+          "type": "string"
+        },
         "provider": {
           "const": "aws-p6-b300.48xlarge-v3"
         },
@@ -44,7 +67,10 @@
         "selected_profile_id",
         "provider",
         "instance_type",
-        "gpu_model"
+        "gpu_model",
+        "purchase_model",
+        "capacity_reservation_id",
+        "capacity_block_offering_id"
       ]
     }
   ],
@@ -56,6 +82,35 @@
     "ami_id": {
       "pattern": "^ami-[0-9a-f]{8,17}$",
       "type": "string"
+    },
+    "ami_describe_sha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "type": "string"
+    },
+    "ami_name": {
+      "maxLength": 255,
+      "minLength": 1,
+      "type": "string"
+    },
+    "ami_owner_id": {
+      "pattern": "^[0-9]{12}$",
+      "type": "string"
+    },
+    "aws_account_id": {
+      "pattern": "^[0-9]{12}$",
+      "type": "string"
+    },
+    "capacity_block_offering_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "capacity_reservation_id": {
+      "type": [
+        "string",
+        "null"
+      ]
     },
     "cohort_assignment_sha256": {
       "pattern": "^[0-9a-f]{64}$",
@@ -69,7 +124,11 @@
       "type": "string"
     },
     "container_image": {
-      "pattern": "^[^\\s@]+@sha256:[0-9a-f]{64}$",
+      "pattern": "^[0-9]{12}\\.dkr\\.ecr\\.us-(east-1|west-2)\\.amazonaws\\.com/[a-z0-9]+([._/-][a-z0-9]+)*@sha256:[0-9a-f]{64}$",
+      "type": "string"
+    },
+    "ecr_describe_sha256": {
+      "pattern": "^[0-9a-f]{64}$",
       "type": "string"
     },
     "gpu_model": {
@@ -84,6 +143,22 @@
         "p6-b300.48xlarge"
       ]
     },
+    "image_build_context_sha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "type": "string"
+    },
+    "image_build_receipt_sha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "type": "string"
+    },
+    "image_dockerfile_sha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "type": "string"
+    },
+    "image_lock_sha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "type": "string"
+    },
     "mixed_profiles": {
       "const": false
     },
@@ -94,6 +169,12 @@
     "profile_sha256": {
       "pattern": "^[0-9a-f]{64}$",
       "type": "string"
+    },
+    "purchase_model": {
+      "enum": [
+        "on_demand",
+        "capacity_block"
+      ]
     },
     "protected_outcomes_inspected": {
       "const": false
@@ -108,7 +189,14 @@
       "const": "memorysplit-aws-provider-selection-v3"
     },
     "region": {
-      "pattern": "^[a-z]{2}(?:-[a-z0-9]+)+-[0-9]+$",
+      "enum": [
+        "us-east-1",
+        "us-west-2"
+      ],
+      "type": "string"
+    },
+    "runtime_dependency_lock_sha256": {
+      "pattern": "^[0-9a-f]{64}$",
       "type": "string"
     },
     "schema_version": {
@@ -152,9 +240,22 @@
     "instance_type",
     "gpu_model",
     "region",
+    "aws_account_id",
     "ami_id",
+    "ami_owner_id",
+    "ami_name",
+    "ami_describe_sha256",
     "container_image",
     "container_digest",
+    "ecr_describe_sha256",
+    "image_build_receipt_sha256",
+    "image_build_context_sha256",
+    "image_dockerfile_sha256",
+    "image_lock_sha256",
+    "runtime_dependency_lock_sha256",
+    "purchase_model",
+    "capacity_reservation_id",
+    "capacity_block_offering_id",
     "seeds",
     "mixed_profiles",
     "protected_outcomes_inspected",

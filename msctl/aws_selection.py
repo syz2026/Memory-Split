@@ -30,7 +30,14 @@ _MAX_JSON_BYTES = 131_072
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _AMI_RE = re.compile(r"^ami-[0-9a-f]{8,17}$")
 _DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
-_REGION_RE = re.compile(r"^[a-z]{2}(?:-[a-z0-9]+)+-[0-9]+$")
+_REGION_RE = re.compile(r"^us-(?:east-1|west-2)$")
+_ACCOUNT_RE = re.compile(r"^[0-9]{12}$")
+_ECR_IMAGE_RE = re.compile(
+    r"^(?P<account>[0-9]{12})\.dkr\.ecr\.(?P<region>us-(?:east-1|west-2))"
+    r"\.amazonaws\.com/(?P<repository>[a-z0-9]+(?:[._/-][a-z0-9]+)*)"
+    r"@(?P<digest>sha256:[0-9a-f]{64})$"
+)
+_CAPACITY_ID_RE = re.compile(r"^[a-z]{2,4}-[A-Za-z0-9-]{8,64}$")
 _AMENDMENT_FIELDS = {
     "schema_version",
     "amendment_id",
@@ -70,13 +77,55 @@ _RECEIPT_FIELDS = {
     "instance_type",
     "gpu_model",
     "region",
+    "aws_account_id",
     "ami_id",
+    "ami_owner_id",
+    "ami_name",
+    "ami_describe_sha256",
     "container_image",
     "container_digest",
+    "ecr_describe_sha256",
+    "image_build_receipt_sha256",
+    "image_build_context_sha256",
+    "image_dockerfile_sha256",
+    "image_lock_sha256",
+    "runtime_dependency_lock_sha256",
+    "purchase_model",
+    "capacity_reservation_id",
+    "capacity_block_offering_id",
     "seeds",
     "mixed_profiles",
     "protected_outcomes_inspected",
     "selected_at",
+}
+_AMI_EVIDENCE_FIELDS = {
+    "schema_version",
+    "receipt_type",
+    "region",
+    "image_id",
+    "owner_id",
+    "name",
+}
+_ECR_EVIDENCE_FIELDS = {
+    "schema_version",
+    "receipt_type",
+    "region",
+    "registry_id",
+    "repository_name",
+    "image_digest",
+    "image_uri",
+}
+_BUILD_EVIDENCE_FIELDS = {
+    "schema_version",
+    "receipt_type",
+    "aws_account_id",
+    "region",
+    "container_image",
+    "container_digest",
+    "build_context_sha256",
+    "dockerfile_sha256",
+    "image_lock_sha256",
+    "runtime_dependency_lock_sha256",
 }
 
 
@@ -127,9 +176,22 @@ class ProviderSelection:
     instance_type: str
     gpu_model: str
     region: str
+    aws_account_id: str
     ami_id: str
+    ami_owner_id: str
+    ami_name: str
+    ami_describe_sha256: str
     container_image: str
     container_digest: str
+    ecr_describe_sha256: str
+    image_build_receipt_sha256: str
+    image_build_context_sha256: str
+    image_dockerfile_sha256: str
+    image_lock_sha256: str
+    runtime_dependency_lock_sha256: str
+    purchase_model: str
+    capacity_reservation_id: str | None
+    capacity_block_offering_id: str | None
     seeds: tuple[int, ...]
     selected_at: str
     sha256: str
@@ -463,6 +525,153 @@ def _validate_container(
     return image, digest
 
 
+def _load_evidence(
+    path: Path | str,
+    *,
+    fields: set[str],
+    label: str,
+) -> tuple[dict[str, object], str]:
+    candidate = Path(path)
+    data = _read_regular(candidate, label=label)
+    value = _json_object(data, label=label)
+    _exact_fields(value, fields, label=label)
+    if data != canonical_json(value) + b"\n":
+        _fail(f"{label} must use canonical JSON plus one newline")
+    return value, hashlib.sha256(data).hexdigest()
+
+
+def _selection_evidence(
+    *,
+    amendment: HardwareAmendment,
+    region: str,
+    ami_id: str,
+    container_image: str,
+    container_digest: str,
+    ami_evidence: Path | str,
+    ecr_evidence: Path | str,
+    image_build_receipt: Path | str,
+) -> dict[str, object]:
+    ami, ami_hash = _load_evidence(
+        ami_evidence,
+        fields=_AMI_EVIDENCE_FIELDS,
+        label="AMI describe evidence",
+    )
+    ecr, ecr_hash = _load_evidence(
+        ecr_evidence,
+        fields=_ECR_EVIDENCE_FIELDS,
+        label="ECR describe evidence",
+    )
+    build, build_hash = _load_evidence(
+        image_build_receipt,
+        fields=_BUILD_EVIDENCE_FIELDS,
+        label="image build receipt",
+    )
+    image_match = _ECR_IMAGE_RE.fullmatch(container_image)
+    if image_match is None:
+        _fail("container image must be a private ECR digest reference")
+    account_id = image_match.group("account")
+    repository = image_match.group("repository")
+    if (
+        image_match.group("region") != region
+        or image_match.group("digest") != container_digest
+        or ami["schema_version"] != 1
+        or ami["receipt_type"] != "memorysplit-aws-ami-describe-v1"
+        or ami["region"] != region
+        or ami["image_id"] != ami_id
+        or not isinstance(ami["owner_id"], str)
+        or _ACCOUNT_RE.fullmatch(ami["owner_id"]) is None
+        or not isinstance(ami["name"], str)
+        or not ami["name"]
+        or len(ami["name"]) > 255
+        or ecr["schema_version"] != 1
+        or ecr["receipt_type"] != "memorysplit-aws-ecr-describe-v1"
+        or ecr["region"] != region
+        or ecr["registry_id"] != account_id
+        or ecr["repository_name"] != repository
+        or ecr["image_digest"] != container_digest
+        or ecr["image_uri"] != container_image
+        or build["schema_version"] != 1
+        or build["receipt_type"] != "memorysplit-aws-gpu-image-build-v1"
+        or build["aws_account_id"] != account_id
+        or build["region"] != region
+        or build["container_image"] != container_image
+        or build["container_digest"] != container_digest
+    ):
+        _fail("provider evidence is stale, cross-account, or cross-region")
+    repo_root = amendment.path.parent.parent
+    expected_files = {
+        "dockerfile_sha256": repo_root / "containers/aws-gpu/Dockerfile",
+        "image_lock_sha256": repo_root / "containers/aws-gpu/image.lock.json",
+        "runtime_dependency_lock_sha256": (
+            repo_root / "containers/aws-gpu/requirements.lock"
+        ),
+    }
+    for field, local_path in expected_files.items():
+        expected = _sha256(build[field], label=f"image build {field}")
+        if hashlib.sha256(_read_regular(local_path, label=field)).hexdigest() != expected:
+            _fail(f"image build {field} does not bind reviewed repository bytes")
+    context_sha256 = _sha256(
+        build["build_context_sha256"],
+        label="image build context",
+    )
+    try:
+        from scripts.build_aws_gpu_image import build_context_sha256
+
+        actual_context_sha256 = build_context_sha256(
+            repo_root / "containers/aws-gpu"
+        )
+    except (ImportError, OSError, ValueError) as error:
+        raise MsctlError(
+            "PROVIDER_SELECTION_INVALID",
+            "reviewed image build context cannot be validated",
+        ) from error
+    if actual_context_sha256 != context_sha256:
+        _fail("image build context hash does not bind reviewed repository bytes")
+    return {
+        "aws_account_id": account_id,
+        "ami_owner_id": ami["owner_id"],
+        "ami_name": ami["name"],
+        "ami_describe_sha256": ami_hash,
+        "ecr_describe_sha256": ecr_hash,
+        "image_build_receipt_sha256": build_hash,
+        "image_build_context_sha256": context_sha256,
+        "image_dockerfile_sha256": build["dockerfile_sha256"],
+        "image_lock_sha256": build["image_lock_sha256"],
+        "runtime_dependency_lock_sha256": build[
+            "runtime_dependency_lock_sha256"
+        ],
+    }
+
+
+def _capacity_identity(
+    profile: object,
+    *,
+    capacity_reservation_id: str | None,
+    capacity_block_offering_id: str | None,
+) -> dict[str, object]:
+    purchase_model = getattr(profile, "purchase_model", None)
+    if purchase_model == "on_demand":
+        if capacity_reservation_id is not None or capacity_block_offering_id is not None:
+            _fail("on-demand selection must not include Capacity Block identity")
+    elif purchase_model == "capacity_block":
+        if (
+            not isinstance(capacity_reservation_id, str)
+            or _CAPACITY_ID_RE.fullmatch(capacity_reservation_id) is None
+            or not isinstance(capacity_block_offering_id, str)
+            or _CAPACITY_ID_RE.fullmatch(capacity_block_offering_id) is None
+        ):
+            _fail(
+                "Capacity Block selection requires exact reservation and offering IDs"
+            )
+    else:
+        _fail("selected profile purchase model is unsupported")
+    return {
+        "purchase_model": purchase_model,
+        "capacity_reservation_id": capacity_reservation_id,
+        "capacity_block_offering_id": capacity_block_offering_id,
+    }
+
+
 def create_provider_selection(
     *,
     profile: object,
@@ -471,6 +680,11 @@ def create_provider_selection(
     ami_id: str,
     container_image: str,
     container_digest: str,
+    ami_evidence: Path | str,
+    ecr_evidence: Path | str,
+    image_build_receipt: Path | str,
+    capacity_reservation_id: str | None,
+    capacity_block_offering_id: str | None,
     selected_at: str,
 ) -> dict[str, object]:
     """Render one canonical provider-selection receipt without writing it."""
@@ -481,6 +695,21 @@ def create_provider_selection(
     if not isinstance(ami_id, str) or _AMI_RE.fullmatch(ami_id) is None:
         _fail("provider selection AMI must be an immutable AMI ID")
     image, digest = _validate_container(container_image, container_digest)
+    evidence = _selection_evidence(
+        amendment=amendment,
+        region=region,
+        ami_id=ami_id,
+        container_image=image,
+        container_digest=digest,
+        ami_evidence=ami_evidence,
+        ecr_evidence=ecr_evidence,
+        image_build_receipt=image_build_receipt,
+    )
+    capacity = _capacity_identity(
+        profile,
+        capacity_reservation_id=capacity_reservation_id,
+        capacity_block_offering_id=capacity_block_offering_id,
+    )
     timestamp = _utc_timestamp(selected_at, label="provider selection selected_at")
     return {
         "schema_version": 3,
@@ -495,9 +724,24 @@ def create_provider_selection(
         "instance_type": allowed.instance_type,
         "gpu_model": allowed.gpu_model,
         "region": region,
+        "aws_account_id": evidence["aws_account_id"],
         "ami_id": ami_id,
+        "ami_owner_id": evidence["ami_owner_id"],
+        "ami_name": evidence["ami_name"],
+        "ami_describe_sha256": evidence["ami_describe_sha256"],
         "container_image": image,
         "container_digest": digest,
+        "ecr_describe_sha256": evidence["ecr_describe_sha256"],
+        "image_build_receipt_sha256": evidence[
+            "image_build_receipt_sha256"
+        ],
+        "image_build_context_sha256": evidence["image_build_context_sha256"],
+        "image_dockerfile_sha256": evidence["image_dockerfile_sha256"],
+        "image_lock_sha256": evidence["image_lock_sha256"],
+        "runtime_dependency_lock_sha256": evidence[
+            "runtime_dependency_lock_sha256"
+        ],
+        **capacity,
         "seeds": list(V3_SEEDS),
         "mixed_profiles": False,
         "protected_outcomes_inspected": False,
@@ -526,6 +770,22 @@ def validate_provider_selection(
         receipt["selected_at"],
         label="provider selection selected_at",
     )
+    image_match = _ECR_IMAGE_RE.fullmatch(image)
+    capacity = _capacity_identity(
+        profile,
+        capacity_reservation_id=receipt["capacity_reservation_id"],
+        capacity_block_offering_id=receipt["capacity_block_offering_id"],
+    )
+    for field in (
+        "ami_describe_sha256",
+        "ecr_describe_sha256",
+        "image_build_receipt_sha256",
+        "image_build_context_sha256",
+        "image_dockerfile_sha256",
+        "image_lock_sha256",
+        "runtime_dependency_lock_sha256",
+    ):
+        _sha256(receipt[field], label=f"provider selection {field}")
     if (
         receipt["schema_version"] != 3
         or receipt["receipt_type"] != SELECTION_RECEIPT_TYPE
@@ -542,8 +802,20 @@ def validate_provider_selection(
         or receipt["gpu_model"] != allowed.gpu_model
         or not isinstance(receipt["region"], str)
         or _REGION_RE.fullmatch(receipt["region"]) is None
+        or not isinstance(receipt["aws_account_id"], str)
+        or _ACCOUNT_RE.fullmatch(receipt["aws_account_id"]) is None
         or not isinstance(receipt["ami_id"], str)
         or _AMI_RE.fullmatch(receipt["ami_id"]) is None
+        or not isinstance(receipt["ami_owner_id"], str)
+        or _ACCOUNT_RE.fullmatch(receipt["ami_owner_id"]) is None
+        or not isinstance(receipt["ami_name"], str)
+        or not receipt["ami_name"]
+        or len(receipt["ami_name"]) > 255
+        or image_match is None
+        or image_match.group("account") != receipt["aws_account_id"]
+        or image_match.group("region") != receipt["region"]
+        or image_match.group("digest") != digest
+        or receipt["purchase_model"] != capacity["purchase_model"]
         or receipt["seeds"] != list(V3_SEEDS)
         or receipt["mixed_profiles"] is not False
         or receipt["protected_outcomes_inspected"] is not False
@@ -571,9 +843,34 @@ def validate_provider_selection(
         instance_type=allowed.instance_type,
         gpu_model=allowed.gpu_model,
         region=str(receipt["region"]),
+        aws_account_id=str(receipt["aws_account_id"]),
         ami_id=str(receipt["ami_id"]),
+        ami_owner_id=str(receipt["ami_owner_id"]),
+        ami_name=str(receipt["ami_name"]),
+        ami_describe_sha256=str(receipt["ami_describe_sha256"]),
         container_image=image,
         container_digest=digest,
+        ecr_describe_sha256=str(receipt["ecr_describe_sha256"]),
+        image_build_receipt_sha256=str(
+            receipt["image_build_receipt_sha256"]
+        ),
+        image_build_context_sha256=str(receipt["image_build_context_sha256"]),
+        image_dockerfile_sha256=str(receipt["image_dockerfile_sha256"]),
+        image_lock_sha256=str(receipt["image_lock_sha256"]),
+        runtime_dependency_lock_sha256=str(
+            receipt["runtime_dependency_lock_sha256"]
+        ),
+        purchase_model=str(receipt["purchase_model"]),
+        capacity_reservation_id=(
+            str(receipt["capacity_reservation_id"])
+            if receipt["capacity_reservation_id"] is not None
+            else None
+        ),
+        capacity_block_offering_id=(
+            str(receipt["capacity_block_offering_id"])
+            if receipt["capacity_block_offering_id"] is not None
+            else None
+        ),
         seeds=V3_SEEDS,
         selected_at=timestamp,
         sha256=receipt_sha256,
@@ -675,6 +972,11 @@ def plan_provider_selection(
     ami_id: str,
     container_image: str,
     container_digest: str,
+    ami_evidence: Path | str,
+    ecr_evidence: Path | str,
+    image_build_receipt: Path | str,
+    capacity_reservation_id: str | None,
+    capacity_block_offering_id: str | None,
     selected_at: str,
     out: Path | str,
     apply: bool,
@@ -689,6 +991,11 @@ def plan_provider_selection(
         ami_id=ami_id,
         container_image=container_image,
         container_digest=container_digest,
+        ami_evidence=ami_evidence,
+        ecr_evidence=ecr_evidence,
+        image_build_receipt=image_build_receipt,
+        capacity_reservation_id=capacity_reservation_id,
+        capacity_block_offering_id=capacity_block_offering_id,
         selected_at=selected_at,
     )
     validated = validate_provider_selection(

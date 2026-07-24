@@ -73,8 +73,8 @@ def test_only_legacy_p5_uses_legacy_receipt_protocol_identities():
                 "memory_gib": 2048,
                 "gpu_model": "NVIDIA H100 80GB",
                 "gres": "gpu:h100:8",
-                "cuda_minimum": "12.1",
-                "driver_minimum": "530",
+                "cuda_minimum": "13.0",
+                "driver_minimum": "580",
             },
         ),
         (
@@ -161,6 +161,10 @@ def _runtime_environment() -> dict[str, str]:
     return {
         "AWS_REGION": "us-east-1",
         "MS_S3_ROOT": "s3://memorysplit-prod/cohort-v3",
+        "MS_S3_KMS_KEY_ID": (
+            "arn:aws:kms:us-east-1:123456789012:"
+            "key/12345678-1234-4234-9234-123456789abc"
+        ),
         "MS_AWS_AMI_ID": "ami-0123456789abcdef0",
         "MS_CONTAINER_DIGEST": digest,
         "MS_CONTAINER_IMAGE": (

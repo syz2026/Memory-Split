@@ -24,8 +24,10 @@ ARNs.
 
 - `ec2:DescribeImages`
 - `ec2:DescribeInstances`
+- `ec2:DescribeInstanceAttribute`
 - `ec2:DescribeInstanceTypes`
 - `ec2:DescribeInstanceTypeOfferings`
+- `ec2:DescribeTags`
 - `ec2:DescribeSubnets`
 - `ec2:DescribeSecurityGroups`
 - `ec2:DescribeVpcs`
@@ -48,6 +50,8 @@ that does not authorize mutation.
 
 - `ec2:RunInstances`
 - `ec2:CreateTags`
+- `ec2:DeleteTags`
+- `ec2:ModifyInstanceAttribute`
 - `ec2:StartInstances`
 - `ec2:StopInstances`
 - `ec2:TerminateInstances`
@@ -57,27 +61,42 @@ Constrain launches to the approved P5/P6 instance types, approved private
 subnets and security groups, encrypted volumes, the reviewed immutable AMI ID,
 the dedicated instance profile, and cohort request/resource tags. Require
 `ec2:CreateAction = RunInstances` on launch-time tagging where applicable.
-Start, stop, terminate, and tag permissions must target cohort-tagged instances;
-operators still pass explicit reviewed instance IDs to every mutating command.
+Start, stop, terminate, instance-attribute, and tag permissions must target
+cohort-tagged instances; operators still pass explicit reviewed instance IDs to
+every mutating command. `ec2:DeleteTags` is used only by approved `fleet
+advance` to remove the prior wave's exact key/value bindings after terminal,
+evaluation, and collection evidence has been verified. It is not permission to
+retag an active pair manually.
 
 ### SSM command and session access
 
 - `ssm:DescribeInstanceInformation`
+- `ssm:GetParameter`
+- `ssm:GetDocument`
+- `ssm:ListDocuments`
+- `ssm:CreateDocument`
 - `ssm:SendCommand`
 - `ssm:GetCommandInvocation`
 - `ssm:ListCommands`
 - `ssm:ListCommandInvocations`
+- `ssm:CancelCommand`
 - `ssm:StartSession`
 - `ssm:ResumeSession`
 - `ssm:TerminateSession`
 - `ssmmessages:OpenDataChannel`
 
-Scope command/session targets to cohort-tagged instances and scope
-`ssm:SendCommand` and `ssm:StartSession` to the approved AWS-managed or
-cohort-owned SSM documents. Restrict resume/terminate to sessions owned by the
+`ssm:GetParameter` resolves only the reviewed public DLAMI alias during
+discovery. Scope command/session targets to cohort-tagged instances and scope
+`ssm:SendCommand` and `ssm:StartSession` to `AWS-RunShellScript`, the fixed
+content-addressed MemorySplit command document, and approved session documents.
+Permit `ssm:CreateDocument` only for the fixed MemorySplit document name; the
+launcher rejects any existing or newly created document whose hash/status
+differs. `ssm:ListDocuments`, `ssm:GetDocument`, command-list/get, and
+`ssm:CancelCommand` support verification, reconciliation, and explicit
+cancellation only. Restrict resume/terminate to sessions owned by the
 requesting principal, and scope `ssmmessages:OpenDataChannel` to that
-principal's own Session Manager session ARN. No public SSH ingress is
-requested.
+principal's own Session Manager session ARN. No document update/delete and no
+public SSH ingress are requested.
 
 ### Private ECR push and pull
 

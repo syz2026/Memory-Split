@@ -12,6 +12,7 @@ import time
 import zipfile
 from copy import deepcopy
 from pathlib import Path
+from types import SimpleNamespace
 from urllib.error import HTTPError
 
 import pytest
@@ -73,6 +74,10 @@ SAFE_ENVIRONMENT = {
     "LANG": "C.UTF-8",
     "LC_ALL": "C.UTF-8",
     "MS_S3_ROOT": "s3://memorysplit-prod/cohort-v2",
+    "MS_S3_KMS_KEY_ID": (
+        "arn:aws:kms:us-east-1:123456789012:"
+        "key/12345678-1234-4234-9234-123456789abc"
+    ),
     "MS_AWS_AMI_ID": "ami-0123456789abcdef0",
     "MS_CONTAINER_DIGEST": "sha256:" + "a" * 64,
     "MS_CONTAINER_IMAGE": CONTAINER_IMAGE,
@@ -502,7 +507,7 @@ def test_dry_run_renders_exact_symmetric_four_plus_four_commands(tmp_path, seed)
     assert dense["arm"] == "dense"
     assert dense["argv"][0:3] == ["docker", "run", "--rm"]
     assert dense["argv"][-12:] == [
-        "/opt/conda/bin/python",
+        "/opt/venv/bin/python",
         "-m",
         "torch.distributed.run",
         "--nnodes=1",
@@ -523,6 +528,9 @@ def test_dry_run_renders_exact_symmetric_four_plus_four_commands(tmp_path, seed)
     assert "--network=host" in dense["argv"]
     assert "--ipc=host" in dense["argv"]
     assert "--pid=host" in dense["argv"]
+    tmpfs = dense["argv"][dense["argv"].index("--tmpfs") + 1]
+    assert "exec" in tmpfs.split(",")
+    assert "noexec" not in tmpfs.split(",")
     assert ["--name", f"memorysplit-s{seed}-dense"] == dense["argv"][
         dense["argv"].index("--name") : dense["argv"].index("--name") + 2
     ]
@@ -755,7 +763,7 @@ def test_trainer_contract_preflight_runs_inside_pinned_container(tmp_path):
     assert "--read-only" in argv
     assert CONTAINER_IMAGE in argv
     assert argv[-3:] == [
-        "/opt/conda/bin/python",
+        "/opt/venv/bin/python",
         "/workspace/scripts/run_train.py",
         "--capabilities-json",
     ]
@@ -1677,7 +1685,7 @@ def test_interruption_signals_both_rank_zero_processes_and_emits_paired_receipt(
     assert "resumable" not in receipt
     assert receipt["protocol"] == "aws-p5-resume-commit-v1"
     candidate_call = next(
-        call for call in store.calls if "/evidence/sha256/" in call[1]
+        call for call in store.calls if "/evidence/seed-1/sha256/" in call[1]
     )
     candidate = json.loads(candidate_call[5])
     assert [item["arm"] for item in candidate["checkpoints"]] == [
@@ -1749,7 +1757,7 @@ def test_v3_interruption_uses_neutral_profile_bound_receipt_protocol(
     assert marker["instance_type"] == request.instance_type
     assert marker["gres"] == request.gres
     candidate_bytes = next(
-        call[5] for call in store.calls if "/evidence/sha256/" in call[1]
+        call[5] for call in store.calls if "/evidence/seed-0/sha256/" in call[1]
     )
     candidate = json.loads(candidate_bytes)
     assert candidate["receipt_type"] == "aws-gpu-interruption-candidate"
@@ -1842,7 +1850,7 @@ def test_interruption_uploads_immutable_bytes_from_new_atomic_generation(tmp_pat
     assert dense_upload[0] != request.checkpoint_paths["dense"]
     assert dense_upload[6] & 0o222 == 0
     candidate_call = next(
-        call for call in store.calls if "/evidence/sha256/" in call[1]
+        call for call in store.calls if "/evidence/seed-1/sha256/" in call[1]
     )
     candidate = json.loads(candidate_call[5])
     dense = next(item for item in candidate["checkpoints"] if item["arm"] == "dense")
@@ -2013,7 +2021,7 @@ def test_resume_commit_is_derived_from_every_fetched_object_hash(tmp_path):
     ).hexdigest()
     rebound_marker["candidate"]["uri"] = (
         "s3://memorysplit-prod/cohort-v2/receipts/interruption/"
-        f"evidence/sha256/{rebound_marker['candidate']['sha256']}.json"
+        f"evidence/seed-1/sha256/{rebound_marker['candidate']['sha256']}.json"
     )
     rebound_marker_bytes = (
         json.dumps(rebound_marker, sort_keys=True, separators=(",", ":"))
@@ -2515,6 +2523,7 @@ def _metadata(instance_type="p5.48xlarge"):
                 "region": SAFE_ENVIRONMENT["AWS_REGION"],
             }
         ),
+        "dynamic/instance-identity/pkcs7": "c2lnbmF0dXJl",
     }
     return values.__getitem__
 
@@ -3008,6 +3017,88 @@ def test_bootstrap_extracts_only_verified_task7_release_read_only(tmp_path):
         path.stat().st_mode & 0o222 == 0
         for path in prepared.root.rglob("*")
     )
+    reused = bootstrap_module.extract_verified_release(
+        release_archive=archive,
+        artifacts=artifacts,
+        scratch_root=tmp_path / "scratch",
+        owner_uid=os.getuid(),
+        owner_gid=os.getgid(),
+    )
+    assert reused == prepared
+
+    changed = prepared.root / "scripts" / "run_train.py"
+    changed.chmod(0o644)
+    changed.write_bytes(b"print('drifted release')\n")
+    changed.chmod(0o444)
+    with pytest.raises(BootstrapError, match="identity drifted"):
+        bootstrap_module.extract_verified_release(
+            release_archive=archive,
+            artifacts=artifacts,
+            scratch_root=tmp_path / "scratch",
+            owner_uid=os.getuid(),
+            owner_gid=os.getgid(),
+        )
+
+
+def test_existing_bootstrap_storage_is_reused_only_with_exact_root_identity(
+    tmp_path,
+):
+    scratch = tmp_path / "scratch"
+    scratch.mkdir(mode=0o700)
+    profile = SimpleNamespace(
+        scratch_root=str(scratch),
+        instance_store_devices=2,
+    )
+
+    def runner(argv, _environment, _timeout):
+        if argv[0] == "findmnt":
+            return CommandResult(
+                returncode=0,
+                stdout=json.dumps(
+                    {
+                        "filesystems": [
+                            {
+                                "target": str(scratch),
+                                "source": "/dev/md/memorysplit",
+                                "fstype": "xfs",
+                                "options": "rw,noatime,nodiratime",
+                            }
+                        ]
+                    }
+                ),
+                stderr="",
+            )
+        if argv[0] == "mdadm":
+            return CommandResult(
+                returncode=0,
+                stdout=(
+                    "MD_LEVEL=raid0\n"
+                    "MD_DEVICES=2\n"
+                    "MD_DEVICE_0_DEV=/dev/nvme1n1\n"
+                    "MD_DEVICE_1_DEV=/dev/nvme2n1\n"
+                ),
+                stderr="",
+            )
+        pytest.fail(f"unexpected storage probe: {argv}")
+
+    expected = bootstrap_module._inspect_existing_storage(
+        profile,
+        owner_uid=os.getuid(),
+        owner_gid=os.getgid(),
+        runner=runner,
+        command_environment={},
+    )
+    assert expected == ("/dev/nvme1n1", "/dev/nvme2n1")
+
+    scratch.chmod(0o755)
+    with pytest.raises(BootstrapError, match="identity has drifted"):
+        bootstrap_module._inspect_existing_storage(
+            profile,
+            owner_uid=os.getuid(),
+            owner_gid=os.getgid(),
+            runner=runner,
+            command_environment={},
+        )
 
 
 def test_bootstrap_rejects_hash_consistent_outer_archive_with_bad_inner_sum(
@@ -3110,6 +3201,26 @@ def test_bootstrap_verifies_all_hashes_and_publishes_canonical_receipt(tmp_path)
     assert receipt["runtime_uid"] == RUNTIME_UID
     assert receipt["runtime_gid"] == RUNTIME_GID
     assert receipt["boot_id"] == BOOT_ID
+    assert publish_bootstrap_receipt(
+        receipt,
+        receipt_path=receipt_path,
+        receipt_uri=(
+            "s3://memorysplit-prod/cohort-v2/receipts/bootstrap/"
+            "i-0123456789abcdef0.json"
+        ),
+        object_store=store,
+    )
+    changed = {**receipt, "release_sha256": "0" * 64}
+    with pytest.raises(BootstrapError, match="identity has drifted"):
+        publish_bootstrap_receipt(
+            changed,
+            receipt_path=receipt_path,
+            receipt_uri=(
+                "s3://memorysplit-prod/cohort-v2/receipts/bootstrap/"
+                "i-0123456789abcdef0.json"
+            ),
+            object_store=store,
+        )
 
 
 def test_bootstrap_rejects_non_utf8_release_receipt(tmp_path):

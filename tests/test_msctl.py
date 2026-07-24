@@ -3374,7 +3374,7 @@ def test_aws_evaluation_runs_task8_module_in_pinned_container(tmp_path):
         image_index = argv.index(_aws_runtime_object().container_image)
         assert argv[:2] == ["/usr/bin/docker", "run"]
         assert argv[image_index + 1 : image_index + 5] == [
-            "/usr/bin/python3",
+            "/opt/venv/bin/python",
             "-m",
             "evals.confirmatory",
             "evaluate",
@@ -6094,7 +6094,7 @@ def test_aws_evaluation_uses_canonical_confirmatory_runner_interface(tmp_path):
         image_index = argv.index(_aws_runtime_object().container_image)
         assert argv[:2] == ["/usr/bin/docker", "run"]
         assert argv[image_index + 1 : image_index + 5] == [
-            "/usr/bin/python3",
+            "/opt/venv/bin/python",
             "-m",
             "evals.confirmatory",
             "evaluate",

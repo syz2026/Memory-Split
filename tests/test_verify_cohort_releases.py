@@ -24,8 +24,8 @@ SCRIPT = REPO_ROOT / "scripts" / "verify_cohort_releases.py"
 RUNBOOK = REPO_ROOT / "docs" / "AWS-P5-360M-RUNBOOK.md"
 
 # Final interface refs. Update only after the owning task publishes a commit.
-COHORT_AULC_REF = "70c1951fedce3a61e24b7d761fa330749b71618c"
-AWS_PACKAGE_REF = "4502db6607b673ead8613e68e8c8db49dd254b65"
+COHORT_AULC_REF = "33b8c9f5452601cd68f3bf4583a8c78ad674e723"
+AWS_PACKAGE_REF = "6454c7375d94fc8fc9d906e5cc89d990be8e64af"
 AWS_PACKAGE_LINEAGE_REF = "81543c216d1a8dcdb6a5ed92fd7c34681ab4894b"
 CONFIRMATORY_RUNNER_REF = "ac4b5a0033817fe1fcd4e0c9514c13252e7d560f"
 TASK_6_REF = "a2361588286f0050a0151ffdff88343e5eec4836"
@@ -713,10 +713,12 @@ def test_accepts_release_built_by_integrated_illumina_packager(
     source = package_tests._minimal_repo(fixture_root)
     reasoning_identity = (integration_root / CORPUS_IDENTITY_PATH).read_bytes()
     package_tests._write(source / CORPUS_IDENTITY_PATH, reasoning_identity)
-    package_tests._commit_mutation(source, "add reasoning identity")
+    package_tests._git(source, "add", "-f", CORPUS_IDENTITY_PATH)
+    package_tests._git(source, "commit", "-qm", "add reasoning identity")
     illumina = package_module.build_handoff(
         source_root=source,
         out_dir=tmp_path / "real-illumina-release",
+        apply=True,
     )
     with zipfile.ZipFile(illumina.archive) as archive:
         assignment = archive.read(ASSIGNMENT_PATH)

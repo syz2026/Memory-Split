@@ -9,9 +9,15 @@ import sys
 from collections.abc import Callable
 from pathlib import Path
 
+from .aws_control_bundle import plan_control_bundle
 from .aws_fleet import plan_fleet
 from .aws_p5 import build_aws_backend
-from .aws_selection import plan_provider_selection
+from .aws_readiness import DIAGNOSTIC_IDS, plan_launch_readiness
+from .aws_selection import (
+    load_hardware_amendment,
+    load_provider_selection,
+    plan_provider_selection,
+)
 from .cleanup import apply_cleanup, make_cleanup_plan
 from .collect import collect_evidence
 from .contracts import load_release
@@ -95,6 +101,23 @@ def build_parser() -> JsonArgumentParser:
     capacity_sub = capacity.add_subparsers(dest="action", required=True)
     _leaf(capacity_sub, "check", help_text="query bounded Slurm capacity")
 
+    control = _leaf(commands, "control", help_text="AWS control bootstrap")
+    control_sub = control.add_subparsers(dest="action", required=True)
+    control_bundle = _leaf(
+        control_sub,
+        "bundle",
+        help_text="render or exclusively publish the deterministic control bundle",
+    )
+    control_bundle.add_argument("--out", required=True)
+    control_bundle.add_argument("--apply", action="store_true")
+    control_install = _leaf(
+        control_sub,
+        "install",
+        help_text="install reviewed control bytes through stock AWS SSM",
+    )
+    control_install.add_argument("--instance-id", required=True)
+    control_install.add_argument("--apply", action="store_true")
+
     provider = _leaf(commands, "provider", help_text="provider selection")
     provider_sub = provider.add_subparsers(dest="action", required=True)
     select = _leaf(
@@ -108,11 +131,42 @@ def build_parser() -> JsonArgumentParser:
     )
     select.add_argument("--region", required=True)
     select.add_argument("--ami-id", required=True)
+    select.add_argument("--ami-evidence", required=True)
     select.add_argument("--container-image", required=True)
     select.add_argument("--container-digest", required=True)
+    select.add_argument("--ecr-evidence", required=True)
+    select.add_argument("--image-build-receipt", required=True)
+    select.add_argument("--capacity-reservation-id")
+    select.add_argument("--capacity-block-offering-id")
     select.add_argument("--selected-at", required=True)
     select.add_argument("--out", required=True)
     select.add_argument("--apply", action="store_true")
+
+    readiness = _leaf(commands, "readiness", help_text="protected launch gate")
+    readiness_sub = readiness.add_subparsers(dest="action", required=True)
+    readiness_create = _leaf(
+        readiness_sub,
+        "create",
+        help_text="render or exclusively publish protected-launch readiness",
+    )
+    readiness_create.add_argument("--release", required=True)
+    readiness_create.add_argument(
+        "--amendment",
+        default=str(DEFAULT_ROOT / "configs" / "hardware-amendment-v3.json"),
+    )
+    readiness_create.add_argument("--provider-selection", required=True)
+    readiness_create.add_argument("--environment-receipt", required=True)
+    readiness_create.add_argument("--qualification-receipt", required=True)
+    readiness_create.add_argument(
+        "--diagnostic-receipt",
+        action="append",
+        required=True,
+    )
+    readiness_create.add_argument("--sealed-evaluation-release", required=True)
+    readiness_create.add_argument("--reviewer", required=True)
+    readiness_create.add_argument("--reviewed-at", required=True)
+    readiness_create.add_argument("--out", required=True)
+    readiness_create.add_argument("--apply", action="store_true")
 
     fleet = _leaf(commands, "fleet", help_text="explicit AWS fleet planning")
     fleet_sub = fleet.add_subparsers(dest="action", required=True)
@@ -140,6 +194,22 @@ def build_parser() -> JsonArgumentParser:
     )
     fleet_plan.add_argument("--out", required=True)
     fleet_plan.add_argument("--apply", action="store_true")
+    fleet_advance = _leaf(
+        fleet_sub,
+        "advance",
+        help_text="verify and unbind one completed same-instance fleet wave",
+    )
+    fleet_advance.add_argument(
+        "--amendment",
+        default=str(DEFAULT_ROOT / "configs" / "hardware-amendment-v3.json"),
+    )
+    fleet_advance.add_argument("--provider-selection", required=True)
+    fleet_advance.add_argument("--fleet-plan", required=True)
+    fleet_advance.add_argument("--to-manifest", required=True)
+    fleet_advance.add_argument("--instance-id", required=True)
+    fleet_advance.add_argument("--collection-root", required=True)
+    fleet_advance.add_argument("--approval")
+    fleet_advance.add_argument("--apply", action="store_true")
 
     env = _leaf(commands, "env", help_text="environment lifecycle")
     env_sub = env.add_subparsers(dest="action", required=True)
@@ -208,6 +278,10 @@ def build_parser() -> JsonArgumentParser:
             dataset_binding.add_argument("--dataset-root")
             dataset_binding.add_argument("--dataset-verification")
             leaf.add_argument("--environment-receipt")
+            leaf.add_argument("--launch-readiness")
+            leaf.add_argument("--qualification-receipt")
+            leaf.add_argument("--sealed-evaluation-release")
+            leaf.add_argument("--diagnostic-receipt", action="append")
         leaf.add_argument("--approval")
         leaf.add_argument("--hardware-amendment")
         leaf.add_argument("--provider-selection")
@@ -280,6 +354,30 @@ def _require_cli_values(args: argparse.Namespace, *names: str) -> None:
         )
 
 
+def _diagnostic_receipts(values: list[str] | None) -> dict[str, str]:
+    result: dict[str, str] = {}
+    for value in values or []:
+        name, separator, path = value.partition("=")
+        if (
+            separator != "="
+            or name not in DIAGNOSTIC_IDS
+            or name in result
+            or not path
+        ):
+            raise MsctlError(
+                "CLI_USAGE",
+                "--diagnostic-receipt must be one unique NAME=PATH for each gate",
+            )
+        result[name] = path
+    if set(result) != set(DIAGNOSTIC_IDS):
+        raise MsctlError(
+            "CLI_USAGE",
+            "all six named diagnostic receipts are required",
+            details={"missing": sorted(set(DIAGNOSTIC_IDS) - set(result))},
+        )
+    return result
+
+
 def _auth_check(profile) -> dict[str, object]:
     value = os.environ.get(profile.shared_root_env)
     if not value:
@@ -340,17 +438,51 @@ def dispatch(
             provider_selection=args.provider_selection,
             sealed_evaluation=args.sealed_evaluation,
         )
+    if command == "control bundle":
+        return not args.apply, plan_control_bundle(
+            source_root=args.repo_root,
+            out=args.out,
+            apply=args.apply,
+        )
     if command == "provider select":
         return not args.apply, plan_provider_selection(
             profile=profile,
             amendment_path=args.amendment,
             region=args.region,
             ami_id=args.ami_id,
+            ami_evidence=args.ami_evidence,
             container_image=args.container_image,
             container_digest=args.container_digest,
+            ecr_evidence=args.ecr_evidence,
+            image_build_receipt=args.image_build_receipt,
+            capacity_reservation_id=args.capacity_reservation_id,
+            capacity_block_offering_id=args.capacity_block_offering_id,
             selected_at=args.selected_at,
             out=args.out,
             apply=args.apply,
+        )
+    if command == "readiness create":
+        amendment = load_hardware_amendment(args.amendment)
+        selection = load_provider_selection(
+            args.provider_selection,
+            amendment=amendment,
+            profile=profile,
+        )
+        return not args.apply, plan_launch_readiness(
+            out=args.out,
+            apply=args.apply,
+            profile=profile,
+            amendment=amendment,
+            selection=selection,
+            release=load_release(args.release),
+            environment_receipt=args.environment_receipt,
+            qualification_receipt=args.qualification_receipt,
+            diagnostic_receipts=_diagnostic_receipts(
+                args.diagnostic_receipt
+            ),
+            sealed_evaluation_release=args.sealed_evaluation_release,
+            reviewer=args.reviewer,
+            reviewed_at=args.reviewed_at,
         )
     if command == "fleet plan":
         return not args.apply, plan_fleet(

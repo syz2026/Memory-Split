@@ -8,8 +8,11 @@ import hashlib
 import json
 import os
 import re
+import secrets
+import stat
 import subprocess
 import tempfile
+import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -18,11 +21,20 @@ from typing import Protocol
 from urllib.parse import urlsplit
 
 from .approval import verify_scope_approval
+from .aws_control_bundle import (
+    build_control_bundle_bytes,
+    render_control_install_command,
+)
 from .aws_fleet import (
     FleetManifestBinding,
     FleetPlan,
+    create_fleet_advance,
+    fleet_transition_for_target,
+    load_fleet_advance,
     load_fleet_plan,
     validate_fleet_manifest,
+    verify_fleet_collection,
+    write_fleet_advance,
 )
 from .aws_argv import (
     ARGV_DOCUMENT_CONTENT,
@@ -35,6 +47,16 @@ from .aws_selection import (
     load_hardware_amendment,
     load_provider_selection,
 )
+from .aws_readiness import (
+    DIAGNOSTIC_IDS,
+    LaunchReadiness,
+    load_launch_readiness,
+)
+from .aws_sealed_evaluation import (
+    REQUIRED_SEALED_MEMBERS,
+    SealedEvaluationRelease,
+    load_sealed_evaluation_release,
+)
 from .contracts import (
     bind_release,
     load_release,
@@ -44,7 +66,7 @@ from .contracts import (
     verify_release_member,
 )
 from .errors import MsctlError
-from .fsutil import atomic_write_at, open_directory
+from .fsutil import atomic_write_at, open_directory, rename_noreplace_at
 from .jsonutil import (
     canonical_json,
     canonical_sha256,
@@ -79,6 +101,11 @@ _PROFILE_SEEDS = {
     "aws-p5.48xlarge-v3": tuple(range(10)),
     "aws-p6-b300.48xlarge-v3": tuple(range(10)),
 }
+_PROFILE_PURCHASE_MODELS = {
+    "aws-p5.48xlarge": "on_demand",
+    "aws-p5.48xlarge-v3": "on_demand",
+    "aws-p6-b300.48xlarge-v3": "capacity_block",
+}
 _V3_PROFILES = frozenset({AWS_P5_V3_PROFILE, AWS_P6_B300_V3_PROFILE})
 _V3_PROVENANCE_FIELDS = (
     "cohort_assignment_sha256",
@@ -87,6 +114,7 @@ _V3_PROVENANCE_FIELDS = (
     "provider_selection_sha256",
     "profile_sha256",
     "sealed_evaluation_sha256",
+    "study_lock_sha256",
 )
 _INSTANCE_ID_RE = re.compile(r"^i-[0-9a-f]{8,17}$")
 _COMMAND_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9-]{7,127}$")
@@ -95,6 +123,10 @@ _AMI_RE = re.compile(r"^ami-[0-9a-f]{8,17}$")
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 _COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
+_BOOT_ID_RE = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-"
+    r"[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+)
 _BUCKET_RE = re.compile(
     r"^(?![0-9]+(?:\.[0-9]+){3}$)(?!-)(?!.*\.\.)(?!.*\.-)(?!.*-\.)"
     r"[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$"
@@ -131,8 +163,11 @@ _V3_INSTANCE_FIELDS = {
     "hardware_amendment_sha256",
     "provider_selection_sha256",
     "sealed_evaluation_sha256",
+    "study_lock_sha256",
     "fleet_plan_sha256",
     "fleet_wave",
+    "launch_readiness_sha256",
+    "control_bundle_sha256",
 }
 _SAFE_PATH = "/usr/local/bin:/usr/bin:/bin"
 _MAX_PAID_RUNTIME = timedelta(minutes=1440)
@@ -173,6 +208,8 @@ class V3LifecycleContext:
     selection: ProviderSelection
     fleet_plan: FleetPlan
     fleet_binding: FleetManifestBinding
+    readiness: LaunchReadiness | None = None
+    sealed_evaluation: SealedEvaluationRelease | None = None
 
     @property
     def instance_id(self) -> str:
@@ -186,6 +223,33 @@ def _manifest_schema(manifest: object) -> int | None:
 
 def _is_v3_manifest(manifest: object) -> bool:
     return _manifest_schema(manifest) == 3
+
+
+def _diagnostic_receipt_map(
+    values: Sequence[str] | None,
+) -> dict[str, Path] | None:
+    if values is None:
+        return None
+    result: dict[str, Path] = {}
+    for value in values:
+        name, separator, path = value.partition("=")
+        if (
+            separator != "="
+            or name not in DIAGNOSTIC_IDS
+            or name in result
+            or not path
+        ):
+            raise MsctlError(
+                "CLI_USAGE",
+                "--diagnostic-receipt must be one unique NAME=PATH for each gate",
+            )
+        result[name] = Path(path)
+    if set(result) != set(DIAGNOSTIC_IDS):
+        raise MsctlError(
+            "CLI_USAGE",
+            "all six named diagnostic receipts are required",
+        )
+    return result
 
 
 def _verify_instance_identity_pkcs7(
@@ -354,7 +418,8 @@ def _validate_profile(profile: object) -> None:
         or not isinstance(getattr(profile, "sha256", None), str)
         or _SHA256_RE.fullmatch(profile.sha256) is None
         or _profile_gres(profile) != _PROFILE_GRES.get(provider)
-        or getattr(profile, "purchase_model", None) != "on_demand"
+        or getattr(profile, "purchase_model", None)
+        != _PROFILE_PURCHASE_MODELS.get(provider)
         or getattr(profile, "allocated_gpus", None) != 8
         or getattr(profile, "train_groups", None) != (4, 4)
         or getattr(profile, "assigned_seeds", None)
@@ -529,6 +594,9 @@ class AwsP5Backend:
         self.corpus_verifier = corpus_verifier
         self.identity_verifier = identity_verifier
         self.environ = dict(os.environ if environ is None else environ)
+        self.control_bundle = build_control_bundle_bytes(
+            Path(__file__).resolve().parents[1]
+        )
 
     def _aws_argv(
         self,
@@ -665,8 +733,6 @@ class AwsP5Backend:
             gpu_hours = getattr(manifest, "estimated_gpu_hours", None)
             if (
                 getattr(manifest, "profile_sha256", None) != self.profile.sha256
-                or getattr(manifest, "study_lock_sha256", None)
-                != getattr(manifest, "preregistration_sha256", None)
                 or isinstance(instance_hours, bool)
                 or not isinstance(instance_hours, (int, float))
                 or instance_hours <= 0
@@ -717,6 +783,22 @@ class AwsP5Backend:
             or selection.ami_id != self.runtime.ami_id
             or selection.container_image != self.runtime.container_image
             or selection.container_digest != self.runtime.container_digest
+            or (
+                context.readiness is not None
+                and (
+                    context.sealed_evaluation is None
+                    or context.readiness.bindings[
+                        "sealed_evaluation_release_sha256"
+                    ]
+                    != context.sealed_evaluation.sha256
+                    or context.readiness.bindings["study_lock_sha256"]
+                    != context.sealed_evaluation.study_lock_sha256
+                    or context.sealed_evaluation.sha256
+                    != getattr(manifest, "sealed_evaluation_sha256", None)
+                    or context.sealed_evaluation.study_lock_sha256
+                    != getattr(manifest, "study_lock_sha256", None)
+                )
+            )
         ):
             raise MsctlError(
                 "PROVIDER_SELECTION_MISMATCH",
@@ -724,13 +806,83 @@ class AwsP5Backend:
             )
         return context
 
+    def _require_protected_launch_context(
+        self,
+        manifest: object,
+        context: V3LifecycleContext | None,
+    ) -> V3LifecycleContext | None:
+        validated = self._validate_v3_context(manifest, context)
+        if not _is_v3_manifest(manifest):
+            return None
+        if (
+            validated is None
+            or validated.readiness is None
+            or validated.sealed_evaluation is None
+            or validated.readiness.bindings.get("release_sha256")
+            != getattr(manifest, "release_sha256", None)
+            or validated.readiness.bindings.get(
+                "provider_selection_sha256"
+            )
+            != validated.selection.sha256
+            or validated.readiness.bindings.get(
+                "hardware_amendment_sha256"
+            )
+            != validated.amendment.sha256
+            or validated.readiness.decision.get(
+                "protected_launch_allowed"
+            )
+            is not True
+        ):
+            raise MsctlError(
+                "LAUNCH_READINESS_REQUIRED",
+                "v3 protected submit, resume, and evaluation require one "
+                "validated affirmative launch-readiness receipt",
+            )
+        return validated
+
+    def _require_fleet_advance(
+        self,
+        manifest: object,
+        context: V3LifecycleContext | None,
+    ) -> None:
+        if not _is_v3_manifest(manifest):
+            return
+        validated = self._validate_v3_context(manifest, context)
+        assert validated is not None
+        binding = validated.fleet_binding
+        if binding.wave == 0:
+            return
+        receipt = load_fleet_advance(
+            self.state_root,
+            plan=validated.fleet_plan,
+            to_binding=binding,
+        )
+        if receipt is None:
+            raise MsctlError(
+                "FLEET_ADVANCE_REQUIRED",
+                "later fleet waves require an explicit completed local "
+                "fleet-advance receipt; absent AWS tags are not proof",
+                details={
+                    "instance_id": binding.instance_id,
+                    "seed": binding.seed,
+                    "wave": binding.wave,
+                },
+            )
+
     def _load_v3_context(
         self,
         manifest: object,
         *,
+        release: object,
         amendment_path: Path | str | None,
         provider_selection_path: Path | str | None,
         fleet_plan_path: Path | str | None,
+        readiness_path: Path | str | None,
+        environment_receipt_path: Path | str | None,
+        qualification_receipt_path: Path | str | None,
+        diagnostic_receipts: Mapping[str, Path | str] | None,
+        sealed_evaluation_release_path: Path | str | None,
+        require_readiness: bool,
         instance_id: str | None = None,
     ) -> V3LifecycleContext | None:
         if not _is_v3_manifest(manifest):
@@ -740,6 +892,10 @@ class AwsP5Backend:
                     amendment_path,
                     provider_selection_path,
                     fleet_plan_path,
+                    readiness_path,
+                    qualification_receipt_path,
+                    diagnostic_receipts,
+                    sealed_evaluation_release_path,
                 )
             ):
                 raise MsctlError(
@@ -751,11 +907,23 @@ class AwsP5Backend:
             amendment_path is None
             or provider_selection_path is None
             or fleet_plan_path is None
+            or (
+                require_readiness
+                and (
+                    readiness_path is None
+                    or environment_receipt_path is None
+                    or qualification_receipt_path is None
+                    or diagnostic_receipts is None
+                    or sealed_evaluation_release_path is None
+                )
+            )
         ):
             raise MsctlError(
                 "CLI_USAGE",
                 "v3 lifecycle requires --hardware-amendment, "
-                "--provider-selection, and --fleet-plan",
+                "--provider-selection, --fleet-plan, --launch-readiness, "
+                "--qualification-receipt, six --diagnostic-receipt values, "
+                "and --sealed-evaluation-release",
             )
         amendment = load_hardware_amendment(amendment_path)
         selection = load_provider_selection(
@@ -773,11 +941,39 @@ class AwsP5Backend:
             manifest,
             instance_id=instance_id,
         )
+        sealed_evaluation = None
+        readiness = None
+        if require_readiness:
+            assert sealed_evaluation_release_path is not None
+            assert readiness_path is not None
+            assert environment_receipt_path is not None
+            assert qualification_receipt_path is not None
+            assert diagnostic_receipts is not None
+            sealed_evaluation = load_sealed_evaluation_release(
+                sealed_evaluation_release_path,
+                expected_release_sha256=str(manifest.sealed_evaluation_sha256),
+                expected_study_lock_sha256=str(manifest.study_lock_sha256),
+            )
+            readiness = load_launch_readiness(
+                readiness_path,
+                profile=self.profile,
+                amendment=amendment,
+                selection=selection,
+                release=release,
+                manifest=manifest,
+                environment_receipt=environment_receipt_path,
+                qualification_receipt=qualification_receipt_path,
+                diagnostic_receipts=diagnostic_receipts,
+                sealed_evaluation_release=sealed_evaluation_release_path,
+                expected_instance_id=binding.instance_id,
+            )
         context = V3LifecycleContext(
             amendment=amendment,
             selection=selection,
             fleet_plan=plan,
             fleet_binding=binding,
+            readiness=readiness,
+            sealed_evaluation=sealed_evaluation,
         )
         return self._validate_v3_context(
             manifest,
@@ -794,13 +990,17 @@ class AwsP5Backend:
             return {}
         validated = self._validate_v3_context(manifest, context)
         assert validated is not None
-        return {
+        bindings = {
             field: getattr(manifest, field)
             for field in _V3_PROVENANCE_FIELDS
         } | {
             "fleet_plan_sha256": validated.fleet_plan.sha256,
             "fleet_wave": validated.fleet_binding.wave,
+            "control_bundle_sha256": self.control_bundle.sha256,
         }
+        if validated.readiness is not None:
+            bindings["launch_readiness_sha256"] = validated.readiness.sha256
+        return bindings
 
     def _validate_release(self, release: object, manifest: object) -> None:
         if (
@@ -855,6 +1055,11 @@ class AwsP5Backend:
         scratch_root = getattr(self.profile, "scratch_root", "/mnt/memorysplit")
         staging = f"{scratch_root}/staging"
         dataset_root = f"{scratch_root}/dataset"
+        control_root = (
+            f"/opt/memorysplit/control/{self.control_bundle.sha256}"
+            if _is_v3_manifest(manifest)
+            else "/opt/memorysplit"
+        )
         profile_name = f"{self.profile.profile_id}.json"
         cohort_version = "v3" if _is_v3_manifest(manifest) else "v2"
         cohort_name = f"cohort-assignment-{cohort_version}.json"
@@ -877,7 +1082,7 @@ class AwsP5Backend:
                 }
             )
         if operation in {"render", "submit"}:
-            release_bucket, release_prefix = self._s3_location(
+            release_bucket, release_key = self._s3_location(
                 f"releases/{release.archive_sha256}/release.zip"
             )
             receipt_bucket, receipt_key = self._s3_location(
@@ -926,7 +1131,7 @@ class AwsP5Backend:
                             "--bucket",
                             release_bucket,
                             "--key",
-                            release_prefix,
+                            release_key,
                             "--checksum-mode",
                             "ENABLED",
                             (
@@ -998,53 +1203,53 @@ class AwsP5Backend:
                     {
                         "name": "bootstrap",
                         "argv": [
-                        "/usr/bin/python3",
-                        "/opt/memorysplit/cluster/aws/p5/bootstrap.py",
-                        "--profile",
-                        f"/opt/memorysplit/cluster/profiles/{profile_name}",
-                        "--container-image",
-                        self.runtime.container_image,
-                        "--release-archive",
-                        (
-                            f"{staging}/releases/{release.archive_sha256}/"
-                            "release.zip"
-                        ),
-                        "--release-sha256",
-                        release.archive_sha256,
-                        "--release-receipt",
-                        (
-                            f"{staging}/releases/{release.archive_sha256}/"
-                            "RELEASE.json"
-                        ),
-                        "--release-receipt-sha256",
-                        getattr(
-                            release,
-                            "receipt_sha256",
-                            manifest.release_sha256,
-                        ),
-                        "--dataset-receipt",
-                        f"{dataset_root}/receipt.json",
-                        "--dataset-receipt-sha256",
-                        manifest.dataset_sha256,
-                        "--cohort-assignment",
-                        (
-                            f"{staging}/releases/{release.archive_sha256}/"
+                            "/usr/bin/python3",
+                            f"{control_root}/cluster/aws/p5/bootstrap.py",
+                            "--profile",
+                            f"{control_root}/cluster/profiles/{profile_name}",
+                            "--container-image",
+                            self.runtime.container_image,
+                            "--release-archive",
+                            (
+                                f"{staging}/releases/{release.archive_sha256}/"
+                                "release.zip"
+                            ),
+                            "--release-sha256",
+                            release.archive_sha256,
+                            "--release-receipt",
+                            (
+                                f"{staging}/releases/{release.archive_sha256}/"
+                                "RELEASE.json"
+                            ),
+                            "--release-receipt-sha256",
+                            getattr(
+                                release,
+                                "receipt_sha256",
+                                manifest.release_sha256,
+                            ),
+                            "--dataset-receipt",
+                            f"{dataset_root}/receipt.json",
+                            "--dataset-receipt-sha256",
+                            manifest.dataset_sha256,
+                            "--cohort-assignment",
+                            (
+                                f"{staging}/releases/{release.archive_sha256}/"
                                 f"{cohort_name}"
-                        ),
-                        "--cohort-assignment-sha256",
-                        manifest.cohort_assignment_sha256,
-                        "--code-commit",
-                        manifest.source_commit,
-                        "--receipt",
-                        f"{staging}/bootstrap-receipt.json",
-                        "--owner-uid",
-                        str(getattr(self.runtime, "uid", 1000)),
-                        "--owner-gid",
-                        str(getattr(self.runtime, "gid", 1000)),
-                        "--aws-private-home",
-                        _AWS_PRIVATE_HOME,
-                        "--authorize-destructive-instance-store",
-                        "--apply",
+                            ),
+                            "--cohort-assignment-sha256",
+                            manifest.cohort_assignment_sha256,
+                            "--code-commit",
+                            manifest.source_commit,
+                            "--receipt",
+                            f"{staging}/bootstrap-receipt.json",
+                            "--owner-uid",
+                            str(getattr(self.runtime, "uid", 1000)),
+                            "--owner-gid",
+                            str(getattr(self.runtime, "gid", 1000)),
+                            "--aws-private-home",
+                            _AWS_PRIVATE_HOME,
+                            "--authorize-destructive-instance-store",
+                            "--apply",
                         ],
                     },
                 ]
@@ -1054,7 +1259,7 @@ class AwsP5Backend:
                     "name": "build-launcher-manifest",
                     "argv": [
                         "/usr/bin/python3",
-                        "/opt/memorysplit/msctl/aws_launch_manifest.py",
+                        f"{release_root}/msctl/aws_launch_manifest.py",
                         "--profile",
                         f"{release_root}/cluster/profiles/{profile_name}",
                         "--out",
@@ -1093,8 +1298,20 @@ class AwsP5Backend:
                                     "--sealed-evaluation-sha256",
                                 ),
                                 (
+                                    "study_lock_sha256",
+                                    "--study-lock-sha256",
+                                ),
+                                (
                                     "fleet_plan_sha256",
                                     "--fleet-plan-sha256",
+                                ),
+                                (
+                                    "launch_readiness_sha256",
+                                    "--launch-readiness-sha256",
+                                ),
+                                (
+                                    "control_bundle_sha256",
+                                    "--control-bundle-sha256",
                                 ),
                             )
                             if field in v3_bindings
@@ -1140,9 +1357,14 @@ class AwsP5Backend:
                 checkpoint_receipt_sha256,
                 label="checkpoint receipt",
             )
+            checkpoint_prefix = (
+                f"checkpoints/seed-{manifest.seed}"
+                if _is_v3_manifest(manifest)
+                else "checkpoints"
+            )
             resume_root = f"{staging}/resume/{receipt_sha256}"
             receipt_bucket, receipt_key = self._s3_location(
-                f"checkpoints/receipts/{receipt_sha256}.json"
+                f"{checkpoint_prefix}/receipts/{receipt_sha256}.json"
             )
             checkpoint_rows = [
                 {
@@ -1192,7 +1414,8 @@ class AwsP5Backend:
             )
             for row in checkpoint_rows:
                 bucket, key = self._s3_location(
-                    f"checkpoints/sha256/{row['resume_sha256']}.pt"
+                    f"{checkpoint_prefix}/{row['arm']}/sha256/"
+                    f"{row['resume_sha256']}.pt"
                 )
                 steps.append(
                     {
@@ -1462,6 +1685,319 @@ class AwsP5Backend:
             "version_id": row["version_id"],
         }
 
+    def _publish_control_bundle(self) -> dict[str, object]:
+        """Publish and independently verify the content-addressed bootstrap."""
+
+        bundle = self.control_bundle
+        if (
+            hashlib.sha256(bundle.payload).hexdigest() != bundle.sha256
+            or len(bundle.payload) != bundle.bytes
+        ):
+            raise MsctlError(
+                "CONTROL_BUNDLE_INVALID",
+                "in-memory control bundle identity changed before publication",
+            )
+        bucket, key = self._s3_location(
+            f"control/{bundle.sha256}.tar"
+        )
+        directory_fd = open_directory(
+            self.state_root,
+            label="AWS state root",
+            create=True,
+        )
+        name = f"control-{bundle.sha256}.tar"
+        try:
+            atomic_write_at(
+                directory_fd,
+                name,
+                bundle.payload,
+                label="control bundle",
+            )
+        finally:
+            os.close(directory_fd)
+        checksum = base64.b64encode(
+            bytes.fromhex(bundle.sha256)
+        ).decode("ascii")
+        encryption = (
+            [
+                "--server-side-encryption",
+                "aws:kms",
+                "--ssekms-key-id",
+                self.runtime.kms_key_id,
+            ]
+            if getattr(self.runtime, "kms_key_id", None) is not None
+            else []
+        )
+        put = self._aws_argv(
+            "s3api",
+            "put-object",
+            "--bucket",
+            bucket,
+            "--key",
+            key,
+            "--body",
+            str((self.state_root / name).absolute()),
+            "--checksum-algorithm",
+            "SHA256",
+            "--checksum-sha256",
+            checksum,
+            "--metadata",
+            f"bundle-type=memorysplit-aws-control-bundle-v1,sha256={bundle.sha256}",
+            "--if-none-match",
+            "*",
+            *encryption,
+            query=(
+                "{object:{checksum_sha256:ChecksumSHA256,"
+                "version_id:VersionId}}"
+            ),
+        )
+        try:
+            put_output = _aws_output_object(
+                self._run(put, operation="publish control bundle"),
+                {"object"},
+                label="S3 control bundle put",
+            )
+        except MsctlError:
+            put_output = None
+        if put_output is not None:
+            put_row = _aws_output_object(
+                put_output["object"],
+                {"checksum_sha256", "version_id"},
+                label="S3 control bundle put",
+            )
+            if (
+                put_row["checksum_sha256"] != checksum
+                or not isinstance(put_row["version_id"], str)
+                or not put_row["version_id"]
+            ):
+                raise MsctlError(
+                    "S3_OBJECT_MISMATCH",
+                    "S3 did not confirm the immutable control bundle",
+                )
+        head = self._aws_argv(
+            "s3api",
+            "head-object",
+            "--bucket",
+            bucket,
+            "--key",
+            key,
+            "--checksum-mode",
+            "ENABLED",
+            query=(
+                "{object:{checksum_sha256:ChecksumSHA256,"
+                "content_length:ContentLength,metadata:Metadata,"
+                "server_side_encryption:ServerSideEncryption,"
+                "sse_kms_key_id:SSEKMSKeyId,version_id:VersionId}}"
+            ),
+        )
+        output = _aws_output_object(
+            self._run(head, operation="verify control bundle"),
+            {"object"},
+            label="S3 control bundle head",
+        )
+        row = _aws_output_object(
+            output["object"],
+            {
+                "checksum_sha256",
+                "content_length",
+                "metadata",
+                "server_side_encryption",
+                "sse_kms_key_id",
+                "version_id",
+            },
+            label="S3 control bundle",
+        )
+        expected_metadata = {
+            "bundle-type": "memorysplit-aws-control-bundle-v1",
+            "sha256": bundle.sha256,
+        }
+        kms_key_id = getattr(self.runtime, "kms_key_id", None)
+        if (
+            row["checksum_sha256"] != checksum
+            or row["content_length"] != bundle.bytes
+            or row["metadata"] != expected_metadata
+            or not isinstance(row["version_id"], str)
+            or not row["version_id"]
+            or (
+                kms_key_id is not None
+                and (
+                    row["server_side_encryption"] != "aws:kms"
+                    or row["sse_kms_key_id"] != kms_key_id
+                )
+            )
+        ):
+            raise MsctlError(
+                "S3_OBJECT_MISMATCH",
+                "published control bundle bytes, metadata, or encryption differ",
+            )
+        return {
+            "sha256": bundle.sha256,
+            "uri": f"s3://{bucket}/{key}",
+            "version_id": row["version_id"],
+        }
+
+    def _control_install_plan(self, instance_id: str) -> dict[str, object]:
+        if (
+            getattr(self.profile, "profile_id", None) not in _V3_PROFILES
+            or _INSTANCE_ID_RE.fullmatch(instance_id) is None
+            or not isinstance(getattr(self.runtime, "kms_key_id", None), str)
+        ):
+            raise MsctlError(
+                "CONTROL_INSTALL_INVALID",
+                "control install requires one explicit v3 instance and KMS key",
+            )
+        bundle = self.control_bundle
+        bucket, key = self._s3_location(f"control/{bundle.sha256}.tar")
+        uri = f"s3://{bucket}/{key}"
+        local_path = (
+            self.state_root / f"control-{bundle.sha256}.tar"
+        ).absolute()
+        checksum = base64.b64encode(
+            bytes.fromhex(bundle.sha256)
+        ).decode("ascii")
+        put = self._aws_argv(
+            "s3api",
+            "put-object",
+            "--bucket",
+            bucket,
+            "--key",
+            key,
+            "--body",
+            str(local_path),
+            "--checksum-algorithm",
+            "SHA256",
+            "--checksum-sha256",
+            checksum,
+            "--metadata",
+            (
+                "bundle-type=memorysplit-aws-control-bundle-v1,"
+                f"sha256={bundle.sha256}"
+            ),
+            "--if-none-match",
+            "*",
+            "--server-side-encryption",
+            "aws:kms",
+            "--ssekms-key-id",
+            str(self.runtime.kms_key_id),
+            query=(
+                "{object:{checksum_sha256:ChecksumSHA256,"
+                "version_id:VersionId}}"
+            ),
+        )
+        head = self._aws_argv(
+            "s3api",
+            "head-object",
+            "--bucket",
+            bucket,
+            "--key",
+            key,
+            "--checksum-mode",
+            "ENABLED",
+            query=(
+                "{object:{checksum_sha256:ChecksumSHA256,"
+                "content_length:ContentLength,metadata:Metadata,"
+                "server_side_encryption:ServerSideEncryption,"
+                "sse_kms_key_id:SSEKMSKeyId,version_id:VersionId}}"
+            ),
+        )
+        install = render_control_install_command(
+            bundle_sha256=bundle.sha256,
+            bundle_uri=uri,
+            region=self.runtime.region,
+        )
+        parameters = canonical_json({"commands": [install]}).decode("ascii")
+        send = self._aws_argv(
+            "ssm",
+            "send-command",
+            "--document-name",
+            "AWS-RunShellScript",
+            "--instance-ids",
+            instance_id,
+            "--comment",
+            f"memorysplit-control-{bundle.sha256}",
+            "--timeout-seconds",
+            "900",
+            "--parameters",
+            parameters,
+            query=(
+                "{command:{command_id:Command.CommandId,"
+                "status:Command.Status}}"
+            ),
+        )
+        return {
+            "schema_version": 1,
+            "instance_id": instance_id,
+            "control_bundle_sha256": bundle.sha256,
+            "control_bundle_uri": uri,
+            "installer_sha256": hashlib.sha256(
+                install.encode("ascii")
+            ).hexdigest(),
+            "ssm_document": "AWS-RunShellScript",
+            "commands": [put, head, send],
+            "installed": 0,
+        }
+
+    def control_install(
+        self,
+        *,
+        instance_id: str,
+        apply: bool,
+    ) -> dict[str, object]:
+        """Install reviewed control bytes before any custom SSM document use."""
+
+        plan = self._control_install_plan(instance_id)
+        if not apply:
+            return plan
+        self._require_ssm_online(instance_id)
+        published = self._publish_control_bundle()
+        output = _aws_output_object(
+            self._run(plan["commands"][2], operation="install control bundle"),
+            {"command"},
+            label="SSM control install",
+        )
+        command = _aws_output_object(
+            output["command"],
+            {"command_id", "status"},
+            label="SSM control install",
+        )
+        if (
+            not isinstance(command["command_id"], str)
+            or _COMMAND_ID_RE.fullmatch(command["command_id"]) is None
+            or command["status"]
+            not in {"Pending", "InProgress", "Delayed", "Success"}
+            or published["sha256"] != plan["control_bundle_sha256"]
+            or published["uri"] != plan["control_bundle_uri"]
+        ):
+            raise MsctlError(
+                "CONTROL_INSTALL_INVALID",
+                "AWS did not accept the exact control install command",
+            )
+        command_id = str(command["command_id"])
+        status = str(command["status"])
+        deadline = time.monotonic() + 900.0
+        while status != "Success":
+            if status not in _ACTIVE_COMMAND_STATES:
+                raise MsctlError(
+                    "CONTROL_INSTALL_FAILED",
+                    "verified control-bundle installation did not succeed",
+                    details={"command_id": command_id, "status": status},
+                )
+            if time.monotonic() >= deadline:
+                raise MsctlError(
+                    "CONTROL_INSTALL_TIMEOUT",
+                    "verified control-bundle installation did not finish in time",
+                    details={"command_id": command_id, "status": status},
+                )
+            time.sleep(2.0)
+            status = self._command_status(instance_id, command_id)
+        return {
+            **plan,
+            "command_id": command_id,
+            "status": status,
+            "control_bundle_version_id": published["version_id"],
+            "installed": 1,
+        }
+
     def _ensure_argv_document(self) -> None:
         listing_argv = self._aws_argv(
             "ssm",
@@ -1566,9 +2102,15 @@ class AwsP5Backend:
             "Tags[?Key=='MemorySplitProviderSelectionSHA256']|[0].Value,"
             "sealed_evaluation_sha256:"
             "Tags[?Key=='MemorySplitSealedEvaluationSHA256']|[0].Value,"
+            "study_lock_sha256:"
+            "Tags[?Key=='MemorySplitStudyLockSHA256']|[0].Value,"
             "fleet_plan_sha256:"
             "Tags[?Key=='MemorySplitFleetPlanSHA256']|[0].Value,"
             "fleet_wave:to_number(Tags[?Key=='MemorySplitFleetWave']|[0].Value),"
+            "launch_readiness_sha256:"
+            "Tags[?Key=='MemorySplitLaunchReadinessSHA256']|[0].Value,"
+            "control_bundle_sha256:"
+            "Tags[?Key=='MemorySplitControlBundleSHA256']|[0].Value,"
             if _is_v3_manifest(manifest)
             else ""
         )
@@ -1615,9 +2157,15 @@ class AwsP5Backend:
             "Tags[?Key=='MemorySplitProviderSelectionSHA256']|[0].Value,"
             "sealed_evaluation_sha256:"
             "Tags[?Key=='MemorySplitSealedEvaluationSHA256']|[0].Value,"
+            "study_lock_sha256:"
+            "Tags[?Key=='MemorySplitStudyLockSHA256']|[0].Value,"
             "fleet_plan_sha256:"
             "Tags[?Key=='MemorySplitFleetPlanSHA256']|[0].Value,"
             "fleet_wave:to_number(Tags[?Key=='MemorySplitFleetWave']|[0].Value),"
+            "launch_readiness_sha256:"
+            "Tags[?Key=='MemorySplitLaunchReadinessSHA256']|[0].Value,"
+            "control_bundle_sha256:"
+            "Tags[?Key=='MemorySplitControlBundleSHA256']|[0].Value,"
             if manifest is not None and _is_v3_manifest(manifest)
             else ""
         )
@@ -1683,6 +2231,7 @@ class AwsP5Backend:
         terminate_at: str,
         require_bound: bool,
         context: V3LifecycleContext | None = None,
+        expected_binding: Mapping[str, object] | None = None,
     ) -> dict[str, object]:
         root = _aws_output_object(
             output,
@@ -1718,11 +2267,25 @@ class AwsP5Backend:
                 "INSTANCE_BINDING_MISMATCH",
                 "operator-selected instance has the wrong immutable runtime",
             )
-        expected = self._selected_binding(
-            manifest,
-            terminate_at=terminate_at,
-            context=context,
+        expected = (
+            dict(expected_binding)
+            if expected_binding is not None
+            else self._selected_binding(
+                manifest,
+                terminate_at=terminate_at,
+                context=context,
+            )
         )
+        expected_fields = (
+            self._instance_tag_names(manifest).keys()
+            if _is_v3_manifest(manifest)
+            else self._instance_tag_names(manifest).keys()
+        )
+        if set(expected) != set(expected_fields):
+            raise MsctlError(
+                "INSTANCE_BINDING_MISMATCH",
+                "selected-instance expected tag binding is incomplete",
+            )
         observed = {field: row[field] for field in expected}
         if require_bound:
             valid = observed == expected
@@ -1749,6 +2312,15 @@ class AwsP5Backend:
             terminate_at=terminate_at,
             context=context,
         )
+        names = self._instance_tag_names(manifest)
+        return canonical_json(
+            [
+                {"Key": names[field], "Value": str(binding[field])}
+                for field in names
+            ]
+        ).decode("ascii")
+
+    def _instance_tag_names(self, manifest: object) -> dict[str, str]:
         names = {
             "provider": "MemorySplitProvider",
             "profile_instance_type": "MemorySplitInstanceType",
@@ -1778,16 +2350,18 @@ class AwsP5Backend:
                     "sealed_evaluation_sha256": (
                         "MemorySplitSealedEvaluationSHA256"
                     ),
+                    "study_lock_sha256": "MemorySplitStudyLockSHA256",
                     "fleet_plan_sha256": "MemorySplitFleetPlanSHA256",
                     "fleet_wave": "MemorySplitFleetWave",
+                    "launch_readiness_sha256": (
+                        "MemorySplitLaunchReadinessSHA256"
+                    ),
+                    "control_bundle_sha256": (
+                        "MemorySplitControlBundleSHA256"
+                    ),
                 }
             )
-        return canonical_json(
-            [
-                {"Key": names[field], "Value": str(binding[field])}
-                for field in names
-            ]
-        ).decode("ascii")
+        return names
 
     def _bind_selected_instance(
         self,
@@ -2563,7 +3137,12 @@ class AwsP5Backend:
             or cohort_member.get("sha256")
             != manifest.cohort_assignment_sha256
             or study_member is None
-            or study_member.get("sha256") != manifest.study_lock_sha256
+            or study_member.get("sha256")
+            != (
+                manifest.preregistration_sha256
+                if _is_v3_manifest(manifest)
+                else manifest.study_lock_sha256
+            )
         ):
             raise MsctlError(
                 "RELEASE_COHORT_MISMATCH",
@@ -2573,21 +3152,14 @@ class AwsP5Backend:
             amendment_member = release.members.get(
                 "configs/hardware-amendment-v3.json"
             )
-            sealed_matches = [
-                relative
-                for relative, member in release.members.items()
-                if member.get("sha256") == manifest.sealed_evaluation_sha256
-            ]
             if (
                 amendment_member is None
                 or amendment_member.get("sha256")
                 != manifest.hardware_amendment_sha256
-                or len(sealed_matches) != 1
             ):
                 raise MsctlError(
                     "RELEASE_COHORT_MISMATCH",
-                    "AWS v3 release does not bind the amendment and sealed "
-                    "evaluation",
+                    "AWS v3 training release does not bind the amendment",
                 )
         return release, manifest
 
@@ -2690,15 +3262,19 @@ class AwsP5Backend:
             load_json(environment_path, label="AWS environment receipt"),
             label="AWS environment receipt",
         )
+        v3_environment = _is_v3_manifest(manifest)
+        environment_fields = {
+            "schema_version",
+            "profile_sha256",
+            "container_image_digest",
+            "aws_instance_identity_document",
+            "aws_instance_identity_pkcs7",
+        }
+        if v3_environment:
+            environment_fields.add("boot_id")
         require_exact_keys(
             environment,
-            {
-                "schema_version",
-                "profile_sha256",
-                "container_image_digest",
-                "aws_instance_identity_document",
-                "aws_instance_identity_pkcs7",
-            },
+            environment_fields,
             label="AWS environment receipt",
         )
         identity = require_object(
@@ -2718,7 +3294,9 @@ class AwsP5Backend:
             ) from error
         if (
             environment_bytes != canonical_json(environment) + b"\n"
-            or environment["schema_version"] != 1
+            or environment["schema_version"] != (
+                3 if v3_environment else 1
+            )
             or environment["profile_sha256"] != self.profile.sha256
             or environment["container_image_digest"]
             != self.runtime.container_digest
@@ -2727,6 +3305,14 @@ class AwsP5Backend:
             or (
                 expected_instance_id is not None
                 and identity.get("instanceId") != expected_instance_id
+            )
+            or (
+                v3_environment
+                and (
+                    not isinstance(environment.get("boot_id"), str)
+                    or _BOOT_ID_RE.fullmatch(str(environment["boot_id"]))
+                    is None
+                )
             )
             or not decoded_pkcs7
             or not self.identity_verifier(
@@ -2958,6 +3544,199 @@ class AwsP5Backend:
             ) from error
         return evidence, identities
 
+    @staticmethod
+    def _hash_regular_nofollow(
+        path: Path,
+        *,
+        label: str,
+    ) -> tuple[str, int, tuple[int, int, int, int, int]]:
+        flags = (
+            os.O_RDONLY
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_CLOEXEC", 0)
+        )
+        try:
+            descriptor = os.open(path, flags)
+        except OSError as error:
+            raise MsctlError(
+                "CHECKPOINT_PROVENANCE_MISMATCH",
+                f"{label} cannot be opened without following links",
+            ) from error
+        try:
+            before = os.fstat(descriptor)
+            if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1:
+                raise MsctlError(
+                    "CHECKPOINT_PROVENANCE_MISMATCH",
+                    f"{label} must be one singly linked regular file",
+                )
+            digest = hashlib.sha256()
+            byte_count = 0
+            while True:
+                chunk = os.read(descriptor, 1 << 20)
+                if not chunk:
+                    break
+                digest.update(chunk)
+                byte_count += len(chunk)
+            after = os.fstat(descriptor)
+        finally:
+            os.close(descriptor)
+        identity = (
+            before.st_dev,
+            before.st_ino,
+            before.st_size,
+            before.st_mtime_ns,
+            before.st_ctime_ns,
+        )
+        if identity != (
+            after.st_dev,
+            after.st_ino,
+            after.st_size,
+            after.st_mtime_ns,
+            after.st_ctime_ns,
+        ) or byte_count != before.st_size:
+            raise MsctlError(
+                "CHECKPOINT_PROVENANCE_MISMATCH",
+                f"{label} changed while read",
+            )
+        return digest.hexdigest(), byte_count, identity
+
+    def _snapshot_checkpoint(
+        self,
+        source: Path,
+        destination: Path,
+        *,
+        expected_sha256: str,
+        expected_bytes: int,
+        arm: str,
+    ) -> None:
+        """Copy one no-follow checkpoint into a private immutable upload path."""
+
+        if destination.exists() or destination.is_symlink():
+            digest, byte_count, _ = self._hash_regular_nofollow(
+                destination,
+                label=f"{arm} checkpoint snapshot",
+            )
+            mode = stat.S_IMODE(destination.stat(follow_symlinks=False).st_mode)
+            if (
+                digest != expected_sha256
+                or byte_count != expected_bytes
+                or mode != 0o400
+            ):
+                raise MsctlError(
+                    "CHECKPOINT_PROVENANCE_MISMATCH",
+                    f"{arm} checkpoint snapshot identity has drifted",
+                )
+            return
+        directory_fd = open_directory(
+            destination.parent,
+            label=f"{arm} checkpoint snapshot",
+            create=True,
+        )
+        source_fd: int | None = None
+        destination_fd: int | None = None
+        temporary = f".{destination.name}.{secrets.token_hex(12)}.tmp"
+        try:
+            source_fd = os.open(
+                source,
+                os.O_RDONLY
+                | getattr(os, "O_NOFOLLOW", 0)
+                | getattr(os, "O_CLOEXEC", 0),
+            )
+            source_before = os.fstat(source_fd)
+            if (
+                not stat.S_ISREG(source_before.st_mode)
+                or source_before.st_nlink != 1
+            ):
+                raise MsctlError(
+                    "CHECKPOINT_PROVENANCE_MISMATCH",
+                    f"{arm} checkpoint source is not one regular file",
+                )
+            destination_fd = os.open(
+                temporary,
+                os.O_WRONLY
+                | os.O_CREAT
+                | os.O_EXCL
+                | getattr(os, "O_NOFOLLOW", 0)
+                | getattr(os, "O_CLOEXEC", 0),
+                0o600,
+                dir_fd=directory_fd,
+            )
+            digest = hashlib.sha256()
+            byte_count = 0
+            while True:
+                chunk = os.read(source_fd, 1 << 20)
+                if not chunk:
+                    break
+                digest.update(chunk)
+                byte_count += len(chunk)
+                view = memoryview(chunk)
+                while view:
+                    view = view[os.write(destination_fd, view) :]
+            source_after = os.fstat(source_fd)
+            if (
+                (
+                    source_before.st_dev,
+                    source_before.st_ino,
+                    source_before.st_size,
+                    source_before.st_mtime_ns,
+                    source_before.st_ctime_ns,
+                )
+                != (
+                    source_after.st_dev,
+                    source_after.st_ino,
+                    source_after.st_size,
+                    source_after.st_mtime_ns,
+                    source_after.st_ctime_ns,
+                )
+                or byte_count != expected_bytes
+                or digest.hexdigest() != expected_sha256
+            ):
+                raise MsctlError(
+                    "CHECKPOINT_PROVENANCE_MISMATCH",
+                    f"{arm} checkpoint changed during no-follow snapshot",
+                )
+            os.fchmod(destination_fd, 0o400)
+            os.fsync(destination_fd)
+            os.close(destination_fd)
+            destination_fd = None
+            try:
+                rename_noreplace_at(
+                    directory_fd,
+                    temporary,
+                    directory_fd,
+                    destination.name,
+                )
+            except FileExistsError as error:
+                raise MsctlError(
+                    "CHECKPOINT_PROVENANCE_MISMATCH",
+                    f"{arm} checkpoint snapshot appeared concurrently",
+                ) from error
+            os.fsync(directory_fd)
+        except OSError as error:
+            raise MsctlError(
+                "CHECKPOINT_PROVENANCE_MISMATCH",
+                f"{arm} checkpoint snapshot failed",
+            ) from error
+        finally:
+            if destination_fd is not None:
+                os.close(destination_fd)
+            if source_fd is not None:
+                os.close(source_fd)
+            try:
+                os.unlink(temporary, dir_fd=directory_fd)
+            except FileNotFoundError:
+                pass
+            os.close(directory_fd)
+        digest, byte_count, _ = self._hash_regular_nofollow(
+            destination,
+            label=f"{arm} checkpoint snapshot",
+        )
+        if digest != expected_sha256 or byte_count != expected_bytes:
+            raise MsctlError(
+                "CHECKPOINT_PROVENANCE_MISMATCH",
+                f"{arm} checkpoint snapshot verification failed",
+            )
+
     def _immutable_s3_object_argv(
         self,
         *,
@@ -2966,10 +3745,27 @@ class AwsP5Backend:
         sha256: str,
         byte_count: int,
         upload: bool,
+        require_kms: bool = False,
     ) -> list[str]:
         bucket, key = self._s3_location(relative)
+        kms_key_id = getattr(self.runtime, "kms_key_id", None)
+        if require_kms and not isinstance(kms_key_id, str):
+            raise MsctlError(
+                "AWS_RUNTIME_INVALID",
+                "v3 checkpoint publication requires an exact SSE-KMS key",
+            )
         if upload:
             checksum = base64.b64encode(bytes.fromhex(sha256)).decode("ascii")
+            encryption = (
+                [
+                    "--server-side-encryption",
+                    "aws:kms",
+                    "--ssekms-key-id",
+                    str(kms_key_id),
+                ]
+                if require_kms
+                else []
+            )
             return self._aws_argv(
                 "s3api",
                 "put-object",
@@ -2989,11 +3785,24 @@ class AwsP5Backend:
                 f"sha256={sha256}",
                 "--if-none-match",
                 "*",
+                *encryption,
                 query=(
                     "{object:{checksum_sha256:ChecksumSHA256,"
                     "etag:ETag,version_id:VersionId}}"
                 ),
             )
+        query = (
+            "{object:{bytes:ContentLength,"
+            "checksum_sha256:ChecksumSHA256,metadata:Metadata,"
+            "server_side_encryption:ServerSideEncryption,"
+            "sse_kms_key_id:SSEKMSKeyId,version_id:VersionId}}"
+            if require_kms
+            else (
+                "{object:{bytes:ContentLength,"
+                "checksum_sha256:ChecksumSHA256,metadata:Metadata,"
+                "version_id:VersionId}}"
+            )
+        )
         return self._aws_argv(
             "s3api",
             "head-object",
@@ -3003,11 +3812,7 @@ class AwsP5Backend:
             key,
             "--checksum-mode",
             "ENABLED",
-            query=(
-                "{object:{bytes:ContentLength,"
-                "checksum_sha256:ChecksumSHA256,metadata:Metadata,"
-                "version_id:VersionId}}"
-            ),
+            query=query,
         )
 
     def _checkpoint_publication(
@@ -3025,7 +3830,32 @@ class AwsP5Backend:
             getattr(checkpoint_receipt, "value", None),
             label="checkpoint receipt",
         )
-        receipt_bytes = canonical_json(receipt_value)
+        v3_checkpoint = getattr(checkpoint_receipt, "schema_version", None) == 3
+        checkpoint_seeds = {
+            getattr(checkpoint, "seed", None)
+            for checkpoint in checkpoints.values()
+        }
+        if v3_checkpoint and (
+            len(checkpoint_seeds) != 1
+            or not all(
+                type(seed) is int and seed in range(10)
+                for seed in checkpoint_seeds
+            )
+        ):
+            raise MsctlError(
+                "CHECKPOINT_PROVENANCE_MISMATCH",
+                "v3 checkpoint publication requires one exact seed",
+            )
+        checkpoint_prefix = (
+            f"checkpoints/seed-{next(iter(checkpoint_seeds))}"
+            if v3_checkpoint
+            else "checkpoints"
+        )
+        receipt_bytes = canonical_json(receipt_value) + (
+            b"\n"
+            if v3_checkpoint
+            else b""
+        )
         if hashlib.sha256(receipt_bytes).hexdigest() != receipt_sha256:
             raise MsctlError(
                 "CHECKPOINT_PROVENANCE_MISMATCH",
@@ -3038,7 +3868,9 @@ class AwsP5Backend:
             {
                 "path": "receipt.json",
                 "local_path": receipt_path,
-                "s3_relative": f"checkpoints/receipts/{receipt_sha256}.json",
+                "s3_relative": (
+                    f"{checkpoint_prefix}/receipts/{receipt_sha256}.json"
+                ),
                 "sha256": receipt_sha256,
                 "bytes": len(receipt_bytes),
                 "device": None,
@@ -3048,49 +3880,38 @@ class AwsP5Backend:
         for arm in ("dense", "split90"):
             checkpoint = checkpoints[arm]
             path = Path(checkpoint.path)
-            try:
-                before = path.stat(follow_symlinks=False)
-                digest = sha256_file(path)
-                after = path.stat(follow_symlinks=False)
-            except OSError as error:
-                raise MsctlError(
-                    "CHECKPOINT_PROVENANCE_MISMATCH",
-                    "checkpoint file is unavailable before publication",
-                    details={"arm": arm},
-                ) from error
-            if (
-                path.is_symlink()
-                or before.st_nlink != 1
-                or (
-                    before.st_dev,
-                    before.st_ino,
-                    before.st_size,
-                    before.st_mtime_ns,
-                    before.st_ctime_ns,
-                )
-                != (
-                    after.st_dev,
-                    after.st_ino,
-                    after.st_size,
-                    after.st_mtime_ns,
-                    after.st_ctime_ns,
-                )
-                or digest != checkpoint.sha256
-            ):
+            digest, byte_count, identity = self._hash_regular_nofollow(
+                path,
+                label=f"{arm} checkpoint",
+            )
+            if digest != checkpoint.sha256:
                 raise MsctlError(
                     "CHECKPOINT_PROVENANCE_MISMATCH",
                     "checkpoint identity changed before immutable publication",
                     details={"arm": arm},
                 )
+            upload_path = path
+            if v3_checkpoint:
+                seed = next(iter(checkpoint_seeds))
+                upload_path = (
+                    self.state_root.absolute()
+                    / "checkpoint-upload-snapshots"
+                    / f"seed-{seed}"
+                    / digest
+                    / f"{arm}.pt"
+                )
             objects.append(
                 {
                     "path": f"{arm}.pt",
-                    "local_path": path,
-                    "s3_relative": f"checkpoints/sha256/{digest}.pt",
+                    "local_path": upload_path,
+                    "source_path": path,
+                    "s3_relative": (
+                        f"{checkpoint_prefix}/{arm}/sha256/{digest}.pt"
+                    ),
                     "sha256": digest,
-                    "bytes": before.st_size,
-                    "device": before.st_dev,
-                    "inode": before.st_ino,
+                    "bytes": byte_count,
+                    "device": identity[0],
+                    "inode": identity[1],
                 }
             )
         commands = [
@@ -3100,6 +3921,7 @@ class AwsP5Backend:
                 sha256=str(item["sha256"]),
                 byte_count=int(item["bytes"]),
                 upload=upload,
+                require_kms=v3_checkpoint,
             )
             for item in objects
             for upload in (True, False)
@@ -3110,7 +3932,7 @@ class AwsP5Backend:
                 {
                     key: value
                     for key, value in item.items()
-                    if key != "local_path"
+                    if key not in {"local_path", "source_path"}
                 }
                 for item in objects
             ],
@@ -3145,7 +3967,29 @@ class AwsP5Backend:
         receipt_stat = receipt_path.stat(follow_symlinks=False)
         objects[0]["device"] = receipt_stat.st_dev
         objects[0]["inode"] = receipt_stat.st_ino
+        if v3_checkpoint:
+            for item in objects[1:]:
+                self._snapshot_checkpoint(
+                    Path(item["source_path"]),
+                    Path(item["local_path"]),
+                    expected_sha256=str(item["sha256"]),
+                    expected_bytes=int(item["bytes"]),
+                    arm=str(item["path"]).removesuffix(".pt"),
+                )
         for index, item in enumerate(objects):
+            local_digest, local_bytes, _ = self._hash_regular_nofollow(
+                Path(item["local_path"]),
+                label=f"checkpoint upload {item['path']}",
+            )
+            if (
+                local_digest != item["sha256"]
+                or local_bytes != item["bytes"]
+            ):
+                raise MsctlError(
+                    "CHECKPOINT_PROVENANCE_MISMATCH",
+                    "checkpoint upload source differs from its reviewed bytes",
+                    details={"path": item["path"]},
+                )
             try:
                 self._run(
                     commands[index * 2],
@@ -3159,13 +4003,27 @@ class AwsP5Backend:
                     commands[index * 2 + 1],
                     operation="verify checkpoint object",
                 ),
+                require_kms=v3_checkpoint,
             )
+            final_digest, final_bytes, _ = self._hash_regular_nofollow(
+                Path(item["local_path"]),
+                label=f"checkpoint upload {item['path']}",
+            )
+            if (
+                final_digest != item["sha256"]
+                or final_bytes != item["bytes"]
+            ):
+                raise MsctlError(
+                    "CHECKPOINT_PROVENANCE_MISMATCH",
+                    "checkpoint upload source changed during publication",
+                    details={"path": item["path"]},
+                )
         result["verified"] = True
         result["objects"] = [
             {
                 key: value
                 for key, value in item.items()
-                if key != "local_path"
+                    if key not in {"local_path", "source_path"}
             }
             for item in objects
         ]
@@ -3366,15 +4224,25 @@ class AwsP5Backend:
         self,
         identity: Mapping[str, object],
         output: object,
+        *,
+        require_kms: bool = False,
     ) -> None:
         wrapped = _aws_output_object(
             output,
             {"object"},
             label="S3 dataset object response",
         )
+        fields = {
+            "bytes",
+            "checksum_sha256",
+            "metadata",
+            "version_id",
+        }
+        if require_kms:
+            fields |= {"server_side_encryption", "sse_kms_key_id"}
         row = _aws_output_object(
             wrapped["object"],
-            {"bytes", "checksum_sha256", "metadata", "version_id"},
+            fields,
             label="S3 dataset object",
         )
         metadata = _aws_output_object(
@@ -3389,6 +4257,14 @@ class AwsP5Backend:
             row["bytes"] != identity["bytes"]
             or row["checksum_sha256"] != expected_checksum
             or metadata["sha256"] != identity["sha256"]
+            or (
+                require_kms
+                and (
+                    row["server_side_encryption"] != "aws:kms"
+                    or row["sse_kms_key_id"]
+                    != getattr(self.runtime, "kms_key_id", None)
+                )
+            )
             or (
                 row["version_id"] is not None
                 and not isinstance(row["version_id"], str)
@@ -3535,6 +4411,407 @@ class AwsP5Backend:
             "s3_uri": f"s3://{bucket}/{key}",
             "out": str(destination),
             "collected": 1,
+        }
+
+    def _fleet_state_tag_binding(
+        self,
+        manifest: object,
+        state: Mapping[str, object],
+    ) -> dict[str, object]:
+        values = {
+            "provider": state.get("provider"),
+            "profile_instance_type": state.get("instance_type"),
+            "seed": state.get("seed"),
+            "cohort_sha256": getattr(
+                manifest,
+                "cohort_assignment_sha256",
+                None,
+            ),
+            "release_sha256": state.get("release_sha256"),
+            "dataset_sha256": state.get("dataset_sha256"),
+            "run_manifest_sha256": state.get("run_manifest_sha256"),
+            "profile_sha256": state.get("profile_sha256"),
+            "runtime_sha256": state.get("runtime_sha256"),
+            "container_digest": state.get("container_digest"),
+            "gres": state.get("gres"),
+            "terminate_at": state.get("terminate_at"),
+        }
+        if _is_v3_manifest(manifest):
+            values.update(
+                {
+                    field: state.get(field)
+                    for field in (
+                        "preregistration_sha256",
+                        "hardware_amendment_sha256",
+                        "provider_selection_sha256",
+                        "sealed_evaluation_sha256",
+                        "study_lock_sha256",
+                        "fleet_plan_sha256",
+                        "fleet_wave",
+                        "launch_readiness_sha256",
+                        "control_bundle_sha256",
+                    )
+                }
+            )
+        if set(values) != set(self._instance_tag_names(manifest)) or any(
+            value is None for value in values.values()
+        ):
+            raise MsctlError(
+                "FLEET_ADVANCE_INVALID",
+                "prior local state does not contain one complete AWS tag binding",
+            )
+        return values
+
+    def _verify_state_terminal_receipt(
+        self,
+        state: Mapping[str, object],
+    ) -> str:
+        operation_id = state.get("operation_id")
+        intent_sha256 = state.get("intent_sha256")
+        require_sha256(operation_id, label="fleet operation ID")
+        require_sha256(intent_sha256, label="fleet intent SHA-256")
+        uri = (
+            f"{self.runtime.s3_root}/operations/{operation_id}/"
+            "receipts/terminal.json"
+        )
+        bucket, key = self._s3_location(
+            uri.removeprefix(f"{self.runtime.s3_root}/")
+        )
+        argv = self._aws_argv(
+            "s3api",
+            "head-object",
+            "--bucket",
+            bucket,
+            "--key",
+            key,
+            "--checksum-mode",
+            "ENABLED",
+            query=(
+                "{receipt:{checksum_sha256:ChecksumSHA256,"
+                "content_length:ContentLength,metadata:Metadata,"
+                "version_id:VersionId}}"
+            ),
+        )
+        output = _aws_output_object(
+            self._run(argv, operation="verify fleet terminal receipt"),
+            {"receipt"},
+            label="fleet terminal receipt",
+        )
+        receipt = _aws_output_object(
+            output["receipt"],
+            {"checksum_sha256", "content_length", "metadata", "version_id"},
+            label="fleet terminal receipt",
+        )
+        metadata = _aws_output_object(
+            receipt["metadata"],
+            {"operation-id", "intent-sha256", "receipt-kind"},
+            label="fleet terminal receipt metadata",
+        )
+        if (
+            not isinstance(receipt["checksum_sha256"], str)
+            or not receipt["checksum_sha256"]
+            or type(receipt["content_length"]) is not int
+            or receipt["content_length"] <= 0
+            or not isinstance(receipt["version_id"], str)
+            or not receipt["version_id"]
+            or metadata
+            != {
+                "operation-id": operation_id,
+                "intent-sha256": intent_sha256,
+                "receipt-kind": "terminal",
+            }
+        ):
+            raise MsctlError(
+                "FLEET_ADVANCE_INVALID",
+                "remote terminal receipt does not bind the prior operation",
+            )
+        return uri
+
+    def fleet_advance(
+        self,
+        *,
+        amendment_path: Path | str,
+        provider_selection_path: Path | str,
+        fleet_plan_path: Path | str,
+        target_manifest_path: Path | str,
+        repo_root: Path | str,
+        instance_id: str,
+        collection_root: Path | str,
+        approval_path: Path | str | None,
+        apply: bool,
+    ) -> dict[str, object]:
+        """Authorize and record one safe same-instance wave transition."""
+
+        amendment = load_hardware_amendment(amendment_path)
+        selection = load_provider_selection(
+            provider_selection_path,
+            amendment=amendment,
+            profile=self.profile,
+        )
+        plan = load_fleet_plan(
+            fleet_plan_path,
+            profile=self.profile,
+            selection=selection,
+        )
+        target = load_run_manifest(target_manifest_path, repo_root=repo_root)
+        from_binding, to_binding = fleet_transition_for_target(
+            plan,
+            instance_id=instance_id,
+            target=target,
+        )
+        previous = load_run_manifest(from_binding.path, repo_root=repo_root)
+        validate_fleet_manifest(
+            plan,
+            previous,
+            instance_id=instance_id,
+        )
+        existing = load_fleet_advance(
+            self.state_root,
+            plan=plan,
+            to_binding=to_binding,
+        )
+        if existing is not None:
+            return {
+                "provider": self.profile.provider,
+                "instance_id": instance_id,
+                "from_seed": from_binding.seed,
+                "to_seed": to_binding.seed,
+                "fleet_plan_sha256": plan.sha256,
+                "advance_receipt_sha256": existing.sha256,
+                "advance_receipt": str(existing.path),
+                "advanced": 0,
+                "idempotent": True,
+            }
+        previous_context = V3LifecycleContext(
+            amendment=amendment,
+            selection=selection,
+            fleet_plan=plan,
+            fleet_binding=from_binding,
+        )
+        collection_sha256 = verify_fleet_collection(
+            collection_root,
+            manifest=previous,
+        )
+        store = StateStore(self.state_root)
+        with store.locked():
+            self._repair_paired_states(store, previous, previous_context)
+            states = [store.read_run(run.run_id) for run in previous.runs]
+            if any(state is None for state in states):
+                raise MsctlError(
+                    "FLEET_ADVANCE_INVALID",
+                    "fleet advance requires complete prior paired local state",
+                )
+            paired = [state for state in states if state is not None]
+            if (
+                not all(
+                    self._same_state_binding(
+                        state,
+                        previous,
+                        previous_context,
+                    )
+                    for state in paired
+                )
+                or {state.get("status") for state in paired} != {"Success"}
+                or len({state.get("command_id") for state in paired}) != 1
+                or None in {state.get("command_id") for state in paired}
+                or len({state.get("operation_id") for state in paired}) != 1
+                or len({state.get("intent_sha256") for state in paired}) != 1
+                or len(
+                    {
+                        state.get("launch_readiness_sha256")
+                        for state in paired
+                    }
+                )
+                != 1
+            ):
+                raise MsctlError(
+                    "FLEET_ADVANCE_INVALID",
+                    "prior paired state is not terminal or has divergent provenance",
+                )
+            evaluation = store.read_evaluation(previous.sha256)
+            if (
+                evaluation is None
+                or evaluation.get("status") != "Success"
+                or evaluation.get("operation") != "evaluate"
+                or evaluation.get("instance_id") != instance_id
+                or evaluation.get("run_manifest_sha256") != previous.sha256
+                or evaluation.get("fleet_plan_sha256") != plan.sha256
+                or evaluation.get("fleet_wave") != from_binding.wave
+                or evaluation.get("launch_readiness_sha256")
+                != paired[0].get("launch_readiness_sha256")
+                or not isinstance(evaluation.get("command_id"), str)
+            ):
+                raise MsctlError(
+                    "FLEET_ADVANCE_INVALID",
+                    "fleet advance requires successful prior evaluation state",
+                )
+            training_state_sha256 = canonical_sha256(
+                {
+                    "states": sorted(
+                        paired,
+                        key=lambda state: str(state["run_id"]),
+                    )
+                }
+            )
+            evaluation_state_sha256 = canonical_sha256(evaluation)
+            bound_tags = self._fleet_state_tag_binding(
+                previous,
+                paired[0],
+            )
+        unbound_tags = {field: None for field in bound_tags}
+        delete_tags = canonical_json(
+            [
+                {
+                    "Key": self._instance_tag_names(previous)[field],
+                    "Value": str(bound_tags[field]),
+                }
+                for field in self._instance_tag_names(previous)
+            ]
+        ).decode("ascii")
+        delete_argv = self._aws_argv(
+            "ec2",
+            "delete-tags",
+            "--resources",
+            instance_id,
+            "--tags",
+            delete_tags,
+            query="{}",
+        )
+        resources = {
+            "schema_version": 1,
+            "operation": "fleet-advance",
+            "provider": self.profile.provider,
+            "instance_type": self.profile.instance_type,
+            "profile_sha256": self.profile.sha256,
+            "gres": _profile_gres(self.profile),
+            "fleet_plan_sha256": plan.sha256,
+            "provider_selection_sha256": selection.sha256,
+            "instance_id": instance_id,
+            "from_seed": from_binding.seed,
+            "from_wave": from_binding.wave,
+            "from_manifest_sha256": from_binding.sha256,
+            "to_seed": to_binding.seed,
+            "to_wave": to_binding.wave,
+            "to_manifest_sha256": to_binding.sha256,
+            "training_state_sha256": training_state_sha256,
+            "evaluation_state_sha256": evaluation_state_sha256,
+            "collection_receipt_sha256": collection_sha256,
+            "jobs": 0,
+            "allocated_gpus": 0,
+            "wall_minutes": 0,
+            "gpu_hours": 0,
+            "script": "aws-fleet-advance",
+        }
+        result = {
+            "provider": self.profile.provider,
+            "instance_id": instance_id,
+            "from_seed": from_binding.seed,
+            "to_seed": to_binding.seed,
+            "fleet_plan_sha256": plan.sha256,
+            "resources": resources,
+            "commands": [delete_argv],
+            "advanced": 0,
+            "idempotent": False,
+        }
+        if not apply:
+            return result
+        if approval_path is None:
+            raise MsctlError(
+                "APPROVAL_REQUIRED",
+                "fleet advance --apply requires explicit signed approval",
+            )
+        self.approval_verifier(
+            path=approval_path,
+            operation="fleet-advance",
+            release_sha256=plan.release_sha256,
+            scope_sha256=plan.sha256,
+            resources=resources,
+            profile=self.profile,
+            environ=self.environ,
+        )
+        training_command_id = str(paired[0]["command_id"])
+        evaluation_command_id = str(evaluation["command_id"])
+        if (
+            self._command_status(instance_id, training_command_id) != "Success"
+            or self._command_status(instance_id, evaluation_command_id)
+            != "Success"
+        ):
+            raise MsctlError(
+                "FLEET_ADVANCE_INVALID",
+                "authoritative AWS commands are not successfully terminal",
+            )
+        training_terminal_uri = self._verify_state_terminal_receipt(paired[0])
+        evaluation_terminal_uri = self._verify_state_terminal_receipt(
+            evaluation
+        )
+        terminate_at = str(paired[0]["terminate_at"])
+        selected_argv = self._selected_instance_argv(instance_id, previous)
+        observed = self._parse_selected_instance(
+            self._run(
+                selected_argv,
+                operation="verify fleet advance binding",
+            ),
+            previous,
+            instance_id=instance_id,
+            terminate_at=terminate_at,
+            require_bound=True,
+            expected_binding=bound_tags,
+        )
+        del observed
+        _aws_output_object(
+            self._run(delete_argv, operation="unbind completed fleet wave"),
+            set(),
+            label="EC2 delete-tags output",
+        )
+        self._parse_selected_instance(
+            self._run(
+                selected_argv,
+                operation="verify fleet wave unbound",
+            ),
+            previous,
+            instance_id=instance_id,
+            terminate_at=terminate_at,
+            require_bound=True,
+            expected_binding=unbound_tags,
+        )
+        evidence = {
+            "training_state_sha256": training_state_sha256,
+            "evaluation_state_sha256": evaluation_state_sha256,
+            "collection_receipt_sha256": collection_sha256,
+            "training_command_id": training_command_id,
+            "evaluation_command_id": evaluation_command_id,
+            "training_terminal_receipt_uri": training_terminal_uri,
+            "evaluation_terminal_receipt_uri": evaluation_terminal_uri,
+            "aws_bound_tags_sha256": canonical_sha256(bound_tags),
+            "aws_unbound_tags_sha256": canonical_sha256(unbound_tags),
+        }
+        receipt = create_fleet_advance(
+            plan=plan,
+            instance_id=instance_id,
+            from_binding=from_binding,
+            to_binding=to_binding,
+            evidence=evidence,
+            approval_sha256=sha256_file(approval_path),
+            advanced_at=_timestamp(),
+        )
+        receipt_path = write_fleet_advance(
+            self.state_root,
+            plan=plan,
+            to_binding=to_binding,
+            value=receipt,
+        )
+        loaded = load_fleet_advance(
+            self.state_root,
+            plan=plan,
+            to_binding=to_binding,
+        )
+        assert loaded is not None
+        return {
+            **result,
+            "commands": [delete_argv],
+            "advance_receipt": str(receipt_path),
+            "advance_receipt_sha256": loaded.sha256,
+            "advanced": 1,
         }
 
     def _new_aws_run_state(
@@ -3823,8 +5100,21 @@ class AwsP5Backend:
         operation_id = str(intent["operation_id"])
         parameters = canonical_json(
             {
+                "BootstrapMode": [
+                    (
+                        "verified-control-bundle"
+                        if intent.get("schema_version") == 3
+                        else "installed"
+                    )
+                ],
+                "ControlBundleSHA256": [self.control_bundle.sha256],
+                "ControlBundleURI": [
+                    f"{self.runtime.s3_root}/control/"
+                    f"{self.control_bundle.sha256}.tar"
+                ],
                 "IntentSHA256": [published["intent_sha256"]],
                 "IntentUri": [published["intent_uri"]],
+                "Region": [self.runtime.region],
             }
         ).decode("ascii")
         argv = self._aws_argv(
@@ -3879,13 +5169,21 @@ class AwsP5Backend:
     ) -> dict[str, object]:
         self._validate_manifest(manifest)
         self._validate_release(release, manifest)
-        validated_context = self._validate_v3_context(
+        validated_context = self._require_protected_launch_context(
             manifest,
             context,
-            instance_id=instance_id,
         )
         if validated_context is not None:
+            if (
+                instance_id is not None
+                and instance_id != validated_context.instance_id
+            ):
+                raise MsctlError(
+                    "FLEET_PLAN_INVALID",
+                    "submit instance differs from the protected fleet binding",
+                )
             instance_id = validated_context.instance_id
+            self._require_fleet_advance(manifest, validated_context)
         if not isinstance(instance_id, str):
             raise MsctlError(
                 "INSTANCE_BINDING_MISMATCH",
@@ -4099,6 +5397,8 @@ class AwsP5Backend:
             )
             self._require_ssm_online(instance_id)
             self._ensure_argv_document()
+            if _is_v3_manifest(manifest):
+                self._publish_control_bundle()
             self._bind_selected_instance(
                 manifest,
                 instance_id=instance_id,
@@ -4218,7 +5518,10 @@ class AwsP5Backend:
     ) -> dict[str, object]:
         self._validate_manifest(manifest)
         self._validate_release(release, manifest)
-        validated_context = self._validate_v3_context(manifest, context)
+        validated_context = self._require_protected_launch_context(
+            manifest,
+            context,
+        )
         checkpoints = self._checkpoint_map(manifest, checkpoint_receipt)
         checkpoint_publication = self._checkpoint_publication(
             checkpoint_receipt=checkpoint_receipt,
@@ -4458,6 +5761,8 @@ class AwsP5Backend:
                 )
             self._require_ssm_online(instance_id)
             self._ensure_argv_document()
+            if _is_v3_manifest(manifest):
+                self._publish_control_bundle()
             attempt = max(int(state.get("attempt", 1)) for state in present) + 1
             self._checkpoint_publication(
                 checkpoint_receipt=checkpoint_receipt,
@@ -4696,16 +6001,23 @@ class AwsP5Backend:
         self,
         release: object,
         manifest: object,
+        context: V3LifecycleContext | None = None,
     ) -> list[list[str]]:
         release_root = self._release_root(release)
         scratch_root = getattr(self.profile, "scratch_root", "/mnt/memorysplit")
         run_root = f"{scratch_root}/runs/seed-{manifest.seed}"
         evaluation_root = f"{scratch_root}/evaluations"
+        sealed_root = (
+            f"{scratch_root}/sealed-evaluation/{manifest.sealed_evaluation_sha256}"
+            if _is_v3_manifest(manifest)
+            else release_root
+        )
         return [
             [
                 "/usr/bin/docker",
                 "run",
                 "--rm",
+                "--read-only",
                 "--network",
                 "none",
                 "--gpus",
@@ -4715,8 +6027,20 @@ class AwsP5Backend:
                     f"{getattr(self.runtime, 'uid', 1000)}:"
                     f"{getattr(self.runtime, 'gid', 1000)}"
                 ),
+                "--security-opt",
+                "no-new-privileges",
+                "--cap-drop",
+                "ALL",
+                "--tmpfs",
+                "/tmp:rw,nosuid,nodev,noexec,size=1073741824",
+                "--env",
+                "HOME=/tmp",
+                "--env",
+                "PYTHONNOUSERSITE=1",
                 "--mount",
-                f"type=bind,src={release_root},dst={release_root},readonly",
+                f"type=bind,src={release_root},dst=/workspace,readonly",
+                "--mount",
+                f"type=bind,src={sealed_root},dst=/sealed,readonly",
                 "--mount",
                 f"type=bind,src={run_root},dst={run_root},readonly",
                 "--mount",
@@ -4725,19 +6049,19 @@ class AwsP5Backend:
                     f"dst={evaluation_root}"
                 ),
                 "--workdir",
-                release_root,
+                "/workspace",
                 self.runtime.container_image,
-                "/usr/bin/python3",
+                "/opt/venv/bin/python",
                 "-m",
                 "evals.confirmatory",
                 "evaluate",
                 "--run",
                 f"{run_root}/{run.arm}/run",
                 "--sealed-release",
-                release_root,
+                "/sealed",
                 "--expected-study-lock-sha256",
                 (
-                    manifest.sealed_evaluation_sha256
+                    manifest.study_lock_sha256
                     if _is_v3_manifest(manifest)
                     else manifest.study_lock_sha256
                 ),
@@ -4757,7 +6081,47 @@ class AwsP5Backend:
         context: V3LifecycleContext | None = None,
     ) -> dict[str, object]:
         v3_bindings = self._v3_bindings(manifest, context)
-        remote_argv = self._evaluation_argv(release, manifest)
+        remote_argv = self._evaluation_argv(release, manifest, context)
+        sealed_materialization: list[dict[str, object]] = []
+        if _is_v3_manifest(manifest):
+            scratch_root = getattr(
+                self.profile,
+                "scratch_root",
+                "/mnt/memorysplit",
+            )
+            sealed_root = (
+                f"{scratch_root}/sealed-evaluation/"
+                f"{manifest.sealed_evaluation_sha256}"
+            )
+            for member in sorted(REQUIRED_SEALED_MEMBERS):
+                bucket, key = self._s3_location(
+                    "sealed-evaluation/"
+                    f"{manifest.sealed_evaluation_sha256}/{member}"
+                )
+                sealed_materialization.append(
+                    {
+                        "name": (
+                            "materialize-sealed-evaluation-"
+                            f"{member.replace('.', '-')}"
+                        ),
+                        "argv": [
+                            "/usr/bin/env",
+                            "aws",
+                            "--no-cli-pager",
+                            "--region",
+                            self.runtime.region,
+                            "s3api",
+                            "get-object",
+                            "--bucket",
+                            bucket,
+                            "--key",
+                            key,
+                            "--checksum-mode",
+                            "ENABLED",
+                            f"{sealed_root}/{member}",
+                        ],
+                    }
+                )
         lifecycle_evidence = dict(
             evidence
             or {
@@ -4792,12 +6156,104 @@ class AwsP5Backend:
             },
             "checkpoint_receipt": None,
             "steps": [
-                {"name": f"evaluate-{run.arm}", "argv": argv}
+                *(
+                    [
+                        {
+                            "name": "prepare-sealed-evaluation",
+                            "argv": [
+                                "/usr/bin/install",
+                                "-d",
+                                "-m",
+                                "0700",
+                                "-o",
+                                str(getattr(self.runtime, "uid", 1000)),
+                                "-g",
+                                str(getattr(self.runtime, "gid", 1000)),
+                                (
+                                    f"{getattr(self.profile, 'scratch_root', '/mnt/memorysplit')}"
+                                    "/sealed-evaluation/"
+                                    f"{manifest.sealed_evaluation_sha256}"
+                                ),
+                            ],
+                        },
+                        {
+                            "name": "prepare-evaluation-output",
+                            "argv": [
+                                "/usr/bin/install",
+                                "-d",
+                                "-m",
+                                "0700",
+                                "-o",
+                                str(getattr(self.runtime, "uid", 1000)),
+                                "-g",
+                                str(getattr(self.runtime, "gid", 1000)),
+                                (
+                                    f"{getattr(self.profile, 'scratch_root', '/mnt/memorysplit')}"
+                                    "/evaluations"
+                                ),
+                            ],
+                        },
+                    ]
+                    + [
+                        {
+                            **step,
+                        }
+                        for step in sealed_materialization
+                    ]
+                    + [
+                        {
+                            "name": "verify-sealed-evaluation",
+                            "argv": [
+                                "/usr/bin/docker",
+                                "run",
+                                "--rm",
+                                "--network",
+                                "none",
+                                "--read-only",
+                                "--user",
+                                (
+                                    f"{getattr(self.runtime, 'uid', 1000)}:"
+                                    f"{getattr(self.runtime, 'gid', 1000)}"
+                                ),
+                                "--mount",
+                                (
+                                    f"type=bind,src={self._release_root(release)},"
+                                    "dst=/workspace,readonly"
+                                ),
+                                "--mount",
+                                (
+                                    "type=bind,src="
+                                    f"{getattr(self.profile, 'scratch_root', '/mnt/memorysplit')}"
+                                    "/sealed-evaluation/"
+                                    f"{manifest.sealed_evaluation_sha256},"
+                                    "dst=/sealed,readonly"
+                                ),
+                                "--workdir",
+                                "/workspace",
+                                self.runtime.container_image,
+                                "/opt/venv/bin/python",
+                                "-m",
+                                "msctl.aws_sealed_evaluation",
+                                "--root",
+                                "/sealed",
+                                "--expected-release-sha256",
+                                manifest.sealed_evaluation_sha256,
+                                "--expected-study-lock-sha256",
+                                manifest.study_lock_sha256,
+                            ],
+                        },
+                    ]
+                    if _is_v3_manifest(manifest)
+                    else []
+                ),
+                *[
+                    {"name": f"evaluate-{run.arm}", "argv": argv}
                 for run, argv in zip(
                     sorted(manifest.runs, key=lambda row: row.arm),
                     remote_argv,
                     strict=True,
                 )
+                ],
             ],
         }
 
@@ -4813,7 +6269,10 @@ class AwsP5Backend:
     ) -> dict[str, object]:
         self._validate_manifest(manifest)
         self._validate_release(release, manifest)
-        validated_context = self._validate_v3_context(manifest, context)
+        validated_context = self._require_protected_launch_context(
+            manifest,
+            context,
+        )
         operation_intent = self._evaluation_operation_intent(
             release,
             manifest,
@@ -5040,6 +6499,8 @@ class AwsP5Backend:
                 }
             self._require_ssm_online(instance_id)
             self._ensure_argv_document()
+            if _is_v3_manifest(manifest):
+                self._publish_control_bundle()
             published = self._publish_operation_intent(operation_intent)
             now = _timestamp()
             evaluation_state = {
@@ -5283,6 +6744,12 @@ class AwsP5Backend:
             return False, self.auth_check()
         if command == "capacity check":
             return False, self.capacity_check()
+        if command == "control install":
+            apply = bool(getattr(args, "apply", False))
+            return not apply, self.control_install(
+                instance_id=str(args.instance_id),
+                apply=apply,
+            )
         if command == "env ensure" and self.profile.provider in _V3_PROFILES:
             raise MsctlError(
                 "EXTERNAL_OPERATION_UNSUPPORTED",
@@ -5318,6 +6785,24 @@ class AwsP5Backend:
             )
             return not apply, operation(
                 receipt_path=receipt_path,
+                apply=apply,
+            )
+        if command == "fleet advance":
+            if self.profile.provider not in _V3_PROFILES:
+                raise MsctlError(
+                    "EXTERNAL_OPERATION_UNSUPPORTED",
+                    "fleet advance is available only to closed AWS v3 profiles",
+                )
+            apply = bool(getattr(args, "apply", False))
+            return not apply, self.fleet_advance(
+                amendment_path=args.amendment,
+                provider_selection_path=args.provider_selection,
+                fleet_plan_path=args.fleet_plan,
+                target_manifest_path=args.to_manifest,
+                repo_root=args.repo_root,
+                instance_id=args.instance_id,
+                collection_root=args.collection_root,
+                approval_path=args.approval,
                 apply=apply,
             )
         if command == "collect":
@@ -5357,6 +6842,7 @@ class AwsP5Backend:
             )
             context = self._load_v3_context(
                 manifest,
+                release=release,
                 amendment_path=getattr(args, "hardware_amendment", None),
                 provider_selection_path=getattr(
                     args,
@@ -5364,6 +6850,26 @@ class AwsP5Backend:
                     None,
                 ),
                 fleet_plan_path=getattr(args, "fleet_plan", None),
+                readiness_path=getattr(args, "launch_readiness", None),
+                environment_receipt_path=getattr(
+                    args,
+                    "environment_receipt",
+                    None,
+                ),
+                qualification_receipt_path=getattr(
+                    args,
+                    "qualification_receipt",
+                    None,
+                ),
+                diagnostic_receipts=_diagnostic_receipt_map(
+                    getattr(args, "diagnostic_receipt", None)
+                ),
+                sealed_evaluation_release_path=getattr(
+                    args,
+                    "sealed_evaluation_release",
+                    None,
+                ),
+                require_readiness=command in {"submit", "resume", "evaluate"},
                 instance_id=requested_instance_id,
             )
             if command == "submit" and context is not None:

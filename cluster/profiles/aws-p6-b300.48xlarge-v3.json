@@ -45,10 +45,11 @@
   ],
   "profile_id": "aws-p6-b300.48xlarge-v3",
   "provider": "aws-p6-b300.48xlarge-v3",
-  "purchase_model": "on_demand",
+  "purchase_model": "capacity_block",
   "runtime": {
     "ami_id_env": "MS_AWS_AMI_ID",
     "container_digest_env": "MS_CONTAINER_DIGEST",
+    "kms_key_id_env": "MS_S3_KMS_KEY_ID",
     "region_env": "AWS_REGION",
     "runtime_gid_env": "MS_RUNTIME_GID",
     "runtime_uid_env": "MS_RUNTIME_UID"

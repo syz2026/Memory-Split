@@ -36,9 +36,11 @@ def test_dockerfile_uses_digest_pinned_base_and_nonroot_runtime_only():
         if line.strip().startswith(("COPY ", "ADD "))
     ]
     assert copy_lines == [
-        "COPY --chown=memorysplit:memorysplit image.lock.json "
-        "/opt/memorysplit/image.lock.json"
+        "COPY image.lock.json requirements.lock /opt/memorysplit-build/"
     ]
+    assert "/opt/venv/bin/python -m pip install" in dockerfile
+    assert "--require-hashes" in dockerfile
+    assert "COPY . " not in dockerfile
 
 
 def test_build_plan_renders_exact_build_then_immutable_ecr_push():

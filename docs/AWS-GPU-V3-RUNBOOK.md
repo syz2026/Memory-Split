@@ -31,6 +31,31 @@ Use temporary federation into the approved operator role. Do not create, copy,
 or export static credentials. The EC2 workers use a different, dedicated
 instance role delivered through instance metadata.
 
+Keep every generated plan, raw AWS response, approval, receipt, manifest, and
+collection outside the reviewed source checkout. The commands below assume one
+operator root next to the repository:
+
+```bash
+set -euo pipefail
+REPO_ROOT="$(git rev-parse --show-toplevel)"
+OPERATOR_ROOT="$(dirname "$REPO_ROOT")/memorysplit-aws-v3-operator"
+REVIEW_ROOT="$OPERATOR_ROOT/review"
+mkdir -p \
+  "$REVIEW_ROOT" \
+  "$OPERATOR_ROOT/approvals" \
+  "$OPERATOR_ROOT/collected" \
+  "$OPERATOR_ROOT/manifests" \
+  "$OPERATOR_ROOT/receipts"
+case "$(realpath "$OPERATOR_ROOT")/" in
+  "$(realpath "$REPO_ROOT")/"*) echo "operator root is inside source tree" >&2; exit 2 ;;
+esac
+test -z "$(git -C "$REPO_ROOT" status --short)"
+```
+
+Do not place temporary review files under an ignored source-tree directory:
+clean-tree gates intentionally inspect the whole checkout, not only tracked
+files.
+
 Only `us-east-1` and `us-west-2` are in scope:
 
 ```bash
@@ -46,12 +71,12 @@ aws sts get-caller-identity
 aws service-quotas list-service-quotas \
   --service-code ec2 \
   --region "$REGION" \
-  --output json > quota-review.json
+  --output json > "$REVIEW_ROOT/quota-review.json"
 aws ec2 describe-instance-type-offerings \
   --location-type region \
   --filters Name=instance-type,Values=p5.48xlarge,p6-b300.48xlarge \
   --region "$REGION" \
-  --output json > offering-review.json
+  --output json > "$REVIEW_ROOT/offering-review.json"
 ```
 
 The launch request must select private subnets, disable public IP assignment,
@@ -97,8 +122,8 @@ RELEASE_RECEIPT="$RELEASE_DIR/RELEASE-AWS-GPU-V3.json"
 python scripts/verify_aws_gpu_v3_release.py \
   --release "$RELEASE_RECEIPT" \
   --profile "$PROFILE" \
-  --source-root . > release-verification.json
-python -m json.tool release-verification.json
+  --source-root . > "$REVIEW_ROOT/release-verification.json"
+python -m json.tool "$REVIEW_ROOT/release-verification.json"
 ```
 
 The archive must contain one selected profile, all twenty v3 configs, and no
@@ -131,9 +156,36 @@ aws ec2 describe-images \
   --region "$REGION" \
   --image-ids "$AMI_ID" \
   --owners amazon \
-  --output json > dlami-review.json
-python -m json.tool dlami-review.json
-sha256sum dlami-review.json
+  --output json > "$REVIEW_ROOT/dlami-review.json"
+python -m json.tool "$REVIEW_ROOT/dlami-review.json"
+sha256sum "$REVIEW_ROOT/dlami-review.json"
+
+AMI_EVIDENCE="$OPERATOR_ROOT/receipts/ami-describe-v1.json"
+python - "$REGION" "$AMI_ID" \
+  "$REVIEW_ROOT/dlami-review.json" "$AMI_EVIDENCE" <<'PY'
+import json
+import pathlib
+import sys
+
+region, image_id, raw_path, out_path = sys.argv[1:]
+raw = json.loads(pathlib.Path(raw_path).read_text(encoding="utf-8"))
+images = raw.get("Images")
+if not isinstance(images, list) or len(images) != 1:
+    raise SystemExit("AMI evidence requires exactly one image")
+image = images[0]
+receipt = {
+    "schema_version": 1,
+    "receipt_type": "memorysplit-aws-ami-describe-v1",
+    "region": region,
+    "image_id": image_id,
+    "owner_id": image["OwnerId"],
+    "name": image["Name"],
+}
+pathlib.Path(out_path).write_text(
+    json.dumps(receipt, sort_keys=True, separators=(",", ":")) + "\n",
+    encoding="ascii",
+)
+PY
 ```
 
 Review one available x86_64 Amazon-owned image whose name is “Deep Learning
@@ -151,17 +203,19 @@ is outside this runbook.
 ```bash
 set -euo pipefail
 ECR_REPOSITORY=REPLACE_WITH_APPROVED_PRIVATE_ECR_REPOSITORY
+IMAGE_PLAN="$REVIEW_ROOT/image-plan.json"
+IMAGE_RESULT="$REVIEW_ROOT/image-result.json"
 
 # DRY RUN: prints exact Docker build and push argv; executes neither.
 python scripts/build_aws_gpu_image.py \
-  --destination "$ECR_REPOSITORY" > image-plan.json
-python -m json.tool image-plan.json
+  --destination "$ECR_REPOSITORY" > "$IMAGE_PLAN"
+python -m json.tool "$IMAGE_PLAN"
 
 # APPLY only after base digest, context hash, immutable build tag, and
 # destination repository are reviewed.
 python scripts/build_aws_gpu_image.py \
   --destination "$ECR_REPOSITORY" \
-  --apply > image-result.json
+  --apply > "$IMAGE_RESULT"
 ```
 
 After the push, use read-only ECR calls to resolve and record the manifest
@@ -169,29 +223,103 @@ digest. The only runtime form is the private
 `repository@sha256:<manifest-digest>` reference; a tag alone is forbidden.
 
 ```bash
-IMAGE_TAG="$(python -c 'import json; print(json.load(open("image-result.json"))["destination"].rsplit(":", 1)[1])')"
+IMAGE_TAG="$(python -c 'import json,sys; print(json.load(open(sys.argv[1]))["destination"].rsplit(":", 1)[1])' "$IMAGE_RESULT")"
 aws ecr describe-images \
   --region "$REGION" \
   --repository-name REPLACE_WITH_REPOSITORY_NAME \
   --image-ids imageTag="$IMAGE_TAG" \
-  --output json > ecr-image-review.json
-python -m json.tool ecr-image-review.json
+  --output json > "$REVIEW_ROOT/ecr-image-review.json"
+python -m json.tool "$REVIEW_ROOT/ecr-image-review.json"
 ```
 
 Set `CONTAINER_DIGEST` from the reviewed `imageDigest`, and set
 `CONTAINER_IMAGE` to the same private repository plus `@CONTAINER_DIGEST`.
+Then create the closed evidence files consumed by provider selection:
+
+```bash
+set -euo pipefail
+CONTAINER_DIGEST="$(python -c 'import json,sys; rows=json.load(open(sys.argv[1]))["imageDetails"]; assert len(rows)==1; print(rows[0]["imageDigest"])' "$REVIEW_ROOT/ecr-image-review.json")"
+CONTAINER_IMAGE="${ECR_REPOSITORY}@${CONTAINER_DIGEST}"
+ECR_EVIDENCE="$OPERATOR_ROOT/receipts/ecr-describe-v1.json"
+IMAGE_BUILD_RECEIPT="$OPERATOR_ROOT/receipts/image-build-v1.json"
+
+python - "$REGION" "$ECR_REPOSITORY" "$CONTAINER_IMAGE" \
+  "$CONTAINER_DIGEST" "$IMAGE_RESULT" "$ECR_EVIDENCE" \
+  "$IMAGE_BUILD_RECEIPT" <<'PY'
+import hashlib
+import json
+import pathlib
+import sys
+
+(
+    region,
+    repository_uri,
+    image_uri,
+    digest,
+    build_result_path,
+    ecr_out,
+    build_out,
+) = sys.argv[1:]
+registry, repository_name = repository_uri.split("/", 1)
+account_id = registry.split(".", 1)[0]
+build = json.loads(pathlib.Path(build_result_path).read_text(encoding="utf-8"))
+
+def sha256(path):
+    return hashlib.sha256(pathlib.Path(path).read_bytes()).hexdigest()
+
+ecr = {
+    "schema_version": 1,
+    "receipt_type": "memorysplit-aws-ecr-describe-v1",
+    "region": region,
+    "registry_id": account_id,
+    "repository_name": repository_name,
+    "image_digest": digest,
+    "image_uri": image_uri,
+}
+image_build = {
+    "schema_version": 1,
+    "receipt_type": "memorysplit-aws-gpu-image-build-v1",
+    "aws_account_id": account_id,
+    "region": region,
+    "container_image": image_uri,
+    "container_digest": digest,
+    "build_context_sha256": build["build_context_sha256"],
+    "dockerfile_sha256": sha256("containers/aws-gpu/Dockerfile"),
+    "image_lock_sha256": sha256("containers/aws-gpu/image.lock.json"),
+    "runtime_dependency_lock_sha256": sha256(
+        "containers/aws-gpu/requirements.lock"
+    ),
+}
+for path, value in ((ecr_out, ecr), (build_out, image_build)):
+    pathlib.Path(path).write_text(
+        json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n",
+        encoding="ascii",
+    )
+PY
+```
 
 ## 5. Publish the provider-selection receipt
 
 Use one fixed timestamp for dry-run and apply so the reviewed bytes are the
-published bytes:
+published bytes. P5 uses no capacity arguments. P6 selection is impossible
+until the exact Capacity Block offering and resulting reservation IDs exist;
+perform section 6 first, then return here with both IDs:
 
 ```bash
 set -euo pipefail
 CONTAINER_DIGEST=sha256:REPLACE_WITH_REVIEWED_MANIFEST_DIGEST
 CONTAINER_IMAGE="${ECR_REPOSITORY}@${CONTAINER_DIGEST}"
 SELECTED_AT=REPLACE_WITH_APPROVED_UTC_TIMESTAMP
-SELECTION=operator/provider-selection-v3.json
+SELECTION="$OPERATOR_ROOT/provider-selection-v3.json"
+CAPACITY_ARGS=()
+if [ "$PROFILE" = "cluster/profiles/aws-p6-b300.48xlarge-v3.json" ]; then
+  CAPACITY_RESERVATION_ID=REPLACE_WITH_EXACT_CAPACITY_RESERVATION_ID
+  CAPACITY_BLOCK_OFFERING_ID=REPLACE_WITH_EXACT_APPROVED_OFFERING_ID
+  CAPACITY_ARGS=(
+    --capacity-reservation-id "$CAPACITY_RESERVATION_ID"
+    --capacity-block-offering-id "$CAPACITY_BLOCK_OFFERING_ID"
+  )
+fi
 
 # DRY RUN: validates but does not write the receipt.
 python -m msctl \
@@ -201,11 +329,15 @@ python -m msctl \
   --amendment configs/hardware-amendment-v3.json \
   --region "$REGION" \
   --ami-id "$AMI_ID" \
+  --ami-evidence "$AMI_EVIDENCE" \
   --container-image "$CONTAINER_IMAGE" \
   --container-digest "$CONTAINER_DIGEST" \
+  --ecr-evidence "$ECR_EVIDENCE" \
+  --image-build-receipt "$IMAGE_BUILD_RECEIPT" \
+  "${CAPACITY_ARGS[@]}" \
   --selected-at "$SELECTED_AT" \
-  --out "$SELECTION" > provider-selection-plan.json
-python -m json.tool provider-selection-plan.json
+  --out "$SELECTION" > "$REVIEW_ROOT/provider-selection-plan.json"
+python -m json.tool "$REVIEW_ROOT/provider-selection-plan.json"
 
 # APPLY only after every hash and selected profile is reviewed.
 python -m msctl \
@@ -215,16 +347,21 @@ python -m msctl \
   --amendment configs/hardware-amendment-v3.json \
   --region "$REGION" \
   --ami-id "$AMI_ID" \
+  --ami-evidence "$AMI_EVIDENCE" \
   --container-image "$CONTAINER_IMAGE" \
   --container-digest "$CONTAINER_DIGEST" \
+  --ecr-evidence "$ECR_EVIDENCE" \
+  --image-build-receipt "$IMAGE_BUILD_RECEIPT" \
+  "${CAPACITY_ARGS[@]}" \
   --selected-at "$SELECTED_AT" \
   --out "$SELECTION" \
-  --apply > provider-selection-result.json
+  --apply > "$REVIEW_ROOT/provider-selection-result.json"
 ```
 
 The receipt must say `mixed_profiles: false`, contain seeds 0–9 exactly once,
-and bind the release profile, amendment, cohort, preregistration, AMI ID,
-Region, and image digest.
+and bind the release profile, amendment, cohort, preregistration, AMI describe
+evidence, Region, private-ECR describe evidence, image build context,
+Dockerfile, dependency lock, image digest, and the selected purchase model.
 
 ## 6. Acquire capacity outside msctl
 
@@ -246,9 +383,9 @@ aws ec2 describe-capacity-block-offerings \
   --start-date-range REPLACE_WITH_EARLIEST_START \
   --end-date-range REPLACE_WITH_LATEST_END \
   --capacity-duration-hours REPLACE_WITH_DURATION \
-  --output json > capacity-block-offerings.json
-python -m json.tool capacity-block-offerings.json
-sha256sum capacity-block-offerings.json
+  --output json > "$REVIEW_ROOT/capacity-block-offerings.json"
+python -m json.tool "$REVIEW_ROOT/capacity-block-offerings.json"
+sha256sum "$REVIEW_ROOT/capacity-block-offerings.json"
 ```
 
 An independent cost approver must sign the exact offering ID, start/end,
@@ -275,27 +412,61 @@ aws ec2 purchase-capacity-block \
   --region "$REGION" \
   --capacity-block-offering-id "$CAPACITY_BLOCK_OFFERING_ID" \
   --instance-platform Linux/UNIX \
-  --no-dry-run > capacity-block-purchase.json
+  --no-dry-run > "$REVIEW_ROOT/capacity-block-purchase.json"
 ```
 
 Launch one P6 into that exact block using a reviewed `launch-request.json`.
 The request must pin `p6-b300.48xlarge`, `AMI_ID`, private networking, no public
 IP, the dedicated instance profile, encrypted volumes, and the Capacity Block
-reservation identity:
+reservation identity. In particular, the reviewed JSON must contain these
+literal API fields; an ordinary reservation target without the market type is
+not a Capacity Block launch:
+
+```json
+{
+  "MinCount": 1,
+  "MaxCount": 1,
+  "InstanceType": "p6-b300.48xlarge",
+  "InstanceMarketOptions": {
+    "MarketType": "capacity-block"
+  },
+  "CapacityReservationSpecification": {
+    "CapacityReservationTarget": {
+      "CapacityReservationId": "REPLACE_WITH_EXACT_CAPACITY_RESERVATION_ID"
+    }
+  }
+}
+```
+
+Validate those closed fields before either AWS call:
 
 ```bash
+LAUNCH_REQUEST="$OPERATOR_ROOT/launch-request.json"
+python - "$LAUNCH_REQUEST" "$CAPACITY_RESERVATION_ID" <<'PY'
+import json
+import sys
+
+request = json.load(open(sys.argv[1], encoding="utf-8"))
+assert request["MinCount"] == request["MaxCount"] == 1
+assert request["InstanceType"] == "p6-b300.48xlarge"
+assert request["InstanceMarketOptions"] == {"MarketType": "capacity-block"}
+assert request["CapacityReservationSpecification"] == {
+    "CapacityReservationTarget": {"CapacityReservationId": sys.argv[2]}
+}
+PY
+
 # DRY RUN: permission and request review; expect DryRunOperation.
 aws ec2 run-instances \
   --region "$REGION" \
-  --cli-input-json file://launch-request.json \
+  --cli-input-json "file://$LAUNCH_REQUEST" \
   --dry-run
 
 # PAID APPLY only after the launch JSON hash and Capacity Block binding match
 # the approval.
 aws ec2 run-instances \
   --region "$REGION" \
-  --cli-input-json file://launch-request.json \
-  --no-dry-run > run-instances-result.json
+  --cli-input-json "file://$LAUNCH_REQUEST" \
+  --no-dry-run > "$REVIEW_ROOT/run-instances-result.json"
 ```
 
 ### P5 On-Demand fallback
@@ -309,26 +480,27 @@ aws pricing get-products \
   --service-code AmazonEC2 \
   --filters Type=TERM_MATCH,Field=instanceType,Value=p5.48xlarge \
   --region us-east-1 \
-  --output json > p5-price-review.json
-python -m json.tool p5-price-review.json
-sha256sum launch-request.json p5-price-review.json
+  --output json > "$REVIEW_ROOT/p5-price-review.json"
+python -m json.tool "$REVIEW_ROOT/p5-price-review.json"
+LAUNCH_REQUEST="$OPERATOR_ROOT/launch-request.json"
+sha256sum "$LAUNCH_REQUEST" "$REVIEW_ROOT/p5-price-review.json"
 
 # DRY RUN: expect DryRunOperation.
 aws ec2 run-instances \
   --region "$REGION" \
-  --cli-input-json file://launch-request.json \
+  --cli-input-json "file://$LAUNCH_REQUEST" \
   --dry-run
 
 # PAID APPLY only after exact hourly price, count, and launch request approval.
 aws ec2 run-instances \
   --region "$REGION" \
-  --cli-input-json file://launch-request.json \
-  --no-dry-run > run-instances-result.json
+  --cli-input-json "file://$LAUNCH_REQUEST" \
+  --no-dry-run > "$REVIEW_ROOT/run-instances-result.json"
 ```
 
 Extract the returned IDs, review them against `DescribeInstances`, and write an
-ordered `instance-ids.txt`. Never use tag queries, “all running instances,” or
-implicit discovery in a mutating command.
+ordered `$OPERATOR_ROOT/instance-ids.txt`. Never use tag queries, “all running
+instances,” or implicit discovery in a mutating command.
 
 ## 7. Stage immutable inputs
 
@@ -338,27 +510,95 @@ receipts:
 
 ```bash
 set -euo pipefail
-S3_RELEASE_URI=s3://REPLACE_WITH_COHORT_BUCKET/releases/REPLACE_WITH_RELEASE_ID
+export MS_S3_ROOT=s3://REPLACE_WITH_COHORT_BUCKET/REPLACE_WITH_COHORT_PREFIX
+export MS_S3_KMS_KEY_ID=arn:aws:kms:REPLACE_WITH_REGION:REPLACE_WITH_ACCOUNT:key/REPLACE_WITH_KEY_UUID
+RELEASE_ARCHIVE="$(python -c 'import json,sys; print(json.load(sys.stdin)["archive"])' <<<"$PACKAGE_RESULT")"
+RELEASE_SHA256="$(python -c 'import json,sys; print(json.load(sys.stdin)["sha256"])' <<<"$PACKAGE_RESULT")"
+S3_RELEASE_PREFIX="${MS_S3_ROOT}/releases/${RELEASE_SHA256}"
 
-# DRY RUN: review every S3 destination and object.
-aws s3 sync "$RELEASE_DIR" "$S3_RELEASE_URI" \
+# DRY RUN: review each exact source and the runtime's fixed destination name.
+aws s3 cp "$RELEASE_ARCHIVE" "$S3_RELEASE_PREFIX/release.zip" \
   --region "$REGION" \
   --sse aws:kms \
-  --sse-kms-key-id REPLACE_WITH_COHORT_KMS_KEY \
+  --sse-kms-key-id "$MS_S3_KMS_KEY_ID" \
+  --dryrun
+aws s3 cp "$RELEASE_RECEIPT" "$S3_RELEASE_PREFIX/RELEASE.json" \
+  --region "$REGION" \
+  --sse aws:kms \
+  --sse-kms-key-id "$MS_S3_KMS_KEY_ID" \
+  --dryrun
+aws s3 cp configs/cohort-assignment-v3.json \
+  "$S3_RELEASE_PREFIX/cohort-assignment-v3.json" \
+  --region "$REGION" \
+  --sse aws:kms \
+  --sse-kms-key-id "$MS_S3_KMS_KEY_ID" \
   --dryrun
 
-# APPLY after the dry-run object list and KMS key are approved.
-aws s3 sync "$RELEASE_DIR" "$S3_RELEASE_URI" \
+# APPLY after all three paths, hashes, and the exact KMS key are approved.
+aws s3 cp "$RELEASE_ARCHIVE" "$S3_RELEASE_PREFIX/release.zip" \
   --region "$REGION" \
   --sse aws:kms \
-  --sse-kms-key-id REPLACE_WITH_COHORT_KMS_KEY
+  --sse-kms-key-id "$MS_S3_KMS_KEY_ID"
+aws s3 cp "$RELEASE_RECEIPT" "$S3_RELEASE_PREFIX/RELEASE.json" \
+  --region "$REGION" \
+  --sse aws:kms \
+  --sse-kms-key-id "$MS_S3_KMS_KEY_ID"
+aws s3 cp configs/cohort-assignment-v3.json \
+  "$S3_RELEASE_PREFIX/cohort-assignment-v3.json" \
+  --region "$REGION" \
+  --sse aws:kms \
+  --sse-kms-key-id "$MS_S3_KMS_KEY_ID"
 ```
+
+Stage the separately controlled evaluator release under its own content root,
+not inside the training archive. It must contain exactly `study-lock.json`,
+`validity.json`, `items.jsonl`, `stores.jsonl`, `sealed-gold.jsonl`, and
+`checkpoints.jsonl`. Compute the release root and the actual study-lock byte
+hash by loading the closed contract:
+
+```bash
+set -euo pipefail
+SEALED_EVALUATION_ROOT=REPLACE_WITH_EXTERNAL_SEALED_RELEASE_DIRECTORY
+SEALED_REPORT="$REVIEW_ROOT/sealed-evaluation.json"
+python - "$SEALED_EVALUATION_ROOT" > "$SEALED_REPORT" <<'PY'
+import json
+import sys
+from msctl.aws_sealed_evaluation import load_sealed_evaluation_release
+
+release = load_sealed_evaluation_release(sys.argv[1])
+print(json.dumps({
+    "sealed_evaluation_release_sha256": release.sha256,
+    "study_lock_sha256": release.study_lock_sha256,
+    "members": dict(release.members),
+}, sort_keys=True, separators=(",", ":")))
+PY
+SEALED_EVALUATION_SHA256="$(python -c 'import json,sys; print(json.load(open(sys.argv[1]))["sealed_evaluation_release_sha256"])' "$SEALED_REPORT")"
+STUDY_LOCK_SHA256="$(python -c 'import json,sys; print(json.load(open(sys.argv[1]))["study_lock_sha256"])' "$SEALED_REPORT")"
+SEALED_S3_URI="${MS_S3_ROOT}/sealed-evaluation/${SEALED_EVALUATION_SHA256}"
+
+# DRY RUN, then APPLY with the same exact external root and KMS key.
+aws s3 sync "$SEALED_EVALUATION_ROOT" "$SEALED_S3_URI" \
+  --region "$REGION" \
+  --sse aws:kms \
+  --sse-kms-key-id "$MS_S3_KMS_KEY_ID" \
+  --no-follow-symlinks \
+  --dryrun
+aws s3 sync "$SEALED_EVALUATION_ROOT" "$SEALED_S3_URI" \
+  --region "$REGION" \
+  --sse aws:kms \
+  --sse-kms-key-id "$MS_S3_KMS_KEY_ID" \
+  --no-follow-symlinks
+```
+
+Publish the separately verified dataset receipt and members under
+`$MS_S3_ROOT/dataset` before bootstrap. Keep the raw review response and every
+generated receipt under `$OPERATOR_ROOT`, never in the source checkout.
 
 Use SSM to reach only the explicit IDs. First perform the read-only
 connectivity check and review the exact target before opening a session:
 
 ```bash
-INSTANCE_ID="$(sed -n '1p' instance-ids.txt)"
+INSTANCE_ID="$(sed -n '1p' "$OPERATOR_ROOT/instance-ids.txt")"
 aws ssm describe-instance-information \
   --region "$REGION" \
   --filters Key=InstanceIds,Values="$INSTANCE_ID"
@@ -376,11 +616,13 @@ aws ssm start-session \
 ## 8. Environment and bootstrap
 
 On each approved instance, set only runtime identities: Region, pinned AMI ID,
-digest-pinned private ECR image/digest, cohort S3 root, runtime UID/GID, and the
-dedicated instance-profile ARN. Do not inject operator credentials.
+digest-pinned private ECR image/digest, cohort S3 root and KMS key, and runtime
+UID/GID. Do not inject operator credentials.
 
-Bootstrap inspects IMDSv2 identity and exact hardware before rendering changes.
-Run it first without `--apply`:
+A stock DLAMI has no `/opt/memorysplit` checkout. First build the deterministic
+closed control tar, review its hash, and install those exact S3 bytes with the
+AWS-managed `AWS-RunShellScript` document. This step must complete before any
+custom argv document is used:
 
 ```bash
 set -euo pipefail
@@ -388,85 +630,126 @@ export AWS_REGION="$REGION"
 export MS_AWS_AMI_ID="$AMI_ID"
 export MS_CONTAINER_IMAGE="$CONTAINER_IMAGE"
 export MS_CONTAINER_DIGEST="$CONTAINER_DIGEST"
-export MS_S3_ROOT=s3://REPLACE_WITH_COHORT_BUCKET/REPLACE_WITH_COHORT_PREFIX
 export MS_RUNTIME_UID=10001
 export MS_RUNTIME_GID=10001
 INSTANCE_ID="${INSTANCE_ID:?set one explicit reviewed instance ID}"
+CONTROL_BUNDLE="$OPERATOR_ROOT/control-bundle.tar"
 
-# DRY RUN: hardware checks run, but RAID/extraction changes are only rendered.
-sudo -E cluster/aws/p5/bootstrap.sh \
-  --profile "$PROFILE" \
-  --container-image "$CONTAINER_IMAGE" \
-  --release-archive /staging/REPLACE_WITH_RELEASE_ARCHIVE.zip \
-  --release-sha256 REPLACE_WITH_ARCHIVE_SHA256 \
-  --release-receipt /staging/RELEASE-AWS-GPU-V3.json \
-  --release-receipt-sha256 REPLACE_WITH_RECEIPT_SHA256 \
-  --dataset-receipt /staging/dataset/receipt.json \
-  --dataset-receipt-sha256 REPLACE_WITH_DATASET_SHA256 \
-  --cohort-assignment configs/cohort-assignment-v3.json \
-  --cohort-assignment-sha256 REPLACE_WITH_COHORT_SHA256 \
-  --code-commit REPLACE_WITH_SOURCE_COMMIT \
-  --receipt /staging/environment-receipt.json \
-  --owner-uid 10001 \
-  --owner-gid 10001 \
-  --aws-private-home /run/memorysplit-aws
+# DRY RUN and exclusive local APPLY; both derive byte-identical tar bytes.
+python -m msctl --profile "$PROFILE" --repo-root . \
+  control bundle --out "$CONTROL_BUNDLE" \
+  > "$REVIEW_ROOT/control-bundle-plan.json"
+python -m msctl --profile "$PROFILE" --repo-root . \
+  control bundle --out "$CONTROL_BUNDLE" --apply \
+  > "$REVIEW_ROOT/control-bundle-result.json"
+CONTROL_BUNDLE_SHA256="$(python -c 'import json,sys; print(json.load(open(sys.argv[1]))["bundle_sha256"])' "$REVIEW_ROOT/control-bundle-result.json")"
+
+# DRY RUN: renders immutable S3 publication and the stock-document command.
+python -m msctl --profile "$PROFILE" --repo-root . \
+  --state-root "$OPERATOR_ROOT/state" \
+  control install --instance-id "$INSTANCE_ID" \
+  > "$REVIEW_ROOT/control-install-plan-${INSTANCE_ID}.json"
+
+# APPLY: publishes with SSE-KMS/no-overwrite, verifies the object, then sends
+# exactly one AWS-RunShellScript command to the explicit instance.
+python -m msctl --profile "$PROFILE" --repo-root . \
+  --state-root "$OPERATOR_ROOT/state" \
+  control install --instance-id "$INSTANCE_ID" --apply \
+  > "$REVIEW_ROOT/control-install-result-${INSTANCE_ID}.json"
+CONTROL_COMMAND_ID="$(python -c 'import json,sys; print(json.load(open(sys.argv[1]))["command_id"])' "$REVIEW_ROOT/control-install-result-${INSTANCE_ID}.json")"
+
+# Read-only completion check. Do not proceed on Pending/InProgress/Failed.
+aws ssm get-command-invocation \
+  --region "$REGION" \
+  --instance-id "$INSTANCE_ID" \
+  --command-id "$CONTROL_COMMAND_ID" \
+  --query '{CommandId:CommandId,Status:Status}' \
+  --output json > "$REVIEW_ROOT/control-install-status-${INSTANCE_ID}.json"
+test "$(python -c 'import json,sys; print(json.load(open(sys.argv[1]))["Status"])' "$REVIEW_ROOT/control-install-status-${INSTANCE_ID}.json")" = Success
 ```
 
-Review device model/count/size, RAID0 target, mounts, image digest, source
-commit, and receipt paths. Bootstrap destroys instance-store contents, which
-are ephemeral:
+The installed root is
+`/opt/memorysplit/control/$CONTROL_BUNDLE_SHA256`. On the explicit instance,
+bootstrap inspects authenticated IMDSv2 identity and exact hardware before
+rendering any mutation. Use the digest root, never `/opt/memorysplit` or an
+unverified checkout:
 
 ```bash
-# APPLY only on the explicit reviewed instance.
-sudo -E cluster/aws/p5/bootstrap.sh \
-  --profile "$PROFILE" \
-  --container-image "$CONTAINER_IMAGE" \
-  --release-archive /staging/REPLACE_WITH_RELEASE_ARCHIVE.zip \
-  --release-sha256 REPLACE_WITH_ARCHIVE_SHA256 \
-  --release-receipt /staging/RELEASE-AWS-GPU-V3.json \
-  --release-receipt-sha256 REPLACE_WITH_RECEIPT_SHA256 \
-  --dataset-receipt /staging/dataset/receipt.json \
-  --dataset-receipt-sha256 REPLACE_WITH_DATASET_SHA256 \
-  --cohort-assignment configs/cohort-assignment-v3.json \
-  --cohort-assignment-sha256 REPLACE_WITH_COHORT_SHA256 \
-  --code-commit REPLACE_WITH_SOURCE_COMMIT \
-  --receipt /staging/environment-receipt.json \
-  --owner-uid 10001 \
-  --owner-gid 10001 \
-  --aws-private-home /run/memorysplit-aws \
+set -euo pipefail
+CONTROL_ROOT="/opt/memorysplit/control/${CONTROL_BUNDLE_SHA256}"
+REMOTE_PROFILE="$CONTROL_ROOT/cluster/profiles/$(basename "$PROFILE")"
+RELEASE_RECEIPT_SHA256=REPLACE_WITH_REVIEWED_RELEASE_RECEIPT_SHA256
+DATASET_RECEIPT_SHA256=REPLACE_WITH_DATASET_RECEIPT_SHA256
+COHORT_SHA256=REPLACE_WITH_REVIEWED_COHORT_ASSIGNMENT_SHA256
+SOURCE_COMMIT=REPLACE_WITH_REVIEWED_40_HEX_SOURCE_COMMIT
+sudo /usr/bin/install -d -m 0700 -o 0 -g 0 /run/memorysplit-aws
+BOOTSTRAP_ARGS=(
+  "$CONTROL_ROOT/cluster/aws/p5/bootstrap.py"
+  --profile "$REMOTE_PROFILE"
+  --container-image "$CONTAINER_IMAGE"
+  --release-archive "/mnt/memorysplit/staging/releases/$RELEASE_SHA256/release.zip"
+  --release-sha256 "$RELEASE_SHA256"
+  --release-receipt "/mnt/memorysplit/staging/releases/$RELEASE_SHA256/RELEASE.json"
+  --release-receipt-sha256 "$RELEASE_RECEIPT_SHA256"
+  --dataset-receipt /mnt/memorysplit/dataset/receipt.json
+  --dataset-receipt-sha256 "$DATASET_RECEIPT_SHA256"
+  --cohort-assignment "/mnt/memorysplit/staging/releases/$RELEASE_SHA256/cohort-assignment-v3.json"
+  --cohort-assignment-sha256 "$COHORT_SHA256"
+  --code-commit "$SOURCE_COMMIT"
+  --receipt /mnt/memorysplit/staging/bootstrap-receipt.json
+  --owner-uid 10001
+  --owner-gid 10001
+  --aws-private-home /run/memorysplit-aws
+)
+
+# DRY RUN: hardware checks run; RAID, extraction, and S3 sync are only rendered.
+sudo -E /usr/bin/python3 "${BOOTSTRAP_ARGS[@]}"
+
+# APPLY only after exact device, image, release, dataset, and command review.
+sudo -E /usr/bin/python3 "${BOOTSTRAP_ARGS[@]}" \
   --authorize-destructive-instance-store \
   --apply
 ```
 
-Bootstrap publishes the final, instance-bound environment receipt under
-`$MS_S3_ROOT/receipts/bootstrap/<instance-id>.json`. For every explicit fleet
-ID, review and retrieve that exact receipt to the operator checkout:
+The first apply may create RAID0 and format ephemeral instance store. A repeated
+apply with identical inputs must reverify and reuse the exact RAID, mount,
+release root, and receipts. It never recreates storage or overwrites a release;
+any member, ownership, mount, device, or receipt drift is a hard failure.
+Consequently, later protected submit is allowed to rerun this same bootstrap
+without failing merely because qualification already prepared the instance.
+
+Bootstrap prints and publishes an authenticated environment receipt under
+`$MS_S3_ROOT/receipts/environment/<instance-id>/<boot-id>.json`, separately
+from the bootstrap receipt. For every explicit fleet ID, copy the exact URI
+printed by bootstrap to the operator root:
 
 ```bash
-ENVIRONMENT_RECEIPT="operator/environment-${INSTANCE_ID}.json"
-BOOTSTRAP_RECEIPT_URI="${MS_S3_ROOT}/receipts/bootstrap/${INSTANCE_ID}.json"
+ENVIRONMENT_RECEIPT="$OPERATOR_ROOT/receipts/environment-${INSTANCE_ID}.json"
+ENVIRONMENT_RECEIPT_URI=REPLACE_WITH_EXACT_URI_PRINTED_BY_BOOTSTRAP
 
 # DRY RUN: review the exact source URI and per-instance destination.
-aws s3 cp "$BOOTSTRAP_RECEIPT_URI" "$ENVIRONMENT_RECEIPT" \
+aws s3 cp "$ENVIRONMENT_RECEIPT_URI" "$ENVIRONMENT_RECEIPT" \
   --region "$REGION" \
   --dryrun
 
 # APPLY after the instance ID and URI are reviewed; this only writes locally.
-aws s3 cp "$BOOTSTRAP_RECEIPT_URI" "$ENVIRONMENT_RECEIPT" \
+aws s3 cp "$ENVIRONMENT_RECEIPT_URI" "$ENVIRONMENT_RECEIPT" \
   --region "$REGION"
 sha256sum "$ENVIRONMENT_RECEIPT"
 ```
 
 Keep one receipt per instance; never reuse a receipt from another fleet ID.
-Copy every 30-minute checkpoint and its canonical receipt to durable
-cohort-scoped S3. Local NVMe is scratch, never the only checkpoint copy.
+The receipt is boot-bound; stopping and starting an instance changes the boot
+ID and requires bootstrap, qualification, and readiness to be repeated.
 
 ## 9. Canary, 100/10 ETA, and launch gate
 
 Render the profile-bound canary plan without executing it:
 
 ```bash
-python - <<'PY' > canary-plan.json
+CANARY_PLAN="$REVIEW_ROOT/canary-plan-${INSTANCE_ID}.json"
+export RELEASE_SHA256
+python - <<'PY' > "$CANARY_PLAN"
 import json
 import os
 from pathlib import Path
@@ -475,14 +758,26 @@ from cluster.aws.p5.profile import load_aws_gpu_profile, validate_runtime_enviro
 
 profile = load_aws_gpu_profile(Path(os.environ["PROFILE"]))
 runtime = validate_runtime_environment(profile, os.environ)
-print(json.dumps(render_canary_command_plan(profile, runtime), sort_keys=True))
+release_sha256 = os.environ["RELEASE_SHA256"]
+print(json.dumps(render_canary_command_plan(
+    profile,
+    runtime,
+    release_sha256=release_sha256,
+    release_root=f"/mnt/memorysplit/releases/{release_sha256}",
+), sort_keys=True))
 PY
-python -m json.tool canary-plan.json
+python -m json.tool "$CANARY_PLAN"
 ```
 
 The approved SSM executor must show the exact instance ID and argv from this
 plan in dry-run/review mode before it executes them. It must not translate them
-into implicit fleet discovery. The qualification receipt must prove:
+into implicit fleet discovery. Each phase runs
+`cluster/aws/p5/canary_runtime.py` from the mounted, digest-named release using
+`/opt/venv/bin/python`; no shell-generated command is accepted. Preserve every
+raw-output hash and build one closed qualification receipt. It must bind the
+instance ID, current boot ID, Region, AMI ID/owner, private image/digest,
+provider selection, environment receipt, timestamp, command-plan hash, release
+hash, and every phase raw-output hash, and it must prove:
 
 - eight matching GPUs and the profile software floors;
 - BF16, SDPA, `torch.compile`, fused AdamW, NVLink/fabric manager, NVMe, and
@@ -495,6 +790,7 @@ into implicit fleet discovery. The qualification receipt must prove:
 Validate the returned receipt locally:
 
 ```bash
+export QUALIFICATION_RECEIPT="$OPERATOR_ROOT/receipts/qualification-${INSTANCE_ID}.json"
 python - <<'PY'
 from pathlib import Path
 import os
@@ -502,13 +798,72 @@ from cluster.aws.p5.canary import load_qualification_receipt
 from cluster.aws.p5.profile import load_aws_gpu_profile
 
 profile = load_aws_gpu_profile(Path(os.environ["PROFILE"]))
-report = load_qualification_receipt(Path("qualification-receipt.json"), profile)
+report = load_qualification_receipt(
+    Path(os.environ["QUALIFICATION_RECEIPT"]),
+    profile,
+)
 print(report.as_dict())
 PY
 ```
 
 Do not proceed if any capability is false, a profile/hash differs, hardware is
 mixed, an update is missing, or ETA misses the approved deadline/cost window.
+
+After all six named 29M diagnostic receipts have independently passed, create
+one affirmative, instance-specific protected-launch receipt. The diagnostic
+names are closed; substitutions or omissions fail:
+
+```bash
+set -euo pipefail
+export QUALIFICATION_RECEIPT
+READINESS="$OPERATOR_ROOT/receipts/readiness-${INSTANCE_ID}.json"
+READINESS_REVIEWER=REPLACE_WITH_REVIEWED_IDENTITY
+READINESS_REVIEWED_AT=REPLACE_WITH_UTC_TIMESTAMP
+DIAGNOSTIC_ARGS=(
+  --diagnostic-receipt "full_corpus_dense=$OPERATOR_ROOT/receipts/diagnostic-full-corpus-dense.json"
+  --diagnostic-receipt "full_corpus_split90=$OPERATOR_ROOT/receipts/diagnostic-full-corpus-split90.json"
+  --diagnostic-receipt "no_arc_conceptarc_dense=$OPERATOR_ROOT/receipts/diagnostic-no-arc-conceptarc-dense.json"
+  --diagnostic-receipt "no_arc_conceptarc_split90=$OPERATOR_ROOT/receipts/diagnostic-no-arc-conceptarc-split90.json"
+  --diagnostic-receipt "no_refinement_dense=$OPERATOR_ROOT/receipts/diagnostic-no-refinement-dense.json"
+  --diagnostic-receipt "no_refinement_split90=$OPERATOR_ROOT/receipts/diagnostic-no-refinement-split90.json"
+)
+
+# DRY RUN: validates every artifact and renders the exact affirmative decision.
+python -m msctl --profile "$PROFILE" --repo-root . \
+  readiness create \
+  --release "$RELEASE_RECEIPT" \
+  --amendment configs/hardware-amendment-v3.json \
+  --provider-selection "$SELECTION" \
+  --environment-receipt "$ENVIRONMENT_RECEIPT" \
+  --qualification-receipt "$QUALIFICATION_RECEIPT" \
+  "${DIAGNOSTIC_ARGS[@]}" \
+  --sealed-evaluation-release "$SEALED_EVALUATION_ROOT" \
+  --reviewer "$READINESS_REVIEWER" \
+  --reviewed-at "$READINESS_REVIEWED_AT" \
+  --out "$READINESS" \
+  > "$REVIEW_ROOT/readiness-plan-${INSTANCE_ID}.json"
+
+# APPLY writes once and refuses replacement.
+python -m msctl --profile "$PROFILE" --repo-root . \
+  readiness create \
+  --release "$RELEASE_RECEIPT" \
+  --amendment configs/hardware-amendment-v3.json \
+  --provider-selection "$SELECTION" \
+  --environment-receipt "$ENVIRONMENT_RECEIPT" \
+  --qualification-receipt "$QUALIFICATION_RECEIPT" \
+  "${DIAGNOSTIC_ARGS[@]}" \
+  --sealed-evaluation-release "$SEALED_EVALUATION_ROOT" \
+  --reviewer "$READINESS_REVIEWER" \
+  --reviewed-at "$READINESS_REVIEWED_AT" \
+  --out "$READINESS" \
+  --apply > "$REVIEW_ROOT/readiness-result-${INSTANCE_ID}.json"
+```
+
+The receipt always contains `protected_launch_allowed: true`; the CLI has no
+flag that can bypass validation to manufacture that decision. Do not edit the
+frozen preregistration, study lock, receipt, or any bound artifact after review.
+Missing, false, stale, cross-profile, cross-instance, or cross-boot evidence
+must fail locally before any paid lifecycle AWS call.
 
 ## 10. Instantiate manifests and make the explicit fleet plan
 
@@ -517,20 +872,23 @@ The example shows seed 0; repeat identically for 0–9:
 
 ```bash
 SEED=0
-MANIFEST="operator/manifests/seed-${SEED}.json"
+MANIFEST="$OPERATOR_ROOT/manifests/seed-${SEED}.json"
+DATASET_RECEIPT="$OPERATOR_ROOT/receipts/dataset-receipt.json"
 
-# DRY RUN: validates release, dataset, amendment, selection, and eval code.
+# DRY RUN: validates release, dataset, amendment, selection, and the complete
+# external sealed-evaluation release without writing a manifest.
 python -m msctl \
   --profile "$PROFILE" \
   --repo-root . \
   runs instantiate \
   --release "$RELEASE_RECEIPT" \
-  --dataset-receipt /staging/dataset/receipt.json \
+  --dataset-receipt "$DATASET_RECEIPT" \
   --seed "$SEED" \
   --hardware-amendment configs/hardware-amendment-v3.json \
   --provider-selection "$SELECTION" \
-  --sealed-evaluation evals/confirmatory/runner.py \
-  --out "$MANIFEST"
+  --sealed-evaluation "$SEALED_EVALUATION_ROOT" \
+  --out "$MANIFEST" \
+  > "$REVIEW_ROOT/manifest-plan-seed-${SEED}.json"
 
 # APPLY only after the rendered manifest hashes are reviewed.
 python -m msctl \
@@ -538,13 +896,13 @@ python -m msctl \
   --repo-root . \
   runs instantiate \
   --release "$RELEASE_RECEIPT" \
-  --dataset-receipt /staging/dataset/receipt.json \
+  --dataset-receipt "$DATASET_RECEIPT" \
   --seed "$SEED" \
   --hardware-amendment configs/hardware-amendment-v3.json \
   --provider-selection "$SELECTION" \
-  --sealed-evaluation evals/confirmatory/runner.py \
+  --sealed-evaluation "$SEALED_EVALUATION_ROOT" \
   --out "$MANIFEST" \
-  --apply
+  --apply > "$REVIEW_ROOT/manifest-result-seed-${SEED}.json"
 ```
 
 Build the fleet command from all ten explicit manifest paths and the reviewed
@@ -558,18 +916,19 @@ python -m msctl \
   fleet plan \
   --amendment configs/hardware-amendment-v3.json \
   --provider-selection "$SELECTION" \
-  --manifest operator/manifests/seed-0.json \
-  --manifest operator/manifests/seed-1.json \
-  --manifest operator/manifests/seed-2.json \
-  --manifest operator/manifests/seed-3.json \
-  --manifest operator/manifests/seed-4.json \
-  --manifest operator/manifests/seed-5.json \
-  --manifest operator/manifests/seed-6.json \
-  --manifest operator/manifests/seed-7.json \
-  --manifest operator/manifests/seed-8.json \
-  --manifest operator/manifests/seed-9.json \
+  --manifest "$OPERATOR_ROOT/manifests/seed-0.json" \
+  --manifest "$OPERATOR_ROOT/manifests/seed-1.json" \
+  --manifest "$OPERATOR_ROOT/manifests/seed-2.json" \
+  --manifest "$OPERATOR_ROOT/manifests/seed-3.json" \
+  --manifest "$OPERATOR_ROOT/manifests/seed-4.json" \
+  --manifest "$OPERATOR_ROOT/manifests/seed-5.json" \
+  --manifest "$OPERATOR_ROOT/manifests/seed-6.json" \
+  --manifest "$OPERATOR_ROOT/manifests/seed-7.json" \
+  --manifest "$OPERATOR_ROOT/manifests/seed-8.json" \
+  --manifest "$OPERATOR_ROOT/manifests/seed-9.json" \
   --instance-id REPLACE_WITH_EXPLICIT_INSTANCE_ID \
-  --out operator/fleet-plan-v3.json
+  --out "$OPERATOR_ROOT/fleet-plan-v3.json" \
+  > "$REVIEW_ROOT/fleet-plan.json"
 ```
 
 For P6, supply exactly one ID: all ten pairs run sequentially in seed order.
@@ -585,115 +944,122 @@ order between review and publication.
 
 Every lifecycle command binds the amendment, provider selection, fleet plan,
 manifest, explicit instance ID, dataset evidence, environment receipt, release,
-and approval. `msctl` sends work to an existing instance through SSM; it cannot
-provision one.
+external sealed-evaluation release, qualification, six diagnostics, affirmative
+readiness, and approval. `msctl` sends work to an existing instance through
+SSM; it cannot provision one.
 
 For each fleet wave, render before submit:
 
 ```bash
-MANIFEST=operator/manifests/seed-0.json
+MANIFEST="$OPERATOR_ROOT/manifests/seed-0.json"
 INSTANCE_ID=REPLACE_WITH_FLEET_BOUND_INSTANCE_ID
-ENVIRONMENT_RECEIPT="operator/environment-${INSTANCE_ID}.json"
+ENVIRONMENT_RECEIPT="$OPERATOR_ROOT/receipts/environment-${INSTANCE_ID}.json"
+QUALIFICATION_RECEIPT="$OPERATOR_ROOT/receipts/qualification-${INSTANCE_ID}.json"
+READINESS="$OPERATOR_ROOT/receipts/readiness-${INSTANCE_ID}.json"
 TERMINATE_AT=REPLACE_WITH_APPROVED_UTC_DEADLINE
+DATASET_VERIFICATION="$OPERATOR_ROOT/receipts/dataset-verification.json"
+FLEET_PLAN="$OPERATOR_ROOT/fleet-plan-v3.json"
+V3_GATE_ARGS=(
+  --hardware-amendment configs/hardware-amendment-v3.json
+  --provider-selection "$SELECTION"
+  --fleet-plan "$FLEET_PLAN"
+  --launch-readiness "$READINESS"
+  --qualification-receipt "$QUALIFICATION_RECEIPT"
+  "${DIAGNOSTIC_ARGS[@]}"
+  --sealed-evaluation-release "$SEALED_EVALUATION_ROOT"
+)
 
 # DRY RUN: no SSM command is sent.
 python -m msctl \
   --profile "$PROFILE" \
   --repo-root . \
+  --state-root "$OPERATOR_ROOT/state" \
   submit \
   --release "$RELEASE_RECEIPT" \
   --manifest "$MANIFEST" \
   --dataset-pointer DATASET-POINTER-AWS.json \
-  --dataset-verification operator/dataset-verification.json \
+  --dataset-verification "$DATASET_VERIFICATION" \
   --environment-receipt "$ENVIRONMENT_RECEIPT" \
-  --hardware-amendment configs/hardware-amendment-v3.json \
-  --provider-selection "$SELECTION" \
-  --fleet-plan operator/fleet-plan-v3.json \
+  "${V3_GATE_ARGS[@]}" \
   --instance-id "$INSTANCE_ID" \
   --terminate-at "$TERMINATE_AT" \
-  --approval operator/submit-approval.json
+  --approval "$OPERATOR_ROOT/approvals/submit-seed-0.json" \
+  > "$REVIEW_ROOT/submit-plan-seed-0.json"
 
 # APPLY only after argv, ID, wave, ETA, cost, and deadline review.
 python -m msctl \
   --profile "$PROFILE" \
   --repo-root . \
+  --state-root "$OPERATOR_ROOT/state" \
   submit \
   --release "$RELEASE_RECEIPT" \
   --manifest "$MANIFEST" \
   --dataset-pointer DATASET-POINTER-AWS.json \
-  --dataset-verification operator/dataset-verification.json \
+  --dataset-verification "$DATASET_VERIFICATION" \
   --environment-receipt "$ENVIRONMENT_RECEIPT" \
-  --hardware-amendment configs/hardware-amendment-v3.json \
-  --provider-selection "$SELECTION" \
-  --fleet-plan operator/fleet-plan-v3.json \
+  "${V3_GATE_ARGS[@]}" \
   --instance-id "$INSTANCE_ID" \
   --terminate-at "$TERMINATE_AT" \
-  --approval operator/submit-approval.json \
-  --apply
+  --approval "$OPERATOR_ROOT/approvals/submit-seed-0.json" \
+  --apply > "$REVIEW_ROOT/submit-result-seed-0.json"
 ```
 
 Poll with `status --cached` first, then the read-only authoritative status
 path. Verify both arms advance together. The trainer’s `ckpt_minutes: 30`
-requires a durable paired checkpoint receipt at least every 30 minutes; sync
-the checkpoint and receipt only after a dry-run object review:
-
-```bash
-# DRY RUN.
-aws s3 sync /mnt/memorysplit/runs \
-  s3://REPLACE_WITH_COHORT_BUCKET/checkpoints \
-  --region "$REGION" \
-  --exclude '*' \
-  --include '*.pt' \
-  --include '*.json' \
-  --dryrun
-
-# APPLY after paths, encryption policy, and receipt hashes are reviewed.
-aws s3 sync /mnt/memorysplit/runs \
-  s3://REPLACE_WITH_COHORT_BUCKET/checkpoints \
-  --region "$REGION" \
-  --exclude '*' \
-  --include '*.pt' \
-  --include '*.json'
-```
+creates local atomic generations every 30 minutes. Never upload checkpoints
+with `s3 sync`, wildcards, or symlink-following tools. The v3 interruption and resume
+publishers open one singly linked regular generation with `O_NOFOLLOW`,
+snapshot and rehash exact bytes, and use checksum-bound `s3api put-object`
+with `--if-none-match '*'`, the exact `MS_S3_KMS_KEY_ID`, and seed-scoped keys
+`checkpoints/seed-<seed>/<arm>/sha256/<digest>.pt`. They independently HEAD and
+verify size, SHA-256 metadata, version ID, and SSE-KMS identity. Local NVMe is
+scratch; do not stop or terminate until the paired canonical receipt and both
+objects are durably verified.
 
 ## 12. Resume, evaluate, and collect
 
 Resume only from a verified paired checkpoint receipt:
 
 ```bash
+CHECKPOINT_RECEIPT="$OPERATOR_ROOT/receipts/checkpoint-seed-0.json"
+
 # DRY RUN.
 python -m msctl \
   --profile "$PROFILE" \
   --repo-root . \
+  --state-root "$OPERATOR_ROOT/state" \
   resume \
   --release "$RELEASE_RECEIPT" \
   --manifest "$MANIFEST" \
-  --checkpoint-receipt operator/checkpoint-receipt.json \
+  --checkpoint-receipt "$CHECKPOINT_RECEIPT" \
   --dataset-pointer DATASET-POINTER-AWS.json \
-  --dataset-verification operator/dataset-verification.json \
+  --dataset-verification "$DATASET_VERIFICATION" \
   --environment-receipt "$ENVIRONMENT_RECEIPT" \
-  --hardware-amendment configs/hardware-amendment-v3.json \
-  --provider-selection "$SELECTION" \
-  --fleet-plan operator/fleet-plan-v3.json \
-  --approval operator/resume-approval.json
+  "${V3_GATE_ARGS[@]}" \
+  --approval "$OPERATOR_ROOT/approvals/resume-seed-0.json" \
+  > "$REVIEW_ROOT/resume-plan-seed-0.json"
 
 # APPLY after checkpoint hashes, steps, world sizes, and explicit ID review.
 python -m msctl \
   --profile "$PROFILE" \
   --repo-root . \
+  --state-root "$OPERATOR_ROOT/state" \
   resume \
   --release "$RELEASE_RECEIPT" \
   --manifest "$MANIFEST" \
-  --checkpoint-receipt operator/checkpoint-receipt.json \
+  --checkpoint-receipt "$CHECKPOINT_RECEIPT" \
   --dataset-pointer DATASET-POINTER-AWS.json \
-  --dataset-verification operator/dataset-verification.json \
+  --dataset-verification "$DATASET_VERIFICATION" \
   --environment-receipt "$ENVIRONMENT_RECEIPT" \
-  --hardware-amendment configs/hardware-amendment-v3.json \
-  --provider-selection "$SELECTION" \
-  --fleet-plan operator/fleet-plan-v3.json \
-  --approval operator/resume-approval.json \
-  --apply
+  "${V3_GATE_ARGS[@]}" \
+  --approval "$OPERATOR_ROOT/approvals/resume-seed-0.json" \
+  --apply > "$REVIEW_ROOT/resume-result-seed-0.json"
 ```
+
+The v3 checkpoint receipt must be canonical schema 3 and bind the same
+cohort-assignment, preregistration, hardware-amendment, provider-selection,
+profile, and sealed-evaluation hashes as the manifest. Schema-2 receipts remain
+valid only for legacy v2 manifests.
 
 Evaluate only after both terminal checkpoints are durable and verified:
 
@@ -702,33 +1068,38 @@ Evaluate only after both terminal checkpoints are durable and verified:
 python -m msctl \
   --profile "$PROFILE" \
   --repo-root . \
+  --state-root "$OPERATOR_ROOT/state" \
   evaluate \
   --release "$RELEASE_RECEIPT" \
   --manifest "$MANIFEST" \
   --dataset-pointer DATASET-POINTER-AWS.json \
-  --dataset-verification operator/dataset-verification.json \
+  --dataset-verification "$DATASET_VERIFICATION" \
   --environment-receipt "$ENVIRONMENT_RECEIPT" \
-  --hardware-amendment configs/hardware-amendment-v3.json \
-  --provider-selection "$SELECTION" \
-  --fleet-plan operator/fleet-plan-v3.json \
-  --approval operator/evaluate-approval.json
+  "${V3_GATE_ARGS[@]}" \
+  --approval "$OPERATOR_ROOT/approvals/evaluate-seed-0.json" \
+  > "$REVIEW_ROOT/evaluate-plan-seed-0.json"
 
 # APPLY after sealed-release, expected study-lock hash, device, and output review.
 python -m msctl \
   --profile "$PROFILE" \
   --repo-root . \
+  --state-root "$OPERATOR_ROOT/state" \
   evaluate \
   --release "$RELEASE_RECEIPT" \
   --manifest "$MANIFEST" \
   --dataset-pointer DATASET-POINTER-AWS.json \
-  --dataset-verification operator/dataset-verification.json \
+  --dataset-verification "$DATASET_VERIFICATION" \
   --environment-receipt "$ENVIRONMENT_RECEIPT" \
-  --hardware-amendment configs/hardware-amendment-v3.json \
-  --provider-selection "$SELECTION" \
-  --fleet-plan operator/fleet-plan-v3.json \
-  --approval operator/evaluate-approval.json \
-  --apply
+  "${V3_GATE_ARGS[@]}" \
+  --approval "$OPERATOR_ROOT/approvals/evaluate-seed-0.json" \
+  --apply > "$REVIEW_ROOT/evaluate-result-seed-0.json"
 ```
+
+Evaluation stages only
+`$MS_S3_ROOT/sealed-evaluation/$SEALED_EVALUATION_SHA256`, revalidates the
+external member root and actual `study-lock.json` bytes inside the digest-pinned
+container, and invokes the evaluator with `/opt/venv/bin/python`. The training
+preregistration hash is never substituted for the external study-lock hash.
 
 Collect by exact source and exclusive output:
 
@@ -738,20 +1109,96 @@ python -m msctl \
   --profile "$PROFILE" \
   collect \
   --source results/seed-0.json \
-  --out operator/collected/seed-0.json
+  --out "$OPERATOR_ROOT/collected/seed-0.json" \
+  > "$REVIEW_ROOT/collect-plan-seed-0.json"
 
 # APPLY after source and destination review.
 python -m msctl \
   --profile "$PROFILE" \
   collect \
   --source results/seed-0.json \
-  --out operator/collected/seed-0.json \
-  --apply
+  --out "$OPERATOR_ROOT/collected/seed-0.json" \
+  --apply > "$REVIEW_ROOT/collect-result-seed-0.json"
 ```
 
-Repeat evaluate/collect for every seed and report all ten paired outcomes.
+Repeat evaluate/collect for every seed and report all ten paired outcomes. For
+a later fleet wave assigned to the same instance, first assemble the closed
+collection directory and its `COLLECTION.json`, then explicitly advance:
 
-## 13. Stop, restart, and teardown
+```bash
+NEXT_MANIFEST="$OPERATOR_ROOT/manifests/seed-1.json"
+COLLECTION_ROOT="$OPERATOR_ROOT/collected/seed-0"
+ADVANCE_APPROVAL="$OPERATOR_ROOT/approvals/fleet-advance-seed-0-to-1.json"
+
+# DRY RUN: verifies paired local terminal state, successful evaluation, exact
+# collection bytes, consecutive plan waves, and the proposed exact tag delete.
+python -m msctl \
+  --profile "$PROFILE" \
+  --repo-root . \
+  --state-root "$OPERATOR_ROOT/state" \
+  fleet advance \
+  --amendment configs/hardware-amendment-v3.json \
+  --provider-selection "$SELECTION" \
+  --fleet-plan "$FLEET_PLAN" \
+  --to-manifest "$NEXT_MANIFEST" \
+  --instance-id "$INSTANCE_ID" \
+  --collection-root "$COLLECTION_ROOT" \
+  --approval "$ADVANCE_APPROVAL" \
+  > "$REVIEW_ROOT/fleet-advance-plan-seed-0-to-1.json"
+
+# APPLY only with a signed approval for the exact rendered resources.
+python -m msctl \
+  --profile "$PROFILE" \
+  --repo-root . \
+  --state-root "$OPERATOR_ROOT/state" \
+  fleet advance \
+  --amendment configs/hardware-amendment-v3.json \
+  --provider-selection "$SELECTION" \
+  --fleet-plan "$FLEET_PLAN" \
+  --to-manifest "$NEXT_MANIFEST" \
+  --instance-id "$INSTANCE_ID" \
+  --collection-root "$COLLECTION_ROOT" \
+  --approval "$ADVANCE_APPROVAL" \
+  --apply > "$REVIEW_ROOT/fleet-advance-result-seed-0-to-1.json"
+```
+
+Apply rechecks authoritative training/evaluation SSM success, immutable terminal
+receipt metadata, and the exact currently bound AWS tags before deleting those
+exact key/value pairs. It then proves the tags absent and writes an exclusive
+local transition receipt bound to the fleet plan, both waves, collection, and
+approval. Manual or external tag deletion is never progression evidence and
+cannot replace this receipt. One active pair per host remains mandatory.
+
+## 13. Apply-time mutation inventory
+
+Every apply in this runbook has a bounded mutation:
+
+- package, provider-selection, readiness, manifest, fleet-plan, collection, and
+  local state applies create exclusive files only under `$OPERATOR_ROOT`;
+- image apply performs one local Docker build and one immutable-tag ECR push;
+- Capacity Block purchase is the separately approved non-cancellable charge,
+  and `run-instances` creates only the reviewed count and launch identity;
+- control install conditionally creates one checksum-bound, SSE-KMS S3 object
+  and sends one command through `AWS-RunShellScript`;
+- the first lifecycle apply may create the fixed hash-checked custom SSM
+  document, creates exact cohort tags, publishes a content-addressed operation
+  intent, sends one SSM command, and installs an auto-shutdown deadline;
+- first bootstrap apply creates/formats RAID0 on ephemeral instance store,
+  creates fixed directories, syncs approved S3 inputs, extracts one immutable
+  digest root, and publishes bootstrap/environment receipts; repeat applies
+  only reverify and reuse the same identity;
+- v3 checkpoint publication creates no-overwrite, SSE-KMS, seed-scoped S3
+  objects after no-follow snapshots; evaluation materializes and validates the
+  external sealed release and writes evaluation output;
+- fleet advance deletes only the prior wave's exact reviewed tag key/value
+  pairs after all terminal/evaluation/collection evidence is rechecked; and
+- stop, start, terminate, session close, and eventual retention deletion are
+  the explicit EC2/session/retention mutations shown below.
+
+No dry-run command is launch authorization, and no apply may be inferred from a
+read-only AWS response.
+
+## 14. Stop, restart, and teardown
 
 Stopping an instance does not cancel or refund a P6 Capacity Block. Before any
 emergency stop or restart, review the exact ID and checkpoint durability:

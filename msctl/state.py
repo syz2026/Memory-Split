@@ -91,8 +91,11 @@ AWS_V3_BINDING_KEYS = {
     "hardware_amendment_sha256",
     "provider_selection_sha256",
     "sealed_evaluation_sha256",
+    "study_lock_sha256",
     "fleet_plan_sha256",
     "fleet_wave",
+    "launch_readiness_sha256",
+    "control_bundle_sha256",
 }
 AWS_V3_RUN_STATE_KEYS = (
     AWS_RUN_STATE_KEYS - {"study_lock_sha256"}
@@ -406,7 +409,10 @@ def _validate_aws_run_state(value: dict[str, object], run_id: str) -> None:
                 "hardware_amendment_sha256",
                 "provider_selection_sha256",
                 "sealed_evaluation_sha256",
+                "study_lock_sha256",
                 "fleet_plan_sha256",
+                "launch_readiness_sha256",
+                "control_bundle_sha256",
             ]
         )
         require_nonnegative_int(
@@ -510,7 +516,10 @@ def _validate_evaluation_state(
                     "hardware_amendment_sha256",
                     "provider_selection_sha256",
                     "sealed_evaluation_sha256",
+                    "study_lock_sha256",
                     "fleet_plan_sha256",
+                    "launch_readiness_sha256",
+                    "control_bundle_sha256",
                 ]
             )
             require_nonnegative_int(
@@ -968,7 +977,10 @@ class StateStore:
                 "hardware_amendment_sha256",
                 "provider_selection_sha256",
                 "sealed_evaluation_sha256",
+                "study_lock_sha256",
                 "fleet_plan_sha256",
+                "launch_readiness_sha256",
+                    "control_bundle_sha256",
             ):
                 require_sha256(
                     value[field],
@@ -1005,8 +1017,11 @@ class StateStore:
                             "hardware_amendment_sha256",
                             "provider_selection_sha256",
                             "sealed_evaluation_sha256",
+                            "study_lock_sha256",
                             "fleet_plan_sha256",
                             "fleet_wave",
+                            "launch_readiness_sha256",
+                            "control_bundle_sha256",
                         )
                     )
                 )

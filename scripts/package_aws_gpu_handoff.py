@@ -30,6 +30,7 @@ AMENDMENT_PATH = "configs/hardware-amendment-v3.json"
 DATASET_POINTER_PATH = "DATASET-POINTER-AWS.json"
 CONTAINER_LOCK_PATH = "containers/aws-gpu/image.lock.json"
 CONTAINER_DOCKERFILE_PATH = "containers/aws-gpu/Dockerfile"
+RUNTIME_DEPENDENCY_LOCK_PATH = "containers/aws-gpu/requirements.lock"
 SELECTION_SCHEMA_PATH = "schemas/aws-gpu-provider-selection-v3.schema.json"
 RELEASE_RECEIPT_NAME = "RELEASE-AWS-GPU-V3.json"
 METADATA_PATH = "RELEASE-METADATA.json"
@@ -43,23 +44,26 @@ FROZEN_CONFIGS_SHA256 = (
 FROZEN_HASHES = {
     COHORT_PATH: "2fc8bae1343fa0ff65c2dd6548be20c5b34b009dae10906070b39cc48d14dd5d",
     PREREGISTRATION_PATH: "de7f2213cc4918665252b3c469778c1caa72066c84c7bae6ebe92c28b070a25a",
-    AMENDMENT_PATH: "b19180e1cfc07260c527875a281bbd96dd349f612325e961f8eeee90ddbe2840",
-    CONTAINER_LOCK_PATH: "64d12ccffa9f3bfeec383afb297c58b6047d20942ae88409846846ac9915cfd3",
-    SELECTION_SCHEMA_PATH: "fb4449dd548cd18b9e7f66320176b5f2d15387734e9cbdf9653522fc9d7417d6",
+    AMENDMENT_PATH: "22e201991c56b447b772ece0b9e1667d6787a305b19983bda9a4e8d8eca6cc3b",
+    CONTAINER_LOCK_PATH: "3cea8a17349b9c17822eabee9f49ad9d40623b2c6ae76752ec8c1004efd6bbf8",
+    RUNTIME_DEPENDENCY_LOCK_PATH: "236ac66261c7dad568c7f236d99b82338c741cf2a8fc9fc4a848acd481a74d32",
+    SELECTION_SCHEMA_PATH: "cf0ac0f57c7b6ebf68d54220d35a2c6bbe9f832d2eae5863c7945da44ff7aee2",
 }
 PROFILE_SPECS = {
     "cluster/profiles/aws-p5.48xlarge-v3.json": {
         "provider": "aws-p5.48xlarge-v3",
         "instance_type": "p5.48xlarge",
         "gpu_model": "NVIDIA H100 80GB",
-        "sha256": "6ba750448d3ab24a8f8936fda29e5deafdef939ca3f75de033985462345e15fa",
+        "sha256": "0969f70b2d10fb9f2065a7b6f10904658c514fa88cde6b818ae56020826d96bd",
+        "purchase_model": "on_demand",
         "slug": "p5",
     },
     "cluster/profiles/aws-p6-b300.48xlarge-v3.json": {
         "provider": "aws-p6-b300.48xlarge-v3",
         "instance_type": "p6-b300.48xlarge",
         "gpu_model": "NVIDIA B300",
-        "sha256": "d5f38407d81767db0980e55a79df7408ab03e11456e6df44d6876cfda2a26cec",
+        "sha256": "f4b3fc95d5f035decbebb5150854dbe81c7440af4a2097697b106246b8db375f",
+        "purchase_model": "capacity_block",
         "slug": "p6-b300",
     },
 }
@@ -109,10 +113,12 @@ _STATIC_REQUIRED_MEMBERS = frozenset(
         "configs/route-policy.json",
         CONTAINER_DOCKERFILE_PATH,
         CONTAINER_LOCK_PATH,
+        RUNTIME_DEPENDENCY_LOCK_PATH,
         SELECTION_SCHEMA_PATH,
         "cluster/aws/p5/bootstrap.py",
         "cluster/aws/p5/bootstrap.sh",
         "cluster/aws/p5/canary.py",
+        "cluster/aws/p5/canary_runtime.py",
         "cluster/aws/p5/corpus_contract.py",
         "cluster/aws/p5/interruption_checkpoint.py",
         "cluster/aws/p5/launch_seed_pair.py",
@@ -166,10 +172,13 @@ _STATIC_REQUIRED_MEMBERS = frozenset(
         "msctl/__main__.py",
         "msctl/approval.py",
         "msctl/aws_argv.py",
+        "msctl/aws_control_bundle.py",
         "msctl/aws_fleet.py",
         "msctl/aws_launch_manifest.py",
         "msctl/aws_p5.py",
+        "msctl/aws_readiness.py",
         "msctl/aws_resume_launch.py",
+        "msctl/aws_sealed_evaluation.py",
         "msctl/aws_selection.py",
         "msctl/bootstrap.py",
         "msctl/cleanup.py",
@@ -219,8 +228,11 @@ CONTRACT_GROUPS = {
     "lifecycle": (
         "msctl/approval.py",
         "msctl/aws_argv.py",
+        "msctl/aws_control_bundle.py",
         "msctl/aws_launch_manifest.py",
         "msctl/aws_p5.py",
+        "msctl/aws_readiness.py",
+        "msctl/aws_sealed_evaluation.py",
         "msctl/cli.py",
         "msctl/contracts.py",
         "msctl/operations.py",
@@ -228,10 +240,12 @@ CONTRACT_GROUPS = {
     ),
     "canary": (
         "cluster/aws/p5/canary.py",
+        "cluster/aws/p5/canary_runtime.py",
     ),
     "container": (
         CONTAINER_DOCKERFILE_PATH,
         CONTAINER_LOCK_PATH,
+        RUNTIME_DEPENDENCY_LOCK_PATH,
         "scripts/build_aws_gpu_image.py",
     ),
 }
@@ -371,7 +385,7 @@ def _validate_profile_and_amendment(
         "profile_id": spec["provider"],
         "provider": spec["provider"],
         "instance_type": spec["instance_type"],
-        "purchase_model": "on_demand",
+        "purchase_model": spec["purchase_model"],
         "assigned_seeds": list(SEEDS),
     }
     for field, expected in expected_profile_fields.items():
@@ -456,7 +470,11 @@ def _validate_container_lock(payload: dict[str, bytes]) -> dict[str, object]:
             "cuda": "13.0",
             "gid": 10001,
             "operating_system": "Amazon Linux 2023",
+            "python": "3.11",
             "pytorch": "2.12.1",
+            "requirements_sha256": (
+                "236ac66261c7dad568c7f236d99b82338c741cf2a8fc9fc4a848acd481a74d32"
+            ),
             "uid": 10001,
             "user": "memorysplit",
         },
@@ -493,6 +511,23 @@ def _validate_selection_schema(data: bytes) -> None:
             "properties": {
                 "gpu_model": {"const": spec["gpu_model"]},
                 "instance_type": {"const": spec["instance_type"]},
+                "purchase_model": {"const": spec["purchase_model"]},
+                "capacity_reservation_id": (
+                    {"type": "null"}
+                    if spec["purchase_model"] == "on_demand"
+                    else {
+                        "pattern": "^[a-z]{2,4}-[A-Za-z0-9-]{8,64}$",
+                        "type": "string",
+                    }
+                ),
+                "capacity_block_offering_id": (
+                    {"type": "null"}
+                    if spec["purchase_model"] == "on_demand"
+                    else {
+                        "pattern": "^[a-z]{2,4}-[A-Za-z0-9-]{8,64}$",
+                        "type": "string",
+                    }
+                ),
                 "provider": {"const": spec["provider"]},
                 "selected_profile_id": {"const": spec["provider"]},
             },
@@ -501,6 +536,9 @@ def _validate_selection_schema(data: bytes) -> None:
                 "provider",
                 "instance_type",
                 "gpu_model",
+                "purchase_model",
+                "capacity_reservation_id",
+                "capacity_block_offering_id",
             ],
         }
         for spec in PROFILE_SPECS.values()

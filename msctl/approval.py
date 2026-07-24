@@ -36,6 +36,7 @@ APPROVAL_OPERATIONS = {
     "cancel",
     "evaluate",
     "cleanup",
+    "fleet-advance",
 }
 KEY_ENV = "MSCTL_APPROVAL_KEY"
 
@@ -257,9 +258,13 @@ def verify_scope_approval(
                 "hardware_amendment_sha256",
                 "provider_selection_sha256",
                 "sealed_evaluation_sha256",
+                "study_lock_sha256",
                 "fleet_plan_sha256",
                 "fleet_wave",
+                "control_bundle_sha256",
             }
+            if operation in {"submit", "resume", "evaluate"}:
+                expected_resource_fields.add("launch_readiness_sha256")
     require_exact_keys(
         receipt_resources,
         expected_resource_fields,
@@ -304,7 +309,9 @@ def verify_scope_approval(
                     "hardware_amendment_sha256",
                     "provider_selection_sha256",
                     "sealed_evaluation_sha256",
+                    "study_lock_sha256",
                     "fleet_plan_sha256",
+                    "control_bundle_sha256",
                 ):
                     require_sha256(
                         resources.get(field),
@@ -314,6 +321,11 @@ def verify_scope_approval(
                     resources.get("fleet_wave"),
                     label="resource request.fleet_wave",
                 )
+                if operation in {"submit", "resume", "evaluate"}:
+                    require_sha256(
+                        resources.get("launch_readiness_sha256"),
+                        label="resource request.launch_readiness_sha256",
+                    )
             if (
                 resources.get("provider") != profile.provider
                 or resources.get("instance_type")

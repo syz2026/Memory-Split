@@ -79,9 +79,16 @@ _PROCESS_ENV_ALLOWLIST = (
 _P5_GPU_NAME_PATTERNS = (r"^NVIDIA H100 80GB(?: HBM3)?$",)
 _P6_B300_GPU_NAME_PATTERNS = (r"^NVIDIA B300$",)
 _CPU_AFFINITY_HALVES = ((0, 95), (96, 191))
-_P5_SOFTWARE_MINIMUMS = {
+_LEGACY_P5_SOFTWARE_MINIMUMS = {
     "cuda_minimum": "12.1",
     "driver_minimum": "530",
+    "efa_minimum": "1.24.1",
+    "linux_kernel_minimum": "5.10",
+    "ofi_nccl_minimum": "1.7.2",
+}
+_P5_SOFTWARE_MINIMUMS = {
+    "cuda_minimum": "13.0",
+    "driver_minimum": "580",
     "efa_minimum": "1.24.1",
     "linux_kernel_minimum": "5.10",
     "ofi_nccl_minimum": "1.7.2",
@@ -104,6 +111,7 @@ def _v3_profile_value(
     gpu_name_patterns: tuple[str, ...],
     gres: str,
     software_minimums: Mapping[str, str],
+    purchase_model: str,
 ) -> dict[str, object]:
     return {
         "assigned_seeds": list(range(10)),
@@ -123,10 +131,11 @@ def _v3_profile_value(
         "process_env_allowlist": list(_PROCESS_ENV_ALLOWLIST),
         "profile_id": profile_id,
         "provider": profile_id,
-        "purchase_model": "on_demand",
+        "purchase_model": purchase_model,
         "runtime": {
             "ami_id_env": "MS_AWS_AMI_ID",
             "container_digest_env": "MS_CONTAINER_DIGEST",
+            "kms_key_id_env": "MS_S3_KMS_KEY_ID",
             "region_env": "AWS_REGION",
             "runtime_gid_env": "MS_RUNTIME_GID",
             "runtime_uid_env": "MS_RUNTIME_UID",
@@ -155,6 +164,7 @@ _KNOWN_V3_PROFILE_VALUES = {
         gpu_name_patterns=_P5_GPU_NAME_PATTERNS,
         gres="gpu:h100:8",
         software_minimums=_P5_SOFTWARE_MINIMUMS,
+        purchase_model="on_demand",
     ),
     AWS_P6_B300_V3_PROFILE_ID: _v3_profile_value(
         profile_id=AWS_P6_B300_V3_PROFILE_ID,
@@ -164,6 +174,7 @@ _KNOWN_V3_PROFILE_VALUES = {
         gpu_name_patterns=_P6_B300_GPU_NAME_PATTERNS,
         gres="gpu:b300:8",
         software_minimums=_P6_SOFTWARE_MINIMUMS,
+        purchase_model="capacity_block",
     ),
 }
 
@@ -194,6 +205,7 @@ class AwsGpuProfile:
     region_env: str
     ami_id_env: str
     container_digest_env: str
+    kms_key_id_env: str | None
     runtime_uid_env: str
     runtime_gid_env: str
     assigned_seeds: tuple[int, ...]
@@ -263,6 +275,7 @@ class AwsGpuRuntime:
     container_digest: str
     uid: int
     gid: int
+    kms_key_id: str | None = None
 
 
 # Compatibility aliases for the established AWS P5 API.
@@ -476,17 +489,18 @@ def _parse_legacy_profile(raw: object, *, sha256: str) -> AwsGpuProfile:
         region_env=region_env,
         ami_id_env=ami_id_env,
         container_digest_env=container_digest_env,
+        kms_key_id_env=None,
         runtime_uid_env=runtime_uid_env,
         runtime_gid_env=runtime_gid_env,
         assigned_seeds=(1, 2, 3, 4),
         process_env_allowlist=_PROCESS_ENV_ALLOWLIST,
-        cuda_minimum=_P5_SOFTWARE_MINIMUMS["cuda_minimum"],
-        driver_minimum=_P5_SOFTWARE_MINIMUMS["driver_minimum"],
-        linux_kernel_minimum=_P5_SOFTWARE_MINIMUMS[
+        cuda_minimum=_LEGACY_P5_SOFTWARE_MINIMUMS["cuda_minimum"],
+        driver_minimum=_LEGACY_P5_SOFTWARE_MINIMUMS["driver_minimum"],
+        linux_kernel_minimum=_LEGACY_P5_SOFTWARE_MINIMUMS[
             "linux_kernel_minimum"
         ],
-        efa_minimum=_P5_SOFTWARE_MINIMUMS["efa_minimum"],
-        ofi_nccl_minimum=_P5_SOFTWARE_MINIMUMS["ofi_nccl_minimum"],
+        efa_minimum=_LEGACY_P5_SOFTWARE_MINIMUMS["efa_minimum"],
+        ofi_nccl_minimum=_LEGACY_P5_SOFTWARE_MINIMUMS["ofi_nccl_minimum"],
         sha256=sha256,
     )
 
@@ -549,6 +563,7 @@ def _parse_v3_profile(
         region_env=runtime["region_env"],
         ami_id_env=runtime["ami_id_env"],
         container_digest_env=runtime["container_digest_env"],
+        kms_key_id_env=runtime["kms_key_id_env"],
         runtime_uid_env=runtime["runtime_uid_env"],
         runtime_gid_env=runtime["runtime_gid_env"],
         assigned_seeds=tuple(value["assigned_seeds"]),
@@ -715,6 +730,19 @@ def validate_runtime_environment(
         _required_environment(environment, profile.runtime_gid_env),
         label="MS_RUNTIME_GID",
     )
+    kms_key_id = None
+    if profile.kms_key_id_env is not None:
+        kms_key_id = _required_environment(environment, profile.kms_key_id_env)
+        kms_match = re.fullmatch(
+            r"arn:aws:kms:(?P<region>us-(?:east-1|west-2)):"
+            r"[0-9]{12}:key/[0-9a-f]{8}-[0-9a-f]{4}-"
+            r"[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}",
+            kms_key_id,
+        )
+        if kms_match is None or kms_match.group("region") != region:
+            raise ValueError(
+                "MS_S3_KMS_KEY_ID must be an immutable KMS key ARN in AWS_REGION"
+            )
     return AwsGpuRuntime(
         region=region,
         s3_root=s3_root,
@@ -723,6 +751,7 @@ def validate_runtime_environment(
         container_digest=container_digest,
         uid=uid,
         gid=gid,
+        kms_key_id=kms_key_id,
     )
 
 

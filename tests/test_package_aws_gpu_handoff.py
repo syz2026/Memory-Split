@@ -234,6 +234,172 @@ def test_published_v3_package_is_bootstrap_compatible(
     assert verified.assigned_seeds == tuple(PACKAGER.SEEDS)
 
 
+@pytest.mark.parametrize(
+    ("profile_path", "gpu_names"),
+    [
+        (P5_PROFILE, ("NVIDIA H100 80GB HBM3",) * 8),
+        (P6_PROFILE, ("NVIDIA B300",) * 8),
+    ],
+)
+def test_published_package_bootstraps_into_v3_paired_launcher(
+    tmp_path: Path,
+    profile_path: str,
+    gpu_names: tuple[str, ...],
+) -> None:
+    from cluster.aws.p5.bootstrap import (
+        extract_verified_release,
+        verify_bootstrap_artifacts,
+    )
+    from cluster.aws.p5.launch_seed_pair import load_launch_plan, render_plan
+    from cluster.aws.p5.profile import load_aws_gpu_profile
+    from msctl.aws_launch_manifest import build_launcher_manifest
+    from msctl.jsonutil import canonical_json
+    from tests.test_aws_p5_launcher import (
+        BOOT_ID,
+        SAFE_ENVIRONMENT,
+        _launcher_fixture,
+    )
+
+    seed = 0
+    source = _source_repo(tmp_path, profile_path)
+    package = _build(source, tmp_path / "package", profile_path)
+    profile = load_aws_gpu_profile(source / profile_path)
+    fixture = _launcher_fixture(tmp_path / "runtime", seed=seed)
+    scratch_root = fixture["scratch_root"]
+    dataset_receipt = fixture["corpus_path"]
+    cohort_assignment = source / PACKAGER.COHORT_PATH
+    code_commit = _git(source, "rev-parse", "HEAD")
+
+    bootstrap_artifacts = verify_bootstrap_artifacts(
+        release_archive=package.archive,
+        release_sha256=_sha256(package.archive.read_bytes()),
+        release_receipt=package.release,
+        release_receipt_sha256=_sha256(package.release.read_bytes()),
+        dataset_receipt=dataset_receipt,
+        dataset_receipt_sha256=_sha256(dataset_receipt.read_bytes()),
+        cohort_assignment=cohort_assignment,
+        cohort_assignment_sha256=_sha256(cohort_assignment.read_bytes()),
+        code_commit=code_commit,
+        profile=profile,
+    )
+    prepared = extract_verified_release(
+        release_archive=package.archive,
+        artifacts=bootstrap_artifacts,
+        scratch_root=scratch_root,
+        owner_uid=os.getuid() or 1000,
+        owner_gid=os.getgid() or 1000,
+    )
+
+    bootstrap_path = fixture["bootstrap_path"]
+    bootstrap = json.loads(bootstrap_path.read_text(encoding="utf-8"))
+    bootstrap.update(
+        {
+            "code_commit": code_commit,
+            "cohort_assignment_sha256": (
+                bootstrap_artifacts.cohort_assignment_sha256
+            ),
+            "instance_store": {
+                "device_bytes": profile.instance_store_device_bytes,
+                "devices": profile.instance_store_devices,
+                "model": profile.instance_store_model,
+                "raid_level": profile.raid_level,
+            },
+            "instance_type": profile.instance_type,
+            "profile_sha256": profile.sha256,
+            "provider": profile.provider,
+            "receipt_type": profile.bootstrap_receipt_type,
+            "release_members_sha256": (
+                bootstrap_artifacts.release_members_sha256
+            ),
+            "release_root": (
+                f"releases/{bootstrap_artifacts.release_sha256}"
+            ),
+            "release_sha256": bootstrap_artifacts.release_sha256,
+        }
+    )
+    bootstrap_path.write_bytes(canonical_json(bootstrap) + b"\n")
+
+    manifest_path = scratch_root / "staging" / "v3-launcher-manifest.json"
+    provenance = {
+        "run_manifest_sha256": "1" * 64,
+        "preregistration_sha256": _sha256(
+            (source / PACKAGER.PREREGISTRATION_PATH).read_bytes()
+        ),
+        "hardware_amendment_sha256": _sha256(
+            (source / PACKAGER.AMENDMENT_PATH).read_bytes()
+        ),
+        "provider_selection_sha256": "2" * 64,
+        "sealed_evaluation_sha256": "3" * 64,
+        "study_lock_sha256": "4" * 64,
+        "fleet_plan_sha256": "5" * 64,
+        "launch_readiness_sha256": "6" * 64,
+        "control_bundle_sha256": "7" * 64,
+    }
+    build_launcher_manifest(
+        out=manifest_path,
+        scratch_root=scratch_root,
+        seed=seed,
+        profile_sha256=profile.sha256,
+        release_sha256=bootstrap_artifacts.release_sha256,
+        release_members_sha256=bootstrap_artifacts.release_members_sha256,
+        cohort_assignment_sha256=(
+            bootstrap_artifacts.cohort_assignment_sha256
+        ),
+        code_commit=code_commit,
+        bootstrap_receipt=bootstrap_path,
+        corpus_receipt=dataset_receipt,
+        runs=[
+            {
+                "arm": arm,
+                "config": f"configs/360m-v3/{arm}-s{seed}.yaml",
+                "config_sha256": _sha256(
+                    (
+                        prepared.root
+                        / f"configs/360m-v3/{arm}-s{seed}.yaml"
+                    ).read_bytes()
+                ),
+            }
+            for arm in ("dense", "split90")
+        ],
+        profile=profile,
+        fleet_wave=0,
+        **provenance,
+    )
+    plan = load_launch_plan(
+        seed=seed,
+        manifest_path=manifest_path,
+        profile_path=source / profile_path,
+        repo_root=prepared.root,
+        scratch_root=scratch_root,
+        environment={
+            **SAFE_ENVIRONMENT,
+            "MS_S3_ROOT": "s3://memorysplit-prod/cohort-v3",
+        },
+        observed_instance_type=profile.instance_type,
+        observed_instance_id="i-0123456789abcdef0",
+        observed_boot_id=BOOT_ID,
+        gpu_names=gpu_names,
+        port_available=lambda _port: True,
+        semantic_corpus_verifier=lambda _root: fixture["corpus"],
+        enforce_profile_scratch=False,
+    )
+    rendered = render_plan(plan)
+
+    assert rendered["provider"] == profile.provider
+    assert [command["arm"] for command in rendered["commands"]] == [
+        "dense",
+        "split90",
+    ]
+    assert [
+        command["argv"][command["argv"].index("--gpus") + 1]
+        for command in rendered["commands"]
+    ] == ["device=0,1,2,3", "device=4,5,6,7"]
+    assert all(
+        "/opt/venv/bin/python" in command["argv"]
+        for command in rendered["commands"]
+    )
+
+
 def test_cli_is_dry_run_by_default_and_profile_is_closed(tmp_path: Path) -> None:
     source = _source_repo(tmp_path, P5_PROFILE)
     out = tmp_path / "out"

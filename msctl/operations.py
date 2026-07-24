@@ -12,6 +12,7 @@ from pathlib import Path
 
 from .approval import verify_approval
 from .aws_selection import load_hardware_amendment, load_provider_selection
+from .aws_sealed_evaluation import load_sealed_evaluation_release
 from .contracts import (
     RunManifest,
     bind_release,
@@ -423,24 +424,10 @@ def instantiate_run_manifest(
                 "PROVIDER_SELECTION_MISMATCH",
                 "provider selection does not bind the requested seed manifest",
             )
-        sealed_path = Path(sealed_evaluation)
-        try:
-            sealed_relative = (
-                sealed_path.resolve(strict=True)
-                .relative_to(root.resolve(strict=True))
-                .as_posix()
-            )
-        except (FileNotFoundError, ValueError) as error:
-            raise MsctlError(
-                "RUN_MANIFEST_INVALID",
-                "sealed evaluation must be a regular release member",
-            ) from error
-        sealed_evaluation_sha256 = verify_release_member(
-            release,
-            member_path=sealed_relative,
-            local_path=sealed_path,
-            label="sealed evaluation",
-        )
+        # The training preregistration and evaluator study lock are separate,
+        # independently frozen contracts.  The manifest binds both hashes;
+        # neither contract is rewritten to impersonate the other.
+        sealed = load_sealed_evaluation_release(sealed_evaluation)
         allocated_gpus = getattr(profile, "allocated_gpus", None)
         if allocated_gpus != 8:
             raise MsctlError(
@@ -461,7 +448,8 @@ def instantiate_run_manifest(
             "hardware_amendment_sha256": amendment.sha256,
             "provider_selection_sha256": selection.sha256,
             "profile_sha256": profile_sha256,
-            "sealed_evaluation_sha256": sealed_evaluation_sha256,
+            "sealed_evaluation_sha256": sealed.sha256,
+            "study_lock_sha256": sealed.study_lock_sha256,
             "estimated_instance_hours": estimated_instance_hours,
             "estimated_gpu_hours": estimated_gpu_hours,
             "runs": run_rows,

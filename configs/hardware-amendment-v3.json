@@ -6,7 +6,7 @@
       "path": "cluster/profiles/aws-p5.48xlarge-v3.json",
       "profile_id": "aws-p5.48xlarge-v3",
       "provider": "aws-p5.48xlarge-v3",
-      "sha256": "6ba750448d3ab24a8f8936fda29e5deafdef939ca3f75de033985462345e15fa"
+      "sha256": "0969f70b2d10fb9f2065a7b6f10904658c514fa88cde6b818ae56020826d96bd"
     },
     {
       "gpu_model": "NVIDIA B300",
@@ -14,7 +14,7 @@
       "path": "cluster/profiles/aws-p6-b300.48xlarge-v3.json",
       "profile_id": "aws-p6-b300.48xlarge-v3",
       "provider": "aws-p6-b300.48xlarge-v3",
-      "sha256": "d5f38407d81767db0980e55a79df7408ab03e11456e6df44d6876cfda2a26cec"
+      "sha256": "f4b3fc95d5f035decbebb5150854dbe81c7440af4a2097697b106246b8db375f"
     }
   ],
   "amendment_id": "memorysplit-confirmatory-v3-hardware-amendment",

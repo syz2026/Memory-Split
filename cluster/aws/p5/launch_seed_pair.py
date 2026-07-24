@@ -83,11 +83,32 @@ _V3_PROVENANCE_FIELDS = frozenset(
         "hardware_amendment_sha256",
         "provider_selection_sha256",
         "sealed_evaluation_sha256",
+        "study_lock_sha256",
         "fleet_plan_sha256",
         "fleet_wave",
+        "launch_readiness_sha256",
+        "control_bundle_sha256",
     }
 )
 _V3_MANIFEST_FIELDS = _MANIFEST_FIELDS | _V3_PROVENANCE_FIELDS
+_V3_RELEASE_METADATA_FIELDS = {
+    "schema_version",
+    "package_format_version",
+    "provider",
+    "selected_profile_id",
+    "source",
+    "seed_assignment",
+    "cohort_assignment",
+    "preregistration",
+    "hardware_amendment",
+    "profile",
+    "environment",
+    "dataset_pointer",
+    "container_base_lock",
+    "config_sha256",
+    "contract_locks",
+    "members",
+}
 _RUN_FIELDS = frozenset(
     {
         "arm",
@@ -427,14 +448,41 @@ def _validate_release_root(
         and assignment.get("provider") in assignment_providers
         and assignment.get("seeds") == list(profile.assigned_seeds)
     )
+    v3_package = _is_v3_profile(profile)
+    source = metadata.get("source") if isinstance(metadata, dict) else None
+    valid_source = (
+        isinstance(source, dict)
+        and source.get("commit") == code_commit
+        and source.get("dirty") is False
+        and (
+            (
+                set(source) == {"commit", "dirty", "tree"}
+                and isinstance(source.get("tree"), str)
+                and re.fullmatch(
+                    r"(?:[0-9a-f]{40}|[0-9a-f]{64})",
+                    source["tree"],
+                )
+                is not None
+            )
+            if v3_package
+            else set(source) == {"commit", "dirty"}
+        )
+    )
     if (
         not isinstance(metadata, dict)
         or _canonical_pretty(metadata) != metadata_bytes
         or metadata.get("schema_version") != 1
-        or metadata.get("package_format_version") != 1
+        or metadata.get("package_format_version")
+        != ("aws-gpu-v3" if v3_package else 1)
         or metadata.get("provider") != profile.provider
-        or metadata.get("source")
-        != {"commit": code_commit, "dirty": False}
+        or (
+            v3_package
+            and (
+                set(metadata) != _V3_RELEASE_METADATA_FIELDS
+                or metadata.get("selected_profile_id") != profile.profile_id
+            )
+        )
+        or not valid_source
         or not valid_assignment
     ):
         raise LaunchError("release metadata identity does not match")
@@ -1248,7 +1296,7 @@ def load_launch_plan(
             "--pids-limit",
             "4096",
             "--tmpfs",
-            "/tmp:rw,noexec,nosuid,nodev,size=4g",
+            "/tmp:rw,exec,nosuid,nodev,size=4g",
             "--mount",
             f"type=bind,src={mount_values['release']},dst=/workspace,readonly",
             "--mount",
@@ -1271,7 +1319,7 @@ def load_launch_plan(
             "--env",
             "PYTHONUNBUFFERED=1",
             container_image,
-            "/opt/conda/bin/python",
+            "/opt/venv/bin/python",
             "-m",
             "torch.distributed.run",
             "--nnodes=1",
@@ -1407,7 +1455,7 @@ def render_trainer_preflight(plan: LaunchPlan) -> tuple[str, ...]:
         "--env",
         "HOME=/tmp/home",
         plan.container_image,
-        "/opt/conda/bin/python",
+        "/opt/venv/bin/python",
         "/workspace/scripts/run_train.py",
         "--capabilities-json",
     )
@@ -2168,6 +2216,7 @@ def _production_interruption_handler(
         os.chmod(home, 0o700)
         store = S3ObjectStore(
             region=plan.runtime.region,
+            kms_key_id=plan.runtime.kms_key_id,
             environment={
                 "AWS_REGION": plan.runtime.region,
                 "HOME": home,

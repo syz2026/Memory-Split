@@ -18,6 +18,7 @@ from .fsutil import hash_fd, open_directory, open_regular_at, read_fd
 from .jsonutil import (
     COMMIT_RE,
     RUN_ID_RE,
+    canonical_json,
     canonical_sha256,
     load_json,
     portable_relative,
@@ -112,6 +113,7 @@ class CheckpointReceipt:
     sha256: str
     checkpoints: tuple[Checkpoint, ...]
     value: dict[str, object]
+    cohort_assignment_sha256: str | None = None
     hardware_amendment_sha256: str | None = None
     provider_selection_sha256: str | None = None
     profile_sha256: str | None = None
@@ -1090,6 +1092,7 @@ def load_run_manifest(
             "provider_selection_sha256",
             "profile_sha256",
             "sealed_evaluation_sha256",
+            "study_lock_sha256",
             "source_commit",
             "estimated_instance_hours",
             "estimated_gpu_hours",
@@ -1291,8 +1294,8 @@ def load_run_manifest(
                 value["study_lock_sha256"],
                 label="run manifest.study_lock_sha256",
             )
-            if schema_version == 2
-            else preregistration_sha256
+            if schema_version in {2, 3}
+            else None
         ),
         source_commit=source_commit,
         preregistration_sha256=preregistration_sha256,
@@ -1550,6 +1553,19 @@ def verify_checkpoint_receipt(
             "sealed_evaluation_sha256",
         }
     require_exact_keys(value, receipt_fields, label="checkpoint receipt")
+    if schema_version == 3:
+        try:
+            payload = receipt_path.read_bytes()
+        except OSError as error:
+            raise MsctlError(
+                "CHECKPOINT_PROVENANCE_MISMATCH",
+                "checkpoint receipt cannot be read",
+            ) from error
+        if payload != canonical_json(value) + b"\n":
+            raise MsctlError(
+                "CHECKPOINT_PROVENANCE_MISMATCH",
+                "schema-v3 checkpoint receipt must be canonical JSON",
+            )
     if (
         value["provider"] != manifest.provider
         or value["release_sha256"] != release.archive_sha256
@@ -1686,11 +1702,20 @@ def verify_checkpoint_receipt(
         )
     return CheckpointReceipt(
         schema_version=schema_version,
-        sha256=canonical_sha256(value),
+        sha256=(
+            sha256_file(receipt_path)
+            if schema_version == 3
+            else canonical_sha256(value)
+        ),
         checkpoints=tuple(
             sorted(checkpoints, key=lambda item: item.run_id)
         ),
         value=value,
+        cohort_assignment_sha256=getattr(
+            manifest,
+            "cohort_assignment_sha256",
+            None,
+        ),
         hardware_amendment_sha256=getattr(
             manifest,
             "hardware_amendment_sha256",

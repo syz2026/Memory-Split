@@ -33,9 +33,61 @@ _ARGV_DOCUMENT = {
             "inputs": {
                 "runCommand": [
                     (
-                        "/usr/bin/python3 /opt/memorysplit/msctl/aws_argv.py "
-                        "--intent-uri '{{ IntentUri }}' "
-                        "--intent-sha256 '{{ IntentSHA256 }}'"
+                        "set -eu; umask 077; "
+                        "R='/opt/memorysplit'; "
+                        "set -- --intent-uri '{{ IntentUri }}' "
+                        "--intent-sha256 '{{ IntentSHA256 }}'; "
+                        "if [ '{{ BootstrapMode }}' = 'verified-control-bundle' ]; "
+                        "then "
+                        "B='/var/lib/memorysplit/control-"
+                        "{{ ControlBundleSHA256 }}.tar'; "
+                        "R='/opt/memorysplit/control/{{ ControlBundleSHA256 }}'; "
+                        "/usr/bin/install -d -m 0700 /var/lib/memorysplit "
+                        "/opt/memorysplit/control; "
+                        "if [ -e \"$B\" ]; then "
+                        "test -f \"$B\" && test ! -L \"$B\"; "
+                        "else BT=\"$B.tmp.$$\"; test ! -e \"$BT\"; "
+                        "/usr/bin/env aws --region '{{ Region }}' s3 cp "
+                        "'{{ ControlBundleURI }}' \"$BT\" "
+                        "--only-show-errors --no-progress; "
+                        "printf '%s  %s\\n' '{{ ControlBundleSHA256 }}' \"$BT\" "
+                        "| /usr/bin/sha256sum -c -; "
+                        "/usr/bin/chmod 0400 \"$BT\"; "
+                        "/usr/bin/ln \"$BT\" \"$B\"; /usr/bin/rm \"$BT\"; fi; "
+                        "printf '%s  %s\\n' '{{ ControlBundleSHA256 }}' \"$B\" "
+                        "| /usr/bin/sha256sum -c -; "
+                        "if [ -e \"$R\" ]; then "
+                        "test -d \"$R\" && test ! -L \"$R\"; "
+                        "/usr/bin/tar --extract --to-stdout --file \"$B\" "
+                        "CONTROL-BUNDLE.json | /usr/bin/cmp - "
+                        "\"$R/CONTROL-BUNDLE.json\"; "
+                        "/usr/bin/tar --extract --to-stdout --file \"$B\" "
+                        "CONTROL-SHA256SUMS | /usr/bin/cmp - "
+                        "\"$R/CONTROL-SHA256SUMS\"; "
+                        "(cd \"$R\" && /usr/bin/sha256sum -c CONTROL-SHA256SUMS); "
+                        "E=$(cd \"$R\" && { /usr/bin/awk '{print $2}' "
+                        "CONTROL-SHA256SUMS; printf '%s\\n' CONTROL-BUNDLE.json "
+                        "CONTROL-SHA256SUMS; } | /usr/bin/sort); "
+                        "A=$(cd \"$R\" && /usr/bin/find . -type f -printf '%P\\n' "
+                        "| /usr/bin/sort); test \"$A\" = \"$E\"; "
+                        "test -z \"$(cd \"$R\" && /usr/bin/find . "
+                        "! -type d ! -type f -print -quit)\"; "
+                        "test -z \"$(cd \"$R\" && /usr/bin/find . -mindepth 1 "
+                        "-perm /222 -print -quit)\"; "
+                        "else T=\"$R.tmp.$$\"; test ! -e \"$T\"; "
+                        "/usr/bin/install -d -m 0700 \"$T\"; "
+                        "/usr/bin/tar --extract --file \"$B\" --directory \"$T\" "
+                        "--no-same-owner --no-same-permissions; "
+                        "(cd \"$T\" && /usr/bin/sha256sum -c CONTROL-SHA256SUMS); "
+                        "/usr/bin/chmod -R a-w \"$T\"; "
+                        "/usr/bin/mv -T -n \"$T\" \"$R\"; "
+                        "test ! -e \"$T\"; fi; "
+                        "set -- \"$@\" --control-bundle-sha256 "
+                        "'{{ ControlBundleSHA256 }}'; fi; "
+                        "test -f \"$R/msctl/aws_argv.py\" && "
+                        "test ! -L \"$R/msctl/aws_argv.py\"; "
+                        "PYTHONDONTWRITEBYTECODE=1 /usr/bin/python3 "
+                        "\"$R/msctl/aws_argv.py\" \"$@\""
                     )
                 ],
                 "timeoutSeconds": "172800",
@@ -44,6 +96,21 @@ _ARGV_DOCUMENT = {
         }
     ],
     "parameters": {
+        "BootstrapMode": {
+            "allowedValues": ["installed", "verified-control-bundle"],
+            "type": "String",
+        },
+        "ControlBundleSHA256": {
+            "allowedPattern": "^[0-9a-f]{64}$",
+            "type": "String",
+        },
+        "ControlBundleURI": {
+            "allowedPattern": (
+                "^s3://[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]/"
+                "[A-Za-z0-9._/-]+$"
+            ),
+            "type": "String",
+        },
         "IntentSHA256": {
             "allowedPattern": "^[0-9a-f]{64}$",
             "type": "String",
@@ -53,6 +120,10 @@ _ARGV_DOCUMENT = {
                 "^s3://[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]/"
                 "[A-Za-z0-9._/-]+$"
             ),
+            "type": "String",
+        },
+        "Region": {
+            "allowedValues": ["us-east-1", "us-west-2"],
             "type": "String",
         },
     },
@@ -121,8 +192,11 @@ _V3_PROVENANCE_FIELDS = {
     "hardware_amendment_sha256",
     "provider_selection_sha256",
     "sealed_evaluation_sha256",
+    "study_lock_sha256",
     "fleet_plan_sha256",
     "fleet_wave",
+    "launch_readiness_sha256",
+    "control_bundle_sha256",
 }
 _ENVIRONMENT_FIELDS = {
     "AWS_REGION",
@@ -283,6 +357,7 @@ def _validate_intent(
     payload: bytes,
     *,
     expected_sha256: str,
+    expected_control_bundle_sha256: str | None = None,
 ) -> dict[str, object]:
     if hashlib.sha256(payload).hexdigest() != _sha256(
         expected_sha256,
@@ -371,6 +446,17 @@ def _validate_intent(
             _sha256(intent[field], label=f"operation intent {field}")
         if type(intent["fleet_wave"]) is not int or intent["fleet_wave"] < 0:
             raise RemoteIntentError("operation intent fleet wave is invalid")
+        if (
+            expected_control_bundle_sha256 is None
+            or intent["control_bundle_sha256"]
+            != _sha256(
+                expected_control_bundle_sha256,
+                label="installed control bundle",
+            )
+        ):
+            raise RemoteIntentError(
+                "operation intent control bundle does not match the installed bytes"
+            )
     elif provider != "aws-p5.48xlarge":
         raise RemoteIntentError(
             "legacy operation intent requires the legacy AWS P5 profile"
@@ -567,11 +653,16 @@ def execute_intent(
     intent_sha256: str,
     store: ImmutableObjectStore,
     executor: ArgvExecutor,
+    control_bundle_sha256: str | None = None,
 ) -> dict[str, object]:
     """Acquire one operation receipt, execute once, and terminally receipt it."""
 
     payload = store.read(_s3_uri(intent_uri), expected_sha256=intent_sha256)
-    intent = _validate_intent(payload, expected_sha256=intent_sha256)
+    intent = _validate_intent(
+        payload,
+        expected_sha256=intent_sha256,
+        expected_control_bundle_sha256=control_bundle_sha256,
+    )
     nonce = secrets.token_hex(16)
     metadata = {
         "operation-id": str(intent["operation_id"]),
@@ -833,6 +924,7 @@ def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
     parser.add_argument("--intent-uri", required=True)
     parser.add_argument("--intent-sha256", required=True)
+    parser.add_argument("--control-bundle-sha256")
     return parser
 
 
@@ -845,6 +937,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             intent_sha256=arguments.intent_sha256,
             store=AwsCliObjectStore(region=region),
             executor=SubprocessArgvExecutor(),
+            control_bundle_sha256=arguments.control_bundle_sha256,
         )
         print(json.dumps(result, sort_keys=True, separators=(",", ":")))
         returncode = result.get("returncode", 0)
