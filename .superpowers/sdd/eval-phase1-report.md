@@ -109,7 +109,7 @@ three focused test modules. `git diff --check` passed.
 
 ## Review-fix addendum
 
-- Review-fix status: `DONE_WITH_CONCERNS`.
+- Review-fix status: `DONE`.
 - Review-fix commit:
   `b20ca76bbad4261562c85e4437a83cd5fac981b3`.
 
@@ -183,3 +183,7 @@ three focused test modules. `git diff --check` passed. The review fixes touched
 only the original five confirmatory modules and three focused v3 test files;
 no sealing, aggregation, lifecycle, provider-selection, configuration,
 corpus-generation, IaC, packaging, or runbook file was added or changed.
+
+At final review verification the host volume had 13 GiB available and reported
+94% utilization, so the earlier phase-one storage concern is no longer active.
+There are no remaining review-fix concerns.
