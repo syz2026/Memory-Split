@@ -9,6 +9,8 @@
   `49efcc6c4d14f3f37565ec4763459e6ed26f5a2f`
 - Review-hardening implementation:
   `4c712bc5a3b728b84207a5e77bed673f7752b005`
+- SQLite cwd-concurrency fix:
+  `7b96479c8ae6acce094646ab2caa9745e2f53ce8`
 - Scope: `corpusgen/reasoning_v2/catalog.py` and
   `tests/test_reasoning_v2_catalog.py`
 
@@ -54,7 +56,10 @@ materialization code was added.
   reused; conflicting winners fail unchanged.
 - Opens SQLite through a pinned-directory `fchdir` boundary, keeps the original
   file descriptor open, and verifies the spool inode before and after use.
-  Namespace replacement fails closed.
+  Namespace replacement fails closed. The process-cwd snapshot, stage `fchdir`,
+  SQLite open, guaranteed cwd restoration, and snapshot-descriptor close all
+  occur under one process-wide lock; a second builder cannot snapshot or
+  observe the temporary stage cwd.
 - Removes pathname deletion authority. Successful spools and failed/losing
   exact-inode stages are atomically moved into the owner-controlled quarantine
   namespace and retained for offline cleanup; replacement objects are never
@@ -74,11 +79,17 @@ symbols.
   winner, quarantine, and pinned-spool cases produced `5 failed`.
 - Review GREEN: hardened catalog suite — `41 passed in 19.38s`, including a
   2,000-edge bounded-memory build/replay proxy.
-- Focused catalog/contract/source/parallel regression —
-  `296 passed in 88.01s`.
+- Concurrency RED: deterministic two-thread/two-stage scheduling produced
+  `8 failed`; the second builder could snapshot the first stage cwd and the
+  required serialized hook phases were absent.
+- Concurrency GREEN: all `8` two-stage schedules passed in `0.31s`; each spool
+  remained bound to its own stage inode, cwd restoration held at every hook,
+  and post-call relative I/O remained under the original cwd.
+- Final focused catalog/contract/source/parallel regression —
+  `304 passed in 33.14s`.
 - Exact-base pre-change focused baseline — `255 passed in 17.32s`.
 - `python -m py_compile` passed for the catalog and focused test.
-- `git diff --check` passed before both implementation commits.
+- `git diff --check` passed before all implementation commits.
 
 ## Concerns
 
