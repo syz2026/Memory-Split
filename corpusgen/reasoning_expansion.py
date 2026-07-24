@@ -123,6 +123,12 @@ def _positive_int(value: object, label: str) -> int:
     return value
 
 
+def _nonnegative_int(value: object, label: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ReasoningExpansionError(f"{label} must be a non-negative integer")
+    return value
+
+
 def _unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     value: dict[str, Any] = {}
     for key, item in pairs:
@@ -386,7 +392,7 @@ def _reasoning_gym_tree_commitment(
             source_stage / relative,
             label=f"Reasoning Gym source {relative}",
         )
-        if size != _positive_int(
+        if size != _nonnegative_int(
             item["bytes"], "Reasoning Gym source bytes"
         ) or digest != _require_sha256(
             item["sha256"],
