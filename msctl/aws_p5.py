@@ -4824,6 +4824,10 @@ class AwsP5Backend:
         receipt: object,
         checkpoint: object,
     ) -> dict[str, str]:
+        # Checkpoint object metadata is content addressed and carries no
+        # request_id: an identical checkpoint published under an earlier
+        # request remains recoverable and verifiable by exact HEAD.
+        del receipt
         return {
             "arm": checkpoint.arm,
             "checkpoint-version": str(checkpoint.checkpoint_version),
@@ -4835,7 +4839,6 @@ class AwsP5Backend:
             "ordered-stream-sha256": (
                 checkpoint.data.ordered_stream_sha256
             ),
-            "request-id": receipt.request_id,
             "run-id": checkpoint.run_id,
             "seed": str(checkpoint.seed),
             "sha256": checkpoint.object.sha256,
@@ -5373,11 +5376,13 @@ class AwsP5Backend:
                     command_id = str(recovered["command_id"])
                     status = str(recovered["status"])
                     now = _timestamp()
-                    for run, state in zip(manifest.runs, present):
+                    for state in present:
                         state["command_id"] = command_id
                         state["status"] = status
                         state["updated_at"] = now
-                        store.write_run(run.run_id, state)
+                    # Keep the durable pair journal bound to the refreshed
+                    # states so exact replay stays repeatable.
+                    self._write_paired_states(store, manifest, present)
                     return {
                         "provider": AWS_P5_PROFILE,
                         "seed": manifest.seed,
@@ -5396,10 +5401,12 @@ class AwsP5Backend:
                 command_id = str(next(iter(command_ids)))
                 status = self._command_status(instance_id, command_id)
                 now = _timestamp()
-                for run, state in zip(manifest.runs, present):
+                for state in present:
                     state["status"] = status
                     state["updated_at"] = now
-                    store.write_run(run.run_id, state)
+                # Keep the durable pair journal bound to the refreshed
+                # states so exact replay stays repeatable.
+                self._write_paired_states(store, manifest, present)
                 return {
                     "provider": AWS_P5_PROFILE,
                     "seed": manifest.seed,

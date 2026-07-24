@@ -626,3 +626,206 @@ permission-only attempts were not product failures.
 - A first mirror aggregate overlapped one of those controller edits and
   observed one replay-state assertion failure. The immediate focused rerun
   and the stable full rerun passed; the isolated staged snapshot also passed.
+
+## Review-fix appendix: seven-finding remediation from `b3471e0`
+
+Status: complete for all seven findings in
+`.superpowers/sdd/task-3c-review-findings.md`, base `b3471e0`.
+
+Commits:
+
+- `9e76a88` — `fix: harden Task 3C checkpoint supervision` (concurrent
+  session; see concurrency note below)
+- this commit — `fix: complete Task 3C checkpoint review fixes`
+
+Concurrency note: this session and the `9e76a88` session remediated the same
+worktree in parallel. `9e76a88` staged and committed whole files, so it
+carries this session's `cluster/aws/p5/launch_seed_pair.py` fixes (findings
+1, 3, 6, 7) and this session's `tests/test_aws_p5_launcher.py` tests together
+with the other session's hardening (baseline generation pinning, scheduler
+deadline ordering, v3 resume-launch scheduler wiring, seed-range fix, and
+supervisor exception termination). This commit contributes the remaining
+finding 2, 4, and 5 hunks that `9e76a88` explicitly excluded. The final
+verification below ran on the exact combined tree that `HEAD` plus this
+commit produces.
+
+### Fixes and RED/GREEN evidence
+
+All commands ran from this worktree with `PYTHONDONTWRITEBYTECODE=1`,
+`-p no:cacheprovider`, and bounded `--basetemp=/tmp/ms3c-fix-*` roots that
+were removed after each run.
+
+1. Missing `secrets` import (critical). New
+   `tests/test_aws_p5_launcher.py::test_production_checkpoint_request_factory_builds_real_requests`
+   constructs `_production_checkpoint_scheduler` against a complete v3
+   fixture plan and calls the real request factory (no injected fake).
+   RED observed: `NameError: name 'secrets' is not defined` at
+   `cluster/aws/p5/launch_seed_pair.py:2581`. GREEN after adding the
+   `import secrets`: `1 passed`.
+
+2. `ForkedCheckpointMirrorAttempt` proofs and pipe deadlock. Five focused
+   tests exercise the real forked attempt:
+   poll-before-exit nonblocking, successful result round-trip, `cancel()`
+   kill/reap/descriptor-close (a SIGKILLed child cannot write its sentinel,
+   `os.kill`/`os.waitpid` prove reaping, `os.fstat` proves the closed
+   descriptor), malformed child payload as a completed failed attempt, and
+   an 8 MiB result that exceeds the kernel pipe buffer.
+   RED observed: `1 failed, 4 passed`; the large-payload attempt never
+   completed in 20 seconds because the parent waited for child exit before
+   reading while the child blocked writing. Fix: the parent pipe is now
+   nonblocking and `poll()` drains it on every call before and after the
+   `WNOHANG` reap; the attempt remains pollable and killable.
+   GREEN: `5 passed` in 1.32s.
+
+3. Supervisor durability fail-stop. New
+   `test_supervisor_stale_fail_stop_terminates_and_cancels_active_attempt`
+   injects a scheduler whose `poll` raises `CheckpointStaleError` without
+   self-cancelling. RED observed: status/code/termination passed but the
+   active attempt was never cancelled. GREEN after the supervision fix:
+   returns `CHECKPOINT_STALE`, code 74, both arms terminated, attempt
+   cancelled.
+
+4. V3 resume exact replay at the apply boundary. New
+   `tests/test_aws_checkpoint_mirror.py::test_v3_resume_apply_exact_replay_is_idempotent_and_version_pinned`
+   publishes a real pair, seeds paired schema-2 submit state, and drives
+   `resume(apply=True)` through the injected runner/approval/state boundary.
+   First apply succeeds (approval and state bind the receipt URI/hash/
+   version and both object versions; one SSM send). Repeating the identical
+   triple is idempotent (twice; no further put-object/send-command).
+   Reusing the same receipt hash under another receipt version or another
+   object version raises `CHECKPOINT_PROVENANCE_MISMATCH` before any state
+   write, archival, or SSM call (exactly two EC2 validation reads observed).
+   RED observed: the drift case failed `STATE_CORRUPT` instead, because the
+   idempotent-replay branch refreshed run states with bare `write_run`,
+   leaving the durable pair journal stale so every later resume failed
+   closed on journal divergence. Fix: both idempotent resume branches now
+   persist through `_write_paired_states`, keeping the journal bound to the
+   refreshed states. GREEN: `1 passed`, including a third identical apply.
+
+5. Content-addressed checkpoint object metadata. New
+   `test_identical_checkpoint_bytes_recover_by_exact_head_without_progress`
+   publishes, then re-publishes identical checkpoint bytes under a new
+   request ID at the same optimizer step against a store that models S3
+   `If-None-Match: *`. RED observed:
+   `ValueError: versioned object HEAD verification failed` because the
+   stored object carried the first attempt's `request-id` metadata. Fix:
+   `request-id` was removed from checkpoint object metadata in the producer
+   (`_checkpoint_metadata`) and from the controller HEAD expectation
+   (`AwsP5Backend._v3_checkpoint_metadata`); `request_id` remains in the
+   paired receipt body and receipt object metadata. GREEN: the second
+   request recovers both objects by exact HEAD (same version IDs, no new
+   checkpoint uploads, no step progress) and publishes its own receipt.
+
+6. Cancel on every supervisor exit path. New parametrized
+   `test_supervisor_cancels_active_mirror_attempt_on_every_exit_path`
+   covers requested shutdown, clean dual-arm exit, peer failure,
+   notice-poll failure, and legacy interruption handling. RED observed:
+   all five paths returned without cancelling the recorded active attempt.
+   Fix: supervision now owns an unconditional `finally` that cancels any
+   active attempt, so the attempt cannot continue publishing after the
+   supervisor returns. GREEN: `5 passed`.
+
+7. Notice-loop stale handling. New parametrized
+   `test_notice_loop_stops_immediately_on_stale_and_falls_back` raises
+   `CheckpointStaleError` from the immediate interruption attempt. RED
+   observed: the loop kept re-raising (`4` stale raises before the bounded
+   fixture stopped it), burning the notice budget in a spin. Fix: the loop
+   breaks on the first `CheckpointStaleError`, cancels the attempt, and
+   falls back only to the last complete receipt (75 with the receipt URI
+   when one exists, otherwise 74, non-resumable). GREEN: `2 passed`,
+   exactly one stale raise.
+
+### Final verification on the combined tree
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 python -m pytest -q -p no:cacheprovider \
+  --basetemp=/tmp/ms3c-fix-final-a \
+  tests/test_aws_checkpoint_mirror.py tests/test_aws_p5_launcher.py
+```
+
+Result: **210 passed**.
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 python -m pytest -q -p no:cacheprovider \
+  --basetemp=/tmp/ms3c-fix-final-b tests/test_msctl.py
+```
+
+Result: **157 passed**.
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 python -m pytest -q -p no:cacheprovider \
+  --basetemp=/tmp/ms3c-fix-final-c \
+  tests/test_aws_argv.py tests/test_aws_contract_roundtrip.py \
+  tests/test_run_manifest_v3.py tests/test_package_aws_p5_handoff.py
+```
+
+Result: **217 passed**.
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 python -m pytest -q -p no:cacheprovider \
+  --basetemp=/tmp/ms3c-fix-final-d \
+  tests/test_trainer.py tests/test_ddp_trainer.py
+```
+
+Result: **90 passed**.
+
+Non-overlapping required-group aggregate: **674 passed**.
+
+Static verification:
+
+```bash
+python -m py_compile \
+  cluster/aws/p5/checkpoint_mirror.py cluster/aws/p5/launch_seed_pair.py \
+  msctl/aws_p5.py msctl/aws_resume_launch.py \
+  tests/test_aws_checkpoint_mirror.py tests/test_aws_p5_launcher.py
+
+git diff --check
+```
+
+Result: both passed. `git status` confirmed only Task 3C scope files
+changed; `msctl/operations.py`, evaluation, finalization, collection,
+cleanup, sequential-transition, IaC, runbook, verifier, v2 scientific
+files, and `corpusgen/` remain untouched.
+
+### Files in this commit
+
+- `cluster/aws/p5/checkpoint_mirror.py` (fork-pipe drain; content-addressed
+  checkpoint object metadata)
+- `msctl/aws_p5.py` (controller HEAD metadata expectation; idempotent-replay
+  pair-journal persistence)
+- `tests/test_aws_checkpoint_mirror.py` (findings 2, 4, 5 proofs)
+- `.superpowers/sdd/task-3c-report.md` (this appendix)
+
+Findings 1, 3, 6, and 7 production and test hunks from this session were
+carried into `9e76a88` as described in the concurrency note.
+
+### Self-review
+
+- The drained pipe preserves the exact pickled result; partial reads across
+  polls accumulate until EOF, and cancellation still SIGKILLs, reaps, and
+  closes the descriptor with no publish after cancel.
+- Checkpoint object metadata is now a pure function of checkpoint identity;
+  the paired receipt keeps `request_id`, and receipt objects remain
+  content-addressed per request, so provenance is not weakened.
+- The pair journal now always matches the run states after idempotent
+  replay, so exact replay is repeatable indefinitely and version drift is
+  still refused before mutation.
+- Supervisor cancellation is idempotent (`cancel_active` no-ops without an
+  attempt) and the `finally` also covers `KeyboardInterrupt`.
+
+### Concerns
+
+- Two remediation sessions edited this worktree concurrently. The combined
+  result was reviewed hunk-by-hunk and verified as one tree, but the
+  interleaving means `9e76a88`'s message and appendix describe some hunks
+  authored here (and vice versa). No work was lost; attribution is blurred.
+- The legacy submit idempotent-refresh branch still updates run states with
+  bare `write_run` (the same journal-divergence shape fixed for resume).
+  No binding finding covers submit, so it was left unchanged; a submit
+  status refresh followed by a resume would still fail closed rather than
+  corrupt state.
+- Sandboxed reruns of the launcher aggregate failed on fixture `git init`
+  (`.git/hooks: Operation not permitted`); unsandboxed reruns passed. Not a
+  product failure.
+- No live paid AWS, versioned S3, P5, NCCL, Docker, or IMDS operation was
+  performed; boundaries remain covered by injected stores and runners.

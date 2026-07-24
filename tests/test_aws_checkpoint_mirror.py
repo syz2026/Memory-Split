@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import hashlib
 import json
+import os
+import time
 from pathlib import Path
 import base64
 import copy
@@ -17,6 +20,7 @@ from cluster.aws.p5.checkpoint_mirror import (
     CheckpointMirrorRequest,
     CheckpointStaleError,
     CheckpointReceiptRef,
+    ForkedCheckpointMirrorAttempt,
     PublishedCheckpointPair,
     S3VersionedObjectStore,
     VersionedUploadedObject,
@@ -446,6 +450,65 @@ def test_publisher_recovers_a_lost_put_response_by_exact_head(
 
     assert published.receipt.version_id == "version-3"
     assert len(store.objects) == 3
+
+
+class _PreconditionMemoryStore(_MemoryVersionedStore):
+    """Model S3 `If-None-Match: *`: a PUT to an existing key fails."""
+
+    def put_if_absent(self, path, uri, **kwargs):
+        if uri in self.objects:
+            return None
+        return super().put_if_absent(path, uri, **kwargs)
+
+
+def test_identical_checkpoint_bytes_recover_by_exact_head_without_progress(
+    tmp_path: Path,
+) -> None:
+    request = _request(tmp_path)
+    store = _PreconditionMemoryStore()
+    arm_by_pid = {101: "dense", 102: "split90"}
+
+    def install_generation(arm: str) -> None:
+        checkpoint = request.checkpoint_paths[arm]
+        metadata = checkpoint.with_name("ckpt.meta.json")
+        for stale in (checkpoint, metadata):
+            if stale.exists():
+                stale.unlink()
+        checkpoint.write_bytes(f"stable-{arm}".encode("ascii"))
+        _write_metadata(
+            checkpoint,
+            step=3,
+            sidecar_name=f"{arm}_target_weights",
+        )
+
+    def signal_process(pid: int, _signum: int) -> None:
+        install_generation(arm_by_pid[pid])
+
+    first = publish_paired_checkpoint(
+        request,
+        object_store=store,
+        signal_process=signal_process,
+        staging_root=tmp_path / "staging-first",
+        staged_at=lambda: "2026-07-23T12:01:00Z",
+    )
+    puts_after_first = list(store.put_order)
+
+    second = publish_paired_checkpoint(
+        replace(request, request_id="b" * 32),
+        object_store=store,
+        signal_process=signal_process,
+        staging_root=tmp_path / "staging-second",
+        staged_at=lambda: "2026-07-23T12:02:00Z",
+    )
+
+    assert [item.version_id for item in second.checkpoints] == [
+        item.version_id for item in first.checkpoints
+    ]
+    assert [row["step"] for row in second.value["checkpoints"]] == [3, 3]
+    assert first.value["request_id"] == "a" * 32
+    assert second.value["request_id"] == "b" * 32
+    assert store.put_order[len(puts_after_first):] == [second.receipt.uri]
+    assert second.receipt.uri != first.receipt.uri
 
 
 @pytest.mark.parametrize(
@@ -1148,6 +1211,420 @@ def test_v3_resume_dry_run_consumes_the_versioned_pair(
             "checkpoints"
         ]
     ] == ["version-1", "version-2"]
+
+
+class _QueueAwsRunner:
+    def __init__(self) -> None:
+        self.outputs: list[object] = []
+        self.calls: list[tuple[list[str], str]] = []
+
+    def run_json(self, argv, *, operation: str):
+        self.calls.append((list(argv), operation))
+        if not self.outputs:
+            raise AssertionError(f"unexpected AWS call: {operation}")
+        output = self.outputs.pop(0)
+        if isinstance(output, Exception):
+            raise output
+        return output
+
+
+def test_v3_resume_apply_exact_replay_is_idempotent_and_version_pinned(
+    tmp_path: Path,
+) -> None:
+    from cluster.aws.p5.profile import load_aws_p5_profile
+    from msctl.aws_p5 import (
+        ARGV_DOCUMENT_NAME,
+        ARGV_DOCUMENT_SHA256,
+        AwsP5Backend,
+    )
+    from msctl.contracts import load_run_manifest
+    from msctl.jsonutil import canonical_json
+    from msctl.state import StateStore
+    from tests.test_aws_canary import (
+        IMAGE,
+        IMAGE_DIGEST,
+        _case,
+        _load_module,
+    )
+
+    case = _case(tmp_path / "controller", _load_module())
+    manifest = load_run_manifest(
+        case["manifest_path"],
+        repo_root=case["release_root"],
+    )
+    release = SimpleNamespace(
+        provider="aws-p5.48xlarge",
+        archive_sha256=manifest.release_sha256,
+        receipt_sha256=manifest.release_receipt_sha256,
+        members_sha256="a" * 64,
+        source_commit=manifest.source_commit,
+        source_tree=manifest.source_tree,
+    )
+    producer = tmp_path / "producer"
+    producer.mkdir()
+    environment_sha256 = "e" * 64
+    request = replace(
+        _request(producer),
+        profile_sha256=manifest.profile_sha256,
+        environment_receipt_sha256=environment_sha256,
+        release_sha256=manifest.release_sha256,
+        release_receipt_sha256=manifest.release_receipt_sha256,
+        run_manifest_sha256=manifest.sha256,
+        dataset_receipt_sha256=manifest.dataset_receipt_sha256,
+        dataset_build_id=manifest.dataset_build_id,
+        ordered_stream_sha256=manifest.ordered_stream_sha256,
+        source_commit=manifest.source_commit,
+        source_tree=manifest.source_tree,
+        config_sha256={
+            run.arm: run.config_sha256 for run in manifest.runs
+        },
+        run_ids={run.arm: run.run_id for run in manifest.runs},
+        s3_root="s3://memorysplit-prod/confirmatory-v3",
+    )
+    store = _MemoryVersionedStore()
+    arm_by_pid = {101: "dense", 102: "split90"}
+
+    def signal_process(pid: int, _signum: int) -> None:
+        arm = arm_by_pid[pid]
+        checkpoint = request.checkpoint_paths[arm]
+        checkpoint.write_bytes(f"replay-{arm}".encode("ascii"))
+        _write_metadata(
+            checkpoint,
+            step=21,
+            sidecar_name=f"{arm}_target_weights",
+            receipt_sha256=request.dataset_receipt_sha256,
+            build_id=request.dataset_build_id,
+            ordered_stream_sha256=request.ordered_stream_sha256,
+        )
+
+    published = publish_paired_checkpoint(
+        request,
+        object_store=store,
+        signal_process=signal_process,
+        staging_root=tmp_path / "producer-staging",
+        staged_at=lambda: "2026-07-23T12:01:00Z",
+    )
+    receipt = parse_paired_checkpoint_receipt_v3(
+        store.objects[published.receipt.uri][0],
+        receipt_uri=published.receipt.uri,
+        receipt_sha256=published.receipt.sha256,
+        receipt_version_id=published.receipt.version_id,
+    )
+
+    runner = _QueueAwsRunner()
+    approvals: list[dict[str, object]] = []
+
+    def approval_verifier(**kwargs):
+        approvals.append(kwargs)
+        return {}
+
+    runtime = SimpleNamespace(
+        region="us-east-1",
+        s3_root="s3://memorysplit-prod/confirmatory-v3",
+        ami_id="ami-0123456789abcdef0",
+        container_image=IMAGE,
+        container_digest=IMAGE_DIGEST,
+        uid=1000,
+        gid=1000,
+    )
+    backend = AwsP5Backend(
+        profile=load_aws_p5_profile(
+            case["release_root"]
+            / "cluster"
+            / "profiles"
+            / "aws-p5.48xlarge-v3.json"
+        ),
+        runtime=runtime,
+        instance_profile_arn=(
+            "arn:aws:iam::123456789012:instance-profile/memorysplit-p5"
+        ),
+        state_root=tmp_path / "controller-state",
+        runner=runner,
+        approval_verifier=approval_verifier,
+        corpus_verifier=case["dataset_verifier"],
+        identity_verifier=lambda *_args: True,
+        environ={},
+    )
+    instance_id = request.instance_id
+    evidence = {
+        "dataset_pointer_sha256": manifest.dataset_pointer_sha256,
+        "dataset_verification_sha256": manifest.dataset_receipt_sha256,
+        "environment_receipt_sha256": environment_sha256,
+        "instance_id": instance_id,
+        "boot_id": request.boot_id,
+    }
+    terminate_at = (
+        datetime.now(timezone.utc).replace(microsecond=0)
+        + timedelta(hours=1)
+    ).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    submit_envelope = backend._operation_envelope(
+        backend._training_operation_intent(
+            operation="submit",
+            release=release,
+            manifest=manifest,
+            terminate_at=terminate_at,
+            evidence=evidence,
+        ),
+        instance_id=instance_id,
+        terminate_at=terminate_at,
+    )
+    submit_digest = hashlib.sha256(
+        canonical_json(submit_envelope)
+    ).hexdigest()
+    submit_states = []
+    for run in manifest.runs:
+        state = backend._new_aws_run_state(
+            run=run,
+            manifest=manifest,
+            operation="submit",
+            instance_id=instance_id,
+            terminate_at=terminate_at,
+            intent=submit_envelope,
+            published={
+                "intent_sha256": submit_digest,
+                "intent_uri": (
+                    f"{runtime.s3_root}/operations/intents/"
+                    f"sha256/{submit_digest}.json"
+                ),
+            },
+            attempt=1,
+        )
+        state["command_id"] = "cmd-0123456789abcdef0"
+        state["send_attempted"] = True
+        state["status"] = "Failed"
+        submit_states.append(state)
+    state_store = StateStore(tmp_path / "controller-state")
+    with state_store.locked():
+        backend._write_paired_states(state_store, manifest, submit_states)
+
+    resume_envelope = backend._operation_envelope(
+        backend._training_operation_intent(
+            operation="resume",
+            release=release,
+            manifest=manifest,
+            checkpoints=backend._checkpoint_map(manifest, receipt),
+            checkpoint_receipt_sha256=receipt.sha256,
+            checkpoint_receipt_uri=receipt.uri,
+            checkpoint_receipt_version_id=receipt.version_id,
+            checkpoint_receipt_bytes=receipt.bytes,
+            evidence=evidence,
+        ),
+        instance_id=instance_id,
+        terminate_at=terminate_at,
+    )
+    resume_payload = canonical_json(resume_envelope)
+    resume_digest = hashlib.sha256(resume_payload).hexdigest()
+    resume_checksum = base64.b64encode(
+        bytes.fromhex(resume_digest)
+    ).decode("ascii")
+    selected = {
+        "instance_id": instance_id,
+        "instance_type": "p5.48xlarge",
+        "state": "running",
+        "instance_profile_arn": (
+            "arn:aws:iam::123456789012:instance-profile/memorysplit-p5"
+        ),
+        "ami_id": runtime.ami_id,
+        **backend._selected_binding(manifest, terminate_at=terminate_at),
+    }
+    attribute = {
+        "attribute": {
+            "instance_id": instance_id,
+            "shutdown_behavior": "terminate",
+        }
+    }
+    runner.outputs.extend(
+        [
+            {"instances": [selected]},
+            attribute,
+            {
+                "command": {
+                    "command_id": "cmd-0123456789abcdef0",
+                    "status": "Failed",
+                }
+            },
+            {
+                "managed_instances": [
+                    {
+                        "instance_id": instance_id,
+                        "ping_status": "Online",
+                    }
+                ]
+            },
+            {
+                "documents": [
+                    {
+                        "name": ARGV_DOCUMENT_NAME,
+                        "hash": ARGV_DOCUMENT_SHA256,
+                        "status": "Active",
+                    }
+                ]
+            },
+            {
+                "object": {
+                    "checksum_sha256": resume_checksum,
+                    "version_id": "intent-version-1",
+                }
+            },
+            {
+                "object": {
+                    "checksum_sha256": resume_checksum,
+                    "content_length": len(resume_payload),
+                    "metadata": {
+                        "operation-id": resume_envelope["operation_id"],
+                        "sha256": resume_digest,
+                    },
+                    "version_id": "intent-version-1",
+                }
+            },
+            {"command": {"command_id": "cmd-resume-12345678"}},
+        ]
+    )
+
+    first = backend.resume(
+        release=release,
+        manifest=manifest,
+        checkpoint_receipt=receipt,
+        approval_path=tmp_path / "resume-approval.json",
+        apply=True,
+        evidence=evidence,
+    )
+
+    assert first["submitted"] == 1
+    assert first["idempotent"] is False
+    assert first["command_id"] == "cmd-resume-12345678"
+    assert first["status"] == "Pending"
+    assert runner.outputs == []
+    assert approvals[0]["operation"] == "resume"
+    resources = approvals[0]["resources"]
+    assert resources["checkpoint_receipt_sha256"] == receipt.sha256
+    assert resources["checkpoint_receipt_uri"] == receipt.uri
+    assert resources["checkpoint_receipt_version_id"] == receipt.version_id
+    assert [
+        row["version_id"] for row in resources["checkpoint_objects"]
+    ] == ["version-1", "version-2"]
+    receipt_binding = {
+        "sha256": receipt.sha256,
+        "uri": receipt.uri,
+        "version_id": receipt.version_id,
+    }
+    with state_store.locked():
+        states_after_first = [
+            state_store.read_run(run.run_id) for run in manifest.runs
+        ]
+    for state in states_after_first:
+        assert state["operation"] == "resume"
+        assert state["command_id"] == "cmd-resume-12345678"
+        assert state["checkpoint_receipt"] == receipt_binding
+        assert [
+            row["version_id"] for row in state["checkpoint_objects"]
+        ] == ["version-1", "version-2"]
+        assert state["prior_command_ids"] == ["cmd-0123456789abcdef0"]
+
+    calls_before_repeat = len(runner.calls)
+    runner.outputs.extend(
+        [
+            {"instances": [selected]},
+            attribute,
+            {
+                "command": {
+                    "command_id": "cmd-resume-12345678",
+                    "status": "InProgress",
+                }
+            },
+        ]
+    )
+    repeated = backend.resume(
+        release=release,
+        manifest=manifest,
+        checkpoint_receipt=receipt,
+        approval_path=tmp_path / "resume-approval.json",
+        apply=True,
+        evidence=evidence,
+    )
+
+    assert repeated["idempotent"] is True
+    assert repeated["submitted"] == 0
+    assert repeated["command_id"] == "cmd-resume-12345678"
+    repeat_calls = runner.calls[calls_before_repeat:]
+    assert not any(
+        "send-command" in argv or "put-object" in argv
+        for argv, _operation in repeat_calls
+    )
+
+    runner.outputs.extend(
+        [
+            {"instances": [selected]},
+            attribute,
+            {
+                "command": {
+                    "command_id": "cmd-resume-12345678",
+                    "status": "InProgress",
+                }
+            },
+        ]
+    )
+    third = backend.resume(
+        release=release,
+        manifest=manifest,
+        checkpoint_receipt=receipt,
+        approval_path=tmp_path / "resume-approval.json",
+        apply=True,
+        evidence=evidence,
+    )
+    assert third["idempotent"] is True
+    assert third["submitted"] == 0
+
+    with state_store.locked():
+        snapshot = [
+            state_store.read_run(run.run_id) for run in manifest.runs
+        ]
+    drifted_receipt_version = replace(
+        receipt,
+        version_id="receipt-version-2",
+    )
+    drifted_object_version = replace(
+        receipt,
+        checkpoints=(
+            replace(
+                receipt.checkpoints[0],
+                object=replace(
+                    receipt.checkpoints[0].object,
+                    version_id="dense-version-2",
+                ),
+            ),
+            receipt.checkpoints[1],
+        ),
+    )
+    for drifted in (drifted_receipt_version, drifted_object_version):
+        calls_before_drift = len(runner.calls)
+        runner.outputs.extend([{"instances": [selected]}, attribute])
+        with pytest.raises(Exception) as caught:
+            backend.resume(
+                release=release,
+                manifest=manifest,
+                checkpoint_receipt=drifted,
+                approval_path=tmp_path / "resume-approval.json",
+                apply=True,
+                evidence=evidence,
+            )
+        assert (
+            getattr(caught.value, "code", None)
+            == "CHECKPOINT_PROVENANCE_MISMATCH"
+        )
+        assert runner.outputs == []
+        drift_calls = runner.calls[calls_before_drift:]
+        assert not any(
+            "send-command" in argv
+            or "put-object" in argv
+            or "get-command-invocation" in argv
+            for argv, _operation in drift_calls
+        )
+        with state_store.locked():
+            assert [
+                state_store.read_run(run.run_id) for run in manifest.runs
+            ] == snapshot
 
 
 def test_v3_resume_intent_version_pins_receipt_and_both_checkpoints(
@@ -2008,3 +2485,138 @@ def test_s3_lost_put_response_recovers_only_through_exact_head(
     assert recovered.version_id == "version-9"
     assert "--if-none-match" in calls[0]
     assert "--version-id" not in calls[1]
+
+
+def _forked_pair(value: dict | None = None) -> PublishedCheckpointPair:
+    return PublishedCheckpointPair(
+        receipt=CheckpointReceiptRef(
+            uri="s3://bucket/receipt.json",
+            sha256="a" * 64,
+            version_id="receipt-version",
+            bytes=123,
+        ),
+        checkpoints=(
+            VersionedUploadedObject(
+                "s3://bucket/dense.pt",
+                "b" * 64,
+                10,
+                "dense-version",
+            ),
+            VersionedUploadedObject(
+                "s3://bucket/split90.pt",
+                "c" * 64,
+                10,
+                "split90-version",
+            ),
+        ),
+        value={"fixture": "pair"} if value is None else value,
+    )
+
+
+def _poll_until_complete(
+    attempt: ForkedCheckpointMirrorAttempt,
+    *,
+    timeout_seconds: float,
+) -> tuple[bool, PublishedCheckpointPair | None]:
+    deadline = time.monotonic() + timeout_seconds
+    complete, result = attempt.poll()
+    while not complete and time.monotonic() < deadline:
+        time.sleep(0.02)
+        complete, result = attempt.poll()
+    return complete, result
+
+
+def test_forked_attempt_poll_before_child_exit_is_nonblocking() -> None:
+    def publish() -> PublishedCheckpointPair:
+        time.sleep(30.0)
+        return _forked_pair()
+
+    attempt = ForkedCheckpointMirrorAttempt(publish)
+    try:
+        started = time.monotonic()
+        complete, result = attempt.poll()
+        elapsed = time.monotonic() - started
+    finally:
+        attempt.cancel()
+
+    assert complete is False
+    assert result is None
+    assert elapsed < 1.0
+
+
+def test_forked_attempt_round_trips_a_successful_child_result() -> None:
+    expected = _forked_pair()
+    attempt = ForkedCheckpointMirrorAttempt(lambda: expected)
+    try:
+        complete, result = _poll_until_complete(
+            attempt,
+            timeout_seconds=30.0,
+        )
+    finally:
+        attempt.cancel()
+
+    assert complete is True
+    assert result == expected
+
+
+def test_forked_attempt_cancel_kills_reaps_and_closes_descriptors(
+    tmp_path: Path,
+) -> None:
+    sentinel = tmp_path / "published.sentinel"
+
+    def publish() -> PublishedCheckpointPair:
+        time.sleep(5.0)
+        sentinel.write_bytes(b"published-after-cancel")
+        return _forked_pair()
+
+    attempt = ForkedCheckpointMirrorAttempt(publish)
+    child_pid = attempt._pid
+    read_fd = attempt._read_fd
+    assert child_pid is not None and read_fd is not None
+
+    attempt.cancel()
+
+    with pytest.raises(ProcessLookupError):
+        os.kill(child_pid, 0)
+    with pytest.raises(ChildProcessError):
+        os.waitpid(child_pid, os.WNOHANG)
+    with pytest.raises(OSError):
+        os.fstat(read_fd)
+    with pytest.raises(RuntimeError, match="consumed"):
+        attempt.poll()
+    assert not sentinel.exists()
+
+
+def test_forked_attempt_reports_malformed_child_payload_as_failure() -> None:
+    def publish() -> PublishedCheckpointPair:
+        os._exit(3)
+
+    attempt = ForkedCheckpointMirrorAttempt(publish)
+    try:
+        complete, result = _poll_until_complete(
+            attempt,
+            timeout_seconds=30.0,
+        )
+    finally:
+        attempt.cancel()
+
+    assert complete is True
+    assert result is None
+
+
+def test_forked_attempt_drains_the_pipe_while_the_child_is_running() -> None:
+    expected = _forked_pair(value={"padding": "x" * (8 << 20)})
+    attempt = ForkedCheckpointMirrorAttempt(lambda: expected)
+    try:
+        complete, result = _poll_until_complete(
+            attempt,
+            timeout_seconds=20.0,
+        )
+    finally:
+        attempt.cancel()
+
+    assert complete is True, (
+        "attempt never completed: the parent must drain the pipe while "
+        "the child is running instead of waiting for child exit"
+    )
+    assert result == expected

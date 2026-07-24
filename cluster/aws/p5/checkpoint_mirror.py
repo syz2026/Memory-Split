@@ -403,27 +403,41 @@ class ForkedCheckpointMirrorAttempt:
                 os.close(write_fd)
             os._exit(0)
         os.close(write_fd)
+        os.set_blocking(read_fd, False)
         self._pid: int | None = pid
         self._read_fd: int | None = read_fd
+        self._chunks: list[bytes] = []
+        self._saw_eof = False
+
+    def _drain_pipe(self) -> None:
+        # The child blocks writing payloads larger than the kernel pipe
+        # buffer, so the parent must keep reading before the child exits.
+        if self._read_fd is None or self._saw_eof:
+            return
+        while True:
+            try:
+                chunk = os.read(self._read_fd, 1 << 20)
+            except BlockingIOError:
+                return
+            if not chunk:
+                self._saw_eof = True
+                return
+            self._chunks.append(chunk)
 
     def poll(self) -> tuple[bool, PublishedCheckpointPair | None]:
         if self._pid is None:
             raise RuntimeError("checkpoint mirror attempt was already consumed")
+        self._drain_pipe()
         waited, _status = os.waitpid(self._pid, os.WNOHANG)
         if waited == 0:
             return False, None
-        chunks = []
+        self._drain_pipe()
         assert self._read_fd is not None
-        while True:
-            chunk = os.read(self._read_fd, 1 << 20)
-            if not chunk:
-                break
-            chunks.append(chunk)
         os.close(self._read_fd)
         self._read_fd = None
         self._pid = None
         try:
-            ok, value = pickle.loads(b"".join(chunks))
+            ok, value = pickle.loads(b"".join(self._chunks))
         except Exception:
             return True, None
         if not ok or not isinstance(value, PublishedCheckpointPair):
@@ -1032,6 +1046,10 @@ def _checkpoint_metadata(
     request: CheckpointMirrorRequest,
     staged: _StagedCheckpoint,
 ) -> dict[str, str]:
+    # Checkpoint objects are content addressed, so their metadata must be
+    # a pure function of the checkpoint identity: identical bytes uploaded
+    # by a later request must be recoverable through exact HEAD. The
+    # per-attempt request_id lives only in the paired receipt.
     data = staged.metadata.data
     return {
         "arm": staged.arm,
@@ -1042,7 +1060,6 @@ def _checkpoint_metadata(
         "data-receipt-sha256": str(data["receipt_sha256"]),
         "global-cursor": str(data["global_cursor"]),
         "ordered-stream-sha256": str(data["ordered_stream_sha256"]),
-        "request-id": request.request_id,
         "run-id": request.run_ids[staged.arm],
         "seed": str(request.seed),
         "sha256": staged.sha256,
