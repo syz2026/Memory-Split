@@ -15,7 +15,7 @@ import tarfile
 import tempfile
 import unicodedata
 import urllib.request
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Mapping, MutableMapping
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any, Literal, Protocol
@@ -1782,19 +1782,93 @@ def verify_source_tree(
             os.close(parent_fd)
 
 
+_REVIEWED_RECIPE_SOURCE_POLICY: tuple[tuple[str, object], ...] = (
+    ("fineweb_source_lock", "configs/current-dataset-lock.json"),
+    ("wikidata_source_lock", "sources/wikidata5m.lock.json"),
+    ("finemath_repository", "HuggingFaceTB/finemath"),
+    (
+        "finemath_subsets_in_order",
+        (
+            "finemath-4plus",
+            "finemath-3plus-cross-deduplicated-remainder",
+        ),
+    ),
+    ("cross_deduplicate_finemath_against_fineweb", True),
+    (
+        "objective_auxiliary_sources",
+        (
+            "deepmind_mathematics_generator",
+            "clrs_text",
+            "ruletaker",
+            "prontoqa",
+            "reasoning_gym_exact_answer",
+            "arc_agi_training",
+            "conceptarc_training",
+        ),
+    ),
+    ("arc_conceptarc_total_max_percent", 0.25),
+    ("teacher_generated_cot_total_max_percent", 0.5),
+    (
+        "teacher_generated_cot_requires",
+        (
+            "independent_answer_validation",
+            "trace_validation",
+            "contamination_review",
+        ),
+    ),
+    (
+        "excluded_from_claim_bearing_core",
+        (
+            "proof_pile_variants",
+            "ambiguous_license_sources",
+            "benchmark_evaluation_answers",
+        ),
+    ),
+)
+
+
+def _canonical_recipe_source_policy(
+    value: object,
+) -> tuple[tuple[str, object], ...]:
+    if not isinstance(value, Mapping) or isinstance(value, MutableMapping):
+        raise ValueError("recipe source policy must be an immutable mapping")
+    expected_keys = tuple(key for key, _expected in _REVIEWED_RECIPE_SOURCE_POLICY)
+    actual_keys = tuple(value)
+    if any(type(key) is not str for key in actual_keys):
+        raise ValueError("recipe source policy key type drift")
+    if actual_keys != expected_keys:
+        raise ValueError("recipe source policy keys and order drift")
+
+    canonical = []
+    for key, expected in _REVIEWED_RECIPE_SOURCE_POLICY:
+        actual = value[key]
+        if type(actual) is not type(expected):
+            raise ValueError(f"recipe source policy value type drift: {key}")
+        if isinstance(expected, tuple):
+            if any(
+                type(actual_item) is not type(expected_item)
+                for actual_item, expected_item in zip(
+                    actual,
+                    expected,
+                    strict=False,
+                )
+            ):
+                raise ValueError(f"recipe source policy value type drift: {key}")
+            actual = tuple(actual)
+        if actual != expected:
+            raise ValueError(f"recipe source policy value drift: {key}")
+        canonical.append((key, actual))
+    return tuple(canonical)
+
+
 def _validate_recipe(recipe: object) -> None:
     if getattr(recipe, "dataset_id", None) != DATASET_ID:
         raise ValueError("recipe dataset identity does not match source-lock contract")
-    source_policy = getattr(recipe, "source_policy", None)
-    if not isinstance(source_policy, dict):
-        raise ValueError("recipe source policy is missing")
-    expected = {
-        "fineweb_source_lock": "configs/current-dataset-lock.json",
-        "wikidata_source_lock": "sources/wikidata5m.lock.json",
-    }
-    for key, value in expected.items():
-        if source_policy.get(key) != value:
-            raise ValueError(f"recipe source policy drift: {key}")
+    canonical = _canonical_recipe_source_policy(
+        getattr(recipe, "source_policy", None)
+    )
+    if canonical != _REVIEWED_RECIPE_SOURCE_POLICY:
+        raise ValueError("recipe source policy canonicalization drift")
 
 
 def resolve_source_lock(

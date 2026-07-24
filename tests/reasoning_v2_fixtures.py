@@ -6,14 +6,12 @@ import json
 import os
 from dataclasses import dataclass
 from pathlib import Path
-from types import SimpleNamespace
 
 import pytest
 
 from corpusgen.parallel.canonical import canonical_json_bytes
-from corpusgen.reasoning_v2 import source_lock as source_lock_module
+from corpusgen.reasoning_v2 import load_recipe, source_lock as source_lock_module
 from corpusgen.reasoning_v2.source_lock import (
-    DATASET_ID,
     FIXED_REQUESTS,
     PUBLIC_REQUESTS,
     SourceEntry,
@@ -173,13 +171,7 @@ class FixtureSourceLock:
 
 @pytest.fixture
 def full_recipe():
-    return SimpleNamespace(
-        dataset_id=DATASET_ID,
-        source_policy={
-            "fineweb_source_lock": "configs/current-dataset-lock.json",
-            "wikidata_source_lock": "sources/wikidata5m.lock.json",
-        },
-    )
+    return load_recipe(ROOT / "configs/reasoning-dataset-v2.json")
 
 
 @pytest.fixture

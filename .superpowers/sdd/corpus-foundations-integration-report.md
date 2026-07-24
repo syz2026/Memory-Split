@@ -110,3 +110,43 @@ tests/test_reasoning_v2_source_lock.py
 No unrelated report or current seven-lane file was added to the reviewed
 implementation range. This report is committed separately as a report-only
 convention commit.
+
+## Addendum: strict immutable recipe boundary
+
+### Result
+
+- Status: `DONE`
+- The recipe/source-lock concern above is resolved.
+- The eight reviewed cherry-picks and their scientific values are unchanged.
+
+### Resolution
+
+Task 2 now accepts the Task 1 policy as an immutable
+`collections.abc.Mapping`, rejects `MutableMapping` inputs, verifies exact key
+types and insertion order, verifies exact scalar/tuple types, values, and tuple
+order, and canonicalizes the accepted policy to an internal tuple before any
+resolver transport. The reviewed request catalog and source-lock commitment
+remain authoritative and unchanged.
+
+The source-lock fixture now loads the real
+`configs/reasoning-dataset-v2.json` through Task 1 instead of constructing a
+mutable two-key stand-in. The direct integration regression records every
+Task 2 request and verifies the exact request order, reviewed catalog digest,
+dataset identity, and generator commit. Mutable policies and immutable forgeries
+with missing/extra/reordered/wrong-typed/wrong-valued fields all fail before the
+resolver is called.
+
+### Strict RED to GREEN evidence
+
+- Initial RED: the new boundary file produced `9 failed`; the real immutable
+  recipe was rejected as missing, while the mutable policy reached transport.
+- Exact-key-type RED: `1 failed, 9 deselected`; a `str` subclass key reached
+  transport before the key-type guard was added.
+- GREEN: `10 passed` in the direct boundary file.
+- Focused Task 1 + Task 2 + boundary run: `172 passed`.
+- Original 337-test combined selection plus the 10 new boundary cases:
+  `347 passed in 40.24s`.
+- `python -m py_compile` on all changed Python files: passed.
+- `git diff --check`: passed.
+- Both reviewed `git range-diff` comparisons still pair every original
+  cherry-pick with `=`; the integration fix does not rewrite reviewed history.
