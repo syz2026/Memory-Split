@@ -1996,3 +1996,279 @@ def test_outer_close_failures_attempt_every_retained_descriptor(
     for descriptor in retained:
         with pytest.raises(OSError):
             os.fstat(descriptor)
+
+
+def _mutate_at_before_finalize(directory_fd: int, name: str) -> None:
+    descriptor = os.open(name, os.O_RDWR, dir_fd=directory_fd)
+    try:
+        payload = os.pread(descriptor, 1, 0)
+        assert payload
+        os.pwrite(descriptor, bytes((payload[0] ^ 1,)), 0)
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+@pytest.mark.parametrize(
+    ("target_phase", "force_merges"),
+    [
+        ("before_flush_finalize", False),
+        ("before_merge_finalize", True),
+    ],
+)
+def test_run_mutation_before_finalization_rejects_observed_hash_adoption(
+    archive_authority: _AuthorityFixture,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    target_phase: str,
+    force_merges: bool,
+):
+    attacked = False
+
+    def mutate_pending_run(phase, work_fd, pending_run):
+        nonlocal attacked
+        if phase != target_phase or attacked:
+            return
+        attacked = True
+        _mutate_at_before_finalize(work_fd, pending_run.name)
+
+    monkeypatch.setattr(
+        wikidata_source_module,
+        "_external_sort_hook",
+        mutate_pending_run,
+    )
+    if force_merges:
+        monkeypatch.setattr(
+            wikidata_source_module,
+            "_SORT_CHUNK_RECORDS",
+            1,
+        )
+
+    with pytest.raises(ValueError, match="expected|digest|byte count"):
+        _build_view(archive_authority, tmp_path / "derived")
+
+    assert attacked
+
+
+def test_run_writer_close_failure_preserves_finalize_error(
+    archive_authority: _AuthorityFixture,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    active = False
+    close_failed = False
+    attempted: list[int] = []
+    real_close = os.close
+
+    def mutate_before_finalize(phase, work_fd, pending_run):
+        nonlocal active
+        if phase != "before_flush_finalize" or active:
+            return
+        _mutate_at_before_finalize(work_fd, pending_run.name)
+        active = True
+
+    def injected_close(descriptor):
+        nonlocal close_failed
+        if not active:
+            real_close(descriptor)
+            return
+        attempted.append(descriptor)
+        real_close(descriptor)
+        if not close_failed:
+            close_failed = True
+            raise OSError("injected run-writer close failure")
+
+    monkeypatch.setattr(
+        wikidata_source_module,
+        "_external_sort_hook",
+        mutate_before_finalize,
+    )
+    monkeypatch.setattr(
+        wikidata_source_module,
+        "_close_descriptor",
+        injected_close,
+    )
+
+    with pytest.raises(ValueError, match="expected|digest|byte count") as raised:
+        _build_view(archive_authority, tmp_path / "derived")
+
+    assert "run-writer close failure" not in str(raised.value)
+    assert close_failed
+    assert attempted
+    for descriptor in attempted:
+        with pytest.raises(OSError):
+            os.fstat(descriptor)
+
+
+def test_archive_teardown_attempts_all_closes_and_preserves_body_error(
+    archive_authority: _AuthorityFixture,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    active = False
+    failures_remaining = 2
+    archive_descriptors: tuple[int, ...] = ()
+    attempted: list[int] = []
+    real_close = os.close
+
+    def injected_close(descriptor):
+        nonlocal failures_remaining
+        if not active:
+            real_close(descriptor)
+            return
+        attempted.append(descriptor)
+        real_close(descriptor)
+        if failures_remaining:
+            failures_remaining -= 1
+            raise OSError("injected archive close failure")
+
+    monkeypatch.setattr(
+        wikidata_source_module,
+        "_close_descriptor",
+        injected_close,
+    )
+
+    with pytest.raises(RuntimeError, match="archive body failure") as raised:
+        with wikidata_source_module._open_verified_archives(
+            archive_authority.source_lock_path,
+            archive_authority.source_root,
+            expected_generator_commit=EXPECTED_GENERATOR_COMMIT,
+        ) as verified:
+            archive_descriptors = tuple(
+                verified._archive_descriptors.values()
+            )
+            active = True
+            raise RuntimeError("archive body failure")
+
+    assert "archive close failure" not in str(raised.value)
+    assert failures_remaining == 0
+    assert len(attempted) == len(archive_descriptors) + 5
+    assert set(archive_descriptors) <= set(attempted)
+    for descriptor in attempted:
+        with pytest.raises(OSError):
+            os.fstat(descriptor)
+
+
+def test_postrename_fsync_failure_exchange_quarantines_and_vacates_final(
+    archive_authority: _AuthorityFixture,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    output_root = tmp_path / "derived"
+    armed = False
+    failed = False
+    final_name: str | None = None
+    published_inode: int | None = None
+    real_fsync_directory = wikidata_source_module.fsync_directory
+
+    def arm_after_rename(phase, authority, receipt_sha256):
+        nonlocal armed, final_name, published_inode
+        if phase != "after_publish_rename":
+            return
+        final_name = receipt_sha256
+        target = output_root / "wikidata" / receipt_sha256
+        published_inode = target.stat().st_ino
+        assert published_inode == authority.identity[1]
+        armed = True
+
+    def fail_transaction_fsync(directory_fd):
+        nonlocal armed, failed
+        if armed and not failed:
+            armed = False
+            failed = True
+            raise OSError("injected postrename fsync failure")
+        real_fsync_directory(directory_fd)
+
+    monkeypatch.setattr(
+        wikidata_source_module,
+        "_derived_view_build_hook",
+        arm_after_rename,
+    )
+    monkeypatch.setattr(
+        wikidata_source_module,
+        "fsync_directory",
+        fail_transaction_fsync,
+    )
+
+    with pytest.raises(ValueError, match="publication|fsync"):
+        _build_view(archive_authority, output_root)
+
+    assert failed
+    assert final_name is not None
+    namespace = output_root / "wikidata"
+    assert not (namespace / final_name).exists()
+    quarantines = tuple(
+        path
+        for path in namespace.iterdir()
+        if path.name.startswith(".quarantine-")
+    )
+    assert len(quarantines) == 1
+    assert quarantines[0].stat().st_ino == published_inode
+    assert quarantines[0].stat().st_mode & 0o777 == 0o700
+
+
+def test_quarantine_exchange_race_restores_substituted_winner(
+    archive_authority: _AuthorityFixture,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    output_root = tmp_path / "derived"
+    final_name: str | None = None
+    winner_inode: int | None = None
+    marker_inode: int | None = None
+    swapped = False
+
+    def fail_then_install_winner(phase, _authority, receipt_sha256):
+        nonlocal final_name, winner_inode, marker_inode, swapped
+        if phase == "before_postpublish_verify":
+            final_name = receipt_sha256
+            raise RuntimeError("forced postpublication failure")
+        if phase != "before_quarantine_exchange" or swapped:
+            return
+        swapped = True
+        namespace = output_root / "wikidata"
+        markers = tuple(
+            path
+            for path in namespace.iterdir()
+            if path.name.startswith(".quarantine-")
+        )
+        assert len(markers) == 1
+        assert not tuple(markers[0].iterdir())
+        assert markers[0].stat().st_mode & 0o777 == 0o700
+        marker_inode = markers[0].stat().st_ino
+        target = namespace / receipt_sha256
+        displaced = namespace / f"{receipt_sha256}.race-displaced"
+        target.rename(displaced)
+        shutil.copytree(displaced, target)
+        winner_inode = target.stat().st_ino
+
+    monkeypatch.setattr(
+        wikidata_source_module,
+        "_derived_view_build_hook",
+        fail_then_install_winner,
+    )
+
+    with pytest.raises(RuntimeError, match="forced postpublication failure"):
+        _build_view(archive_authority, output_root)
+
+    assert swapped
+    assert final_name is not None
+    namespace = output_root / "wikidata"
+    winner = namespace / final_name
+    assert winner.is_dir()
+    assert winner.stat().st_ino == winner_inode
+    assert all(
+        path.stat().st_ino != marker_inode
+        for path in namespace.iterdir()
+    )
+    assert not tuple(
+        path
+        for path in namespace.iterdir()
+        if path.name.startswith(".quarantine-")
+    )
+    verified = wikidata_source_module.verify_wikidata_derived_view(
+        archive_authority.source_lock_path,
+        archive_authority.source_root,
+        winner,
+        expected_generator_commit=EXPECTED_GENERATOR_COMMIT,
+    )
+    assert verified.root == winner

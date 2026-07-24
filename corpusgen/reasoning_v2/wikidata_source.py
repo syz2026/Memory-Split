@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ctypes
 import hashlib
 import heapq
 import json
@@ -10,6 +11,7 @@ import re
 import secrets
 import stat
 import struct
+import sys
 import tarfile
 import unicodedata
 import weakref
@@ -123,6 +125,8 @@ _SORT_HEADER = struct.Struct(">IQ")
 _UINT64 = struct.Struct(">Q")
 _ALIAS_INDEX_RECORD = struct.Struct(">QQQ")
 _EDGE_SORT_KEY = struct.Struct(">QQQBQ")
+_RENAME_EXCHANGE = 2
+_RENAME_SWAP = 0x00000002
 _WRITE_FLAGS = (
     os.O_RDWR
     | os.O_CREAT
@@ -1362,6 +1366,7 @@ def _open_verified_archives(
     archive_fds: dict[str, int] = {}
     state: _ArchiveAuthorityState | None = None
     body_raised = False
+    primary_error: BaseException | None = None
     try:
         lock_parent_fd, lock_name = open_parent_directory(Path(source_lock_path))
         lock_parent_metadata = os.fstat(lock_parent_fd)
@@ -1524,21 +1529,31 @@ def _open_verified_archives(
         _verify_authority_state(state, rehash=True)
     except OSError as error:
         if body_raised:
+            primary_error = error
             raise
-        raise ValueError("Wikidata archive authority is missing or unsafe") from error
+        wrapped = ValueError("Wikidata archive authority is missing or unsafe")
+        primary_error = wrapped
+        raise wrapped from error
+    except BaseException as error:
+        primary_error = error
+        raise
     finally:
-        for descriptor in archive_fds.values():
-            os.close(descriptor)
-        if wikidata_fd >= 0:
-            os.close(wikidata_fd)
-        if root_fd >= 0:
-            os.close(root_fd)
-        if root_parent_fd >= 0:
-            os.close(root_parent_fd)
-        if lock_fd >= 0:
-            os.close(lock_fd)
-        if lock_parent_fd >= 0:
-            os.close(lock_parent_fd)
+        close_error = _close_descriptors_exhaustively(
+            (
+                *archive_fds.values(),
+                wikidata_fd,
+                root_fd,
+                root_parent_fd,
+                lock_fd,
+                lock_parent_fd,
+            )
+        )
+        if close_error is not None:
+            if primary_error is None:
+                raise close_error
+            primary_error.add_note(
+                f"archive authority close also failed: {close_error!r}"
+            )
 
 
 def _require_derived_mode(
@@ -1646,6 +1661,76 @@ def _check_named_derived_directory(
 
 def _close_descriptor(descriptor: int) -> None:
     os.close(descriptor)
+
+
+def _atomic_exchange_directories(
+    directory_fd: int,
+    first_name: str,
+    second_name: str,
+) -> None:
+    first = _safe_relative_path(first_name, "exchange entry")
+    second = _safe_relative_path(second_name, "exchange entry")
+    if "/" in first or "/" in second or first == second:
+        raise ValueError("atomic exchange requires distinct sibling names")
+    first_bytes = os.fsencode(first)
+    second_bytes = os.fsencode(second)
+    libc = ctypes.CDLL(None, use_errno=True)
+    ctypes.set_errno(0)
+    if sys.platform.startswith("linux"):
+        try:
+            primitive = libc.renameat2
+        except AttributeError as error:
+            raise RuntimeError(
+                "atomic quarantine exchange requires Linux renameat2"
+            ) from error
+        primitive.argtypes = [
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_uint,
+        ]
+        primitive.restype = ctypes.c_int
+        result = primitive(
+            directory_fd,
+            first_bytes,
+            directory_fd,
+            second_bytes,
+            _RENAME_EXCHANGE,
+        )
+    elif sys.platform == "darwin":
+        try:
+            primitive = libc.renameatx_np
+        except AttributeError as error:
+            raise RuntimeError(
+                "atomic quarantine exchange requires macOS renameatx_np"
+            ) from error
+        primitive.argtypes = [
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_uint,
+        ]
+        primitive.restype = ctypes.c_int
+        result = primitive(
+            directory_fd,
+            first_bytes,
+            directory_fd,
+            second_bytes,
+            _RENAME_SWAP,
+        )
+    else:
+        raise RuntimeError(
+            f"no atomic directory exchange for platform {sys.platform!r}"
+        )
+    if result != 0:
+        error_number = ctypes.get_errno()
+        raise OSError(
+            error_number,
+            os.strerror(error_number),
+            f"{first} <-> {second}",
+        )
 
 
 def _append_secondary_error(
@@ -1817,7 +1902,7 @@ def _derived_view_build_hook(
 def _external_sort_hook(
     phase: str,
     work_fd: int,
-    run: "_SortRun",
+    run: "_SortRun | _RunExpectation",
 ) -> None:
     del phase, work_fd, run
 
@@ -2052,10 +2137,27 @@ def _read_exact(descriptor: int, size: int, description: str) -> bytes:
     return b"".join(chunks)
 
 
+@dataclass
+class _RunExpectation:
+    name: str
+    byte_count: int = 0
+    digest: Any = field(default_factory=hashlib.sha256)
+
+    @property
+    def sha256(self) -> str:
+        return self.digest.hexdigest()
+
+    def write(self, descriptor: int, payload: bytes) -> None:
+        _write_all(descriptor, payload)
+        self.byte_count += len(payload)
+        self.digest.update(payload)
+
+
 def _write_sort_record(
     descriptor: int,
     key: bytes,
     payload: bytes,
+    expectation: _RunExpectation | None = None,
 ) -> None:
     if (
         not isinstance(key, bytes)
@@ -2064,9 +2166,16 @@ def _write_sort_record(
         or len(key) + len(payload) > _SORT_RECORD_LIMIT
     ):
         raise ValueError("external-sort record exceeds the bounded contract")
-    _write_all(descriptor, _SORT_HEADER.pack(len(key), len(payload)))
-    _write_all(descriptor, key)
-    _write_all(descriptor, payload)
+    parts = (
+        _SORT_HEADER.pack(len(key), len(payload)),
+        key,
+        payload,
+    )
+    for part in parts:
+        if expectation is None:
+            _write_all(descriptor, part)
+        else:
+            expectation.write(descriptor, part)
 
 
 def _read_sort_record(descriptor: int) -> tuple[bytes, bytes] | None:
@@ -2264,23 +2373,32 @@ class _ExternalSorter:
         name: str,
         descriptor: int,
         creation_identity: _CreationIdentity,
+        expectation: _RunExpectation,
+        hook_phase: str,
     ) -> _SortRun:
+        _external_sort_hook(hook_phase, self.work_fd, expectation)
         metadata = os.fstat(descriptor)
         file_identity = _private_file_identity(metadata)
-        byte_count, sha256 = _digest_private_descriptor(
+        observed_bytes, observed_sha256 = _digest_private_descriptor(
             descriptor,
             expected_identity=file_identity,
             description="external-sort output run",
         )
-        if byte_count != metadata.st_size:
-            raise ValueError("external-sort output run size drift")
+        if (
+            observed_bytes != expectation.byte_count
+            or observed_sha256 != expectation.sha256
+        ):
+            raise ValueError(
+                "external-sort output run does not match independently "
+                "accumulated expected byte count and digest"
+            )
         file_authority = _finalize_private_file(
             self.work_fd,
             name,
             f".work/{name}",
             descriptor,
             creation_identity,
-            sha256,
+            expectation.sha256,
             self.authority,
         )
         return _SortRun(
@@ -2295,17 +2413,39 @@ class _ExternalSorter:
         self.chunk.sort(key=lambda record: record[0])
         name = self._new_run_name(0)
         descriptor, creation_identity = self._create_run(name)
+        expectation = _RunExpectation(name=name)
+        run: _SortRun | None = None
+        body_error: BaseException | None = None
         try:
             for key, payload in self.chunk:
-                _write_sort_record(descriptor, key, payload)
+                _write_sort_record(
+                    descriptor,
+                    key,
+                    payload,
+                    expectation,
+                )
             os.fsync(descriptor)
             run = self._finalize_run(
                 name,
                 descriptor,
                 creation_identity,
+                expectation,
+                "before_flush_finalize",
             )
+        except BaseException as error:
+            body_error = error
+            raise
         finally:
-            os.close(descriptor)
+            close_error = _close_descriptors_exhaustively((descriptor,))
+            if close_error is not None:
+                if body_error is None:
+                    raise close_error
+                body_error.add_note(
+                    f"external-sort run writer close also failed: "
+                    f"{close_error!r}"
+                )
+        if run is None:
+            raise RuntimeError("external-sort run finalization did not complete")
         self.chunk.clear()
         self.chunk_bytes = 0
         self._store_run(0, run)
@@ -2319,6 +2459,7 @@ class _ExternalSorter:
         output = -1
         output_run: _SortRun | None = None
         output_creation_identity: _CreationIdentity | None = None
+        output_expectation = _RunExpectation(name=output_name)
         body_error: BaseException | None = None
         try:
             for run in runs:
@@ -2338,7 +2479,12 @@ class _ExternalSorter:
                 if previous is not None and key < previous:
                     raise ValueError("external-sort merge ordering drift")
                 previous = key
-                _write_sort_record(output, key, payload)
+                _write_sort_record(
+                    output,
+                    key,
+                    payload,
+                    output_expectation,
+                )
                 record = _read_sort_record(inputs[index][1])
                 if record is not None:
                     next_key, next_payload = record
@@ -2351,6 +2497,8 @@ class _ExternalSorter:
                 output_name,
                 output,
                 output_creation_identity,
+                output_expectation,
+                "before_merge_finalize",
             )
             for run, descriptor in inputs:
                 _check_named_private_file(
@@ -4415,39 +4563,163 @@ def _verify_sealed_private_build(
             )
 
 
-def _quarantine_published_candidate(
-    authority: _PrivateBuildAuthority,
+@dataclass
+class _QuarantineMarker:
+    namespace_fd: int
+    name: str
+    descriptor: int
+    identity: _CreationIdentity
+    entry_name: str | None
+
+
+def _allocate_quarantine_marker(
+    namespace_fd: int,
     published_name: str,
-) -> str:
-    _check_named_derived_directory(
-        authority.namespace_fd,
-        published_name,
-        authority.descriptor,
-        authority.identity,
-        "published candidate before quarantine",
-    )
+) -> _QuarantineMarker:
     prefix = f".quarantine-{published_name[:16]}-"
     for _attempt in range(32):
-        quarantine_name = prefix + secrets.token_hex(8)
+        name = prefix + secrets.token_hex(8)
         try:
-            atomic_rename_noreplace(
-                authority.namespace_fd,
-                published_name,
-                authority.namespace_fd,
-                quarantine_name,
+            descriptor, identity = _create_private_directory(
+                namespace_fd,
+                name,
             )
         except FileExistsError:
             continue
+        if list_entries(descriptor):
+            os.close(descriptor)
+            raise ValueError("quarantine marker is not empty")
+        return _QuarantineMarker(
+            namespace_fd=namespace_fd,
+            name=name,
+            descriptor=descriptor,
+            identity=identity,
+            entry_name=name,
+        )
+    raise FileExistsError("could not allocate quarantine marker")
+
+
+def _remove_quarantine_marker(
+    marker: _QuarantineMarker,
+    *,
+    sync_parent: bool,
+) -> None:
+    if marker.entry_name is None:
+        return
+    name = marker.entry_name
+    _check_named_derived_directory(
+        marker.namespace_fd,
+        name,
+        marker.descriptor,
+        marker.identity,
+        "quarantine marker before removal",
+    )
+    if list_entries(marker.descriptor):
+        raise ValueError("quarantine marker is not empty")
+    os.rmdir(name, dir_fd=marker.namespace_fd)
+    marker.entry_name = None
+    if sync_parent:
+        fsync_directory(marker.namespace_fd)
+
+
+def _rollback_quarantine_exchange(
+    authority: _PrivateBuildAuthority,
+    published_name: str,
+    marker: _QuarantineMarker,
+    swapped_entry_identity: _CreationIdentity,
+) -> None:
+    _atomic_exchange_directories(
+        authority.namespace_fd,
+        published_name,
+        marker.name,
+    )
+    marker.entry_name = marker.name
+    _check_named_derived_directory(
+        marker.namespace_fd,
+        marker.name,
+        marker.descriptor,
+        marker.identity,
+        "quarantine marker after exchange rollback",
+    )
+    restored = entry_lstat(authority.namespace_fd, published_name)
+    _require_derived_mode(
+        restored,
+        directory=True,
+        description="restored concurrent winner",
+    )
+    if _creation_identity(restored) != swapped_entry_identity:
+        raise ValueError("quarantine exchange rollback identity drift")
+    fsync_directory(authority.namespace_fd)
+
+
+def _exchange_quarantine_published_candidate(
+    authority: _PrivateBuildAuthority,
+    published_name: str,
+    marker: _QuarantineMarker,
+) -> str:
+    _derived_view_build_hook(
+        "before_quarantine_exchange",
+        authority,
+        published_name,
+    )
+    before_exchange = entry_lstat(
+        authority.namespace_fd,
+        published_name,
+    )
+    _require_derived_mode(
+        before_exchange,
+        directory=True,
+        description="entry before quarantine exchange",
+    )
+    swapped_entry_identity = _creation_identity(before_exchange)
+    _atomic_exchange_directories(
+        authority.namespace_fd,
+        published_name,
+        marker.name,
+    )
+    marker.entry_name = published_name
+    try:
+        swapped_metadata = entry_lstat(
+            authority.namespace_fd,
+            marker.name,
+        )
+        _require_derived_mode(
+            swapped_metadata,
+            directory=True,
+            description="entry moved into quarantine",
+        )
+        swapped_entry_identity = _creation_identity(swapped_metadata)
         _check_named_derived_directory(
             authority.namespace_fd,
-            quarantine_name,
+            marker.name,
             authority.descriptor,
             authority.identity,
-            "quarantined candidate root",
+            "published candidate after quarantine exchange",
         )
-        fsync_directory(authority.namespace_fd)
-        return quarantine_name
-    raise FileExistsError("could not allocate candidate quarantine name")
+        _check_named_derived_directory(
+            authority.namespace_fd,
+            published_name,
+            marker.descriptor,
+            marker.identity,
+            "quarantine marker at final name",
+        )
+        _remove_quarantine_marker(marker, sync_parent=True)
+        return marker.name
+    except BaseException as exchange_error:
+        if marker.entry_name is not None:
+            try:
+                _rollback_quarantine_exchange(
+                    authority,
+                    published_name,
+                    marker,
+                    swapped_entry_identity,
+                )
+            except BaseException as rollback_error:
+                exchange_error.add_note(
+                    f"quarantine exchange rollback also failed: "
+                    f"{rollback_error!r}"
+                )
+        raise
 
 
 def _cleanup_private_build(authority: _PrivateBuildAuthority) -> None:
@@ -4595,6 +4867,8 @@ def build_wikidata_derived_view(
     indexes_fd = -1
     work_fd = -1
     authority: _PrivateBuildAuthority | None = None
+    quarantine_marker: _QuarantineMarker | None = None
+    candidate_private = False
     published = False
     primary_error: BaseException | None = None
     output_path = Path(output_root)
@@ -4646,6 +4920,7 @@ def build_wikidata_derived_view(
                 descriptor=build_fd,
                 identity=build_identity,
             )
+            candidate_private = True
             members_fd, _members_identity = _create_private_directory(
                 build_fd,
                 "members",
@@ -4808,6 +5083,10 @@ def build_wikidata_derived_view(
                 authority.sealed_root_identity,
             ),
         )
+        quarantine_marker = _allocate_quarantine_marker(
+            wikidata_fd,
+            receipt_sha256,
+        )
         try:
             atomic_rename_noreplace(
                 wikidata_fd,
@@ -4823,14 +5102,14 @@ def build_wikidata_derived_view(
                 require_namespace=True,
             )
             return winner
-        published = True
-        fsync_directory(wikidata_fd)
+        candidate_private = False
         try:
             _derived_view_build_hook(
                 "after_publish_rename",
                 authority,
                 receipt_sha256,
             )
+            fsync_directory(wikidata_fd)
             _check_named_derived_directory(
                 wikidata_fd,
                 receipt_sha256,
@@ -4865,12 +5144,18 @@ def build_wikidata_derived_view(
                 root_name=receipt_sha256,
                 expected_root_identity=postrename_root_identity,
             )
+            _remove_quarantine_marker(
+                quarantine_marker,
+                sync_parent=False,
+            )
+            published = True
             return winner
         except BaseException as error:
             try:
-                _quarantine_published_candidate(
+                _exchange_quarantine_published_candidate(
                     authority,
                     receipt_sha256,
+                    quarantine_marker,
                 )
             except BaseException as quarantine_error:
                 error.add_note(
@@ -4889,7 +5174,7 @@ def build_wikidata_derived_view(
         raise
     finally:
         secondary_error: BaseException | None = None
-        if authority is not None and not published:
+        if authority is not None and candidate_private and not published:
             try:
                 _derived_view_build_hook(
                     "before_cleanup",
@@ -4899,6 +5184,21 @@ def build_wikidata_derived_view(
                 _cleanup_private_build(authority)
             except BaseException as error:
                 secondary_error = error
+        if (
+            quarantine_marker is not None
+            and quarantine_marker.entry_name is not None
+        ):
+            try:
+                _remove_quarantine_marker(
+                    quarantine_marker,
+                    sync_parent=True,
+                )
+            except BaseException as error:
+                secondary_error = _append_secondary_error(
+                    secondary_error,
+                    error,
+                    "quarantine marker cleanup failure",
+                )
         close_error = _close_descriptors_exhaustively(
             (
                 work_fd,
@@ -4906,6 +5206,11 @@ def build_wikidata_derived_view(
                 streams_fd,
                 members_fd,
                 build_fd,
+                (
+                    quarantine_marker.descriptor
+                    if quarantine_marker is not None
+                    else -1
+                ),
                 wikidata_fd,
                 output_fd,
             )
