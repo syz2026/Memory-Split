@@ -177,6 +177,20 @@ def test_seed_collection_closure_is_required():
     )
 
 
+def test_study_lock_builder_closure_is_required():
+    module = _load_module()
+
+    lock_builder_members = {
+        "evals/confirmatory/lock_builder.py",
+        "scripts/build_confirmatory_study_lock.py",
+    }
+    assert lock_builder_members <= module.REQUIRED_MEMBERS
+    assert all(
+        module._classification(path) == "included"
+        for path in lock_builder_members
+    )
+
+
 def test_authenticated_package_metadata_comes_only_from_fixed_authority(
     tmp_path,
     monkeypatch,
