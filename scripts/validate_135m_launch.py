@@ -40,6 +40,7 @@ def main(argv: list[str] | None = None) -> int:
             args.preflight,
             profile=profile,
             dataset_receipt_sha256=pair["dataset"]["receipt_sha256"],
+            cohort_id=pair["cohort_id"],
         )
     print(
         json.dumps(

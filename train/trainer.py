@@ -20,6 +20,8 @@ from train.model import GPT, GPTConfig, PRESETS
 
 
 PARALLEL_CORPUS_V2 = "memorysplit-parallel-corpus-v2"
+REASONING_CORPUS_V3 = "memorysplit-reasoning-dataset-v3"
+DIRECT_WEIGHT_CONTRACTS = frozenset({PARALLEL_CORPUS_V2, REASONING_CORPUS_V3})
 
 
 def pick_device(requested: str = "auto") -> str:
@@ -68,7 +70,7 @@ class Trainer:
         dataset = cfg.get("dataset")
         self.direct_target_weights = (
             isinstance(dataset, dict)
-            and dataset.get("contract_id") == PARALLEL_CORPUS_V2
+            and dataset.get("contract_id") in DIRECT_WEIGHT_CONTRACTS
         )
         if self.direct_target_weights and (
             cfg.get("train_mask") is None

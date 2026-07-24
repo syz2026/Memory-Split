@@ -20,6 +20,7 @@ from msctl.profile import load_profile  # noqa: E402
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--profile", required=True)
+    parser.add_argument("--cohort-id")
     parser.add_argument("--dataset-receipt-sha256", required=True)
     parser.add_argument("--functional-evidence", required=True)
     parser.add_argument("--resume-evidence", required=True)
@@ -33,6 +34,7 @@ def main(argv: list[str] | None = None) -> int:
         resume_evidence=args.resume_evidence,
         throughput_evidence=args.throughput_evidence,
         output=args.output,
+        **({"cohort_id": args.cohort_id} if args.cohort_id is not None else {}),
     )
     print(json.dumps({"preflight": str(output)}, sort_keys=True))
     return 0

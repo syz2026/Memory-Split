@@ -4,8 +4,15 @@ from __future__ import annotations
 
 import argparse
 import json
+from dataclasses import asdict, is_dataclass
 from pathlib import Path
 
+from cluster.aws.reasoning_v3 import (
+    stage_from_s3,
+    upload_to_s3,
+    verify_staged_corpus,
+)
+from msctl.aws_operations import instantiate_aws
 from msctl.cohort import ROLES
 from msctl.operations import (
     collect,
@@ -20,6 +27,8 @@ from msctl.operations import (
 def _json_default(value):
     if isinstance(value, Path):
         return str(value)
+    if is_dataclass(value) and not isinstance(value, type):
+        return asdict(value)
     raise TypeError(f"cannot encode {type(value).__name__}")
 
 
@@ -71,12 +80,85 @@ def build_parser() -> argparse.ArgumentParser:
     collect_parser.add_argument("pair_manifests", nargs="+")
     collect_parser.add_argument("--evidence-root", required=True)
     collect_parser.add_argument("--output", required=True)
+
+    aws = commands.add_parser("aws")
+    aws_commands = aws.add_subparsers(dest="aws_command", required=True)
+    upload_parser = aws_commands.add_parser("upload-corpus")
+    upload_parser.add_argument("--repository-root", default=".")
+    upload_parser.add_argument(
+        "--manifest",
+        default="cluster/aws/reasoning-v3-corpus-manifest.json",
+    )
+    upload_parser.add_argument("--s3-uri", required=True)
+    upload_parser.add_argument("--kms-key-id", required=True)
+    upload_parser.add_argument("--apply", action="store_true")
+
+    stage_parser = aws_commands.add_parser("stage-corpus")
+    stage_parser.add_argument(
+        "--manifest",
+        default="cluster/aws/reasoning-v3-corpus-manifest.json",
+    )
+    stage_parser.add_argument("--s3-uri", required=True)
+    stage_parser.add_argument("--destination", required=True)
+    stage_parser.add_argument("--apply", action="store_true")
+
+    verify_parser = aws_commands.add_parser("verify-corpus")
+    verify_parser.add_argument(
+        "--manifest",
+        default="cluster/aws/reasoning-v3-corpus-manifest.json",
+    )
+    verify_parser.add_argument("--dataset-root", required=True)
+
+    aws_instantiate = aws_commands.add_parser("instantiate")
+    aws_instantiate.add_argument("--dataset-root", required=True)
+    aws_instantiate.add_argument(
+        "--pointer",
+        default="DATASET-POINTER-AWS-135M-V3.json",
+    )
+    aws_instantiate.add_argument(
+        "--manifest",
+        default="cluster/aws/reasoning-v3-corpus-manifest.json",
+    )
+    aws_instantiate.add_argument("--profile", required=True)
+    aws_instantiate.add_argument("--runtime-root", required=True)
+    aws_instantiate.add_argument("--out-root", required=True)
+    aws_instantiate.add_argument("--repository-root", default=".")
+    aws_instantiate.add_argument("--seeds", nargs="+", type=int, default=list(range(10)))
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    if args.command == "runs":
+    if args.command == "aws":
+        if args.aws_command == "upload-corpus":
+            result = upload_to_s3(
+                args.repository_root,
+                args.manifest,
+                args.s3_uri,
+                kms_key_id=args.kms_key_id,
+                apply=args.apply,
+            )
+        elif args.aws_command == "stage-corpus":
+            result = stage_from_s3(
+                args.s3_uri,
+                args.destination,
+                args.manifest,
+                apply=args.apply,
+            )
+        elif args.aws_command == "verify-corpus":
+            result = verify_staged_corpus(args.dataset_root, args.manifest)
+        else:
+            result = instantiate_aws(
+                dataset_root=args.dataset_root,
+                pointer_path=args.pointer,
+                transfer_manifest_path=args.manifest,
+                profile_path=args.profile,
+                runtime_root=args.runtime_root,
+                out_root=args.out_root,
+                repository_root=args.repository_root,
+                seeds=tuple(args.seeds),
+            )
+    elif args.command == "runs":
         result = instantiate(
             args.role,
             dataset_root=args.dataset_root,

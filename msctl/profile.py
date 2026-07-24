@@ -140,8 +140,8 @@ def validate_profile(
     ):
         raise ValueError("schema_version must be exactly 1")
     platform = raw["platform"]
-    if platform not in {"farmshare", "mit"}:
-        raise ValueError("platform must be farmshare or mit")
+    if platform not in {"aws", "farmshare", "mit"}:
+        raise ValueError("platform must be aws, farmshare, or mit")
     gres = _safe_text(raw["gres"], field="gres")
     if not _GRES_RE.fullmatch(gres):
         raise ValueError("gres must request exactly two GPUs")

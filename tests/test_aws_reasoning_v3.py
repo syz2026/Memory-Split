@@ -1,0 +1,512 @@
+from __future__ import annotations
+
+import hashlib
+import json
+import shutil
+from pathlib import Path
+from types import SimpleNamespace
+
+import numpy as np
+import pytest
+import torch
+import yaml
+
+import cluster.aws.reasoning_v3 as corpus
+import msctl.aws_operations as aws_operations
+from cluster.aws.reasoning_v3 import (
+    AwsCorpusError,
+    StagedCorpus,
+    load_transfer_manifest,
+    parse_s3_uri,
+    stage_from_s3,
+    upload_to_s3,
+    verify_staged_corpus,
+)
+from cluster.aws.readiness import inspect_aws_readiness
+from msctl.adapters.slurm import load_pair_manifest, plan_sbatch
+from msctl.operations import collect, resume, status, submit
+from msctl.profile import load_profile
+from msctl.reasoning_cohort import (
+    COHORT_ID,
+    COMPOSITE_STREAM_SHA256,
+    RAW_TARGETS,
+    TERMINAL_UPDATES,
+    TRANSFER_MANIFEST_SHA256,
+    VIRTUAL_RECEIPT_SHA256,
+    load_cohort_assignment,
+    load_dataset_pointer,
+    load_run_config,
+)
+from scripts.evaluate_reasoning_v3_run import evaluate_run
+from scripts.generate_aws_reasoning_configs import generate
+from scripts.package_aws_reasoning_v3 import build_package, verify_package
+from train.model import GPT, GPTConfig
+
+
+ROOT = Path(__file__).resolve().parents[1]
+MANIFEST = ROOT / "cluster" / "aws" / "reasoning-v3-corpus-manifest.json"
+PROFILE = ROOT / "cluster" / "profiles" / "aws-p5-p6.example.json"
+
+
+def _sha(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _write_json(path: Path, value: object) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n")
+
+
+def _tiny_transfer(tmp_path: Path, monkeypatch) -> tuple[Path, Path, dict[str, bytes]]:
+    remote = tmp_path / "remote"
+    sources = tmp_path / "repository"
+    token_segments = {
+        "base/packed/targets.bin": np.arange(12, dtype=np.uint16).tobytes(),
+        "extension/packed/targets.bin": np.arange(12, 20, dtype=np.uint16).tobytes(),
+        "base/sidecars/dense_target_weights.bin": bytes([1] * 12),
+        "base/sidecars/split90_target_weights.bin": bytes([1, 0] * 6),
+        "extension/sidecars/shared_target_weights.bin": bytes([1] * 8),
+        "extension/records/manifest.bin": b"tiny-record-manifest",
+    }
+    base_receipt = {
+        "contract_id": "memorysplit-parallel-corpus-v2",
+        "raw_target_tokens": 7_120_879_616,
+        "task4_publication": {"receipt_sha256": "c" * 64},
+    }
+    extension_receipt = {
+        "base_corpus": {"receipt_sha256": "c" * 64},
+        "composite": {
+            "raw_target_tokens": 20,
+            "stream_sha256": {},
+        },
+        "contract_id": corpus.CONTRACT_ID,
+    }
+    packed_sha = hashlib.sha256(
+        token_segments["base/packed/targets.bin"]
+        + token_segments["extension/packed/targets.bin"]
+    ).hexdigest()
+    dense_sha = hashlib.sha256(
+        token_segments["base/sidecars/dense_target_weights.bin"]
+        + token_segments["extension/sidecars/shared_target_weights.bin"]
+    ).hexdigest()
+    split_sha = hashlib.sha256(
+        token_segments["base/sidecars/split90_target_weights.bin"]
+        + token_segments["extension/sidecars/shared_target_weights.bin"]
+    ).hexdigest()
+    composite = {
+        "dense_target_weights": dense_sha,
+        "packed_targets": packed_sha,
+        "split90_target_weights": split_sha,
+    }
+    extension_receipt["composite"]["stream_sha256"] = composite
+    receipt_bytes = (
+        json.dumps(extension_receipt, indent=2, sort_keys=True) + "\n"
+    ).encode()
+    virtual_receipt = hashlib.sha256(receipt_bytes).hexdigest()
+    pointer = {
+        "expected_composite_stream_sha256": composite,
+        "expected_receipt_sha256": virtual_receipt,
+        "launch_gate_status": "frozen",
+    }
+    pointer_bytes = (json.dumps(pointer, indent=2, sort_keys=True) + "\n").encode()
+    frozen = {
+        "composite_stream_sha256": composite,
+        "pointer_sha256": hashlib.sha256(pointer_bytes).hexdigest(),
+        "receipt_sha256": virtual_receipt,
+    }
+    files = {
+        **token_segments,
+        "base/receipt.json": (
+            json.dumps(base_receipt, indent=2, sort_keys=True) + "\n"
+        ).encode(),
+        "extension/receipt.json": receipt_bytes,
+        "locks/reasoning-pointer.json": pointer_bytes,
+        "locks/FROZEN.json": (
+            json.dumps(frozen, indent=2, sort_keys=True) + "\n"
+        ).encode(),
+    }
+    objects = []
+    for relative, data in sorted(files.items()):
+        source_path = f"sources/{relative}"
+        objects.append(
+            {
+                "bytes": len(data),
+                "path": relative,
+                "sha256": hashlib.sha256(data).hexdigest(),
+                "source_path": source_path,
+            }
+        )
+        for root, path in (
+            (remote, relative),
+            (sources, source_path),
+        ):
+            destination = root / path
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.write_bytes(data)
+    manifest_value = {
+        "composite_stream_sha256": composite,
+        "contract_id": corpus.CONTRACT_ID,
+        "format": corpus.TRANSFER_FORMAT,
+        "objects": objects,
+        "raw_target_tokens": 20,
+        "schema_version": 1,
+        "virtual_receipt_sha256": virtual_receipt,
+    }
+    manifest = tmp_path / "manifest.json"
+    _write_json(manifest, manifest_value)
+    monkeypatch.setattr(corpus, "RAW_TARGET_TOKENS", 20)
+    monkeypatch.setattr(corpus, "VIRTUAL_RECEIPT_SHA256", virtual_receipt)
+    monkeypatch.setattr(corpus, "EXPECTED_COMPOSITE_STREAM_SHA256", composite)
+    monkeypatch.setattr(corpus, "EXPECTED_OBJECTS", tuple(objects))
+    monkeypatch.setattr(corpus, "TRANSFER_MANIFEST_SHA256", _sha(manifest))
+    return manifest, remote, files
+
+
+def test_checked_in_aws_contract_is_frozen_and_all_configs_are_exact():
+    manifest = load_transfer_manifest(MANIFEST)
+    assert manifest.sha256 == TRANSFER_MANIFEST_SHA256
+    assert len(manifest.objects) == 10
+    load_dataset_pointer(ROOT / "DATASET-POINTER-AWS-135M-V3.json")
+    assignment = load_cohort_assignment(
+        ROOT / "configs" / "cohort-assignment-135m-v3-aws-n10.json"
+    )
+    assert assignment["raw_target_tokens"] == RAW_TARGETS
+    assert assignment["terminal_updates"] == TERMINAL_UPDATES
+    for seed in range(10):
+        for arm in ("dense", "split90"):
+            cfg = load_run_config(
+                ROOT / "configs" / "135m-v3" / f"{arm}-s{seed}.yaml",
+                root=ROOT,
+            )
+            assert len(cfg["train_bin"]) == len(cfg["train_mask"]) == 2
+            assert cfg["dataset"]["scientific_scope"].startswith("successor_")
+    assert generate(ROOT, write=False) == []
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "https://bucket/key",
+        "s3://UPPER/key",
+        "s3://bucket/../key",
+        "s3://bucket/key?versionId=unbound",
+        "s3://127.0.0.1/key",
+        "s3://bucket/key\n--profile=other",
+    ],
+)
+def test_s3_uri_parser_rejects_ambiguous_or_injectable_values(value):
+    with pytest.raises(AwsCorpusError):
+        parse_s3_uri(value)
+    assert parse_s3_uri("s3://valid-private-bucket/frozen/v3") == (
+        "valid-private-bucket",
+        "frozen/v3",
+    )
+
+
+def test_s3_stage_is_hash_gated_atomic_and_idempotent(tmp_path, monkeypatch):
+    manifest, remote, _ = _tiny_transfer(tmp_path, monkeypatch)
+    destination = tmp_path / "staged"
+    calls = []
+
+    def runner(command):
+        calls.append(command)
+        assert command[:3] == ["aws", "s3", "cp"]
+        relative = command[3].split("/frozen/v3/", 1)[1]
+        target = Path(command[4])
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(remote / relative, target)
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    report = stage_from_s3(
+        "s3://valid-private-bucket/frozen/v3",
+        destination,
+        manifest,
+        apply=True,
+        runner=runner,
+    )
+    assert report["already_present"] is False
+    assert len(calls) == len(corpus.EXPECTED_OBJECTS)
+    evidence = verify_staged_corpus(destination, manifest)
+    assert evidence.raw_target_tokens == 20
+    second = stage_from_s3(
+        "s3://valid-private-bucket/frozen/v3",
+        destination,
+        manifest,
+        apply=True,
+        runner=lambda command: pytest.fail(f"unexpected download: {command}"),
+    )
+    assert second["already_present"] is True
+    (destination / "extension/packed/targets.bin").write_bytes(b"tampered")
+    with pytest.raises(AwsCorpusError, match="differs"):
+        verify_staged_corpus(destination, manifest)
+
+
+def test_s3_upload_uses_kms_metadata_and_never_a_shell(tmp_path, monkeypatch):
+    manifest, _, _ = _tiny_transfer(tmp_path, monkeypatch)
+    repository = tmp_path / "repository"
+    uploaded: set[str] = set()
+    commands = []
+
+    def runner(command):
+        assert isinstance(command, list)
+        commands.append(command)
+        if command[1:3] == ["s3api", "head-object"]:
+            key = command[command.index("--key") + 1]
+            relative = key.split("frozen/v3/", 1)[1]
+            item = next(value for value in corpus.EXPECTED_OBJECTS if value["path"] == relative)
+            if relative in uploaded:
+                return SimpleNamespace(returncode=0, stdout=item["sha256"] + "\n", stderr="")
+            return SimpleNamespace(returncode=255, stdout="", stderr="404 Not Found")
+        relative = command[4].split("/frozen/v3/", 1)[1]
+        uploaded.add(relative)
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    report = upload_to_s3(
+        repository,
+        manifest,
+        "s3://valid-private-bucket/frozen/v3",
+        kms_key_id="alias/memorysplit",
+        apply=True,
+        runner=runner,
+    )
+    assert report["uploaded"] == len(corpus.EXPECTED_OBJECTS)
+    uploads = [command for command in commands if command[1:3] == ["s3", "cp"]]
+    assert all("--sse-kms-key-id" in command for command in uploads)
+    assert all("--metadata" in command for command in uploads)
+
+
+def test_aws_profile_and_parallelcluster_template_scale_from_zero():
+    profile = load_profile(PROFILE)
+    assert profile.platform == "aws"
+    assert profile.gpus_per_pair == 2
+    template = yaml.safe_load(
+        (
+            ROOT
+            / "cluster/aws/parallelcluster/memorysplit-v3-p5.example.yaml"
+        ).read_text()
+    )
+    queue = template["Scheduling"]["SlurmQueues"][0]
+    assert queue["Name"] == profile.partition
+    assert queue["ComputeResources"][0]["MinCount"] == 0
+    assert queue["ComputeResources"][0]["MaxCount"] == 3
+    assert template["HeadNode"]["Imds"]["Secured"] is True
+    assert template["SharedStorage"][0]["EfsSettings"]["DeletionPolicy"] == "Retain"
+
+
+def test_aws_readiness_inspection_is_read_only_and_reports_p_offerings():
+    commands = []
+    responses = [
+        {
+            "Account": "123456789012",
+            "Arn": "arn:aws:sts::123456789012:assumed-role/test/session",
+            "UserId": "fixture",
+        },
+        {
+            "InstanceTypeOfferings": [
+                {"InstanceType": "p5.48xlarge", "Location": "us-east-1a"},
+                {"InstanceType": "p5.48xlarge", "Location": "us-east-1f"},
+            ]
+        },
+        [
+            {
+                "Adjustable": True,
+                "QuotaCode": "L-417A185B",
+                "QuotaName": "Running On-Demand P instances",
+                "Unit": "None",
+                "Value": 192.0,
+            }
+        ],
+    ]
+
+    def runner(command):
+        commands.append(command)
+        return SimpleNamespace(
+            returncode=0,
+            stdout=json.dumps(responses[len(commands) - 1]),
+            stderr="",
+        )
+
+    report = inspect_aws_readiness(region="us-east-1", runner=runner)
+    assert report["account"] == "123456789012"
+    assert report["instance_type_availability_zones"]["p5.48xlarge"] == [
+        "us-east-1a",
+        "us-east-1f",
+    ]
+    assert all(command[1] in {"ec2", "service-quotas", "sts"} for command in commands)
+
+
+def test_aws_instantiate_submit_resume_status_and_collect(tmp_path, monkeypatch):
+    evidence = StagedCorpus(
+        root=(tmp_path / "dataset").resolve(),
+        manifest_sha256=TRANSFER_MANIFEST_SHA256,
+        virtual_receipt_sha256=VIRTUAL_RECEIPT_SHA256,
+        raw_target_tokens=RAW_TARGETS,
+        composite_stream_sha256=COMPOSITE_STREAM_SHA256,
+    )
+    monkeypatch.setattr(
+        aws_operations,
+        "verify_staged_corpus",
+        lambda *args, **kwargs: evidence,
+    )
+    result = aws_operations.instantiate_aws(
+        dataset_root=tmp_path / "dataset",
+        pointer_path=ROOT / "DATASET-POINTER-AWS-135M-V3.json",
+        transfer_manifest_path=MANIFEST,
+        profile_path=PROFILE,
+        runtime_root=tmp_path / "runtime",
+        out_root=tmp_path / "outputs",
+        repository_root=ROOT,
+        seeds=(0,),
+    )
+    pair_path = result["pair_manifests"][0]
+    pair = load_pair_manifest(pair_path)
+    assert pair["cohort_id"] == COHORT_ID
+    command = plan_sbatch(
+        pair_path,
+        profile=load_profile(PROFILE),
+        action="train",
+        mode="functional",
+        venv_root=tmp_path / "venv",
+    )
+    assert command[0] == "sbatch"
+    assert "--gres=gpu:2" in command
+    submitted = submit(
+        [pair_path],
+        profile_path=PROFILE,
+        mode="functional",
+        venv_root=tmp_path / "venv",
+        apply=True,
+        runner=lambda command: SimpleNamespace(
+            returncode=0,
+            stdout="Submitted batch job 1",
+            stderr="",
+        ),
+    )
+    assert submitted["exit_code"] == 0
+
+    for arm in pair["arms"]:
+        output = Path(arm["out_dir"])
+        output.mkdir(parents=True)
+        torch.save(
+            {"step": 100, "data": {"cursor": 52_428_800, "epoch": 0}},
+            output / "ckpt.pt",
+        )
+    preflight = tmp_path / "preflight.json"
+    _write_json(
+        preflight,
+        {
+            "canaries": {
+                "exact_paired_resume": {"passed": True},
+                "one_hundred_update_throughput_oom": {
+                    "oom_detected": False,
+                    "passed": True,
+                },
+                "one_update_functional": {"passed": True},
+            },
+            "cohort_id": COHORT_ID,
+            "dataset_receipt_sha256": VIRTUAL_RECEIPT_SHA256,
+            "profile_sha256": load_profile(PROFILE).sha256,
+            "schema_version": 1,
+            "site_id": "aws-parallelcluster",
+        },
+    )
+    resumed = resume(
+        pair_path,
+        profile_path=PROFILE,
+        venv_root=tmp_path / "venv",
+        preflight_path=preflight,
+        runner=lambda command: SimpleNamespace(returncode=0, stdout="ok", stderr=""),
+    )
+    assert resumed["dry_run"] is True
+    assert resumed["resume_state"]["step"] == 100
+
+    evidence_root = tmp_path / "runtime" / "evidence"
+    for action in ("train", "evaluate"):
+        _write_json(
+            evidence_root / f"{pair['pair_id']}-{action}-evidence.json",
+            {"status": "completed"},
+        )
+    state = status([pair_path], evidence_root=evidence_root)
+    assert state["pairs"][0]["status"] == "completed"
+    collection = collect(
+        [pair_path],
+        evidence_root=evidence_root,
+        output=tmp_path / "collection.json",
+    )
+    assert collection.is_file()
+
+
+def test_reasoning_v3_operational_evaluation_crosses_segment_boundary(tmp_path):
+    run = tmp_path / "run"
+    run.mkdir()
+    ctx = 8
+    tokens = [
+        np.arange(64, dtype=np.uint16),
+        np.arange(64, 128, dtype=np.uint16),
+    ]
+    masks = [
+        np.ones(64, dtype=np.uint8),
+        np.ones(64, dtype=np.uint8),
+    ]
+    token_paths, mask_paths = [], []
+    for index, (token, mask) in enumerate(zip(tokens, masks)):
+        token_path = tmp_path / f"tokens-{index}.bin"
+        mask_path = tmp_path / f"weights-{index}.bin"
+        token.tofile(token_path)
+        mask.tofile(mask_path)
+        token_paths.append(str(token_path))
+        mask_paths.append(str(mask_path))
+    model_cfg = {
+        "n_layer": 1,
+        "n_head": 2,
+        "d_model": 32,
+        "ctx": ctx,
+        "vocab_size": 50304,
+    }
+    cfg = {
+        "dataset": {"contract_id": "memorysplit-reasoning-dataset-v3"},
+        "dataset_receipt_sha256": VIRTUAL_RECEIPT_SHA256,
+        "max_steps": TERMINAL_UPDATES,
+        "micro_batch_size": 2,
+        "model": model_cfg,
+        "run_id": "fixture",
+        "seed": 0,
+        "tokens_per_step": 524288,
+        "total_tokens": RAW_TARGETS,
+        "train_bin": token_paths,
+        "train_mask": mask_paths,
+    }
+    (run / "config.yaml").write_text(yaml.safe_dump(cfg, sort_keys=False))
+    model = GPT(GPTConfig(**model_cfg))
+    torch.save(
+        {
+            "data": {"cursor": RAW_TARGETS, "epoch": 1},
+            "model": model.state_dict(),
+            "step": TERMINAL_UPDATES,
+        },
+        run / "ckpt.pt",
+    )
+    summary = evaluate_run(run, device="cpu")
+    assert summary["evaluation_scope"] == "operational_integrity_only"
+    assert summary["targets_evaluated"] == 16
+    assert summary["target_weight_sum"] == 16
+
+
+def test_aws_execution_package_is_deterministic_and_contains_no_corpus(tmp_path):
+    first = build_package(
+        tmp_path / "first.zip",
+        source_root=ROOT,
+        require_clean=False,
+    )
+    second = build_package(
+        tmp_path / "second.zip",
+        source_root=ROOT,
+        require_clean=False,
+    )
+    assert first.read_bytes() == second.read_bytes()
+    report = verify_package(first, source_root=ROOT)
+    assert report["verified"] is True
+    with __import__("zipfile").ZipFile(first) as archive:
+        names = archive.namelist()
+    assert not any(name.startswith("corpus-build/") for name in names)
+    assert "docs/AWS-135M-REASONING-V3-RUNBOOK.md" in names

@@ -1,0 +1,63 @@
+Region: us-east-1
+Image:
+  Os: ubuntu2204
+HeadNode:
+  InstanceType: c7i.2xlarge
+  Imds:
+    Secured: true
+  LocalStorage:
+    RootVolume:
+      DeleteOnTermination: true
+      Encrypted: true
+      Size: 100
+      VolumeType: gp3
+  Networking:
+    SubnetId: subnet-REPLACE
+  Ssh:
+    KeyName: memorysplit-REPLACE
+  Iam:
+    S3Access:
+      - BucketName: memorysplit-REPLACE
+        KeyName: corpus/REPLACE/*
+        EnableWriteAccess: false
+      - BucketName: memorysplit-REPLACE
+        KeyName: evidence/REPLACE/*
+        EnableWriteAccess: true
+    AdditionalIamPolicies:
+      - Policy: arn:aws:iam::REPLACE:policy/memorysplit-kms-REPLACE
+Scheduling:
+  Scheduler: slurm
+  SlurmSettings:
+    ScaledownIdletime: 5
+  SlurmQueues:
+    - Name: gpu
+      CapacityType: ONDEMAND
+      ComputeResources:
+        - Name: p5
+          InstanceType: p5.48xlarge
+          MinCount: 0
+          MaxCount: 3
+          Efa:
+            Enabled: true
+      ComputeSettings:
+        LocalStorage:
+          RootVolume:
+            DeleteOnTermination: true
+            Encrypted: true
+            Size: 200
+            VolumeType: gp3
+      Networking:
+        PlacementGroup:
+          Enabled: true
+        SubnetIds:
+          - subnet-REPLACE
+SharedStorage:
+  - MountDir: /shared
+    Name: memorysplit
+    StorageType: Efs
+    EfsSettings:
+      DeletionPolicy: Retain
+      Encrypted: true
+      KmsKeyId: arn:aws:kms:us-east-1:REPLACE:key/REPLACE
+      PerformanceMode: generalPurpose
+      ThroughputMode: elastic

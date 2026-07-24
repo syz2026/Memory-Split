@@ -6,9 +6,24 @@ import json
 from pathlib import Path
 from typing import Any
 
-from msctl.cohort import ARMS, COHORT_ID, SEEDS
+from msctl.cohort import ARMS, COHORT_ID, SEEDS, config_path
 from msctl.preflight import validate_preflight
 from msctl.profile import SlurmProfile
+from msctl.reasoning_cohort import (
+    COHORT_ID as REASONING_COHORT_ID,
+)
+from msctl.reasoning_cohort import (
+    SEEDS as REASONING_SEEDS,
+)
+from msctl.reasoning_cohort import (
+    config_path as reasoning_config_path,
+)
+from msctl.reasoning_cohort import (
+    pair_id as reasoning_pair_id,
+)
+from msctl.reasoning_cohort import (
+    run_id as reasoning_run_id,
+)
 
 
 TRAIN_SCRIPT = "cluster/slurm/v2_pair_train.sbatch"
@@ -19,6 +34,22 @@ _HEX = frozenset("0123456789abcdef")
 
 def _is_sha(value: object) -> bool:
     return isinstance(value, str) and len(value) == 64 and set(value) <= _HEX
+
+
+def _cell_identity(cohort_id: object, arm: str, seed: int) -> tuple[str, str, str]:
+    if cohort_id == COHORT_ID and seed in SEEDS:
+        return (
+            f"d135m_full_s{seed}",
+            f"d135m_{arm}_full_s{seed}",
+            config_path(arm, seed),
+        )
+    if cohort_id == REASONING_COHORT_ID and seed in REASONING_SEEDS:
+        return (
+            reasoning_pair_id(seed),
+            reasoning_run_id(arm, seed),
+            reasoning_config_path(arm, seed),
+        )
+    raise ValueError("pair manifest cohort or seed is invalid")
 
 
 def load_pair_manifest(path: Path | str) -> dict[str, Any]:
@@ -45,12 +76,15 @@ def load_pair_manifest(path: Path | str) -> dict[str, Any]:
     if not isinstance(raw, dict) or set(raw) != required:
         raise ValueError("pair manifest fields do not match the protected schema")
     seed = raw["seed"]
+    if isinstance(seed, bool) or not isinstance(seed, int):
+        raise ValueError("pair manifest identity is invalid")
+    try:
+        expected_pair, _, _ = _cell_identity(raw["cohort_id"], ARMS[0], seed)
+    except ValueError as error:
+        raise ValueError("pair manifest identity is invalid") from error
     if (
         raw["schema_version"] != 1
-        or raw["cohort_id"] != COHORT_ID
-        or isinstance(seed, bool)
-        or seed not in SEEDS
-        or raw["pair_id"] != f"d135m_full_s{seed}"
+        or raw["pair_id"] != expected_pair
         or not _is_sha(raw["profile_sha256"])
     ):
         raise ValueError("pair manifest identity is invalid")
@@ -81,8 +115,14 @@ def load_pair_manifest(path: Path | str) -> dict[str, Any]:
         raise ValueError("pair manifest arms must be ordered Dense then Split90")
     for item in arms:
         arm = item["arm"]
+        _, expected_run, expected_config = _cell_identity(
+            raw["cohort_id"],
+            arm,
+            seed,
+        )
         if (
-            item["run_id"] != f"d135m_{arm}_full_s{seed}"
+            item["run_id"] != expected_run
+            or item["config_path"] != expected_config
             or not _is_sha(item["config_sha256"])
             or not _is_sha(item["runtime_config_sha256"])
         ):
@@ -137,6 +177,7 @@ def plan_sbatch(
             preflight,
             profile=profile,
             dataset_receipt_sha256=pair["dataset"]["receipt_sha256"],
+            cohort_id=pair["cohort_id"],
         )
 
     command = ["sbatch", f"--partition={profile.partition}"]

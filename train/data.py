@@ -12,6 +12,8 @@ run continues on the exact next batch.
 
 from __future__ import annotations
 
+from bisect import bisect_right
+from collections.abc import Sequence
 from pathlib import Path
 
 import numpy as np
@@ -21,8 +23,8 @@ import torch
 class PackedShards:
     def __init__(
         self,
-        bin_path: str | Path,
-        mask_path: str | Path | None,
+        bin_path: str | Path | Sequence[str | Path],
+        mask_path: str | Path | Sequence[str | Path] | None,
         ctx: int,
         batch_size: int,
         device: str = "cpu",
@@ -30,19 +32,52 @@ class PackedShards:
         seed: int = 0,
     ):
         del seed
-        token_path = Path(bin_path)
-        if not token_path.is_file() or token_path.is_symlink():
-            raise ValueError("token stream is missing, symlinked, or unsafe")
-        self.tokens = np.memmap(token_path, dtype=np.uint16, mode="r")
+
+        def paths(
+            value: str | Path | Sequence[str | Path],
+            *,
+            label: str,
+        ) -> tuple[Path, ...]:
+            values: Sequence[str | Path]
+            if isinstance(value, (str, Path)):
+                values = (value,)
+            elif isinstance(value, Sequence) and value:
+                values = value
+            else:
+                raise ValueError(f"{label} must contain at least one path")
+            result = tuple(Path(item) for item in values)
+            if any(not path.is_file() or path.is_symlink() for path in result):
+                raise ValueError(f"{label} is missing, symlinked, or unsafe")
+            return result
+
+        token_paths = paths(bin_path, label="token stream")
+        self._tokens = tuple(
+            np.memmap(path, dtype=np.uint16, mode="r") for path in token_paths
+        )
+        if any(len(stream) == 0 for stream in self._tokens):
+            raise ValueError("token stream segments must be non-empty")
         if mask_path is not None:
-            target_mask_path = Path(mask_path)
-            if not target_mask_path.is_file() or target_mask_path.is_symlink():
-                raise ValueError("target-weight stream is missing, symlinked, or unsafe")
-            self.mask = np.memmap(target_mask_path, dtype=np.uint8, mode="r")
-            if len(self.mask) != len(self.tokens):
-                raise ValueError("mask/token length mismatch")
+            mask_paths = paths(mask_path, label="target-weight stream")
+            if len(mask_paths) != len(token_paths):
+                raise ValueError("mask/token segment count mismatch")
+            self._masks = tuple(
+                np.memmap(path, dtype=np.uint8, mode="r") for path in mask_paths
+            )
+            if any(
+                len(mask) != len(tokens)
+                for mask, tokens in zip(self._masks, self._tokens)
+            ):
+                raise ValueError("mask/token segment length mismatch")
         else:
-            self.mask = None
+            self._masks = None
+        self.tokens = self._tokens[0] if len(self._tokens) == 1 else self._tokens
+        self.mask = (
+            None
+            if self._masks is None
+            else self._masks[0]
+            if len(self._masks) == 1
+            else self._masks
+        )
         if (
             isinstance(ctx, bool)
             or not isinstance(ctx, int)
@@ -62,25 +97,37 @@ class PackedShards:
         self.batch_size = batch_size
         self.device = device
         self.cursor = start_cursor
-        self.n_tokens = len(self.tokens)
+        self._segment_ends = []
+        for stream in self._tokens:
+            self._segment_ends.append(
+                (self._segment_ends[-1] if self._segment_ends else 0) + len(stream)
+            )
+        self.n_tokens = self._segment_ends[-1]
         self.epoch = start_cursor // self.n_tokens if self.n_tokens else 0
         target_count = self.batch_size * self.ctx
         if self.n_tokens < target_count:
             raise ValueError("corpus smaller than one batch")
 
     def _window(self, start: int, length: int) -> tuple[np.ndarray, np.ndarray | None]:
-        def read(stream: np.memmap) -> np.ndarray:
-            result = np.empty(length, dtype=stream.dtype)
+        def read(streams: tuple[np.memmap, ...]) -> np.ndarray:
+            result = np.empty(length, dtype=streams[0].dtype)
             position = start % self.n_tokens
             written = 0
             while written < length:
-                take = min(length - written, self.n_tokens - position)
-                result[written : written + take] = stream[position : position + take]
+                segment = bisect_right(self._segment_ends, position)
+                segment_start = 0 if segment == 0 else self._segment_ends[segment - 1]
+                offset = position - segment_start
+                stream = streams[segment]
+                take = min(length - written, len(stream) - offset)
+                result[written : written + take] = stream[offset : offset + take]
                 written += take
                 position = (position + take) % self.n_tokens
             return result
 
-        return read(self.tokens), read(self.mask) if self.mask is not None else None
+        return (
+            read(self._tokens),
+            read(self._masks) if self._masks is not None else None,
+        )
 
     def _next_arrays(self) -> tuple[np.ndarray, np.ndarray, np.ndarray | None]:
         target_count = self.batch_size * self.ctx

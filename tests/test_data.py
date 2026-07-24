@@ -125,3 +125,56 @@ def test_dense_arm_no_mask_file(tmp_path):
     _, y = ds.next_batch()
     assert (y == -100).sum() == 0
     assert ds.masked_value_batch() is None
+
+
+def test_segmented_stream_crosses_boundary_and_wraps_exactly(tmp_path):
+    token_paths = []
+    mask_paths = []
+    for index, values in enumerate(
+        (
+            np.arange(24, dtype=np.uint16),
+            np.arange(24, 48, dtype=np.uint16),
+        )
+    ):
+        token_path = tmp_path / f"tokens-{index}.bin"
+        mask_path = tmp_path / f"weights-{index}.bin"
+        values.tofile(token_path)
+        np.ones(len(values), dtype=np.uint8).tofile(mask_path)
+        token_paths.append(token_path)
+        mask_paths.append(mask_path)
+
+    ds = PackedShards(
+        token_paths,
+        mask_paths,
+        ctx=8,
+        batch_size=2,
+        start_cursor=16,
+    )
+    targets = []
+    for _ in range(3):
+        _, y, weights = ds.next_weighted_batch()
+        targets.extend(y.flatten().tolist())
+        assert weights.sum() == 16
+
+    assert targets == [*range(17, 48), *range(17)]
+    assert ds.state_dict() == {"cursor": 64, "epoch": 1}
+
+
+def test_segmented_stream_rejects_misaligned_segments(tmp_path):
+    first_root = tmp_path / "first"
+    second_root = tmp_path / "second"
+    first_root.mkdir()
+    second_root.mkdir()
+    first, first_mask = make_shards(first_root, n=64)
+    second, second_mask = make_shards(second_root, n=64)
+    with pytest.raises(ValueError, match="segment count"):
+        PackedShards([first, second], [first_mask], ctx=8, batch_size=2)
+
+    np.ones(63, dtype=np.uint8).tofile(second_mask)
+    with pytest.raises(ValueError, match="segment length"):
+        PackedShards(
+            [first, second],
+            [first_mask, second_mask],
+            ctx=8,
+            batch_size=2,
+        )

@@ -102,6 +102,22 @@ def test_receipt_v2_training_uses_direct_weights_over_raw_targets(tmp_path):
     assert row["loss"] == round(expected, 4)
 
 
+def test_reasoning_v3_segmented_training_uses_direct_weights(tmp_path):
+    first_root = tmp_path / "first"
+    second_root = tmp_path / "second"
+    first_root.mkdir()
+    second_root.mkdir()
+    first_bin, first_mask = write_corpus(first_root, n=20_000)
+    second_bin, second_mask = write_corpus(second_root, n=20_000, seed=1)
+    cfg = base_cfg(tmp_path, [first_bin, second_bin], [first_mask, second_mask])
+    cfg["max_steps"] = 1
+    cfg["dataset"] = {"contract_id": "memorysplit-reasoning-dataset-v3"}
+    trainer = Trainer(cfg)
+    assert trainer.direct_target_weights is True
+    trainer.train_steps()
+    assert trainer.data.state_dict()["cursor"] == cfg["tokens_per_step"]
+
+
 def test_cosine_schedule():
     assert cosine_lr(0, 1.0, 10, 100) < 0.2
     assert abs(cosine_lr(10, 1.0, 10, 100) - 1.0) < 0.01

@@ -12,6 +12,7 @@ from cluster.corpus_contract import sha256_file
 from msctl.cohort import COHORT_ID
 from msctl.manifest import write_json_no_replace
 from msctl.profile import SlurmProfile
+from msctl.reasoning_cohort import COHORT_ID as REASONING_COHORT_ID
 
 
 CANARY_NAMES = (
@@ -46,7 +47,10 @@ def validate_preflight(
     *,
     profile: SlurmProfile,
     dataset_receipt_sha256: str,
+    cohort_id: str = COHORT_ID,
 ) -> dict[str, Any]:
+    if cohort_id not in {COHORT_ID, REASONING_COHORT_ID}:
+        raise ValueError("preflight cohort is not a supported 135M contract")
     raw = load_preflight(path)
     expected_fields = {
         "schema_version",
@@ -61,7 +65,7 @@ def validate_preflight(
     if (
         raw["schema_version"] != 1
         or isinstance(raw["schema_version"], bool)
-        or raw["cohort_id"] != COHORT_ID
+        or raw["cohort_id"] != cohort_id
         or raw["site_id"] != profile.site_id
         or raw["profile_sha256"] != profile.sha256
         or raw["dataset_receipt_sha256"] != dataset_receipt_sha256
@@ -158,9 +162,12 @@ def build_preflight_receipt(
     resume_evidence: Path | str,
     throughput_evidence: Path | str,
     output: Path | str,
+    cohort_id: str = COHORT_ID,
 ) -> Path:
     """Freeze all three measured site canaries into a no-replace receipt."""
 
+    if cohort_id not in {COHORT_ID, REASONING_COHORT_ID}:
+        raise ValueError("preflight cohort is not a supported 135M contract")
     if not _is_sha(dataset_receipt_sha256):
         raise ValueError("dataset receipt identity is not a SHA-256 digest")
     receipt = {
@@ -181,7 +188,7 @@ def build_preflight_receipt(
                 updates=1,
             ),
         },
-        "cohort_id": COHORT_ID,
+        "cohort_id": cohort_id,
         "dataset_receipt_sha256": dataset_receipt_sha256,
         "profile_sha256": profile.sha256,
         "schema_version": 1,
@@ -192,5 +199,6 @@ def build_preflight_receipt(
         path,
         profile=profile,
         dataset_receipt_sha256=dataset_receipt_sha256,
+        cohort_id=cohort_id,
     )
     return path
