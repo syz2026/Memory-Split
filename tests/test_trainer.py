@@ -56,6 +56,10 @@ def file_sha256(path):
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def set_checkpoint_request_parent_group(path):
+    os.chown(path, -1, os.getegid())
+
+
 def tiny_cfg(tmp_path, bp, mp, *, out_name="out", max_steps=2):
     cfg = base_cfg(tmp_path, bp, mp)
     cfg.update(
@@ -150,11 +154,40 @@ def test_checkpoint_request_token_is_canonical_and_arm_bound() -> None:
         )
 
 
+def test_checkpoint_request_token_missing_ok_is_explicit_and_strict_by_default(
+    tmp_path,
+) -> None:
+    parent = tmp_path / "missing"
+    parent.mkdir(mode=0o700)
+    set_checkpoint_request_parent_group(parent)
+    path = parent / "checkpoint-request.json"
+
+    with pytest.raises(FileNotFoundError, match="request token|missing"):
+        safeio.consume_checkpoint_request_token(
+            path,
+            expected_arm="dense",
+            expected_uid=os.geteuid(),
+            expected_gid=os.getegid(),
+        )
+
+    assert (
+        safeio.consume_checkpoint_request_token(
+            path,
+            expected_arm="dense",
+            expected_uid=os.geteuid(),
+            expected_gid=os.getegid(),
+            missing_ok=True,
+        )
+        is None
+    )
+
+
 def test_checkpoint_request_token_publish_is_exclusive_and_substitution_safe(
     tmp_path,
 ) -> None:
     parent = tmp_path / "run"
     parent.mkdir(mode=0o700)
+    set_checkpoint_request_parent_group(parent)
     path = parent / "checkpoint-request.json"
     first = safeio.publish_checkpoint_request_token(
         path,
@@ -196,6 +229,7 @@ def test_checkpoint_request_token_consume_rejects_unsafe_files(
 ) -> None:
     parent = tmp_path / mutation
     parent.mkdir(mode=0o700)
+    set_checkpoint_request_parent_group(parent)
     path = parent / "checkpoint-request.json"
     published = safeio.publish_checkpoint_request_token(
         path,
@@ -235,11 +269,48 @@ def test_checkpoint_request_token_consume_rejects_unsafe_files(
         )
 
 
+def test_checkpoint_request_token_rejects_wrong_parent_gid_before_claim(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    parent = tmp_path / "wrong-parent-gid"
+    parent.mkdir(mode=0o700)
+    set_checkpoint_request_parent_group(parent)
+    path = parent / "checkpoint-request.json"
+    safeio.publish_checkpoint_request_token(
+        path,
+        request_id="d" * 32,
+        arm="dense",
+        owner_uid=os.geteuid(),
+        owner_gid=os.getegid(),
+    )
+    rename_calls = []
+    real_rename = safeio.os.rename
+
+    def recording_rename(*args, **kwargs):
+        rename_calls.append((args, kwargs))
+        return real_rename(*args, **kwargs)
+
+    monkeypatch.setattr(safeio.os, "rename", recording_rename)
+
+    with pytest.raises(ValueError, match="parent|foreign|unsafe"):
+        safeio.consume_checkpoint_request_token(
+            path,
+            expected_arm="dense",
+            expected_uid=os.geteuid(),
+            expected_gid=os.getegid() + 1,
+        )
+
+    assert rename_calls == []
+    assert path.exists()
+
+
 def test_checkpoint_request_token_rejects_symlinked_path_components(
     tmp_path,
 ) -> None:
     real_parent = tmp_path / "real"
     real_parent.mkdir(mode=0o700)
+    set_checkpoint_request_parent_group(real_parent)
     linked_parent = tmp_path / "linked"
     linked_parent.symlink_to(real_parent, target_is_directory=True)
     path = linked_parent / "checkpoint-request.json"
@@ -1096,6 +1167,7 @@ def test_sigusr1_service_consumes_and_binds_exact_request_token(
         lambda signum, handler: installed.__setitem__(signum, handler),
     )
     trainer = Trainer(cfg)
+    set_checkpoint_request_parent_group(trainer.out_dir)
     request_id = "a" * 32
     safeio.publish_checkpoint_request_token(
         token_path,
@@ -1124,7 +1196,7 @@ def test_sigusr1_service_consumes_and_binds_exact_request_token(
     trainer.close()
 
 
-def test_sigusr1_service_fails_closed_until_pending_token_exists(
+def test_sigusr1_service_abandons_cleaned_token_and_services_next_signal(
     tmp_path,
     monkeypatch,
 ):
@@ -1145,10 +1217,18 @@ def test_sigusr1_service_fails_closed_until_pending_token_exists(
         lambda signum, handler: installed.__setitem__(signum, handler),
     )
     trainer = Trainer(cfg)
+    set_checkpoint_request_parent_group(trainer.out_dir)
+    abandoned = safeio.publish_checkpoint_request_token(
+        token_path,
+        request_id="a" * 32,
+        arm="dense",
+        owner_uid=os.geteuid(),
+        owner_gid=os.getegid(),
+    )
     installed[signal.SIGUSR1](signal.SIGUSR1, None)
+    assert safeio.cleanup_checkpoint_request_token(abandoned) is True
 
-    with pytest.raises(FileNotFoundError, match="request token|missing"):
-        trainer._service_checkpoint_request()
+    assert trainer._service_checkpoint_request() is False
     assert not trainer.ckpt_path.exists()
 
     safeio.publish_checkpoint_request_token(
@@ -1158,11 +1238,57 @@ def test_sigusr1_service_fails_closed_until_pending_token_exists(
         owner_uid=os.geteuid(),
         owner_gid=os.getegid(),
     )
+    assert trainer._service_checkpoint_request() is False
+    assert token_path.exists()
+
+    installed[signal.SIGUSR1](signal.SIGUSR1, None)
     assert trainer._service_checkpoint_request() is True
     metadata = json.loads(
         (trainer.out_dir / "ckpt.meta.json").read_text(encoding="ascii")
     )
     assert metadata["request_token"] == "b" * 32
+    assert not token_path.exists()
+    trainer.close()
+
+
+def test_missing_signal_token_preserves_due_periodic_checkpoint(
+    tmp_path,
+    monkeypatch,
+):
+    bp, mp = write_corpus(tmp_path, n=64)
+    cfg = tiny_cfg(tmp_path, bp, mp)
+    cfg["condition"] = "dense"
+    token_path = Path(cfg["out_dir"]) / "checkpoint-request.json"
+    installed = {}
+    monkeypatch.setenv(
+        "MS_CHECKPOINT_REQUEST_TOKEN_FILE",
+        str(token_path),
+    )
+    monkeypatch.setenv("MS_CHECKPOINT_REQUEST_ARM", "dense")
+    monkeypatch.setattr(signal, "getsignal", lambda signum: f"old-{signum}")
+    monkeypatch.setattr(
+        signal,
+        "signal",
+        lambda signum, handler: installed.__setitem__(signum, handler),
+    )
+    trainer = Trainer(cfg)
+    set_checkpoint_request_parent_group(trainer.out_dir)
+    abandoned = safeio.publish_checkpoint_request_token(
+        token_path,
+        request_id="c" * 32,
+        arm="dense",
+        owner_uid=os.geteuid(),
+        owner_gid=os.getegid(),
+    )
+    installed[signal.SIGUSR1](signal.SIGUSR1, None)
+    assert safeio.cleanup_checkpoint_request_token(abandoned) is True
+
+    assert trainer._service_checkpoint_request(checkpoint_due=True) is False
+    metadata = json.loads(
+        (trainer.out_dir / "ckpt.meta.json").read_text(encoding="ascii")
+    )
+    assert trainer.ckpt_path.exists()
+    assert metadata["request_token"] is None
     trainer.close()
 
 
@@ -1187,6 +1313,7 @@ def test_periodic_checkpoint_does_not_consume_pending_signal_token(
         lambda signum, handler: installed.__setitem__(signum, handler),
     )
     trainer = Trainer(cfg)
+    set_checkpoint_request_parent_group(trainer.out_dir)
     safeio.publish_checkpoint_request_token(
         token_path,
         request_id="c" * 32,

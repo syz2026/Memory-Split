@@ -891,8 +891,12 @@ class Trainer:
             master_requested = generation != self._checkpoint_request_consumed
         requested = self._broadcast_master_bool(master_requested)
         request_token = None
+        request_acknowledged = requested
         if requested:
-            token_holder: dict[str, str | None] = {"request_token": None}
+            token_holder: dict[str, str | bool | None] = {
+                "request_token": None,
+                "token_present": True,
+            }
 
             def consume_pending_token() -> None:
                 if (
@@ -906,7 +910,11 @@ class Trainer:
                         expected_arm=self.checkpoint_request_arm,
                         expected_uid=os.geteuid(),
                         expected_gid=os.getegid(),
+                        missing_ok=True,
                     )
+                )
+                token_holder["token_present"] = (
+                    token_holder["request_token"] is not None
                 )
 
             self._rank0_action(
@@ -914,12 +922,20 @@ class Trainer:
                 "checkpoint request token consumption",
             )
             request_token = token_holder["request_token"]
+            assert isinstance(request_token, str) or request_token is None
+            request_acknowledged = self._broadcast_master_bool(
+                bool(token_holder["token_present"])
+            )
             if self.is_master:
                 assert generation is not None
                 self._checkpoint_request_consumed = generation
-        if requested or checkpoint_due:
-            self.save_ckpt(request_token=request_token)
-        return requested
+        if request_acknowledged or checkpoint_due:
+            self.save_ckpt(
+                request_token=(
+                    request_token if request_acknowledged else None
+                )
+            )
+        return request_acknowledged
 
     def close(self) -> None:
         if getattr(self, "is_master", False):

@@ -249,6 +249,7 @@ def _validate_checkpoint_request_parent(
     if (
         not stat.S_ISDIR(metadata.st_mode)
         or metadata.st_uid != owner_uid
+        or metadata.st_gid != owner_gid
         or stat.S_IMODE(metadata.st_mode) & 0o022
     ):
         raise ValueError(
@@ -524,7 +525,10 @@ def consume_checkpoint_request_token(
     expected_arm: str,
     expected_uid: int,
     expected_gid: int,
-) -> str:
+    missing_ok: bool = False,
+) -> str | None:
+    if type(missing_ok) is not bool:
+        raise ValueError("missing_ok must be boolean")
     request_id = _claim_checkpoint_request_token(
         Path(path),
         expected_arm=expected_arm,
@@ -532,9 +536,10 @@ def consume_checkpoint_request_token(
         owner_gid=expected_gid,
         expected_request_id=None,
         expected_identity=None,
-        missing_ok=False,
+        missing_ok=missing_ok,
     )
-    assert request_id is not None
+    if request_id is None:
+        assert missing_ok
     return request_id
 
 

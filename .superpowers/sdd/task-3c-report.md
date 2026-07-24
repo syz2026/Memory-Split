@@ -1036,3 +1036,152 @@ the two corrections above.
 - No live paid AWS, P5, Docker, NCCL, IMDS, or versioned S3 operation was
   performed; the failure, process, launcher, trainer, resume, and package
   boundaries use deterministic local tests.
+
+## Task 3C.2: cleaned request tokens are abandoned
+
+Status: implementation complete with one Darwin test-fixture concern, starting
+from exact base `96d6223a427b6717c01132977e6c6464856e01f4`.
+
+Implementation commit: this commit —
+`fix: abandon cleaned checkpoint requests`.
+
+### Fix and scope
+
+1. `consume_checkpoint_request_token` now has an explicit
+   `missing_ok: bool = False` boundary. The default remains strict and raises
+   `FileNotFoundError`; when a token exists, all arm, owner, mode, link,
+   identity, request-ID, and canonical-byte checks are unchanged.
+2. Rank zero services a signaled schema-v3 request with `missing_ok=True`,
+   broadcasts token presence to all ranks, and consumes the signal generation
+   even when mirror cleanup already removed the token. An absent token returns
+   `False` and writes no signal checkpoint. A simultaneously due periodic
+   checkpoint is still written with `request_token=None` and returns `False`.
+   The next signal generation can consume and bind the next exact token.
+3. `_validate_checkpoint_request_parent` now requires the expected GID as well
+   as UID before the token is claimed, while preserving the group/world-write
+   rejection.
+
+Only `train/safeio.py`, `train/trainer.py`, `tests/test_trainer.py`,
+`tests/test_ddp_trainer.py`, and this report changed. Mirror timing, receipt
+schemas, token publication/claim integrity, checkpoint payloads, scheduler and
+launcher/controller logic, evaluation, finalization, collection, IaC,
+runbooks, verifier, v2 scientific files, `msctl/operations.py`, and
+`corpusgen/` were not changed.
+
+### RED evidence
+
+The five focused regressions were added before production changes and run on
+the exact `96d6223` implementation:
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 python -m pytest -q -p no:cacheprovider \
+  --basetemp=/private/tmp/memorysplit-v3-task3c2-red \
+  tests/test_trainer.py::test_checkpoint_request_token_missing_ok_is_explicit_and_strict_by_default \
+  tests/test_trainer.py::test_checkpoint_request_token_rejects_wrong_parent_gid_before_claim \
+  tests/test_trainer.py::test_sigusr1_service_abandons_cleaned_token_and_services_next_signal \
+  tests/test_trainer.py::test_missing_signal_token_preserves_due_periodic_checkpoint \
+  tests/test_ddp_trainer.py::test_cpu_gloo_missing_signal_token_is_abandoned_by_all_ranks
+```
+
+Observed: **5 failed** for the intended reasons:
+
+- the public consumer rejected the unknown `missing_ok` argument after the
+  strict-default control raised as required;
+- a wrong parent GID reached `os.rename`, proving claim began before rejection;
+- both single-rank missing-token services raised `FileNotFoundError`;
+- both Gloo ranks raised the coordinated `FileNotFoundError` instead of
+  returning `False`.
+
+### GREEN evidence
+
+The unchanged focused selection after the production fix:
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 python -m pytest -q -p no:cacheprovider \
+  --basetemp=/private/tmp/memorysplit-v3-task3c2-green-final \
+  <the five Task 3C.2 node IDs above>
+```
+
+Result: **5 passed**. This includes strict-default absence, optional absence,
+pre-claim parent-GID rejection, abandoned generation consumption, no tight
+retry, exact next-request metadata, periodic checkpoint preservation, and
+two-rank absence agreement without failure or deadlock.
+
+### Final bounded verification
+
+The required trainer group passed at the requested root:
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 python -m pytest -q -p no:cacheprovider \
+  --basetemp=/private/tmp/memorysplit-v3-task3c2-trainer \
+  tests/test_trainer.py tests/test_ddp_trainer.py
+```
+
+Result: **103 passed**.
+
+The literal required mirror command was also run:
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 python -m pytest -q -p no:cacheprovider \
+  --basetemp=/private/tmp/memorysplit-v3-task3c2-mirror \
+  tests/test_aws_checkpoint_mirror.py \
+  tests/test_checkpoint_mirror_attempt_cleanup.py \
+  tests/test_aws_p5_launcher.py
+```
+
+On this Darwin host, pytest recreates that base as UID 501/GID 0 (`wheel`);
+its child fixture directories therefore have GID 0 while `_request` correctly
+declares runtime GID 20 (`staff`). The newly required parent-GID check rejected
+all 33 token-publishing fixtures before mutation: **198 passed, 33 failed**.
+This is a fixture ownership mismatch exposed by the security fix, not a relaxed
+production check.
+
+The same bounded files were rerun without changing code or tests under a root
+owned by the declared runtime UID/GID:
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 python -m pytest -q -p no:cacheprovider \
+  --basetemp=/Users/stephenzhang/Documents/memorysplit-v3-task3c2-mirror \
+  tests/test_aws_checkpoint_mirror.py \
+  tests/test_checkpoint_mirror_attempt_cleanup.py \
+  tests/test_aws_p5_launcher.py
+```
+
+Result: **231 passed**. Non-overlapping group-matched total: **334 passed**.
+
+Changed-file compilation and static checks:
+
+```bash
+python -m py_compile train/safeio.py train/trainer.py \
+  tests/test_trainer.py tests/test_ddp_trainer.py
+git diff --check
+```
+
+Result: both passed. The final exact allowed-file scope check also passed.
+
+### Self-review
+
+- Missing allowance applies only to the absent filename after safe no-follow
+  parent validation. Every present-token validation and quarantine/restore
+  path is unchanged.
+- Token presence is broadcast after coordinated rank-zero consumption, so all
+  ranks either enter collective checkpoint writing or skip it together.
+- Rank zero records the observed signal generation even for absence. A token
+  published without a new signal remains untouched; the next SIGUSR1 services
+  and records its exact request ID.
+- Periodic behavior is independent of signal acknowledgment: absence suppresses
+  only the abandoned signal checkpoint, never an already-due ordinary save.
+- Parent GID is checked with UID and writability before `os.rename`; the RED
+  rename probe proves no claim starts on a mismatched group.
+- No timing constant, receipt or checkpoint schema, scheduler, controller,
+  launcher, scientific configuration, or excluded subsystem changed.
+
+### Deferred Minor items and concerns
+
+- **Minor, deferred because `tests/test_aws_checkpoint_mirror.py` is explicitly
+  outside Task 3C.2 scope:** make mirror fixtures normalize each token parent
+  to `runtime_gid`, or choose a portable bounded temp root. That would make the
+  literal `/private/tmp` command portable to Darwin without weakening the
+  production GID check.
+- No additional Task 3C.2 code Minor items were found. Earlier Task 3C report
+  concerns remain unchanged.
