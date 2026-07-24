@@ -1051,15 +1051,36 @@ python -m msctl \
 
 Poll with `status --cached` first, then the read-only authoritative status
 path. Verify both arms advance together. The trainer’s `ckpt_minutes: 30`
-creates local atomic generations every 30 minutes. Never upload checkpoints
-with `s3 sync`, wildcards, or symlink-following tools. The v3 interruption and resume
-publishers open one singly linked regular generation with `O_NOFOLLOW`,
-snapshot and rehash exact bytes, and use checksum-bound `s3api put-object`
-with `--if-none-match '*'`, the exact `MS_S3_KMS_KEY_ID`, and seed-scoped keys
+creates local atomic generations every 30 minutes, each accompanied by a
+canonical `checkpoint-meta.json`. Never upload checkpoints with `s3 sync`,
+wildcards, or symlink-following tools. Normal completion, resumed completion,
+and interruption publication open one singly linked regular generation with
+`O_NOFOLLOW`, snapshot and rehash exact bytes, and use checksum-bound
+`s3api put-object` with `--if-none-match '*'`, the exact
+`MS_S3_KMS_KEY_ID`, and seed-scoped keys
 `checkpoints/seed-<seed>/<arm>/sha256/<digest>.pt`. They independently HEAD and
-verify size, SHA-256 metadata, version ID, and SSE-KMS identity. Local NVMe is
-scratch; do not stop or terminate until the paired canonical receipt and both
-objects are durably verified.
+verify size, SHA-256 metadata, and SSE-KMS identity.
+
+Successful paired completion additionally requires both metadata records to
+say `terminal: true` at the configured final step. It snapshots
+`configuration.yaml`, writes the evaluator `run.json` beside each `ckpt.pt`,
+and publishes one canonical schema-v3 pair receipt at
+`checkpoints/seed-<seed>/receipts/<receipt-sha256>.json`. A successful
+interruption publishes the same schema-v3 receipt shape from its stabilized
+pair, so its exact receipt can be supplied to `resume`. Local NVMe is scratch;
+do not stop or terminate until the paired receipt and both objects are durably
+verified.
+
+There is no prelaunch evaluator or checkpoint-hash binding. At terminal
+completion the publisher derives `model_id` and raw token count from the
+verified config, route-dose SHA-256 from the config-selected verified corpus
+sidecar, corpus SHA-256 from the ordered stream, code SHA-256 from the
+authenticated release-member inventory, and checkpoint SHA-256 from the
+no-follow snapshot. It writes a canonical `CheckpointRecord` from those exact
+values and immutably publishes it under
+`checkpoints/seed-<seed>/<arm>/records/<record-sha256>.json`. Interrupted,
+nonterminal checkpoints publish only the fixture-bound resume receipt; they
+are not finalization records.
 
 ## 12. Resume, evaluate, and collect
 
@@ -1104,14 +1125,16 @@ python -m msctl \
 The v3 checkpoint receipt must be canonical schema 3 and bind the same
 cohort-assignment, preregistration, hardware-amendment, provider-selection,
 profile, and sealed-fixture hashes as the manifest. Schema-2 receipts remain
-valid only for legacy v2 manifests.
+valid only for legacy v2 manifests. For an interrupted run, use the
+`checkpoint_receipt` and `checkpoint_receipt_sha256` emitted by the paired
+launcher; the resume path rejects a receipt whose run IDs, arm paths, hashes,
+world sizes, or manifest provenance differ from its executable bindings.
 
 Completion publication must create one evaluator `run.json` per arm from the
 actual terminal checkpoint and configuration bytes. Use
-`evals.confirmatory.run_binding.build_run_binding(...)`, then
-`write_run_binding(<run-root>/run.json, value)`. The helper hashes the files,
-enforces the evaluator's closed field set and relative paths, and refuses to
-replace existing evidence. The same publication step emits one canonical
+`evals.confirmatory.run_binding.build_run_binding(...)` to hash the files and
+enforce the evaluator's closed field set and relative paths, then publish those
+canonical bytes immutably. The same publication step emits one canonical
 `CheckpointRecord` for each arm; do not synthesize these records from mutable
 “latest” pointers.
 
@@ -1228,10 +1251,16 @@ python -m msctl \
 Evaluation stages only
 `$MS_S3_ROOT/sealed-evaluation/$SEALED_EVALUATION_SHA256`, revalidates the
 external member root and actual `study-lock.json` bytes inside the digest-pinned
-container, and invokes the evaluator with `/opt/venv/bin/python`. The training
-preregistration hash is never substituted for the external study-lock hash.
+container, and invokes the evaluator with `/opt/venv/bin/python`. Before either
+arm runs, it re-verifies the terminal pair, both evaluator `run.json` bindings,
+and all checkpoint objects. After both arms succeed, it requires the exact
+closed confirmatory artifact inventory, immutably uploads each file, and
+publishes a closed paired evaluation receipt at
+`evaluations/seed-<seed>/receipts/<receipt-sha256>.json` and the canonical
+collection source `results/seed-<seed>.json`. The training preregistration hash
+is never substituted for the external study-lock hash.
 
-Collect by exact source and exclusive output:
+Collect by exact source into one exclusive paired directory:
 
 ```bash
 # DRY RUN.
@@ -1239,7 +1268,7 @@ python -m msctl \
   --profile "$PROFILE" \
   collect \
   --source results/seed-0.json \
-  --out "$OPERATOR_ROOT/collected/seed-0.json" \
+  --out "$OPERATOR_ROOT/collected/seed-0" \
   > "$REVIEW_ROOT/collect-plan-seed-0.json"
 
 # APPLY after source and destination review.
@@ -1247,9 +1276,18 @@ python -m msctl \
   --profile "$PROFILE" \
   collect \
   --source results/seed-0.json \
-  --out "$OPERATOR_ROOT/collected/seed-0.json" \
+  --out "$OPERATOR_ROOT/collected/seed-0" \
   --apply > "$REVIEW_ROOT/collect-result-seed-0.json"
 ```
+
+Apply downloads the paired checkpoint and evaluation receipts plus every
+receipt-listed artifact into a staging directory, verifies S3 checksums,
+content hashes, byte counts, canonical URIs, pair provenance, the
+`study-lock.json` hash, the finalized six-member sealed-evaluation root, the
+three-member launch-fixture root, and the exact inventory, then atomically
+installs the directory with canonical `COLLECTION.json`. Repeating the command
+accepts only byte-identical verified contents; a partial, extra, symlinked, or
+conflicting destination fails closed.
 
 Repeat evaluate/collect for every seed and report all ten paired outcomes. For
 a later fleet wave assigned to the same instance, first assemble the closed
@@ -1297,7 +1335,11 @@ receipt metadata, and the exact currently bound AWS tags before deleting those
 exact key/value pairs. It then proves the tags absent and writes an exclusive
 local transition receipt bound to the fleet plan, both waves, collection, and
 approval. Manual or external tag deletion is never progression evidence and
-cannot replace this receipt. One active pair per host remains mandatory.
+cannot replace this receipt. Submit, resume, and evaluate for a later wave are
+admitted only after every instance participating in that wave has its own
+validated prior-wave advance receipt. This prevents one parallel instance from
+starting the next wave while a peer remains uncollected or unadvanced. One
+active pair per host remains mandatory.
 
 ## 13. Apply-time mutation inventory
 

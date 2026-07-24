@@ -124,6 +124,7 @@ _STATIC_REQUIRED_MEMBERS = frozenset(
         "cluster/aws/p5/interruption_checkpoint.py",
         "cluster/aws/p5/launch_seed_pair.py",
         "cluster/aws/p5/profile.py",
+        "cluster/aws/p5/terminal_artifacts.py",
         "corpusgen/__init__.py",
         "corpusgen/bios.py",
         "corpusgen/build.py",

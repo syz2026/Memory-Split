@@ -45,6 +45,10 @@ from cluster.aws.p5.profile import (
     load_aws_gpu_profile,
     validate_aws_gpu_runtime_environment,
 )
+from cluster.aws.p5.terminal_artifacts import (
+    TerminalPublication,
+    publish_terminal_pair,
+)
 
 
 # Historical module constant retained for legacy receipt/import compatibility.
@@ -193,6 +197,8 @@ class VerifiedFile:
 @dataclass(frozen=True)
 class ArmLaunch:
     arm: str
+    run_id: str
+    condition_id: str
     argv: tuple[str, ...]
     environment: Mapping[str, str]
     cwd: Path
@@ -211,6 +217,10 @@ class ArmLaunch:
     master_port: int
     cpu_affinity: tuple[int, int]
     data_loader_workers: int
+    max_steps: int
+    model_id: str
+    raw_token_count: int
+    route_dose_sha256: str
 
 
 @dataclass(frozen=True)
@@ -226,10 +236,12 @@ class LaunchPlan:
     release_sha256: str
     release_members_sha256: str
     corpus_receipt_sha256: str
+    ordered_stream_sha256: str
     code_commit: str
     container_image: str
     runtime_uid: int
     runtime_gid: int
+    launch_manifest: Mapping[str, object]
 
 
 @dataclass(frozen=True)
@@ -241,6 +253,12 @@ class SupervisionResult:
     peer_terminated: bool = False
     resumable: bool = False
     interruption_receipt: str | None = None
+    checkpoint_receipt: str | None = None
+    checkpoint_receipt_sha256: str | None = None
+    checkpoint_receipt_uri: str | None = None
+    checkpoint_record_paths: Mapping[str, str] | None = None
+    checkpoint_record_sha256: Mapping[str, str] | None = None
+    checkpoint_record_uris: Mapping[str, str] | None = None
 
 
 class ProcessHandle(Protocol):
@@ -870,14 +888,20 @@ def _default_port_available(port: int) -> bool:
         sock.close()
 
 
-def _arm_by_name(runs: object) -> dict[str, dict[str, object]]:
+def _arm_by_name(
+    runs: object,
+) -> dict[str, dict[str, object]]:
     if not isinstance(runs, list) or len(runs) != 2:
         raise LaunchError("run manifest must contain one complete pair")
     result = {}
     for run in runs:
         if not isinstance(run, dict):
             raise LaunchError("run manifest pair entries must be objects")
-        _exact_fields(run, _RUN_FIELDS, label="run manifest entry")
+        _exact_fields(
+            run,
+            _RUN_FIELDS,
+            label="run manifest entry",
+        )
         arm = run["arm"]
         if arm not in _ARMS or arm in result:
             raise LaunchError("run manifest must contain a unique explicit pair")
@@ -1100,6 +1124,13 @@ def load_launch_plan(
     )
 
     runs = _arm_by_name(manifest["runs"])
+    route_dose_by_sidecar = {
+        str(record["name"]): _sha256(
+            record["stream_sha256"],
+            label=f"{record['name']} stream",
+        )
+        for record in corpus_evidence.receipt["sidecar_sets"]
+    }
     parsed_runs = []
     ports = []
     worker_budgets = []
@@ -1149,6 +1180,16 @@ def load_launch_plan(
             corpus_path="dataset/corpus-receipt.json",
             v3=is_v3,
         )
+        run_id = str(config["run_id"])
+        condition_id = str(config["condition"])
+        max_steps = int(config["max_steps"])
+        sidecar_name = str(config["sidecar_name"])
+        try:
+            route_dose_sha256 = route_dose_by_sidecar[sidecar_name]
+        except KeyError as error:
+            raise LaunchError(
+                f"{arm} route-dose sidecar is absent from the verified corpus"
+            ) from error
         out_dir = _inside_output(
             scratch, out_relative, label=f"{arm} output"
         )
@@ -1334,6 +1375,8 @@ def load_launch_plan(
         parsed_runs.append(
             ArmLaunch(
                 arm=arm,
+                run_id=run_id,
+                condition_id=condition_id,
                 argv=container_argv,
                 environment=child_environment,
                 cwd=scratch,
@@ -1352,6 +1395,10 @@ def load_launch_plan(
                 master_port=port,
                 cpu_affinity=tuple(affinity),
                 data_loader_workers=workers,
+                max_steps=max_steps,
+                model_id=str(config["model"]),
+                raw_token_count=int(config["total_tokens"]),
+                route_dose_sha256=route_dose_sha256,
             )
         )
         verified_files.append(
@@ -1378,10 +1425,12 @@ def load_launch_plan(
         release_sha256=release_sha256,
         release_members_sha256=release_members_sha256,
         corpus_receipt_sha256=corpus_sha256,
+        ordered_stream_sha256=ordered_sha256,
         code_commit=code_commit,
         container_image=str(bootstrap_receipt["container_image"]),
         runtime_uid=int(bootstrap_receipt["runtime_uid"]),
         runtime_gid=int(bootstrap_receipt["runtime_gid"]),
+        launch_manifest=dict(manifest),
     )
 
 
@@ -1415,6 +1464,7 @@ def render_plan(plan: LaunchPlan) -> dict[str, object]:
 
 _TRAINER_CONTRACT_FIELDS = frozenset(
     {
+        "checkpoint_metadata",
         "rank_zero_pid_file",
         "receipt_v2",
         "resume_sha256",
@@ -1540,6 +1590,7 @@ def preflight_trainer_contract(
     missing = sorted(name for name, supported in contract.items() if not supported)
     if missing:
         labels = {
+            "checkpoint_metadata": "checkpoint metadata",
             "rank_zero_pid_file": "rank-zero PID file",
             "receipt_v2": "memorysplit-parallel-corpus-v2 receipt",
             "resume_sha256": "explicit resume SHA",
@@ -1943,6 +1994,7 @@ def supervise_pair(
     ]
     | None = None,
     shutdown_source: Callable[[], int | None] | None = None,
+    terminal_handler: Callable[[LaunchPlan], TerminalPublication] | None = None,
 ) -> SupervisionResult:
     """Hold the host-wide lock while supervising exactly one seed pair."""
 
@@ -1957,6 +2009,7 @@ def supervise_pair(
             trainer_preflight=trainer_preflight,
             rank_zero_resolver=rank_zero_resolver,
             shutdown_source=shutdown_source,
+            terminal_handler=terminal_handler,
         )
     finally:
         fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
@@ -1979,6 +2032,7 @@ def _supervise_pair_locked(
     ]
     | None = None,
     shutdown_source: Callable[[], int | None] | None = None,
+    terminal_handler: Callable[[LaunchPlan], TerminalPublication] | None = None,
 ) -> SupervisionResult:
     """Launch both arms, then accept only paired zero exit status."""
 
@@ -2091,6 +2145,17 @@ def _supervise_pair_locked(
                         child_pids=child_pids,
                         resumable=interruption.resumable,
                         interruption_receipt=str(interruption.receipt_path),
+                        checkpoint_receipt=(
+                            str(interruption.checkpoint_receipt_path)
+                            if interruption.checkpoint_receipt_path is not None
+                            else None
+                        ),
+                        checkpoint_receipt_sha256=(
+                            interruption.checkpoint_receipt_sha256
+                        ),
+                        checkpoint_receipt_uri=(
+                            interruption.checkpoint_receipt_uri
+                        ),
                     )
 
             statuses = {
@@ -2118,10 +2183,54 @@ def _supervise_pair_locked(
                 )
             if all(status == 0 for status in statuses.values()):
                 _terminate_all(tuple(processes.values()))
+                publication = None
+                if terminal_handler is not None:
+                    try:
+                        publication = terminal_handler(plan)
+                    except Exception as error:
+                        raise LaunchError(
+                            "paired training completed but terminal artifact "
+                            "publication failed"
+                        ) from error
                 return SupervisionResult(
                     status="completed",
                     returncode=0,
                     child_pids=child_pids,
+                    checkpoint_receipt=(
+                        str(publication.receipt_path)
+                        if publication is not None
+                        else None
+                    ),
+                    checkpoint_receipt_sha256=(
+                        publication.receipt_sha256
+                        if publication is not None
+                        else None
+                    ),
+                    checkpoint_receipt_uri=(
+                        publication.receipt_uri
+                        if publication is not None
+                        else None
+                    ),
+                    checkpoint_record_paths=(
+                        {
+                            arm: str(path)
+                            for arm, path in (
+                                publication.checkpoint_record_paths.items()
+                            )
+                        }
+                        if publication is not None
+                        else None
+                    ),
+                    checkpoint_record_sha256=(
+                        dict(publication.checkpoint_record_sha256)
+                        if publication is not None
+                        else None
+                    ),
+                    checkpoint_record_uris=(
+                        dict(publication.checkpoint_record_uris)
+                        if publication is not None
+                        else None
+                    ),
                 )
             sleep(0.25)
     except KeyboardInterrupt:
@@ -2211,6 +2320,47 @@ def _production_interruption_handler(
     notice: str,
 ) -> InterruptionResult:
     staging = plan.scratch_root / "staging"
+    bridge: dict[str, object] = {}
+    if _is_v3_profile(plan.profile):
+        operation_id = os.environ.get("MS_OPERATION_ID", "")
+        if _SHA256_RE.fullmatch(operation_id) is None:
+            raise LaunchError(
+                "v3 interruption publication requires the bound operation ID"
+            )
+        manifest = plan.launch_manifest
+        bridge = {
+            "checkpoint_metadata_paths": {
+                launch.arm: launch.checkpoint_path.parent
+                / "checkpoint-meta.json"
+                for launch in plan.arms
+            },
+            "checkpoint_receipt_path": (
+                plan.scratch_root
+                / "receipts"
+                / "checkpoints"
+                / f"seed-{plan.seed}"
+                / "interrupted"
+                / operation_id
+                / "receipt.json"
+            ),
+            "run_ids": {
+                launch.arm: launch.run_id for launch in plan.arms
+            },
+            "run_manifest_sha256": manifest["run_manifest_sha256"],
+            "cohort_assignment_sha256": manifest[
+                "cohort_assignment_sha256"
+            ],
+            "preregistration_sha256": manifest["preregistration_sha256"],
+            "hardware_amendment_sha256": manifest[
+                "hardware_amendment_sha256"
+            ],
+            "provider_selection_sha256": manifest[
+                "provider_selection_sha256"
+            ],
+            "sealed_fixture_sha256": manifest[
+                "sealed_fixture_sha256"
+            ],
+        }
     with tempfile.TemporaryDirectory(prefix="aws-home-", dir=staging) as home:
         os.chmod(home, 0o700)
         store = S3ObjectStore(
@@ -2255,8 +2405,32 @@ def _production_interruption_handler(
             ),
             interruption_receipt_type=plan.profile.interruption_receipt_type,
             resume_commit_protocol=plan.profile.resume_commit_protocol,
+            **bridge,
         )
         return handle_interruption(request, object_store=store)
+
+
+def _production_terminal_handler(plan: LaunchPlan) -> TerminalPublication:
+    operation_id = os.environ.get("MS_OPERATION_ID", "")
+    staging = plan.scratch_root / "staging"
+    with tempfile.TemporaryDirectory(prefix="aws-home-", dir=staging) as home:
+        os.chmod(home, 0o700)
+        store = S3ObjectStore(
+            region=plan.runtime.region,
+            kms_key_id=plan.runtime.kms_key_id,
+            environment={
+                "AWS_REGION": plan.runtime.region,
+                "HOME": home,
+                "LANG": "C.UTF-8",
+                "LC_ALL": "C.UTF-8",
+                "PATH": "/usr/bin:/bin",
+            },
+        )
+        return publish_terminal_pair(
+            plan,
+            object_store=store,
+            operation_id=operation_id,
+        )
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -2297,12 +2471,23 @@ def main(argv: Sequence[str] | None = None) -> int:
                 notice_source=client.interruption_notice,
                 interruption_handler=_production_interruption_handler,
                 shutdown_source=shutdown_source,
+                terminal_handler=(
+                    _production_terminal_handler
+                    if _is_v3_profile(plan.profile)
+                    else None
+                ),
             )
         report = {
             "child_pids": dict(sorted(result.child_pids.items())),
             "dry_run": False,
             "failed_arm": result.failed_arm,
             "interruption_receipt": result.interruption_receipt,
+            "checkpoint_receipt": result.checkpoint_receipt,
+            "checkpoint_receipt_sha256": result.checkpoint_receipt_sha256,
+            "checkpoint_receipt_uri": result.checkpoint_receipt_uri,
+            "checkpoint_record_paths": result.checkpoint_record_paths,
+            "checkpoint_record_sha256": result.checkpoint_record_sha256,
+            "checkpoint_record_uris": result.checkpoint_record_uris,
             "ok": result.returncode == 0,
             "peer_terminated": result.peer_terminated,
             "resumable": result.resumable,

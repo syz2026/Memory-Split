@@ -706,6 +706,16 @@ def test_later_fleet_wave_requires_local_terminal_advance_receipt(tmp_path):
         "evaluation_terminal_receipt_uri": (
             "s3://memorysplit-prod/evaluation/receipts/terminal.json"
         ),
+        "checkpoint_receipt_sha256": "8" * 64,
+        "checkpoint_receipt_uri": (
+            "s3://memorysplit-prod/checkpoints/seed-0/receipts/"
+            f"{'8' * 64}.json"
+        ),
+        "evaluation_receipt_sha256": "9" * 64,
+        "evaluation_receipt_uri": (
+            "s3://memorysplit-prod/evaluations/seed-0/receipts/"
+            f"{'9' * 64}.json"
+        ),
         "aws_bound_tags_sha256": "4" * 64,
         "aws_unbound_tags_sha256": "5" * 64,
     }
@@ -889,6 +899,8 @@ def test_fleet_advance_dry_run_then_apply_verifies_and_unbinds_exact_tags(
         "command_id": "evaluation-command-12345678",
         "operation_id": "5" * 64,
         "intent_sha256": "6" * 64,
+            "sealed_evaluation_sha256": "a" * 64,
+            "study_lock_sha256": "b" * 64,
     }
 
     class Store:
@@ -907,6 +919,29 @@ def test_fleet_advance_dry_run_then_apply_verifies_and_unbinds_exact_tags(
         aws_p5,
         "verify_fleet_collection",
         lambda *_args, **_kwargs: "7" * 64,
+    )
+    monkeypatch.setattr(
+        backend,
+        "_verify_v3_lifecycle_collection",
+        lambda *_args, **_kwargs: {
+            "collection_receipt_sha256": "7" * 64,
+            "checkpoint_receipt_sha256": "8" * 64,
+            "checkpoint_receipt_uri": (
+                "s3://memorysplit-prod/checkpoints/seed-0/receipts/"
+                f"{'8' * 64}.json"
+            ),
+            "evaluation_receipt_sha256": "9" * 64,
+            "evaluation_receipt_uri": (
+                "s3://memorysplit-prod/evaluations/seed-0/receipts/"
+                f"{'9' * 64}.json"
+            ),
+            "evaluation": {
+                "launch_readiness_sha256": "3" * 64,
+                "operation_id": "5" * 64,
+                    "sealed_evaluation_sha256": "a" * 64,
+                    "study_lock_sha256": "b" * 64,
+            },
+        },
     )
     monkeypatch.setattr(backend, "_repair_paired_states", lambda *_args: None)
     monkeypatch.setattr(
@@ -1000,7 +1035,6 @@ def test_v3_profiles_support_full_dry_run_lifecycle(
     from msctl.aws_argv import _receipt, _validate_intent, _validate_receipt
     from msctl.contracts import verify_checkpoint_receipt
     from msctl.state import StateStore
-
     profile, selection, paths = _manifests(
         tmp_path,
         profile_path=profile_path,
@@ -1091,6 +1125,29 @@ def test_v3_profiles_support_full_dry_run_lifecycle(
         fleet_binding=plan.binding_for_seed(manifest.seed),
         readiness=readiness,
         sealed_evaluation=sealed,
+    )
+    mismatched_evaluation_context = V3LifecycleContext(
+        amendment=amendment,
+        selection=selection,
+        fleet_plan=plan,
+        fleet_binding=plan.binding_for_seed(manifest.seed),
+        readiness=readiness,
+        sealed_evaluation=SealedEvaluationRelease(
+            root=sealed.root,
+            sha256=sealed.sha256,
+            fixture_sha256="f" * 64,
+            study_lock_sha256=sealed.study_lock_sha256,
+            preregistration_sha256=sealed.preregistration_sha256,
+            members=sealed.members,
+        ),
+    )
+    with pytest.raises(Exception) as fixture_mismatch:
+        backend._v3_evaluation_bindings(
+            manifest,
+            mismatched_evaluation_context,
+        )
+    assert getattr(fixture_mismatch.value, "code", None) == (
+        "PROVIDER_SELECTION_MISMATCH"
     )
     assert context is not None
     release = SimpleNamespace(
@@ -1670,3 +1727,17 @@ def test_v3_launcher_manifest_is_consumable_by_remote_dry_run(
         tuple(command["runtime_config"]["snapshot_steps"])
         for command in rendered["commands"]
     } == {(1358, 3396, 6791, 10187, 13582)}
+    sidecar_hashes = {
+        row["name"]: row["stream_sha256"]
+        for row in fixture["corpus"]["sidecar_sets"]
+    }
+    assert plan.ordered_stream_sha256 == fixture["corpus"][
+        "ordered_stream_sha256"
+    ]
+    assert plan.release_members_sha256 == release_members_sha256
+    for launch in plan.arms:
+        assert launch.model_id == "d360m"
+        assert launch.raw_token_count == 7_120_879_616
+        assert launch.route_dose_sha256 == sidecar_hashes[
+            f"{launch.arm}_target_weights"
+        ]

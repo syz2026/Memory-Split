@@ -245,6 +245,7 @@ _ENVIRONMENT_FIELDS = {
     "MS_RUNTIME_UID",
     "MS_S3_ROOT",
 }
+_V3_ENVIRONMENT_FIELDS = _ENVIRONMENT_FIELDS | {"MS_S3_KMS_KEY_ID"}
 _CHECKPOINT_RECEIPT_FIELDS = {"sha256", "checkpoints"}
 _CHECKPOINT_FIELDS = {
     "arm",
@@ -673,9 +674,12 @@ def _validate_intent(
     if hashlib.sha256(canonical_json(identity)).hexdigest() != intent["operation_id"]:
         raise RemoteIntentError("operation ID does not match canonical intent identity")
     environment = intent["environment"]
+    expected_environment_fields = (
+        _V3_ENVIRONMENT_FIELDS if schema_version == 3 else _ENVIRONMENT_FIELDS
+    )
     if (
         not isinstance(environment, dict)
-        or set(environment) != _ENVIRONMENT_FIELDS
+        or set(environment) != expected_environment_fields
         or set(environment) & _FORBIDDEN_ENVIRONMENT
         or not all(isinstance(value, str) and value for value in environment.values())
         or _REGION_RE.fullmatch(str(environment["AWS_REGION"])) is None
@@ -929,6 +933,7 @@ def execute_intent(
         "HOME": "/var/lib/memorysplit/aws-home",
         "LANG": "C.UTF-8",
         "LC_ALL": "C.UTF-8",
+        "MS_OPERATION_ID": str(intent["operation_id"]),
         "PATH": _SAFE_PATH,
     }
     returncode = 0

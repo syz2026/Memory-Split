@@ -272,6 +272,7 @@ def _launcher_fixture(tmp_path: Path, seed: int = 1) -> dict[str, Path | dict]:
             "import json\n"
             "import sys\n"
             "CAPABILITIES = {\n"
+            "    'checkpoint_metadata': True,\n"
             "    'rank_zero_pid_file': True,\n"
             "    'receipt_v2': True,\n"
             "    'resume_sha256': True,\n"
@@ -807,6 +808,7 @@ def test_trainer_contract_preflight_fails_before_any_output_or_spawn(tmp_path):
 def test_trainer_contract_preflight_rejects_missing_capability(tmp_path):
     plan = _load_fixture_plan(_launcher_fixture(tmp_path))
     contract = {
+        "checkpoint_metadata": True,
         "rank_zero_pid_file": True,
         "receipt_v2": True,
         "resume_sha256": True,
@@ -854,7 +856,8 @@ def test_trainer_preflight_rejects_source_tokens_without_behavior(tmp_path):
 def test_trainer_preflight_rejects_duplicate_or_noncanonical_json(tmp_path):
     plan = _load_fixture_plan(_launcher_fixture(tmp_path))
     duplicate = (
-        '{"rank_zero_pid_file":true,"rank_zero_pid_file":true,'
+        '{"checkpoint_metadata":true,"rank_zero_pid_file":true,'
+        '"rank_zero_pid_file":true,'
         '"receipt_v2":true,"resume_sha256":true,"sidecar_name":true,'
         '"sigusr1_checkpoint":true}\n'
     )
@@ -1725,6 +1728,23 @@ def test_v3_interruption_uses_neutral_profile_bound_receipt_protocol(
             ),
             "interruption_receipt_type": profile.interruption_receipt_type,
             "resume_commit_protocol": profile.resume_commit_protocol,
+            "checkpoint_metadata_paths": {
+                "dense": tmp_path / "dense-checkpoint-meta.json",
+                "split90": tmp_path / "split90-checkpoint-meta.json",
+            },
+            "checkpoint_receipt_path": (
+                tmp_path / "v3-checkpoint" / "receipt.json"
+            ),
+            "run_ids": {
+                "dense": "v3-dense-s0",
+                "split90": "v3-split90-s0",
+            },
+            "run_manifest_sha256": "8" * 64,
+            "cohort_assignment_sha256": "9" * 64,
+            "preregistration_sha256": "a" * 64,
+            "hardware_amendment_sha256": "b" * 64,
+            "provider_selection_sha256": "c" * 64,
+            "sealed_fixture_sha256": "d" * 64,
         }
     )
     request = InterruptionRequest(**values)
@@ -1735,9 +1755,37 @@ def test_v3_interruption_uses_neutral_profile_bound_receipt_protocol(
 
     def signal_process(pid, _signum):
         arm = {101: "dense", 202: "split90"}[pid]
+        payload = f"{profile.profile_id}-{arm}-checkpoint".encode()
         _atomic_checkpoint(
             request.checkpoint_paths[arm],
-            f"{profile.profile_id}-{arm}-checkpoint".encode(),
+            payload,
+        )
+        _atomic_checkpoint(
+            request.checkpoint_metadata_paths[arm],
+            (
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "receipt_type": "memorysplit-training-checkpoint-v1",
+                        "run_id": request.run_ids[arm],
+                        "condition": arm,
+                        "seed": 0,
+                        "step": 42,
+                        "max_steps": 1358,
+                        "world_size": 4,
+                        "config_fingerprint": request.config_sha256[arm],
+                        "checkpoint_path": "ckpt.pt",
+                        "checkpoint_sha256": hashlib.sha256(
+                            payload
+                        ).hexdigest(),
+                        "checkpoint_bytes": len(payload),
+                        "terminal": False,
+                    },
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+                + "\n"
+            ).encode("ascii"),
         )
 
     store = _FakeStore()
@@ -1749,6 +1797,24 @@ def test_v3_interruption_uses_neutral_profile_bound_receipt_protocol(
     )
 
     assert result.resumable is True
+    assert result.checkpoint_receipt_path == request.checkpoint_receipt_path
+    assert result.checkpoint_receipt_sha256
+    assert result.checkpoint_receipt_uri.endswith(
+        f"/receipts/{result.checkpoint_receipt_sha256}.json"
+    )
+    from cluster.aws.p5.terminal_artifacts import (
+        verify_checkpoint_receipt_bytes,
+    )
+
+    bridged = verify_checkpoint_receipt_bytes(
+        request.checkpoint_receipt_path.read_bytes(),
+        expected={
+            "provider": request.provider,
+            "run_manifest_sha256": request.run_manifest_sha256,
+            "sealed_fixture_sha256": request.sealed_fixture_sha256,
+        },
+    )
+    assert {row["step"] for row in bridged["checkpoints"]} == {42}
     marker = json.loads(request.receipt_path.read_bytes())
     assert marker["receipt_type"] == "aws-gpu-paired-interruption"
     assert marker["protocol"] == "aws-gpu-resume-commit-v1"
@@ -1769,7 +1835,7 @@ def test_v3_interruption_uses_neutral_profile_bound_receipt_protocol(
     checkpoint_objects = {
         call[1]: call[5]
         for call in store.calls
-        if "/checkpoints/" in call[1]
+        if "/checkpoints/" in call[1] and call[1].endswith(".pt")
     }
     assert interruption_module.verify_resume_commit(
         candidate_bytes=candidate_bytes,

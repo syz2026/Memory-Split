@@ -94,6 +94,10 @@ _ADVANCE_EVIDENCE_FIELDS = {
     "evaluation_command_id",
     "training_terminal_receipt_uri",
     "evaluation_terminal_receipt_uri",
+    "checkpoint_receipt_sha256",
+    "checkpoint_receipt_uri",
+    "evaluation_receipt_sha256",
+    "evaluation_receipt_uri",
     "aws_bound_tags_sha256",
     "aws_unbound_tags_sha256",
 }
@@ -1081,6 +1085,8 @@ def validate_fleet_advance(
         "training_state_sha256",
         "evaluation_state_sha256",
         "collection_receipt_sha256",
+        "checkpoint_receipt_sha256",
+        "evaluation_receipt_sha256",
         "aws_bound_tags_sha256",
         "aws_unbound_tags_sha256",
     ):
@@ -1107,6 +1113,23 @@ def validate_fleet_advance(
         ):
             _fail(
                 "fleet advance terminal receipt URI is invalid",
+                code="FLEET_ADVANCE_INVALID",
+            )
+    for field, marker in (
+        ("checkpoint_receipt_uri", "/checkpoints/seed-"),
+        ("evaluation_receipt_uri", "/evaluations/seed-"),
+    ):
+        uri = evidence[field]
+        if (
+            not isinstance(uri, str)
+            or not uri.startswith("s3://")
+            or marker not in uri
+            or "/receipts/" not in uri
+            or not uri.endswith(".json")
+            or any(character in uri for character in "\n\r\x00")
+        ):
+            _fail(
+                "fleet advance lifecycle receipt URI is invalid",
                 code="FLEET_ADVANCE_INVALID",
             )
     advanced_at = _advance_timestamp(receipt["advanced_at"])

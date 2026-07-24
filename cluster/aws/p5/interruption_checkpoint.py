@@ -69,6 +69,21 @@ _KMS_KEY_ARN_RE = re.compile(
     r"[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
 )
 _ARMS = ("dense", "split90")
+_CHECKPOINT_METADATA_FIELDS = {
+    "schema_version",
+    "receipt_type",
+    "run_id",
+    "condition",
+    "seed",
+    "step",
+    "max_steps",
+    "world_size",
+    "config_fingerprint",
+    "checkpoint_path",
+    "checkpoint_sha256",
+    "checkpoint_bytes",
+    "terminal",
+}
 _IMDS_ROOT = "http://169.254.169.254/latest"
 
 
@@ -144,6 +159,15 @@ class InterruptionRequest:
     candidate_receipt_type: str = _LEGACY_CANDIDATE_RECEIPT_TYPE
     interruption_receipt_type: str = _LEGACY_INTERRUPTION_RECEIPT_TYPE
     resume_commit_protocol: str = _LEGACY_RESUME_COMMIT_PROTOCOL
+    checkpoint_metadata_paths: Mapping[str, Path] | None = None
+    checkpoint_receipt_path: Path | None = None
+    run_ids: Mapping[str, str] | None = None
+    run_manifest_sha256: str | None = None
+    cohort_assignment_sha256: str | None = None
+    preregistration_sha256: str | None = None
+    hardware_amendment_sha256: str | None = None
+    provider_selection_sha256: str | None = None
+    sealed_fixture_sha256: str | None = None
 
     def __post_init__(self) -> None:
         contract = _PROFILE_CONTRACTS.get(self.provider)
@@ -233,6 +257,51 @@ class InterruptionRequest:
                 "upload reserve must be positive and below checkpoint timeout"
             )
         _split_s3_uri(self.s3_root + "/sentinel")
+        bridge_values = (
+            self.checkpoint_metadata_paths,
+            self.checkpoint_receipt_path,
+            self.run_ids,
+            self.run_manifest_sha256,
+            self.cohort_assignment_sha256,
+            self.preregistration_sha256,
+            self.hardware_amendment_sha256,
+            self.provider_selection_sha256,
+            self.sealed_fixture_sha256,
+        )
+        if any(value is not None for value in bridge_values):
+            if self.provider == PROVIDER or any(
+                value is None for value in bridge_values
+            ):
+                raise ValueError(
+                    "checkpoint receipt bridge requires one complete v3 binding"
+                )
+            assert self.checkpoint_metadata_paths is not None
+            assert self.checkpoint_receipt_path is not None
+            assert self.run_ids is not None
+            if (
+                set(self.checkpoint_metadata_paths) != set(_ARMS)
+                or set(self.run_ids) != set(_ARMS)
+                or any(
+                    not isinstance(path, Path)
+                    for path in self.checkpoint_metadata_paths.values()
+                )
+                or not isinstance(self.checkpoint_receipt_path, Path)
+                or any(
+                    not isinstance(run_id, str) or not run_id
+                    for run_id in self.run_ids.values()
+                )
+            ):
+                raise ValueError("checkpoint receipt bridge pair is invalid")
+            for label, digest in (
+                ("run manifest", self.run_manifest_sha256),
+                ("cohort assignment", self.cohort_assignment_sha256),
+                ("preregistration", self.preregistration_sha256),
+                ("hardware amendment", self.hardware_amendment_sha256),
+                ("provider selection", self.provider_selection_sha256),
+                ("sealed fixture", self.sealed_fixture_sha256),
+            ):
+                if not isinstance(digest, str) or _SHA256_RE.fullmatch(digest) is None:
+                    raise ValueError(f"{label} SHA-256 must be lowercase hex")
 
 
 @dataclass(frozen=True)
@@ -241,6 +310,9 @@ class InterruptionResult:
     exit_code: int
     receipt_path: Path
     receipt_upload_verified: bool
+    checkpoint_receipt_path: Path | None = None
+    checkpoint_receipt_sha256: str | None = None
+    checkpoint_receipt_uri: str | None = None
 
 
 def _default_runner(
@@ -737,6 +809,72 @@ def _checkpoint_identity(path: Path) -> _FileIdentity | None:
         os.close(descriptor)
 
 
+def _checkpoint_metadata(
+    path: Path,
+    *,
+    arm: str,
+    request: InterruptionRequest,
+    pinned: _PinnedCheckpoint,
+) -> dict[str, object] | None:
+    descriptor = _open_checkpoint(path)
+    if descriptor is None:
+        return None
+    try:
+        before = os.fstat(descriptor)
+        if before.st_size <= 0 or before.st_size > 64 * 1024:
+            return None
+        payload = b""
+        while len(payload) <= before.st_size:
+            chunk = os.read(descriptor, before.st_size - len(payload) + 1)
+            if not chunk:
+                break
+            payload += chunk
+        after = os.fstat(descriptor)
+    finally:
+        os.close(descriptor)
+    if (
+        before.st_dev,
+        before.st_ino,
+        before.st_size,
+        before.st_mtime_ns,
+        before.st_ctime_ns,
+    ) != (
+        after.st_dev,
+        after.st_ino,
+        after.st_size,
+        after.st_mtime_ns,
+        after.st_ctime_ns,
+    ) or len(payload) != after.st_size:
+        return None
+    try:
+        value = _canonical_payload(payload, label=f"{arm} checkpoint metadata")
+    except ValueError:
+        return None
+    run_ids = request.run_ids
+    if (
+        set(value) != _CHECKPOINT_METADATA_FIELDS
+        or value["schema_version"] != 1
+        or value["receipt_type"] != "memorysplit-training-checkpoint-v1"
+        or run_ids is None
+        or value["run_id"] != run_ids[arm]
+        or value["condition"] != arm
+        or value["seed"] != request.seed
+        or type(value["step"]) is not int
+        or value["step"] <= 0
+        or type(value["max_steps"]) is not int
+        or value["max_steps"] < value["step"]
+        or value["world_size"] != 4
+        or value["checkpoint_path"] != "ckpt.pt"
+        or value["checkpoint_sha256"] != pinned.sha256
+        or value["checkpoint_bytes"] != pinned.bytes
+        or not isinstance(value["terminal"], bool)
+        or not isinstance(value["config_fingerprint"], str)
+        or _SHA256_RE.fullmatch(value["config_fingerprint"]) is None
+    ):
+        return None
+    return value
+
+
 def _generation_changed(
     baseline: _FileIdentity | None,
     current: _FileIdentity,
@@ -942,6 +1080,16 @@ def _checkpoint_uri(
     )
 
 
+def _checkpoint_receipt_uri(
+    request: InterruptionRequest,
+    digest: str,
+) -> str:
+    return (
+        f"{request.s3_root.rstrip('/')}/checkpoints/seed-{request.seed}/"
+        f"receipts/{digest}.json"
+    )
+
+
 def _evidence_uri(request: InterruptionRequest, digest: str) -> str:
     return (
         f"{request.s3_root.rstrip('/')}/receipts/interruption/evidence/"
@@ -1103,6 +1251,8 @@ def handle_interruption(
             wall_monotonic=wall_monotonic,
             sleep=sleep,
         )
+        bridge_enabled = request.checkpoint_receipt_path is not None
+        bridge_metadata: dict[str, dict[str, object]] = {}
         checkpoint_rows = []
         all_verified = not signal_errors
         for arm in _ARMS:
@@ -1155,6 +1305,41 @@ def handle_interruption(
                     ),
                 }
             )
+        if bridge_enabled:
+            assert request.checkpoint_metadata_paths is not None
+            for arm in _ARMS:
+                pinned = stable[arm]
+                metadata = None
+                while (
+                    pinned is not None
+                    and _remaining_seconds(
+                        deadline=checkpoint_deadline,
+                        monotonic=monotonic,
+                        wall_deadline=checkpoint_wall_deadline,
+                        wall_monotonic=wall_monotonic,
+                    )
+                    > 0
+                ):
+                    metadata = _checkpoint_metadata(
+                        request.checkpoint_metadata_paths[arm],
+                        arm=arm,
+                        request=request,
+                        pinned=pinned,
+                    )
+                    if metadata is not None:
+                        break
+                    sleep(0.01)
+                if metadata is None:
+                    all_verified = False
+                else:
+                    bridge_metadata[arm] = metadata
+            if len(
+                {
+                    metadata["step"]
+                    for metadata in bridge_metadata.values()
+                }
+            ) != 1:
+                all_verified = False
 
         deadline_exhausted = (
             _remaining_seconds(
@@ -1219,6 +1404,100 @@ def handle_interruption(
                 wall_monotonic=wall_monotonic,
             )
 
+        checkpoint_receipt_uploaded = None
+        checkpoint_receipt_digest = None
+        checkpoint_receipt_uri = None
+        if bridge_enabled and all_verified:
+            assert request.checkpoint_receipt_path is not None
+            assert request.run_ids is not None
+            local_checkpoints_published = all(
+                stable[arm] is not None
+                and _publish_local_handoff(
+                    stable[arm].path,
+                    request.checkpoint_receipt_path.parent / f"{arm}.pt",
+                    deadline=deadline,
+                    monotonic=monotonic,
+                    wall_deadline=wall_deadline,
+                    wall_monotonic=wall_monotonic,
+                )
+                for arm in _ARMS
+            )
+            if local_checkpoints_published:
+                receipt_value = {
+                    "schema_version": 3,
+                    "provider": request.provider,
+                    "release_sha256": request.release_sha256,
+                    "run_manifest_sha256": request.run_manifest_sha256,
+                    "dataset_sha256": request.corpus_receipt_sha256,
+                    "source_commit": request.code_commit,
+                    "cohort_assignment_sha256": (
+                        request.cohort_assignment_sha256
+                    ),
+                    "preregistration_sha256": request.preregistration_sha256,
+                    "hardware_amendment_sha256": (
+                        request.hardware_amendment_sha256
+                    ),
+                    "provider_selection_sha256": (
+                        request.provider_selection_sha256
+                    ),
+                    "profile_sha256": request.profile_sha256,
+                    "sealed_fixture_sha256": (
+                        request.sealed_fixture_sha256
+                    ),
+                    "checkpoints": [
+                        {
+                            "run_id": request.run_ids[arm],
+                            "arm": arm,
+                            "seed": request.seed,
+                            "path": f"{arm}.pt",
+                            "sha256": stable[arm].sha256,
+                            "config_sha256": request.config_sha256[arm],
+                            "dataset_sha256": request.corpus_receipt_sha256,
+                            "source_commit": request.code_commit,
+                            "step": bridge_metadata[arm]["step"],
+                            "world_size": 4,
+                        }
+                        for arm in _ARMS
+                    ],
+                }
+                receipt_written = _write_immutable_json(
+                    request.checkpoint_receipt_path,
+                    receipt_value,
+                    deadline=deadline,
+                    monotonic=monotonic,
+                    wall_deadline=wall_deadline,
+                    wall_monotonic=wall_monotonic,
+                )
+                if receipt_written is not None:
+                    receipt_bytes, checkpoint_receipt_digest = receipt_written
+                    checkpoint_receipt_uri = _checkpoint_receipt_uri(
+                        request,
+                        checkpoint_receipt_digest,
+                    )
+                    checkpoint_receipt_uploaded = object_store.put_verified(
+                        request.checkpoint_receipt_path,
+                        checkpoint_receipt_uri,
+                        expected_sha256=checkpoint_receipt_digest,
+                        deadline=deadline,
+                        monotonic=monotonic,
+                        wall_deadline=wall_deadline,
+                        wall_monotonic=wall_monotonic,
+                    )
+                    if (
+                        checkpoint_receipt_uploaded is None
+                        or checkpoint_receipt_uploaded.uri
+                        != checkpoint_receipt_uri
+                        or checkpoint_receipt_uploaded.sha256
+                        != checkpoint_receipt_digest
+                        or checkpoint_receipt_uploaded.bytes
+                        != len(receipt_bytes)
+                    ):
+                        all_verified = False
+                else:
+                    all_verified = False
+            else:
+                all_verified = False
+
         marker_path = staging / "commit.json"
         marker_uploaded = None
         marker_digest = None
@@ -1231,6 +1510,16 @@ def handle_interruption(
             and candidate_uploaded.uri == candidate_uri
             and candidate_uploaded.sha256 == candidate_digest
             and candidate_uploaded.bytes == len(_candidate_bytes)
+            and (
+                not bridge_enabled
+                or (
+                    checkpoint_receipt_uploaded is not None
+                    and checkpoint_receipt_uploaded.uri
+                    == checkpoint_receipt_uri
+                    and checkpoint_receipt_uploaded.sha256
+                    == checkpoint_receipt_digest
+                )
+            )
             and _remaining_seconds(
                 deadline=deadline,
                 monotonic=monotonic,
@@ -1295,6 +1584,10 @@ def handle_interruption(
             and marker_uploaded.bytes == len(marker_bytes)
             and marker_digest
             == hashlib.sha256(marker_bytes).hexdigest()
+            and (
+                not bridge_enabled
+                or checkpoint_receipt_uploaded is not None
+            )
             and _publish_local_handoff(
                 marker_path,
                 request.receipt_path,
@@ -1321,6 +1614,21 @@ def handle_interruption(
         ),
         receipt_path=request.receipt_path,
         receipt_upload_verified=resumable,
+        checkpoint_receipt_path=(
+            request.checkpoint_receipt_path
+            if resumable and bridge_enabled
+            else None
+        ),
+        checkpoint_receipt_sha256=(
+            checkpoint_receipt_digest
+            if resumable and bridge_enabled
+            else None
+        ),
+        checkpoint_receipt_uri=(
+            checkpoint_receipt_uri
+            if resumable and bridge_enabled
+            else None
+        ),
     )
 
 

@@ -9,8 +9,10 @@ import json
 import os
 import re
 import secrets
+import shutil
 import stat
 import subprocess
+import tempfile
 import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
@@ -18,6 +20,16 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Protocol
 from urllib.parse import urlsplit
+
+from cluster.aws.p5.terminal_artifacts import (
+    EVALUATION_ARTIFACTS,
+    verify_checkpoint_receipt_bytes,
+    verify_evaluation_receipt_bytes,
+)
+from evals.confirmatory.sealing import (
+    SEALED_FIXTURE_MEMBERS,
+    sealed_fixture_sha256,
+)
 
 from .approval import verify_scope_approval
 from .aws_control_bundle import (
@@ -804,20 +816,36 @@ class AwsP5Backend:
         binding = validated.fleet_binding
         if binding.wave == 0:
             return
-        receipt = load_fleet_advance(
-            self.state_root,
-            plan=validated.fleet_plan,
-            to_binding=binding,
+        wave_bindings = tuple(
+            candidate
+            for candidate in validated.fleet_plan.manifests
+            if candidate.wave == binding.wave
         )
-        if receipt is None:
+        missing = [
+            {
+                "instance_id": candidate.instance_id,
+                "seed": candidate.seed,
+                "wave": candidate.wave,
+            }
+            for candidate in wave_bindings
+            if load_fleet_advance(
+                self.state_root,
+                plan=validated.fleet_plan,
+                to_binding=candidate,
+            )
+            is None
+        ]
+        if missing:
             raise MsctlError(
                 "FLEET_ADVANCE_REQUIRED",
-                "later fleet waves require an explicit completed local "
-                "fleet-advance receipt; absent AWS tags are not proof",
+                "later fleet waves require completed local fleet-advance "
+                "receipts for every instance in the wave; absent AWS tags "
+                "are not proof",
                 details={
                     "instance_id": binding.instance_id,
                     "seed": binding.seed,
                     "wave": binding.wave,
+                    "missing": missing,
                 },
             )
 
@@ -1514,6 +1542,15 @@ class AwsP5Backend:
                 "MS_RUNTIME_GID": str(getattr(self.runtime, "gid", 1000)),
                 "MS_RUNTIME_UID": str(getattr(self.runtime, "uid", 1000)),
                 "MS_S3_ROOT": self.runtime.s3_root,
+                **(
+                    {
+                        "MS_S3_KMS_KEY_ID": str(
+                            getattr(self.runtime, "kms_key_id", "")
+                        )
+                    }
+                    if v3_bindings
+                    else {}
+                ),
             },
             "checkpoint_receipt": checkpoint_binding,
             "steps": steps,
@@ -4719,6 +4756,471 @@ class AwsP5Backend:
             apply=apply,
         )
 
+    @staticmethod
+    def _read_collection_regular(
+        path: Path,
+        *,
+        label: str,
+        maximum: int = 1 << 30,
+    ) -> bytes:
+        flags = (
+            os.O_RDONLY
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_CLOEXEC", 0)
+        )
+        try:
+            descriptor = os.open(path, flags)
+        except OSError as error:
+            raise MsctlError(
+                "FLEET_COLLECTION_INVALID",
+                f"{label} cannot be opened without following links",
+            ) from error
+        try:
+            before = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(before.st_mode)
+                or before.st_nlink != 1
+                or before.st_size <= 0
+                or before.st_size > maximum
+            ):
+                raise MsctlError(
+                    "FLEET_COLLECTION_INVALID",
+                    f"{label} must be one bounded singly linked regular file",
+                )
+            chunks: list[bytes] = []
+            offset = 0
+            while offset < before.st_size:
+                chunk = os.pread(
+                    descriptor,
+                    min(1 << 20, before.st_size - offset),
+                    offset,
+                )
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                offset += len(chunk)
+            after = os.fstat(descriptor)
+        finally:
+            os.close(descriptor)
+        if (
+            (
+                before.st_dev,
+                before.st_ino,
+                before.st_size,
+                before.st_mtime_ns,
+                before.st_ctime_ns,
+            )
+            != (
+                after.st_dev,
+                after.st_ino,
+                after.st_size,
+                after.st_mtime_ns,
+                after.st_ctime_ns,
+            )
+            or offset != after.st_size
+        ):
+            raise MsctlError(
+                "FLEET_COLLECTION_INVALID",
+                f"{label} changed while being read",
+            )
+        return b"".join(chunks)
+
+    def _runtime_relative_uri(self, uri: object, *, label: str) -> str:
+        prefix = f"{self.runtime.s3_root.rstrip('/')}/"
+        if (
+            not isinstance(uri, str)
+            or not uri.startswith(prefix)
+            or any(character in uri for character in "\n\r\x00")
+        ):
+            raise MsctlError(
+                "FLEET_COLLECTION_INVALID",
+                f"{label} is outside the immutable runtime root",
+            )
+        relative = uri.removeprefix(prefix)
+        bucket, key = self._s3_location(relative)
+        if f"s3://{bucket}/{key}" != uri:
+            raise MsctlError(
+                "FLEET_COLLECTION_INVALID",
+                f"{label} is not a canonical runtime URI",
+            )
+        return relative
+
+    def _collection_get_object(
+        self,
+        *,
+        relative: str,
+        destination: Path,
+        label: str,
+        expected_sha256: str | None = None,
+        expected_bytes: int | None = None,
+    ) -> tuple[list[str], dict[str, object]]:
+        bucket, key = self._s3_location(relative)
+        argv = self._aws_argv(
+            "s3api",
+            "get-object",
+            "--bucket",
+            bucket,
+            "--key",
+            key,
+            "--checksum-mode",
+            "ENABLED",
+            str(destination),
+            query=(
+                "{object:{checksum_sha256:ChecksumSHA256,"
+                "version_id:VersionId}}"
+            ),
+        )
+        destination.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
+        output = _aws_output_object(
+            self._run(argv, operation=f"collect {label}"),
+            {"object"},
+            label=f"{label} get-object output",
+        )
+        row = _aws_output_object(
+            output["object"],
+            {"checksum_sha256", "version_id"},
+            label=f"{label} downloaded object",
+        )
+        digest, byte_count, _ = self._hash_regular_nofollow(
+            destination,
+            label=label,
+        )
+        expected_checksum = base64.b64encode(
+            bytes.fromhex(expected_sha256 or digest)
+        ).decode("ascii")
+        if (
+            row["checksum_sha256"] != expected_checksum
+            or (
+                row["version_id"] is not None
+                and (
+                    not isinstance(row["version_id"], str)
+                    or not row["version_id"]
+                )
+            )
+            or (expected_sha256 is not None and digest != expected_sha256)
+            or (expected_bytes is not None and byte_count != expected_bytes)
+        ):
+            raise MsctlError(
+                "COLLECT_INCOMPLETE",
+                f"{label} does not match its immutable S3 identity",
+            )
+        return argv, {
+            "path": destination,
+            "sha256": digest,
+            "bytes": byte_count,
+        }
+
+    def _verify_v3_lifecycle_collection(
+        self,
+        root: Path | str,
+        *,
+        source: str | None = None,
+        manifest: object | None = None,
+        fleet_plan_sha256: str | None = None,
+        fleet_wave: int | None = None,
+    ) -> dict[str, object]:
+        collection = Path(root)
+        try:
+            root_status = collection.stat(follow_symlinks=False)
+            resolved = collection.resolve(strict=True)
+        except OSError as error:
+            raise MsctlError(
+                "FLEET_COLLECTION_INVALID",
+                "v3 lifecycle collection root is unavailable",
+            ) from error
+        if collection.is_symlink() or not stat.S_ISDIR(root_status.st_mode):
+            raise MsctlError(
+                "FLEET_COLLECTION_INVALID",
+                "v3 lifecycle collection root must be a real directory",
+            )
+
+        evaluation_payload = self._read_collection_regular(
+            resolved / "EVALUATION.json",
+            label="paired evaluation receipt",
+        )
+        checkpoint_payload = self._read_collection_regular(
+            resolved / "CHECKPOINT.json",
+            label="paired checkpoint receipt",
+        )
+        try:
+            checkpoint = verify_checkpoint_receipt_bytes(
+                checkpoint_payload,
+                expected={"provider": self.profile.provider},
+            )
+            evaluation = verify_evaluation_receipt_bytes(
+                evaluation_payload,
+                expected={
+                    "provider": self.profile.provider,
+                    "profile_sha256": self.profile.sha256,
+                },
+            )
+        except (TypeError, ValueError) as error:
+            raise MsctlError(
+                "FLEET_COLLECTION_INVALID",
+                "paired lifecycle receipts do not satisfy their closed schemas",
+            ) from error
+        checkpoint_sha256 = hashlib.sha256(checkpoint_payload).hexdigest()
+        evaluation_sha256 = hashlib.sha256(evaluation_payload).hexdigest()
+        seed = evaluation["seed"]
+        canonical_source = f"results/seed-{seed}.json"
+        if source is not None and source != canonical_source:
+            raise MsctlError(
+                "FLEET_COLLECTION_INVALID",
+                "collection source does not match the paired evaluation seed",
+            )
+        checkpoint_uri = (
+            f"{self.runtime.s3_root.rstrip('/')}/checkpoints/seed-{seed}/"
+            f"receipts/{checkpoint_sha256}.json"
+        )
+        if evaluation["checkpoint_receipt"] != {
+            "sha256": checkpoint_sha256,
+            "uri": checkpoint_uri,
+        }:
+            raise MsctlError(
+                "FLEET_COLLECTION_INVALID",
+                "evaluation receipt does not bind the collected checkpoint receipt",
+            )
+        self._runtime_relative_uri(
+            evaluation["checkpoint_receipt"]["uri"],
+            label="checkpoint receipt URI",
+        )
+        shared_fields = (
+            "provider",
+            "release_sha256",
+            "run_manifest_sha256",
+            "dataset_sha256",
+            "source_commit",
+            "cohort_assignment_sha256",
+            "preregistration_sha256",
+            "hardware_amendment_sha256",
+            "provider_selection_sha256",
+            "profile_sha256",
+            "sealed_fixture_sha256",
+        )
+        if any(evaluation[field] != checkpoint[field] for field in shared_fields):
+            raise MsctlError(
+                "FLEET_COLLECTION_INVALID",
+                "checkpoint and evaluation receipts have divergent provenance",
+            )
+        checkpoint_rows = {
+            str(row["arm"]): row for row in checkpoint["checkpoints"]
+        }
+        evaluation_rows = {
+            str(row["arm"]): row for row in evaluation["arms"]
+        }
+        if (
+            set(checkpoint_rows) != {"dense", "split90"}
+            or set(evaluation_rows) != {"dense", "split90"}
+            or any(
+                evaluation_rows[arm]["run_id"]
+                != checkpoint_rows[arm]["run_id"]
+                or evaluation_rows[arm]["checkpoint_sha256"]
+                != checkpoint_rows[arm]["sha256"]
+                or checkpoint_rows[arm]["seed"] != seed
+                for arm in ("dense", "split90")
+            )
+        ):
+            raise MsctlError(
+                "FLEET_COLLECTION_INVALID",
+                "evaluation receipt does not close the checkpoint pair",
+            )
+        if manifest is not None:
+            expected_manifest = {
+                "provider": getattr(manifest, "provider", None),
+                "release_sha256": getattr(manifest, "release_sha256", None),
+                "run_manifest_sha256": getattr(manifest, "sha256", None),
+                "dataset_sha256": getattr(manifest, "dataset_sha256", None),
+                "source_commit": getattr(manifest, "source_commit", None),
+                "cohort_assignment_sha256": getattr(
+                    manifest,
+                    "cohort_assignment_sha256",
+                    None,
+                ),
+                "preregistration_sha256": getattr(
+                    manifest,
+                    "preregistration_sha256",
+                    None,
+                ),
+                "hardware_amendment_sha256": getattr(
+                    manifest,
+                    "hardware_amendment_sha256",
+                    None,
+                ),
+                "provider_selection_sha256": getattr(
+                    manifest,
+                    "provider_selection_sha256",
+                    None,
+                ),
+                "profile_sha256": getattr(manifest, "profile_sha256", None),
+                "sealed_fixture_sha256": getattr(
+                    manifest,
+                    "sealed_fixture_sha256",
+                    None,
+                ),
+            }
+            if any(
+                evaluation[field] != expected
+                for field, expected in expected_manifest.items()
+            ) or (
+                evaluation["seed"] != getattr(manifest, "seed", None)
+                or evaluation["fleet_plan_sha256"] != fleet_plan_sha256
+                or evaluation["fleet_wave"] != fleet_wave
+            ):
+                raise MsctlError(
+                    "FLEET_COLLECTION_INVALID",
+                    "lifecycle receipts do not bind the completed fleet wave",
+                )
+            manifest_runs = {
+                str(run.arm): run for run in getattr(manifest, "runs", ())
+            }
+            if set(manifest_runs) != {"dense", "split90"} or any(
+                checkpoint_rows[arm]["run_id"] != manifest_runs[arm].run_id
+                or checkpoint_rows[arm]["config_sha256"]
+                != manifest_runs[arm].config_sha256
+                for arm in ("dense", "split90")
+            ):
+                raise MsctlError(
+                    "FLEET_COLLECTION_INVALID",
+                    "checkpoint receipt does not bind the manifest run pair",
+                )
+
+        expected_files: dict[str, dict[str, object]] = {}
+        for name, payload in (
+            ("CHECKPOINT.json", checkpoint_payload),
+            ("EVALUATION.json", evaluation_payload),
+        ):
+            expected_files[name] = {
+                "path": name,
+                "bytes": len(payload),
+                "sha256": hashlib.sha256(payload).hexdigest(),
+            }
+        for arm in ("dense", "split90"):
+            arm_row = evaluation_rows[arm]
+            run_id = str(arm_row["run_id"])
+            artifacts_by_name = {
+                str(artifact["path"]): artifact
+                for artifact in arm_row["artifacts"]
+            }
+            for artifact in arm_row["artifacts"]:
+                name = str(artifact["path"])
+                relative = f"{run_id}/{name}"
+                expected_uri = (
+                    f"{self.runtime.s3_root.rstrip('/')}/evaluations/seed-{seed}/"
+                    f"{run_id}/{name}/sha256/{artifact['sha256']}"
+                )
+                if artifact["uri"] != expected_uri:
+                    raise MsctlError(
+                        "FLEET_COLLECTION_INVALID",
+                        "evaluation artifact URI is not canonical",
+                        details={"path": relative},
+                    )
+                self._runtime_relative_uri(
+                    artifact["uri"],
+                    label=f"evaluation artifact {relative}",
+                )
+                digest, byte_count, _ = self._hash_regular_nofollow(
+                    resolved.joinpath(*relative.split("/")),
+                    label=f"collected artifact {relative}",
+                )
+                if (
+                    digest != artifact["sha256"]
+                    or byte_count != artifact["bytes"]
+                ):
+                    raise MsctlError(
+                        "FLEET_COLLECTION_INVALID",
+                        "collected evaluation artifact differs from its receipt",
+                        details={"path": relative},
+                    )
+                expected_files[relative] = {
+                    "path": relative,
+                    "bytes": byte_count,
+                    "sha256": digest,
+                }
+            sealed_inventory = {
+                member: str(artifacts_by_name[member]["sha256"])
+                for member in REQUIRED_SEALED_MEMBERS
+            }
+            fixture_inventory = {
+                member: sealed_inventory[member]
+                for member in SEALED_FIXTURE_MEMBERS
+            }
+            if (
+                sealed_inventory["study-lock.json"]
+                != evaluation["study_lock_sha256"]
+                or canonical_sha256(
+                    {
+                        "schema_version": 1,
+                        "members": dict(sorted(sealed_inventory.items())),
+                    }
+                )
+                != evaluation["sealed_evaluation_sha256"]
+                or sealed_fixture_sha256(fixture_inventory)
+                != evaluation["sealed_fixture_sha256"]
+            ):
+                raise MsctlError(
+                    "FLEET_COLLECTION_INVALID",
+                    "collected finalized evaluator provenance does not match "
+                    "the paired evaluation receipt",
+                    details={"arm": arm},
+                )
+        collection_payload = self._read_collection_regular(
+            resolved / "COLLECTION.json",
+            label="collection receipt",
+        )
+        try:
+            collection_value = json.loads(collection_payload.decode("ascii"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise MsctlError(
+                "FLEET_COLLECTION_INVALID",
+                "collection receipt is not valid canonical JSON",
+            ) from error
+        expected_rows = [
+            expected_files[path] for path in sorted(expected_files)
+        ]
+        if (
+            not isinstance(collection_value, dict)
+            or collection_value
+            != {"schema_version": 1, "files": expected_rows}
+            or collection_payload != canonical_json(collection_value) + b"\n"
+        ):
+            raise MsctlError(
+                "FLEET_COLLECTION_INVALID",
+                "collection receipt does not enumerate the exact paired lifecycle",
+            )
+        actual_files: set[str] = set()
+        for path in resolved.rglob("*"):
+            metadata = path.stat(follow_symlinks=False)
+            if path.is_symlink() or not (
+                stat.S_ISDIR(metadata.st_mode) or stat.S_ISREG(metadata.st_mode)
+            ):
+                raise MsctlError(
+                    "FLEET_COLLECTION_INVALID",
+                    "collection contains a symlink or special member",
+                )
+            if stat.S_ISREG(metadata.st_mode):
+                actual_files.add(path.relative_to(resolved).as_posix())
+        if actual_files != set(expected_files) | {"COLLECTION.json"}:
+            raise MsctlError(
+                "FLEET_COLLECTION_INVALID",
+                "collection file inventory is not exact",
+            )
+        return {
+            "collection_receipt_sha256": hashlib.sha256(
+                collection_payload
+            ).hexdigest(),
+            "checkpoint_receipt_sha256": checkpoint_sha256,
+            "checkpoint_receipt_uri": checkpoint_uri,
+            "evaluation_receipt_sha256": evaluation_sha256,
+            "evaluation_receipt_uri": (
+                f"{self.runtime.s3_root.rstrip('/')}/evaluations/seed-{seed}/"
+                f"receipts/{evaluation_sha256}.json"
+            ),
+            "evaluation": evaluation,
+            "checkpoint": checkpoint,
+            "files": expected_rows,
+            "source": canonical_source,
+        }
+
     def collect(
         self,
         *,
@@ -4726,6 +5228,232 @@ class AwsP5Backend:
         out: Path | str,
         apply: bool,
     ) -> dict[str, object]:
+        if self.profile.provider in _V3_PROFILES:
+            destination = Path(out).absolute()
+            if destination.exists() or destination.is_symlink():
+                if destination.is_symlink() or not destination.is_dir():
+                    raise MsctlError(
+                        "COLLECT_DESTINATION_EXISTS",
+                        "v3 collection destination must be a real directory",
+                    )
+                details = self._verify_v3_lifecycle_collection(
+                    destination,
+                    source=source,
+                )
+                return {
+                    "provider": self.profile.provider,
+                    "s3_uri": f"{self.runtime.s3_root.rstrip('/')}/{source}",
+                    "out": str(destination),
+                    "collection_receipt_sha256": details[
+                        "collection_receipt_sha256"
+                    ],
+                    "evaluation_receipt_sha256": details[
+                        "evaluation_receipt_sha256"
+                    ],
+                    "collected": 0,
+                    "idempotent": True,
+                }
+            bucket, key = self._s3_location(source)
+            first_argv = self._aws_argv(
+                "s3api",
+                "get-object",
+                "--bucket",
+                bucket,
+                "--key",
+                key,
+                "--checksum-mode",
+                "ENABLED",
+                str(destination / "EVALUATION.json"),
+                query=(
+                    "{object:{checksum_sha256:ChecksumSHA256,"
+                    "version_id:VersionId}}"
+                ),
+            )
+            if not apply:
+                return {
+                    "provider": self.profile.provider,
+                    "s3_uri": f"s3://{bucket}/{key}",
+                    "out": str(destination),
+                    "commands": [first_argv],
+                    "collected": 0,
+                    "idempotent": False,
+                }
+            parent_fd = open_directory(
+                destination.parent,
+                label="v3 collection destination",
+                create=True,
+            )
+            os.close(parent_fd)
+            staging = Path(
+                tempfile.mkdtemp(
+                    prefix=f".{destination.name}.",
+                    dir=destination.parent,
+                )
+            )
+            os.chmod(staging, 0o700)
+            commands: list[list[str]] = []
+            try:
+                argv, evaluation_identity = self._collection_get_object(
+                    relative=source,
+                    destination=staging / "EVALUATION.json",
+                    label="paired evaluation receipt",
+                )
+                commands.append(argv)
+                evaluation_payload = self._read_collection_regular(
+                    staging / "EVALUATION.json",
+                    label="paired evaluation receipt",
+                )
+                try:
+                    evaluation = verify_evaluation_receipt_bytes(
+                        evaluation_payload,
+                        expected={
+                            "provider": self.profile.provider,
+                            "profile_sha256": self.profile.sha256,
+                        },
+                    )
+                except (TypeError, ValueError) as error:
+                    raise MsctlError(
+                        "COLLECT_INCOMPLETE",
+                        "source is not a closed paired evaluation receipt",
+                    ) from error
+                if source != f"results/seed-{evaluation['seed']}.json":
+                    raise MsctlError(
+                        "COLLECT_INCOMPLETE",
+                        "source path does not match the evaluation seed",
+                    )
+                checkpoint_binding = evaluation["checkpoint_receipt"]
+                checkpoint_relative = self._runtime_relative_uri(
+                    checkpoint_binding["uri"],
+                    label="checkpoint receipt URI",
+                )
+                argv, checkpoint_identity = self._collection_get_object(
+                    relative=checkpoint_relative,
+                    destination=staging / "CHECKPOINT.json",
+                    label="paired checkpoint receipt",
+                    expected_sha256=str(checkpoint_binding["sha256"]),
+                )
+                commands.append(argv)
+                identities: dict[str, dict[str, object]] = {
+                    "EVALUATION.json": {
+                        **evaluation_identity,
+                        "path": "EVALUATION.json",
+                    },
+                    "CHECKPOINT.json": {
+                        **checkpoint_identity,
+                        "path": "CHECKPOINT.json",
+                    },
+                }
+                for arm_row in evaluation["arms"]:
+                    run_id = str(arm_row["run_id"])
+                    for artifact in arm_row["artifacts"]:
+                        name = str(artifact["path"])
+                        relative = f"{run_id}/{name}"
+                        artifact_relative = self._runtime_relative_uri(
+                            artifact["uri"],
+                            label=f"evaluation artifact {relative}",
+                        )
+                        argv, identity = self._collection_get_object(
+                            relative=artifact_relative,
+                            destination=staging / run_id / name,
+                            label=f"evaluation artifact {relative}",
+                            expected_sha256=str(artifact["sha256"]),
+                            expected_bytes=int(artifact["bytes"]),
+                        )
+                        commands.append(argv)
+                        identities[relative] = {
+                            **identity,
+                            "path": relative,
+                        }
+                rows = [
+                    {
+                        "path": relative,
+                        "bytes": int(identities[relative]["bytes"]),
+                        "sha256": str(identities[relative]["sha256"]),
+                    }
+                    for relative in sorted(identities)
+                ]
+                receipt_payload = (
+                    canonical_json({"schema_version": 1, "files": rows}) + b"\n"
+                )
+                stage_fd = open_directory(
+                    staging,
+                    label="v3 collection staging",
+                )
+                try:
+                    atomic_write_at(
+                        stage_fd,
+                        "COLLECTION.json",
+                        receipt_payload,
+                        label="v3 collection receipt",
+                    )
+                finally:
+                    os.close(stage_fd)
+                details = self._verify_v3_lifecycle_collection(
+                    staging,
+                    source=source,
+                )
+                parent_fd = open_directory(
+                    destination.parent,
+                    label="v3 collection destination",
+                )
+                try:
+                    try:
+                        rename_noreplace_at(
+                            parent_fd,
+                            staging.name,
+                            parent_fd,
+                            destination.name,
+                        )
+                    except FileExistsError:
+                        existing = self._verify_v3_lifecycle_collection(
+                            destination,
+                            source=source,
+                        )
+                        if (
+                            existing["evaluation_receipt_sha256"]
+                            != details["evaluation_receipt_sha256"]
+                        ):
+                            raise MsctlError(
+                                "COLLECT_DESTINATION_EXISTS",
+                                "concurrent collection destination conflicts",
+                            )
+                        shutil.rmtree(staging)
+                        return {
+                            "provider": self.profile.provider,
+                            "s3_uri": f"s3://{bucket}/{key}",
+                            "out": str(destination),
+                            "collection_receipt_sha256": existing[
+                                "collection_receipt_sha256"
+                            ],
+                            "evaluation_receipt_sha256": existing[
+                                "evaluation_receipt_sha256"
+                            ],
+                            "commands": commands,
+                            "collected": 0,
+                            "idempotent": True,
+                        }
+                    os.fsync(parent_fd)
+                finally:
+                    os.close(parent_fd)
+                staging = Path()
+                return {
+                    "provider": self.profile.provider,
+                    "s3_uri": f"s3://{bucket}/{key}",
+                    "out": str(destination),
+                    "collection_receipt_sha256": details[
+                        "collection_receipt_sha256"
+                    ],
+                    "evaluation_receipt_sha256": details[
+                        "evaluation_receipt_sha256"
+                    ],
+                    "commands": commands,
+                    "collected": len(rows),
+                    "idempotent": False,
+                }
+            finally:
+                if staging != Path() and staging.exists():
+                    shutil.rmtree(staging)
+
         bucket, key = self._s3_location(source)
         destination = Path(out).absolute()
         if destination.exists() or destination.is_symlink():
@@ -4952,6 +5680,20 @@ class AwsP5Backend:
             collection_root,
             manifest=previous,
         )
+        lifecycle_collection = self._verify_v3_lifecycle_collection(
+            collection_root,
+            manifest=previous,
+            fleet_plan_sha256=plan.sha256,
+            fleet_wave=from_binding.wave,
+        )
+        if (
+            lifecycle_collection["collection_receipt_sha256"]
+            != collection_sha256
+        ):
+            raise MsctlError(
+                "FLEET_ADVANCE_INVALID",
+                "generic and lifecycle collection verification disagree",
+            )
         store = StateStore(self.state_root)
         with store.locked():
             self._repair_paired_states(store, previous, previous_context)
@@ -4999,6 +5741,18 @@ class AwsP5Backend:
                 or evaluation.get("fleet_wave") != from_binding.wave
                 or evaluation.get("launch_readiness_sha256")
                 != paired[0].get("launch_readiness_sha256")
+                or lifecycle_collection["evaluation"][
+                    "launch_readiness_sha256"
+                ]
+                != paired[0].get("launch_readiness_sha256")
+                or lifecycle_collection["evaluation"]["operation_id"]
+                != evaluation.get("operation_id")
+                or lifecycle_collection["evaluation"][
+                    "sealed_evaluation_sha256"
+                ]
+                != evaluation.get("sealed_evaluation_sha256")
+                or lifecycle_collection["evaluation"]["study_lock_sha256"]
+                != evaluation.get("study_lock_sha256")
                 or not isinstance(evaluation.get("command_id"), str)
             ):
                 raise MsctlError(
@@ -5056,6 +5810,12 @@ class AwsP5Backend:
             "training_state_sha256": training_state_sha256,
             "evaluation_state_sha256": evaluation_state_sha256,
             "collection_receipt_sha256": collection_sha256,
+            "checkpoint_receipt_sha256": lifecycle_collection[
+                "checkpoint_receipt_sha256"
+            ],
+            "evaluation_receipt_sha256": lifecycle_collection[
+                "evaluation_receipt_sha256"
+            ],
             "jobs": 0,
             "allocated_gpus": 0,
             "wall_minutes": 0,
@@ -5142,6 +5902,18 @@ class AwsP5Backend:
             "evaluation_command_id": evaluation_command_id,
             "training_terminal_receipt_uri": training_terminal_uri,
             "evaluation_terminal_receipt_uri": evaluation_terminal_uri,
+            "checkpoint_receipt_sha256": lifecycle_collection[
+                "checkpoint_receipt_sha256"
+            ],
+            "checkpoint_receipt_uri": lifecycle_collection[
+                "checkpoint_receipt_uri"
+            ],
+            "evaluation_receipt_sha256": lifecycle_collection[
+                "evaluation_receipt_sha256"
+            ],
+            "evaluation_receipt_uri": lifecycle_collection[
+                "evaluation_receipt_uri"
+            ],
             "aws_bound_tags_sha256": canonical_sha256(bound_tags),
             "aws_unbound_tags_sha256": canonical_sha256(unbound_tags),
         }
@@ -5882,6 +6654,8 @@ class AwsP5Backend:
             manifest,
             context,
         )
+        if validated_context is not None:
+            self._require_fleet_advance(manifest, validated_context)
         checkpoints = self._checkpoint_map(manifest, checkpoint_receipt)
         checkpoint_publication = self._checkpoint_publication(
             checkpoint_receipt=checkpoint_receipt,
@@ -6517,6 +7291,15 @@ class AwsP5Backend:
                 "MS_RUNTIME_GID": str(getattr(self.runtime, "gid", 1000)),
                 "MS_RUNTIME_UID": str(getattr(self.runtime, "uid", 1000)),
                 "MS_S3_ROOT": self.runtime.s3_root,
+                **(
+                    {
+                        "MS_S3_KMS_KEY_ID": str(
+                            getattr(self.runtime, "kms_key_id", "")
+                        )
+                    }
+                    if v3_bindings
+                    else {}
+                ),
             },
             "checkpoint_receipt": None,
             "steps": [
@@ -6606,6 +7389,36 @@ class AwsP5Backend:
                                 final_bindings["study_lock_sha256"],
                             ],
                         },
+                        {
+                            "name": "verify-terminal-checkpoints",
+                            "argv": [
+                                "/usr/bin/python3",
+                                (
+                                    f"{self._release_root(release)}/"
+                                    "cluster/aws/p5/terminal_artifacts.py"
+                                ),
+                                "verify-terminal",
+                                "--receipt",
+                                (
+                                    f"{getattr(self.profile, 'scratch_root', '/mnt/memorysplit')}"
+                                    f"/receipts/checkpoints/seed-{manifest.seed}/"
+                                    "receipt.json"
+                                ),
+                                "--run-root",
+                                (
+                                    f"{getattr(self.profile, 'scratch_root', '/mnt/memorysplit')}"
+                                    f"/runs/seed-{manifest.seed}"
+                                ),
+                                "--s3-root",
+                                self.runtime.s3_root,
+                                "--provider",
+                                self.profile.provider,
+                                "--run-manifest-sha256",
+                                manifest.sha256,
+                                "--sealed-fixture-sha256",
+                                manifest.sealed_fixture_sha256,
+                            ],
+                        },
                     ]
                     if _is_v3_manifest(manifest)
                     else []
@@ -6618,6 +7431,52 @@ class AwsP5Backend:
                     strict=True,
                 )
                 ],
+                *(
+                    [
+                        {
+                            "name": "publish-paired-evaluation",
+                            "argv": [
+                                "/usr/bin/python3",
+                                (
+                                    f"{self._release_root(release)}/"
+                                    "cluster/aws/p5/terminal_artifacts.py"
+                                ),
+                                "publish-evaluation",
+                                "--evaluation-root",
+                                (
+                                    f"{getattr(self.profile, 'scratch_root', '/mnt/memorysplit')}"
+                                    "/evaluations"
+                                ),
+                                "--checkpoint-receipt",
+                                (
+                                    f"{getattr(self.profile, 'scratch_root', '/mnt/memorysplit')}"
+                                    f"/receipts/checkpoints/seed-{manifest.seed}/"
+                                    "receipt.json"
+                                ),
+                                "--s3-root",
+                                self.runtime.s3_root,
+                                "--provider",
+                                self.profile.provider,
+                                "--run-manifest-sha256",
+                                manifest.sha256,
+                                "--sealed-fixture-sha256",
+                                manifest.sealed_fixture_sha256,
+                                "--sealed-evaluation-sha256",
+                                final_bindings["sealed_evaluation_sha256"],
+                                "--study-lock-sha256",
+                                final_bindings["study_lock_sha256"],
+                                "--fleet-plan-sha256",
+                                v3_bindings["fleet_plan_sha256"],
+                                "--fleet-wave",
+                                str(v3_bindings["fleet_wave"]),
+                                "--launch-readiness-sha256",
+                                v3_bindings["launch_readiness_sha256"],
+                            ],
+                        }
+                    ]
+                    if _is_v3_manifest(manifest)
+                    else []
+                ),
             ],
         }
 
@@ -6637,6 +7496,8 @@ class AwsP5Backend:
             manifest,
             context,
         )
+        if validated_context is not None:
+            self._require_fleet_advance(manifest, validated_context)
         operation_intent = self._evaluation_operation_intent(
             release,
             manifest,

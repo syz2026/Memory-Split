@@ -496,6 +496,8 @@ def _verify_checkpoint_receipt(
         if (
             binding is None
             or launch is None
+            or row["run_id"] != launch.run_id
+            or row["path"] != f"{arm}.pt"
             or row["sha256"] != binding.get("resume_sha256")
             or row["world_size"] != binding.get("world_size")
             or row["config_sha256"] != launch.config_sha256
@@ -617,9 +619,17 @@ def main(argv: Sequence[str] | None = None) -> int:
                     reviewed_launcher._production_interruption_handler
                 ),
                 shutdown_source=shutdown_source,
+                terminal_handler=(
+                    reviewed_launcher._production_terminal_handler
+                    if reviewed_launcher._is_v3_profile(plan.profile)
+                    else None
+                ),
             )
         report = {
             "child_pids": dict(sorted(result.child_pids.items())),
+            "checkpoint_receipt": result.checkpoint_receipt,
+            "checkpoint_receipt_sha256": result.checkpoint_receipt_sha256,
+            "checkpoint_receipt_uri": result.checkpoint_receipt_uri,
             "dry_run": False,
             "failed_arm": result.failed_arm,
             "interruption_receipt": result.interruption_receipt,
