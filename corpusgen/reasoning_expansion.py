@@ -21,9 +21,10 @@ import tempfile
 import types
 from array import array
 from collections.abc import Callable, Mapping, Sequence
-from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import Future, ProcessPoolExecutor, ThreadPoolExecutor
 from dataclasses import dataclass
 from fractions import Fraction
+from multiprocessing import get_context
 from pathlib import Path, PurePosixPath
 from typing import Any, Protocol, Self
 
@@ -51,7 +52,7 @@ POINTER_FORMAT = "memorysplit-reasoning-pointer-v1"
 SCHEMA_VERSION = 2
 FINISH_WINDOW = 1 << 18
 MAX_FINISH_CANDIDATES = 32_768
-PREFETCH_BATCH_SIZE = 64
+PREFETCH_BATCH_SIZE = 256
 PROBE_INDICES = (0, 1, 17, 127)
 _HEX = frozenset("0123456789abcdef")
 _MANIFEST_MAGIC = b"MSR3REC2"
@@ -110,6 +111,13 @@ class GeneratedRecord:
 
 class RecordGenerator(Protocol):
     def generate(self, task: str, index: int) -> GeneratedRecord: ...
+
+
+class RecordReplayer(Protocol):
+    def replay(
+        self,
+        requests: Sequence[tuple[str, int]],
+    ) -> tuple[GeneratedRecord, ...]: ...
 
 
 @dataclass
@@ -814,6 +822,190 @@ class ReasoningGymGenerator:
             token_count=len(token_ids),
             record_sha256=digest,
         )
+
+
+_PROCESS_GENERATOR: ReasoningGymGenerator | None = None
+
+
+def _initialize_process_generator(
+    source_root: str,
+    recipe: ExpansionRecipe,
+) -> None:
+    global _PROCESS_GENERATOR
+    sys.dont_write_bytecode = True
+    _PROCESS_GENERATOR = ReasoningGymGenerator(Path(source_root), recipe)
+
+
+def _process_generate_serial(
+    task: str,
+    start: int,
+    count: int,
+) -> tuple[GeneratedRecord, ...]:
+    if _PROCESS_GENERATOR is None:
+        raise RuntimeError("reasoning process generator is not initialized")
+    return tuple(
+        _PROCESS_GENERATOR.generate(task, index)
+        for index in range(start, start + count)
+    )
+
+
+def _process_generate_indices(
+    task: str,
+    indices: tuple[int, ...],
+) -> tuple[GeneratedRecord, ...]:
+    if _PROCESS_GENERATOR is None:
+        raise RuntimeError("reasoning process generator is not initialized")
+    return tuple(_PROCESS_GENERATOR.generate(task, index) for index in indices)
+
+
+def _process_pool(
+    source_root: Path,
+    recipe: ExpansionRecipe,
+) -> ProcessPoolExecutor:
+    return ProcessPoolExecutor(
+        max_workers=min(len(recipe.tasks), max(1, os.cpu_count() or 1)),
+        mp_context=get_context("spawn"),
+        initializer=_initialize_process_generator,
+        initargs=(str(source_root.resolve(strict=True)), recipe),
+    )
+
+
+class _ProcessPrefetchingRecordGenerator:
+    """Materialize independent task batches in isolated deterministic workers."""
+
+    def __init__(
+        self,
+        source_root: Path,
+        recipe: ExpansionRecipe,
+        *,
+        batch_size: int = PREFETCH_BATCH_SIZE,
+    ) -> None:
+        if batch_size <= 0:
+            raise ValueError("prefetch batch size must be positive")
+        self.batch_size = batch_size
+        self.executor = _process_pool(source_root, recipe)
+        self.states = {
+            task.dataset: _PrefetchState(
+                next_index=0,
+                batch_start=0,
+                rows=(),
+                future=self._submit(task.dataset, 0),
+            )
+            for task in recipe.tasks
+        }
+        self.closed = False
+
+    def _submit(
+        self,
+        task: str,
+        start: int,
+    ) -> Future[tuple[GeneratedRecord, ...]]:
+        return self.executor.submit(
+            _process_generate_serial,
+            task,
+            start,
+            self.batch_size,
+        )
+
+    def generate(self, task: str, index: int) -> GeneratedRecord:
+        if self.closed:
+            raise RuntimeError("reasoning process prefetch generator is closed")
+        state = self.states[task]
+        if index != state.next_index:
+            raise ReasoningExpansionError(
+                f"reasoning process prefetch index is non-serial for {task}: "
+                f"expected {state.next_index}, got {index}"
+            )
+        if not state.rows or index >= state.batch_start + len(state.rows):
+            if state.future is None:
+                raise RuntimeError("reasoning process prefetch future is missing")
+            state.rows = state.future.result()
+            state.batch_start = index
+            if len(state.rows) != self.batch_size:
+                raise ReasoningExpansionError(
+                    f"reasoning process prefetch batch size differs for {task}"
+                )
+            next_start = state.batch_start + self.batch_size
+            state.future = self._submit(task, next_start)
+        record = state.rows[index - state.batch_start]
+        state.next_index += 1
+        return record
+
+    def close(self) -> None:
+        if self.closed:
+            return
+        self.closed = True
+        for state in self.states.values():
+            if state.future is not None:
+                state.future.cancel()
+        self.executor.shutdown(wait=True, cancel_futures=True)
+
+    def __enter__(self) -> Self:
+        return self
+
+    def __exit__(self, *_args: object) -> None:
+        self.close()
+
+
+class _GeneratorRecordReplayer:
+    def __init__(self, generator: RecordGenerator):
+        self.generator = generator
+
+    def replay(
+        self,
+        requests: Sequence[tuple[str, int]],
+    ) -> tuple[GeneratedRecord, ...]:
+        return tuple(self.generator.generate(task, index) for task, index in requests)
+
+
+class _ProcessRecordReplayer:
+    """Replay arbitrary manifest indices in task-grouped process batches."""
+
+    def __init__(self, source_root: Path, recipe: ExpansionRecipe):
+        self.executor = _process_pool(source_root, recipe)
+        self.closed = False
+
+    def replay(
+        self,
+        requests: Sequence[tuple[str, int]],
+    ) -> tuple[GeneratedRecord, ...]:
+        if self.closed:
+            raise RuntimeError("reasoning process replayer is closed")
+        grouped: dict[str, list[tuple[int, int]]] = {}
+        for position, (task, index) in enumerate(requests):
+            grouped.setdefault(task, []).append((position, index))
+        futures = {
+            task: self.executor.submit(
+                _process_generate_indices,
+                task,
+                tuple(index for _position, index in positions),
+            )
+            for task, positions in grouped.items()
+        }
+        output: list[GeneratedRecord | None] = [None] * len(requests)
+        for task, positions in grouped.items():
+            records = futures[task].result()
+            if len(records) != len(positions):
+                raise ReasoningExpansionError(
+                    f"reasoning process replay batch size differs for {task}"
+                )
+            for (position, _index), record in zip(positions, records):
+                output[position] = record
+        if any(record is None for record in output):
+            raise ReasoningExpansionError("reasoning process replay omitted a record")
+        return tuple(record for record in output if record is not None)
+
+    def close(self) -> None:
+        if self.closed:
+            return
+        self.closed = True
+        self.executor.shutdown(wait=True, cancel_futures=True)
+
+    def __enter__(self) -> Self:
+        return self
+
+    def __exit__(self, *_args: object) -> None:
+        self.close()
 
 
 class _PrefetchingRecordGenerator:
@@ -1628,9 +1820,9 @@ def build_reasoning_corpus(
         (staging / "packed").mkdir(parents=True)
         (staging / "records").mkdir()
         (staging / "sidecars").mkdir()
-        with _PrefetchingRecordGenerator(
-            ReasoningGymGenerator(source_root, recipe),
-            recipe.tasks,
+        with _ProcessPrefetchingRecordGenerator(
+            source_root,
+            recipe,
         ) as generator:
             compiled = _compile_extension(
                 recipe,
@@ -1775,7 +1967,7 @@ def _verify_record_manifest(
     recipe: ExpansionRecipe,
     artifacts: Mapping[str, Mapping[str, Any]],
     extension: Mapping[str, Any],
-    generator: RecordGenerator | None = None,
+    replayer: RecordReplayer | None = None,
 ) -> dict[str, Any]:
     manifest_path = root / artifacts["record_manifest"]["path"]
     packed_path = root / artifacts["packed_targets"]["path"]
@@ -1825,15 +2017,7 @@ def _verify_record_manifest(
     eot_count = 0
     maximum_token = 0
     validation_buffer = bytearray()
-    replay_executor = (
-        ThreadPoolExecutor(
-            max_workers=min(len(recipe.tasks), max(1, os.cpu_count() or 1)),
-            thread_name_prefix="reasoning-replay",
-        )
-        if generator is not None
-        else None
-    )
-    replay_queue: list[tuple[Future[GeneratedRecord], int, int, int, bytes]] = []
+    replay_queue: list[tuple[int, int, int, bytes]] = []
 
     def validate_buffer() -> None:
         nonlocal eot_count, maximum_token
@@ -1847,8 +2031,24 @@ def _verify_record_manifest(
         validation_buffer.clear()
 
     def validate_replays() -> None:
-        for future, task_id, source_index, token_count, payload in replay_queue:
-            generated = future.result()
+        if not replay_queue:
+            return
+        if replayer is None:
+            raise RuntimeError("reasoning record replayer is missing")
+        generated_records = replayer.replay(
+            tuple(
+                (recipe.tasks[task_id].dataset, source_index)
+                for task_id, source_index, _token_count, _payload in replay_queue
+            )
+        )
+        if len(generated_records) != len(replay_queue):
+            raise ReasoningExpansionError("reasoning record replay count differs")
+        for generated, (
+            task_id,
+            source_index,
+            token_count,
+            payload,
+        ) in zip(generated_records, replay_queue):
             task = recipe.tasks[task_id].dataset
             if (
                 generated.task != task
@@ -1917,22 +2117,16 @@ def _verify_record_manifest(
                 validation_buffer.extend(payload)
                 if len(validation_buffer) >= (8 << 20):
                     validate_buffer()
-                if replay_executor is not None:
-                    assert generator is not None
+                if replayer is not None:
                     replay_queue.append(
                         (
-                            replay_executor.submit(
-                                generator.generate,
-                                recipe.tasks[task_id].dataset,
-                                source_index,
-                            ),
                             task_id,
                             source_index,
                             token_count,
                             payload,
                         )
                     )
-                    if len(replay_queue) >= 1024:
+                    if len(replay_queue) >= 4096:
                         validate_replays()
                 record_count += 1
                 task_records[task_id] += 1
@@ -1947,8 +2141,6 @@ def _verify_record_manifest(
         manifest_after = os.fstat(manifest_descriptor)
         packed_after = os.fstat(packed_descriptor)
     finally:
-        if replay_executor is not None:
-            replay_executor.shutdown(wait=True, cancel_futures=True)
         os.close(manifest_descriptor)
         os.close(packed_descriptor)
     if (
@@ -2025,7 +2217,7 @@ def _verify_record_manifest(
         "packed_sha256": packed_digest.hexdigest(),
         "record_count": record_count,
         "record_stream_sha256": record_stream_digest.hexdigest(),
-        "replayed_records": record_count if generator is not None else 0,
+        "replayed_records": record_count if replayer is not None else 0,
     }
 
 
@@ -2214,13 +2406,17 @@ def verify_reasoning_corpus(
         raise ReasoningExpansionError(
             "reasoning extension geometry, probes, or task accounting differs"
         )
-    manifest_report = _verify_record_manifest(
-        root,
+    with _ProcessRecordReplayer(
+        source_stage_root / recipe.source_relative_path,
         recipe,
-        artifacts,
-        extension,
-        generator,
-    )
+    ) as replayer:
+        manifest_report = _verify_record_manifest(
+            root,
+            recipe,
+            artifacts,
+            extension,
+            replayer,
+        )
     composite_hashes = _composite_stream_hashes(
         Path(base_corpus),
         base,

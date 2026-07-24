@@ -17,8 +17,10 @@ from corpusgen.reasoning_expansion import (
     TaskSpec,
     _compile_extension,
     _ExactSubsetAccumulator,
+    _GeneratorRecordReplayer,
     _PrefetchingRecordGenerator,
     _probe_generator,
+    _ProcessPrefetchingRecordGenerator,
     _verify_record_manifest,
     load_expansion_recipe,
 )
@@ -173,7 +175,7 @@ def test_record_manifest_replays_every_emitted_record(tmp_path):
             "record_stream_sha256": compiled["record_stream_sha256"],
             "task_stats": compiled["task_stats"],
         },
-        _FixtureGenerator(),
+        _GeneratorRecordReplayer(_FixtureGenerator()),
     )
 
     assert report["record_count"] == compiled["record_count"]
@@ -201,3 +203,29 @@ def test_reasoning_gym_new_task_probes_are_exact_and_order_independent():
     assert sys.modules["reasoning_gym"].__memorysplit_source__ == str(
         (DEFAULT_SOURCE_STAGE / recipe.source_relative_path).resolve()
     )
+
+
+@pytest.mark.skipif(
+    not DEFAULT_SOURCE_STAGE.is_dir(),
+    reason="frozen Reasoning Gym source stage is not present",
+)
+def test_process_prefetch_matches_serial_reasoning_records():
+    recipe = load_expansion_recipe()
+    source_root = DEFAULT_SOURCE_STAGE / recipe.source_relative_path
+    serial = ReasoningGymGenerator(source_root, recipe)
+    expected = {
+        task.dataset: [serial.generate(task.dataset, index) for index in range(4)]
+        for task in recipe.tasks
+    }
+
+    with _ProcessPrefetchingRecordGenerator(
+        source_root,
+        recipe,
+        batch_size=4,
+    ) as parallel:
+        actual = {
+            task.dataset: [parallel.generate(task.dataset, index) for index in range(4)]
+            for task in reversed(recipe.tasks)
+        }
+
+    assert actual == expected
