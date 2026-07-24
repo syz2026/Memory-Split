@@ -321,3 +321,154 @@ Both static checks were silent with exit code zero.
 
 The pre-existing full-suite failures recorded above remain outside this task's
 ownership. All requested Task 2 and source-lock regression checks are green.
+
+## Residual integrity closure
+
+Status: `DONE_WITH_CONCERNS`
+
+Implementation commit:
+`143820db38de02781657940aeb07f59c976359e8` —
+`fix: seal Wikidata derived-view publication`.
+
+### Findings addressed
+
+1. Every finalized private file now has a `_PrivateFileIdentity` containing
+   device, inode, kind, owner, exact mode, link count, byte size, `mtime_ns`,
+   and `ctime_ns`, plus an expected SHA-256 in `_PrivateFileAuthority`.
+   This covers decoded members, external-sort runs, streams, indexes, the
+   receipt, and every other candidate file. Incomplete outputs remain in a
+   separate creation-identity ledger and cannot enter a sealed candidate.
+2. Member and run consumers reopen descriptor-relatively, bind the name to
+   the expected open descriptor, hash that descriptor in bounded chunks, read
+   from the same descriptor, and postcheck its full identity. Run unlink and
+   merge-input checks occur while those descriptors remain open. Same-inode
+   modify/restore ABA changes `ctime_ns` and is rejected even when bytes,
+   length, mode, and `mtime_ns` are restored.
+3. After logical candidate verification, the builder seals the exact root and
+   child inventories, retained child-directory identities, and every private
+   file identity/hash. Immediately before no-replace rename it rehashes and
+   rechecks that sealed authority using retained descriptors.
+4. The published root descriptor remains open. Postrename verification
+   rechecks the sealed ledger before and after full logical verification. If
+   the exact published inode drifts, it is atomically moved from the final
+   content-addressed name to a unique owner-only `.quarantine-*` sibling and
+   the namespace is fsynced. A substituted concurrent winner fails the inode
+   comparison and is never renamed or removed.
+5. `_open_sorted_run`, `_merge_batch`, and outer build teardown use exhaustive
+   close loops. Every descriptor is attempted after injected failures; a body
+   error remains primary, while close failures are raised only after all
+   close attempts or attached as diagnostic notes.
+6. The added adversarial cases cover member and run ABA, full identity/hash
+   ledger closure, stream/index/receipt drift after candidate verification,
+   child-directory drift, exact-root quarantine with an absent final target,
+   concurrent-winner preservation, and close-failure exhaustion in all three
+   required paths.
+
+### Residual-fix TDD evidence
+
+The 10 named tests were added before production changes; the parameterized
+candidate-file test produces three cases, for 12 total cases.
+
+Direct RED selection:
+
+```bash
+python -m pytest -q tests/test_reasoning_v2_wikidata_source.py \
+  -k 'materialized_member_same_inode or run_in_place_modify_restore or \
+private_file_authority or candidate_file_drift_after or \
+candidate_child_directory_drift or postpublish_drift or \
+postpublish_root_swap or open_sorted_run_close or merge_close_failures or \
+outer_close_failures'
+```
+
+Exact RED result:
+
+```text
+FFFFFFFFFFFF                                                             [100%]
+12 failed, 49 deselected in 1.26s
+```
+
+The member and run ABA attacks reported `DID NOT RAISE`; run identities still
+had five fields and no hash; prepublish stream/index/receipt/child drift left
+the final name occupied; postpublish hooks were absent; and injected close
+failures were never invoked through an exhaustive close primitive.
+
+The same direct selection after implementation:
+
+```text
+............                                                             [100%]
+12 passed, 49 deselected in 0.67s
+```
+
+### Residual-fix final verification
+
+```bash
+python -m pytest -q tests/test_reasoning_v2_wikidata_source.py
+```
+
+```text
+.............................................................            [100%]
+61 passed in 2.11s
+```
+
+```bash
+python -m pytest -q \
+  tests/test_reasoning_v2_source_lock.py \
+  tests/test_current_sources.py
+```
+
+```text
+........................................................................ [ 64%]
+.......................................                                  [100%]
+111 passed in 14.37s
+```
+
+The regression command again used unrestricted local filesystem execution
+only because its fixtures create temporary Git repositories. No network or
+AWS access was enabled or used.
+
+```bash
+python -m py_compile \
+  corpusgen/reasoning_v2/wikidata_source.py \
+  tests/test_reasoning_v2_wikidata_source.py
+git diff --check
+```
+
+Both static checks were silent with exit code zero.
+
+### Residual-fix bounded-memory evidence
+
+- All new hashing is descriptor-based and streams fixed 1 MiB chunks. It does
+  not use unbounded `read()`, `read_bytes()`, or whole-artifact collections.
+- The private ledger contains only the fixed candidate file inventory and
+  bounded external-run metadata `(name, identity, sha256)`; payload bytes are
+  never retained.
+- External-sort chunk, record, pending-level, and merge-fan-in bounds remain
+  unchanged. Forced one-record multi-level merges remain covered by the
+  deterministic focused suite.
+- Publication sealing performs repeated streaming passes for integrity, not
+  in-memory materialization, so memory remains independent of corpus size.
+
+### Residual-fix self-review
+
+- Public Task 1/Task 2 signatures, receipt format/schema v1, deterministic
+  stream/index bytes, numeric ordering, and content-address names are
+  unchanged.
+- Successful candidates cannot cross publication on creation identity alone:
+  all files, children, inventory, receipt, and root are sealed and checked
+  immediately before rename. Postrename checks use the retained root and child
+  descriptors rather than accepting a path-only candidate.
+- Quarantine first proves the final name still denotes the retained published
+  root. Therefore candidate drift vacates the target, while a different inode
+  at that name is preserved as a possible concurrent winner.
+- Close-failure tests call the real close before injecting an exception, prove
+  every expected descriptor was attempted, and prove each is closed.
+- Commit scope before this appendix contained exactly the two authorized
+  Wikidata code/test files. This appendix is the only report change. No amend,
+  push, source mutation, AWS operation, network operation, or other worktree
+  edit occurred.
+
+### Residual concern
+
+The unrelated pre-existing full-suite failures recorded earlier remain outside
+this task's ownership. All requested focused, Task 1/source-lock, compilation,
+and diff checks are green.
