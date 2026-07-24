@@ -9,6 +9,19 @@ from .contracts import (
     hamilton_quotas,
     load_recipe,
 )
+from .semantic import (
+    RouteArtifacts,
+    RouteIndex,
+    SemanticLeakageError,
+    SemanticRole,
+    SidecarWeights,
+    TokenSemanticSpan,
+    audit_answer_state_surfaces,
+    audit_proof_surfaces,
+    audit_sidecar_weights,
+    build_route_artifacts,
+    derive_sidecar_weights,
+)
 
 __all__ = (
     "LANE_ORDER",
@@ -16,7 +29,18 @@ __all__ = (
     "LaneContract",
     "LaneId",
     "ReasoningV2Recipe",
+    "RouteArtifacts",
+    "RouteIndex",
+    "SemanticLeakageError",
+    "SemanticRole",
+    "SidecarWeights",
+    "TokenSemanticSpan",
+    "audit_answer_state_surfaces",
+    "audit_proof_surfaces",
+    "audit_sidecar_weights",
     "balanced_record_lengths",
+    "build_route_artifacts",
+    "derive_sidecar_weights",
     "geometry_for",
     "hamilton_quotas",
     "load_recipe",
