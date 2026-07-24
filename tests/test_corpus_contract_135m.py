@@ -21,29 +21,20 @@ from train.data import PackedShards
 
 ROOT = Path(__file__).resolve().parents[1]
 SOURCE_LOCK = ROOT / "configs" / "reasoning-dataset-v2.json"
-TINY_TOTAL = 40
+TINY_TOTAL = 48
 TINY_UPDATE = 8
-TINY_STEPS = 5
+TINY_STEPS = 6
 TINY_QUOTAS = {
-    "fineweb_edu": 10,
-    "finemath": 6,
-    "wikidata_graph": 8,
-    "synthetic_graph": 4,
-    "verified_synthetic_multihop": 6,
-    "wikidata_path_reasoning": 3,
+    "fineweb_edu": 12,
+    "finemath": 7,
+    "wikidata_graph": 10,
+    "synthetic_graph": 5,
+    "verified_synthetic_multihop": 7,
+    "wikidata_path_reasoning": 4,
     "relational_refinement": 1,
     "objective_auxiliary": 2,
 }
-LANE_WEIGHTS = (
-    ("fineweb_edu", 50),
-    ("finemath", 30),
-    ("wikidata_graph", 40),
-    ("synthetic_graph", 20),
-    ("verified_synthetic_multihop", 30),
-    ("wikidata_path_reasoning", 15),
-    ("relational_refinement", 5),
-    ("objective_auxiliary", 10),
-)
+LANE_WEIGHTS = tuple(TINY_QUOTAS.items())
 DYNAMIC_POINTER_FIELDS = (
     "expected_receipt_sha256",
     "expected_source_receipt_sha256",
@@ -233,7 +224,7 @@ def test_task4_publication_materializes_freezes_verifies_and_stages(tiny_task4, 
         batch_size=2,
     )
     observed_targets = []
-    for _ in range(5):
+    for _ in range(TINY_STEPS):
         _x, y = loader.next_batch()
         observed_targets.extend(y.flatten().tolist())
     packed_tokens = np.frombuffer(expected_packed, dtype=np.uint16).tolist()

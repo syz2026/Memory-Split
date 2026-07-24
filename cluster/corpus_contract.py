@@ -593,17 +593,13 @@ def _validate_publication_recipe(
         parsed_weights.append(
             _positive_int(item.get("weight"), label=f"lane weight {index}")
         )
-    scale = Fraction(parsed_weights[0], 1) / recipe.lane_shares[0]
-    if any(
-        Fraction(weight, 1) / share != scale
-        for weight, share in zip(
-            parsed_weights,
-            recipe.lane_shares,
-            strict=True,
-        )
-    ):
+    expected_weights = [
+        recipe.token_quotas[lane_id] for lane_id in recipe.lane_ids
+    ]
+    if parsed_weights != expected_weights:
         raise CorpusContractError(
-            "Task-4 publication lane weights are not proportional to recipe shares"
+            "Task-4 publication lane weights do not match the authoritative "
+            "Hamilton quotas"
         )
 
     schedule_path = _safe_member(
