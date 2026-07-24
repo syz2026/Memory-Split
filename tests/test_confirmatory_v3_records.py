@@ -44,6 +44,10 @@ from msctl.aws_contracts import (
     checkpoint_object_key,
     checkpoint_receipt_key,
 )
+from msctl.aws_hardware import (
+    AWS_HARDWARE_AMENDMENT_SHA256,
+    PROVIDER_SELECTION_S3_KEY,
+)
 
 
 STEP = 1_358
@@ -159,6 +163,8 @@ def _snapshot_digest(seed: int, arm: str, step: int) -> str:
 
 
 def _study_lock() -> StudyLockV3:
+    selection_sha256 = "6" * 64
+    selection_version_id = "provider-selection-version-p5"
     snapshots = []
     for seed in SEEDS:
         for arm in ARMS:
@@ -186,6 +192,10 @@ def _study_lock() -> StudyLockV3:
                         "checkpoint_receipt_s3_version_id": (
                             f"receipt-version-{seed}-{step}"
                         ),
+                        "provider_selection_sha256": selection_sha256,
+                        "provider_selection_s3_version_id": (
+                            selection_version_id
+                        ),
                     }
                 )
     return StudyLockV3.from_dict(
@@ -194,6 +204,20 @@ def _study_lock() -> StudyLockV3:
             "schema_version": STUDY_CONTRACT_VERSION,
             "preregistration_sha256": FROZEN_PREREGISTRATION_SHA256_V3,
             "sealed_evaluation_release_sha256": "f" * 64,
+            "provider_selection": {
+                "cohort_id": "memorysplit-confirmatory-v3-360m-n10-aws",
+                "provider_selection_s3_key": PROVIDER_SELECTION_S3_KEY,
+                "provider_selection_sha256": selection_sha256,
+                "provider_selection_s3_version_id": selection_version_id,
+                "hardware_amendment_sha256": AWS_HARDWARE_AMENDMENT_SHA256,
+                "selected_provider": "aws-p5.48xlarge",
+                "profile_id": "aws-p5.48xlarge-v3",
+                "profile_sha256": (
+                    "2207bfbad5e8fa9fc804770b582d0b21f8b6ed109b2e3f3b5c0474c732c53543"
+                ),
+                "runtime_lock_sha256": "7" * 64,
+                "qualification_evidence_sha256": "8" * 64,
+            },
             "snapshots": snapshots,
         }
     )
@@ -499,6 +523,10 @@ def test_v3_outcome_binding_rejects_checkpoint_and_object_replacements():
             replacement_receipt_hash,
         ),
         checkpoint_receipt_s3_version_id="replacement-receipt-version",
+        provider_selection_sha256=snapshot.provider_selection_sha256,
+        provider_selection_s3_version_id=(
+            snapshot.provider_selection_s3_version_id
+        ),
     )
     with pytest.raises(ValueError, match="lock|object|checkpoint"):
         validate_study_outcome_binding(

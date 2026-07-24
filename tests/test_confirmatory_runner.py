@@ -672,6 +672,24 @@ def test_external_study_lock_is_checked_before_model_visible_items(tmp_path):
     assert not fixture.output.exists()
 
 
+def test_v2_runner_behavior_is_unchanged_by_an_unrelated_v3_marker(tmp_path):
+    runner = _runner()
+    fixture = _sealed_fixture(tmp_path)
+    fixture.release.joinpath("sealed-release.json").write_bytes(
+        canonical_json_bytes({"unrelated": True})
+    )
+
+    result = runner.preflight(
+        run=fixture.run,
+        sealed_release=fixture.release,
+        expected_study_lock_sha256=fixture.expected_study_lock_sha256,
+    )
+
+    assert result.condition_id == "split90"
+    assert result.optimizer_step is None
+    assert result.output_id is None
+
+
 @pytest.mark.parametrize(
     ("mutation", "message"),
     [

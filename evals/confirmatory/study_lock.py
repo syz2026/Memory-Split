@@ -17,6 +17,11 @@ from evals.confirmatory.contracts import (
 )
 from msctl.aws_contracts import ARMS, SEEDS, SNAPSHOT_STEPS
 from msctl.aws_contracts import checkpoint_object_key, checkpoint_receipt_key
+from msctl.aws_hardware import (
+    AWS_HARDWARE_AMENDMENT_SHA256,
+    PROVIDER_SELECTION_S3_KEY,
+    AuthenticatedSelectionBinding,
+)
 
 
 STUDY_LOCK_SCHEMA = "memorysplit.confirmatory.study-lock.v2"
@@ -73,6 +78,21 @@ REQUIRED_RECEIPTS = (
 )
 _SHA256_RE = re.compile(r"[0-9a-f]{64}")
 _MAX_S3_VERSION_ID_LENGTH = 1_024
+_STUDY_COHORT_ID_V3 = "memorysplit-confirmatory-v3-360m-n10-aws"
+_ELIGIBLE_PROFILE_IDENTITIES_V3 = frozenset(
+    {
+        (
+            "aws-p5.48xlarge-v3",
+            "aws-p5.48xlarge",
+            "2207bfbad5e8fa9fc804770b582d0b21f8b6ed109b2e3f3b5c0474c732c53543",
+        ),
+        (
+            "aws-p6-b300.48xlarge-v3",
+            "aws-p6-b300.48xlarge",
+            "6884cd30670214bcecaa105d32b2b5518b1533d9fdbad6ac15327f9a8b7fefa4",
+        ),
+    }
+)
 
 
 def _strict_fields(
@@ -149,6 +169,140 @@ def _ordered_strings(
 
 
 @dataclass(frozen=True)
+class ProviderSelectionBinding:
+    """Cohort-wide commitment copied from authenticated selection admission."""
+
+    cohort_id: str
+    provider_selection_s3_key: str
+    provider_selection_sha256: str
+    provider_selection_s3_version_id: str
+    hardware_amendment_sha256: str
+    selected_provider: str
+    profile_id: str
+    profile_sha256: str
+    runtime_lock_sha256: str
+    qualification_evidence_sha256: str
+
+    FIELDS: ClassVar[frozenset[str]] = frozenset(
+        {
+            "cohort_id",
+            "provider_selection_s3_key",
+            "provider_selection_sha256",
+            "provider_selection_s3_version_id",
+            "hardware_amendment_sha256",
+            "selected_provider",
+            "profile_id",
+            "profile_sha256",
+            "runtime_lock_sha256",
+            "qualification_evidence_sha256",
+        }
+    )
+
+    def __post_init__(self) -> None:
+        if self.cohort_id != _STUDY_COHORT_ID_V3:
+            raise ValueError("provider selection cohort identity is invalid")
+        if self.provider_selection_s3_key != PROVIDER_SELECTION_S3_KEY:
+            raise ValueError("provider selection does not use the fixed S3 key")
+        selection = _hash(
+            self.provider_selection_sha256,
+            "provider selection SHA-256",
+        )
+        version = _s3_version_id(
+            self.provider_selection_s3_version_id,
+            "provider selection S3 version ID",
+        )
+        amendment = _hash(
+            self.hardware_amendment_sha256,
+            "hardware amendment SHA-256",
+        )
+        if amendment != AWS_HARDWARE_AMENDMENT_SHA256:
+            raise ValueError("hardware amendment commitment is invalid")
+        provider = _string(self.selected_provider, "selected provider")
+        profile_id = _string(self.profile_id, "profile ID")
+        profile = _hash(self.profile_sha256, "profile SHA-256")
+        if (profile_id, provider, profile) not in _ELIGIBLE_PROFILE_IDENTITIES_V3:
+            raise ValueError(
+                "selected provider, profile identity, and profile evidence "
+                "are crossed"
+            )
+        runtime = _hash(self.runtime_lock_sha256, "runtime-lock SHA-256")
+        qualification = _hash(
+            self.qualification_evidence_sha256,
+            "qualification evidence SHA-256",
+        )
+        object.__setattr__(self, "provider_selection_sha256", selection)
+        object.__setattr__(
+            self,
+            "provider_selection_s3_version_id",
+            version,
+        )
+        object.__setattr__(self, "hardware_amendment_sha256", amendment)
+        object.__setattr__(self, "selected_provider", provider)
+        object.__setattr__(self, "profile_id", profile_id)
+        object.__setattr__(self, "profile_sha256", profile)
+        object.__setattr__(self, "runtime_lock_sha256", runtime)
+        object.__setattr__(
+            self,
+            "qualification_evidence_sha256",
+            qualification,
+        )
+
+    @classmethod
+    def from_dict(cls, raw: Mapping[str, Any]) -> "ProviderSelectionBinding":
+        return cls(
+            **dict(
+                _strict_fields(
+                    raw,
+                    cls.FIELDS,
+                    "provider selection binding",
+                )
+            )
+        )
+
+    @classmethod
+    def from_authenticated(
+        cls,
+        binding: AuthenticatedSelectionBinding,
+    ) -> "ProviderSelectionBinding":
+        if not isinstance(binding, AuthenticatedSelectionBinding):
+            raise TypeError(
+                "provider selection requires authenticated admission output"
+            )
+        return cls(
+            cohort_id=binding.cohort_id,
+            provider_selection_s3_key=PROVIDER_SELECTION_S3_KEY,
+            provider_selection_sha256=binding.selection_sha256,
+            provider_selection_s3_version_id=binding.selection_version_id,
+            hardware_amendment_sha256=binding.amendment_sha256,
+            selected_provider=binding.provider,
+            profile_id=binding.profile_id,
+            profile_sha256=binding.profile_sha256,
+            runtime_lock_sha256=binding.runtime_lock_sha256,
+            qualification_evidence_sha256=(
+                binding.qualification_evidence_sha256
+            ),
+        )
+
+    def to_dict(self) -> dict[str, str]:
+        return {
+            "cohort_id": self.cohort_id,
+            "provider_selection_s3_key": self.provider_selection_s3_key,
+            "provider_selection_sha256": self.provider_selection_sha256,
+            "provider_selection_s3_version_id": (
+                self.provider_selection_s3_version_id
+            ),
+            "hardware_amendment_sha256": self.hardware_amendment_sha256,
+            "selected_provider": self.selected_provider,
+            "profile_id": self.profile_id,
+            "profile_sha256": self.profile_sha256,
+            "runtime_lock_sha256": self.runtime_lock_sha256,
+            "qualification_evidence_sha256": (
+                self.qualification_evidence_sha256
+            ),
+        }
+
+
+@dataclass(frozen=True)
 class StudySnapshotBinding:
     """Candidate S3 identity requiring later versioned HEAD/receipt replay."""
 
@@ -161,6 +315,8 @@ class StudySnapshotBinding:
     checkpoint_receipt_sha256: str
     checkpoint_receipt_s3_object_key: str
     checkpoint_receipt_s3_version_id: str
+    provider_selection_sha256: str
+    provider_selection_s3_version_id: str
 
     FIELDS: ClassVar[frozenset[str]] = frozenset(
         {
@@ -173,6 +329,8 @@ class StudySnapshotBinding:
             "checkpoint_receipt_sha256",
             "checkpoint_receipt_s3_object_key",
             "checkpoint_receipt_s3_version_id",
+            "provider_selection_sha256",
+            "provider_selection_s3_version_id",
         }
     )
 
@@ -215,6 +373,14 @@ class StudySnapshotBinding:
             self.checkpoint_receipt_s3_version_id,
             "checkpoint receipt S3 version ID",
         )
+        selection_digest = _hash(
+            self.provider_selection_sha256,
+            "provider selection SHA-256",
+        )
+        selection_version_id = _s3_version_id(
+            self.provider_selection_s3_version_id,
+            "provider selection S3 version ID",
+        )
         object.__setattr__(self, "checkpoint_sha256", digest)
         object.__setattr__(self, "arm", arm)
         object.__setattr__(self, "s3_object_key", object_key)
@@ -233,6 +399,16 @@ class StudySnapshotBinding:
             self,
             "checkpoint_receipt_s3_version_id",
             receipt_version_id,
+        )
+        object.__setattr__(
+            self,
+            "provider_selection_sha256",
+            selection_digest,
+        )
+        object.__setattr__(
+            self,
+            "provider_selection_s3_version_id",
+            selection_version_id,
         )
 
     @classmethod
@@ -255,6 +431,10 @@ class StudySnapshotBinding:
             "checkpoint_receipt_s3_version_id": (
                 self.checkpoint_receipt_s3_version_id
             ),
+            "provider_selection_sha256": self.provider_selection_sha256,
+            "provider_selection_s3_version_id": (
+                self.provider_selection_s3_version_id
+            ),
         }
 
 
@@ -266,6 +446,7 @@ class StudyLockV3:
     schema_version: int
     preregistration_sha256: str
     sealed_evaluation_release_sha256: str
+    provider_selection: ProviderSelectionBinding
     snapshots: tuple[StudySnapshotBinding, ...]
 
     FIELDS: ClassVar[frozenset[str]] = frozenset(
@@ -274,6 +455,7 @@ class StudyLockV3:
             "schema_version",
             "preregistration_sha256",
             "sealed_evaluation_release_sha256",
+            "provider_selection",
             "snapshots",
         }
     )
@@ -294,6 +476,11 @@ class StudyLockV3:
             self.sealed_evaluation_release_sha256,
             "sealed evaluation release SHA-256",
         )
+        selection = (
+            self.provider_selection
+            if isinstance(self.provider_selection, ProviderSelectionBinding)
+            else ProviderSelectionBinding.from_dict(self.provider_selection)
+        )
         if not isinstance(self.snapshots, (list, tuple)):
             raise ValueError("v3 study lock snapshots must be ordered")
         snapshots = tuple(
@@ -309,6 +496,16 @@ class StudyLockV3:
         if slots != EXPECTED_STUDY_SLOTS_V3:
             raise ValueError(
                 "v3 study lock requires the exact ordered 100 snapshot slots"
+            )
+        if any(
+            snapshot.provider_selection_sha256
+            != selection.provider_selection_sha256
+            or snapshot.provider_selection_s3_version_id
+            != selection.provider_selection_s3_version_id
+            for snapshot in snapshots
+        ):
+            raise ValueError(
+                "every snapshot must share the cohort provider selection"
             )
         checkpoint_hashes = tuple(
             snapshot.checkpoint_sha256 for snapshot in snapshots
@@ -358,6 +555,7 @@ class StudyLockV3:
             "sealed_evaluation_release_sha256",
             release,
         )
+        object.__setattr__(self, "provider_selection", selection)
         object.__setattr__(self, "snapshots", snapshots)
 
     @classmethod
@@ -370,6 +568,7 @@ class StudyLockV3:
             sealed_evaluation_release_sha256=value[
                 "sealed_evaluation_release_sha256"
             ],
+            provider_selection=value["provider_selection"],
             snapshots=value["snapshots"],
         )
 
@@ -381,6 +580,7 @@ class StudyLockV3:
             "sealed_evaluation_release_sha256": (
                 self.sealed_evaluation_release_sha256
             ),
+            "provider_selection": self.provider_selection.to_dict(),
             "snapshots": [
                 snapshot.to_dict() for snapshot in self.snapshots
             ],

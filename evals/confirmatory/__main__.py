@@ -107,6 +107,14 @@ def main(
                 "seed": result.seed,
                 "item_count": result.item_count,
             }
+            if result.optimizer_step is not None:
+                payload.update(
+                    {
+                        "optimizer_step": result.optimizer_step,
+                        "output_id": result.output_id,
+                        "selected_provider": result.selected_provider,
+                    }
+                )
             print("confirmatory evaluation dry-run verified", file=sys.stderr)
             return_code = 0
         else:
@@ -129,6 +137,14 @@ def main(
                 "item_count": result.item_count,
                 "report_sha256": result.report_sha256,
             }
+            if result.optimizer_step is not None:
+                payload.update(
+                    {
+                        "optimizer_step": result.optimizer_step,
+                        "output_id": result.output_id,
+                        "selected_provider": result.selected_provider,
+                    }
+                )
             print("confirmatory evidence published", file=sys.stderr)
             return_code = 0
     except _HelpRequested:

@@ -28,15 +28,28 @@ if __name__ == "__main__" and __package__ in (None, ""):
 
     raise SystemExit(main())
 
-from evals.confirmatory import metrics, reporting, solver as solver_module
+from evals.confirmatory import (
+    metrics,
+    reporting,
+    sealing,
+    solver as solver_module,
+)
 from evals.confirmatory.actions import ActionOp, ActionSlot, validate_action_slots
+from evals.confirmatory.aggregate import (
+    RUN_BINDING_SCHEMA_V3,
+    STUDY_LOCK_FILE_NAME,
+    RunBindingV3,
+)
 from evals.confirmatory.contracts import (
     CONTRACT_VERSION,
+    STUDY_CONTRACT_VERSION,
+    STUDY_TARGETS_PER_UPDATE,
     CheckpointRecord,
     ItemRecord,
     MemoryMode,
     SealedGoldRecord,
     StoreRecord,
+    Twin,
     canonical_json_bytes,
     canonical_sha256,
     validate_contract_bundle,
@@ -49,6 +62,26 @@ OUTCOME_SCHEMA = "memorysplit.confirmatory.outcome.v2"
 METRICS_SCHEMA = "memorysplit.confirmatory.metrics.v2"
 INFERENCE_EVIDENCE_SCHEMA = "memorysplit.confirmatory.inference-evidence.v2"
 VALIDITY_EVIDENCE_SCHEMA = "memorysplit.confirmatory.validity-evidence.v2"
+SNAPSHOT_OUTPUT_SCHEMA_V3 = (
+    "memorysplit.confirmatory.snapshot-evaluation-output.v3"
+)
+SNAPSHOT_METRICS_SCHEMA_V3 = (
+    "memorysplit.confirmatory.snapshot-evaluation-metrics.v3"
+)
+SNAPSHOT_INFERENCE_SCHEMA_V3 = (
+    "memorysplit.confirmatory.snapshot-inference-evidence.v3"
+)
+_V3_OUTPUT_ARTIFACTS = (
+    "inference.json",
+    "items.jsonl",
+    "metrics.json",
+    "outcomes.jsonl",
+    "run.json",
+    "sealed-gold.jsonl",
+    "sealed-release.json",
+    "stores.jsonl",
+    "study-lock.json",
+)
 PRIMARY_CONTRAST_ID = (
     "primary_omnibus_pair_and_proof__graph_non_path__"
     "composition_joint_ood__split90_minus_dense"
@@ -176,6 +209,9 @@ class EvaluationResult:
     seed: int
     item_count: int
     report_sha256: str
+    optimizer_step: int | None = None
+    output_id: str | None = None
+    selected_provider: str | None = None
 
 
 @dataclass(frozen=True)
@@ -185,6 +221,9 @@ class PreflightResult:
     condition_id: str
     seed: int
     item_count: int
+    optimizer_step: int | None = None
+    output_id: str | None = None
+    selected_provider: str | None = None
 
 
 @dataclass(frozen=True)
@@ -226,6 +265,22 @@ class _PreparedEvaluation:
     validity_content: bytes
     binding: RunBinding
     checkpoint: _CheckpointView
+    selected_ids: tuple[str, ...]
+    items_content: bytes
+    items: Mapping[str, ItemRecord]
+    stores_content: bytes
+    stores: Mapping[str, StoreRecord]
+
+
+@dataclass(frozen=True)
+class _PreparedEvaluationV3:
+    run: Path
+    release: Path
+    binding: RunBindingV3
+    run_content: bytes
+    lock_content: bytes
+    release_manifest_content: bytes
+    release_manifest: Mapping[str, Any]
     selected_ids: tuple[str, ...]
     items_content: bytes
     items: Mapping[str, ItemRecord]
@@ -387,11 +442,13 @@ class RepositoryGPTAdapter:
     def from_bound_run(
         cls,
         run: str | Path,
-        binding: RunBinding,
+        binding: RunBinding | RunBindingV3,
         device: str,
     ) -> "RepositoryGPTAdapter":
         """Load only hash-bound config/checkpoint bytes into the repository GPT."""
 
+        if isinstance(binding, RunBindingV3):
+            return cls._from_bound_snapshot(run, binding, device)
         import torch
         from train.model import GPT, GPTConfig
         from train.tokenizer import get_tok
@@ -432,7 +489,9 @@ class RepositoryGPTAdapter:
                 weights_only=True,
             )
         except Exception as exc:
-            raise ValueError("checkpoint state could not be safely loaded") from exc
+            raise ValueError(
+                "checkpoint state could not be safely loaded"
+            ) from exc
         if not isinstance(state, Mapping):
             raise ValueError("checkpoint state must be an object")
         state_dict = state.get("model")
@@ -477,6 +536,95 @@ class RepositoryGPTAdapter:
         ):
             raise ValueError("checkpoint/config architecture mismatch")
 
+        try:
+            model = GPT(expected_config)
+            model.load_state_dict(dict(state_dict), strict=True)
+        except (AssertionError, RuntimeError, TypeError, ValueError) as exc:
+            raise ValueError("checkpoint model state mismatch") from exc
+        resolved_device = cls._device(device)
+        try:
+            model.to(resolved_device).eval()
+        except (RuntimeError, TypeError, ValueError) as exc:
+            raise RuntimeError(
+                "checkpoint could not be loaded on selected device"
+            ) from exc
+        return cls(model, get_tok(), resolved_device)
+
+    @classmethod
+    def _from_bound_snapshot(
+        cls,
+        run: str | Path,
+        binding: RunBindingV3,
+        device: str,
+    ) -> "RepositoryGPTAdapter":
+        """Load a v3 checkpoint whose hash binds its architecture metadata."""
+
+        import torch
+        from train.model import GPT, GPTConfig
+        from train.tokenizer import get_tok
+
+        run_root = _directory(run, "run")
+        checkpoint_path = _relative_file(
+            run_root,
+            binding.checkpoint_path,
+            "checkpoint_path",
+        )
+        checkpoint_content = _read_regular_file(
+            checkpoint_path,
+            "checkpoint",
+        )
+        if (
+            hashlib.sha256(checkpoint_content).hexdigest()
+            != binding.checkpoint_sha256
+        ):
+            raise ValueError("checkpoint hash mismatch while loading model")
+        try:
+            state = torch.load(
+                io.BytesIO(checkpoint_content),
+                map_location="cpu",
+                weights_only=True,
+            )
+        except Exception as exc:
+            raise ValueError("checkpoint state could not be safely loaded") from exc
+        if not isinstance(state, Mapping):
+            raise ValueError("checkpoint state must be an object")
+        if (
+            type(state.get("step")) is not int
+            or state["step"] != binding.optimizer_step
+        ):
+            raise ValueError("checkpoint optimizer step mismatch")
+        config = state.get("cfg")
+        if not isinstance(config, Mapping):
+            raise ValueError("checkpoint config state must be an object")
+        if (
+            _integer(config.get("seed"), "checkpoint config seed")
+            != binding.seed
+        ):
+            raise ValueError("checkpoint config seed mismatch")
+        if (
+            _condition(
+                config.get("condition"),
+                "checkpoint config condition",
+            )
+            != binding.condition_id
+        ):
+            raise ValueError("checkpoint config condition mismatch")
+        expected_config = cls._model_config(config)
+        raw_model_config = state.get("model_cfg")
+        if raw_model_config is not None:
+            if not isinstance(raw_model_config, Mapping):
+                raise ValueError("checkpoint model_cfg state must be an object")
+            try:
+                checkpoint_config = GPTConfig(**dict(raw_model_config))
+            except (AssertionError, TypeError, ValueError) as exc:
+                raise ValueError(
+                    "checkpoint model_cfg architecture is invalid"
+                ) from exc
+            if asdict(checkpoint_config) != asdict(expected_config):
+                raise ValueError("checkpoint config architecture mismatch")
+        state_dict = state.get("model")
+        if not isinstance(state_dict, Mapping) or not state_dict:
+            raise ValueError("checkpoint model state is missing")
         try:
             model = GPT(expected_config)
             model.load_state_dict(dict(state_dict), strict=True)
@@ -863,15 +1011,14 @@ def _canonical_jsonl(
     return tuple(result)
 
 
-def _load_run_binding(run: Path) -> RunBinding:
-    raw = _strict_mapping(
-        _canonical_object(
-            _read_regular_file(run / "run.json", "run binding"),
-            "run.json",
-        ),
-        _RUN_FIELDS,
-        "run binding",
+def _load_run_binding(run: Path) -> RunBinding | RunBindingV3:
+    parsed = _canonical_object(
+        _read_regular_file(run / "run.json", "run binding"),
+        "run.json",
     )
+    if parsed.get("record_type") == RUN_BINDING_SCHEMA_V3:
+        return RunBindingV3.from_dict(parsed)
+    raw = _strict_mapping(parsed, _RUN_FIELDS, "run binding")
     if raw["record_type"] != RUN_BINDING_SCHEMA:
         raise ValueError("run binding record_type is invalid")
     if (
@@ -1295,6 +1442,269 @@ def _score_and_summarize(
     return outcomes_bytes, metrics_bytes
 
 
+def _study_submission_outcome(
+    *,
+    item: ItemRecord,
+    submission: Submission,
+    binding: RunBindingV3,
+) -> dict[str, Any]:
+    return {
+        "record_type": metrics.STUDY_OUTCOME_SCHEMA,
+        "schema_version": STUDY_CONTRACT_VERSION,
+        "item_id": item.item_id,
+        "pair_id": item.pair_id,
+        "twin": item.twin.value,
+        "stratum": item.stratum.value,
+        "family": item.family.value,
+        "seed": binding.seed,
+        "world_id": item.world_id,
+        "checkpoint_sha256": binding.checkpoint_sha256,
+        "arm": binding.arm.value,
+        "condition_id": binding.condition_id,
+        "optimizer_step": binding.optimizer_step,
+        "raw_token_count": binding.raw_token_count,
+        "memory_mode": item.memory_mode.value,
+        "control": item.control.value,
+        "submitted_answer": submission.answer,
+        "submitted_proof": [
+            action.to_dict() for action in submission.actions
+        ],
+    }
+
+
+def _aggregate_scored_study_pairs(
+    rows,
+    *,
+    binding: RunBindingV3,
+):
+    values = tuple(rows)
+    if not values:
+        raise ValueError("v3 pair metric requires outcomes")
+    grouped: dict[tuple[int, str, str], dict[Twin, tuple[Any, Any]]] = (
+        defaultdict(dict)
+    )
+    seen_items = set()
+    for outcome, verification in values:
+        if outcome.item_id in seen_items:
+            raise ValueError("v3 pair metric contains a duplicate item")
+        seen_items.add(outcome.item_id)
+        key = outcome.seed, outcome.world_id, outcome.pair_id
+        if outcome.twin in grouped[key]:
+            raise ValueError("v3 pair metric contains a duplicate twin")
+        grouped[key][outcome.twin] = outcome, verification
+
+    stratum_successes: dict[Any, int] = defaultdict(int)
+    stratum_totals: dict[Any, int] = defaultdict(int)
+    family_successes: dict[Any, int] = defaultdict(int)
+    family_totals: dict[Any, int] = defaultdict(int)
+    primary_successes = {cell: 0 for cell in metrics.PRIMARY_CELLS}
+    primary_totals = {cell: 0 for cell in metrics.PRIMARY_CELLS}
+    pair_metadata = (
+        "pair_id",
+        "stratum",
+        "family",
+        "seed",
+        "world_id",
+        "checkpoint_sha256",
+        "arm",
+        "condition_id",
+        "optimizer_step",
+        "raw_token_count",
+        "memory_mode",
+        "control",
+    )
+    for pair in grouped.values():
+        if set(pair) != {Twin.ORIGINAL, Twin.COUNTERFACTUAL}:
+            raise ValueError("v3 pair metric requires both twins")
+        original, original_verification = pair[Twin.ORIGINAL]
+        counterfactual, counterfactual_verification = pair[
+            Twin.COUNTERFACTUAL
+        ]
+        if any(
+            getattr(original, field) != getattr(counterfactual, field)
+            for field in pair_metadata
+        ):
+            raise ValueError("v3 pair metric twins have crossed metadata")
+        success = (
+            original_verification.proof_valid
+            and original_verification.answer_valid
+            and counterfactual_verification.proof_valid
+            and counterfactual_verification.answer_valid
+        )
+        stratum_totals[original.stratum] += 1
+        stratum_successes[original.stratum] += success
+        family_totals[original.family] += 1
+        family_successes[original.family] += success
+        cell = original.family, original.stratum
+        if cell in primary_totals:
+            primary_totals[cell] += 1
+            primary_successes[cell] += success
+    missing = [
+        f"{family.value}__{stratum.value}"
+        for family, stratum in metrics.PRIMARY_CELLS
+        if primary_totals[(family, stratum)] == 0
+    ]
+    if missing:
+        raise ValueError(
+            f"v3 pair metric is missing required primary cells: {missing}"
+        )
+    primary_rates = {
+        f"{family.value}__{stratum.value}": metrics.Rate(
+            primary_successes[(family, stratum)],
+            primary_totals[(family, stratum)],
+        )
+        for family, stratum in metrics.PRIMARY_CELLS
+    }
+    return metrics.StudyMetricsRecord(
+        primary_accuracy=(
+            sum(rate.value for rate in primary_rates.values())
+            / len(metrics.PRIMARY_CELLS)
+        ),
+        primary_cells=primary_rates,
+        overall_pair_accuracy=metrics.Rate(
+            sum(stratum_successes.values()),
+            sum(stratum_totals.values()),
+        ),
+        by_stratum={
+            stratum: metrics.Rate(
+                stratum_successes[stratum],
+                total,
+            )
+            for stratum, total in stratum_totals.items()
+        },
+        by_family={
+            family: metrics.Rate(
+                family_successes[family],
+                total,
+            )
+            for family, total in family_totals.items()
+        },
+        checkpoint_sha256=binding.checkpoint_sha256,
+        seed=binding.seed,
+        arm=binding.arm,
+        condition_id=binding.condition_id,
+        optimizer_step=binding.optimizer_step,
+        raw_token_count=binding.raw_token_count,
+        memory_mode=values[0][0].memory_mode,
+        control=values[0][0].control,
+    )
+
+
+def _score_and_summarize_v3(
+    *,
+    items: Mapping[str, ItemRecord],
+    gold: Mapping[str, SealedGoldRecord],
+    stores: Mapping[str, StoreRecord],
+    binding: RunBindingV3,
+    submissions: Mapping[str, Submission],
+) -> tuple[bytes, bytes]:
+    outcome_dicts = []
+    scored = []
+    for item_id in submissions:
+        item = items[item_id]
+        sealed = gold[item_id]
+        store = stores[item.store_id]
+        if (
+            (item.item_id, item.pair_id, item.twin)
+            != (sealed.item_id, sealed.pair_id, sealed.twin)
+            or item.store_id != store.store_id
+            or item.world_id != store.world_id
+            or sealed.store_sha256 != store.content_sha256
+        ):
+            raise ValueError("v3 item/gold/store binding mismatch")
+        study_dict = _study_submission_outcome(
+            item=item,
+            submission=submissions[item_id],
+            binding=binding,
+        )
+        study_outcome = metrics.StudyOutcomeRecord.from_dict(study_dict)
+        for field in (
+            "item_id",
+            "pair_id",
+            "twin",
+            "stratum",
+            "family",
+            "world_id",
+            "memory_mode",
+            "control",
+        ):
+            if getattr(study_outcome, field) != getattr(item, field):
+                raise ValueError(f"v3 output item binding mismatch: {field}")
+        for field in (
+            "checkpoint_sha256",
+            "seed",
+            "optimizer_step",
+            "raw_token_count",
+        ):
+            if getattr(study_outcome, field) != getattr(binding, field):
+                raise ValueError(
+                    f"v3 output checkpoint binding mismatch: {field}"
+                )
+        if (
+            study_outcome.arm != binding.arm
+            or study_outcome.condition_id.value != binding.condition_id
+        ):
+            raise ValueError("v3 output arm binding mismatch")
+        verification = solver_module.verify_proof_and_answer(
+            item=item,
+            store=store,
+            gold=sealed,
+            proof=submissions[item_id].actions,
+            answer=submissions[item_id].answer,
+            solver=_registered_solver(sealed.solver_id),
+        )
+        scored.append((study_outcome, verification))
+        outcome_dicts.append(study_outcome.to_dict())
+
+    grouped: dict[tuple[Any, Any], list[Any]] = defaultdict(list)
+    for row, verification in scored:
+        grouped[(row.memory_mode, row.control)].append((row, verification))
+    summaries = []
+    for key in sorted(
+        grouped,
+        key=lambda value: (value[0].value, value[1].value),
+    ):
+        rows = grouped[key]
+        study_summary = _aggregate_scored_study_pairs(
+            rows,
+            binding=binding,
+        )
+        summaries.append(study_summary.to_dict())
+    return (
+        b"".join(canonical_json_bytes(row) for row in outcome_dicts),
+        canonical_json_bytes(
+            {
+                "record_type": SNAPSHOT_METRICS_SCHEMA_V3,
+                "schema_version": STUDY_CONTRACT_VERSION,
+                "scope": "single_snapshot",
+                "seed": binding.seed,
+                "arm": binding.arm.value,
+                "optimizer_step": binding.optimizer_step,
+                "checkpoint_sha256": binding.checkpoint_sha256,
+                "summaries": summaries,
+            }
+        ),
+    )
+
+
+def _inference_bytes_v3(binding: RunBindingV3) -> bytes:
+    return canonical_json_bytes(
+        {
+            "record_type": SNAPSHOT_INFERENCE_SCHEMA_V3,
+            "schema_version": STUDY_CONTRACT_VERSION,
+            "scope": "cohort",
+            "snapshot_scope": "single_snapshot",
+            "output_id": binding.output_id,
+            "seed": binding.seed,
+            "arm": binding.arm.value,
+            "optimizer_step": binding.optimizer_step,
+            "checkpoint_sha256": binding.checkpoint_sha256,
+            "cohort_aggregation_status": "not_implemented",
+            "final_conclusion": None,
+        }
+    )
+
+
 def _inference_bytes() -> bytes:
     return canonical_json_bytes(
         {
@@ -1488,6 +1898,105 @@ def _publish_evidence(
             _quarantine_or_clean_staging(staging, parent)
 
 
+def _snapshot_output_manifest_bytes(
+    *,
+    binding: RunBindingV3,
+    artifacts: Mapping[str, bytes],
+) -> bytes:
+    if tuple(artifacts) != _V3_OUTPUT_ARTIFACTS:
+        raise ValueError("v3 snapshot output artifacts are not exact")
+    return canonical_json_bytes(
+        {
+            "record_type": SNAPSHOT_OUTPUT_SCHEMA_V3,
+            "schema_version": STUDY_CONTRACT_VERSION,
+            "output_id": binding.output_id,
+            "run_binding_sha256": hashlib.sha256(
+                artifacts["run.json"]
+            ).hexdigest(),
+            "study_lock_sha256": binding.study_lock_sha256,
+            "sealed_evaluation_release_sha256": (
+                binding.sealed_evaluation_release_sha256
+            ),
+            "provider_selection_sha256": (
+                binding.provider_selection_sha256
+            ),
+            "provider_selection_s3_version_id": (
+                binding.provider_selection_s3_version_id
+            ),
+            "checkpoint_sha256": binding.checkpoint_sha256,
+            "seed": binding.seed,
+            "arm": binding.arm.value,
+            "optimizer_step": binding.optimizer_step,
+            "scope": "single_snapshot",
+            "inference_scope": "cohort",
+            "final_conclusion": None,
+            "artifacts": [
+                {
+                    "path": name,
+                    "sha256": hashlib.sha256(artifacts[name]).hexdigest(),
+                    "bytes": len(artifacts[name]),
+                }
+                for name in sorted(artifacts)
+            ],
+        }
+    )
+
+
+def _publish_v3_evidence(
+    *,
+    output: Path,
+    binding: RunBindingV3,
+    artifacts: Mapping[str, bytes],
+) -> str:
+    if output.name != binding.output_id:
+        raise ValueError("output directory name disagrees with output identity")
+    if output.name in {"", ".", ".."}:
+        raise ValueError("output must name a directory")
+    parent = output.parent
+    try:
+        parent_status = parent.lstat()
+    except FileNotFoundError:
+        raise ValueError("output parent directory is missing") from None
+    if stat.S_ISLNK(parent_status.st_mode) or not stat.S_ISDIR(
+        parent_status.st_mode
+    ):
+        raise ValueError("output parent must be a regular non-symlink directory")
+    if output.exists() or output.is_symlink():
+        raise FileExistsError(f"output directory already exists: {output}")
+    manifest = _snapshot_output_manifest_bytes(
+        binding=binding,
+        artifacts=artifacts,
+    )
+    staging = Path(
+        tempfile.mkdtemp(
+            prefix=f".{output.name}.confirmatory-v3-",
+            dir=parent,
+        )
+    )
+    published = False
+    try:
+        for name in _V3_OUTPUT_ARTIFACTS:
+            _publish_file(staging / name, artifacts[name])
+        _publish_file(staging / "output.json", manifest)
+        _fsync_directory(staging)
+        _atomic_publish_directory(staging, output)
+        published = True
+        try:
+            _fsync_directory(parent)
+        except OSError:
+            quarantine = parent / (
+                f".{output.name}.confirmatory-v3-quarantine-"
+                f"{os.getpid()}-{id(output):x}"
+            )
+            _atomic_publish_directory(output, quarantine)
+            _fsync_directory(parent)
+            raise
+    finally:
+        if not published:
+            _quarantine_or_clean_staging(staging, parent)
+    return hashlib.sha256(manifest).hexdigest()
+
+
 def _validate_model_visible_protocol(
     items: Mapping[str, ItemRecord],
     stores: Mapping[str, StoreRecord],
@@ -1511,14 +2020,252 @@ def _validate_model_visible_protocol(
         raise ValueError("store uses an unsupported frozen relation vocabulary")
 
 
+def _has_v3_release_manifest(release: Path) -> bool:
+    try:
+        release.joinpath(sealing.SEALED_RELEASE_MANIFEST).lstat()
+    except FileNotFoundError:
+        return False
+    return True
+
+
+def _has_v3_run_lock(run: Path) -> bool:
+    try:
+        run.joinpath(STUDY_LOCK_FILE_NAME).lstat()
+    except FileNotFoundError:
+        return False
+    return True
+
+
+def _v3_snapshot_for_binding(lock, binding: RunBindingV3):
+    matches = [
+        snapshot
+        for snapshot in lock.snapshots
+        if (
+            snapshot.seed,
+            snapshot.arm,
+            snapshot.optimizer_step,
+        )
+        == (
+            binding.seed,
+            binding.arm,
+            binding.optimizer_step,
+        )
+    ]
+    if len(matches) != 1:
+        raise ValueError("study lock does not contain one exact snapshot slot")
+    snapshot = matches[0]
+    for run_field, snapshot_field in (
+        ("checkpoint_sha256", "checkpoint_sha256"),
+        ("checkpoint_s3_object_key", "s3_object_key"),
+        ("checkpoint_s3_version_id", "s3_version_id"),
+        ("checkpoint_receipt_sha256", "checkpoint_receipt_sha256"),
+        (
+            "checkpoint_receipt_s3_object_key",
+            "checkpoint_receipt_s3_object_key",
+        ),
+        (
+            "checkpoint_receipt_s3_version_id",
+            "checkpoint_receipt_s3_version_id",
+        ),
+        ("provider_selection_sha256", "provider_selection_sha256"),
+        (
+            "provider_selection_s3_version_id",
+            "provider_selection_s3_version_id",
+        ),
+    ):
+        if getattr(binding, run_field) != getattr(snapshot, snapshot_field):
+            raise ValueError(
+                f"run/study-lock snapshot mismatch: {run_field}"
+            )
+    return snapshot
+
+
+def _validate_v3_selection_binding(lock, binding: RunBindingV3) -> None:
+    selection = lock.provider_selection
+    for run_field, selection_field in (
+        ("provider_selection_s3_key", "provider_selection_s3_key"),
+        ("provider_selection_sha256", "provider_selection_sha256"),
+        (
+            "provider_selection_s3_version_id",
+            "provider_selection_s3_version_id",
+        ),
+        ("hardware_amendment_sha256", "hardware_amendment_sha256"),
+        ("selected_provider", "selected_provider"),
+        ("evaluator_profile_id", "profile_id"),
+        ("evaluator_profile_sha256", "profile_sha256"),
+        ("evaluator_runtime_lock_sha256", "runtime_lock_sha256"),
+        (
+            "evaluator_qualification_evidence_sha256",
+            "qualification_evidence_sha256",
+        ),
+    ):
+        if getattr(binding, run_field) != getattr(selection, selection_field):
+            raise ValueError(
+                f"run/provider selection mismatch: {run_field}"
+            )
+
+
+def _prepare_evaluation_v3(
+    *,
+    run_root: Path,
+    release: Path,
+    expected_study_lock_sha256: str,
+) -> _PreparedEvaluationV3:
+    from evals.confirmatory.study_lock import StudyLockV3
+
+    binding = _load_run_binding(run_root)
+    if not isinstance(binding, RunBindingV3):
+        raise ValueError("v3 sealed release requires a v3 run binding")
+    run_content = _read_regular_file(run_root / "run.json", "run.json")
+    if run_content != canonical_json_bytes(binding.to_dict()):
+        raise ValueError("run.json changed or is not the canonical binding")
+    expected_lock = _sha256(
+        expected_study_lock_sha256,
+        "expected_study_lock_sha256",
+    )
+    if binding.study_lock_sha256 != expected_lock:
+        raise ValueError("run binding study-lock commitment mismatch")
+    lock_path = _relative_file(
+        run_root,
+        binding.study_lock_path,
+        "study_lock_path",
+    )
+    lock_content = _read_regular_file(lock_path, "study-lock.json")
+    if hashlib.sha256(lock_content).hexdigest() != expected_lock:
+        raise ValueError("study lock disagrees with run/external commitment")
+    lock = StudyLockV3.from_dict(
+        _canonical_object(lock_content, "study-lock.json")
+    )
+    if lock.sealed_evaluation_release_sha256 != (
+        binding.sealed_evaluation_release_sha256
+    ):
+        raise ValueError("run/study-lock sealed release mismatch")
+    _validate_v3_selection_binding(lock, binding)
+    _v3_snapshot_for_binding(lock, binding)
+
+    checkpoint_path = _relative_file(
+        run_root,
+        binding.checkpoint_path,
+        "checkpoint_path",
+    )
+    checkpoint_content = _read_regular_file(
+        checkpoint_path,
+        "checkpoint",
+    )
+    if (
+        hashlib.sha256(checkpoint_content).hexdigest()
+        != binding.checkpoint_sha256
+    ):
+        raise ValueError("checkpoint file hash disagrees with run binding")
+
+    visible_preflight = sealing.preflight_model_visible_release(
+        release_dir=release,
+        expected_release_sha256=binding.sealed_evaluation_release_sha256,
+    )
+    manifest_content = _read_regular_file(
+        release / sealing.SEALED_RELEASE_MANIFEST,
+        sealing.SEALED_RELEASE_MANIFEST,
+    )
+    if (
+        hashlib.sha256(manifest_content).hexdigest()
+        != binding.sealed_evaluation_release_sha256
+    ):
+        raise ValueError("sealed-release manifest commitment mismatch")
+    manifest = _canonical_object(
+        manifest_content,
+        sealing.SEALED_RELEASE_MANIFEST,
+    )
+    model_visible = manifest.get("model_visible")
+    if not isinstance(model_visible, Mapping):
+        raise ValueError("sealed release has no model-visible binding")
+    items_binding = model_visible.get("items")
+    stores_binding = model_visible.get("stores")
+    if not isinstance(items_binding, Mapping) or not isinstance(
+        stores_binding,
+        Mapping,
+    ):
+        raise ValueError(
+            "sealed release model-visible artifact binding is invalid"
+        )
+    items_content = _read_bound_artifact(
+        release,
+        sealing.ITEMS_NAME,
+        items_binding.get("sha256"),
+    )
+    items_sequence = _canonical_jsonl(
+        items_content,
+        name=sealing.ITEMS_NAME,
+        parser=ItemRecord.from_dict,
+        identity=lambda item: item.item_id,
+    )
+    items = {item.item_id: item for item in items_sequence}
+    selected_ids_raw = model_visible.get("item_ids")
+    if (
+        not isinstance(selected_ids_raw, list)
+        or any(not isinstance(item_id, str) for item_id in selected_ids_raw)
+    ):
+        raise ValueError("sealed release item registry is invalid")
+    selected_ids = tuple(selected_ids_raw)
+    if tuple(items) != selected_ids:
+        raise ValueError("model-visible item registry is missing or reordered")
+    stores_content = _read_bound_artifact(
+        release,
+        sealing.STORES_NAME,
+        stores_binding.get("sha256"),
+    )
+    stores_sequence = _canonical_jsonl(
+        stores_content,
+        name=sealing.STORES_NAME,
+        parser=StoreRecord.from_dict,
+        identity=lambda record: record.store_id,
+    )
+    stores = {record.store_id: record for record in stores_sequence}
+    _validate_model_visible_protocol(items, stores)
+    if (
+        visible_preflight.item_count != len(items)
+        or visible_preflight.store_count != len(stores)
+    ):
+        raise ValueError("sealed release preflight count binding mismatch")
+    final_preflight = sealing.preflight_model_visible_release(
+        release_dir=release,
+        expected_release_sha256=binding.sealed_evaluation_release_sha256,
+    )
+    if final_preflight != visible_preflight:
+        raise ValueError("sealed release changed during evaluator preflight")
+    if _read_regular_file(run_root / "run.json", "run.json") != run_content:
+        raise ValueError("run.json changed during evaluator preflight")
+    if _read_regular_file(lock_path, "study-lock.json") != lock_content:
+        raise ValueError("study-lock.json changed during evaluator preflight")
+    return _PreparedEvaluationV3(
+        run=run_root,
+        release=release,
+        binding=binding,
+        run_content=run_content,
+        lock_content=lock_content,
+        release_manifest_content=manifest_content,
+        release_manifest=MappingProxyType(dict(manifest)),
+        selected_ids=selected_ids,
+        items_content=items_content,
+        items=MappingProxyType(items),
+        stores_content=stores_content,
+        stores=MappingProxyType(stores),
+    )
+
+
 def _prepare_evaluation(
     *,
     run: str | Path,
     sealed_release: str | Path,
     expected_study_lock_sha256: str,
-) -> _PreparedEvaluation:
+) -> _PreparedEvaluation | _PreparedEvaluationV3:
     release = _directory(sealed_release, "sealed release")
     run_root = _directory(run, "run")
+    if _has_v3_release_manifest(release) and _has_v3_run_lock(run_root):
+        return _prepare_evaluation_v3(
+            run_root=run_root,
+            release=release,
+            expected_study_lock_sha256=expected_study_lock_sha256,
+        )
     lock = _load_study_lock(release, expected_study_lock_sha256)
     validity_content = _load_complete_readiness(release, lock)
     binding = _load_run_binding(run_root)
@@ -1580,12 +2327,157 @@ def preflight(
         sealed_release=sealed_release,
         expected_study_lock_sha256=expected_study_lock_sha256,
     )
+    if isinstance(prepared, _PreparedEvaluationV3):
+        return PreflightResult(
+            study_lock_sha256=prepared.binding.study_lock_sha256,
+            checkpoint_sha256=prepared.binding.checkpoint_sha256,
+            condition_id=prepared.binding.condition_id,
+            seed=prepared.binding.seed,
+            item_count=len(prepared.items),
+            optimizer_step=prepared.binding.optimizer_step,
+            output_id=prepared.binding.output_id,
+            selected_provider=prepared.binding.selected_provider,
+        )
     return PreflightResult(
         study_lock_sha256=prepared.lock.sha256,
         checkpoint_sha256=prepared.binding.checkpoint_sha256,
         condition_id=prepared.binding.condition_id,
         seed=prepared.binding.seed,
         item_count=len(prepared.items),
+    )
+
+
+def _evaluate_prepared_v3(
+    *,
+    prepared: _PreparedEvaluationV3,
+    output: Path,
+    model_adapter: ModelAdapter | None,
+    device: str,
+) -> EvaluationResult:
+    binding = prepared.binding
+    if output.name != binding.output_id:
+        raise ValueError("output directory name disagrees with output identity")
+    if model_adapter is None:
+        model_adapter = RepositoryGPTAdapter.from_bound_run(
+            prepared.run,
+            binding,
+            device,
+        )
+    if not callable(getattr(model_adapter, "generate", None)):
+        raise TypeError("model_adapter must expose generate(item, store)")
+
+    submissions: dict[str, Submission] = {}
+    for item_id in prepared.selected_ids:
+        item = prepared.items[item_id]
+        visible_store = (
+            None
+            if item.memory_mode is MemoryMode.MEMORY_OFF
+            else prepared.stores[item.store_id]
+        )
+        submission = model_adapter.generate(item, visible_store)
+        if not isinstance(submission, Submission):
+            raise ValueError("ModelAdapter.generate must return a Submission")
+        if submission.item_id != item_id:
+            if submission.item_id in submissions:
+                raise ValueError("model adapter returned a duplicate submission")
+            raise ValueError("model adapter returned a submission item mismatch")
+        if item_id in submissions:
+            raise ValueError("model adapter returned a duplicate submission")
+        submissions[item_id] = submission
+    if tuple(submissions) != prepared.selected_ids:
+        raise ValueError("model adapter omitted a required item submission")
+
+    checkpoint_path = _relative_file(
+        prepared.run,
+        binding.checkpoint_path,
+        "checkpoint_path",
+    )
+    if (
+        hashlib.sha256(
+            _read_regular_file(checkpoint_path, "checkpoint")
+        ).hexdigest()
+        != binding.checkpoint_sha256
+    ):
+        raise ValueError("checkpoint changed after evaluator preflight")
+    if _read_regular_file(prepared.run / "run.json", "run.json") != (
+        prepared.run_content
+    ):
+        raise ValueError("run.json changed before scoring")
+    lock_path = _relative_file(
+        prepared.run,
+        binding.study_lock_path,
+        "study_lock_path",
+    )
+    if (
+        _read_regular_file(lock_path, "study-lock.json")
+        != prepared.lock_content
+    ):
+        raise ValueError("study-lock.json changed before scoring")
+    verified = sealing.verify_release(
+        release_dir=prepared.release,
+        expected_release_sha256=binding.sealed_evaluation_release_sha256,
+    )
+    if (
+        verified.item_count != len(prepared.items)
+        or verified.store_count != len(prepared.stores)
+    ):
+        raise ValueError("verified sealed-release counts changed")
+    sealed_gold_binding = prepared.release_manifest.get("sealed_gold")
+    if not isinstance(sealed_gold_binding, Mapping):
+        raise ValueError("sealed release has no sealed-gold binding")
+    gold_content = _read_bound_artifact(
+        prepared.release,
+        sealing.SEALED_GOLD_NAME,
+        sealed_gold_binding.get("sha256"),
+    )
+    gold_sequence = _canonical_jsonl(
+        gold_content,
+        name=sealing.SEALED_GOLD_NAME,
+        parser=SealedGoldRecord.from_dict,
+        identity=lambda record: record.item_id,
+    )
+    gold = {record.item_id: record for record in gold_sequence}
+    if tuple(gold) != prepared.selected_ids:
+        raise ValueError(
+            "sealed-gold registry disagrees with model-visible items"
+        )
+
+    outcomes_content, metrics_content = _score_and_summarize_v3(
+        items=prepared.items,
+        gold=gold,
+        stores=prepared.stores,
+        binding=binding,
+        submissions=submissions,
+    )
+    artifacts = MappingProxyType(
+        {
+            "inference.json": _inference_bytes_v3(binding),
+            "items.jsonl": prepared.items_content,
+            "metrics.json": metrics_content,
+            "outcomes.jsonl": outcomes_content,
+            "run.json": prepared.run_content,
+            "sealed-gold.jsonl": gold_content,
+            "sealed-release.json": prepared.release_manifest_content,
+            "stores.jsonl": prepared.stores_content,
+            "study-lock.json": prepared.lock_content,
+        }
+    )
+    report_hash = _publish_v3_evidence(
+        output=output,
+        binding=binding,
+        artifacts=artifacts,
+    )
+    return EvaluationResult(
+        output_dir=output,
+        study_lock_sha256=binding.study_lock_sha256,
+        checkpoint_sha256=binding.checkpoint_sha256,
+        condition_id=binding.condition_id,
+        seed=binding.seed,
+        item_count=len(prepared.items),
+        report_sha256=report_hash,
+        optimizer_step=binding.optimizer_step,
+        output_id=binding.output_id,
+        selected_provider=binding.selected_provider,
     )
 
 
@@ -1608,6 +2500,13 @@ def evaluate(
         sealed_release=sealed_release,
         expected_study_lock_sha256=expected_study_lock_sha256,
     )
+    if isinstance(prepared, _PreparedEvaluationV3):
+        return _evaluate_prepared_v3(
+            prepared=prepared,
+            output=output,
+            model_adapter=model_adapter,
+            device=device,
+        )
     release = prepared.release
     lock = prepared.lock
     binding = prepared.binding
