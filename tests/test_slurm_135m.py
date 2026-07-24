@@ -9,13 +9,12 @@ import pytest
 import torch
 import yaml
 
-import msctl.operations as operations
+from msctl import operations
 from msctl.adapters.slurm import plan_sbatch
 from msctl.cohort import COHORT_ID
 from msctl.operations import inspect_paired_resume, submit
 from msctl.profile import load_profile
 from scripts.run_135m_pair import _write_pair_checkpoint_receipt
-
 
 ROOT = Path(__file__).resolve().parents[1]
 FARM_PROFILE = ROOT / "cluster" / "profiles" / "farmshare-l40s.json"

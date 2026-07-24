@@ -21,8 +21,8 @@ from cluster.aws.reasoning_v3 import (
     parse_s3_uri,
     stage_from_s3,
     upload_to_s3,
-    verify_upload_sources,
     verify_staged_corpus,
+    verify_upload_sources,
 )
 from msctl import aws_operations
 from msctl.adapters.slurm import load_pair_manifest, plan_sbatch
