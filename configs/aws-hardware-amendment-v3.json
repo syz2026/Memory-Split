@@ -1,0 +1,59 @@
+{
+  "amendment_id": "memorysplit-confirmatory-v3-aws-hardware-selection",
+  "amendment_mode": "append_only",
+  "cohort_assignment": {
+    "path": "configs/cohort-assignment-v3.json",
+    "sha256": "47faf6f15e13336f67666081c3d0ebf5be3b981f3d2ac455385faa39e543199c"
+  },
+  "cohort_id": "memorysplit-confirmatory-v3-360m-n10-aws",
+  "eligible_profiles": [
+    {
+      "path": "cluster/profiles/aws-p5.48xlarge-v3.json",
+      "profile_id": "aws-p5.48xlarge-v3",
+      "provider": "aws-p5.48xlarge",
+      "sha256": "2207bfbad5e8fa9fc804770b582d0b21f8b6ed109b2e3f3b5c0474c732c53543"
+    },
+    {
+      "path": "cluster/profiles/aws-p6-b300.48xlarge-v3.json",
+      "profile_id": "aws-p6-b300.48xlarge-v3",
+      "provider": "aws-p6-b300.48xlarge",
+      "sha256": "f22ccf259e30b07b7ad9d848723ad10e59092cbf5ea6e3aceca7a556279ce681"
+    }
+  ],
+  "frozen_contract": {
+    "arms": [
+      "dense",
+      "split90"
+    ],
+    "one_profile_for_entire_cohort": true,
+    "protected_outcomes_inspected": [],
+    "scientific_invariants": "all_non_provider_fields_remain_frozen",
+    "seeds": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9
+    ],
+    "symmetric_training": true,
+    "train_groups": [
+      4,
+      4
+    ]
+  },
+  "preregistration": {
+    "path": "configs/preregistration-v3.yaml",
+    "sha256": "6b2b5da3e3dc3d533498a0aa9d1891f356134ce045b1553b74a0161d94cb81d7"
+  },
+  "prospective": true,
+  "schema_version": 1,
+  "supersedes_only": [
+    "provider_assignment",
+    "hardware_topology"
+  ]
+}

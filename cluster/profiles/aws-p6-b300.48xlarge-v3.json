@@ -1,0 +1,60 @@
+{
+  "assigned_seeds": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9
+  ],
+  "cpu": {
+    "architecture": "x86_64",
+    "memory_gib": 4096,
+    "vcpus": 192
+  },
+  "gpu": {
+    "allocated": 8,
+    "model": "NVIDIA B300",
+    "seed_train_groups": [
+      4,
+      4
+    ]
+  },
+  "instance_type": "p6-b300.48xlarge",
+  "offerings": [
+    {
+      "availability_zone": "us-east-1d",
+      "region": "us-east-1"
+    }
+  ],
+  "process_env_allowlist": [
+    "AWS_REGION",
+    "LANG",
+    "LC_ALL"
+  ],
+  "profile_id": "aws-p6-b300.48xlarge-v3",
+  "provider": "aws-p6-b300.48xlarge",
+  "purchase_model": "capacity_block",
+  "runtime": {
+    "ami_id_env": "MS_AWS_AMI_ID",
+    "container_digest_env": "MS_CONTAINER_DIGEST",
+    "region_env": "AWS_REGION",
+    "runtime_gid_env": "MS_RUNTIME_GID",
+    "runtime_uid_env": "MS_RUNTIME_UID"
+  },
+  "schema_version": 1,
+  "storage": {
+    "durable_uri_env": "MS_S3_ROOT",
+    "instance_store": {
+      "device_bytes": 3840000000000,
+      "devices": 8,
+      "model": "Amazon EC2 NVMe Instance Storage",
+      "raid_level": "0"
+    },
+    "scratch_root": "/mnt/memorysplit"
+  }
+}
