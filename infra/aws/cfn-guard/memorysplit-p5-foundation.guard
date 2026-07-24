@@ -27,6 +27,218 @@ let public_routes = Resources.*[
 
 let subnets = Resources.*[ Type == 'AWS::EC2::Subnet' ]
 
+let train_list_prefixes = [
+  '${ArtifactRootPrefix}/canary-roundtrip',
+  '${ArtifactRootPrefix}/canary-roundtrip/*',
+  '${ArtifactRootPrefix}/checkpoints',
+  '${ArtifactRootPrefix}/checkpoints/*',
+  '${ArtifactRootPrefix}/dataset',
+  '${ArtifactRootPrefix}/dataset/*',
+  '${ArtifactRootPrefix}/logs',
+  '${ArtifactRootPrefix}/logs/*',
+  '${ArtifactRootPrefix}/operations/intents',
+  '${ArtifactRootPrefix}/operations/intents/*',
+  '${ArtifactRootPrefix}/operations/*/receipts',
+  '${ArtifactRootPrefix}/operations/*/receipts/*',
+  '${ArtifactRootPrefix}/receipts/bootstrap',
+  '${ArtifactRootPrefix}/receipts/bootstrap/*',
+  '${ArtifactRootPrefix}/receipts/canary',
+  '${ArtifactRootPrefix}/receipts/canary/*',
+  '${ArtifactRootPrefix}/receipts/checkpoints',
+  '${ArtifactRootPrefix}/receipts/checkpoints/*',
+  '${ArtifactRootPrefix}/receipts/interruption',
+  '${ArtifactRootPrefix}/receipts/interruption/*',
+  '${ArtifactRootPrefix}/receipts/runs',
+  '${ArtifactRootPrefix}/receipts/runs/*',
+  '${ArtifactRootPrefix}/releases',
+  '${ArtifactRootPrefix}/releases/*',
+  '${ArtifactRootPrefix}/snapshots',
+  '${ArtifactRootPrefix}/snapshots/*'
+]
+let train_read_resources = [
+  '${ArtifactBucket.Arn}/${ArtifactRootPrefix}/dataset/*',
+  '${ArtifactBucket.Arn}/${ArtifactRootPrefix}/operations/intents/*',
+  '${ArtifactBucket.Arn}/${ArtifactRootPrefix}/releases/*'
+]
+let train_write_resources = [
+  '${ArtifactBucket.Arn}/${ArtifactRootPrefix}/canary-roundtrip/*',
+  '${ArtifactBucket.Arn}/${ArtifactRootPrefix}/checkpoints/*',
+  '${ArtifactBucket.Arn}/${ArtifactRootPrefix}/logs/*',
+  '${ArtifactBucket.Arn}/${ArtifactRootPrefix}/operations/*/receipts/*',
+  '${ArtifactBucket.Arn}/${ArtifactRootPrefix}/receipts/bootstrap/*',
+  '${ArtifactBucket.Arn}/${ArtifactRootPrefix}/receipts/canary/*',
+  '${ArtifactBucket.Arn}/${ArtifactRootPrefix}/receipts/checkpoints/*',
+  '${ArtifactBucket.Arn}/${ArtifactRootPrefix}/receipts/interruption/*',
+  '${ArtifactBucket.Arn}/${ArtifactRootPrefix}/receipts/runs/*',
+  '${ArtifactBucket.Arn}/${ArtifactRootPrefix}/snapshots/*'
+]
+let evaluator_list_prefixes = [
+  '${ArtifactRootPrefix}/checkpoints',
+  '${ArtifactRootPrefix}/checkpoints/*',
+  '${ArtifactRootPrefix}/evaluations',
+  '${ArtifactRootPrefix}/evaluations/*',
+  '${ArtifactRootPrefix}/receipts/checkpoints',
+  '${ArtifactRootPrefix}/receipts/checkpoints/*',
+  '${ArtifactRootPrefix}/receipts/evaluations',
+  '${ArtifactRootPrefix}/receipts/evaluations/*',
+  '${ArtifactRootPrefix}/sealed',
+  '${ArtifactRootPrefix}/sealed/*'
+]
+let evaluator_read_resources = [
+  '${ArtifactBucket.Arn}/${ArtifactRootPrefix}/checkpoints/*',
+  '${ArtifactBucket.Arn}/${ArtifactRootPrefix}/receipts/checkpoints/*',
+  '${ArtifactBucket.Arn}/${ArtifactRootPrefix}/sealed/*'
+]
+let evaluator_write_resources = [
+  '${ArtifactBucket.Arn}/${ArtifactRootPrefix}/evaluations/*',
+  '${ArtifactBucket.Arn}/${ArtifactRootPrefix}/receipts/evaluations/*'
+]
+let controller_list_prefixes = [
+  '${ArtifactRootPrefix}/canaries',
+  '${ArtifactRootPrefix}/canaries/*',
+  '${ArtifactRootPrefix}/canary-roundtrip',
+  '${ArtifactRootPrefix}/canary-roundtrip/*',
+  '${ArtifactRootPrefix}/checkpoints',
+  '${ArtifactRootPrefix}/checkpoints/*',
+  '${ArtifactRootPrefix}/collections',
+  '${ArtifactRootPrefix}/collections/*',
+  '${ArtifactRootPrefix}/dataset',
+  '${ArtifactRootPrefix}/dataset/*',
+  '${ArtifactRootPrefix}/environments',
+  '${ArtifactRootPrefix}/environments/*',
+  '${ArtifactRootPrefix}/evaluations',
+  '${ArtifactRootPrefix}/evaluations/*',
+  '${ArtifactRootPrefix}/logs',
+  '${ArtifactRootPrefix}/logs/*',
+  '${ArtifactRootPrefix}/operations/intents',
+  '${ArtifactRootPrefix}/operations/intents/*',
+  '${ArtifactRootPrefix}/operations/*/receipts',
+  '${ArtifactRootPrefix}/operations/*/receipts/*',
+  '${ArtifactRootPrefix}/receipts/bootstrap',
+  '${ArtifactRootPrefix}/receipts/bootstrap/*',
+  '${ArtifactRootPrefix}/receipts/canary',
+  '${ArtifactRootPrefix}/receipts/canary/*',
+  '${ArtifactRootPrefix}/receipts/checkpoints',
+  '${ArtifactRootPrefix}/receipts/checkpoints/*',
+  '${ArtifactRootPrefix}/receipts/collections',
+  '${ArtifactRootPrefix}/receipts/collections/*',
+  '${ArtifactRootPrefix}/receipts/evaluations',
+  '${ArtifactRootPrefix}/receipts/evaluations/*',
+  '${ArtifactRootPrefix}/receipts/interruption',
+  '${ArtifactRootPrefix}/receipts/interruption/*',
+  '${ArtifactRootPrefix}/receipts/runs',
+  '${ArtifactRootPrefix}/receipts/runs/*',
+  '${ArtifactRootPrefix}/releases',
+  '${ArtifactRootPrefix}/releases/*',
+  '${ArtifactRootPrefix}/snapshots',
+  '${ArtifactRootPrefix}/snapshots/*'
+]
+let controller_read_resources = [
+  '${ArtifactBucket.Arn}/${ArtifactRootPrefix}/canaries/*',
+  '${ArtifactBucket.Arn}/${ArtifactRootPrefix}/canary-roundtrip/*',
+  '${ArtifactBucket.Arn}/${ArtifactRootPrefix}/checkpoints/*',
+  '${ArtifactBucket.Arn}/${ArtifactRootPrefix}/collections/*',
+  '${ArtifactBucket.Arn}/${ArtifactRootPrefix}/dataset/*',
+  '${ArtifactBucket.Arn}/${ArtifactRootPrefix}/environments/*',
+  '${ArtifactBucket.Arn}/${ArtifactRootPrefix}/evaluations/*',
+  '${ArtifactBucket.Arn}/${ArtifactRootPrefix}/logs/*',
+  '${ArtifactBucket.Arn}/${ArtifactRootPrefix}/operations/intents/*',
+  '${ArtifactBucket.Arn}/${ArtifactRootPrefix}/operations/*/receipts/*',
+  '${ArtifactBucket.Arn}/${ArtifactRootPrefix}/receipts/bootstrap/*',
+  '${ArtifactBucket.Arn}/${ArtifactRootPrefix}/receipts/canary/*',
+  '${ArtifactBucket.Arn}/${ArtifactRootPrefix}/receipts/checkpoints/*',
+  '${ArtifactBucket.Arn}/${ArtifactRootPrefix}/receipts/collections/*',
+  '${ArtifactBucket.Arn}/${ArtifactRootPrefix}/receipts/evaluations/*',
+  '${ArtifactBucket.Arn}/${ArtifactRootPrefix}/receipts/interruption/*',
+  '${ArtifactBucket.Arn}/${ArtifactRootPrefix}/receipts/runs/*',
+  '${ArtifactBucket.Arn}/${ArtifactRootPrefix}/releases/*',
+  '${ArtifactBucket.Arn}/${ArtifactRootPrefix}/snapshots/*'
+]
+let controller_write_resources = [
+  '${ArtifactBucket.Arn}/${ArtifactRootPrefix}/canaries/*',
+  '${ArtifactBucket.Arn}/${ArtifactRootPrefix}/checkpoints/receipts/*',
+  '${ArtifactBucket.Arn}/${ArtifactRootPrefix}/checkpoints/sha256/*',
+  '${ArtifactBucket.Arn}/${ArtifactRootPrefix}/dataset/*',
+  '${ArtifactBucket.Arn}/${ArtifactRootPrefix}/environments/*',
+  '${ArtifactBucket.Arn}/${ArtifactRootPrefix}/operations/intents/*'
+]
+let endpoint_object_resources = [
+  '${ArtifactBucket.Arn}/${ArtifactRootPrefix}/canaries/*',
+  '${ArtifactBucket.Arn}/${ArtifactRootPrefix}/canary-roundtrip/*',
+  '${ArtifactBucket.Arn}/${ArtifactRootPrefix}/checkpoints/*',
+  '${ArtifactBucket.Arn}/${ArtifactRootPrefix}/collections/*',
+  '${ArtifactBucket.Arn}/${ArtifactRootPrefix}/dataset/*',
+  '${ArtifactBucket.Arn}/${ArtifactRootPrefix}/environments/*',
+  '${ArtifactBucket.Arn}/${ArtifactRootPrefix}/evaluations/*',
+  '${ArtifactBucket.Arn}/${ArtifactRootPrefix}/logs/*',
+  '${ArtifactBucket.Arn}/${ArtifactRootPrefix}/operations/*',
+  '${ArtifactBucket.Arn}/${ArtifactRootPrefix}/receipts/*',
+  '${ArtifactBucket.Arn}/${ArtifactRootPrefix}/releases/*',
+  '${ArtifactBucket.Arn}/${ArtifactRootPrefix}/sealed/*',
+  '${ArtifactBucket.Arn}/${ArtifactRootPrefix}/snapshots/*'
+]
+let train_readable_resources = [
+  '${ArtifactBucket.Arn}/${ArtifactRootPrefix}/canary-roundtrip/*',
+  '${ArtifactBucket.Arn}/${ArtifactRootPrefix}/checkpoints/*',
+  '${ArtifactBucket.Arn}/${ArtifactRootPrefix}/dataset/*',
+  '${ArtifactBucket.Arn}/${ArtifactRootPrefix}/logs/*',
+  '${ArtifactBucket.Arn}/${ArtifactRootPrefix}/operations/intents/*',
+  '${ArtifactBucket.Arn}/${ArtifactRootPrefix}/operations/*/receipts/*',
+  '${ArtifactBucket.Arn}/${ArtifactRootPrefix}/receipts/bootstrap/*',
+  '${ArtifactBucket.Arn}/${ArtifactRootPrefix}/receipts/canary/*',
+  '${ArtifactBucket.Arn}/${ArtifactRootPrefix}/receipts/checkpoints/*',
+  '${ArtifactBucket.Arn}/${ArtifactRootPrefix}/receipts/interruption/*',
+  '${ArtifactBucket.Arn}/${ArtifactRootPrefix}/receipts/runs/*',
+  '${ArtifactBucket.Arn}/${ArtifactRootPrefix}/releases/*',
+  '${ArtifactBucket.Arn}/${ArtifactRootPrefix}/snapshots/*'
+]
+let evaluator_readable_resources = [
+  '${ArtifactBucket.Arn}/${ArtifactRootPrefix}/checkpoints/*',
+  '${ArtifactBucket.Arn}/${ArtifactRootPrefix}/evaluations/*',
+  '${ArtifactBucket.Arn}/${ArtifactRootPrefix}/receipts/checkpoints/*',
+  '${ArtifactBucket.Arn}/${ArtifactRootPrefix}/receipts/evaluations/*',
+  '${ArtifactBucket.Arn}/${ArtifactRootPrefix}/sealed/*'
+]
+let train_policy_statements = Resources.TrainRole.Properties.Policies[*].PolicyDocument.Statement[*]
+let train_s3_read_statements = %train_policy_statements[
+  Action == 's3:GetObject' or
+  some Action[*] == 's3:GetObject'
+]
+let train_s3_write_statements = %train_policy_statements[
+  Action == 's3:PutObject' or
+  some Action[*] == 's3:PutObject'
+]
+let train_s3_list_statements = %train_policy_statements[
+  Action == 's3:ListBucket' or
+  some Action[*] == 's3:ListBucket'
+]
+let evaluator_policy_statements = Resources.EvaluatorRole.Properties.Policies[*].PolicyDocument.Statement[*]
+let evaluator_s3_read_statements = %evaluator_policy_statements[
+  Action == 's3:GetObject' or
+  some Action[*] == 's3:GetObject'
+]
+let evaluator_s3_write_statements = %evaluator_policy_statements[
+  Action == 's3:PutObject' or
+  some Action[*] == 's3:PutObject'
+]
+let evaluator_s3_list_statements = %evaluator_policy_statements[
+  Action == 's3:ListBucket' or
+  some Action[*] == 's3:ListBucket'
+]
+let controller_policy_statements = Resources.ControllerOperationsPolicy.Properties.PolicyDocument.Statement[*]
+let controller_s3_read_statements = %controller_policy_statements[
+  Action == 's3:GetObject' or
+  some Action[*] == 's3:GetObject'
+]
+let controller_s3_write_statements = %controller_policy_statements[
+  Action == 's3:PutObject' or
+  some Action[*] == 's3:PutObject'
+]
+let controller_s3_list_statements = %controller_policy_statements[
+  Action == 's3:ListBucket' or
+  some Action[*] == 's3:ListBucket'
+]
+
 rule no_ec2_instances {
   %ec2_instances empty
 }
@@ -173,5 +385,49 @@ rule meaningful_role_policy_invariants {
   }
   Resources.SignerRole.Properties.Policies[*].PolicyDocument.Statement[ Sid == 'SignWithApprovalKey' ] {
     some Action[*] == 'kms:Sign'
+  }
+}
+
+rule exact_s3_role_separation {
+  Resources.TrainRole.Properties.Policies[*].PolicyDocument.Statement[ Sid == 'ListTrainPrefixes' ].Condition[ keys == 'ForAnyValue:StringLike' ][ keys == 's3:prefix' ][*][ keys == 'Fn::Sub' ] IN %train_list_prefixes
+  Resources.TrainRole.Properties.Policies[*].PolicyDocument.Statement[ Sid == 'ReadTrainingInputs' ] {
+    some Action[*] == 's3:GetObject'
+    Resource[*][ keys == 'Fn::Sub' ] IN %train_read_resources
+  }
+  Resources.TrainRole.Properties.Policies[*].PolicyDocument.Statement[ Sid == 'ReadWriteTrainingArtifacts' ] {
+    some Action[*] == 's3:PutObject'
+    Resource[*][ keys == 'Fn::Sub' ] IN %train_write_resources
+  }
+  %train_s3_list_statements.Condition[ keys == 'ForAnyValue:StringLike' ][ keys == 's3:prefix' ][*][ keys == 'Fn::Sub' ] IN %train_list_prefixes
+  %train_s3_read_statements.Resource[*][ keys == 'Fn::Sub' ] IN %train_readable_resources
+  %train_s3_write_statements.Resource[*][ keys == 'Fn::Sub' ] IN %train_write_resources
+
+  Resources.EvaluatorRole.Properties.Policies[*].PolicyDocument.Statement[ Sid == 'ListEvaluatorPrefixes' ].Condition[ keys == 'ForAnyValue:StringLike' ][ keys == 's3:prefix' ][*][ keys == 'Fn::Sub' ] IN %evaluator_list_prefixes
+  Resources.EvaluatorRole.Properties.Policies[*].PolicyDocument.Statement[ Sid == 'ReadEvaluationInputs' ] {
+    Action[*] != 's3:PutObject'
+    Resource[*][ keys == 'Fn::Sub' ] IN %evaluator_read_resources
+  }
+  Resources.EvaluatorRole.Properties.Policies[*].PolicyDocument.Statement[ Sid == 'ReadWriteEvaluationEvidence' ] {
+    some Action[*] == 's3:PutObject'
+    Resource[*][ keys == 'Fn::Sub' ] IN %evaluator_write_resources
+  }
+  %evaluator_s3_list_statements.Condition[ keys == 'ForAnyValue:StringLike' ][ keys == 's3:prefix' ][*][ keys == 'Fn::Sub' ] IN %evaluator_list_prefixes
+  %evaluator_s3_read_statements.Resource[*][ keys == 'Fn::Sub' ] IN %evaluator_readable_resources
+  %evaluator_s3_write_statements.Resource[*][ keys == 'Fn::Sub' ] IN %evaluator_write_resources
+
+  Resources.ControllerOperationsPolicy.Properties.PolicyDocument.Statement[ Sid == 'ListControllerPrefixes' ].Condition[ keys == 'ForAnyValue:StringLike' ][ keys == 's3:prefix' ][*][ keys == 'Fn::Sub' ] IN %controller_list_prefixes
+  Resources.ControllerOperationsPolicy.Properties.PolicyDocument.Statement[ Sid == 'ReadLifecycleArtifacts' ] {
+    Action[*] != 's3:PutObject'
+    Resource[*][ keys == 'Fn::Sub' ] IN %controller_read_resources
+  }
+  Resources.ControllerOperationsPolicy.Properties.PolicyDocument.Statement[ Sid == 'WriteControllerPublications' ] {
+    Action == 's3:PutObject'
+    Resource[*][ keys == 'Fn::Sub' ] IN %controller_write_resources
+  }
+  %controller_s3_list_statements.Condition[ keys == 'ForAnyValue:StringLike' ][ keys == 's3:prefix' ][*][ keys == 'Fn::Sub' ] IN %controller_list_prefixes
+  %controller_s3_read_statements.Resource[*][ keys == 'Fn::Sub' ] IN %controller_read_resources
+  %controller_s3_write_statements.Resource[*][ keys == 'Fn::Sub' ] IN %controller_write_resources
+  Resources.S3Endpoint.Properties.PolicyDocument.Statement[ Sid == 'MemorySplitVersionedObjects' ] {
+    Resource[*][ keys == 'Fn::Sub' ] IN %endpoint_object_resources
   }
 }

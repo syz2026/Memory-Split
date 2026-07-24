@@ -169,6 +169,22 @@ def _attached_role_statements(
     return {statement["Sid"]: statement for statement in statements}
 
 
+def _sub_resources(statement: dict[str, object]) -> list[str]:
+    resources = statement["Resource"]
+    rows = resources if isinstance(resources, list) else [resources]
+    return [row["Fn::Sub"] for row in rows if "Fn::Sub" in row]
+
+
+def _list_prefixes(statement: dict[str, object]) -> list[str]:
+    values = statement["Condition"]["ForAnyValue:StringLike"]["s3:prefix"]
+    return [value["Fn::Sub"] for value in values]
+
+
+def _action_set(statement: dict[str, object]) -> set[str]:
+    actions = statement["Action"]
+    return {actions} if isinstance(actions, str) else set(actions)
+
+
 def test_template_is_plain_yaml_using_only_long_form_intrinsics(template):
     text = TEMPLATE_PATH.read_text(encoding="utf-8")
 
@@ -586,57 +602,229 @@ def test_controller_ebs_kms_permissions_are_exact_and_grant_is_constrained(
     } & _attached_role_actions(template, "ControllerRole")
 
 
-def test_train_and_evaluator_s3_permissions_are_prefix_scoped(template):
-    bucket_arn = {"Fn::GetAtt": ["ArtifactBucket", "Arn"]}
-    assert template["Parameters"]["ArtifactRootPrefix"] == {
-        "Type": "String",
-        "Default": "memorysplit-v3",
-        "AllowedPattern": (
-            "^[a-z0-9](?:[a-z0-9._-]{0,61}[a-z0-9])?"
-            "(?:/[a-z0-9](?:[a-z0-9._-]{0,61}[a-z0-9])?)*$"
-        ),
-        "MinLength": 1,
-        "MaxLength": 127,
-        "Description": "Durable S3 key prefix used as MS_S3_ROOT.",
-    }
-    train = _attached_role_statements(template, "TrainRole")
-    assert train["ListTrainPrefixes"] == {
-        "Sid": "ListTrainPrefixes",
-        "Effect": "Allow",
-        "Action": ["s3:ListBucket", "s3:ListBucketVersions"],
-        "Resource": bucket_arn,
-        "Condition": {
-            "ForAnyValue:StringLike": {
-                "s3:prefix": [
-                    {"Fn::Sub": "${ArtifactRootPrefix}/canary-roundtrip"},
-                    {"Fn::Sub": "${ArtifactRootPrefix}/canary-roundtrip/*"},
-                    {"Fn::Sub": "${ArtifactRootPrefix}/checkpoints"},
-                    {"Fn::Sub": "${ArtifactRootPrefix}/checkpoints/*"},
-                    {"Fn::Sub": "${ArtifactRootPrefix}/dataset"},
-                    {"Fn::Sub": "${ArtifactRootPrefix}/dataset/*"},
-                    {"Fn::Sub": "${ArtifactRootPrefix}/operations"},
-                    {"Fn::Sub": "${ArtifactRootPrefix}/operations/*"},
-                    {"Fn::Sub": "${ArtifactRootPrefix}/receipts"},
-                    {"Fn::Sub": "${ArtifactRootPrefix}/receipts/*"},
-                    {"Fn::Sub": "${ArtifactRootPrefix}/releases"},
-                    {"Fn::Sub": "${ArtifactRootPrefix}/releases/*"},
-                ]
-            }
-        },
-    }
-    assert train["ReadBootstrapInputs"]["Resource"] == [
-        {
-            "Fn::Sub": (
-                "${ArtifactBucket.Arn}/${ArtifactRootPrefix}/dataset/*"
-            )
-        },
-        {
-            "Fn::Sub": (
-                "${ArtifactBucket.Arn}/${ArtifactRootPrefix}/releases/*"
-            )
-        },
+def test_train_s3_permissions_exclude_evaluator_and_sealed_prefixes(template):
+    statements = _attached_role_statements(template, "TrainRole")
+    assert _list_prefixes(statements["ListTrainPrefixes"]) == [
+        "${ArtifactRootPrefix}/canary-roundtrip",
+        "${ArtifactRootPrefix}/canary-roundtrip/*",
+        "${ArtifactRootPrefix}/checkpoints",
+        "${ArtifactRootPrefix}/checkpoints/*",
+        "${ArtifactRootPrefix}/dataset",
+        "${ArtifactRootPrefix}/dataset/*",
+        "${ArtifactRootPrefix}/logs",
+        "${ArtifactRootPrefix}/logs/*",
+        "${ArtifactRootPrefix}/operations/intents",
+        "${ArtifactRootPrefix}/operations/intents/*",
+        "${ArtifactRootPrefix}/operations/*/receipts",
+        "${ArtifactRootPrefix}/operations/*/receipts/*",
+        "${ArtifactRootPrefix}/receipts/bootstrap",
+        "${ArtifactRootPrefix}/receipts/bootstrap/*",
+        "${ArtifactRootPrefix}/receipts/canary",
+        "${ArtifactRootPrefix}/receipts/canary/*",
+        "${ArtifactRootPrefix}/receipts/checkpoints",
+        "${ArtifactRootPrefix}/receipts/checkpoints/*",
+        "${ArtifactRootPrefix}/receipts/interruption",
+        "${ArtifactRootPrefix}/receipts/interruption/*",
+        "${ArtifactRootPrefix}/receipts/runs",
+        "${ArtifactRootPrefix}/receipts/runs/*",
+        "${ArtifactRootPrefix}/releases",
+        "${ArtifactRootPrefix}/releases/*",
+        "${ArtifactRootPrefix}/snapshots",
+        "${ArtifactRootPrefix}/snapshots/*",
     ]
-    assert train["ReadWriteTrainingState"]["Resource"] == [
+    assert _sub_resources(statements["ReadTrainingInputs"]) == [
+        "${ArtifactBucket.Arn}/${ArtifactRootPrefix}/dataset/*",
+        "${ArtifactBucket.Arn}/${ArtifactRootPrefix}/operations/intents/*",
+        "${ArtifactBucket.Arn}/${ArtifactRootPrefix}/releases/*",
+    ]
+    assert _sub_resources(statements["ReadWriteTrainingArtifacts"]) == [
+        "${ArtifactBucket.Arn}/${ArtifactRootPrefix}/canary-roundtrip/*",
+        "${ArtifactBucket.Arn}/${ArtifactRootPrefix}/checkpoints/*",
+        "${ArtifactBucket.Arn}/${ArtifactRootPrefix}/logs/*",
+        "${ArtifactBucket.Arn}/${ArtifactRootPrefix}/operations/*/receipts/*",
+        "${ArtifactBucket.Arn}/${ArtifactRootPrefix}/receipts/bootstrap/*",
+        "${ArtifactBucket.Arn}/${ArtifactRootPrefix}/receipts/canary/*",
+        "${ArtifactBucket.Arn}/${ArtifactRootPrefix}/receipts/checkpoints/*",
+        "${ArtifactBucket.Arn}/${ArtifactRootPrefix}/receipts/interruption/*",
+        "${ArtifactBucket.Arn}/${ArtifactRootPrefix}/receipts/runs/*",
+        "${ArtifactBucket.Arn}/${ArtifactRootPrefix}/snapshots/*",
+    ]
+    all_prefixes = _list_prefixes(statements["ListTrainPrefixes"])
+    all_resources = [
+        resource
+        for statement in statements.values()
+        if _action_set(statement) & {
+            "s3:GetObject",
+            "s3:GetObjectVersion",
+            "s3:PutObject",
+        }
+        for resource in _sub_resources(statement)
+    ]
+    assert all(
+        forbidden not in value
+        for forbidden in ("/evaluations", "/receipts/evaluations", "/sealed")
+        for value in [*all_prefixes, *all_resources]
+    )
+    assert "${ArtifactBucket.Arn}/${ArtifactRootPrefix}/*" not in all_resources
+
+
+def test_evaluator_s3_permissions_are_read_only_for_training_inputs(template):
+    statements = _attached_role_statements(template, "EvaluatorRole")
+    assert _list_prefixes(statements["ListEvaluatorPrefixes"]) == [
+        "${ArtifactRootPrefix}/checkpoints",
+        "${ArtifactRootPrefix}/checkpoints/*",
+        "${ArtifactRootPrefix}/evaluations",
+        "${ArtifactRootPrefix}/evaluations/*",
+        "${ArtifactRootPrefix}/receipts/checkpoints",
+        "${ArtifactRootPrefix}/receipts/checkpoints/*",
+        "${ArtifactRootPrefix}/receipts/evaluations",
+        "${ArtifactRootPrefix}/receipts/evaluations/*",
+        "${ArtifactRootPrefix}/sealed",
+        "${ArtifactRootPrefix}/sealed/*",
+    ]
+    assert _sub_resources(statements["ReadEvaluationInputs"]) == [
+        "${ArtifactBucket.Arn}/${ArtifactRootPrefix}/checkpoints/*",
+        (
+            "${ArtifactBucket.Arn}/${ArtifactRootPrefix}/"
+            "receipts/checkpoints/*"
+        ),
+        "${ArtifactBucket.Arn}/${ArtifactRootPrefix}/sealed/*",
+    ]
+    assert "s3:PutObject" not in _action_set(
+        statements["ReadEvaluationInputs"]
+    )
+    assert _sub_resources(statements["ReadWriteEvaluationEvidence"]) == [
+        "${ArtifactBucket.Arn}/${ArtifactRootPrefix}/evaluations/*",
+        (
+            "${ArtifactBucket.Arn}/${ArtifactRootPrefix}/"
+            "receipts/evaluations/*"
+        ),
+    ]
+    assert "s3:PutObject" in _action_set(
+        statements["ReadWriteEvaluationEvidence"]
+    )
+    assert all(
+        "checkpoints" not in resource
+        and "/receipts/runs/" not in resource
+        and "/receipts/bootstrap/" not in resource
+        for resource in _sub_resources(
+            statements["ReadWriteEvaluationEvidence"]
+        )
+    )
+
+
+def test_controller_s3_reads_and_writes_use_disjoint_exact_prefixes(template):
+    statements = _attached_role_statements(template, "ControllerRole")
+    assert _list_prefixes(statements["ListControllerPrefixes"]) == [
+        "${ArtifactRootPrefix}/canaries",
+        "${ArtifactRootPrefix}/canaries/*",
+        "${ArtifactRootPrefix}/canary-roundtrip",
+        "${ArtifactRootPrefix}/canary-roundtrip/*",
+        "${ArtifactRootPrefix}/checkpoints",
+        "${ArtifactRootPrefix}/checkpoints/*",
+        "${ArtifactRootPrefix}/collections",
+        "${ArtifactRootPrefix}/collections/*",
+        "${ArtifactRootPrefix}/dataset",
+        "${ArtifactRootPrefix}/dataset/*",
+        "${ArtifactRootPrefix}/environments",
+        "${ArtifactRootPrefix}/environments/*",
+        "${ArtifactRootPrefix}/evaluations",
+        "${ArtifactRootPrefix}/evaluations/*",
+        "${ArtifactRootPrefix}/logs",
+        "${ArtifactRootPrefix}/logs/*",
+        "${ArtifactRootPrefix}/operations/intents",
+        "${ArtifactRootPrefix}/operations/intents/*",
+        "${ArtifactRootPrefix}/operations/*/receipts",
+        "${ArtifactRootPrefix}/operations/*/receipts/*",
+        "${ArtifactRootPrefix}/receipts/bootstrap",
+        "${ArtifactRootPrefix}/receipts/bootstrap/*",
+        "${ArtifactRootPrefix}/receipts/canary",
+        "${ArtifactRootPrefix}/receipts/canary/*",
+        "${ArtifactRootPrefix}/receipts/checkpoints",
+        "${ArtifactRootPrefix}/receipts/checkpoints/*",
+        "${ArtifactRootPrefix}/receipts/collections",
+        "${ArtifactRootPrefix}/receipts/collections/*",
+        "${ArtifactRootPrefix}/receipts/evaluations",
+        "${ArtifactRootPrefix}/receipts/evaluations/*",
+        "${ArtifactRootPrefix}/receipts/interruption",
+        "${ArtifactRootPrefix}/receipts/interruption/*",
+        "${ArtifactRootPrefix}/receipts/runs",
+        "${ArtifactRootPrefix}/receipts/runs/*",
+        "${ArtifactRootPrefix}/releases",
+        "${ArtifactRootPrefix}/releases/*",
+        "${ArtifactRootPrefix}/snapshots",
+        "${ArtifactRootPrefix}/snapshots/*",
+    ]
+    read_resources = _sub_resources(statements["ReadLifecycleArtifacts"])
+    assert read_resources == [
+        "${ArtifactBucket.Arn}/${ArtifactRootPrefix}/canaries/*",
+        "${ArtifactBucket.Arn}/${ArtifactRootPrefix}/canary-roundtrip/*",
+        "${ArtifactBucket.Arn}/${ArtifactRootPrefix}/checkpoints/*",
+        "${ArtifactBucket.Arn}/${ArtifactRootPrefix}/collections/*",
+        "${ArtifactBucket.Arn}/${ArtifactRootPrefix}/dataset/*",
+        "${ArtifactBucket.Arn}/${ArtifactRootPrefix}/environments/*",
+        "${ArtifactBucket.Arn}/${ArtifactRootPrefix}/evaluations/*",
+        "${ArtifactBucket.Arn}/${ArtifactRootPrefix}/logs/*",
+        "${ArtifactBucket.Arn}/${ArtifactRootPrefix}/operations/intents/*",
+        "${ArtifactBucket.Arn}/${ArtifactRootPrefix}/operations/*/receipts/*",
+        "${ArtifactBucket.Arn}/${ArtifactRootPrefix}/receipts/bootstrap/*",
+        "${ArtifactBucket.Arn}/${ArtifactRootPrefix}/receipts/canary/*",
+        "${ArtifactBucket.Arn}/${ArtifactRootPrefix}/receipts/checkpoints/*",
+        "${ArtifactBucket.Arn}/${ArtifactRootPrefix}/receipts/collections/*",
+        "${ArtifactBucket.Arn}/${ArtifactRootPrefix}/receipts/evaluations/*",
+        "${ArtifactBucket.Arn}/${ArtifactRootPrefix}/receipts/interruption/*",
+        "${ArtifactBucket.Arn}/${ArtifactRootPrefix}/receipts/runs/*",
+        "${ArtifactBucket.Arn}/${ArtifactRootPrefix}/releases/*",
+        "${ArtifactBucket.Arn}/${ArtifactRootPrefix}/snapshots/*",
+    ]
+    write_resources = _sub_resources(
+        statements["WriteControllerPublications"]
+    )
+    assert write_resources == [
+        "${ArtifactBucket.Arn}/${ArtifactRootPrefix}/canaries/*",
+        (
+            "${ArtifactBucket.Arn}/${ArtifactRootPrefix}/"
+            "checkpoints/receipts/*"
+        ),
+        (
+            "${ArtifactBucket.Arn}/${ArtifactRootPrefix}/"
+            "checkpoints/sha256/*"
+        ),
+        "${ArtifactBucket.Arn}/${ArtifactRootPrefix}/dataset/*",
+        "${ArtifactBucket.Arn}/${ArtifactRootPrefix}/environments/*",
+        "${ArtifactBucket.Arn}/${ArtifactRootPrefix}/operations/intents/*",
+    ]
+    assert _action_set(statements["WriteControllerPublications"]) == {
+        "s3:PutObject"
+    }
+    assert _action_set(statements["ReadLifecycleArtifacts"]) == {
+        "s3:GetObject",
+        "s3:GetObjectVersion",
+    }
+    assert "${ArtifactBucket.Arn}/${ArtifactRootPrefix}/*" not in [
+        *read_resources,
+        *write_resources,
+    ]
+    assert all(
+        "/evaluations/" not in resource
+        and "/receipts/evaluations/" not in resource
+        and "/sealed/" not in resource
+        for resource in write_resources
+    )
+    assert all("/sealed/" not in resource for resource in read_resources)
+
+    endpoint_statements = {
+        statement["Sid"]: statement
+        for statement in template["Resources"]["S3Endpoint"]["Properties"][
+            "PolicyDocument"
+        ]["Statement"]
+    }
+    assert endpoint_statements["MemorySplitVersionedObjects"]["Resource"] == [
+        {
+            "Fn::Sub": (
+                "${ArtifactBucket.Arn}/${ArtifactRootPrefix}/canaries/*"
+            )
+        },
         {
             "Fn::Sub": (
                 "${ArtifactBucket.Arn}/${ArtifactRootPrefix}/"
@@ -650,6 +838,31 @@ def test_train_and_evaluator_s3_permissions_are_prefix_scoped(template):
         },
         {
             "Fn::Sub": (
+                "${ArtifactBucket.Arn}/${ArtifactRootPrefix}/collections/*"
+            )
+        },
+        {
+            "Fn::Sub": (
+                "${ArtifactBucket.Arn}/${ArtifactRootPrefix}/dataset/*"
+            )
+        },
+        {
+            "Fn::Sub": (
+                "${ArtifactBucket.Arn}/${ArtifactRootPrefix}/environments/*"
+            )
+        },
+        {
+            "Fn::Sub": (
+                "${ArtifactBucket.Arn}/${ArtifactRootPrefix}/evaluations/*"
+            )
+        },
+        {
+            "Fn::Sub": (
+                "${ArtifactBucket.Arn}/${ArtifactRootPrefix}/logs/*"
+            )
+        },
+        {
+            "Fn::Sub": (
                 "${ArtifactBucket.Arn}/${ArtifactRootPrefix}/operations/*"
             )
         },
@@ -658,57 +871,9 @@ def test_train_and_evaluator_s3_permissions_are_prefix_scoped(template):
                 "${ArtifactBucket.Arn}/${ArtifactRootPrefix}/receipts/*"
             )
         },
-    ]
-
-    evaluator = _attached_role_statements(template, "EvaluatorRole")
-    assert evaluator["ListEvaluatorPrefixes"] == {
-        "Sid": "ListEvaluatorPrefixes",
-        "Effect": "Allow",
-        "Action": ["s3:ListBucket", "s3:ListBucketVersions"],
-        "Resource": bucket_arn,
-        "Condition": {
-            "ForAnyValue:StringLike": {
-                "s3:prefix": [
-                    {"Fn::Sub": "${ArtifactRootPrefix}/checkpoints"},
-                    {"Fn::Sub": "${ArtifactRootPrefix}/checkpoints/*"},
-                    {"Fn::Sub": "${ArtifactRootPrefix}/evaluations"},
-                    {"Fn::Sub": "${ArtifactRootPrefix}/evaluations/*"},
-                    {
-                        "Fn::Sub": (
-                            "${ArtifactRootPrefix}/receipts/checkpoints"
-                        )
-                    },
-                    {
-                        "Fn::Sub": (
-                            "${ArtifactRootPrefix}/receipts/checkpoints/*"
-                        )
-                    },
-                    {
-                        "Fn::Sub": (
-                            "${ArtifactRootPrefix}/receipts/evaluations"
-                        )
-                    },
-                    {
-                        "Fn::Sub": (
-                            "${ArtifactRootPrefix}/receipts/evaluations/*"
-                        )
-                    },
-                    {"Fn::Sub": "${ArtifactRootPrefix}/sealed"},
-                    {"Fn::Sub": "${ArtifactRootPrefix}/sealed/*"},
-                ]
-            }
-        },
-    }
-    assert evaluator["ReadEvaluationInputs"]["Resource"] == [
         {
             "Fn::Sub": (
-                "${ArtifactBucket.Arn}/${ArtifactRootPrefix}/checkpoints/*"
-            )
-        },
-        {
-            "Fn::Sub": (
-                "${ArtifactBucket.Arn}/${ArtifactRootPrefix}/"
-                "receipts/checkpoints/*"
+                "${ArtifactBucket.Arn}/${ArtifactRootPrefix}/releases/*"
             )
         },
         {
@@ -716,39 +881,12 @@ def test_train_and_evaluator_s3_permissions_are_prefix_scoped(template):
                 "${ArtifactBucket.Arn}/${ArtifactRootPrefix}/sealed/*"
             )
         },
-    ]
-    evaluation_outputs = evaluator["ReadWriteEvaluationEvidence"]["Resource"]
-    assert evaluation_outputs == [
         {
             "Fn::Sub": (
-                "${ArtifactBucket.Arn}/${ArtifactRootPrefix}/evaluations/*"
-            )
-        },
-        {
-            "Fn::Sub": (
-                "${ArtifactBucket.Arn}/${ArtifactRootPrefix}/"
-                "receipts/evaluations/*"
+                "${ArtifactBucket.Arn}/${ArtifactRootPrefix}/snapshots/*"
             )
         },
     ]
-    assert "s3:PutObject" not in evaluator["ReadEvaluationInputs"]["Action"]
-    assert all(
-        "checkpoints" not in resource["Fn::Sub"]
-        for resource in evaluation_outputs
-    )
-    controller = _attached_role_statements(template, "ControllerRole")
-    assert controller["ReadWriteOperationIntents"]["Resource"] == {
-        "Fn::Sub": "${ArtifactBucket.Arn}/${ArtifactRootPrefix}/*"
-    }
-    endpoint_statements = {
-        statement["Sid"]: statement
-        for statement in template["Resources"]["S3Endpoint"]["Properties"][
-            "PolicyDocument"
-        ]["Statement"]
-    }
-    assert endpoint_statements["MemorySplitVersionedObjects"]["Resource"] == {
-        "Fn::Sub": "${ArtifactBucket.Arn}/${ArtifactRootPrefix}/*"
-    }
 
 
 def test_controller_mutations_and_ssm_targets_are_strictly_scoped(template):
@@ -977,7 +1115,12 @@ def test_cfn_guard_required_resources_and_role_policies_are_non_vacuous():
         assert f"Resources.{logical_id}.Type ==" in guard
     for policy_invariant in (
         "Sid == 'ListTrainPrefixes'",
+        "Sid == 'ReadWriteTrainingArtifacts'",
         "Sid == 'ListEvaluatorPrefixes'",
+        "Sid == 'ListControllerPrefixes'",
+        "Sid == 'ReadLifecycleArtifacts'",
+        "Sid == 'WriteControllerPublications'",
+        "Sid == 'MemorySplitVersionedObjects'",
         "Sid == 'RunApprovedLaunchTemplate'",
         "Sid == 'CreateEbsGrant'",
         "Sid == 'SendToTaggedInstances'",
@@ -986,5 +1129,6 @@ def test_cfn_guard_required_resources_and_role_policies_are_non_vacuous():
         "ec2:IsLaunchTemplateResource",
         "ssm:resourceTag/MemorySplitManaged",
         "some Action[*] == 'kms:Sign'",
+        "rule exact_s3_role_separation",
     ):
         assert policy_invariant in guard

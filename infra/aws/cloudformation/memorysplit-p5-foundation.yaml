@@ -399,13 +399,27 @@ Resources:
                       - Fn::Sub: ${ArtifactRootPrefix}/checkpoints/*
                       - Fn::Sub: ${ArtifactRootPrefix}/dataset
                       - Fn::Sub: ${ArtifactRootPrefix}/dataset/*
-                      - Fn::Sub: ${ArtifactRootPrefix}/operations
-                      - Fn::Sub: ${ArtifactRootPrefix}/operations/*
-                      - Fn::Sub: ${ArtifactRootPrefix}/receipts
-                      - Fn::Sub: ${ArtifactRootPrefix}/receipts/*
+                      - Fn::Sub: ${ArtifactRootPrefix}/logs
+                      - Fn::Sub: ${ArtifactRootPrefix}/logs/*
+                      - Fn::Sub: ${ArtifactRootPrefix}/operations/intents
+                      - Fn::Sub: ${ArtifactRootPrefix}/operations/intents/*
+                      - Fn::Sub: ${ArtifactRootPrefix}/operations/*/receipts
+                      - Fn::Sub: ${ArtifactRootPrefix}/operations/*/receipts/*
+                      - Fn::Sub: ${ArtifactRootPrefix}/receipts/bootstrap
+                      - Fn::Sub: ${ArtifactRootPrefix}/receipts/bootstrap/*
+                      - Fn::Sub: ${ArtifactRootPrefix}/receipts/canary
+                      - Fn::Sub: ${ArtifactRootPrefix}/receipts/canary/*
+                      - Fn::Sub: ${ArtifactRootPrefix}/receipts/checkpoints
+                      - Fn::Sub: ${ArtifactRootPrefix}/receipts/checkpoints/*
+                      - Fn::Sub: ${ArtifactRootPrefix}/receipts/interruption
+                      - Fn::Sub: ${ArtifactRootPrefix}/receipts/interruption/*
+                      - Fn::Sub: ${ArtifactRootPrefix}/receipts/runs
+                      - Fn::Sub: ${ArtifactRootPrefix}/receipts/runs/*
                       - Fn::Sub: ${ArtifactRootPrefix}/releases
                       - Fn::Sub: ${ArtifactRootPrefix}/releases/*
-              - Sid: ReadBootstrapInputs
+                      - Fn::Sub: ${ArtifactRootPrefix}/snapshots
+                      - Fn::Sub: ${ArtifactRootPrefix}/snapshots/*
+              - Sid: ReadTrainingInputs
                 Effect: Allow
                 Action:
                   - s3:GetObject
@@ -414,8 +428,9 @@ Resources:
                   - s3:GetObjectVersion
                 Resource:
                   - Fn::Sub: ${ArtifactBucket.Arn}/${ArtifactRootPrefix}/dataset/*
+                  - Fn::Sub: ${ArtifactBucket.Arn}/${ArtifactRootPrefix}/operations/intents/*
                   - Fn::Sub: ${ArtifactBucket.Arn}/${ArtifactRootPrefix}/releases/*
-              - Sid: ReadWriteTrainingState
+              - Sid: ReadWriteTrainingArtifacts
                 Effect: Allow
                 Action:
                   - s3:AbortMultipartUpload
@@ -429,8 +444,14 @@ Resources:
                 Resource:
                   - Fn::Sub: ${ArtifactBucket.Arn}/${ArtifactRootPrefix}/canary-roundtrip/*
                   - Fn::Sub: ${ArtifactBucket.Arn}/${ArtifactRootPrefix}/checkpoints/*
-                  - Fn::Sub: ${ArtifactBucket.Arn}/${ArtifactRootPrefix}/operations/*
-                  - Fn::Sub: ${ArtifactBucket.Arn}/${ArtifactRootPrefix}/receipts/*
+                  - Fn::Sub: ${ArtifactBucket.Arn}/${ArtifactRootPrefix}/logs/*
+                  - Fn::Sub: ${ArtifactBucket.Arn}/${ArtifactRootPrefix}/operations/*/receipts/*
+                  - Fn::Sub: ${ArtifactBucket.Arn}/${ArtifactRootPrefix}/receipts/bootstrap/*
+                  - Fn::Sub: ${ArtifactBucket.Arn}/${ArtifactRootPrefix}/receipts/canary/*
+                  - Fn::Sub: ${ArtifactBucket.Arn}/${ArtifactRootPrefix}/receipts/checkpoints/*
+                  - Fn::Sub: ${ArtifactBucket.Arn}/${ArtifactRootPrefix}/receipts/interruption/*
+                  - Fn::Sub: ${ArtifactBucket.Arn}/${ArtifactRootPrefix}/receipts/runs/*
+                  - Fn::Sub: ${ArtifactBucket.Arn}/${ArtifactRootPrefix}/snapshots/*
               - Sid: UseDataKey
                 Effect: Allow
                 Action:
@@ -718,14 +739,92 @@ Resources:
               - ssm:GetCommandInvocation
               - ssm:ListCommands
             Resource: "*"
-          - Sid: ReadWriteOperationIntents
+          - Sid: ListControllerPrefixes
+            Effect: Allow
+            Action:
+              - s3:ListBucket
+              - s3:ListBucketVersions
+            Resource:
+              Fn::GetAtt:
+                - ArtifactBucket
+                - Arn
+            Condition:
+              "ForAnyValue:StringLike":
+                s3:prefix:
+                  - Fn::Sub: ${ArtifactRootPrefix}/canaries
+                  - Fn::Sub: ${ArtifactRootPrefix}/canaries/*
+                  - Fn::Sub: ${ArtifactRootPrefix}/canary-roundtrip
+                  - Fn::Sub: ${ArtifactRootPrefix}/canary-roundtrip/*
+                  - Fn::Sub: ${ArtifactRootPrefix}/checkpoints
+                  - Fn::Sub: ${ArtifactRootPrefix}/checkpoints/*
+                  - Fn::Sub: ${ArtifactRootPrefix}/collections
+                  - Fn::Sub: ${ArtifactRootPrefix}/collections/*
+                  - Fn::Sub: ${ArtifactRootPrefix}/dataset
+                  - Fn::Sub: ${ArtifactRootPrefix}/dataset/*
+                  - Fn::Sub: ${ArtifactRootPrefix}/environments
+                  - Fn::Sub: ${ArtifactRootPrefix}/environments/*
+                  - Fn::Sub: ${ArtifactRootPrefix}/evaluations
+                  - Fn::Sub: ${ArtifactRootPrefix}/evaluations/*
+                  - Fn::Sub: ${ArtifactRootPrefix}/logs
+                  - Fn::Sub: ${ArtifactRootPrefix}/logs/*
+                  - Fn::Sub: ${ArtifactRootPrefix}/operations/intents
+                  - Fn::Sub: ${ArtifactRootPrefix}/operations/intents/*
+                  - Fn::Sub: ${ArtifactRootPrefix}/operations/*/receipts
+                  - Fn::Sub: ${ArtifactRootPrefix}/operations/*/receipts/*
+                  - Fn::Sub: ${ArtifactRootPrefix}/receipts/bootstrap
+                  - Fn::Sub: ${ArtifactRootPrefix}/receipts/bootstrap/*
+                  - Fn::Sub: ${ArtifactRootPrefix}/receipts/canary
+                  - Fn::Sub: ${ArtifactRootPrefix}/receipts/canary/*
+                  - Fn::Sub: ${ArtifactRootPrefix}/receipts/checkpoints
+                  - Fn::Sub: ${ArtifactRootPrefix}/receipts/checkpoints/*
+                  - Fn::Sub: ${ArtifactRootPrefix}/receipts/collections
+                  - Fn::Sub: ${ArtifactRootPrefix}/receipts/collections/*
+                  - Fn::Sub: ${ArtifactRootPrefix}/receipts/evaluations
+                  - Fn::Sub: ${ArtifactRootPrefix}/receipts/evaluations/*
+                  - Fn::Sub: ${ArtifactRootPrefix}/receipts/interruption
+                  - Fn::Sub: ${ArtifactRootPrefix}/receipts/interruption/*
+                  - Fn::Sub: ${ArtifactRootPrefix}/receipts/runs
+                  - Fn::Sub: ${ArtifactRootPrefix}/receipts/runs/*
+                  - Fn::Sub: ${ArtifactRootPrefix}/releases
+                  - Fn::Sub: ${ArtifactRootPrefix}/releases/*
+                  - Fn::Sub: ${ArtifactRootPrefix}/snapshots
+                  - Fn::Sub: ${ArtifactRootPrefix}/snapshots/*
+          - Sid: ReadLifecycleArtifacts
             Effect: Allow
             Action:
               - s3:GetObject
               - s3:GetObjectVersion
+            Resource:
+              - Fn::Sub: ${ArtifactBucket.Arn}/${ArtifactRootPrefix}/canaries/*
+              - Fn::Sub: ${ArtifactBucket.Arn}/${ArtifactRootPrefix}/canary-roundtrip/*
+              - Fn::Sub: ${ArtifactBucket.Arn}/${ArtifactRootPrefix}/checkpoints/*
+              - Fn::Sub: ${ArtifactBucket.Arn}/${ArtifactRootPrefix}/collections/*
+              - Fn::Sub: ${ArtifactBucket.Arn}/${ArtifactRootPrefix}/dataset/*
+              - Fn::Sub: ${ArtifactBucket.Arn}/${ArtifactRootPrefix}/environments/*
+              - Fn::Sub: ${ArtifactBucket.Arn}/${ArtifactRootPrefix}/evaluations/*
+              - Fn::Sub: ${ArtifactBucket.Arn}/${ArtifactRootPrefix}/logs/*
+              - Fn::Sub: ${ArtifactBucket.Arn}/${ArtifactRootPrefix}/operations/intents/*
+              - Fn::Sub: ${ArtifactBucket.Arn}/${ArtifactRootPrefix}/operations/*/receipts/*
+              - Fn::Sub: ${ArtifactBucket.Arn}/${ArtifactRootPrefix}/receipts/bootstrap/*
+              - Fn::Sub: ${ArtifactBucket.Arn}/${ArtifactRootPrefix}/receipts/canary/*
+              - Fn::Sub: ${ArtifactBucket.Arn}/${ArtifactRootPrefix}/receipts/checkpoints/*
+              - Fn::Sub: ${ArtifactBucket.Arn}/${ArtifactRootPrefix}/receipts/collections/*
+              - Fn::Sub: ${ArtifactBucket.Arn}/${ArtifactRootPrefix}/receipts/evaluations/*
+              - Fn::Sub: ${ArtifactBucket.Arn}/${ArtifactRootPrefix}/receipts/interruption/*
+              - Fn::Sub: ${ArtifactBucket.Arn}/${ArtifactRootPrefix}/receipts/runs/*
+              - Fn::Sub: ${ArtifactBucket.Arn}/${ArtifactRootPrefix}/releases/*
+              - Fn::Sub: ${ArtifactBucket.Arn}/${ArtifactRootPrefix}/snapshots/*
+          - Sid: WriteControllerPublications
+            Effect: Allow
+            Action:
               - s3:PutObject
             Resource:
-              Fn::Sub: ${ArtifactBucket.Arn}/${ArtifactRootPrefix}/*
+              - Fn::Sub: ${ArtifactBucket.Arn}/${ArtifactRootPrefix}/canaries/*
+              - Fn::Sub: ${ArtifactBucket.Arn}/${ArtifactRootPrefix}/checkpoints/receipts/*
+              - Fn::Sub: ${ArtifactBucket.Arn}/${ArtifactRootPrefix}/checkpoints/sha256/*
+              - Fn::Sub: ${ArtifactBucket.Arn}/${ArtifactRootPrefix}/dataset/*
+              - Fn::Sub: ${ArtifactBucket.Arn}/${ArtifactRootPrefix}/environments/*
+              - Fn::Sub: ${ArtifactBucket.Arn}/${ArtifactRootPrefix}/operations/intents/*
           - Sid: UseDataKeyForObjectsAndEbs
             Effect: Allow
             Action:
@@ -922,7 +1021,19 @@ Resources:
               - s3:PutObject
               - s3:PutObjectTagging
             Resource:
-              Fn::Sub: ${ArtifactBucket.Arn}/${ArtifactRootPrefix}/*
+              - Fn::Sub: ${ArtifactBucket.Arn}/${ArtifactRootPrefix}/canaries/*
+              - Fn::Sub: ${ArtifactBucket.Arn}/${ArtifactRootPrefix}/canary-roundtrip/*
+              - Fn::Sub: ${ArtifactBucket.Arn}/${ArtifactRootPrefix}/checkpoints/*
+              - Fn::Sub: ${ArtifactBucket.Arn}/${ArtifactRootPrefix}/collections/*
+              - Fn::Sub: ${ArtifactBucket.Arn}/${ArtifactRootPrefix}/dataset/*
+              - Fn::Sub: ${ArtifactBucket.Arn}/${ArtifactRootPrefix}/environments/*
+              - Fn::Sub: ${ArtifactBucket.Arn}/${ArtifactRootPrefix}/evaluations/*
+              - Fn::Sub: ${ArtifactBucket.Arn}/${ArtifactRootPrefix}/logs/*
+              - Fn::Sub: ${ArtifactBucket.Arn}/${ArtifactRootPrefix}/operations/*
+              - Fn::Sub: ${ArtifactBucket.Arn}/${ArtifactRootPrefix}/receipts/*
+              - Fn::Sub: ${ArtifactBucket.Arn}/${ArtifactRootPrefix}/releases/*
+              - Fn::Sub: ${ArtifactBucket.Arn}/${ArtifactRootPrefix}/sealed/*
+              - Fn::Sub: ${ArtifactBucket.Arn}/${ArtifactRootPrefix}/snapshots/*
           - Sid: EcrLayerDownloads
             Effect: Allow
             Principal: "*"
