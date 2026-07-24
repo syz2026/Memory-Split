@@ -197,7 +197,7 @@ def _s3_policy_groups(
         "evaluator": resources["EvaluatorRole"]["Properties"]["Policies"][0][
             "PolicyDocument"
         ]["Statement"],
-        "controller": resources["ControllerOperationsPolicy"]["Properties"][
+        "controller": resources["ControllerRole"]["Properties"]["Policies"][0][
             "PolicyDocument"
         ]["Statement"],
         "endpoint": resources["S3Endpoint"]["Properties"]["PolicyDocument"][
@@ -243,6 +243,109 @@ def _assert_exact_s3_statement_allowlist(
                     assert resource["Fn::Sub"] != (
                         "${ArtifactBucket.Arn}/${ArtifactRootPrefix}/*"
                     )
+            assert statement["Sid"] in expected_s3
+            assert statement == expected_s3[statement["Sid"]]
+        assert len(observed_s3) == len(expected_s3)
+
+
+def _policy_documents(
+    value: dict[str, object],
+) -> dict[tuple[object, ...], dict[str, object]]:
+    documents: dict[tuple[object, ...], dict[str, object]] = {}
+
+    def visit(node: object, path: tuple[object, ...]) -> None:
+        if isinstance(node, dict):
+            for key, child in node.items():
+                child_path = (*path, key)
+                if key == "KeyPolicy" or str(key).endswith("PolicyDocument"):
+                    assert isinstance(child, dict)
+                    documents[child_path] = child
+                visit(child, child_path)
+        elif isinstance(node, list):
+            for index, child in enumerate(node):
+                visit(child, (*path, index))
+
+    visit(value["Resources"], ("Resources",))
+    return documents
+
+
+def _assert_exact_iam_containers(
+    candidate: dict[str, object],
+    expected: dict[str, object],
+) -> None:
+    candidate_resources = candidate["Resources"]
+    expected_resources = expected["Resources"]
+    candidate_iam = {
+        name: resource
+        for name, resource in candidate_resources.items()
+        if resource["Type"].startswith("AWS::IAM::")
+    }
+    expected_iam = {
+        name: resource
+        for name, resource in expected_resources.items()
+        if resource["Type"].startswith("AWS::IAM::")
+    }
+    assert {
+        name: resource["Type"] for name, resource in candidate_iam.items()
+    } == {name: resource["Type"] for name, resource in expected_iam.items()}
+    for name, expected_resource in expected_iam.items():
+        actual = candidate_iam[name]
+        if actual["Type"] == "AWS::IAM::Role":
+            actual_properties = actual["Properties"]
+            expected_properties = expected_resource["Properties"]
+            assert "PermissionsBoundary" not in actual_properties
+            assert actual_properties.get("ManagedPolicyArns") == (
+                expected_properties.get("ManagedPolicyArns")
+            )
+            assert [
+                policy["PolicyName"]
+                for policy in actual_properties.get("Policies", [])
+            ] == [
+                policy["PolicyName"]
+                for policy in expected_properties.get("Policies", [])
+            ]
+        elif actual["Type"] == "AWS::IAM::InstanceProfile":
+            assert actual["Properties"] == expected_resource["Properties"]
+
+
+def _assert_whole_template_policy_containers(
+    candidate: dict[str, object],
+    expected: dict[str, object],
+) -> None:
+    _assert_exact_iam_containers(candidate, expected)
+    expected_documents = _policy_documents(expected)
+    observed_documents = _policy_documents(candidate)
+    assert set(observed_documents) == set(expected_documents)
+    for path, document in observed_documents.items():
+        expected_document = expected_documents[path]
+        statements = document["Statement"]
+        expected_statements = expected_document["Statement"]
+        expected_s3 = {
+            statement["Sid"]: statement
+            for statement in expected_statements
+            if any(
+                action == "*" or action.lower().startswith("s3:")
+                for action in _action_set(statement)
+            )
+        }
+        observed_s3: list[dict[str, object]] = []
+        for statement in statements:
+            assert "NotAction" not in statement
+            assert "NotResource" not in statement
+            actions = _action_set(statement)
+            wildcard_actions = {action for action in actions if "*" in action}
+            if wildcard_actions:
+                assert statement in expected_statements
+            s3_actions = {
+                action
+                for action in actions
+                if action == "*" or action.lower().startswith("s3:")
+            }
+            if not s3_actions:
+                continue
+            observed_s3.append(statement)
+            assert all("*" not in action for action in s3_actions)
+            assert statement["Resource"] != "*"
             assert statement["Sid"] in expected_s3
             assert statement == expected_s3[statement["Sid"]]
         assert len(observed_s3) == len(expected_s3)
@@ -570,6 +673,192 @@ def test_roles_are_separate_and_only_signer_can_sign_approvals(template):
     }
 
 
+def test_iam_policy_containers_and_attachments_are_exact(template):
+    resources = template["Resources"]
+    iam_resources = {
+        name: resource["Type"]
+        for name, resource in resources.items()
+        if resource["Type"].startswith("AWS::IAM::")
+    }
+    assert iam_resources == {
+        "ControllerRole": "AWS::IAM::Role",
+        "EvaluatorRole": "AWS::IAM::Role",
+        "SignerRole": "AWS::IAM::Role",
+        "TrainInstanceProfile": "AWS::IAM::InstanceProfile",
+        "TrainRole": "AWS::IAM::Role",
+    }
+    expected_policies = {
+        "TrainRole": ["TrainArtifactData"],
+        "EvaluatorRole": ["EvaluatorArtifacts"],
+        "ControllerRole": ["ControllerOperations"],
+        "SignerRole": ["SignApprovals"],
+    }
+    for role_name, policy_names in expected_policies.items():
+        properties = resources[role_name]["Properties"]
+        assert [policy["PolicyName"] for policy in properties["Policies"]] == (
+            policy_names
+        )
+        assert "PermissionsBoundary" not in properties
+        if role_name == "TrainRole":
+            assert properties["ManagedPolicyArns"] == [
+                {
+                    "Fn::Sub": (
+                        "arn:${AWS::Partition}:iam::aws:policy/"
+                        "AmazonSSMManagedInstanceCore"
+                    )
+                }
+            ]
+        else:
+            assert "ManagedPolicyArns" not in properties
+    assert resources["TrainInstanceProfile"]["Properties"] == {
+        "Roles": [{"Ref": "TrainRole"}]
+    }
+
+
+def test_whole_template_policy_inventory_accepts_only_reviewed_documents(
+    template,
+):
+    _assert_whole_template_policy_containers(template, copy.deepcopy(template))
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "external-iam-policy",
+        "managed-policy-resource",
+        "extra-role",
+        "train-managed-policy",
+        "evaluator-managed-policy",
+        "controller-managed-policy",
+        "extra-inline-policy",
+        "extra-instance-profile",
+        "unexpected-iam-user",
+        "sns-topic-policy",
+        "second-bucket-policy",
+        "custom-policy-document",
+        "nested-policy-document",
+        "kms-s3-statement",
+        "trust-s3-statement",
+    ],
+)
+def test_whole_template_policy_inventory_rejects_every_container_bypass(
+    template,
+    case,
+):
+    expected = copy.deepcopy(template)
+    candidate = copy.deepcopy(template)
+    resources = candidate["Resources"]
+    injected_s3 = {
+        "Version": "2012-10-17",
+        "Statement": [
+            {
+                "Sid": "InjectedS3Access",
+                "Effect": "Allow",
+                "Action": "s3:GetObject",
+                "Resource": "*",
+            }
+        ],
+    }
+    if case == "external-iam-policy":
+        resources["InjectedPolicy"] = {
+            "Type": "AWS::IAM::Policy",
+            "Properties": {
+                "PolicyName": "Injected",
+                "Roles": [{"Ref": "TrainRole"}],
+                "PolicyDocument": injected_s3,
+            },
+        }
+    elif case == "managed-policy-resource":
+        resources["InjectedManagedPolicy"] = {
+            "Type": "AWS::IAM::ManagedPolicy",
+            "Properties": {
+                "ManagedPolicyName": "Injected",
+                "PolicyDocument": injected_s3,
+                "Roles": [{"Ref": "TrainRole"}],
+            },
+        }
+    elif case == "extra-role":
+        resources["InjectedRole"] = {
+            "Type": "AWS::IAM::Role",
+            "Properties": {
+                "AssumeRolePolicyDocument": {
+                    "Version": "2012-10-17",
+                    "Statement": [],
+                }
+            },
+        }
+    elif case == "train-managed-policy":
+        resources["TrainRole"]["Properties"]["ManagedPolicyArns"].append(
+            "arn:aws:iam::aws:policy/AmazonS3FullAccess"
+        )
+    elif case in {"evaluator-managed-policy", "controller-managed-policy"}:
+        role = (
+            "EvaluatorRole"
+            if case == "evaluator-managed-policy"
+            else "ControllerRole"
+        )
+        resources[role]["Properties"]["ManagedPolicyArns"] = [
+            "arn:aws:iam::aws:policy/AmazonS3ReadOnlyAccess"
+        ]
+    elif case == "extra-inline-policy":
+        resources["SignerRole"]["Properties"]["Policies"].append(
+            {
+                "PolicyName": "Injected",
+                "PolicyDocument": injected_s3,
+            }
+        )
+    elif case == "extra-instance-profile":
+        resources["InjectedProfile"] = {
+            "Type": "AWS::IAM::InstanceProfile",
+            "Properties": {"Roles": [{"Ref": "EvaluatorRole"}]},
+        }
+    elif case == "unexpected-iam-user":
+        resources["InjectedUser"] = {
+            "Type": "AWS::IAM::User",
+            "Properties": {},
+        }
+    elif case == "sns-topic-policy":
+        resources["InjectedTopicPolicy"] = {
+            "Type": "AWS::SNS::TopicPolicy",
+            "Properties": {
+                "Topics": [],
+                "PolicyDocument": injected_s3,
+            },
+        }
+    elif case == "second-bucket-policy":
+        resources["InjectedBucketPolicy"] = {
+            "Type": "AWS::S3::BucketPolicy",
+            "Properties": {
+                "Bucket": {"Ref": "ArtifactBucket"},
+                "PolicyDocument": injected_s3,
+            },
+        }
+    elif case == "custom-policy-document":
+        resources["InjectedCarrier"] = {
+            "Type": "Custom::PolicyCarrier",
+            "Properties": {"PolicyDocument": injected_s3},
+        }
+    elif case == "nested-policy-document":
+        resources["Vpc"]["Properties"]["Injected"] = {
+            "PolicyDocument": injected_s3
+        }
+    elif case in {"kms-s3-statement", "trust-s3-statement"}:
+        statement = injected_s3["Statement"][0]
+        if case == "kms-s3-statement":
+            resources["DataKey"]["Properties"]["KeyPolicy"][
+                "Statement"
+            ].append(statement)
+        else:
+            resources["TrainRole"]["Properties"][
+                "AssumeRolePolicyDocument"
+            ]["Statement"].append(statement)
+    else:
+        raise AssertionError(f"unknown policy-container mutation: {case}")
+
+    with pytest.raises((AssertionError, KeyError, TypeError)):
+        _assert_whole_template_policy_containers(candidate, expected)
+
+
 def test_controller_covers_rendered_calls_without_unrendered_instance_mutations(
     template,
 ):
@@ -608,16 +897,11 @@ def test_controller_ebs_kms_permissions_are_exact_and_grant_is_constrained(
     template,
 ):
     resources = template["Resources"]
-    controller_policy = resources["ControllerOperationsPolicy"]
-    assert controller_policy["Type"] == "AWS::IAM::Policy"
-    assert controller_policy["Properties"]["Roles"] == [
-        {"Ref": "ControllerRole"}
-    ]
+    controller_policy = resources["ControllerRole"]["Properties"]["Policies"][0]
+    assert controller_policy["PolicyName"] == "ControllerOperations"
     statements = {
         statement["Sid"]: statement
-        for statement in controller_policy["Properties"]["PolicyDocument"][
-            "Statement"
-        ]
+        for statement in controller_policy["PolicyDocument"]["Statement"]
     }
     expected_use_actions = {
         "kms:Decrypt",
@@ -646,15 +930,31 @@ def test_controller_ebs_kms_permissions_are_exact_and_grant_is_constrained(
     key_use = key_statements["AllowControllerDataAndEbsUse"]
     assert set(key_use["Action"]) == expected_use_actions
     assert key_use["Principal"] == {
-        "AWS": {"Fn::GetAtt": ["ControllerRole", "Arn"]}
+        "AWS": {
+            "Fn::Sub": (
+                "arn:${AWS::Partition}:iam::${AWS::AccountId}:root"
+            )
+        }
+    }
+    assert key_use["Condition"] == {
+        "StringEquals": {
+            "aws:PrincipalTag/memorysplit:role": "controller"
+        }
     }
     key_grant = key_statements["AllowControllerEbsGrant"]
     assert key_grant["Action"] == "kms:CreateGrant"
     assert key_grant["Principal"] == {
-        "AWS": {"Fn::GetAtt": ["ControllerRole", "Arn"]}
+        "AWS": {
+            "Fn::Sub": (
+                "arn:${AWS::Partition}:iam::${AWS::AccountId}:root"
+            )
+        }
     }
     assert key_grant["Condition"] == {
-        "Bool": {"kms:GrantIsForAWSResource": "true"}
+        "Bool": {"kms:GrantIsForAWSResource": "true"},
+        "StringEquals": {
+            "aws:PrincipalTag/memorysplit:role": "controller"
+        },
     }
     assert not {
         "kms:CreateGrant*",
@@ -1367,7 +1667,6 @@ def test_cfn_guard_required_resources_and_role_policies_are_non_vacuous():
         "TrainRole",
         "EvaluatorRole",
         "ControllerRole",
-        "ControllerOperationsPolicy",
         "SignerRole",
         "TrainInstanceProfile",
     ):
@@ -1394,5 +1693,9 @@ def test_cfn_guard_required_resources_and_role_policies_are_non_vacuous():
         "NotResource !exists",
         "train_all_s3_statements",
         "endpoint_all_s3_statements",
+        "rule exact_iam_policy_containers",
+        "count(%iam_resources)",
+        "AWS::IAM::ManagedPolicy",
+        "unexpected_nested_policy_containers",
     ):
         assert policy_invariant in guard
