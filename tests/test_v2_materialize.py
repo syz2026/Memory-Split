@@ -680,6 +680,61 @@ def test_wikidata_index_materializes_selected_training_triples_once(tmp_path):
     resumed.close()
 
 
+def test_wikidata_graph_next_group_uses_ordered_index_seeks():
+    connection = sqlite3.connect(":memory:")
+    connection.execute(
+        """
+        CREATE TABLE triples (
+            ordinal INTEGER PRIMARY KEY,
+            subject INTEGER NOT NULL,
+            relation INTEGER NOT NULL,
+            target INTEGER NOT NULL
+        )
+        """
+    )
+    connection.execute(
+        "CREATE UNIQUE INDEX triples_address_target "
+        "ON triples(subject, relation, target)"
+    )
+    connection.executemany(
+        "INSERT INTO triples VALUES (?, ?, ?, ?)",
+        (
+            (0, 1, 10, 2),
+            (1, 1, 10, 3),
+            (2, 1, 12, 4),
+            (3, 3, 2, 5),
+        ),
+    )
+
+    class _Index:
+        pass
+
+    index = _Index()
+    index.connection = connection
+    source = _WikidataGraphSource(index)
+
+    assert source._next_group(-1, -1) == (1, 10)
+    assert source._next_group(1, 10) == (1, 12)
+    assert source._next_group(1, 12) == (3, 2)
+    assert source._next_group(3, 2) is None
+
+    plans = (
+        connection.execute(
+            f"EXPLAIN QUERY PLAN {source._NEXT_RELATION_SQL}",
+            (1, 10),
+        ).fetchall(),
+        connection.execute(
+            f"EXPLAIN QUERY PLAN {source._NEXT_SUBJECT_SQL}",
+            (1,),
+        ).fetchall(),
+    )
+    for rows in plans:
+        detail = " ".join(str(row[3]).upper() for row in rows)
+        assert "SEARCH" in detail
+        assert "SCAN" not in detail
+    connection.close()
+
+
 def test_wikidata_graph_pages_each_selected_triple_once_and_resumes(
     monkeypatch,
 ):

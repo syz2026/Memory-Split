@@ -1486,9 +1486,45 @@ def _wikidata_page_segments(
 
 
 class _WikidataGraphSource(_RecordSource):
+    _NEXT_RELATION_SQL = """
+        SELECT subject, relation
+        FROM triples
+        WHERE subject = ? AND relation > ?
+        ORDER BY relation, target
+        LIMIT 1
+    """
+    _NEXT_SUBJECT_SQL = """
+        SELECT subject, relation
+        FROM triples
+        WHERE subject > ?
+        ORDER BY subject, relation, target
+        LIMIT 1
+    """
+
     def __init__(self, index: _WikidataIndex):
         self.index = index
         self.tok = get_tok()
+
+    def _next_group(
+        self,
+        previous_subject: int,
+        previous_relation: int,
+    ) -> tuple[int, int] | None:
+        # Keep both seeks indexable.  Expressing this as one OR/GROUP BY query
+        # makes SQLite scan every preceding address on each call, turning a
+        # linear walk into a quadratic one on the production Wikidata index.
+        group = self.index.connection.execute(
+            self._NEXT_RELATION_SQL,
+            (previous_subject, previous_relation),
+        ).fetchone()
+        if group is None:
+            group = self.index.connection.execute(
+                self._NEXT_SUBJECT_SQL,
+                (previous_subject,),
+            ).fetchone()
+        if group is None:
+            return None
+        return tuple(map(int, group))
 
     def _record(
         self,
@@ -1523,25 +1559,13 @@ class _WikidataGraphSource(_RecordSource):
             else:
                 previous_subject = int(state.get("subject", -1))
                 previous_relation = int(state.get("relation", -1))
-                group = self.index.connection.execute(
-                    """
-                    SELECT subject, relation
-                    FROM triples
-                    WHERE subject > ?
-                       OR (subject = ? AND relation > ?)
-                    GROUP BY subject, relation
-                    ORDER BY subject, relation
-                    LIMIT 1
-                    """,
-                    (
-                        previous_subject,
-                        previous_subject,
-                        previous_relation,
-                    ),
-                ).fetchone()
+                group = self._next_group(
+                    previous_subject,
+                    previous_relation,
+                )
                 if group is None:
                     raise StopIteration
-                subject, relation = map(int, group)
+                subject, relation = group
                 after_target = -1
                 page = 0
 
