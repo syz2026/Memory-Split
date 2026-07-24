@@ -17,7 +17,7 @@
       "path": "cluster/profiles/aws-p6-b300.48xlarge-v3.json",
       "profile_id": "aws-p6-b300.48xlarge-v3",
       "provider": "aws-p6-b300.48xlarge",
-      "sha256": "f22ccf259e30b07b7ad9d848723ad10e59092cbf5ea6e3aceca7a556279ce681"
+      "sha256": "6884cd30670214bcecaa105d32b2b5518b1533d9fdbad6ac15327f9a8b7fefa4"
     }
   ],
   "frozen_contract": {

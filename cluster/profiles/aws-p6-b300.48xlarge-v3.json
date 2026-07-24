@@ -38,7 +38,7 @@
   ],
   "profile_id": "aws-p6-b300.48xlarge-v3",
   "provider": "aws-p6-b300.48xlarge",
-  "purchase_model": "capacity_block",
+  "purchase_model": "on_demand",
   "runtime": {
     "ami_id_env": "MS_AWS_AMI_ID",
     "container_digest_env": "MS_CONTAINER_DIGEST",
@@ -47,6 +47,14 @@
     "runtime_uid_env": "MS_RUNTIME_UID"
   },
   "schema_version": 1,
+  "software_floors": {
+    "cuda": "13.0",
+    "efa": "1.44.0",
+    "kernel": "6.1",
+    "nvidia_driver": "R580",
+    "nvlink": "R580",
+    "ofi_nccl": "1.17.1"
+  },
   "storage": {
     "durable_uri_env": "MS_S3_ROOT",
     "instance_store": {

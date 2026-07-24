@@ -2,15 +2,20 @@
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
+import os
 import re
+import stat
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Mapping
 from urllib.parse import urlsplit
 
 from msctl.aws_contracts import validate_digest_pinned_oci_image
+from msctl.errors import MsctlError
+from msctl.fsutil import open_directory
 
 
 P5_PROFILE_ID = "aws-p5.48xlarge"
@@ -84,6 +89,7 @@ class _ProfileContract:
     assigned_seeds: tuple[int, ...]
     allowed_regions: tuple[str, ...]
     allowed_availability_zones: tuple[str, ...]
+    software_floors: tuple[tuple[str, str], ...] = ()
     extended_location_fields: bool = False
 
 
@@ -121,7 +127,7 @@ _PROFILE_CONTRACTS = (
         profile_id=P6_PROFILE_ID_V3,
         provider="aws-p6-b300.48xlarge",
         instance_type="p6-b300.48xlarge",
-        purchase_model="capacity_block",
+        purchase_model="on_demand",
         architecture="x86_64",
         vcpus=192,
         memory_gib=4096,
@@ -129,6 +135,14 @@ _PROFILE_CONTRACTS = (
         assigned_seeds=tuple(range(10)),
         allowed_regions=("us-east-1",),
         allowed_availability_zones=("us-east-1d",),
+        software_floors=(
+            ("cuda", "13.0"),
+            ("efa", "1.44.0"),
+            ("kernel", "6.1"),
+            ("nvidia_driver", "R580"),
+            ("nvlink", "R580"),
+            ("ofi_nccl", "1.17.1"),
+        ),
         extended_location_fields=True,
     ),
 )
@@ -143,7 +157,6 @@ class AwsGpuProfile:
     provider: str
     instance_type: str
     purchase_model: str
-    architecture: str
     vcpus: int
     memory_gib: int
     gpu_model: str
@@ -162,9 +175,11 @@ class AwsGpuProfile:
     runtime_gid_env: str
     assigned_seeds: tuple[int, ...]
     process_env_allowlist: tuple[str, ...]
-    allowed_regions: tuple[str, ...]
-    allowed_availability_zones: tuple[str, ...]
     sha256: str
+    architecture: str = "x86_64"
+    allowed_regions: tuple[str, ...] = ()
+    allowed_availability_zones: tuple[str, ...] = ()
+    software_floors: tuple[tuple[str, str], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -237,7 +252,7 @@ def _profile_contract(value: object) -> tuple[dict[str, object], _ProfileContrac
         )
     fields = _BASE_ROOT_FIELDS
     if contract.extended_location_fields:
-        fields = fields | {"offerings"}
+        fields = fields | {"offerings", "software_floors"}
     return _object(value, fields=fields, label="profile"), contract
 
 
@@ -420,6 +435,17 @@ def _parse_profile(raw: object, *, sha256: str) -> AwsGpuProfile:
             contract.allowed_availability_zones[0],
             label="profile.offerings[0].availability_zone",
         )
+        software_floors = _object(
+            value["software_floors"],
+            fields=frozenset(dict(contract.software_floors)),
+            label="profile.software_floors",
+        )
+        for name, expected in contract.software_floors:
+            _exact_string(
+                software_floors[name],
+                expected,
+                label=f"profile.software_floors.{name}",
+            )
 
     return AwsGpuProfile(
         schema_version=schema_version,
@@ -449,6 +475,7 @@ def _parse_profile(raw: object, *, sha256: str) -> AwsGpuProfile:
         allowed_regions=contract.allowed_regions,
         allowed_availability_zones=contract.allowed_availability_zones,
         sha256=sha256,
+        software_floors=contract.software_floors,
     )
 
 
@@ -472,15 +499,107 @@ def parse_aws_gpu_profile_bytes(data: bytes) -> AwsGpuProfile:
     return _parse_profile(raw, sha256=hashlib.sha256(data).hexdigest())
 
 
+def _file_identity(metadata: os.stat_result) -> tuple[int, ...]:
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_mode,
+        metadata.st_nlink,
+        metadata.st_uid,
+        metadata.st_gid,
+        metadata.st_size,
+        metadata.st_mtime_ns,
+        metadata.st_ctime_ns,
+    )
+
+
+def read_secure_regular_file(
+    path: Path | str,
+    *,
+    label: str,
+    max_bytes: int,
+    private: bool = False,
+) -> bytes:
+    """Read one descriptor-pinned owned file without path replacement."""
+
+    if type(max_bytes) is not int or max_bytes <= 0:
+        raise ValueError("secure file byte limit must be a positive integer")
+    candidate = Path(path)
+    name = candidate.name
+    if not name or name in {".", ".."}:
+        raise ValueError(f"{label} path is invalid")
+    try:
+        parent_fd = open_directory(candidate.parent, label=f"{label} parent")
+    except (MsctlError, OSError) as error:
+        raise ValueError(f"{label} parent path is unsafe") from error
+    descriptor: int | None = None
+    try:
+        descriptor = os.open(
+            name,
+            os.O_RDONLY
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_CLOEXEC", 0),
+            dir_fd=parent_fd,
+        )
+        before = os.fstat(descriptor)
+        mode = stat.S_IMODE(before.st_mode)
+        if not stat.S_ISREG(before.st_mode):
+            raise ValueError(f"{label} must be a regular file")
+        if before.st_nlink != 1:
+            raise ValueError(f"{label} must have exactly one link")
+        if before.st_uid != os.geteuid():
+            raise ValueError(f"{label} owner must be the current user")
+        if mode & stat.S_IRUSR == 0:
+            raise ValueError(f"{label} mode must permit owner reads")
+        if private:
+            if mode & 0o077:
+                raise ValueError(f"{label} mode must be private")
+        elif mode & 0o022:
+            raise ValueError(f"{label} must not be group or other writable")
+        if before.st_size > max_bytes:
+            raise ValueError(f"{label} exceeds its byte limit")
+
+        chunks: list[bytes] = []
+        total = 0
+        while True:
+            chunk = os.read(descriptor, min(1024 * 1024, max_bytes + 1 - total))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            total += len(chunk)
+            if total > max_bytes:
+                raise ValueError(f"{label} exceeds its byte limit")
+        after = os.fstat(descriptor)
+        path_after = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        if (
+            _file_identity(before) != _file_identity(after)
+            or _file_identity(after) != _file_identity(path_after)
+            or total != after.st_size
+        ):
+            raise ValueError(f"{label} changed or was replaced during read")
+        return b"".join(chunks)
+    except FileNotFoundError as error:
+        raise ValueError(f"{label} is not a regular file") from error
+    except OSError as error:
+        if error.errno == errno.ELOOP:
+            raise ValueError(f"{label} must not be a symlink") from error
+        raise ValueError(f"{label} could not be read safely") from error
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+        os.close(parent_fd)
+
+
 def load_aws_gpu_profile(path: Path | str) -> AwsGpuProfile:
     """Load one regular JSON file under a closed AWS GPU profile identity."""
 
-    profile_path = Path(path)
-    if profile_path.is_symlink():
-        raise ValueError(f"profile must not be a symlink: {profile_path}")
-    if not profile_path.is_file():
-        raise ValueError(f"profile is not a regular file: {profile_path}")
-    return parse_aws_gpu_profile_bytes(profile_path.read_bytes())
+    return parse_aws_gpu_profile_bytes(
+        read_secure_regular_file(
+            path,
+            label="profile",
+            max_bytes=_MAX_PROFILE_BYTES,
+        )
+    )
 
 
 def _required_environment(
@@ -600,5 +719,6 @@ __all__ = [
     "P6_PROFILE_ID_V3",
     "load_aws_gpu_profile",
     "parse_aws_gpu_profile_bytes",
+    "read_secure_regular_file",
     "validate_runtime_environment",
 ]
