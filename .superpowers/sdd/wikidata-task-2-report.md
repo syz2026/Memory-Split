@@ -742,6 +742,163 @@ The unrelated pre-existing full-suite failures recorded earlier remain outside
 this task's ownership. All requested focused, source-lock, compilation, and
 diff gates are green.
 
+## Identity-aware quarantine-marker detach closure
+
+Status: `DONE_WITH_CONCERNS`
+
+Implementation commit:
+`ad300c7497a1f2c1d9421c5f1db4ab2bc7ebd858` —
+`fix: detach Wikidata quarantine markers safely`.
+
+### Remaining race addressed
+
+1. Quarantine-marker cleanup no longer calls `rmdir` on a checked pathname.
+   It atomically moves the current source-name entry to a unique
+   `.orphan-marker-*` name with no-replace rename before deciding what moved.
+2. If the moved entry matches the retained marker descriptor and creation
+   identity, the parent is fsynced, the same descriptor/name binding is
+   rechecked, and the owner-only marker remains retained at the orphan name.
+   The final content-addressed name is therefore absent after exact detach.
+3. If a substituted owner-only directory moved, the implementation opens and
+   identity-pins that moved directory, restores it to the source name with
+   no-replace rename, verifies the restored descriptor/name binding before and
+   after parent fsync, closes the temporary descriptor exhaustively, and
+   retries only a fixed number of times.
+4. Fresh-marker allocation, post-allocation bind failure, retired-marker
+   release, successful publication, winner reuse, and failed-candidate
+   exchange all use the same no-delete detach path.
+5. One shared `_QuarantineOrphanBudget` follows marker rotations and is
+   installed before allocation validation. Cleanup may retain at most seven
+   orphan markers and reserves the eighth slot for the marker exchanged out of
+   the final name. Once the reserve is reached, no additional fresh marker is
+   allocated; an exact entry that cannot be detached is left in place.
+
+### TDD evidence
+
+The final-name substitution test and the strengthened repeated fresh-bind
+stress test were written before the detach implementation.
+
+Direct RED command:
+
+```bash
+python -m pytest -q \
+  tests/test_reasoning_v2_wikidata_source.py::test_repeated_fresh_marker_bind_failures_keep_resources_bounded \
+  tests/test_reasoning_v2_wikidata_source.py::test_marker_detach_restores_substitute_without_rmdir
+```
+
+Exact RED result:
+
+```text
+FF                                                                       [100%]
+2 failed in 1.78s
+```
+
+The existing implementation called marker `rmdir` during repeated fresh-bind
+cleanup, and the final-name race never reached an atomic detach, so its
+substitution hook remained untriggered.
+
+The same selection after implementation:
+
+```text
+..                                                                       [100%]
+2 passed in 0.46s
+```
+
+Self-review then identified that allocation-stage validation failed before the
+active state machine's budget could be attached. A separate shared-budget test
+was added before that production correction.
+
+Direct RED command:
+
+```bash
+python -m pytest -q \
+  tests/test_reasoning_v2_wikidata_source.py::test_quarantine_allocation_failures_share_orphan_budget
+```
+
+Exact RED result:
+
+```text
+F                                                                        [100%]
+1 failed in 0.43s
+```
+
+The failure was the missing shared-budget argument:
+`TypeError: _allocate_quarantine_marker() takes 2 positional arguments but 3 were given`.
+
+The same test after implementation:
+
+```text
+.                                                                        [100%]
+1 passed in 0.36s
+```
+
+### Final verification
+
+```bash
+python -m pytest -q tests/test_reasoning_v2_wikidata_source.py
+```
+
+```text
+........................................................................ [ 92%]
+......                                                                   [100%]
+78 passed in 2.99s
+```
+
+```bash
+python -m pytest -q \
+  tests/test_reasoning_v2_source_lock.py \
+  tests/test_current_sources.py
+```
+
+```text
+........................................................................ [ 64%]
+.......................................                                  [100%]
+111 passed in 15.00s
+```
+
+The first sandboxed regression attempt produced 17 fixture setup failures
+because macOS denied creation of temporary Git hook directories. The exact
+command was rerun outside the filesystem sandbox and passed as shown above.
+No network or AWS access was enabled or used.
+
+```bash
+python -m py_compile \
+  corpusgen/reasoning_v2/wikidata_source.py \
+  tests/test_reasoning_v2_wikidata_source.py
+git diff --check
+```
+
+Both static checks were silent with exit code zero.
+
+### Changed files and self-review
+
+- `corpusgen/reasoning_v2/wikidata_source.py`
+- `tests/test_reasoning_v2_wikidata_source.py`
+- `.superpowers/sdd/wikidata-task-2-report.md` (this appendix only)
+- Marker cleanup contains no pathname deletion. The remaining `rmdir` calls
+  remove only descriptor-pinned private build/work directories and are outside
+  the quarantine-marker protocol.
+- The race test moves an empty replacement at the former check/use point,
+  proves the replacement is restored at the final name, proves the failed
+  candidate remains quarantined, proves every recorded marker descriptor is
+  closed, and checks the retained orphan cap. The stress tests cover exact
+  detach (final absent), repeated post-bind failures, allocation-stage
+  failures, close-error preservation, and the seven-plus-one reserve.
+- Detach state is constant-size and performs no corpus-sized reads or
+  collections. External-sort bounds, deterministic output bytes, Task 1
+  interfaces, and schema/format v1 are unchanged.
+- The implementation commit contains exactly the authorized Wikidata
+  module/test files. This report is committed separately. No amend, push,
+  source mutation, AWS operation, network operation, or other worktree edit
+  occurred.
+
+### Concern
+
+The eight-entry cap is per publication/quarantine state-machine invocation.
+Across independent invocations, retained empty owner-only marker directories
+intentionally persist because library-side deletion is forbidden by this
+review closure; any eventual operator reclamation is outside this task.
+
 ## Two-name exchange state-machine closure
 
 Status: `DONE_WITH_CONCERNS`
