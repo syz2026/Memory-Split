@@ -472,3 +472,136 @@ Both static checks were silent with exit code zero.
 The unrelated pre-existing full-suite failures recorded earlier remain outside
 this task's ownership. All requested focused, Task 1/source-lock, compilation,
 and diff checks are green.
+
+## Final review closure
+
+Status: `DONE_WITH_CONCERNS`
+
+Implementation commit:
+`df5f60bcfffb7cccd1f6f5955c4945aafdef7548` —
+`fix: make Wikidata publication transactional`.
+
+### Final findings addressed
+
+1. Initial-run and merge-output writers now accumulate expected byte count and
+   SHA-256 directly from each successfully written header, key, and payload.
+   `_finalize_run` hashes the pinned output descriptor and requires those
+   observed values to equal the independently accumulated expectation before
+   registering `_SortRun` authority. It never promotes an observed post-write
+   hash into the expected authority.
+2. Publication allocates and retains an empty mode-0700 quarantine marker
+   directory and descriptor before rename. Failure quarantine atomically
+   exchanges the final and marker names with descriptor-relative Linux
+   `renameat2(RENAME_EXCHANGE)`; macOS tests use the equivalent
+   descriptor-relative `renameatx_np(RENAME_SWAP)`.
+3. After exchange, both names are bound to retained descriptors: the quarantine
+   name must be the exact published root and the final name must be the exact
+   marker. A mismatch triggers a second atomic exchange, then verifies that the
+   entry actually swapped out of the final name is restored and that the marker
+   is back under its retained name. A race-substituted winner is preserved.
+4. A correct exchange removes only the descriptor-bound empty marker at the
+   final name and fsyncs the namespace, leaving the failed root under the
+   owner-only quarantine name and the content-addressed final name absent.
+5. Rename success, the first parent fsync, retained-root binding, full
+   postpublication verification, and marker retirement are one guarded
+   transaction. The terminal `published` state is set only after they succeed.
+   Any prior failure, including the parent fsync, invokes exchange quarantine.
+6. Initial-run writer teardown and all archive-authority teardown now use the
+   exhaustive close helper. Every close is attempted, body errors remain
+   primary, and close errors are surfaced only after all descriptors have been
+   attempted or attached as notes.
+
+### Final-review TDD evidence
+
+Five named tests were added before production changes; the run-finalization
+test is parameterized over initial and merge outputs, producing six cases.
+
+Direct RED selection:
+
+```bash
+python -m pytest -q tests/test_reasoning_v2_wikidata_source.py \
+  -k 'run_mutation_before_finalization or run_writer_close_failure or \
+archive_teardown_attempts_all or postrename_fsync_failure or \
+quarantine_exchange_race'
+```
+
+Exact RED result:
+
+```text
+FFFFFF                                                                   [100%]
+6 failed, 61 deselected in 0.91s
+```
+
+Both pre-finalization mutations were accepted, the run-writer hooks did not
+fire, archive close injection was bypassed, postrename fsync happened outside
+the guarded hook window, and the pre-exchange winner substitution hook never
+ran.
+
+The same direct selection after implementation:
+
+```text
+......                                                                   [100%]
+6 passed, 61 deselected in 0.44s
+```
+
+### Final-review verification
+
+```bash
+python -m pytest -q tests/test_reasoning_v2_wikidata_source.py
+```
+
+```text
+...................................................................      [100%]
+67 passed in 2.58s
+```
+
+```bash
+python -m pytest -q \
+  tests/test_reasoning_v2_source_lock.py \
+  tests/test_current_sources.py
+```
+
+```text
+........................................................................ [ 64%]
+.......................................                                  [100%]
+111 passed in 14.55s
+```
+
+The regression command used unrestricted local filesystem execution only
+because its fixtures create temporary Git repositories. No network or AWS
+access was enabled or used.
+
+```bash
+python -m py_compile \
+  corpusgen/reasoning_v2/wikidata_source.py \
+  tests/test_reasoning_v2_wikidata_source.py
+git diff --check
+```
+
+Both static checks were silent with exit code zero.
+
+### Final-review bounded-memory and self-review
+
+- Expected run authority is updated incrementally from bounded record parts;
+  final verification still hashes in fixed 1 MiB chunks. No corpus-sized
+  payload or run is retained in memory.
+- External-sort chunk, record, pending-level, and merge-fan-in bounds and all
+  deterministic stream, index, receipt, and content-address bytes are
+  unchanged.
+- Exchange quarantine has no check-then-rename decision: the atomic swap occurs
+  first, retained descriptor identities adjudicate what moved, and a wrong
+  swap is atomically reversed before reporting failure.
+- Successful builds remove the still-empty retained marker; failed exact-root
+  builds retain only the quarantined root; substituted-winner failures restore
+  the winner and remove the marker without deleting either candidate.
+- Public Task 1/Task 2 signatures and schema/format v1 remain unchanged.
+- Commit scope before this appendix contained exactly the two authorized
+  Wikidata implementation/test files. This appendix is the only report change.
+  No amend, push, source mutation, AWS operation, network operation, or other
+  worktree edit occurred.
+
+### Final concern
+
+The unrelated pre-existing full-suite failures recorded earlier remain outside
+this task's ownership. All requested focused, source-lock, compilation, and
+diff checks are green.
