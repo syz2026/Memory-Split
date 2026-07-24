@@ -4307,42 +4307,69 @@ class AwsP5Backend:
             state["prior_command_ids"] = list(prior_command_ids or [])
         return state
 
+    def _canonical_paired_state_inputs(
+        self,
+        manifest: object,
+        states: Sequence[dict[str, object]],
+    ) -> list[dict[str, object]]:
+        manifest_runs = tuple(getattr(manifest, "runs", ()))
+        supplied = tuple(states)
+        manifest_run_ids = [
+            getattr(run, "run_id", None) for run in manifest_runs
+        ]
+        manifest_arms = [getattr(run, "arm", None) for run in manifest_runs]
+        supplied_run_ids = [
+            state.get("run_id") if isinstance(state, dict) else None
+            for state in supplied
+        ]
+        supplied_arms = [
+            state.get("arm") if isinstance(state, dict) else None
+            for state in supplied
+        ]
+        if (
+            getattr(manifest, "provider", None) != AWS_P5_PROFILE
+            or len(manifest_runs) != 2
+            or any(not isinstance(run_id, str) for run_id in manifest_run_ids)
+            or len(set(manifest_run_ids)) != 2
+            or manifest_arms.count("dense") != 1
+            or manifest_arms.count("split90") != 1
+            or len(supplied) != 2
+            or any(not isinstance(state, dict) for state in supplied)
+            or any(not isinstance(run_id, str) for run_id in supplied_run_ids)
+            or len(set(supplied_run_ids)) != 2
+            or supplied_arms.count("dense") != 1
+            or supplied_arms.count("split90") != 1
+            or set(supplied_run_ids) != set(manifest_run_ids)
+        ):
+            raise MsctlError(
+                "STATE_CORRUPT",
+                "AWS pair update must bind exactly two unique manifest runs",
+            )
+        state_by_id = {
+            str(state["run_id"]): state for state in supplied
+        }
+        if not all(
+            self._same_state_binding(state, manifest)
+            for state in state_by_id.values()
+        ):
+            raise MsctlError(
+                "STATE_CORRUPT",
+                "AWS pair update has invalid manifest provenance",
+            )
+        return [
+            dict(state_by_id[str(run_id)]) for run_id in manifest_run_ids
+        ]
+
     def _write_paired_states(
         self,
         store: StateStore,
         manifest: object,
         states: Sequence[dict[str, object]],
     ) -> None:
-        manifest_runs = {
-            run.run_id: run
-            for run in manifest.runs
-            if isinstance(run.run_id, str)
-        }
-        state_by_id = {
-            str(state.get("run_id")): state
-            for state in states
-            if isinstance(state, dict)
-            and isinstance(state.get("run_id"), str)
-        }
-        if (
-            getattr(manifest, "provider", None) != AWS_P5_PROFILE
-            or len(manifest_runs) != 2
-            or {run.arm for run in manifest_runs.values()}
-            != {"dense", "split90"}
-            or len(state_by_id) != 2
-            or set(state_by_id) != set(manifest_runs)
-            or not all(
-                self._same_state_binding(state, manifest)
-                for state in state_by_id.values()
-            )
-        ):
-            raise MsctlError(
-                "STATE_CORRUPT",
-                "AWS pair update must bind the exact manifest run set",
-            )
-        ordered_states = [
-            dict(state_by_id[run.run_id]) for run in manifest.runs
-        ]
+        ordered_states = self._canonical_paired_state_inputs(
+            manifest,
+            states,
+        )
         operation_ids = {state.get("operation_id") for state in ordered_states}
         if (
             len(operation_ids) != 1
@@ -4386,28 +4413,17 @@ class AwsP5Backend:
                 "STATE_CORRUPT",
                 "AWS pair refresh contains unsupported fields",
             )
-        manifest_run_ids = {run.run_id for run in manifest.runs}
+        canonical_states = self._canonical_paired_state_inputs(
+            manifest,
+            states,
+        )
         state_by_id = {
-            str(state.get("run_id")): state
-            for state in states
-            if isinstance(state, dict)
+            str(state["run_id"]): state for state in canonical_states
         }
-        if (
-            len(manifest_run_ids) != 2
-            or len(state_by_id) != 2
-            or set(state_by_id) != manifest_run_ids
-            or not all(
-                self._same_state_binding(state, manifest)
-                for state in state_by_id.values()
-            )
-        ):
-            raise MsctlError(
-                "STATE_INCOMPLETE",
-                "AWS pair refresh does not bind the exact manifest run pair",
-            )
+        manifest_run_ids = tuple(state_by_id)
         current = {
             run_id: store.read_run(run_id)
-            for run_id in sorted(manifest_run_ids)
+            for run_id in manifest_run_ids
         }
         if any(
             current[run_id] is None
@@ -4438,11 +4454,11 @@ class AwsP5Backend:
             all(state.get(field) == value for field, value in updates.items())
             for state in state_by_id.values()
         ):
-            return [dict(state) for state in states]
+            return canonical_states
 
         now = _timestamp()
         refreshed = []
-        for state in states:
+        for state in canonical_states:
             next_state = dict(state)
             next_state.update(updates)
             next_state["updated_at"] = now

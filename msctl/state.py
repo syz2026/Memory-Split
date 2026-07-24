@@ -878,7 +878,10 @@ class StateStore:
             raise MsctlError("UNSAFE_STATE", "invalid run ID for state path")
         return f"{run_id}.json"
 
-    def read_run(self, run_id: str) -> dict[str, object] | None:
+    def _load_run_unchecked(
+        self,
+        run_id: str,
+    ) -> dict[str, object] | None:
         _, runs_fd, _, _ = self._require_locked()
         name = self._run_name(run_id)
         try:
@@ -908,8 +911,31 @@ class StateStore:
             ) from error
         return value
 
+    @staticmethod
+    def _is_aws_v3_run(value: dict[str, object]) -> bool:
+        return (
+            value.get("provider") == _AWS_PROVIDER
+            and value.get("schema_version") == 2
+        )
+
+    def read_run(self, run_id: str) -> dict[str, object] | None:
+        value = self._load_run_unchecked(run_id)
+        if value is None or not self._is_aws_v3_run(value):
+            return value
+        manifest_sha256 = str(value["run_manifest_sha256"])
+        _journal, generation = self._load_aws_v3_generation(
+            manifest_sha256,
+        )
+        if run_id not in generation or generation[run_id] != value:
+            raise MsctlError(
+                "STATE_CORRUPT",
+                "AWS v3 run state conflicts with its pair generation",
+                details={"run_id": run_id},
+            )
+        return generation[run_id]
+
     def write_run(self, run_id: str, value: dict[str, object]) -> None:
-        _, runs_fd, _, _ = self._require_locked()
+        _, runs_fd, _, intents_fd = self._require_locked()
         try:
             _validate_run_state(value, run_id)
         except MsctlError as error:
@@ -917,6 +943,23 @@ class StateStore:
                 "STATE_CORRUPT",
                 "state write schema is invalid",
             ) from error
+        if self._is_aws_v3_run(value):
+            manifest_sha256 = str(value["run_manifest_sha256"])
+            self._require_aws_pair_not_failed(
+                intents_fd,
+                manifest_sha256,
+            )
+            journal = self._load_aws_pair_unchecked(manifest_sha256)
+            if journal is not None:
+                self._load_aws_v3_generation(
+                    manifest_sha256,
+                    journal=journal,
+                )
+            raise MsctlError(
+                "STATE_TRANSACTION_REQUIRED",
+                "AWS v3 run state writes require the paired transaction",
+                details={"run_id": run_id},
+            )
         atomic_write_json_at(
             runs_fd,
             self._run_name(run_id),
@@ -1181,7 +1224,7 @@ class StateStore:
                 "AWS pair intent must contain both exact arms",
             )
 
-    def read_aws_pair(
+    def _load_aws_pair_unchecked(
         self,
         manifest_sha256: str,
     ) -> dict[str, object] | None:
@@ -1204,6 +1247,63 @@ class StateStore:
         self._validate_aws_pair(value, manifest_sha256)
         return value
 
+    def _load_aws_v3_generation(
+        self,
+        manifest_sha256: str,
+        *,
+        journal: dict[str, object] | None = None,
+    ) -> tuple[dict[str, object], dict[str, dict[str, object]]]:
+        current_journal = (
+            self._load_aws_pair_unchecked(manifest_sha256)
+            if journal is None
+            else journal
+        )
+        if current_journal is None:
+            raise MsctlError(
+                "STATE_INCOMPLETE",
+                "AWS v3 run state lacks its pair journal",
+                details={"manifest_sha256": manifest_sha256},
+            )
+        if current_journal.get("schema_version") != 2:
+            raise MsctlError(
+                "STATE_CORRUPT",
+                "AWS v3 run state has the wrong pair journal version",
+                details={"manifest_sha256": manifest_sha256},
+            )
+        expected = {
+            str(state["run_id"]): state
+            for state in current_journal["states"]
+        }
+        generation: dict[str, dict[str, object]] = {}
+        for run_id, expected_state in expected.items():
+            current = self._load_run_unchecked(run_id)
+            if current is None:
+                raise MsctlError(
+                    "STATE_INCOMPLETE",
+                    "AWS v3 pair generation is missing one run file",
+                    details={"run_id": run_id},
+                )
+            if current != expected_state:
+                raise MsctlError(
+                    "STATE_CORRUPT",
+                    "AWS v3 pair generation conflicts with its journal",
+                    details={"run_id": run_id},
+                )
+            generation[run_id] = current
+        return current_journal, generation
+
+    def read_aws_pair(
+        self,
+        manifest_sha256: str,
+    ) -> dict[str, object] | None:
+        value = self._load_aws_pair_unchecked(manifest_sha256)
+        if value is not None and value.get("schema_version") == 2:
+            self._load_aws_v3_generation(
+                manifest_sha256,
+                journal=value,
+            )
+        return value
+
     def write_aws_pair(
         self,
         manifest_sha256: str,
@@ -1212,6 +1312,12 @@ class StateStore:
         _, _, _, intents_fd = self._require_locked()
         self._require_aws_pair_not_failed(intents_fd, manifest_sha256)
         self._validate_aws_pair(value, manifest_sha256)
+        if value.get("schema_version") == 2:
+            raise MsctlError(
+                "STATE_TRANSACTION_REQUIRED",
+                "AWS v3 pair journal writes require the paired transaction",
+                details={"manifest_sha256": manifest_sha256},
+            )
         atomic_write_json_at(
             intents_fd,
             self._aws_pair_name(manifest_sha256),
@@ -1419,6 +1525,7 @@ class StateStore:
         """Install one AWS journal and its two run files as one rollback unit."""
 
         _, runs_fd, _, intents_fd = self._require_locked()
+        self._require_aws_pair_not_failed(intents_fd, manifest_sha256)
         self._validate_aws_pair(value, manifest_sha256)
         state_by_id: dict[str, dict[str, object]] = {}
         for state in states:

@@ -1998,12 +1998,13 @@ def test_schema_two_state_records_receipt_and_object_versions(
     from msctl.state import StateStore
 
     store = StateStore(tmp_path / "state")
-    with store.locked():
+    with store.locked(), pytest.raises(Exception) as caught:
         store.write_run(run.run_id, state)
-        assert store.read_run(run.run_id) == state
+    assert getattr(caught.value, "code", None) == "STATE_TRANSACTION_REQUIRED"
 
 
 def test_v3_partial_paired_state_fails_closed(tmp_path: Path) -> None:
+    from msctl.jsonutil import canonical_json
     from msctl.state import StateStore
     from tests.test_aws_canary import _backend, _case, _load_module
 
@@ -2056,20 +2057,28 @@ def test_v3_partial_paired_state_fails_closed(tmp_path: Path) -> None:
         )
         for run in runs
     ]
-    store = StateStore(tmp_path / "partial-state")
+    state_root = tmp_path / "partial-state"
+    store = StateStore(state_root)
     with store.locked():
-        store.write_aws_pair(
-            manifest.sha256,
-            {
-                "schema_version": 2,
-                "provider": "aws-p5.48xlarge",
-                "run_manifest_sha256": manifest.sha256,
-                "operation_id": intent["operation_id"],
-                "states": states,
-            },
+        journal = {
+            "schema_version": 2,
+            "provider": "aws-p5.48xlarge",
+            "run_manifest_sha256": manifest.sha256,
+            "operation_id": intent["operation_id"],
+            "states": states,
+        }
+        (
+            state_root / "intents" / f"aws-{manifest.sha256}.json"
+        ).write_bytes(canonical_json(journal) + b"\n")
+        (
+            state_root / "runs" / f"{runs[0].run_id}.json"
+        ).write_bytes(
+            canonical_json(states[0]) + b"\n",
         )
-        store.write_run(runs[0].run_id, states[0])
-        with pytest.raises(Exception, match="partial|incomplete"):
+        with pytest.raises(
+            Exception,
+            match="partial|incomplete|missing|generation",
+        ):
             backend._repair_paired_states(store, manifest)
 
 

@@ -237,6 +237,53 @@ def _generation_bytes(fixture) -> dict[Path, bytes]:
     return {path: path.read_bytes() for path in _generation_paths(fixture)}
 
 
+def _induce_unmarked_mixed_generation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    import msctl.aws_p5 as aws_p5
+    import msctl.fsutil as fsutil
+    import msctl.state as state_module
+
+    fixture = _v3_pair(tmp_path)
+    writes = 0
+    original_write = fsutil.atomic_write_at
+    original_open = state_module.os.open
+
+    def fail_install_and_restore(*args, **kwargs):
+        nonlocal writes
+        writes += 1
+        if writes in {3, 5}:
+            raise OSError(f"injected transaction failure {writes}")
+        return original_write(*args, **kwargs)
+
+    def fail_marker_open(path, *args, **kwargs):
+        if str(path).endswith(".rollback-failed"):
+            raise OSError("injected rollback marker failure")
+        return original_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(state_module, "atomic_write_at", fail_install_and_restore)
+    monkeypatch.setattr(state_module.os, "open", fail_marker_open)
+    monkeypatch.setattr(aws_p5, "_timestamp", lambda: "2099-01-02T03:04:05Z")
+    with fixture.store.locked(), pytest.raises(Exception) as caught:
+        fixture.backend._refresh_paired_states(
+            fixture.store,
+            fixture.manifest,
+            copy.deepcopy(fixture.states),
+            {"status": "InProgress"},
+        )
+    assert getattr(caught.value, "code", None) == "STATE_ROLLBACK_FAILED"
+    monkeypatch.setattr(state_module, "atomic_write_at", original_write)
+    monkeypatch.setattr(state_module.os, "open", original_open)
+    marker = (
+        fixture.state_root
+        / "intents"
+        / f"aws-{fixture.manifest.sha256}.rollback-failed"
+    )
+    assert not marker.exists()
+    return fixture
+
+
 def _read_generation(fixture):
     with fixture.store.locked():
         journal = fixture.store.read_aws_pair(fixture.manifest.sha256)
@@ -324,7 +371,74 @@ def test_v3_exact_paired_refresh_does_not_touch_timestamp_inputs_or_bytes(
             {"status": "Pending"},
         )
 
-    assert refreshed == supplied
+    assert len(refreshed) == 2
+    assert [state["run_id"] for state in refreshed] == [
+        run.run_id for run in fixture.manifest.runs
+    ]
+    assert {state["run_id"]: state for state in refreshed} == {
+        state["run_id"]: state for state in supplied
+    }
+    assert supplied == before_supplied
+    assert _generation_bytes(fixture) == before_bytes
+
+
+@pytest.mark.parametrize(
+    "invalid_shape",
+    ["three_inputs", "duplicate_ids", "duplicate_arms"],
+)
+def test_v3_noop_refresh_rejects_noncanonical_inputs_before_timestamp_or_disk(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    invalid_shape: str,
+) -> None:
+    import msctl.aws_p5 as aws_p5
+
+    fixture = _v3_pair(tmp_path)
+    supplied = copy.deepcopy(fixture.states)
+    if invalid_shape == "three_inputs":
+        supplied.append(copy.deepcopy(supplied[0]))
+    elif invalid_shape == "duplicate_ids":
+        supplied = [
+            copy.deepcopy(supplied[0]),
+            copy.deepcopy(supplied[0]),
+        ]
+    else:
+        supplied[1]["arm"] = supplied[0]["arm"]
+    before_supplied = copy.deepcopy(supplied)
+    before_bytes = _generation_bytes(fixture)
+
+    def timestamp_must_not_be_read() -> str:
+        raise AssertionError("invalid no-op input must fail before timestamp")
+
+    monkeypatch.setattr(aws_p5, "_timestamp", timestamp_must_not_be_read)
+    with fixture.store.locked(), pytest.raises(Exception):
+        fixture.backend._refresh_paired_states(
+            fixture.store,
+            fixture.manifest,
+            supplied,
+            {"status": "Pending"},
+        )
+
+    assert supplied == before_supplied
+    assert _generation_bytes(fixture) == before_bytes
+
+
+def test_v3_paired_write_rejects_extra_duplicate_input_before_disk(
+    tmp_path: Path,
+) -> None:
+    fixture = _v3_pair(tmp_path)
+    supplied = copy.deepcopy(fixture.states)
+    supplied.append(copy.deepcopy(supplied[0]))
+    before_supplied = copy.deepcopy(supplied)
+    before_bytes = _generation_bytes(fixture)
+
+    with fixture.store.locked(), pytest.raises(Exception):
+        fixture.backend._write_paired_states(
+            fixture.store,
+            fixture.manifest,
+            supplied,
+        )
+
     assert supplied == before_supplied
     assert _generation_bytes(fixture) == before_bytes
 
@@ -648,6 +762,116 @@ def test_v3_rollback_marker_failure_still_returns_fail_closed_error(
         )
 
     assert getattr(caught.value, "code", None) == "STATE_ROLLBACK_FAILED"
+
+
+def test_v3_unmarked_mixed_generation_blocks_every_read_and_reopen(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from msctl.state import StateStore
+
+    fixture = _induce_unmarked_mixed_generation(tmp_path, monkeypatch)
+
+    with fixture.store.locked():
+        for run in fixture.manifest.runs:
+            with pytest.raises(Exception, match="generation|journal|state"):
+                fixture.store.read_run(run.run_id)
+        with pytest.raises(Exception, match="generation|journal|state"):
+            fixture.store.read_aws_pair(fixture.manifest.sha256)
+
+    reopened = StateStore(fixture.state_root)
+    with reopened.locked():
+        for run in fixture.manifest.runs:
+            with pytest.raises(Exception, match="generation|journal|state"):
+                reopened.read_run(run.run_id)
+        with pytest.raises(Exception, match="generation|journal|state"):
+            reopened.read_aws_pair(fixture.manifest.sha256)
+
+
+@pytest.mark.parametrize("arm", ["dense", "split90"])
+def test_v3_unmarked_mixed_generation_blocks_direct_run_write(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    arm: str,
+) -> None:
+    fixture = _induce_unmarked_mixed_generation(tmp_path, monkeypatch)
+    before = _generation_bytes(fixture)
+    run = next(run for run in fixture.manifest.runs if run.arm == arm)
+    state = next(state for state in fixture.states if state["arm"] == arm)
+
+    with fixture.store.locked(), pytest.raises(
+        Exception,
+        match="generation|journal|transaction|state",
+    ):
+        fixture.store.write_run(run.run_id, copy.deepcopy(state))
+
+    assert _generation_bytes(fixture) == before
+
+
+def test_v3_valid_generation_rejects_all_standalone_writes(
+    tmp_path: Path,
+) -> None:
+    fixture = _v3_pair(tmp_path)
+    before = _generation_bytes(fixture)
+    journal = _journal(fixture, fixture.states)
+
+    with fixture.store.locked():
+        for run, state in zip(
+            fixture.manifest.runs,
+            fixture.states,
+            strict=True,
+        ):
+            with pytest.raises(Exception, match="transaction"):
+                fixture.store.write_run(run.run_id, copy.deepcopy(state))
+        with pytest.raises(Exception, match="transaction"):
+            fixture.store.write_aws_pair(
+                fixture.manifest.sha256,
+                journal,
+            )
+
+    assert _generation_bytes(fixture) == before
+
+
+def test_v3_poison_marker_gates_every_state_entrypoint(tmp_path: Path) -> None:
+    fixture = _v3_pair(tmp_path)
+    marker = (
+        fixture.state_root
+        / "intents"
+        / f"aws-{fixture.manifest.sha256}.rollback-failed"
+    )
+    marker.write_text("rollback uncertain\n")
+
+    with fixture.store.locked():
+        for run, state in zip(
+            fixture.manifest.runs,
+            fixture.states,
+            strict=True,
+        ):
+            with pytest.raises(Exception) as read_error:
+                fixture.store.read_run(run.run_id)
+            assert (
+                getattr(read_error.value, "code", None)
+                == "STATE_ROLLBACK_FAILED"
+            )
+            with pytest.raises(Exception) as write_error:
+                fixture.store.write_run(run.run_id, copy.deepcopy(state))
+            assert (
+                getattr(write_error.value, "code", None)
+                == "STATE_ROLLBACK_FAILED"
+            )
+        with pytest.raises(Exception) as pair_error:
+            fixture.store.read_aws_pair(fixture.manifest.sha256)
+        assert getattr(pair_error.value, "code", None) == "STATE_ROLLBACK_FAILED"
+        with pytest.raises(Exception) as transaction_error:
+            fixture.store.write_aws_pair_transaction(
+                fixture.manifest.sha256,
+                _journal(fixture, fixture.states),
+                copy.deepcopy(fixture.states),
+            )
+        assert (
+            getattr(transaction_error.value, "code", None)
+            == "STATE_ROLLBACK_FAILED"
+        )
 
 
 def test_v3_validates_every_new_state_before_first_install(
