@@ -68,7 +68,6 @@ REQUIRED_FILES = frozenset(
         "scripts/validate_135m_launch.py",
         "tests/test_aws_reasoning_v3.py",
         "tests/test_data.py",
-        "tests/test_slurm_135m.py",
         "tests/test_trainer.py",
     }
 )
@@ -85,6 +84,21 @@ _SECRET_NAMES = (
 
 
 def _source_revision(source_root: Path, *, require_clean: bool) -> str:
+    if not (source_root / ".git").exists():
+        if require_clean:
+            raise ValueError("production AWS releases require a Git checkout")
+        inventory = _packaged_inventory(source_root)
+        receipt = json.loads(_read_source(source_root, "release-receipt.json"))
+        revision = receipt.get("source_revision")
+        if (
+            inventory.get("release-receipt.json")
+            != _sha(_read_source(source_root, "release-receipt.json"))
+            or not isinstance(revision, str)
+            or len(revision) != 40
+            or any(character not in "0123456789abcdef" for character in revision)
+        ):
+            raise ValueError("packaged source revision is invalid")
+        return revision
     revision = _git(source_root, "rev-parse", "--verify", "HEAD").strip()
     if len(revision) != 40:
         raise ValueError("source revision is not a full commit id")
@@ -110,13 +124,49 @@ def _source_revision(source_root: Path, *, require_clean: bool) -> str:
     return revision
 
 
+def _packaged_inventory(source_root: Path) -> dict[str, str]:
+    try:
+        lines = _read_source(source_root, "SHA256SUMS").decode("utf-8").splitlines()
+    except UnicodeDecodeError as error:
+        raise ValueError("packaged checksum inventory is not UTF-8") from error
+    inventory: dict[str, str] = {}
+    for line in lines:
+        digest, separator, path = line.partition("  ")
+        if (
+            separator != "  "
+            or len(digest) != 64
+            or any(character not in "0123456789abcdef" for character in digest)
+        ):
+            raise ValueError("packaged checksum inventory is malformed")
+        _portable_member(path)
+        if path in inventory:
+            raise ValueError("packaged checksum inventory contains duplicate paths")
+        inventory[path] = digest
+    if "release-receipt.json" not in inventory:
+        raise ValueError("packaged checksum inventory omits the release receipt")
+    for path, expected in inventory.items():
+        if _sha(_read_source(source_root, path)) != expected:
+            raise ValueError(f"packaged source checksum differs: {path}")
+    return inventory
+
+
 def source_paths(source_root: Path) -> list[str]:
-    tracked = set(_git(source_root, "ls-files").splitlines())
-    selected = {
-        path
-        for path in tracked
-        if path.endswith(".py") and path.startswith(PYTHON_PREFIXES)
-    } | set(REQUIRED_FILES) | set(role_config_paths("aws-operator"))
+    if (source_root / ".git").exists():
+        tracked = set(_git(source_root, "ls-files").splitlines())
+        selected = {
+            path
+            for path in tracked
+            if path.endswith(".py") and path.startswith(PYTHON_PREFIXES)
+        } | set(REQUIRED_FILES) | set(role_config_paths("aws-operator"))
+    else:
+        selected = set(_packaged_inventory(source_root)) - {
+            "release-receipt.json",
+        }
+    if not REQUIRED_FILES <= selected:
+        raise ValueError(
+            "AWS release source inventory omits required members: "
+            f"{sorted(REQUIRED_FILES - selected)}"
+        )
     missing = [
         path
         for path in sorted(selected)

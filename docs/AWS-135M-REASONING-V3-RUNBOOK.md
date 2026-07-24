@@ -35,6 +35,10 @@ The operator identity needs S3 upload access and ParallelCluster create/update
 permissions. Cluster nodes should use instance roles. Do not put access keys in
 the repository, ZIP, profile, user data, or Slurm exports.
 
+The example head-node role grants read-only access to the frozen corpus and
+release prefixes and write access only to the evidence prefix. Replace each
+`REPLACE` value with the same bucket/prefix identities used below.
+
 Before creating a cluster, confirm regional P-instance vCPU quota and actual
 instance-type offerings. Live quota, capacity, AMI, and GPU canaries cannot be
 validated without an attached AWS identity.
@@ -105,8 +109,9 @@ pcluster create-cluster \
 
 The template uses the `gpu` Slurm queue and P5 by default. To use P5en or P6,
 change the instance type only after checking quota and availability. Keep the
-paired profile's partition equal to the queue name. ParallelCluster 3.15 or
-newer is recommended for automatic multi-NIC EFA configuration.
+paired profile's partition equal to the queue name. EFA and placement groups
+are disabled because every pair is a single-node job; this avoids an
+unnecessary capacity constraint. ParallelCluster 3.15 or newer is recommended.
 
 ## 5. Install and stage on the head node
 
@@ -122,13 +127,14 @@ sha256sum -c SHA256SUMS
 
 python3 -m venv /shared/memorysplit-venv
 /shared/memorysplit-venv/bin/pip install -r requirements.txt
+PYTHON=/shared/memorysplit-venv/bin/python
 
 PREFIX=s3://YOUR-BUCKET/corpus/84142597cebd96e041d47c7c22dd4b42285b71a213b01265728042cb1a8f6fbb
-python -m msctl aws stage-corpus \
+"$PYTHON" -m msctl aws stage-corpus \
   --s3-uri "$PREFIX" \
   --destination /shared/memorysplit-dataset \
   --apply
-python -m msctl aws verify-corpus \
+"$PYTHON" -m msctl aws verify-corpus \
   --dataset-root /shared/memorysplit-dataset
 ```
 
@@ -143,7 +149,7 @@ any divergent existing destination fails closed.
 Start with seed 0:
 
 ```bash
-python -m msctl aws instantiate \
+"$PYTHON" -m msctl aws instantiate \
   --dataset-root /shared/memorysplit-dataset \
   --profile cluster/profiles/aws-p5-p6.example.json \
   --runtime-root /shared/runtime-v3 \
@@ -152,7 +158,19 @@ python -m msctl aws instantiate \
 PAIR=/shared/runtime-v3/pairs/pair-s0.json
 ```
 
-Use `--seeds 0 1 ... 9` only after seed 0 passes every canary.
+Instantiation is additive and no-replace: an identical seed can be requested
+again, while any changed existing runtime file is rejected. After seed 0 passes
+every canary, add the other seeds in the same runtime root:
+
+```bash
+"$PYTHON" -m msctl aws instantiate \
+  --dataset-root /shared/memorysplit-dataset \
+  --profile cluster/profiles/aws-p5-p6.example.json \
+  --runtime-root /shared/runtime-v3 \
+  --out-root /shared/outputs-v3 \
+  --seeds 1 2 3 4 5 6 7 8 9
+PAIRS=(/shared/runtime-v3/pairs/pair-s{0..9}.json)
+```
 
 ## 7. Run and freeze site canaries
 
@@ -160,7 +178,7 @@ Commands dry-run unless `--apply` is present:
 
 ```bash
 for MODE in functional resume throughput; do
-  python -m msctl submit "$PAIR" \
+  "$PYTHON" -m msctl submit "$PAIR" \
     --profile cluster/profiles/aws-p5-p6.example.json \
     --venv-root /shared/memorysplit-venv \
     --mode "$MODE" --apply
@@ -171,7 +189,7 @@ Wait for Slurm completion and inspect `/shared/runtime-v3/evidence`. Freeze the
 measured canaries:
 
 ```bash
-python scripts/build_135m_preflight.py \
+"$PYTHON" scripts/build_135m_preflight.py \
   --cohort-id memorysplit-exploratory-v3-135m-aws-n10 \
   --profile cluster/profiles/aws-p5-p6.example.json \
   --dataset-receipt-sha256 \
@@ -191,28 +209,31 @@ profile, v3 cohort, and virtual corpus receipt.
 ## 8. Train, resume, evaluate, and collect
 
 ```bash
-python -m msctl submit "$PAIR" \
+"$PYTHON" -m msctl submit "${PAIRS[@]}" \
   --profile cluster/profiles/aws-p5-p6.example.json \
   --venv-root /shared/memorysplit-venv \
   --mode protected \
   --preflight /shared/runtime-v3/aws-preflight.json \
   --apply
 
-# Safe after interruption: both arms must share the exact step and cursor.
-python -m msctl resume "$PAIR" \
-  --profile cluster/profiles/aws-p5-p6.example.json \
-  --venv-root /shared/memorysplit-venv \
-  --preflight /shared/runtime-v3/aws-preflight.json \
-  --apply
+# Safe after interruption: both arms of each pair must share the exact step
+# and cursor.
+for PAIR in "${PAIRS[@]}"; do
+  "$PYTHON" -m msctl resume "$PAIR" \
+    --profile cluster/profiles/aws-p5-p6.example.json \
+    --venv-root /shared/memorysplit-venv \
+    --preflight /shared/runtime-v3/aws-preflight.json \
+    --apply
+done
 
-python -m msctl evaluate "$PAIR" \
+"$PYTHON" -m msctl evaluate "${PAIRS[@]}" \
   --profile cluster/profiles/aws-p5-p6.example.json \
   --venv-root /shared/memorysplit-venv \
   --mode protected \
   --preflight /shared/runtime-v3/aws-preflight.json \
   --apply
 
-python -m msctl collect "$PAIR" \
+"$PYTHON" -m msctl collect "${PAIRS[@]}" \
   --evidence-root /shared/runtime-v3/evidence \
   --output /shared/runtime-v3/collection.json
 
@@ -230,12 +251,11 @@ endpoint and must not be reported as confirmatory evidence.
 ## 9. Run package tests
 
 ```bash
-python scripts/generate_aws_reasoning_configs.py
-python -m pytest -q \
+"$PYTHON" scripts/generate_aws_reasoning_configs.py
+"$PYTHON" -m pytest -q \
   tests/test_aws_reasoning_v3.py \
   tests/test_data.py \
-  tests/test_trainer.py \
-  tests/test_slurm_135m.py
+  tests/test_trainer.py
 ```
 
 Do not launch protected runs when any test, corpus verification, or site

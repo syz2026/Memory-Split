@@ -82,7 +82,24 @@ def evaluate_run(run_dir: Path, *, device: str = "auto") -> dict:
     model.load_state_dict(state["model"])
     model.eval()
     target_count = cfg["micro_batch_size"] * model_cfg.ctx
-    boundary_cursor = 7_120_879_616 - target_count // 2
+    token_paths = cfg.get("train_bin")
+    if (
+        not isinstance(token_paths, list)
+        or len(token_paths) != 2
+        or any(not isinstance(path, str) or not path for path in token_paths)
+    ):
+        raise ValueError("reasoning-v3 evaluation requires two packed token segments")
+    base_path = Path(token_paths[0])
+    if (
+        not base_path.is_file()
+        or base_path.is_symlink()
+        or base_path.stat().st_size % 2
+    ):
+        raise ValueError("reasoning-v3 base token segment is missing, unsafe, or invalid")
+    base_target_tokens = base_path.stat().st_size // 2
+    if target_count < 2 or base_target_tokens <= target_count // 2:
+        raise ValueError("reasoning-v3 base segment is too short for boundary evaluation")
+    boundary_cursor = base_target_tokens - target_count // 2
     data = PackedShards(
         cfg["train_bin"],
         cfg["train_mask"],
@@ -110,6 +127,7 @@ def evaluate_run(run_dir: Path, *, device: str = "auto") -> dict:
         raise ValueError("reasoning-v3 boundary evaluation produced non-finite loss")
     return {
         "boundary_cursor": boundary_cursor,
+        "base_target_tokens": base_target_tokens,
         "checkpoint_sha256": _sha256(checkpoint_path),
         "dataset_receipt_sha256": VIRTUAL_RECEIPT_SHA256,
         "evaluation_scope": "operational_integrity_only",

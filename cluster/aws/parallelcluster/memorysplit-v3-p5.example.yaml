@@ -21,6 +21,9 @@ HeadNode:
         KeyName: corpus/REPLACE/*
         EnableWriteAccess: false
       - BucketName: memorysplit-REPLACE
+        KeyName: releases/*
+        EnableWriteAccess: false
+      - BucketName: memorysplit-REPLACE
         KeyName: evidence/REPLACE/*
         EnableWriteAccess: true
     AdditionalIamPolicies:
@@ -38,7 +41,7 @@ Scheduling:
           MinCount: 0
           MaxCount: 3
           Efa:
-            Enabled: true
+            Enabled: false
       ComputeSettings:
         LocalStorage:
           RootVolume:
@@ -48,7 +51,7 @@ Scheduling:
             VolumeType: gp3
       Networking:
         PlacementGroup:
-          Enabled: true
+          Enabled: false
         SubnetIds:
           - subnet-REPLACE
 SharedStorage:

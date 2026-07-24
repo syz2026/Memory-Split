@@ -152,8 +152,9 @@ def test_pair_sbatch_argv_is_deterministic_and_resource_injected(tmp_path):
     assert "--gres=gpu:L40S:2" in first
     assert "--partition=gpu" in first
     assert "--qos=gpu" in first
+    assert f"--chdir={ROOT}" in first
     assert any(arg.startswith("--export=NONE,") for arg in first)
-    assert first[-1] == "cluster/slurm/v2_pair_train.sbatch"
+    assert Path(first[-1]) == ROOT / "cluster/slurm/v2_pair_train.sbatch"
 
 
 def test_protected_submit_requires_all_bound_canaries(tmp_path):
@@ -253,8 +254,10 @@ def test_pair_scripts_are_generic_supervised_and_atomic():
         assert "PAIR_MANIFEST" in text
         assert "PROFILE_PATH" in text
     for required in (
-        "CUDA_VISIBLE_DEVICES=0",
-        "CUDA_VISIBLE_DEVICES=1",
+        'allocation_gpus="${CUDA_VISIBLE_DEVICES:-}"',
+        '"CUDA_VISIBLE_DEVICES=$dense_gpu"',
+        '"CUDA_VISIBLE_DEVICES=$split90_gpu"',
+        "expected exactly two Slurm-assigned GPUs",
         'wait "$dense_pid"',
         'wait "$split_pid"',
         "kill",
@@ -262,6 +265,8 @@ def test_pair_scripts_are_generic_supervised_and_atomic():
         "os.replace",
     ):
         assert required in train
+    assert "CUDA_VISIBLE_DEVICES=0" not in train
+    assert "CUDA_VISIBLE_DEVICES=1" not in train
 
 
 def test_instantiate_writes_two_hash_bound_pairs_without_replacement(

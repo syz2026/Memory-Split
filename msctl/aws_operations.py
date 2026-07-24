@@ -5,10 +5,12 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
+import yaml
+
 from cluster.aws.reasoning_v3 import verify_staged_corpus
 from cluster.corpus_contract import sha256_file
 from msctl.adapters.slurm import load_pair_manifest
-from msctl.manifest import write_json_no_replace
+from msctl.manifest import canonical_json_bytes, write_json_no_replace
 from msctl.operations import _write_yaml_no_replace
 from msctl.profile import load_profile
 from msctl.reasoning_cohort import (
@@ -36,6 +38,26 @@ def _runtime_paths(dataset_root: Path, values: list[str]) -> list[str]:
             raise ValueError("reasoning-v3 stream paths must begin with dataset/")
         result.append(str(dataset_root / value.removeprefix("dataset/")))
     return result
+
+
+def _write_json_no_replace_or_identical(path: Path, value: object) -> Path:
+    expected = canonical_json_bytes(value)
+    try:
+        return write_json_no_replace(path, value)
+    except FileExistsError as error:
+        if path.is_file() and not path.is_symlink() and path.read_bytes() == expected:
+            return path
+        raise FileExistsError(f"existing AWS manifest differs: {path}") from error
+
+
+def _write_yaml_no_replace_or_identical(path: Path, value: object) -> Path:
+    expected = yaml.safe_dump(value, sort_keys=False).encode()
+    try:
+        return _write_yaml_no_replace(path, value)
+    except FileExistsError as error:
+        if path.is_file() and not path.is_symlink() and path.read_bytes() == expected:
+            return path
+        raise FileExistsError(f"existing AWS runtime config differs: {path}") from error
 
 
 def instantiate_aws(
@@ -74,8 +96,11 @@ def instantiate_aws(
     assignment = load_cohort_assignment(
         root / "configs" / "cohort-assignment-135m-v3-aws-n10.json"
     )
+    # The role manifest always binds the complete cohort, independent of the
+    # selected launch wave. This makes seed-by-seed instantiation additive
+    # without weakening no-replace semantics for any existing file.
     configs = []
-    for seed in seeds:
+    for seed in SEEDS:
         for arm in ARMS:
             relative = config_path(arm, seed)
             path = root / relative
@@ -106,11 +131,11 @@ def instantiate_aws(
         "platform": ROLES[ROLE]["platform"],
         "provider": PROVIDER,
         "schema_version": 1,
-        "seeds": list(seeds),
+        "seeds": list(SEEDS),
     }
     if assignment["scientific_scope"] != SCIENTIFIC_SCOPE:
         raise ValueError("AWS cohort assignment scientific scope differs")
-    role_manifest_path = write_json_no_replace(
+    role_manifest_path = _write_json_no_replace_or_identical(
         runtime / "role-manifest.json",
         role_manifest,
     )
@@ -132,7 +157,7 @@ def instantiate_aws(
             runtime_cfg["transfer_manifest_sha256"] = evidence.manifest_sha256
             runtime_cfg["profile_sha256"] = profile.sha256
             runtime_path = runtime / "configs" / f"{cfg['run_id']}.yaml"
-            _write_yaml_no_replace(runtime_path, runtime_cfg)
+            _write_yaml_no_replace_or_identical(runtime_path, runtime_cfg)
             arm_records.append(
                 {
                     "arm": arm,
@@ -160,7 +185,7 @@ def instantiate_aws(
             "schema_version": 1,
             "seed": seed,
         }
-        pair_path = write_json_no_replace(
+        pair_path = _write_json_no_replace_or_identical(
             runtime / "pairs" / f"pair-s{seed}.json",
             pair,
         )

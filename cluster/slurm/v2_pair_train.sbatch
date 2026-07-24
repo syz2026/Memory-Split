@@ -9,12 +9,22 @@ set -Eeuo pipefail
 : "${PROFILE_PATH:?PROFILE_PATH is required}"
 : "${RUN_MODE:?RUN_MODE is required}"
 : "${MS135_VENV:?MS135_VENV is required}"
-: "${SLURM_SUBMIT_DIR:?SLURM_SUBMIT_DIR is required}"
 
-repo="$SLURM_SUBMIT_DIR"
+repo="$(pwd -P)"
 python="$MS135_VENV/bin/python"
 evidence_root="$(dirname "$PAIR_MANIFEST")/../evidence"
 mkdir -p "$evidence_root"
+
+allocation_gpus="${CUDA_VISIBLE_DEVICES:-}"
+IFS=',' read -r -a pair_gpus <<< "$allocation_gpus"
+if [ "${#pair_gpus[@]}" -ne 2 ] \
+  || [ -z "${pair_gpus[0]}" ] \
+  || [ -z "${pair_gpus[1]}" ]; then
+  echo "expected exactly two Slurm-assigned GPUs; got: ${allocation_gpus:-<unset>}" >&2
+  exit 2
+fi
+dense_gpu="${pair_gpus[0]}"
+split90_gpu="${pair_gpus[1]}"
 
 common_env=(
   "HOME=${HOME:-$repo}"
@@ -27,6 +37,12 @@ common_env=(
   "SLURM_CPUS_PER_TASK=${SLURM_CPUS_PER_TASK:-1}"
   "TOKENIZERS_PARALLELISM=false"
 )
+if [ -n "${TMPDIR:-}" ]; then
+  common_env+=("TMPDIR=$TMPDIR")
+fi
+if [ -n "${NCCL_DEBUG:-}" ]; then
+  common_env+=("NCCL_DEBUG=$NCCL_DEBUG")
+fi
 
 cd "$repo"
 preflight_args=()
@@ -42,13 +58,13 @@ if [ "$RUN_MODE" = "protected" ]; then
     --manifest "$PAIR_MANIFEST"
 fi
 
-env -i "${common_env[@]}" CUDA_VISIBLE_DEVICES=0 \
+env -i "${common_env[@]}" "CUDA_VISIBLE_DEVICES=$dense_gpu" \
   "$python" scripts/run_135m_pair.py \
   --manifest "$PAIR_MANIFEST" --profile "$PROFILE_PATH" \
   --mode "$RUN_MODE" --evidence-root "$evidence_root" --arm dense &
 dense_pid=$!
 
-env -i "${common_env[@]}" CUDA_VISIBLE_DEVICES=1 \
+env -i "${common_env[@]}" "CUDA_VISIBLE_DEVICES=$split90_gpu" \
   "$python" scripts/run_135m_pair.py \
   --manifest "$PAIR_MANIFEST" --profile "$PROFILE_PATH" \
   --mode "$RUN_MODE" --evidence-root "$evidence_root" --arm split90 &

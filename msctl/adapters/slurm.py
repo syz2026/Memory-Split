@@ -25,8 +25,9 @@ from msctl.reasoning_cohort import (
     run_id as reasoning_run_id,
 )
 
-TRAIN_SCRIPT = "cluster/slurm/v2_pair_train.sbatch"
-EVALUATE_SCRIPT = "cluster/slurm/v2_pair_evaluate.sbatch"
+REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
+TRAIN_SCRIPT = REPOSITORY_ROOT / "cluster/slurm/v2_pair_train.sbatch"
+EVALUATE_SCRIPT = REPOSITORY_ROOT / "cluster/slurm/v2_pair_evaluate.sbatch"
 MODES = ("functional", "resume", "throughput", "protected")
 _HEX = frozenset("0123456789abcdef")
 
@@ -179,7 +180,18 @@ def plan_sbatch(
             cohort_id=pair["cohort_id"],
         )
 
-    command = ["sbatch", f"--partition={profile.partition}"]
+    script = TRAIN_SCRIPT if action == "train" else EVALUATE_SCRIPT
+    if not script.is_file() or script.is_symlink():
+        raise ValueError(f"Slurm entrypoint is missing or unsafe: {script}")
+    repository_root = _export_value(
+        REPOSITORY_ROOT.resolve(),
+        label="repository root",
+    )
+    command = [
+        "sbatch",
+        f"--partition={profile.partition}",
+        f"--chdir={repository_root}",
+    ]
     if profile.account is not None:
         command.append(f"--account={profile.account}")
     if profile.qos is not None:
@@ -207,7 +219,5 @@ def plan_sbatch(
     command.append(f"--export={','.join(exports)}")
     if action == "train":
         command.append("--requeue")
-        command.append(TRAIN_SCRIPT)
-    else:
-        command.append(EVALUATE_SCRIPT)
+    command.append(str(script))
     return command
