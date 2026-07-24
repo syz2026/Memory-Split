@@ -1,3 +1,4 @@
+import hashlib
 import io
 import json
 import sqlite3
@@ -296,6 +297,94 @@ def test_prontoqa_rejection_sampling_resets_state_and_rotates_depth():
     assert record["metadata"]["attempt"] == 1
     assert record["metadata"]["deduction_steps"] == 3
     assert len(record["metadata"]["native_proof_trace_sha256"]) == 64
+
+
+def test_prontoqa_exhausts_primary_before_rotating_depth_pairing():
+    calls = []
+
+    class _Config:
+        def __init__(self, **values):
+            self.values = values
+
+    class _Module:
+        OntologyConfig = _Config
+        config = None
+
+        def generate_question(self, steps, *_args, **_kwargs):
+            calls.append((steps, self.config))
+            if len(calls) <= 160:
+                return (None,) * 6
+            return (
+                "Alex is a gorpus. Every gorpus is not earthy.",
+                "Alex is earthy.",
+                (),
+                [
+                    "Alex is a gorpus.",
+                    "Every gorpus is not earthy.",
+                    "Alex is not earthy.",
+                ],
+                False,
+                (),
+            )
+
+    provider = object.__new__(_ProntoQA)
+    provider._module = _Module()
+
+    record = provider.generate(2317)
+
+    assert [steps for steps, _config in calls[:128]] == [
+        2 + ((2317 + attempt) % 5) for attempt in range(128)
+    ]
+    assert [steps for steps, _config in calls[128:]] == [
+        2 + ((2317 + attempt + 1) % 5) for attempt in range(33)
+    ]
+    assert len({id(config) for _steps, config in calls}) == len(calls)
+    assert record["metadata"] == {
+        "attempt": 32,
+        "deduction_steps": 2,
+        "depth_schedule_pass": 1,
+        "native_proof_trace_sha256": hashlib.sha256(
+            canonical_json_bytes(
+                [
+                    "Alex is a gorpus.",
+                    "Every gorpus is not earthy.",
+                    "Alex is not earthy.",
+                ]
+            )
+        ).hexdigest(),
+        "rejected_native_samples": 160,
+        "rejection_policy": "exhaust_primary_then_rotate_seed_depth_pairing",
+        "seed": _seed("prontoqa", 2317, 32),
+    }
+
+
+def test_prontoqa_fails_closed_after_all_seed_depth_combinations():
+    calls = []
+
+    class _Config:
+        def __init__(self, **values):
+            self.values = values
+
+    class _Module:
+        OntologyConfig = _Config
+        config = None
+
+        def generate_question(self, steps, *_args, **_kwargs):
+            calls.append((steps, self.config))
+            return (None,) * 6
+
+    provider = object.__new__(_ProntoQA)
+    provider._module = _Module()
+
+    with pytest.raises(RuntimeError, match="640 frozen seed/depth combinations"):
+        provider.generate(2317)
+
+    assert len(calls) == 640
+    assert len({id(config) for _steps, config in calls}) == len(calls)
+    for attempt in range(128):
+        assert {
+            calls[depth_pass * 128 + attempt][0] for depth_pass in range(5)
+        } == {2, 3, 4, 5, 6}
 
 
 def test_deepmind_adapter_removes_object_hash_order_before_seeded_shuffle(

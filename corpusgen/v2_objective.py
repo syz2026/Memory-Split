@@ -328,6 +328,7 @@ class _RuleTaker:
 
 class _ProntoQA:
     distributions = ("numpy", "scipy")
+    _DEPTHS = (2, 3, 4, 5, 6)
 
     def __init__(self, root: Path):
         sys.path.insert(0, str(root))
@@ -342,42 +343,42 @@ class _ProntoQA:
     def generate(self, index: int) -> dict[str, Any]:
         import numpy as np
 
-        for attempt in range(128):
-            seed = _seed("prontoqa", index, attempt)
-            random.seed(seed)
-            np.random.seed(seed)
-            # ``generate_question`` mutates the module-global OntologyConfig.
-            # Recreate the upstream default for every attempt so an ordinal is
-            # independent of records generated earlier in the worker and can
-            # be resumed directly.
-            self._module.config = self._module.OntologyConfig(
-                max_child_count=1,
-                generate_negation=True,
-                generate_properties=True,
-                require_properties=False,
-                stop_probability=0.3,
-            )
-            # Native generation is a rejection sampler whose valid-sample
-            # probability drops sharply at larger depths.  Rotate the frozen
-            # depth schedule across attempts so one unlucky deep ordinal does
-            # not make the finite seed domain unusable.
-            steps = 2 + ((index + attempt) % 5)
-            output = self._module.generate_question(
-                steps,
-                None,
-                formula_ordering="postorder",
-                ontology="fictional",
-                distractors="relevant",
-                deduction_rule="ModusPonens",
-                proofs_only=False,
-            )
-            question, query, _formulas, trace, answer, _proof = output
-            if question is None:
-                continue
-            proof_payload = list(trace)
-            return {
-                "answer": str(answer),
-                "metadata": {
+        for depth_schedule_pass in range(len(self._DEPTHS)):
+            for attempt in range(_SEED_ATTEMPTS):
+                seed = _seed("prontoqa", index, attempt)
+                random.seed(seed)
+                np.random.seed(seed)
+                # ``generate_question`` mutates the module-global
+                # OntologyConfig. Recreate the upstream default for every
+                # attempt so an ordinal is independent of records generated
+                # earlier in the worker and can be resumed directly.
+                self._module.config = self._module.OntologyConfig(
+                    max_child_count=1,
+                    generate_negation=True,
+                    generate_properties=True,
+                    require_properties=False,
+                    stop_probability=0.3,
+                )
+                # Preserve the primary seed/depth schedule byte-for-byte.
+                # Only after all 128 primary combinations reject do we rotate
+                # the same frozen seeds through the remaining native depths.
+                steps = self._DEPTHS[
+                    (index + attempt + depth_schedule_pass) % len(self._DEPTHS)
+                ]
+                output = self._module.generate_question(
+                    steps,
+                    None,
+                    formula_ordering="postorder",
+                    ontology="fictional",
+                    distractors="relevant",
+                    deduction_rule="ModusPonens",
+                    proofs_only=False,
+                )
+                question, query, _formulas, trace, answer, _proof = output
+                if question is None:
+                    continue
+                proof_payload = list(trace)
+                metadata = {
                     "attempt": attempt,
                     "deduction_steps": steps,
                     # Native FOL nodes use the default object representation,
@@ -388,19 +389,38 @@ class _ProntoQA:
                         _canonical_bytes(proof_payload)
                     ).hexdigest(),
                     "seed": seed,
-                },
-                "question": json.dumps(
-                    {
-                        "premises": question,
-                        "proof": list(trace),
-                        "query": query,
-                    },
-                    ensure_ascii=False,
-                    separators=(",", ":"),
-                    sort_keys=True,
-                ),
-            }
-        raise RuntimeError(f"ProntoQA record {index} had no formal proof")
+                }
+                if depth_schedule_pass:
+                    metadata.update(
+                        {
+                            "depth_schedule_pass": depth_schedule_pass,
+                            "rejected_native_samples": (
+                                depth_schedule_pass * _SEED_ATTEMPTS + attempt
+                            ),
+                            "rejection_policy": (
+                                "exhaust_primary_then_rotate_seed_depth_pairing"
+                            ),
+                        }
+                    )
+                return {
+                    "answer": str(answer),
+                    "metadata": metadata,
+                    "question": json.dumps(
+                        {
+                            "premises": question,
+                            "proof": list(trace),
+                            "query": query,
+                        },
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                        sort_keys=True,
+                    ),
+                }
+        combinations = len(self._DEPTHS) * _SEED_ATTEMPTS
+        raise RuntimeError(
+            f"ProntoQA record {index} had no formal proof after "
+            f"{combinations} frozen seed/depth combinations"
+        )
 
 
 class _ReasoningGym:
