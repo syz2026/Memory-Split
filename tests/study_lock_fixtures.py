@@ -500,6 +500,9 @@ def build_collected_evidence(
         for arm in ARMS:
             run_id = f"memorysplit-v3-360m-s{seed}-{arm}"
             config_sha256 = arm_configs[arm]
+            training_config_sha256 = digest(
+                f"runtime-config:{seed}:{arm}"
+            )
             config_fingerprint = digest(f"config:{seed}:{arm}")
             metadata = lifecycle_operational_metadata(
                 binding,
@@ -521,7 +524,7 @@ def build_collected_evidence(
             study_identity = {
                 "arm": arm,
                 "cohort_id": STUDY_COHORT_ID,
-                "config_sha256": config_sha256,
+                "config_sha256": training_config_sha256,
                 "data_build_id": DATA_BUILD_ID,
                 "data_provenance_sha256": data_provenance_sha256,
                 "data_receipt_sha256": DATA_RECEIPT_SHA256,
@@ -584,7 +587,7 @@ def build_collected_evidence(
                         "snapshot_version": 2,
                         "training_run_id": run_id,
                         "config_fingerprint": config_fingerprint,
-                        "training_config_sha256": config_sha256,
+                        "training_config_sha256": training_config_sha256,
                         "model_config_sha256": model_cfg_sha256,
                         "model_identity": MODEL_IDENTITY,
                         "data_provenance_sha256": data_provenance_sha256,

@@ -176,6 +176,7 @@ class RunStudyIdentity:
 
     seed: int
     arm: str
+    training_config_sha256: str
     model_config_sha256: str
     model_identity: str
     data_provenance_sha256: str
@@ -189,6 +190,7 @@ class RunStudyIdentity:
         if self.arm not in ARMS:
             raise _fail("run study identity arm must be dense or split90")
         for field in (
+            "training_config_sha256",
             "model_config_sha256",
             "data_provenance_sha256",
             "config_fingerprint",
@@ -776,8 +778,6 @@ def extract_run_study_identities(
                     identity_value["seed"] != admitted.seed
                     or identity_value["arm"] != arm
                     or identity_value["run_id"] != arm_row["run_id"]
-                    or identity_value["config_sha256"]
-                    != arm_row["config_sha256"]
                     or identity_value["data_receipt_sha256"]
                     != value["dataset_receipt_sha256"]
                     or identity_value["data_build_id"]
@@ -799,6 +799,7 @@ def extract_run_study_identities(
                 extracted = RunStudyIdentity(
                     seed=admitted.seed,
                     arm=arm,
+                    training_config_sha256=identity_value["config_sha256"],
                     model_config_sha256=identity_value["model_cfg_sha256"],
                     model_identity=identity_value["model_identity"],
                     data_provenance_sha256=identity_value[
@@ -946,7 +947,9 @@ def build_study_lock_v3(
                         "snapshot_version": 2,
                         "training_run_id": arm_row["run_id"],
                         "config_fingerprint": identity.config_fingerprint,
-                        "training_config_sha256": arm_row["config_sha256"],
+                        "training_config_sha256": (
+                            identity.training_config_sha256
+                        ),
                         "model_config_sha256": identity.model_config_sha256,
                         "model_identity": identity.model_identity,
                         "data_provenance_sha256": (

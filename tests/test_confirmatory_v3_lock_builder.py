@@ -38,7 +38,10 @@ from evals.confirmatory.study_lock import (
     StudyLockV3,
 )
 from msctl.aws_contracts import ARMS, SEEDS, SNAPSHOT_STEPS, snapshot_object_key
-from msctl.aws_lifecycle import LIFECYCLE_BINDING_FIELDS
+from msctl.aws_lifecycle import (
+    LIFECYCLE_BINDING_FIELDS,
+    OPERATIONAL_METADATA_FIELDS,
+)
 from scripts import build_confirmatory_study_lock as lock_cli
 from tests.study_lock_fixtures import (
     S3_ROOT,
@@ -165,6 +168,7 @@ def test_lock_builder_module_exports_its_closed_public_interface():
     identity = RunStudyIdentity(
         seed=0,
         arm="dense",
+        training_config_sha256="d" * 64,
         model_config_sha256="a" * 64,
         model_identity="d360m",
         data_provenance_sha256="b" * 64,
@@ -176,6 +180,7 @@ def test_lock_builder_module_exports_its_closed_public_interface():
         RunStudyIdentity(
             seed=0,
             arm="split",
+            training_config_sha256="d" * 64,
             model_config_sha256="a" * 64,
             model_identity="d360m",
             data_provenance_sha256="b" * 64,
@@ -209,6 +214,17 @@ def test_extraction_returns_twenty_receipt_bound_run_identities(
         == digest(f"config:{identity.seed}:{identity.arm}")
         for identity in identities
     )
+    assert all(
+        identity.training_config_sha256
+        == digest(f"runtime-config:{identity.seed}:{identity.arm}")
+        for identity in identities
+    )
+    assert not {
+        identity.training_config_sha256 for identity in identities
+    } & {
+        digest("dense-operational-config"),
+        digest("split90-operational-config"),
+    }
     assert {
         identity.model_config_sha256 for identity in identities
     } == {canonical_bundle.snapshots[0]["model_config_sha256"]}
@@ -450,6 +466,9 @@ def test_builder_rejects_cross_seed_checkpoint_placement_drift():
         RunStudyIdentity(
             seed=seed,
             arm=arm,
+            training_config_sha256=digest(
+                f"runtime-config:{seed}:{arm}"
+            ),
             model_config_sha256=bundle.snapshots[0]["model_config_sha256"],
             model_identity="d360m",
             data_provenance_sha256=digest(f"unused:{seed}:{arm}"),
@@ -514,9 +533,10 @@ def test_extraction_rejects_snapshot_body_and_byte_drift(
     ("mutation", "message"),
     [
         ("step", "step"),
-        ("identity-config", "config"),
+        ("identity-config", "config|invariant|cross-step"),
         ("cross-step-identity", "invariant|cross-step"),
         ("operational-only", "study identity"),
+        ("study-only", "provider lifecycle metadata"),
         ("full-checkpoint", "full optimizer|checkpoint"),
         ("legacy", "legacy|metadata"),
     ],
@@ -540,6 +560,9 @@ def test_extraction_rejects_snapshot_content_drift(
         elif mutation == "operational-only":
             del state["snapshot_version"]
             del state["study_identity"]
+        elif mutation == "study-only":
+            for field in OPERATIONAL_METADATA_FIELDS:
+                del state[field]
         elif mutation == "full-checkpoint":
             state["cfg"] = {}
             state["opt"] = {}

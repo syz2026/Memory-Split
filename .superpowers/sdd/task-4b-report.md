@@ -147,11 +147,17 @@ collection_receipts=...)` must yield exactly 100 valid Task 4A plans.
 The builder over the canonical payload fixtures reproduces the hand-built
 fixture lock byte-for-byte and SHA-for-SHA (tested).
 
-`training_config_sha256` and the per-arm operational config hashes both
-come from the finalized arm `config_sha256`; extraction requires the
-snapshot's embedded `study_identity.config_sha256` to equal the same
-value, so a runtime/launch config divergence fails closed at build time
-instead of surfacing later in the evaluator.
+The two config identities remain distinct and explicit:
+
+- each seed lifecycle's per-arm operational config hash comes from the
+  finalized arm `config_sha256` (the frozen launch-config file bytes);
+- each snapshot slot's `training_config_sha256` comes from the snapshot's
+  embedded `study_identity.config_sha256` (the actual runtime config bytes,
+  including reviewed launch-time overrides).
+
+Extraction requires the training-config hash to remain invariant across one
+run's five snapshots; it no longer incorrectly requires equality with the
+different operational-config hash. The evaluator binds and checks both.
 
 ## Publication authority
 
@@ -252,10 +258,10 @@ on the real host (unsandboxed) because fixtures `git init` under `/tmp`.
 - Collection receipt S3 `version_id` cannot be falsified from local
   bytes; it flows into the lock verbatim and remains provable only by the
   later versioned HEAD/receipt replay, exactly like Task 4A planning.
-- One deliberate coherence rule beyond the brief's letter: extraction
-  requires `study_identity.config_sha256` to equal the finalized arm
-  `config_sha256` (see derivation section) so the built lock can never
-  disagree with the evaluator's own identity equality checks.
+- `RunStudyIdentity` carries the snapshot-embedded training-config SHA
+  separately from the finalized arm's operational-config SHA. Canonical
+  fixtures deliberately use different values and assert the distinction, so
+  production runtime overrides cannot be hidden by synthetic equality.
 - The `PATH_AUTHORITY` constant is imported from sealing rather than
   redefined (caught in self-review before commit).
 - Ruff is not installed on this host; linting relied on `py_compile`
@@ -278,3 +284,34 @@ on the real host (unsandboxed) because fixtures `git init` under `/tmp`.
 - Real production evidence (ten S3-collected receipt bodies and 100
   snapshot bodies) does not exist yet; the builder is proven over
   payload-real fixtures that admit through the production parsers.
+
+## Review correction: production config identities
+
+The task review proved the original config-hash equality was unsatisfiable for
+real trainer output: the finalized arm binds the frozen launch-config file,
+while `study_identity.config_sha256` hashes the runtime config containing
+operational metadata and runtime path overrides.
+
+Correction:
+
+- `RunStudyIdentity` now includes `training_config_sha256`;
+- extraction records that value from each snapshot and enforces only the
+  correct five-step run invariant;
+- StudyLock snapshot `training_config_sha256` uses the extracted runtime hash;
+- SeedLifecycleBinding operational config hashes remain the finalized
+  launch-file hashes;
+- canonical fixtures use
+  `digest("runtime-config:{seed}:{arm}")`, explicitly different from
+  `digest("{arm}-operational-config")`.
+
+Review-fix verification:
+
+```text
+tests/test_confirmatory_v3_lock_builder.py: 67 passed
+focused Task 4B bridge group:               502 passed
+```
+
+The added study-only snapshot case also closes the report's prior test-coverage
+overclaim. No trainer, receipt, lock, runner, or frozen-science schema was
+weakened; the existing Task 4A evaluator already validates the two fields
+independently.
