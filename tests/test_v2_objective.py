@@ -5,8 +5,8 @@ from types import SimpleNamespace
 import pytest
 
 from corpusgen.v2_objective import (
-    _ReasoningGym,
     _SEED_ATTEMPTS,
+    _ReasoningGym,
     _seed,
 )
 
