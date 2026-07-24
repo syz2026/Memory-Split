@@ -23,6 +23,8 @@ from evals.confirmatory.contracts import (
     StudyCheckpointRecord,
 )
 from evals.confirmatory.metrics import (
+    PairMetricSummary,
+    Rate,
     STUDY_METRICS_SCHEMA,
     STUDY_OUTCOME_SCHEMA,
     StudyMetricsRecord,
@@ -203,6 +205,38 @@ def _rate(numerator: int, denominator: int) -> dict:
         "numerator": numerator,
         "denominator": denominator,
     }
+
+
+def test_v2_pair_metric_keeps_legacy_float_aggregation_with_exact_v3_path():
+    primary_rates = {
+        "graph__composition_ood": Rate(0, 1),
+        "graph__joint_ood": Rate(0, 1),
+        "non_path__composition_ood": Rate(1, 1),
+        "non_path__joint_ood": Rate(2, 3),
+    }
+    legacy_float = sum(rate.value for rate in primary_rates.values()) / 4
+    exact_value = Fraction(5, 12)
+
+    assert legacy_float != float(exact_value)
+    summary = PairMetricSummary(
+        primary_accuracy=legacy_float,
+        primary_cells=primary_rates,
+        overall_pair_accuracy=Rate(0, 2),
+        by_stratum={contracts_module.Stratum.COMPOSITION_OOD: Rate(0, 2)},
+        by_family={
+            contracts_module.ReasoningFamily.GRAPH: Rate(0, 1),
+            contracts_module.ReasoningFamily.NON_PATH: Rate(0, 1),
+        },
+        checkpoint_sha256="6" * 64,
+        arm=Arm.DENSE,
+        condition_id="dense",
+        memory_mode="memory_on",
+        control="correct",
+    )
+
+    assert summary.primary_accuracy == legacy_float
+    assert summary.exact_primary_accuracy == exact_value
+    assert summary.to_dict()["primary_accuracy"] == legacy_float
 
 
 def _metrics(**changes) -> dict:

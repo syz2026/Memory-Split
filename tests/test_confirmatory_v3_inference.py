@@ -9,6 +9,7 @@ import pytest
 from evals.confirmatory.inference import (
     BootstrapEstimate,
     PairedObservation,
+    PracticalEquivalenceBounds,
     V3_BOOTSTRAP_CONFIDENCE,
     V3_BOOTSTRAP_DRAWS,
     V3_BOOTSTRAP_RNG_SEED,
@@ -161,6 +162,47 @@ def test_bootstrap_estimate_rejects_nonfinite_mistyped_or_inconsistent_values(
 ):
     with pytest.raises(ValueError):
         replace(_bootstrap_estimate(), **changes)
+
+
+def _claimed_v3_bootstrap(
+    *,
+    ci_low: Fraction,
+    ci_high: Fraction,
+) -> BootstrapEstimate:
+    replicates = (
+        *(Fraction(-1, 10) for _ in range(10_000)),
+        *(Fraction(1, 10) for _ in range(10_000)),
+    )
+    return BootstrapEstimate(
+        estimate=Fraction(0),
+        ci_low=ci_low,
+        ci_high=ci_high,
+        seed_effects=tuple(Fraction(0) for _ in range(10)),
+        replicates=replicates,
+        n_seeds=10,
+        n_worlds=10,
+        n_pairs=10,
+        n_resamples=20_000,
+        rng_seed=0,
+    )
+
+
+def test_v3_practical_bounds_recompute_frozen_nearest_rank_quantiles():
+    with pytest.raises(ValueError, match="nearest-rank|quantile|bounds"):
+        PracticalEquivalenceBounds(
+            bootstrap=_claimed_v3_bootstrap(
+                ci_low=Fraction(-9, 1_000),
+                ci_high=Fraction(9, 1_000),
+            )
+        )
+
+    validated = PracticalEquivalenceBounds(
+        bootstrap=_claimed_v3_bootstrap(
+            ci_low=Fraction(-1, 10),
+            ci_high=Fraction(1, 10),
+        )
+    )
+    assert validated.supports_equivalence is False
 
 
 def test_v3_aulc_is_the_frozen_right_step_integral():

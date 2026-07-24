@@ -197,6 +197,32 @@ def test_v3_study_lock_rejects_wrong_checkpoint_receipt_reference():
         StudyLockV3.from_dict(_lock(snapshots=snapshots))
 
 
+def test_v3_study_lock_rejects_receipt_content_alias_with_new_version():
+    snapshots = _snapshots()
+    source_dense = 0
+    source_split90 = len(SNAPSHOT_STEPS)
+    target_dense = 1
+    target_split90 = len(SNAPSHOT_STEPS) + 1
+    assert (
+        snapshots[source_dense]["checkpoint_receipt_sha256"]
+        == snapshots[source_split90]["checkpoint_receipt_sha256"]
+    )
+
+    for target in (target_dense, target_split90):
+        snapshots[target]["checkpoint_receipt_sha256"] = snapshots[
+            source_dense
+        ]["checkpoint_receipt_sha256"]
+        snapshots[target]["checkpoint_receipt_s3_object_key"] = snapshots[
+            source_dense
+        ]["checkpoint_receipt_s3_object_key"]
+        snapshots[target][
+            "checkpoint_receipt_s3_version_id"
+        ] = "different-version-cannot-disguise-content-alias"
+
+    with pytest.raises(ValueError, match="receipt.*(reuse|alias|content)"):
+        StudyLockV3.from_dict(_lock(snapshots=snapshots))
+
+
 def test_v3_study_lock_binds_frozen_preregistration_and_sealed_release_hashes():
     with pytest.raises(ValueError, match="preregistration"):
         StudyLockV3.from_dict(

@@ -667,17 +667,10 @@ class PairMetricSummary:
             or any(not isinstance(rate, Rate) for rate in self.by_family.values())
         ):
             raise ValueError("family diagnostics must contain both families")
-        exact_primary = (
-            sum(
-                (
-                    rate.exact_value
-                    for rate in self.primary_cells.values()
-                ),
-                Fraction(),
-            )
+        expected_primary = (
+            sum(rate.value for rate in self.primary_cells.values())
             / len(PRIMARY_CELLS)
         )
-        expected_primary = float(exact_primary)
         if primary_accuracy != expected_primary:
             raise ValueError("primary_accuracy disagrees with primary cells")
         for name, rates in (

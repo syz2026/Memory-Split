@@ -200,6 +200,25 @@ class BootstrapEstimate:
         object.__setattr__(self, "rng_seed", rng_seed)
 
 
+def _nearest_rank_bounds(
+    values: Sequence[float | Fraction],
+    confidence: float,
+) -> tuple[float | Fraction, float | Fraction]:
+    materialized = sorted(values)
+    tail = round((1.0 - confidence) / 2.0, 15)
+
+    def index(percentile: float) -> int:
+        return min(
+            len(materialized) - 1,
+            max(0, math.ceil(percentile * len(materialized)) - 1),
+        )
+
+    return (
+        materialized[index(tail)],
+        materialized[index(1.0 - tail)],
+    )
+
+
 def nearest_rank_interval(
     values: Sequence[float],
     confidence: float = 0.95,
@@ -214,19 +233,8 @@ def nearest_rank_interval(
     confidence_value = _finite(confidence, "confidence")
     if not 0.0 < confidence_value < 1.0:
         raise ValueError("confidence must be between zero and one")
-    materialized.sort()
-    tail = round((1.0 - confidence_value) / 2.0, 15)
-
-    def index(percentile: float) -> int:
-        return min(
-            len(materialized) - 1,
-            max(0, math.ceil(percentile * len(materialized)) - 1),
-        )
-
-    return (
-        materialized[index(tail)],
-        materialized[index(1.0 - tail)],
-    )
+    low, high = _nearest_rank_bounds(materialized, confidence_value)
+    return float(low), float(high)
 
 
 def _panel(
@@ -348,18 +356,9 @@ def _hierarchical_paired_bootstrap(
             )
         replicates.append(_mean(sampled_seed_effects, exact=exact))
     if exact:
-        ordered = sorted(replicates)
-        tail = round((1.0 - confidence_value) / 2.0, 15)
-
-        def exact_index(percentile: float) -> int:
-            return min(
-                len(ordered) - 1,
-                max(0, math.ceil(percentile * len(ordered)) - 1),
-            )
-
-        low, high = (
-            ordered[exact_index(tail)],
-            ordered[exact_index(1.0 - tail)],
+        low, high = _nearest_rank_bounds(
+            replicates,
+            confidence_value,
         )
     else:
         low, high = nearest_rank_interval(replicates, confidence_value)
@@ -440,6 +439,18 @@ class PracticalEquivalenceBounds:
             *self.bootstrap.replicates,
         ):
             _exact_rational(value, "practical-equivalence bootstrap value")
+        expected_bounds = _nearest_rank_bounds(
+            self.bootstrap.replicates,
+            V3_BOOTSTRAP_CONFIDENCE,
+        )
+        if (
+            self.bootstrap.ci_low,
+            self.bootstrap.ci_high,
+        ) != expected_bounds:
+            raise ValueError(
+                "practical-equivalence bounds disagree with frozen "
+                "nearest-rank quantiles"
+            )
         if (
             self.bootstrap.n_seeds != V3_CONFIRMATORY_SEED_COUNT
             or self.bootstrap.n_resamples != V3_BOOTSTRAP_DRAWS

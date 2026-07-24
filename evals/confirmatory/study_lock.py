@@ -341,11 +341,16 @@ class StudyLockV3:
                 raise ValueError(
                     "paired snapshot slots disagree on checkpoint receipt"
                 )
-        if len(set(receipt_by_seed_step.values())) != len(
-            receipt_by_seed_step
+        receipt_content_identities = tuple(
+            (receipt_sha256, receipt_key)
+            for receipt_sha256, receipt_key, _version_id
+            in receipt_by_seed_step.values()
+        )
+        if len(set(receipt_content_identities)) != len(
+            receipt_content_identities
         ):
             raise ValueError(
-                "checkpoint receipt evidence is reused across seed/step slots"
+                "checkpoint receipt content is reused across seed/step slots"
             )
         object.__setattr__(self, "preregistration_sha256", preregistration)
         object.__setattr__(
