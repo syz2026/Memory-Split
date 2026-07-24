@@ -23,14 +23,17 @@ from corpusgen.reasoning import (
     SemanticLeakageError as ClosureSemanticLeakageError,
 )
 from corpusgen.reasoning_v2 import (
+    OccurrenceClosureLedger,
     RouteArtifacts,
     RouteIndex,
     SemanticLeakageError,
     SidecarWeights,
+    TokenOccurrenceBinding,
     TokenSemanticSpan,
     audit_answer_state_surfaces,
     audit_proof_surfaces,
     audit_sidecar_weights,
+    build_occurrence_closure_ledger,
     build_route_artifacts,
     derive_sidecar_weights,
 )
@@ -169,7 +172,7 @@ def _write_route_index(path: Path, external_fact_ids: set[str]) -> Path:
     try:
         connection.execute(
             "CREATE TABLE selected ("
-            "fact_id TEXT NOT NULL PRIMARY KEY"
+            "fact_id TEXT COLLATE BINARY NOT NULL PRIMARY KEY"
             ") WITHOUT ROWID"
         )
         connection.executemany(
@@ -181,6 +184,46 @@ def _write_route_index(path: Path, external_fact_ids: set[str]) -> Path:
         connection.close()
     os.chmod(path, 0o600)
     return path
+
+
+def _occurrence_ledger(
+    token_count: int,
+    expected: tuple[tuple[int, int, str], ...],
+):
+    fact_ids = tuple(sorted({fact_id for _start, _end, fact_id in expected}))
+    facts = tuple(
+        SemanticFact(fact_id, (f"<{fact_id}-surface>",))
+        for fact_id in fact_ids
+    )
+    surfaces = {fact.fact_id: fact.surfaces[0] for fact in facts}
+    text_parts: list[str] = []
+    bindings = []
+    char_cursor = 0
+    for token_start, token_end, fact_id in expected:
+        if text_parts:
+            text_parts.append(" ")
+            char_cursor += 1
+        surface = surfaces[fact_id]
+        char_start = char_cursor
+        text_parts.append(surface)
+        char_cursor += len(surface)
+        bindings.append(
+            TokenOccurrenceBinding(
+                field_id="payload",
+                char_start=char_start,
+                char_end=char_cursor,
+                fact_id=fact_id,
+                surface=surface,
+                token_start=token_start,
+                token_end=token_end,
+            )
+        )
+    return build_occurrence_closure_ledger(
+        token_count=token_count,
+        facts=facts,
+        fields=(SupervisedField("payload", "".join(text_parts)),),
+        bindings=tuple(bindings),
+    )
 
 
 @pytest.fixture
@@ -299,6 +342,33 @@ def test_reverse_catalog_order_is_byte_identical_and_exact_winner_is_reused(
         "route-index.sqlite3",
         "route-manifest.jsonl",
     ]
+
+
+def test_route_artifacts_bind_index_hash_and_open_index_rejects_tampering(
+    tmp_path: Path,
+):
+    artifacts = build_route_artifacts(
+        RoutingCatalog(_routing_rows()),
+        tmp_path / "work",
+        tmp_path / "routes",
+    )
+    index_bytes = artifacts.index_path.read_bytes()
+    index_sha256 = hashlib.sha256(index_bytes).hexdigest()
+    header = json.loads(_manifest_lines(artifacts.manifest_path)[0])
+
+    assert artifacts.index_sha256 == index_sha256
+    assert artifacts.index_bytes == len(index_bytes)
+    assert header["index_sha256"] == index_sha256
+    assert header["index_bytes"] == len(index_bytes)
+
+    connection = sqlite3.connect(artifacts.index_path)
+    try:
+        connection.execute("PRAGMA application_id=1297306452")
+        connection.commit()
+    finally:
+        connection.close()
+    with pytest.raises(ValueError, match="SHA-256|hash|content"):
+        artifacts.open_index()
 
 
 def test_existing_route_winner_requires_exact_index_bytes(tmp_path: Path):
@@ -433,6 +503,35 @@ def test_exact_rational_route_dose_rejects_either_threshold():
         )
 
 
+def test_route_dose_outputs_are_deeply_immutable(tmp_path: Path):
+    dose = semantic_module.audit_route_dose(
+        total_facts=10,
+        external_facts=9,
+        total_information_burden=Fraction(100),
+        external_information_burden=Fraction(90),
+    )
+    artifacts = build_route_artifacts(
+        RoutingCatalog(_routing_rows()),
+        tmp_path / "work",
+        tmp_path / "routes",
+    )
+
+    with pytest.raises(TypeError):
+        dose["passed"] = False
+    with pytest.raises(TypeError):
+        dose["distinct_fact_fraction"]["numerator"] = 0
+    with pytest.raises(TypeError):
+        artifacts.dose_report["passed"] = False
+    with pytest.raises(TypeError):
+        artifacts.dose_report["target_external_fraction"]["numerator"] = 0
+    reconstructed = replace(
+        artifacts,
+        dose_report={"nested": {"passed": True}},
+    )
+    with pytest.raises(TypeError):
+        reconstructed.dose_report["nested"]["passed"] = False
+
+
 def test_conflicting_existing_route_winner_is_preserved_and_loser_quarantined(
     tmp_path: Path,
 ):
@@ -509,6 +608,48 @@ def test_route_publication_rejects_symlinked_output_parent(tmp_path: Path):
     assert not (real_parent / "routes").exists()
 
 
+def test_route_database_creation_uses_absolute_paths_without_cwd(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    phases: list[tuple[str, str]] = []
+
+    def observe(
+        phase: str,
+        directory_fd: int,
+        name: str,
+        pinned_fd: int,
+    ) -> None:
+        del directory_fd, pinned_fd
+        phases.append((name, phase))
+
+    def reject_fchdir(_descriptor: int) -> None:
+        raise AssertionError("route database creation changed process cwd")
+
+    monkeypatch.setattr(
+        semantic_module,
+        "_database_open_hook",
+        observe,
+        raising=False,
+    )
+    monkeypatch.setattr(semantic_module.os, "fchdir", reject_fchdir)
+    build_route_artifacts(
+        RoutingCatalog(_routing_rows()),
+        tmp_path / "work",
+        tmp_path / "routes",
+    )
+
+    expected_phases = {
+        "before_sqlite_open",
+        "sqlite_opened",
+        "after_sqlite_open",
+    }
+    for name in (".route-reducer.sqlite3", "route-index.sqlite3"):
+        assert {
+            phase for observed_name, phase in phases if observed_name == name
+        } == expected_phases
+
+
 def test_route_index_rejects_symlink_and_hardlink(tmp_path: Path):
     original = _write_route_index(tmp_path / "route-index.sqlite3", {"fact-a"})
     symlink = tmp_path / "symlink.sqlite3"
@@ -520,6 +661,47 @@ def test_route_index_rejects_symlink_and_hardlink(tmp_path: Path):
     os.link(original, hardlink)
     with pytest.raises(ValueError, match="owner-controlled"):
         RouteIndex.open(original)
+
+
+@pytest.mark.parametrize("mutation", ["nocase", "custom", "extra_index"])
+def test_route_index_rejects_collation_or_index_schema_drift(
+    tmp_path: Path,
+    mutation: str,
+):
+    path = tmp_path / "route-index.sqlite3"
+    connection = sqlite3.connect(path)
+    try:
+        if mutation == "custom":
+            connection.create_collation(
+                "FACT_ORDER",
+                lambda left, right: (left > right) - (left < right),
+            )
+        collation = (
+            "NOCASE"
+            if mutation == "nocase"
+            else "FACT_ORDER"
+            if mutation == "custom"
+            else "BINARY"
+        )
+        connection.execute(
+            f"CREATE TABLE selected (fact_id TEXT COLLATE {collation} "
+            "NOT NULL PRIMARY KEY) WITHOUT ROWID"
+        )
+        if mutation == "extra_index":
+            connection.execute(
+                "CREATE INDEX selected_extra ON selected(fact_id)"
+            )
+        connection.execute(
+            "INSERT INTO selected(fact_id) VALUES (?)",
+            ("fact-a",),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+    os.chmod(path, 0o600)
+
+    with pytest.raises(ValueError, match="schema|collation"):
+        RouteIndex.open(path)
 
 
 def test_route_index_open_detects_namespace_swap_and_preserves_both_inodes(
@@ -559,6 +741,121 @@ def test_route_index_open_detects_namespace_swap_and_preserves_both_inodes(
         RouteIndex.open(path)
     assert path.is_file()
     assert (tmp_path / ".attacker-original-index.sqlite3").is_file()
+
+
+def test_route_index_open_never_changes_process_cwd(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    path = _write_route_index(tmp_path / "route-index.sqlite3", {"fact-a"})
+
+    def reject_fchdir(_descriptor: int) -> None:
+        raise AssertionError("route index open changed process cwd")
+
+    monkeypatch.setattr(semantic_module.os, "fchdir", reject_fchdir)
+    with RouteIndex.open(path) as index:
+        assert index.is_external("fact-a") is True
+
+
+def test_route_index_open_rejects_namespace_aba_to_different_sqlite_inode(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    path = _write_route_index(tmp_path / "route-index.sqlite3", {"fact-a"})
+    attacker = _write_route_index(
+        tmp_path / "attacker.sqlite3",
+        {"fact-evil"},
+    )
+    swapped = False
+    restored = False
+
+    def aba_swap(
+        phase: str,
+        parent_fd: int,
+        name: str,
+        pinned_fd: int,
+    ) -> None:
+        nonlocal restored, swapped
+        del pinned_fd
+        if phase == "before_sqlite_open" and not swapped:
+            swapped = True
+            os.rename(
+                name,
+                ".original-index.sqlite3",
+                src_dir_fd=parent_fd,
+                dst_dir_fd=parent_fd,
+            )
+            os.rename(
+                attacker.name,
+                name,
+                src_dir_fd=parent_fd,
+                dst_dir_fd=parent_fd,
+            )
+        elif phase == "sqlite_opened" and not restored:
+            restored = True
+            os.rename(
+                name,
+                ".opened-attacker.sqlite3",
+                src_dir_fd=parent_fd,
+                dst_dir_fd=parent_fd,
+            )
+            os.rename(
+                ".original-index.sqlite3",
+                name,
+                src_dir_fd=parent_fd,
+                dst_dir_fd=parent_fd,
+            )
+
+    monkeypatch.setattr(
+        semantic_module,
+        "_route_index_open_hook",
+        aba_swap,
+    )
+    with pytest.raises(ValueError, match="identity|inode"):
+        RouteIndex.open(path)
+    assert path.is_file()
+    assert (tmp_path / ".opened-attacker.sqlite3").is_file()
+
+
+def test_route_index_open_rejects_parent_directory_aba(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    trusted = tmp_path / "trusted"
+    attacker = tmp_path / "attacker"
+    path = _write_route_index(trusted / "route-index.sqlite3", {"fact-a"})
+    _write_route_index(attacker / "route-index.sqlite3", {"fact-evil"})
+    swapped = False
+    restored = False
+
+    def aba_parent(
+        phase: str,
+        parent_fd: int,
+        name: str,
+        pinned_fd: int,
+    ) -> None:
+        nonlocal restored, swapped
+        del parent_fd, name, pinned_fd
+        if phase == "before_sqlite_open" and not swapped:
+            swapped = True
+            trusted.rename(tmp_path / ".original-parent")
+            attacker.rename(trusted)
+        elif phase == "sqlite_opened" and not restored:
+            restored = True
+            trusted.rename(tmp_path / ".opened-attacker-parent")
+            (tmp_path / ".original-parent").rename(trusted)
+
+    monkeypatch.setattr(
+        semantic_module,
+        "_route_index_open_hook",
+        aba_parent,
+    )
+    with pytest.raises(ValueError, match="identity|inode|ABA"):
+        RouteIndex.open(path)
+    assert path.is_file()
+    assert (
+        tmp_path / ".opened-attacker-parent" / "route-index.sqlite3"
+    ).is_file()
 
 
 def test_route_index_open_hook_failure_closes_the_sqlite_connection(
@@ -634,7 +931,112 @@ def test_route_index_query_replays_namespace_identity(
     assert (tmp_path / ".attacker-query-original.sqlite3").is_file()
 
 
-def test_split90_masks_only_every_routed_factual_payload_token(route_index):
+def test_occurrence_closure_ledger_binds_independent_plan_and_token_mappings():
+    facts = (SemanticFact("fact-a", ("cerulean",)),)
+    fields = (SupervisedField("payload", "cerulean then cerulean"),)
+    bindings = (
+        TokenOccurrenceBinding(
+            field_id="payload",
+            char_start=0,
+            char_end=8,
+            fact_id="fact-a",
+            surface="cerulean",
+            token_start=0,
+            token_end=2,
+        ),
+        TokenOccurrenceBinding(
+            field_id="payload",
+            char_start=14,
+            char_end=22,
+            fact_id="fact-a",
+            surface="cerulean",
+            token_start=4,
+            token_end=6,
+        ),
+    )
+
+    ledger = build_occurrence_closure_ledger(
+        token_count=8,
+        facts=facts,
+        fields=fields,
+        bindings=bindings,
+    )
+
+    assert ledger.plan_occurrence_count == 2
+    assert isinstance(ledger, OccurrenceClosureLedger)
+    assert ledger.payload_occurrence_count == 2
+    assert ledger.payload_target_count == 4
+    assert len(ledger.plan_sha256) == 64
+    assert len(ledger.sha256) == 64
+    assert ledger.bindings == bindings
+
+
+@pytest.mark.parametrize("replacement_role", [None, "plain_text", "answer_state", "proof"])
+def test_sidecar_derivation_rejects_omitted_or_mislabeled_authority_occurrence(
+    route_index,
+    replacement_role: str | None,
+):
+    ledger = _occurrence_ledger(
+        8,
+        ((0, 2, "fact-a"), (6, 8, "fact-a")),
+    )
+    spans = [TokenSemanticSpan(0, 2, "fact-a", "factual_payload")]
+    if replacement_role is not None:
+        spans.append(
+            TokenSemanticSpan(
+                6,
+                8,
+                "fact-a",
+                replacement_role,  # type: ignore[arg-type]
+            )
+        )
+    with (
+        route_index({"fact-a"}) as index,
+        pytest.raises(SemanticLeakageError, match="closure|payload|mislabeled"),
+    ):
+        derive_sidecar_weights(
+            8,
+            tuple(spans),
+            index,
+            closure=ledger,
+        )
+
+
+def test_sidecar_derivation_rejects_extra_factual_payload_span(route_index):
+    ledger = _occurrence_ledger(6, ((0, 2, "fact-a"),))
+    spans = (
+        TokenSemanticSpan(0, 2, "fact-a", "factual_payload"),
+        TokenSemanticSpan(4, 6, "fact-a", "factual_payload"),
+    )
+    with (
+        route_index({"fact-a"}) as index,
+        pytest.raises(SemanticLeakageError, match="extra|closure|payload"),
+    ):
+        derive_sidecar_weights(6, spans, index, closure=ledger)
+
+
+def test_semantic_leak_records_are_deeply_immutable(route_index):
+    ledger = _occurrence_ledger(2, ((0, 2, "fact-a"),))
+    spans = (TokenSemanticSpan(0, 2, "fact-a", "plain_text"),)
+    with (
+        route_index({"fact-a"}) as index,
+        pytest.raises(SemanticLeakageError) as caught,
+    ):
+        derive_sidecar_weights(2, spans, index, closure=ledger)
+
+    leak = caught.value.leaks[0]
+    with pytest.raises(TypeError):
+        leak["kind"] = "rewritten"
+    assert isinstance(leak["actual_roles"], tuple)
+    with pytest.raises(AttributeError):
+        leak["actual_roles"].append("proof")
+
+
+def test_sidecar_weights_bind_independent_closure_hash_and_counts(route_index):
+    ledger = _occurrence_ledger(
+        8,
+        ((0, 2, "fact-a"), (6, 8, "fact-a")),
+    )
     spans = (
         TokenSemanticSpan(0, 2, "fact-a", "factual_payload"),
         TokenSemanticSpan(2, 4, "fact-a", "answer_state"),
@@ -642,7 +1044,28 @@ def test_split90_masks_only_every_routed_factual_payload_token(route_index):
         TokenSemanticSpan(6, 8, "fact-a", "factual_payload"),
     )
     with route_index({"fact-a"}) as index:
-        weights = derive_sidecar_weights(8, spans, index)
+        weights = derive_sidecar_weights(8, spans, index, closure=ledger)
+
+    assert weights.closure_sha256 == ledger.sha256
+    assert weights.closure_plan_sha256 == ledger.plan_sha256
+    assert weights.closure_occurrence_count == 2
+    assert weights.closure_payload_target_count == 4
+    assert weights.split90 == b"\x00\x00\x01\x01\x01\x01\x00\x00"
+
+
+def test_split90_masks_only_every_routed_factual_payload_token(route_index):
+    ledger = _occurrence_ledger(
+        8,
+        ((0, 2, "fact-a"), (6, 8, "fact-a")),
+    )
+    spans = (
+        TokenSemanticSpan(0, 2, "fact-a", "factual_payload"),
+        TokenSemanticSpan(2, 4, "fact-a", "answer_state"),
+        TokenSemanticSpan(4, 6, None, "rule"),
+        TokenSemanticSpan(6, 8, "fact-a", "factual_payload"),
+    )
+    with route_index({"fact-a"}) as index:
+        weights = derive_sidecar_weights(8, spans, index, closure=ledger)
 
     assert isinstance(weights, SidecarWeights)
     assert weights.dense == b"\x01" * 8
@@ -652,15 +1075,32 @@ def test_split90_masks_only_every_routed_factual_payload_token(route_index):
 
 
 def test_same_fact_overlapping_payload_spans_mask_the_exact_union(route_index):
+    ledger = _occurrence_ledger(
+        8,
+        ((0, 4, "fact-a"), (2, 6, "fact-a")),
+    )
     spans = (
         TokenSemanticSpan(0, 4, "fact-a", "factual_payload"),
         TokenSemanticSpan(2, 6, "fact-a", "factual_payload"),
         TokenSemanticSpan(6, 8, None, "operator"),
     )
     with route_index({"fact-a"}) as index:
-        weights = derive_sidecar_weights(8, spans, index)
+        weights = derive_sidecar_weights(8, spans, index, closure=ledger)
     assert weights.split90 == b"\x00" * 6 + b"\x01" * 2
     assert weights.routed_payload_targets == 6
+
+
+def test_none_fact_semantic_spans_may_not_overlap(route_index):
+    ledger = _occurrence_ledger(4, ())
+    spans = (
+        TokenSemanticSpan(0, 3, None, "rule"),
+        TokenSemanticSpan(2, 4, None, "rule"),
+    )
+    with (
+        route_index(set()) as index,
+        pytest.raises(ValueError, match="overlap"),
+    ):
+        derive_sidecar_weights(4, spans, index, closure=ledger)
 
 
 @pytest.mark.parametrize(
@@ -695,11 +1135,12 @@ def test_semantic_spans_fail_closed_on_order_bounds_and_cross_fact_overlap(
     spans: tuple[TokenSemanticSpan, ...],
     message: str,
 ):
+    ledger = _occurrence_ledger(token_count, ())
     with (
         route_index({"fact-a", "fact-b"}) as index,
         pytest.raises(ValueError, match=message),
     ):
-        derive_sidecar_weights(token_count, spans, index)
+        derive_sidecar_weights(token_count, spans, index, closure=ledger)
 
 
 @pytest.mark.parametrize(
@@ -726,11 +1167,12 @@ def test_proof_or_answer_tokens_cannot_also_be_marked_factual(
     spans: tuple[TokenSemanticSpan, ...],
     message: str,
 ):
+    ledger = _occurrence_ledger(2, ())
     with (
         route_index({"fact-a"}) as index,
         pytest.raises(SemanticLeakageError, match=message),
     ):
-        derive_sidecar_weights(2, spans, index)
+        derive_sidecar_weights(2, spans, index, closure=ledger)
 
 
 @pytest.mark.parametrize(
@@ -749,6 +1191,7 @@ def test_token_semantic_span_rejects_invalid_scalar_or_role(factory):
 
 
 def test_sidecar_audit_rejects_one_unmasked_target_and_nonbinary_value(route_index):
+    ledger = _occurrence_ledger(4, ((0, 3, "fact-a"),))
     spans = (
         TokenSemanticSpan(0, 3, "fact-a", "factual_payload"),
         TokenSemanticSpan(3, 4, None, "rule"),
@@ -759,6 +1202,7 @@ def test_sidecar_audit_rejects_one_unmasked_target_and_nonbinary_value(route_ind
                 4,
                 spans,
                 index,
+                closure=ledger,
                 dense=b"\x01" * 4,
                 split90=b"\x00\x01\x00\x01",
             )
@@ -767,12 +1211,14 @@ def test_sidecar_audit_rejects_one_unmasked_target_and_nonbinary_value(route_ind
                 4,
                 spans,
                 index,
+                closure=ledger,
                 dense=b"\x01" * 4,
                 split90=b"\x00\x00\x02\x01",
             )
 
 
 def test_sidecar_audit_rejects_masking_nonpayload_or_dense_targets(route_index):
+    ledger = _occurrence_ledger(4, ((0, 2, "fact-a"),))
     spans = (
         TokenSemanticSpan(0, 2, "fact-a", "factual_payload"),
         TokenSemanticSpan(2, 4, None, "proof"),
@@ -783,6 +1229,7 @@ def test_sidecar_audit_rejects_masking_nonpayload_or_dense_targets(route_index):
                 4,
                 spans,
                 index,
+                closure=ledger,
                 dense=b"\x01" * 4,
                 split90=b"\x00\x00\x00\x01",
             )
@@ -791,6 +1238,7 @@ def test_sidecar_audit_rejects_masking_nonpayload_or_dense_targets(route_index):
                 4,
                 spans,
                 index,
+                closure=ledger,
                 dense=b"\x01\x00\x01\x01",
                 split90=b"\x00\x00\x01\x01",
             )

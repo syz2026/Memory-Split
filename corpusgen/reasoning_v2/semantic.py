@@ -10,11 +10,13 @@ import secrets
 import sqlite3
 import stat
 import unicodedata
-from collections.abc import Callable, Iterable, Iterator, Sequence
-from dataclasses import dataclass
+from collections import Counter
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
+from dataclasses import dataclass, field
 from fractions import Fraction
 from itertools import zip_longest
 from pathlib import Path
+from types import MappingProxyType
 from typing import Literal, NoReturn, Self, cast
 from urllib.parse import quote
 
@@ -46,7 +48,6 @@ from corpusgen.reasoning import (
 from corpusgen.reasoning import (
     SemanticLeakageError as _ClosureSemanticLeakageError,
 )
-from corpusgen.reasoning_v2 import catalog as _catalog_module
 from corpusgen.reasoning_v2.catalog import (
     CatalogRecord,
     InputCatalog,
@@ -61,11 +62,15 @@ _ROUTE_INDEX_NAME = "route-index.sqlite3"
 _ROUTE_MANIFEST_NAME = "route-manifest.jsonl"
 _DOSE_REPORT_NAME = "dose-report.json"
 _DECISION_STREAM_NAME = "route-decisions.jsonl"
+_ROUTE_INDEX_SCHEMA_SQL = (
+    "CREATE TABLE selected ("
+    "fact_id TEXT COLLATE BINARY NOT NULL PRIMARY KEY"
+    ") WITHOUT ROWID"
+)
 _SPLIT = "Split90"
 _TARGET_FRACTION = Fraction(9, 10)
 _EXTERNAL_SORT_CHUNK_ROWS = 50_000
 _EXTERNAL_SORT_MERGE_FAN_IN = 32
-_SQLITE_OPEN_LOCK = _catalog_module._SQLITE_OPEN_LOCK
 _SEMANTIC_ROLES = frozenset(
     {
         "plain_text",
@@ -76,6 +81,9 @@ _SEMANTIC_ROLES = frozenset(
         "proof",
         "answer_state",
     }
+)
+_COMPATIBLE_OVERLAP_ROLES = frozenset(
+    (role, role) for role in _SEMANTIC_ROLES
 )
 _FACT_VALUE_FIELDS = frozenset(
     {
@@ -119,6 +127,15 @@ def _route_index_read_hook(
     pinned_fd: int,
 ) -> None:
     del phase, parent_fd, name, pinned_fd
+
+
+def _database_open_hook(
+    phase: str,
+    directory_fd: int,
+    name: str,
+    pinned_fd: int,
+) -> None:
+    del phase, directory_fd, name, pinned_fd
 
 
 def _artifact_read_hook(
@@ -206,6 +223,32 @@ def _strict_json_bytes(payload: bytes, description: str) -> object:
     return value
 
 
+def _deep_freeze_json(value: object) -> object:
+    if isinstance(value, Mapping):
+        frozen: dict[str, object] = {}
+        for key, item in value.items():
+            if type(key) is not str:
+                raise TypeError("frozen JSON mappings require string keys")
+            frozen[key] = _deep_freeze_json(item)
+        return MappingProxyType(frozen)
+    if isinstance(value, (list, tuple)):
+        return tuple(_deep_freeze_json(item) for item in value)
+    if value is None or type(value) in {bool, int, float, str}:
+        return value
+    raise TypeError(f"unsupported frozen JSON value: {type(value).__name__}")
+
+
+def _deep_thaw_json(value: object) -> object:
+    if isinstance(value, Mapping):
+        return {
+            key: _deep_thaw_json(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, tuple):
+        return [_deep_thaw_json(item) for item in value]
+    return value
+
+
 def _byte_key(value: str) -> bytes:
     return value.encode("utf-8")
 
@@ -233,6 +276,16 @@ def _regular_inode_identity(
     )
 
 
+def _readonly_namespace_identity(
+    metadata: os.stat_result,
+) -> tuple[int, int, int, int, int, int, int, int]:
+    return (
+        *_file_identity(metadata),
+        metadata.st_mtime_ns,
+        metadata.st_ctime_ns,
+    )
+
+
 def _directory_identity(
     metadata: os.stat_result,
 ) -> tuple[int, int, int, int]:
@@ -241,6 +294,16 @@ def _directory_identity(
         metadata.st_ino,
         metadata.st_uid,
         stat.S_IMODE(metadata.st_mode),
+    )
+
+
+def _readonly_directory_namespace_identity(
+    metadata: os.stat_result,
+) -> tuple[int, int, int, int, int, int]:
+    return (
+        *_directory_identity(metadata),
+        metadata.st_mtime_ns,
+        metadata.st_ctime_ns,
     )
 
 
@@ -358,6 +421,35 @@ def _regular_commitment_at(
             raise ValueError(f"{description} identity changed while verifying")
     finally:
         os.close(descriptor)
+    return byte_count, digest.hexdigest()
+
+
+def _descriptor_commitment(
+    descriptor: int,
+    expected_identity: tuple[int, int, int, int, int, int],
+    description: str,
+) -> tuple[int, str]:
+    before = os.fstat(descriptor)
+    _require_owned_regular(before, description)
+    if _file_identity(before) != expected_identity:
+        raise ValueError(f"{description} identity changed before hashing")
+    digest = hashlib.sha256()
+    byte_count = 0
+    offset = 0
+    while offset < before.st_size:
+        chunk = os.pread(
+            descriptor,
+            min(1 << 20, before.st_size - offset),
+            offset,
+        )
+        if not chunk:
+            raise ValueError(f"{description} ended before declared size")
+        digest.update(chunk)
+        byte_count += len(chunk)
+        offset += len(chunk)
+    after = os.fstat(descriptor)
+    if _file_identity(after) != expected_identity:
+        raise ValueError(f"{description} identity changed while hashing")
     return byte_count, digest.hexdigest()
 
 
@@ -510,46 +602,170 @@ def _quarantine_stage(
     return quarantine_name
 
 
-def _connect_sqlite_at(
+def _sqlite_reported_main_path(
+    connection: sqlite3.Connection,
+    description: str,
+) -> Path:
+    rows = tuple(connection.execute("PRAGMA database_list"))
+    main_rows = tuple(row for row in rows if len(row) == 3 and row[1] == "main")
+    auxiliary_rows = tuple(row for row in rows if row not in main_rows)
+    if (
+        len(main_rows) != 1
+        or type(main_rows[0][2]) is not str
+        or any(
+            len(row) != 3 or row[1] != "temp" or row[2] != ""
+            for row in auxiliary_rows
+        )
+    ):
+        raise ValueError(f"{description} database list is not canonical")
+    path = Path(main_rows[0][2])
+    if not path.is_absolute():
+        raise ValueError(f"{description} SQLite path is not absolute")
+    return path
+
+
+def _prove_sqlite_connection_inode(
+    connection: sqlite3.Connection,
     directory_fd: int,
     name: str,
+    absolute_path: Path,
+    pinned_fd: int,
+    *,
+    description: str,
+    expected_namespace_identity: tuple[int, int, int, int, int, int, int, int]
+    | None = None,
+    expected_parent_namespace_identity: tuple[int, int, int, int, int, int]
+    | None = None,
+) -> None:
+    reported_path = _sqlite_reported_main_path(connection, description)
+    if os.path.normpath(os.fspath(reported_path)) != os.path.normpath(
+        os.fspath(absolute_path)
+    ):
+        raise ValueError(f"{description} SQLite path changed")
+    reported = os.stat(reported_path, follow_symlinks=False)
+    _prove_pinned_absolute_path(
+        directory_fd,
+        name,
+        absolute_path,
+        pinned_fd,
+        description=description,
+        expected_namespace_identity=expected_namespace_identity,
+        expected_parent_namespace_identity=(
+            expected_parent_namespace_identity
+        ),
+    )
+    if _regular_inode_identity(reported) != _regular_inode_identity(
+        os.fstat(pinned_fd)
+    ):
+        raise ValueError(f"{description} SQLite inode differs from pinned file")
+    if expected_namespace_identity is not None and (
+        _readonly_namespace_identity(reported) != expected_namespace_identity
+    ):
+        raise ValueError(f"{description} namespace ABA changed file identity")
+
+
+def _prove_pinned_absolute_path(
+    directory_fd: int,
+    name: str,
+    absolute_path: Path,
+    pinned_fd: int,
+    *,
+    description: str,
+    expected_namespace_identity: tuple[int, int, int, int, int, int, int, int]
+    | None = None,
+    expected_parent_namespace_identity: tuple[int, int, int, int, int, int]
+    | None = None,
+) -> None:
+    pinned = os.fstat(pinned_fd)
+    named = entry_lstat(directory_fd, name)
+    requested = os.stat(absolute_path, follow_symlinks=False)
+    for metadata in (pinned, named, requested):
+        _require_owned_regular(metadata, description)
+    pinned_parent = os.fstat(directory_fd)
+    requested_parent = os.stat(
+        absolute_path.parent,
+        follow_symlinks=False,
+    )
+    _require_owned_directory(pinned_parent, f"{description} parent")
+    _require_owned_directory(requested_parent, f"{description} parent")
+    if _directory_identity(pinned_parent) != _directory_identity(
+        requested_parent
+    ):
+        raise ValueError(
+            f"{description} parent path inode differs from pinned directory"
+        )
+    if expected_parent_namespace_identity is not None and (
+        _readonly_directory_namespace_identity(pinned_parent)
+        != expected_parent_namespace_identity
+        or _readonly_directory_namespace_identity(requested_parent)
+        != expected_parent_namespace_identity
+    ):
+        raise ValueError(
+            f"{description} parent namespace ABA changed identity"
+        )
+    identity = _regular_inode_identity(pinned)
+    if any(
+        _regular_inode_identity(metadata) != identity
+        for metadata in (named, requested)
+    ):
+        raise ValueError(
+            f"{description} path inode identity differs from pinned file"
+        )
+    if expected_namespace_identity is not None and any(
+        _readonly_namespace_identity(metadata) != expected_namespace_identity
+        for metadata in (pinned, named, requested)
+    ):
+        raise ValueError(f"{description} namespace ABA changed file identity")
+
+
+def _connect_sqlite_absolute(
+    directory_fd: int,
+    name: str,
+    absolute_path: Path,
     pinned_fd: int,
     *,
     mode: Literal["ro", "rw"],
+    description: str,
+    expected_namespace_identity: tuple[int, int, int, int, int, int, int, int],
+    expected_parent_namespace_identity: tuple[int, int, int, int, int, int],
     hook: Callable[[str, int, str, int], None] | None = None,
 ) -> sqlite3.Connection:
+    if not absolute_path.is_absolute() or absolute_path.name != name:
+        raise ValueError(f"{description} requires an absolute private path")
     callback = hook or (lambda phase, parent, item, descriptor: None)
     connection: sqlite3.Connection | None = None
     try:
-        with _SQLITE_OPEN_LOCK:
-            callback("before_sqlite_open", directory_fd, name, pinned_fd)
-            callback("before_cwd_snapshot", directory_fd, name, pinned_fd)
-            cwd_fd = os.open(
-                ".",
-                os.O_RDONLY
-                | getattr(os, "O_CLOEXEC", 0)
-                | getattr(os, "O_DIRECTORY", 0),
-            )
-            cwd_changed = False
-            try:
-                callback("after_cwd_snapshot", directory_fd, name, pinned_fd)
-                os.fchdir(directory_fd)
-                cwd_changed = True
-                callback("after_stage_fchdir", directory_fd, name, pinned_fd)
-                connection = sqlite3.connect(
-                    f"file:{quote(name, safe='')}?mode={mode}",
-                    uri=True,
-                )
-                callback("sqlite_opened", directory_fd, name, pinned_fd)
-            finally:
-                try:
-                    if cwd_changed:
-                        os.fchdir(cwd_fd)
-                finally:
-                    os.close(cwd_fd)
-                if cwd_changed:
-                    callback("cwd_restored", directory_fd, name, pinned_fd)
-            callback("after_sqlite_open", directory_fd, name, pinned_fd)
+        callback("before_sqlite_open", directory_fd, name, pinned_fd)
+        connection = sqlite3.connect(
+            f"file:{quote(os.fspath(absolute_path), safe='/')}?mode={mode}",
+            uri=True,
+        )
+        callback("sqlite_opened", directory_fd, name, pinned_fd)
+        _prove_sqlite_connection_inode(
+            connection,
+            directory_fd,
+            name,
+            absolute_path,
+            pinned_fd,
+            description=description,
+            expected_namespace_identity=expected_namespace_identity,
+            expected_parent_namespace_identity=(
+                expected_parent_namespace_identity
+            ),
+        )
+        callback("after_sqlite_open", directory_fd, name, pinned_fd)
+        _prove_sqlite_connection_inode(
+            connection,
+            directory_fd,
+            name,
+            absolute_path,
+            pinned_fd,
+            description=description,
+            expected_namespace_identity=expected_namespace_identity,
+            expected_parent_namespace_identity=(
+                expected_parent_namespace_identity
+            ),
+        )
     except BaseException:
         if connection is not None:
             connection.close()
@@ -565,10 +781,20 @@ class _PinnedDatabase:
     descriptor: int
     identity: tuple[int, int, int, int, int]
     name: str
+    absolute_path: Path
+    description: str
 
     def close_connection(self, directory_fd: int, description: str) -> None:
         if self.connection is None:
             return
+        _prove_sqlite_connection_inode(
+            self.connection,
+            directory_fd,
+            self.name,
+            self.absolute_path,
+            self.descriptor,
+            description=description,
+        )
         quick_check = self.connection.execute("PRAGMA quick_check").fetchone()
         if quick_check != ("ok",):
             raise ValueError(f"{description} integrity check failed")
@@ -578,9 +804,11 @@ class _PinnedDatabase:
         os.fsync(self.descriptor)
         pinned = os.fstat(self.descriptor)
         named = entry_lstat(directory_fd, self.name)
+        requested = os.stat(self.absolute_path, follow_symlinks=False)
         if (
             _regular_inode_identity(pinned) != self.identity
             or _regular_inode_identity(named) != self.identity
+            or _regular_inode_identity(requested) != self.identity
         ):
             raise ValueError(f"{description} identity changed after use")
 
@@ -598,8 +826,11 @@ class _PinnedDatabase:
 def _create_database(
     directory_fd: int,
     name: str,
+    absolute_path: Path,
     description: str,
 ) -> _PinnedDatabase:
+    if not absolute_path.is_absolute() or absolute_path.name != name:
+        raise ValueError(f"{description} requires an absolute private path")
     descriptor = os.open(
         name,
         os.O_RDWR
@@ -616,13 +847,38 @@ def _create_database(
         named = entry_lstat(directory_fd, name)
         _require_owned_regular(pinned, description)
         identity = _regular_inode_identity(pinned)
+        namespace_identity = _readonly_namespace_identity(pinned)
+        parent_namespace_identity = _readonly_directory_namespace_identity(
+            os.fstat(directory_fd)
+        )
         if _regular_inode_identity(named) != identity:
             raise ValueError(f"{description} identity changed before SQLite open")
-        connection = _connect_sqlite_at(
+        requested = os.stat(absolute_path, follow_symlinks=False)
+        if _readonly_namespace_identity(requested) != namespace_identity:
+            raise ValueError(
+                f"{description} absolute path differs before SQLite open"
+            )
+        requested_parent = os.stat(
+            absolute_path.parent,
+            follow_symlinks=False,
+        )
+        if (
+            _readonly_directory_namespace_identity(requested_parent)
+            != parent_namespace_identity
+        ):
+            raise ValueError(
+                f"{description} absolute parent differs before SQLite open"
+            )
+        connection = _connect_sqlite_absolute(
             directory_fd,
             name,
+            absolute_path,
             descriptor,
             mode="rw",
+            description=description,
+            expected_namespace_identity=namespace_identity,
+            expected_parent_namespace_identity=parent_namespace_identity,
+            hook=_database_open_hook,
         )
         named_after = entry_lstat(directory_fd, name)
         if (
@@ -643,6 +899,8 @@ def _create_database(
         descriptor=descriptor,
         identity=identity,
         name=name,
+        absolute_path=absolute_path,
+        description=description,
     )
 
 
@@ -656,7 +914,7 @@ class SemanticLeakageError(_ClosureSemanticLeakageError):
         routed_fact_ids: Sequence[str] = (),
         occurrences: Sequence[SemanticOccurrence] = (),
         metadata_errors: Sequence[str] = (),
-        leaks: Sequence[dict[str, object]] = (),
+        leaks: Sequence[Mapping[str, object]] = (),
     ) -> None:
         occurrence_rows = tuple(occurrences)
         errors = tuple(metadata_errors) or (message,)
@@ -667,10 +925,268 @@ class SemanticLeakageError(_ClosureSemanticLeakageError):
             unmasked_occurrences=occurrence_rows,
             metadata_errors=errors,
         )
-        self.leaks = tuple(leaks)
+        self.leaks = tuple(
+            cast(Mapping[str, object], _deep_freeze_json(leak))
+            for leak in leaks
+        )
         self.detail = message
         super().__init__(report)
         self.args = (f"{message}: {self.args[0]}",)
+
+
+@dataclass(frozen=True)
+class TokenOccurrenceBinding:
+    field_id: str
+    char_start: int
+    char_end: int
+    fact_id: str
+    surface: str
+    token_start: int
+    token_end: int
+
+    def __post_init__(self) -> None:
+        _strict_text(self.field_id, "occurrence binding field ID")
+        _strict_text(self.fact_id, "occurrence binding fact ID")
+        _strict_text(self.surface, "occurrence binding surface")
+        if (
+            type(self.char_start) is not int
+            or type(self.char_end) is not int
+            or self.char_start < 0
+            or self.char_end <= self.char_start
+        ):
+            raise ValueError("occurrence binding character bounds are invalid")
+        if (
+            type(self.token_start) is not int
+            or type(self.token_end) is not int
+            or self.token_start < 0
+            or self.token_end <= self.token_start
+        ):
+            raise ValueError("occurrence binding token bounds are invalid")
+
+
+def _semantic_fact_dict(fact: SemanticFact) -> dict[str, object]:
+    return {
+        "fact_id": fact.fact_id,
+        "surfaces": list(fact.surfaces),
+    }
+
+
+def _supervised_field_dict(value: SupervisedField) -> dict[str, object]:
+    return {
+        "field_id": value.field_id,
+        "supervised": value.supervised,
+        "text": value.text,
+    }
+
+
+def _semantic_occurrence_dict(
+    occurrence: SemanticOccurrence,
+) -> dict[str, object]:
+    return occurrence.as_dict()
+
+
+def _token_occurrence_binding_dict(
+    binding: TokenOccurrenceBinding,
+) -> dict[str, object]:
+    return {
+        "char_end": binding.char_end,
+        "char_start": binding.char_start,
+        "fact_id": binding.fact_id,
+        "field_id": binding.field_id,
+        "surface": binding.surface,
+        "token_end": binding.token_end,
+        "token_start": binding.token_start,
+    }
+
+
+def _token_interval_union_count(
+    bindings: tuple[TokenOccurrenceBinding, ...],
+) -> int:
+    intervals = sorted(
+        (binding.token_start, binding.token_end) for binding in bindings
+    )
+    if not intervals:
+        return 0
+    total = 0
+    active_start, active_end = intervals[0]
+    for start, end in intervals[1:]:
+        if start > active_end:
+            total += active_end - active_start
+            active_start, active_end = start, end
+        else:
+            active_end = max(active_end, end)
+    return total + active_end - active_start
+
+
+@dataclass(frozen=True)
+class OccurrenceClosureLedger:
+    token_count: int
+    facts: tuple[SemanticFact, ...]
+    fields: tuple[SupervisedField, ...]
+    bindings: tuple[TokenOccurrenceBinding, ...]
+    plan_sha256: str = field(init=False)
+    plan_occurrence_count: int = field(init=False)
+    payload_occurrence_count: int = field(init=False)
+    payload_target_count: int = field(init=False)
+    sha256: str = field(init=False)
+
+    def __post_init__(self) -> None:
+        if type(self.token_count) is not int or self.token_count < 0:
+            raise ValueError("closure ledger token count must be non-negative")
+        if type(self.facts) is not tuple or any(
+            not isinstance(fact, SemanticFact) for fact in self.facts
+        ):
+            raise TypeError("closure ledger facts must be a SemanticFact tuple")
+        if type(self.fields) is not tuple or any(
+            not isinstance(value, SupervisedField) for value in self.fields
+        ):
+            raise TypeError(
+                "closure ledger fields must be a SupervisedField tuple"
+            )
+        if type(self.bindings) is not tuple or any(
+            not isinstance(binding, TokenOccurrenceBinding)
+            for binding in self.bindings
+        ):
+            raise TypeError(
+                "closure ledger bindings must be a TokenOccurrenceBinding tuple"
+            )
+        fact_ids = tuple(fact.fact_id for fact in self.facts)
+        if fact_ids != tuple(sorted(fact_ids, key=_byte_key)):
+            raise ValueError("closure ledger facts must use canonical order")
+        for fact in self.facts:
+            _strict_text(fact.fact_id, "closure ledger fact ID")
+            if fact.surfaces != tuple(sorted(fact.surfaces, key=_byte_key)):
+                raise ValueError(
+                    "closure ledger surfaces must use canonical order"
+                )
+            for surface in fact.surfaces:
+                _strict_text(surface, "closure ledger fact surface")
+        field_ids = tuple(value.field_id for value in self.fields)
+        if field_ids != tuple(sorted(field_ids, key=_byte_key)):
+            raise ValueError("closure ledger fields must use canonical order")
+        for value in self.fields:
+            _strict_text(value.field_id, "closure ledger field ID")
+            _strict_text(
+                value.text,
+                "closure ledger field text",
+                nonempty=False,
+            )
+        for binding in self.bindings:
+            if binding.token_end > self.token_count:
+                raise ValueError(
+                    "closure ledger binding exceeds token count"
+                )
+
+        plan = plan_occurrence_closure(self.facts, self.fields)
+        routed_fact_ids = tuple(fact.fact_id for fact in self.facts)
+        masks = plan.mask_for_routes(routed_fact_ids)
+        report = audit_occurrence_closure(
+            self.facts,
+            self.fields,
+            routed_fact_ids,
+            masks,
+            fail_closed=False,
+        )
+        if not report.passed or report.masked_occurrences != len(
+            plan.occurrences
+        ):
+            raise SemanticLeakageError(
+                "independent occurrence closure plan failed its audit",
+                routed_fact_ids=routed_fact_ids,
+                occurrences=report.unmasked_occurrences,
+                metadata_errors=report.metadata_errors,
+            )
+
+        expected = tuple(
+            (
+                occurrence.field_id,
+                occurrence.start,
+                occurrence.end,
+                occurrence.fact_id,
+                occurrence.surface,
+            )
+            for occurrence in plan.occurrences
+        )
+        supplied = tuple(
+            (
+                binding.field_id,
+                binding.char_start,
+                binding.char_end,
+                binding.fact_id,
+                binding.surface,
+            )
+            for binding in self.bindings
+        )
+        if supplied != expected:
+            raise SemanticLeakageError(
+                "token occurrence bindings do not exactly cover closure plan",
+                routed_fact_ids=routed_fact_ids,
+                metadata_errors=(
+                    "missing, extra, or reordered token occurrence binding",
+                ),
+            )
+
+        plan_bytes = canonical_json_bytes(
+            {
+                "facts": [_semantic_fact_dict(fact) for fact in self.facts],
+                "fields": [
+                    _supervised_field_dict(value) for value in self.fields
+                ],
+                "format": "memorysplit-occurrence-closure-plan-v1",
+                "occurrences": [
+                    _semantic_occurrence_dict(occurrence)
+                    for occurrence in plan.occurrences
+                ],
+            }
+        )
+        plan_sha256 = sha256_hex(plan_bytes)
+        payload_target_count = _token_interval_union_count(self.bindings)
+        ledger_bytes = canonical_json_bytes(
+            {
+                "bindings": [
+                    _token_occurrence_binding_dict(binding)
+                    for binding in self.bindings
+                ],
+                "format": "memorysplit-token-occurrence-ledger-v1",
+                "payload_occurrence_count": len(self.bindings),
+                "payload_target_count": payload_target_count,
+                "plan_occurrence_count": len(plan.occurrences),
+                "plan_sha256": plan_sha256,
+                "token_count": self.token_count,
+            }
+        )
+        object.__setattr__(self, "plan_sha256", plan_sha256)
+        object.__setattr__(
+            self,
+            "plan_occurrence_count",
+            len(plan.occurrences),
+        )
+        object.__setattr__(
+            self,
+            "payload_occurrence_count",
+            len(self.bindings),
+        )
+        object.__setattr__(
+            self,
+            "payload_target_count",
+            payload_target_count,
+        )
+        object.__setattr__(self, "sha256", sha256_hex(ledger_bytes))
+
+
+def build_occurrence_closure_ledger(
+    *,
+    token_count: int,
+    facts: tuple[SemanticFact, ...],
+    fields: tuple[SupervisedField, ...],
+    bindings: tuple[TokenOccurrenceBinding, ...],
+) -> OccurrenceClosureLedger:
+    return OccurrenceClosureLedger(
+        token_count=token_count,
+        facts=facts,
+        fields=fields,
+        bindings=bindings,
+    )
 
 
 @dataclass(frozen=True)
@@ -701,7 +1217,11 @@ class SidecarWeights:
     dense: bytes
     split90: bytes
     routed_payload_targets: int
-    leaks: tuple[dict[str, object], ...]
+    leaks: tuple[Mapping[str, object], ...]
+    closure_sha256: str
+    closure_plan_sha256: str
+    closure_occurrence_count: int
+    closure_payload_target_count: int
 
     def __post_init__(self) -> None:
         if type(self.dense) is not bytes or type(self.split90) is not bytes:
@@ -720,6 +1240,32 @@ class SidecarWeights:
             raise ValueError("routed payload target count disagrees with sidecar")
         if type(self.leaks) is not tuple:
             raise TypeError("semantic leaks must be a tuple")
+        object.__setattr__(
+            self,
+            "leaks",
+            tuple(
+                cast(Mapping[str, object], _deep_freeze_json(leak))
+                for leak in self.leaks
+            ),
+        )
+        for description, value in (
+            ("closure ledger SHA-256", self.closure_sha256),
+            ("closure plan SHA-256", self.closure_plan_sha256),
+        ):
+            if (
+                type(value) is not str
+                or len(value) != 64
+                or any(character not in "0123456789abcdef" for character in value)
+            ):
+                raise ValueError(f"{description} is invalid")
+        if (
+            type(self.closure_occurrence_count) is not int
+            or self.closure_occurrence_count < 0
+            or type(self.closure_payload_target_count) is not int
+            or self.closure_payload_target_count < 0
+            or self.closure_payload_target_count > len(self.dense)
+        ):
+            raise ValueError("closure ledger counts are invalid")
 
 
 @dataclass(frozen=True)
@@ -729,23 +1275,41 @@ class RouteArtifacts:
     dose_report_path: Path
     manifest_sha256: str
     dose_report_sha256: str
+    index_sha256: str
+    index_bytes: int
     external_fact_count: int
     distinct_fact_fraction: Fraction
     information_burden_fraction: Fraction
-    dose_report: dict[str, object]
+    dose_report: Mapping[str, object]
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.dose_report, Mapping):
+            raise TypeError("route dose report must be a mapping")
+        object.__setattr__(
+            self,
+            "dose_report",
+            cast(
+                Mapping[str, object],
+                _deep_freeze_json(self.dose_report),
+            ),
+        )
 
     def open_index(self) -> RouteIndex:
-        return RouteIndex.open(self.index_path)
+        return RouteIndex.open(
+            self.index_path,
+            expected_sha256=self.index_sha256,
+            expected_bytes=self.index_bytes,
+        )
 
 
 def _validate_route_index_schema(connection: sqlite3.Connection) -> None:
     objects = tuple(
         connection.execute(
-            "SELECT type, name FROM sqlite_schema "
+            "SELECT type, name, sql FROM sqlite_schema "
             "WHERE name NOT LIKE 'sqlite_%' ORDER BY type, name"
         )
     )
-    if objects != (("table", "selected"),):
+    if objects != (("table", "selected", _ROUTE_INDEX_SCHEMA_SQL),):
         raise ValueError("route index schema is not canonical")
     columns = tuple(connection.execute("PRAGMA table_info(selected)"))
     if (
@@ -756,19 +1320,43 @@ def _validate_route_index_schema(connection: sqlite3.Connection) -> None:
         or columns[0][5] != 1
     ):
         raise ValueError("route index selected table is not canonical")
+    indexes = tuple(connection.execute("PRAGMA index_list(selected)"))
+    if indexes != ((0, "sqlite_autoindex_selected_1", 1, "pk", 0),):
+        raise ValueError("route index primary index is not canonical")
+    index_columns = tuple(
+        connection.execute(
+            "PRAGMA index_xinfo('sqlite_autoindex_selected_1')"
+        )
+    )
+    if index_columns != ((0, 0, "fact_id", 0, "BINARY", 1),):
+        raise ValueError("route index collation is not canonical")
     if connection.execute("PRAGMA quick_check").fetchone() != ("ok",):
         raise ValueError("route index integrity check failed")
 
 
 class RouteIndex:
     @classmethod
-    def open(cls, database_path: Path) -> Self:
+    def open(
+        cls,
+        database_path: Path,
+        *,
+        expected_sha256: str | None = None,
+        expected_bytes: int | None = None,
+    ) -> Self:
         if not isinstance(database_path, Path):
             raise TypeError("route index path must be a pathlib.Path")
+        if not database_path.is_absolute():
+            raise ValueError("route index path must be absolute")
         parent_fd = -1
         try:
             parent_fd, name = open_parent_directory(database_path)
-            return cls._open_at(parent_fd, name, database_path)
+            return cls._open_at(
+                parent_fd,
+                name,
+                database_path,
+                expected_sha256=expected_sha256,
+                expected_bytes=expected_bytes,
+            )
         except OSError as error:
             if parent_fd >= 0:
                 os.close(parent_fd)
@@ -784,6 +1372,9 @@ class RouteIndex:
         parent_fd: int,
         name: str,
         database_path: Path,
+        *,
+        expected_sha256: str | None = None,
+        expected_bytes: int | None = None,
     ) -> Self:
         descriptor = -1
         connection: sqlite3.Connection | None = None
@@ -793,13 +1384,67 @@ class RouteIndex:
             descriptor, opened = open_regular_file_at(parent_fd, name)
             _require_owned_regular(opened, "route index")
             identity = _file_identity(opened)
+            namespace_identity = _readonly_namespace_identity(opened)
+            parent_namespace_identity = (
+                _readonly_directory_namespace_identity(
+                    os.fstat(parent_fd)
+                )
+            )
             if _file_identity(named) != identity:
                 raise ValueError("route index identity changed before open")
-            connection = _connect_sqlite_at(
+            if (expected_sha256 is None) != (expected_bytes is None):
+                raise ValueError(
+                    "route index hash and byte count must be supplied together"
+                )
+            if expected_sha256 is not None:
+                if (
+                    type(expected_sha256) is not str
+                    or len(expected_sha256) != 64
+                    or any(
+                        character not in "0123456789abcdef"
+                        for character in expected_sha256
+                    )
+                    or type(expected_bytes) is not int
+                    or expected_bytes < 0
+                ):
+                    raise ValueError("route index expected commitment is invalid")
+                actual_bytes, actual_sha256 = _descriptor_commitment(
+                    descriptor,
+                    identity,
+                    "route index",
+                )
+                if (
+                    actual_bytes != expected_bytes
+                    or actual_sha256 != expected_sha256
+                ):
+                    raise ValueError("route index SHA-256 or byte count differs")
+            requested = os.stat(database_path, follow_symlinks=False)
+            if _readonly_namespace_identity(requested) != namespace_identity:
+                raise ValueError(
+                    "route index absolute path identity changed before open"
+                )
+            requested_parent = os.stat(
+                database_path.parent,
+                follow_symlinks=False,
+            )
+            if (
+                _readonly_directory_namespace_identity(requested_parent)
+                != parent_namespace_identity
+            ):
+                raise ValueError(
+                    "route index absolute parent identity changed before open"
+                )
+            connection = _connect_sqlite_absolute(
                 parent_fd,
                 name,
+                database_path,
                 descriptor,
                 mode="ro",
+                description="route index",
+                expected_namespace_identity=namespace_identity,
+                expected_parent_namespace_identity=(
+                    parent_namespace_identity
+                ),
                 hook=_route_index_open_hook,
             )
             named_after = entry_lstat(parent_fd, name)
@@ -817,19 +1462,28 @@ class RouteIndex:
                 name,
                 descriptor,
             )
-            if (
-                _file_identity(os.fstat(descriptor)) != identity
-                or _file_identity(entry_lstat(parent_fd, name)) != identity
-            ):
-                raise ValueError(
-                    "route index identity changed during schema validation"
-                )
+            _prove_sqlite_connection_inode(
+                connection,
+                parent_fd,
+                name,
+                database_path,
+                descriptor,
+                description="route index",
+                expected_namespace_identity=namespace_identity,
+                expected_parent_namespace_identity=(
+                    parent_namespace_identity
+                ),
+            )
             result = cls.__new__(cls)
             result.database_path = database_path
             result._parent_fd = parent_fd
             result._name = name
             result._descriptor = descriptor
             result._identity = identity
+            result._namespace_identity = namespace_identity
+            result._parent_namespace_identity = parent_namespace_identity
+            result._expected_sha256 = expected_sha256
+            result._expected_bytes = expected_bytes
             result._connection = connection
             result._closed = False
             result._unsafe = False
@@ -861,6 +1515,18 @@ class RouteIndex:
                 or _file_identity(named) != self._identity
             ):
                 raise ValueError(f"route index identity changed {context}")
+            _prove_sqlite_connection_inode(
+                self._connection,
+                self._parent_fd,
+                self._name,
+                self.database_path,
+                self._descriptor,
+                description="route index",
+                expected_namespace_identity=self._namespace_identity,
+                expected_parent_namespace_identity=(
+                    self._parent_namespace_identity
+                ),
+            )
         except BaseException:
             self._unsafe = True
             raise
@@ -924,7 +1590,17 @@ class RouteIndex:
         self._connection.close()
         if not self._unsafe:
             try:
-                self._replay_identity("after close")
+                _prove_pinned_absolute_path(
+                    self._parent_fd,
+                    self._name,
+                    self.database_path,
+                    self._descriptor,
+                    description="route index",
+                    expected_namespace_identity=self._namespace_identity,
+                    expected_parent_namespace_identity=(
+                        self._parent_namespace_identity
+                    ),
+                )
             except (OSError, ValueError) as error:
                 identity_error = identity_error or error
         os.close(self._descriptor)
@@ -1081,10 +1757,14 @@ def _fact_from_reduced(
     )
 
 
-def _create_reducer(directory_fd: int) -> _PinnedDatabase:
+def _create_reducer(
+    directory_fd: int,
+    absolute_path: Path,
+) -> _PinnedDatabase:
     database = _create_database(
         directory_fd,
         _ROUTE_REDUCER_NAME,
+        absolute_path,
         "route reducer database",
     )
     assert database.connection is not None
@@ -1098,18 +1778,18 @@ def _create_reducer(directory_fd: int) -> _PinnedDatabase:
     return database
 
 
-def _create_route_index(directory_fd: int) -> _PinnedDatabase:
+def _create_route_index(
+    directory_fd: int,
+    absolute_path: Path,
+) -> _PinnedDatabase:
     database = _create_database(
         directory_fd,
         _ROUTE_INDEX_NAME,
+        absolute_path,
         "route index database",
     )
     assert database.connection is not None
-    database.connection.execute(
-        "CREATE TABLE selected ("
-        "fact_id TEXT NOT NULL PRIMARY KEY"
-        ") WITHOUT ROWID"
-    )
+    database.connection.execute(_ROUTE_INDEX_SCHEMA_SQL)
     return database
 
 
@@ -1360,7 +2040,7 @@ def audit_route_dose(
     external_facts: int,
     total_information_burden: Fraction,
     external_information_burden: Fraction,
-) -> dict[str, object]:
+) -> Mapping[str, object]:
     if (
         type(total_facts) is not int
         or type(external_facts) is not int
@@ -1389,20 +2069,27 @@ def audit_route_dose(
         raise ValueError("Split90 distinct fact dose is below 9/10")
     if burden_fraction < _TARGET_FRACTION:
         raise ValueError("Split90 information burden dose is below 9/10")
-    return {
-        "distinct_fact_fraction": _fraction_dict(distinct_fraction),
-        "distinct_fact_passed": True,
-        "external_fact_count": external_facts,
-        "external_information_burden_bits": _fraction_dict(external_burden),
-        "format": _ROUTE_DOSE_FORMAT,
-        "information_burden_fraction": _fraction_dict(burden_fraction),
-        "information_burden_passed": True,
-        "passed": True,
-        "split": _SPLIT,
-        "target_external_fraction": _fraction_dict(_TARGET_FRACTION),
-        "total_fact_count": total_facts,
-        "total_information_burden_bits": _fraction_dict(total_burden),
-    }
+    return cast(
+        Mapping[str, object],
+        _deep_freeze_json(
+            {
+                "distinct_fact_fraction": _fraction_dict(distinct_fraction),
+                "distinct_fact_passed": True,
+                "external_fact_count": external_facts,
+                "external_information_burden_bits": _fraction_dict(
+                    external_burden
+                ),
+                "format": _ROUTE_DOSE_FORMAT,
+                "information_burden_fraction": _fraction_dict(burden_fraction),
+                "information_burden_passed": True,
+                "passed": True,
+                "split": _SPLIT,
+                "target_external_fraction": _fraction_dict(_TARGET_FRACTION),
+                "total_fact_count": total_facts,
+                "total_information_burden_bits": _fraction_dict(total_burden),
+            }
+        ),
+    )
 
 
 def _selected(
@@ -1548,10 +2235,12 @@ def _route_artifacts(
     *,
     manifest_sha256: str,
     dose_report_sha256: str,
+    index_sha256: str,
+    index_bytes: int,
     external_fact_count: int,
     distinct_fact_fraction: Fraction,
     information_burden_fraction: Fraction,
-    dose_report: dict[str, object],
+    dose_report: Mapping[str, object],
 ) -> RouteArtifacts:
     return RouteArtifacts(
         manifest_path=output_root / _ROUTE_MANIFEST_NAME,
@@ -1559,10 +2248,15 @@ def _route_artifacts(
         dose_report_path=output_root / _DOSE_REPORT_NAME,
         manifest_sha256=manifest_sha256,
         dose_report_sha256=dose_report_sha256,
+        index_sha256=index_sha256,
+        index_bytes=index_bytes,
         external_fact_count=external_fact_count,
         distinct_fact_fraction=distinct_fact_fraction,
         information_burden_fraction=information_burden_fraction,
-        dose_report=dose_report,
+        dose_report=cast(
+            Mapping[str, object],
+            _deep_freeze_json(dose_report),
+        ),
     )
 
 
@@ -1570,10 +2264,19 @@ def _open_route_index_at(
     directory_fd: int,
     name: str,
     database_path: Path,
+    *,
+    expected_sha256: str | None = None,
+    expected_bytes: int | None = None,
 ) -> RouteIndex:
     duplicated = os.dup(directory_fd)
     try:
-        return RouteIndex._open_at(duplicated, name, database_path)
+        return RouteIndex._open_at(
+            duplicated,
+            name,
+            database_path,
+            expected_sha256=expected_sha256,
+            expected_bytes=expected_bytes,
+        )
     except BaseException:
         os.close(duplicated)
         raise
@@ -1581,16 +2284,25 @@ def _open_route_index_at(
 
 def _indexes_match(
     first_directory_fd: int,
+    first_root: Path,
     second_directory_fd: int,
+    second_root: Path,
+    *,
+    expected_sha256: str,
+    expected_bytes: int,
 ) -> bool:
     with _open_route_index_at(
         first_directory_fd,
         _ROUTE_INDEX_NAME,
-        Path(_ROUTE_INDEX_NAME),
+        first_root / _ROUTE_INDEX_NAME,
+        expected_sha256=expected_sha256,
+        expected_bytes=expected_bytes,
     ) as first, _open_route_index_at(
         second_directory_fd,
         _ROUTE_INDEX_NAME,
-        Path(_ROUTE_INDEX_NAME),
+        second_root / _ROUTE_INDEX_NAME,
+        expected_sha256=expected_sha256,
+        expected_bytes=expected_bytes,
     ) as second:
         sentinel = object()
         for left, right in zip_longest(
@@ -1605,6 +2317,7 @@ def _indexes_match(
 
 def _verify_output_stage(
     output_fd: int,
+    output_root: Path,
     *,
     manifest_bytes: int,
     manifest_sha256: str,
@@ -1643,7 +2356,9 @@ def _verify_output_stage(
     with _open_route_index_at(
         output_fd,
         _ROUTE_INDEX_NAME,
-        Path(_ROUTE_INDEX_NAME),
+        output_root / _ROUTE_INDEX_NAME,
+        expected_sha256=index_sha256,
+        expected_bytes=index_bytes,
     ):
         pass
 
@@ -1653,6 +2368,7 @@ def _verify_exact_route_winner(
     final_name: str,
     output_root: Path,
     candidate_fd: int,
+    candidate_root: Path,
     *,
     manifest_bytes: int,
     manifest_sha256: str,
@@ -1663,7 +2379,7 @@ def _verify_exact_route_winner(
     external_fact_count: int,
     distinct_fact_fraction: Fraction,
     information_burden_fraction: Fraction,
-    dose_report: dict[str, object],
+    dose_report: Mapping[str, object],
 ) -> RouteArtifacts:
     winner_fd = -1
     try:
@@ -1676,6 +2392,7 @@ def _verify_exact_route_winner(
             raise ValueError("route winner identity changed before verification")
         _verify_output_stage(
             winner_fd,
+            output_root,
             manifest_bytes=manifest_bytes,
             manifest_sha256=manifest_sha256,
             dose_report_bytes=dose_report_bytes,
@@ -1683,7 +2400,14 @@ def _verify_exact_route_winner(
             index_bytes=index_bytes,
             index_sha256=index_sha256,
         )
-        if not _indexes_match(winner_fd, candidate_fd):
+        if not _indexes_match(
+            winner_fd,
+            output_root,
+            candidate_fd,
+            candidate_root,
+            expected_sha256=index_sha256,
+            expected_bytes=index_bytes,
+        ):
             raise ValueError("route winner index differs")
         if (
             _directory_identity(os.fstat(winner_fd)) != identity
@@ -1695,6 +2419,8 @@ def _verify_exact_route_winner(
             output_root,
             manifest_sha256=manifest_sha256,
             dose_report_sha256=dose_report_sha256,
+            index_sha256=index_sha256,
+            index_bytes=index_bytes,
             external_fact_count=external_fact_count,
             distinct_fact_fraction=distinct_fact_fraction,
             information_burden_fraction=information_burden_fraction,
@@ -1714,6 +2440,8 @@ def build_route_artifacts(
 ) -> RouteArtifacts:
     if not isinstance(work_root, Path) or not isinstance(output_root, Path):
         raise TypeError("route work and output roots must be pathlib.Path values")
+    if not work_root.is_absolute() or not output_root.is_absolute():
+        raise ValueError("route work and output roots must be absolute")
     if os.fspath(work_root) == os.fspath(output_root):
         raise ValueError("route work and output roots must differ")
 
@@ -1764,8 +2492,13 @@ def build_route_artifacts(
             output_stage_fd,
             output_stage_identity,
         ) = _new_stage(output_parent_fd, output_name)
+        work_stage_path = work_root.parent / work_stage_name
+        output_stage_path = output_root.parent / output_stage_name
 
-        reducer = _create_reducer(work_stage_fd)
+        reducer = _create_reducer(
+            work_stage_fd,
+            work_stage_path / _ROUTE_REDUCER_NAME,
+        )
         assert reducer.connection is not None
         total_facts = _reduce_catalog(catalog, reducer.connection)
         rank_rows = external_sort_rows(
@@ -1778,7 +2511,10 @@ def build_route_artifacts(
             raise ValueError("external route rank row count changed")
 
         quota = minimally_rounded_quota(total_facts, _TARGET_FRACTION)
-        selected_database = _create_route_index(output_stage_fd)
+        selected_database = _create_route_index(
+            output_stage_fd,
+            output_stage_path / _ROUTE_INDEX_NAME,
+        )
         assert selected_database.connection is not None
         total_burden = Fraction()
         selected_burden = Fraction()
@@ -1840,6 +2576,22 @@ def build_route_artifacts(
         )
         if decision_row_count != total_facts:
             raise ValueError("route decision row count changed")
+
+        selected_database.close_connection(
+            output_stage_fd,
+            "route index database",
+        )
+        selected_database.close_descriptor()
+        selected_database = None
+        index_bytes, index_sha256 = _regular_commitment_at(
+            output_stage_fd,
+            _ROUTE_INDEX_NAME,
+            description="route index",
+        )
+        reducer.close_connection(work_stage_fd, "route reducer database")
+        reducer.close_descriptor()
+        reducer = None
+
         header = {
             "decision_stream_bytes": decision_bytes,
             "decision_stream_sha256": decision_sha256,
@@ -1852,6 +2604,8 @@ def build_route_artifacts(
             "information_burden_fraction": _fraction_dict(
                 information_burden_fraction
             ),
+            "index_bytes": index_bytes,
+            "index_sha256": index_sha256,
             "metadata_scope": METADATA_SCOPE,
             "policy": ROUTE_POLICY,
             "row_count": total_facts,
@@ -1884,7 +2638,9 @@ def build_route_artifacts(
         manifest_bytes = len(header_bytes) + decision_bytes
         manifest_sha256 = manifest_digest.hexdigest()
 
-        dose_report_bytes = canonical_json_bytes(dose_report)
+        dose_report_bytes = canonical_json_bytes(
+            _deep_thaw_json(dose_report)
+        )
         dose_report_sha256 = sha256_hex(dose_report_bytes)
         _write_payload(
             output_stage_fd,
@@ -1892,23 +2648,9 @@ def build_route_artifacts(
             dose_report_bytes,
         )
 
-        selected_database.close_connection(
-            output_stage_fd,
-            "route index database",
-        )
-        selected_database.close_descriptor()
-        selected_database = None
-        index_bytes, index_sha256 = _regular_commitment_at(
-            output_stage_fd,
-            _ROUTE_INDEX_NAME,
-            description="route index",
-        )
-        reducer.close_connection(work_stage_fd, "route reducer database")
-        reducer.close_descriptor()
-        reducer = None
-
         _verify_output_stage(
             output_stage_fd,
+            output_stage_path,
             manifest_bytes=manifest_bytes,
             manifest_sha256=manifest_sha256,
             dose_report_bytes=len(dose_report_bytes),
@@ -1958,6 +2700,7 @@ def build_route_artifacts(
                 output_name,
                 output_root,
                 output_stage_fd,
+                output_stage_path,
                 manifest_bytes=manifest_bytes,
                 manifest_sha256=manifest_sha256,
                 dose_report_bytes=len(dose_report_bytes),
@@ -1990,6 +2733,7 @@ def build_route_artifacts(
                 raise ValueError("published route identity changed")
             _verify_output_stage(
                 final_fd,
+                output_root,
                 manifest_bytes=manifest_bytes,
                 manifest_sha256=manifest_sha256,
                 dose_report_bytes=len(dose_report_bytes),
@@ -2012,6 +2756,8 @@ def build_route_artifacts(
             output_root,
             manifest_sha256=manifest_sha256,
             dose_report_sha256=dose_report_sha256,
+            index_sha256=index_sha256,
+            index_bytes=index_bytes,
             external_fact_count=external_fact_count,
             distinct_fact_fraction=distinct_fraction,
             information_burden_fraction=information_burden_fraction,
@@ -2116,11 +2862,15 @@ def _validated_spans(
             if previous.token_end > span.token_start
         ]
         for previous in active:
+            if previous.fact_id is None or span.fact_id is None:
+                raise ValueError(
+                    "overlapping token semantic spans require non-null fact IDs"
+                )
             if previous.fact_id != span.fact_id:
                 raise ValueError(
                     "cross-fact overlapping token semantic spans"
                 )
-            if previous.role != span.role:
+            if (previous.role, span.role) not in _COMPATIBLE_OVERLAP_ROLES:
                 roles = {previous.role, span.role}
                 if "factual_payload" in roles and "proof" in roles:
                     raise SemanticLeakageError(
@@ -2147,26 +2897,102 @@ def _validated_spans(
     return spans
 
 
+def _validated_closure(
+    token_count: int,
+    closure: OccurrenceClosureLedger,
+) -> OccurrenceClosureLedger:
+    if not isinstance(closure, OccurrenceClosureLedger):
+        raise TypeError(
+            "sidecar derivation requires an OccurrenceClosureLedger"
+        )
+    if closure.token_count != token_count:
+        raise SemanticLeakageError(
+            "occurrence closure token count disagrees with sidecar"
+        )
+    return closure
+
+
+def _audit_span_occurrence_coverage(
+    spans: tuple[TokenSemanticSpan, ...],
+    closure: OccurrenceClosureLedger,
+) -> None:
+    expected = Counter(
+        (
+            binding.token_start,
+            binding.token_end,
+            binding.fact_id,
+        )
+        for binding in closure.bindings
+    )
+    actual = Counter(
+        (span.token_start, span.token_end, span.fact_id)
+        for span in spans
+        if span.role == "factual_payload"
+    )
+    if actual == expected:
+        return
+    missing = expected - actual
+    extra = actual - expected
+    leaks: list[dict[str, object]] = []
+    for (token_start, token_end, fact_id), count in sorted(missing.items()):
+        matching_roles = tuple(
+            span.role
+            for span in spans
+            if span.token_start == token_start
+            and span.token_end == token_end
+            and span.fact_id == fact_id
+            and span.role != "factual_payload"
+        )
+        leaks.append(
+            {
+                "actual_roles": list(matching_roles),
+                "count": count,
+                "fact_id": fact_id,
+                "kind": (
+                    "mislabeled_factual_payload"
+                    if matching_roles
+                    else "missing_factual_payload_span"
+                ),
+                "token_end": token_end,
+                "token_start": token_start,
+            }
+        )
+    for (token_start, token_end, fact_id), count in sorted(extra.items()):
+        leaks.append(
+            {
+                "count": count,
+                "fact_id": fact_id,
+                "kind": "extra_factual_payload_span",
+                "token_end": token_end,
+                "token_start": token_start,
+            }
+        )
+    raise SemanticLeakageError(
+        "semantic spans do not exactly cover independent occurrence closure",
+        routed_fact_ids=tuple(
+            binding.fact_id for binding in closure.bindings
+        ),
+        leaks=leaks,
+    )
+
+
 def _expected_split90(
     token_count: int,
-    spans: tuple[TokenSemanticSpan, ...],
+    closure: OccurrenceClosureLedger,
     routes: RouteIndex,
 ) -> bytes:
     if not isinstance(routes, RouteIndex):
         raise TypeError("routes must be a read-only RouteIndex")
     expected = bytearray(b"\x01" * token_count)
     route_cache: dict[str, bool] = {}
-    for span in spans:
-        if span.role != "factual_payload":
-            continue
-        assert span.fact_id is not None
-        external = route_cache.get(span.fact_id)
+    for binding in closure.bindings:
+        external = route_cache.get(binding.fact_id)
         if external is None:
-            external = routes.is_external(span.fact_id)
-            route_cache[span.fact_id] = external
+            external = routes.is_external(binding.fact_id)
+            route_cache[binding.fact_id] = external
         if external:
-            expected[span.token_start : span.token_end] = (
-                b"\x00" * (span.token_end - span.token_start)
+            expected[binding.token_start : binding.token_end] = (
+                b"\x00" * (binding.token_end - binding.token_start)
             )
     return bytes(expected)
 
@@ -2176,10 +3002,13 @@ def audit_sidecar_weights(
     spans: tuple[TokenSemanticSpan, ...],
     routes: RouteIndex,
     *,
+    closure: OccurrenceClosureLedger,
     dense: bytes,
     split90: bytes,
 ) -> tuple[dict[str, object], ...]:
     validated = _validated_spans(token_count, spans)
+    validated_closure = _validated_closure(token_count, closure)
+    _audit_span_occurrence_coverage(validated, validated_closure)
     if type(dense) is not bytes or type(split90) is not bytes:
         raise SemanticLeakageError("sidecar masks must be bytes")
     if len(dense) != token_count or len(split90) != token_count:
@@ -2190,7 +3019,7 @@ def audit_sidecar_weights(
         raise SemanticLeakageError("Dense sidecar masks supervised targets")
     if any(value not in (0, 1) for value in split90):
         raise SemanticLeakageError("Split90 sidecar is not binary")
-    expected = _expected_split90(token_count, validated, routes)
+    expected = _expected_split90(token_count, validated_closure, routes)
     leaks: list[dict[str, object]] = []
     for index, (expected_value, actual_value) in enumerate(
         zip(expected, split90, strict=True)
@@ -2231,14 +3060,19 @@ def derive_sidecar_weights(
     token_count: int,
     spans: tuple[TokenSemanticSpan, ...],
     routes: RouteIndex,
+    *,
+    closure: OccurrenceClosureLedger,
 ) -> SidecarWeights:
     validated = _validated_spans(token_count, spans)
+    validated_closure = _validated_closure(token_count, closure)
+    _audit_span_occurrence_coverage(validated, validated_closure)
     dense = b"\x01" * token_count
-    split90 = _expected_split90(token_count, validated, routes)
+    split90 = _expected_split90(token_count, validated_closure, routes)
     leaks = audit_sidecar_weights(
         token_count,
         validated,
         routes,
+        closure=validated_closure,
         dense=dense,
         split90=split90,
     )
@@ -2247,6 +3081,14 @@ def derive_sidecar_weights(
         split90=split90,
         routed_payload_targets=split90.count(0),
         leaks=leaks,
+        closure_sha256=validated_closure.sha256,
+        closure_plan_sha256=validated_closure.plan_sha256,
+        closure_occurrence_count=(
+            validated_closure.payload_occurrence_count
+        ),
+        closure_payload_target_count=(
+            validated_closure.payload_target_count
+        ),
     )
 
 
@@ -2311,16 +3153,19 @@ def audit_proof_surfaces(
 
 
 __all__ = (
+    "OccurrenceClosureLedger",
     "RouteArtifacts",
     "RouteIndex",
     "SemanticLeakageError",
     "SemanticRole",
     "SidecarWeights",
+    "TokenOccurrenceBinding",
     "TokenSemanticSpan",
     "audit_answer_state_surfaces",
     "audit_proof_surfaces",
     "audit_route_dose",
     "audit_sidecar_weights",
+    "build_occurrence_closure_ledger",
     "build_route_artifacts",
     "derive_sidecar_weights",
     "external_sort_rows",
