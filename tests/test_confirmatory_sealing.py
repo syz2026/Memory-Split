@@ -47,8 +47,35 @@ def _write_source(tmp_path: Path) -> tuple[Path, Path]:
     return source, preregistration
 
 
+def _publish_fixture(tmp_path: Path):
+    source, preregistration = _write_source(tmp_path)
+    output_root = tmp_path / "releases"
+    output_root.mkdir(mode=0o700)
+    output_root.chmod(0o700)
+    published = seal_release(
+        source_dir=source,
+        preregistration_path=preregistration,
+        output_root=output_root,
+        apply=True,
+    )
+    return source, preregistration, output_root, published
+
+
 def _rewrite_jsonl(path: Path, records: list[dict[str, object]]) -> None:
     path.write_bytes(b"".join(canonical_json_bytes(record) for record in records))
+
+
+def _write_file_at(directory_fd: int, name: str, content: bytes) -> None:
+    descriptor = os.open(
+        name,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+        0o600,
+        dir_fd=directory_fd,
+    )
+    try:
+        os.write(descriptor, content)
+    finally:
+        os.close(descriptor)
 
 
 def test_dry_run_builds_one_deterministic_v3_manifest_without_writing(tmp_path):
@@ -166,6 +193,44 @@ def test_sealing_rejects_gold_that_the_registered_solver_cannot_reproduce(tmp_pa
     _rewrite_jsonl(gold_path, gold)
 
     with pytest.raises(ValueError, match="gold|solver"):
+        seal_release(
+            source_dir=source,
+            preregistration_path=preregistration,
+            output_root=tmp_path / "releases",
+            apply=False,
+        )
+
+
+@pytest.mark.parametrize("mutation", ["insert", "remove", "replace"])
+def test_seal_plan_detects_source_membership_mutation_after_solver_replay(
+    tmp_path,
+    monkeypatch,
+    mutation,
+):
+    source, preregistration = _write_source(tmp_path)
+    items_bytes = source.joinpath("items.jsonl").read_bytes()
+
+    def mutate_source(event, **_context):
+        if event != "seal_plan_before_final_return":
+            return
+        if mutation == "insert":
+            source.joinpath("unexpected").write_text("inserted", encoding="utf-8")
+        elif mutation == "remove":
+            source.joinpath("stores.jsonl").rename(
+                tmp_path / "removed-source-stores.jsonl"
+            )
+        else:
+            items = source / "items.jsonl"
+            items.rename(tmp_path / "displaced-source-items.jsonl")
+            items.write_bytes(items_bytes)
+            items.chmod(0o644)
+
+    monkeypatch.setattr(sealing, "_run_mutation_hook", mutate_source)
+
+    with pytest.raises(
+        SealingError,
+        match="changed|membership|replaced|entries",
+    ):
         seal_release(
             source_dir=source,
             preregistration_path=preregistration,
@@ -361,6 +426,345 @@ def test_apply_detects_source_toctou_before_publication(tmp_path, monkeypatch):
     assert list(output_root.iterdir()) == []
 
 
+def test_publish_boundary_rejects_release_directory_swapped_before_return(
+    tmp_path,
+    monkeypatch,
+):
+    source, preregistration = _write_source(tmp_path)
+    output_root = tmp_path / "releases"
+    output_root.mkdir(mode=0o700)
+    output_root.chmod(0o700)
+    plan = seal_release(
+        source_dir=source,
+        preregistration_path=preregistration,
+        output_root=output_root,
+        apply=False,
+    )
+    displaced = output_root / "displaced-published-release"
+    sentinel = plan.release_dir / "replacement-sentinel"
+
+    def swap_release(event, **_context):
+        if event != "publish_before_final_return":
+            return
+        plan.release_dir.rename(displaced)
+        plan.release_dir.mkdir(mode=0o700)
+        plan.release_dir.chmod(0o700)
+        sentinel.write_text("replacement", encoding="utf-8")
+
+    monkeypatch.setattr(sealing, "_run_mutation_hook", swap_release)
+
+    with pytest.raises(SealingError, match="changed|replaced|identity|entries"):
+        seal_release(
+            source_dir=source,
+            preregistration_path=preregistration,
+            output_root=output_root,
+            apply=True,
+        )
+
+    assert sentinel.read_text(encoding="utf-8") == "replacement"
+    assert not displaced.exists()
+
+
+def test_quarantine_cleanup_recursively_deletes_only_the_pinned_directory(
+    tmp_path,
+):
+    parent = tmp_path / "cleanup-parent"
+    parent.mkdir(mode=0o700)
+    parent.chmod(0o700)
+    owned = parent / "owned"
+    owned.mkdir(mode=0o700)
+    owned.chmod(0o700)
+    owned.joinpath("payload").write_bytes(b"payload")
+    nested = owned / "nested"
+    nested.mkdir(mode=0o700)
+    nested.chmod(0o700)
+    nested.joinpath("child").write_bytes(b"child")
+    parent_fd = os.open(parent, sealing._directory_flags())
+    owned_fd = os.open("owned", sealing._directory_flags(), dir_fd=parent_fd)
+    try:
+        sealing._quarantine_and_delete_directory(
+            parent_fd,
+            "owned",
+            owned_fd,
+            label="test owned directory",
+        )
+    finally:
+        os.close(owned_fd)
+        os.close(parent_fd)
+
+    assert list(parent.iterdir()) == []
+
+
+def test_quarantine_cleanup_restores_replacement_directory_on_identity_mismatch(
+    tmp_path,
+    monkeypatch,
+):
+    parent = tmp_path / "cleanup-parent"
+    parent.mkdir(mode=0o700)
+    parent.chmod(0o700)
+    owned = parent / "owned"
+    owned.mkdir(mode=0o700)
+    owned.chmod(0o700)
+    owned.joinpath("payload").write_bytes(b"exact-owned")
+    parent_fd = os.open(parent, sealing._directory_flags())
+    owned_fd = os.open("owned", sealing._directory_flags(), dir_fd=parent_fd)
+
+    def replace_quarantine(event, **context):
+        if (
+            event != "cleanup_after_directory_quarantine"
+            or context["source_name"] != "owned"
+        ):
+            return
+        directory_fd = context["parent_fd"]
+        quarantine_name = context["quarantine_name"]
+        os.rename(
+            quarantine_name,
+            "displaced-exact-owned",
+            src_dir_fd=directory_fd,
+            dst_dir_fd=directory_fd,
+        )
+        os.mkdir(quarantine_name, 0o700, dir_fd=directory_fd)
+        replacement_fd = os.open(
+            quarantine_name,
+            sealing._directory_flags(),
+            dir_fd=directory_fd,
+        )
+        try:
+            _write_file_at(replacement_fd, "sentinel", b"replacement")
+        finally:
+            os.close(replacement_fd)
+
+    monkeypatch.setattr(sealing, "_run_mutation_hook", replace_quarantine)
+    try:
+        with pytest.raises(SealingError, match="quarantine|identity|restore"):
+            sealing._quarantine_and_delete_directory(
+                parent_fd,
+                "owned",
+                owned_fd,
+                label="test owned directory",
+            )
+    finally:
+        os.close(owned_fd)
+        os.close(parent_fd)
+
+    assert parent.joinpath("owned", "sentinel").read_bytes() == b"replacement"
+    assert (
+        parent.joinpath("displaced-exact-owned", "payload").read_bytes()
+        == b"exact-owned"
+    )
+
+
+def test_quarantine_cleanup_restores_replacement_member_on_identity_mismatch(
+    tmp_path,
+    monkeypatch,
+):
+    parent = tmp_path / "cleanup-parent"
+    parent.mkdir(mode=0o700)
+    parent.chmod(0o700)
+    owned = parent / "owned"
+    owned.mkdir(mode=0o700)
+    owned.chmod(0o700)
+    owned.joinpath("payload").write_bytes(b"exact-owned")
+    parent_fd = os.open(parent, sealing._directory_flags())
+    owned_fd = os.open("owned", sealing._directory_flags(), dir_fd=parent_fd)
+
+    def replace_member(event, **context):
+        if (
+            event != "cleanup_after_member_quarantine"
+            or context["source_name"] != "payload"
+        ):
+            return
+        directory_fd = context["parent_fd"]
+        quarantine_name = context["quarantine_name"]
+        os.rename(
+            quarantine_name,
+            "displaced-exact-member",
+            src_dir_fd=directory_fd,
+            dst_dir_fd=directory_fd,
+        )
+        _write_file_at(directory_fd, quarantine_name, b"replacement")
+
+    monkeypatch.setattr(sealing, "_run_mutation_hook", replace_member)
+    try:
+        with pytest.raises(SealingError, match="quarantine|identity|restore"):
+            sealing._quarantine_and_delete_directory(
+                parent_fd,
+                "owned",
+                owned_fd,
+                label="test owned directory",
+            )
+    finally:
+        os.close(owned_fd)
+        os.close(parent_fd)
+
+    assert parent.joinpath("owned", "payload").read_bytes() == b"replacement"
+    assert (
+        parent.joinpath("owned", "displaced-exact-member").read_bytes()
+        == b"exact-owned"
+    )
+
+
+@pytest.mark.parametrize("mutation", ["insert", "remove", "replace"])
+def test_quarantine_cleanup_detects_membership_mutation_after_rename(
+    tmp_path,
+    monkeypatch,
+    mutation,
+):
+    parent = tmp_path / "cleanup-parent"
+    parent.mkdir(mode=0o700)
+    parent.chmod(0o700)
+    owned = parent / "owned"
+    owned.mkdir(mode=0o700)
+    owned.chmod(0o700)
+    owned.joinpath("payload").write_bytes(b"exact-owned")
+    parent_fd = os.open(parent, sealing._directory_flags())
+    owned_fd = os.open("owned", sealing._directory_flags(), dir_fd=parent_fd)
+
+    def mutate_membership(event, **context):
+        if (
+            event != "cleanup_after_directory_quarantine"
+            or context["source_name"] != "owned"
+        ):
+            return
+        directory_fd = context["descriptor"]
+        if mutation == "insert":
+            _write_file_at(directory_fd, "unexpected", b"inserted")
+        elif mutation == "remove":
+            os.rename(
+                "payload",
+                "displaced-payload",
+                src_dir_fd=directory_fd,
+                dst_dir_fd=parent_fd,
+            )
+        else:
+            os.rename(
+                "payload",
+                "displaced-payload",
+                src_dir_fd=directory_fd,
+                dst_dir_fd=parent_fd,
+            )
+            _write_file_at(directory_fd, "payload", b"replacement")
+
+    monkeypatch.setattr(sealing, "_run_mutation_hook", mutate_membership)
+    try:
+        with pytest.raises(
+            SealingError,
+            match="changed|membership|identity|replaced",
+        ):
+            sealing._quarantine_and_delete_directory(
+                parent_fd,
+                "owned",
+                owned_fd,
+                label="test owned directory",
+            )
+    finally:
+        os.close(owned_fd)
+        os.close(parent_fd)
+
+    assert owned.is_dir()
+    if mutation == "insert":
+        assert owned.joinpath("payload").read_bytes() == b"exact-owned"
+        assert owned.joinpath("unexpected").read_bytes() == b"inserted"
+    elif mutation == "remove":
+        assert not owned.joinpath("payload").exists()
+        assert parent.joinpath("displaced-payload").read_bytes() == b"exact-owned"
+    else:
+        assert owned.joinpath("payload").read_bytes() == b"replacement"
+        assert parent.joinpath("displaced-payload").read_bytes() == b"exact-owned"
+
+
+def test_cleanup_failure_still_closes_all_staged_descriptors(
+    tmp_path,
+    monkeypatch,
+):
+    source, preregistration = _write_source(tmp_path)
+    output_root = tmp_path / "releases"
+    output_root.mkdir(mode=0o700)
+    output_root.chmod(0o700)
+    closed = False
+    original_close = sealing._close_staged
+
+    def mutate_published_membership(event, **context):
+        if event == "publish_before_final_return":
+            os.mkdir("unexpected", 0o700, dir_fd=context["release_fd"])
+
+    def fail_cleanup(*_args, **_kwargs):
+        raise SealingError("injected safe cleanup failure")
+
+    def record_close(staged):
+        nonlocal closed
+        closed = True
+        original_close(staged)
+
+    monkeypatch.setattr(
+        sealing,
+        "_run_mutation_hook",
+        mutate_published_membership,
+    )
+    monkeypatch.setattr(sealing, "_cleanup_staged_directory", fail_cleanup)
+    monkeypatch.setattr(sealing, "_close_staged", record_close)
+
+    with pytest.raises(SealingError, match="cleanup failure"):
+        seal_release(
+            source_dir=source,
+            preregistration_path=preregistration,
+            output_root=output_root,
+            apply=True,
+        )
+
+    assert closed
+
+
+@pytest.mark.parametrize("mutation", ["insert", "remove", "replace"])
+def test_publish_boundary_detects_concurrent_membership_mutation(
+    tmp_path,
+    monkeypatch,
+    mutation,
+):
+    source, preregistration = _write_source(tmp_path)
+    output_root = tmp_path / "releases"
+    output_root.mkdir(mode=0o700)
+    output_root.chmod(0o700)
+    plan = seal_release(
+        source_dir=source,
+        preregistration_path=preregistration,
+        output_root=output_root,
+        apply=False,
+    )
+    replacement_bytes = source.joinpath("items.jsonl").read_bytes()
+
+    def mutate_membership(event, **_context):
+        if event != "publish_before_final_return":
+            return
+        if mutation == "insert":
+            plan.release_dir.joinpath("unexpected").write_text(
+                "inserted",
+                encoding="utf-8",
+            )
+        elif mutation == "remove":
+            plan.release_dir.joinpath("stores.jsonl").rename(
+                output_root / "removed-published-stores.jsonl"
+            )
+        else:
+            items = plan.release_dir / "items.jsonl"
+            items.rename(output_root / "displaced-published-items.jsonl")
+            items.write_bytes(replacement_bytes)
+            items.chmod(0o644)
+
+    monkeypatch.setattr(sealing, "_run_mutation_hook", mutate_membership)
+
+    with pytest.raises(
+        SealingError,
+        match="changed|replaced|membership|entries",
+    ):
+        seal_release(
+            source_dir=source,
+            preregistration_path=preregistration,
+            output_root=output_root,
+            apply=True,
+        )
+
+
 @pytest.mark.parametrize("attack", ["symlink", "hardlink", "unsafe_mode"])
 def test_sealing_rejects_unsafe_source_files(tmp_path, attack):
     source, preregistration = _write_source(tmp_path)
@@ -525,6 +929,112 @@ def test_model_visible_preflight_rejects_unsafe_gold_metadata_without_reading_it
         )
 
 
+@pytest.mark.parametrize(
+    ("operation_name", "operation"),
+    [
+        (
+            "preflight",
+            lambda published: preflight_model_visible_release(
+                release_dir=published.release_dir,
+                expected_release_sha256=published.release_sha256,
+            ),
+        ),
+        (
+            "verify",
+            lambda published: verify_release(
+                release_dir=published.release_dir,
+                expected_release_sha256=published.release_sha256,
+            ),
+        ),
+    ],
+)
+def test_read_boundary_rejects_release_directory_swapped_before_return(
+    tmp_path,
+    monkeypatch,
+    operation_name,
+    operation,
+):
+    _source, _preregistration, _output_root, published = _publish_fixture(
+        tmp_path
+    )
+    displaced = tmp_path / f"{operation_name}-displaced-release"
+    sentinel = published.release_dir / "replacement-sentinel"
+
+    def swap_release(event, **_context):
+        if event != f"{operation_name}_before_final_return":
+            return
+        published.release_dir.rename(displaced)
+        published.release_dir.mkdir(mode=0o700)
+        published.release_dir.chmod(0o700)
+        sentinel.write_text("replacement", encoding="utf-8")
+
+    monkeypatch.setattr(
+        sealing,
+        "_run_mutation_hook",
+        swap_release,
+        raising=False,
+    )
+
+    with pytest.raises(SealingError, match="changed|replaced|identity|entries"):
+        operation(published)
+
+    assert sentinel.read_text(encoding="utf-8") == "replacement"
+    assert displaced.is_dir()
+
+
+@pytest.mark.parametrize("operation_name", ["preflight", "verify"])
+@pytest.mark.parametrize("mutation", ["insert", "remove", "replace"])
+def test_read_boundary_detects_concurrent_membership_mutation(
+    tmp_path,
+    monkeypatch,
+    operation_name,
+    mutation,
+):
+    _source, _preregistration, _output_root, published = _publish_fixture(
+        tmp_path
+    )
+    replacement_bytes = published.release_dir.joinpath("items.jsonl").read_bytes()
+
+    def mutate_membership(event, **_context):
+        if event != f"{operation_name}_before_final_return":
+            return
+        if mutation == "insert":
+            published.release_dir.joinpath("unexpected").write_text(
+                "inserted",
+                encoding="utf-8",
+            )
+        elif mutation == "remove":
+            published.release_dir.joinpath("stores.jsonl").rename(
+                tmp_path / f"{operation_name}-removed-stores.jsonl"
+            )
+        else:
+            items = published.release_dir / "items.jsonl"
+            items.rename(tmp_path / f"{operation_name}-displaced-items.jsonl")
+            items.write_bytes(replacement_bytes)
+            items.chmod(0o644)
+
+    monkeypatch.setattr(
+        sealing,
+        "_run_mutation_hook",
+        mutate_membership,
+        raising=False,
+    )
+    operation = (
+        preflight_model_visible_release
+        if operation_name == "preflight"
+        else verify_release
+    )
+
+    with pytest.raises(
+        SealingError,
+        match="changed|replaced|membership|entries",
+    ):
+        operation(
+            release_dir=published.release_dir,
+            expected_release_sha256=published.release_sha256,
+        )
+
+
 @pytest.mark.parametrize("artifact", ["items.jsonl", "sealed-gold.jsonl"])
 def test_explicit_verification_rejects_artifact_tampering(tmp_path, artifact):
     source, preregistration = _write_source(tmp_path)
@@ -659,3 +1169,42 @@ def test_cli_help_and_errors_preserve_json_only_stdout(arguments, capsys):
         assert result["published"] is False
         assert result["error"]["code"]
         assert result["error"]["message"]
+
+
+def test_cli_emits_repository_canonical_utf8_and_rejects_nonfinite(
+    tmp_path,
+    capsys,
+):
+    value = {"message": "mémoire 雪"}
+    sealing_cli._emit(value)
+    captured = capsys.readouterr()
+    assert captured.out == canonical_json_bytes(value).decode("utf-8")
+    assert "mémoire 雪" in captured.out
+    assert "\\u" not in captured.out
+
+    with pytest.raises(ValueError, match="non-canonical|non-finite"):
+        sealing_cli._emit({"bad": float("nan")})
+    assert capsys.readouterr().out == ""
+
+    unicode_root = tmp_path / "资料"
+    unicode_root.mkdir(mode=0o700)
+    source, preregistration = _write_source(unicode_root)
+    output_root = unicode_root / "发布"
+    return_code = sealing_cli.main(
+        [
+            "--source-dir",
+            str(source),
+            "--preregistration",
+            str(preregistration),
+            "--out-dir",
+            str(output_root),
+            "--dry-run",
+        ]
+    )
+    captured = capsys.readouterr()
+    assert return_code == 0
+    assert "资料" in captured.out
+    assert "发布" in captured.out
+    assert captured.out == canonical_json_bytes(
+        json.loads(captured.out)
+    ).decode("utf-8")

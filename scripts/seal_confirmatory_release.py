@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import argparse
-import json
 from pathlib import Path
 import sys
 from typing import Any
@@ -20,6 +19,7 @@ from evals.confirmatory.sealing import (
     seal_release,
     verify_release,
 )
+from evals.confirmatory.contracts import canonical_json_bytes
 
 
 class _ArgumentError(ValueError):
@@ -52,16 +52,7 @@ def _parser() -> _JsonArgumentParser:
 
 
 def _emit(value: dict[str, Any]) -> None:
-    sys.stdout.write(
-        json.dumps(
-            value,
-            sort_keys=True,
-            separators=(",", ":"),
-            ensure_ascii=True,
-            allow_nan=False,
-        )
-        + "\n"
-    )
+    sys.stdout.write(canonical_json_bytes(value).decode("utf-8"))
 
 
 def _counts(value: SealedReleaseResult | VerifiedSealedRelease) -> dict[str, int]:
