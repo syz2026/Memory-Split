@@ -83,3 +83,76 @@ empty, preserving the existing v2 semantic contract and fixture sources.
 ## Concerns
 
 None.
+
+## Filesystem-race review addendum
+
+- Status: `DONE`.
+- Review base:
+  `a979946e1b156da7eaa4f17fea46a6d8a05306e7`.
+- Fix commit:
+  `b87aa134bd5328e5b4ab76579353606167e4150c`.
+
+### Findings closed
+
+1. Publication, model-visible preflight, and full verification now hold the
+   immediate parent and release directory descriptors, capture exact sorted
+   membership plus directory device/inode/mode/owner/link/mtime/ctime state,
+   and re-assert parent-name binding and the full snapshot as the final
+   operation before returning.
+2. Staging and installed-release cleanup now atomically rename only a
+   descriptor-pinned directory to an unpredictable private quarantine.
+   Recursive deletion descriptor-pins every member, atomically quarantines it,
+   compares device/inode/type/mode/owner/link/size after rename, and verifies
+   the open descriptor reflects the exact unlink. A mismatched replacement is
+   restored or left untouched under a fail-closed error.
+3. Deterministic mutation hooks cover insertion, removal, same-name inode
+   replacement, and whole-directory swaps after source solver replay, after
+   installation, during preflight/verification, and during quarantine cleanup.
+   Directory snapshots detect same-name replacement through mtime/ctime even
+   when the final name set is unchanged.
+4. The CLI now emits `canonical_json_bytes` directly as UTF-8
+   (`ensure_ascii=False`) and rejects non-canonical or non-finite values.
+
+### Review RED to GREEN
+
+```text
+preflight/verify parent and membership races
+RED: 8 failed
+GREEN: 8 passed
+
+post-install parent and membership races
+RED: 4 failed
+GREEN: 4 passed
+
+quarantine directory/member identity races
+RED: 4 failed
+GREEN: 4 passed
+
+cleanup membership and descriptor-close races
+RED: 2 focused failures across the added cycles
+GREEN: all focused cases passed
+
+canonical non-ASCII CLI output
+RED: 1 failed
+GREEN: 1 passed
+
+source membership after solver replay
+RED: 3 failed
+GREEN: 3 passed
+```
+
+Final verification:
+
+```text
+original 23 sealing tests plus adversarial race regressions
+46 passed in 9.23s
+
+bounded existing confirmatory v2/v3 regressions
+204 passed in 149.22s
+```
+
+`python -m py_compile` passed for the sealing module, CLI, and focused tests.
+`git diff --check` passed, and `contracts.py`/`fixtures.py` remain unchanged
+from the review base. The review fix did not change the manifest, closure,
+solver, gold-isolation, no-replace, or scope-exclusion contracts. There are no
+remaining filesystem-race review concerns.
