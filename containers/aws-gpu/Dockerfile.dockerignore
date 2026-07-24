@@ -3,3 +3,6 @@
 !containers/aws-gpu/
 !containers/aws-gpu/inspect_container.py
 !containers/aws-gpu/requirements.lock
+!cluster/
+!cluster/aws/
+!cluster/aws/qualification_worker.py

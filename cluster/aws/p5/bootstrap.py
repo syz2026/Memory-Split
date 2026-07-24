@@ -33,6 +33,10 @@ from cluster.aws.p5.profile import (
     load_aws_p5_profile,
     validate_runtime_environment,
 )
+from cluster.aws.qualification import (
+    build_selected_bootstrap_receipt,
+    build_selected_environment_receipt,
+)
 from msctl.aws_contracts import (
     ARMS,
     COHORT_ASSIGNMENT_PATH,
@@ -1475,6 +1479,44 @@ def build_bootstrap_receipt(
         "schema_version": 2,
         "scratch_root": profile.scratch_root,
     }
+
+
+def bootstrap_authenticated_gpu_environment(
+    *,
+    selected_profile: object,
+    selection_binding: object,
+    runtime_lock_data: bytes,
+    runtime_sbom_data: bytes,
+    environment_receipt: Mapping[str, object],
+    hardware_reader: object,
+) -> dict[str, object]:
+    """Measure through an injected reader and bind selected bootstrap facts."""
+
+    measure = getattr(hardware_reader, "measure", None)
+    if not callable(measure):
+        raise BootstrapError("selected hardware reader is unavailable")
+    try:
+        evidence = measure(
+            selected_profile=selected_profile,
+            selection_binding=selection_binding,
+        )
+    except BootstrapError:
+        raise
+    except Exception as error:
+        raise BootstrapError("selected hardware measurement failed") from error
+    if not isinstance(evidence, Mapping):
+        raise BootstrapError("selected hardware measurement is not an object")
+    try:
+        return build_selected_bootstrap_receipt(
+            selected_profile=selected_profile,
+            selection_binding=selection_binding,
+            runtime_lock_data=runtime_lock_data,
+            runtime_sbom_data=runtime_sbom_data,
+            environment_receipt=environment_receipt,
+            hardware_evidence=evidence,
+        )
+    except (TypeError, ValueError) as error:
+        raise BootstrapError("selected bootstrap evidence is invalid") from error
 
 
 def _canonical_json(value: object) -> bytes:

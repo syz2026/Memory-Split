@@ -25,6 +25,7 @@ RUNTIME_LOCK_SCRIPT = RUNTIME_ROOT / "runtime_lock.py"
 HOST_CANDIDATE = RUNTIME_ROOT / "host-candidate.json"
 DOCKERIGNORE = RUNTIME_ROOT / "Dockerfile.dockerignore"
 INSPECT_SCRIPT = RUNTIME_ROOT / "inspect_container.py"
+QUALIFICATION_WORKER = ROOT / "cluster" / "aws" / "qualification_worker.py"
 
 BASE_REGISTRY = (
     "763104351884.dkr.ecr.us-east-1.amazonaws.com/pytorch-training"
@@ -424,6 +425,7 @@ def _image_binding() -> dict[str, object]:
                 REQUIREMENTS_LOCK.read_bytes()
             ).hexdigest(),
             "inspection_script_sha256": "c" * 64,
+            "qualification_worker_sha256": "d" * 64,
         },
         "repository_transcript_sha256": {
             "plan": {"head": "1" * 64, "tree": "2" * 64, "status": "3" * 64},
@@ -487,6 +489,7 @@ def test_dockerfile_uses_only_the_approved_digest_pinned_base():
     assert "--ignore-installed" not in text
     assert "--report=/opt/memorysplit/project-install-report.json" in text
     assert "inspect_container.py" in text
+    assert "qualification_worker.py" in text
     assert "RUN /opt/conda/bin/python -m pip install" in text
     assert "/opt/conda/bin/python -c" in text
     assert re.search(r"(?m)^RUN python\b", text) is None
@@ -536,6 +539,9 @@ def test_docker_context_is_a_closed_dependency_only_allowlist():
         "!containers/aws-gpu/",
         "!containers/aws-gpu/inspect_container.py",
         "!containers/aws-gpu/requirements.lock",
+        "!cluster/",
+        "!cluster/aws/",
+        "!cluster/aws/qualification_worker.py",
     ]
 
 
@@ -994,6 +1000,9 @@ def test_apply_holds_and_rehashes_build_inputs_before_push(tmp_path):
     runtime.mkdir(parents=True)
     for source in (DOCKERFILE, REQUIREMENTS_LOCK, DOCKERIGNORE, INSPECT_SCRIPT):
         shutil.copyfile(source, runtime / source.name)
+    worker = repository / "cluster" / "aws" / "qualification_worker.py"
+    worker.parent.mkdir(parents=True)
+    shutil.copyfile(QUALIFICATION_WORKER, worker)
     plan = module.render_build_plan(
         repository_uri=PRIVATE_REPOSITORY,
         source_commit=SOURCE_COMMIT,
@@ -1091,6 +1100,9 @@ def test_build_plan_binds_inputs_and_rejects_post_plan_drift(tmp_path):
     runtime.mkdir(parents=True)
     for source in (DOCKERFILE, REQUIREMENTS_LOCK, DOCKERIGNORE, INSPECT_SCRIPT):
         shutil.copyfile(source, runtime / source.name)
+    worker = repository / "cluster" / "aws" / "qualification_worker.py"
+    worker.parent.mkdir(parents=True)
+    shutil.copyfile(QUALIFICATION_WORKER, worker)
     plan = module.render_build_plan(
         repository_uri=PRIVATE_REPOSITORY,
         source_commit=SOURCE_COMMIT,
@@ -1111,6 +1123,9 @@ def test_build_plan_binds_inputs_and_rejects_post_plan_drift(tmp_path):
         ).hexdigest(),
         "inspection_script_sha256": hashlib.sha256(
             (runtime / "inspect_container.py").read_bytes()
+        ).hexdigest(),
+        "qualification_worker_sha256": hashlib.sha256(
+            worker.read_bytes()
         ).hexdigest(),
     }
 
@@ -1473,6 +1488,7 @@ def test_operator_tree_contains_no_embedded_secret_or_network_fetcher():
         BUILD_SCRIPT,
         RUNTIME_LOCK_SCRIPT,
         INSPECT_SCRIPT,
+        QUALIFICATION_WORKER,
         HOST_CANDIDATE,
     ]
     combined = "\n".join(

@@ -65,6 +65,7 @@ _INPUT_FIELDS = {
     "dockerignore_sha256",
     "dependency_lock_sha256",
     "inspection_script_sha256",
+    "qualification_worker_sha256",
 }
 _SHA1_RE = re.compile(r"^[0-9a-f]{40}$")
 _DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
@@ -463,6 +464,9 @@ _BUILD_INPUT_PATHS = {
     "inspection_script_sha256": Path(
         "containers/aws-gpu/inspect_container.py"
     ),
+    "qualification_worker_sha256": Path(
+        "cluster/aws/qualification_worker.py"
+    ),
 }
 
 
@@ -606,6 +610,9 @@ def render_build_plan(
     dockerignore_path = runtime_root / "Dockerfile.dockerignore"
     dependency_lock_path = runtime_root / "requirements.lock"
     inspection_script_path = runtime_root / "inspect_container.py"
+    qualification_worker_path = (
+        Path(root) / "cluster" / "aws" / "qualification_worker.py"
+    )
     dockerfile = str(dockerfile_path)
     if not Path(root).is_dir():
         raise BuildPlanError("repository root does not contain the AWS GPU Dockerfile")
@@ -625,6 +632,10 @@ def render_build_plan(
         "inspection_script_sha256": _regular_file_sha256(
             inspection_script_path,
             label="container inspection script",
+        ),
+        "qualification_worker_sha256": _regular_file_sha256(
+            qualification_worker_path,
+            label="qualification worker",
         ),
     }
     config = _absolute_path(docker_config, label="Docker configuration directory")

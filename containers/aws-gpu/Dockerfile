@@ -20,6 +20,7 @@ RUN groupadd --gid 10001 memorysplit \
 
 COPY containers/aws-gpu/requirements.lock /opt/memorysplit/requirements.lock
 COPY containers/aws-gpu/inspect_container.py /opt/memorysplit/inspect_container.py
+COPY cluster/aws/qualification_worker.py /opt/memorysplit/cluster/aws/qualification_worker.py
 
 RUN /opt/conda/bin/python -m pip install \
         --disable-pip-version-check \

@@ -26,6 +26,10 @@ from cluster.aws.p5.profile import (
     PROFILE_ID_V3,
     parse_aws_p5_profile_bytes,
 )
+from cluster.aws.qualification import (
+    build_selected_environment_receipt,
+    canonical_qualification_json,
+)
 from msctl.aws_contracts import (
     AWS_ENVIRONMENT_RECEIPT_V2_FIELDS,
     AWS_GPU_ATTESTATION_EVIDENCE_V1_FIELDS,
@@ -1591,6 +1595,57 @@ def attest_selected_gpu_environment(
     if apply:
         _publish_receipt(output_path, payload)
     return evidence
+
+
+def attest_authenticated_gpu_environment(
+    *,
+    selected_profile: object,
+    selection_binding: object,
+    runtime_lock_path: Path | str,
+    runtime_sbom_path: Path | str,
+    control_bundle_path: Path | str,
+    output_path: Path | str,
+    apply: bool,
+    imds_reader: object | None = None,
+    command_reader: object | None = None,
+    boot_id_path: Path | str = "/proc/sys/kernel/random/boot_id",
+) -> dict[str, object]:
+    """Measure a selected host, then bind it to authenticated selection.
+
+    The legacy ``attest_environment`` and its v2 bytes remain unchanged.  This
+    post-selection producer deliberately reuses the reviewed selected-profile
+    measurements and publishes a distinct closed receipt.
+    """
+
+    evidence = attest_selected_gpu_environment(
+        selected_profile=selected_profile,
+        runtime_lock_path=runtime_lock_path,
+        control_bundle_path=control_bundle_path,
+        output_path=output_path,
+        apply=False,
+        imds_reader=imds_reader,
+        command_reader=command_reader,
+        boot_id_path=boot_id_path,
+    )
+    lock_data = _read_regular(runtime_lock_path, label="runtime lock")
+    sbom_data = _read_regular(
+        runtime_sbom_path,
+        label="runtime SBOM",
+        maximum_bytes=512 * 1024 * 1024,
+    )
+    receipt = build_selected_environment_receipt(
+        selected_profile=selected_profile,
+        selection_binding=selection_binding,
+        runtime_lock_data=lock_data,
+        runtime_sbom_data=sbom_data,
+        attestation_evidence=evidence,
+    )
+    if apply:
+        _publish_receipt(
+            output_path,
+            canonical_qualification_json(receipt),
+        )
+    return receipt
 
 
 def _parser() -> argparse.ArgumentParser:
