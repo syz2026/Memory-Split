@@ -14,7 +14,7 @@ import tarfile
 import unicodedata
 import weakref
 import zlib
-from collections.abc import Iterator, Mapping
+from collections.abc import Iterable, Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath, PureWindowsPath
@@ -124,7 +124,7 @@ _UINT64 = struct.Struct(">Q")
 _ALIAS_INDEX_RECORD = struct.Struct(">QQQ")
 _EDGE_SORT_KEY = struct.Struct(">QQQBQ")
 _WRITE_FLAGS = (
-    os.O_WRONLY
+    os.O_RDWR
     | os.O_CREAT
     | os.O_EXCL
     | getattr(os, "O_CLOEXEC", 0)
@@ -186,6 +186,17 @@ _FileIdentity = tuple[
     int | None,
 ]
 _CreationIdentity = tuple[int, int, int, int, int]
+_PrivateFileIdentity = tuple[
+    int,
+    int,
+    int,
+    int,
+    int,
+    int,
+    int,
+    int | None,
+    int | None,
+]
 
 
 def _byte_key(value: str) -> bytes:
@@ -650,6 +661,22 @@ def _creation_identity(metadata: os.stat_result) -> _CreationIdentity:
         stat.S_IFMT(metadata.st_mode),
         metadata.st_uid,
         stat.S_IMODE(metadata.st_mode),
+    )
+
+
+def _private_file_identity(
+    metadata: os.stat_result,
+) -> _PrivateFileIdentity:
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        stat.S_IFMT(metadata.st_mode),
+        metadata.st_uid,
+        stat.S_IMODE(metadata.st_mode),
+        metadata.st_nlink,
+        metadata.st_size,
+        getattr(metadata, "st_mtime_ns", None),
+        getattr(metadata, "st_ctime_ns", None),
     )
 
 
@@ -1334,6 +1361,7 @@ def _open_verified_archives(
     wikidata_fd = -1
     archive_fds: dict[str, int] = {}
     state: _ArchiveAuthorityState | None = None
+    body_raised = False
     try:
         lock_parent_fd, lock_name = open_parent_directory(Path(source_lock_path))
         lock_parent_metadata = os.fstat(lock_parent_fd)
@@ -1487,10 +1515,16 @@ def _open_verified_archives(
         _verify_authority_state(state, rehash=False)
         _archive_authority_hook("before_yield", None, verified)
         _verify_authority_state(state, rehash=False)
-        yield verified
+        try:
+            yield verified
+        except BaseException:
+            body_raised = True
+            raise
         _archive_authority_hook("before_postcheck", None, verified)
         _verify_authority_state(state, rehash=True)
     except OSError as error:
+        if body_raised:
+            raise
         raise ValueError("Wikidata archive authority is missing or unsafe") from error
     finally:
         for descriptor in archive_fds.values():
@@ -1523,7 +1557,7 @@ def _require_derived_mode(
         raise ValueError(f"{description} mode drift")
 
 
-def _check_named_derived_file(
+def _check_named_created_file(
     parent_fd: int,
     name: str,
     descriptor: int,
@@ -1548,6 +1582,35 @@ def _check_named_derived_file(
     if (
         _creation_identity(opened) != expected_identity
         or _creation_identity(named) != expected_identity
+    ):
+        raise ValueError(f"{description} identity drift")
+
+
+def _check_named_private_file(
+    parent_fd: int,
+    name: str,
+    descriptor: int,
+    expected_identity: _PrivateFileIdentity,
+    description: str,
+) -> None:
+    try:
+        opened = os.fstat(descriptor)
+        named = entry_lstat(parent_fd, name)
+        _require_derived_mode(
+            opened,
+            directory=False,
+            description=description,
+        )
+        _require_derived_mode(
+            named,
+            directory=False,
+            description=description,
+        )
+    except (OSError, ValueError) as error:
+        raise ValueError(f"{description} identity drift") from error
+    if (
+        _private_file_identity(opened) != expected_identity
+        or _private_file_identity(named) != expected_identity
     ):
         raise ValueError(f"{description} identity drift")
 
@@ -1581,6 +1644,78 @@ def _check_named_derived_directory(
         raise ValueError(f"{description} identity drift")
 
 
+def _close_descriptor(descriptor: int) -> None:
+    os.close(descriptor)
+
+
+def _append_secondary_error(
+    current: BaseException | None,
+    error: BaseException,
+    description: str,
+) -> BaseException:
+    if current is None:
+        return error
+    current.add_note(f"{description}: {error!r}")
+    return current
+
+
+def _close_descriptors_exhaustively(
+    descriptors: Iterable[int],
+) -> BaseException | None:
+    close_error: BaseException | None = None
+    for descriptor in descriptors:
+        if descriptor < 0:
+            continue
+        try:
+            _close_descriptor(descriptor)
+        except BaseException as error:
+            close_error = _append_secondary_error(
+                close_error,
+                error,
+                "additional descriptor close failure",
+            )
+    return close_error
+
+
+def _digest_private_descriptor(
+    descriptor: int,
+    *,
+    expected_identity: _PrivateFileIdentity,
+    description: str,
+) -> tuple[int, str]:
+    before = os.fstat(descriptor)
+    _require_derived_mode(
+        before,
+        directory=False,
+        description=description,
+    )
+    if _private_file_identity(before) != expected_identity:
+        raise ValueError(f"{description} identity drift")
+    digest = hashlib.sha256()
+    byte_count = 0
+    os.lseek(descriptor, 0, os.SEEK_SET)
+    while True:
+        chunk = os.read(descriptor, _READ_CHUNK_SIZE)
+        if not chunk:
+            break
+        byte_count += len(chunk)
+        digest.update(chunk)
+    after = os.fstat(descriptor)
+    if (
+        _private_file_identity(after) != expected_identity
+        or byte_count != before.st_size
+        or os.read(descriptor, 1)
+    ):
+        raise ValueError(f"{description} changed while hashing")
+    return byte_count, digest.hexdigest()
+
+
+@dataclass(frozen=True)
+class _PrivateFileAuthority:
+    identity: _PrivateFileIdentity
+    sha256: str
+
+
 @dataclass
 class _PrivateBuildAuthority:
     namespace_fd: int
@@ -1591,7 +1726,16 @@ class _PrivateBuildAuthority:
     directory_identities: dict[str, _CreationIdentity] = field(
         default_factory=dict
     )
-    file_identities: dict[str, _CreationIdentity] = field(default_factory=dict)
+    pending_file_identities: dict[str, _CreationIdentity] = field(
+        default_factory=dict
+    )
+    file_authorities: dict[str, _PrivateFileAuthority] = field(
+        default_factory=dict
+    )
+    sealed_root_identity: _PrivateFileIdentity | None = None
+    sealed_directory_identities: dict[str, _PrivateFileIdentity] = field(
+        default_factory=dict
+    )
 
     def register_directory(
         self,
@@ -1606,7 +1750,8 @@ class _PrivateBuildAuthority:
         if (
             "/" in path
             or path in self.directory_identities
-            or path in self.file_identities
+            or path in self.pending_file_identities
+            or path in self.file_authorities
         ):
             raise ValueError("duplicate private directory authority")
         self.directory_descriptors[path] = descriptor
@@ -1618,18 +1763,37 @@ class _PrivateBuildAuthority:
         identity: _CreationIdentity,
     ) -> None:
         path = _safe_relative_path(relative_path, "private file path")
-        if path in self.file_identities or path in self.directory_identities:
+        if (
+            path in self.pending_file_identities
+            or path in self.file_authorities
+            or path in self.directory_identities
+        ):
             raise ValueError("duplicate private file authority")
-        self.file_identities[path] = identity
+        self.pending_file_identities[path] = identity
+
+    def finalize_file(
+        self,
+        relative_path: str,
+        creation_identity: _CreationIdentity,
+        file_authority: _PrivateFileAuthority,
+    ) -> None:
+        if (
+            self.pending_file_identities.get(relative_path)
+            != creation_identity
+            or relative_path in self.file_authorities
+        ):
+            raise ValueError("private file authority finalization drift")
+        del self.pending_file_identities[relative_path]
+        self.file_authorities[relative_path] = file_authority
 
     def forget_file(
         self,
         relative_path: str,
-        identity: _CreationIdentity,
+        file_authority: _PrivateFileAuthority,
     ) -> None:
-        if self.file_identities.get(relative_path) != identity:
+        if self.file_authorities.get(relative_path) != file_authority:
             raise ValueError("private file authority removal drift")
-        del self.file_identities[relative_path]
+        del self.file_authorities[relative_path]
 
     def forget_directory(
         self,
@@ -1681,7 +1845,7 @@ def _open_created_file(
         identity = _creation_identity(os.fstat(descriptor))
         if authority is not None:
             authority.register_file(relative_path, identity)
-        _check_named_derived_file(
+        _check_named_created_file(
             directory_fd,
             name,
             descriptor,
@@ -1692,6 +1856,83 @@ def _open_created_file(
     except BaseException:
         os.close(descriptor)
         raise
+
+
+def _finalize_private_file(
+    directory_fd: int,
+    name: str,
+    relative_path: str,
+    descriptor: int,
+    creation_identity: _CreationIdentity,
+    sha256: str,
+    authority: _PrivateBuildAuthority,
+) -> _PrivateFileAuthority:
+    expected_sha256 = _validate_sha256(
+        sha256,
+        f"private file {relative_path} sha256",
+    )
+    metadata = os.fstat(descriptor)
+    _require_derived_mode(
+        metadata,
+        directory=False,
+        description=f"private file {relative_path}",
+    )
+    if _creation_identity(metadata) != creation_identity:
+        raise ValueError(f"private file {relative_path} creation identity drift")
+    file_authority = _PrivateFileAuthority(
+        identity=_private_file_identity(metadata),
+        sha256=expected_sha256,
+    )
+    _check_named_private_file(
+        directory_fd,
+        name,
+        descriptor,
+        file_authority.identity,
+        f"private file {relative_path}",
+    )
+    authority.finalize_file(
+        relative_path,
+        creation_identity,
+        file_authority,
+    )
+    return file_authority
+
+
+def _verify_open_private_file(
+    parent_fd: int,
+    name: str,
+    descriptor: int,
+    file_authority: _PrivateFileAuthority,
+    description: str,
+    *,
+    rewind: bool,
+) -> None:
+    _check_named_private_file(
+        parent_fd,
+        name,
+        descriptor,
+        file_authority.identity,
+        description,
+    )
+    byte_count, sha256 = _digest_private_descriptor(
+        descriptor,
+        expected_identity=file_authority.identity,
+        description=description,
+    )
+    if (
+        byte_count != file_authority.identity[6]
+        or sha256 != file_authority.sha256
+    ):
+        raise ValueError(f"{description} digest drift")
+    _check_named_private_file(
+        parent_fd,
+        name,
+        descriptor,
+        file_authority.identity,
+        description,
+    )
+    if rewind:
+        os.lseek(descriptor, 0, os.SEEK_SET)
 
 
 def _write_all(descriptor: int, payload: bytes) -> None:
@@ -1719,7 +1960,7 @@ class _ArtifactWriter:
         self.directory_fd = directory_fd
         self.name = name
         self.authority = authority
-        self.descriptor, self.identity = _open_created_file(
+        self.descriptor, self.creation_identity = _open_created_file(
             directory_fd,
             name,
             self.relative_path,
@@ -1742,13 +1983,30 @@ class _ArtifactWriter:
         if self.closed:
             raise ValueError("derived artifact writer is closed")
         os.fsync(self.descriptor)
-        _check_named_derived_file(
-            self.directory_fd,
-            self.name,
-            self.descriptor,
-            self.identity,
-            f"derived artifact {self.relative_path}",
-        )
+        metadata = os.fstat(self.descriptor)
+        if metadata.st_size != self.byte_count:
+            raise ValueError(
+                f"derived artifact {self.relative_path} size drift"
+            )
+        if self.authority is None:
+            identity = _private_file_identity(metadata)
+            _check_named_private_file(
+                self.directory_fd,
+                self.name,
+                self.descriptor,
+                identity,
+                f"derived artifact {self.relative_path}",
+            )
+        else:
+            _finalize_private_file(
+                self.directory_fd,
+                self.name,
+                self.relative_path,
+                self.descriptor,
+                self.creation_identity,
+                self.digest.hexdigest(),
+                self.authority,
+            )
         os.close(self.descriptor)
         self.descriptor = -1
         self.closed = True
@@ -1833,7 +2091,8 @@ def _read_sort_record(descriptor: int) -> tuple[bytes, bytes] | None:
 @dataclass(frozen=True)
 class _SortRun:
     name: str
-    identity: _CreationIdentity
+    identity: _PrivateFileIdentity
+    sha256: str
 
 
 def _open_sort_run_descriptor(work_fd: int, run: _SortRun) -> int:
@@ -1846,12 +2105,16 @@ def _open_sort_run_descriptor(work_fd: int, run: _SortRun) -> int:
             directory=False,
             description="external-sort run",
         )
-        _check_named_derived_file(
+        _verify_open_private_file(
             work_fd,
             run.name,
             descriptor,
-            run.identity,
+            _PrivateFileAuthority(
+                identity=run.identity,
+                sha256=run.sha256,
+            ),
             "external-sort run",
+            rewind=True,
         )
         return descriptor
     except BaseException:
@@ -1866,7 +2129,11 @@ def _unlink_open_sort_run(
     descriptor: int,
     authority: _PrivateBuildAuthority,
 ) -> None:
-    _check_named_derived_file(
+    file_authority = _PrivateFileAuthority(
+        identity=run.identity,
+        sha256=run.sha256,
+    )
+    _check_named_private_file(
         work_fd,
         run.name,
         descriptor,
@@ -1874,7 +2141,7 @@ def _unlink_open_sort_run(
         "external-sort run before unlink",
     )
     os.unlink(run.name, dir_fd=work_fd)
-    authority.forget_file(f".work/{run.name}", run.identity)
+    authority.forget_file(f".work/{run.name}", file_authority)
 
 
 @contextmanager
@@ -1898,6 +2165,7 @@ def _open_sorted_run(
             if previous is not None and key < previous:
                 raise ValueError("external-sort run ordering drift")
             previous = key
+            _external_sort_hook("before_record_yield", work_fd, run)
             yield key, payload
 
     body_error: BaseException | None = None
@@ -1918,8 +2186,13 @@ def _open_sorted_run(
             fsync_directory(work_fd)
         except BaseException as error:
             cleanup_error = error
-        finally:
-            os.close(descriptor)
+        close_error = _close_descriptors_exhaustively((descriptor,))
+        if close_error is not None:
+            cleanup_error = _append_secondary_error(
+                cleanup_error,
+                close_error,
+                "external-sort run close failure",
+            )
         if cleanup_error is not None:
             if body_error is None:
                 raise cleanup_error
@@ -1977,31 +2250,59 @@ class _ExternalSorter:
                 raise ValueError("external-sort run count exceeds uint64")
         self.pending_runs[level] = run
 
-    def _create_run(self, name: str) -> tuple[int, _SortRun]:
-        descriptor, identity = _open_created_file(
+    def _create_run(self, name: str) -> tuple[int, _CreationIdentity]:
+        descriptor, creation_identity = _open_created_file(
             self.work_fd,
             name,
             f".work/{name}",
             self.authority,
         )
-        return descriptor, _SortRun(name=name, identity=identity)
+        return descriptor, creation_identity
+
+    def _finalize_run(
+        self,
+        name: str,
+        descriptor: int,
+        creation_identity: _CreationIdentity,
+    ) -> _SortRun:
+        metadata = os.fstat(descriptor)
+        file_identity = _private_file_identity(metadata)
+        byte_count, sha256 = _digest_private_descriptor(
+            descriptor,
+            expected_identity=file_identity,
+            description="external-sort output run",
+        )
+        if byte_count != metadata.st_size:
+            raise ValueError("external-sort output run size drift")
+        file_authority = _finalize_private_file(
+            self.work_fd,
+            name,
+            f".work/{name}",
+            descriptor,
+            creation_identity,
+            sha256,
+            self.authority,
+        )
+        return _SortRun(
+            name=name,
+            identity=file_authority.identity,
+            sha256=file_authority.sha256,
+        )
 
     def _flush(self) -> None:
         if not self.chunk:
             return
         self.chunk.sort(key=lambda record: record[0])
         name = self._new_run_name(0)
-        descriptor, run = self._create_run(name)
+        descriptor, creation_identity = self._create_run(name)
         try:
             for key, payload in self.chunk:
                 _write_sort_record(descriptor, key, payload)
             os.fsync(descriptor)
-            _check_named_derived_file(
-                self.work_fd,
-                run.name,
+            run = self._finalize_run(
+                name,
                 descriptor,
-                run.identity,
-                "external-sort flushed run",
+                creation_identity,
             )
         finally:
             os.close(descriptor)
@@ -2017,12 +2318,14 @@ class _ExternalSorter:
         inputs: list[tuple[_SortRun, int]] = []
         output = -1
         output_run: _SortRun | None = None
+        output_creation_identity: _CreationIdentity | None = None
+        body_error: BaseException | None = None
         try:
             for run in runs:
                 inputs.append(
                     (run, _open_sort_run_descriptor(self.work_fd, run))
                 )
-            output, output_run = self._create_run(output_name)
+            output, output_creation_identity = self._create_run(output_name)
             heap: list[tuple[bytes, int, bytes]] = []
             for index, (_run, descriptor) in enumerate(inputs):
                 record = _read_sort_record(descriptor)
@@ -2044,15 +2347,13 @@ class _ExternalSorter:
                         (next_key, index, next_payload),
                     )
             os.fsync(output)
-            _check_named_derived_file(
-                self.work_fd,
-                output_run.name,
+            output_run = self._finalize_run(
+                output_name,
                 output,
-                output_run.identity,
-                "external-sort merge output",
+                output_creation_identity,
             )
             for run, descriptor in inputs:
-                _check_named_derived_file(
+                _check_named_private_file(
                     self.work_fd,
                     run.name,
                     descriptor,
@@ -2068,11 +2369,37 @@ class _ExternalSorter:
                 )
             fsync_directory(self.work_fd)
             return output_run
+        except BaseException as error:
+            body_error = error
+            raise
         finally:
-            if output >= 0:
-                os.close(output)
-            for _run, descriptor in inputs:
-                os.close(descriptor)
+            hook_error: BaseException | None = None
+            if output_run is not None:
+                try:
+                    _external_sort_hook(
+                        "before_merge_close",
+                        self.work_fd,
+                        output_run,
+                    )
+                except BaseException as error:
+                    hook_error = error
+            close_error = _close_descriptors_exhaustively(
+                (output, *(descriptor for _run, descriptor in inputs))
+            )
+            secondary_error = hook_error
+            if close_error is not None:
+                secondary_error = _append_secondary_error(
+                    secondary_error,
+                    close_error,
+                    "external-sort merge close failure",
+                )
+            if secondary_error is not None:
+                if body_error is None:
+                    raise secondary_error
+                body_error.add_note(
+                    f"external-sort merge cleanup also failed: "
+                    f"{secondary_error!r}"
+                )
 
     def finish(self) -> _SortRun | None:
         if self.finished:
@@ -2261,26 +2588,76 @@ def _materialize_member_files(
     return ordered
 
 
-def _open_member_file(members_fd: int, member_name: str) -> int:
-    descriptor, metadata = open_regular_file_at(members_fd, member_name)
+@contextmanager
+def _open_member_file(
+    members_fd: int,
+    member_name: str,
+    authority: _PrivateBuildAuthority,
+) -> Iterator[int]:
+    relative_path = f"members/{member_name}"
+    file_authority = authority.file_authorities.get(relative_path)
+    if file_authority is None:
+        raise ValueError(f"decoded member authority is missing: {member_name}")
+    descriptor = -1
+    body_error: BaseException | None = None
     try:
+        descriptor, metadata = open_regular_file_at(members_fd, member_name)
         _require_derived_mode(
             metadata,
             directory=False,
             description=f"decoded member {member_name}",
         )
-        return descriptor
-    except BaseException:
-        os.close(descriptor)
+        _verify_open_private_file(
+            members_fd,
+            member_name,
+            descriptor,
+            file_authority,
+            f"decoded member {member_name}",
+            rewind=True,
+        )
+        yield descriptor
+    except BaseException as error:
+        body_error = error
         raise
+    finally:
+        postcheck_error: BaseException | None = None
+        if descriptor >= 0:
+            try:
+                _check_named_private_file(
+                    members_fd,
+                    member_name,
+                    descriptor,
+                    file_authority.identity,
+                    f"decoded member {member_name} postcheck",
+                )
+            except BaseException as error:
+                postcheck_error = error
+        close_error = _close_descriptors_exhaustively((descriptor,))
+        if close_error is not None:
+            postcheck_error = _append_secondary_error(
+                postcheck_error,
+                close_error,
+                "decoded member close failure",
+            )
+        if postcheck_error is not None:
+            if body_error is None:
+                raise postcheck_error
+            body_error.add_note(
+                f"decoded member postcheck also failed: "
+                f"{postcheck_error!r}"
+            )
 
 
 def _iter_member_triples(
     members_fd: int,
     member_name: str,
+    authority: _PrivateBuildAuthority,
 ) -> Iterator[tuple[int, int, int, int]]:
-    descriptor = _open_member_file(members_fd, member_name)
-    try:
+    with _open_member_file(
+        members_fd,
+        member_name,
+        authority,
+    ) as descriptor:
         source_row = 0
         for _offset, line in _iter_descriptor_lines(
             descriptor,
@@ -2314,8 +2691,6 @@ def _iter_member_triples(
                     f"{member_name}:{source_row}: {error}"
                 ) from error
             yield source_row, subject, relation, object_id
-    finally:
-        os.close(descriptor)
 
 
 def _training_stream_line(
@@ -2386,6 +2761,7 @@ def _build_training_artifacts(
             for row, subject, relation, object_id in _iter_member_triples(
                 members_fd,
                 member_name,
+                authority,
             ):
                 if is_training:
                     training_split = source_name
@@ -2508,9 +2884,13 @@ def _iter_alias_member_rows(
     members_fd: int,
     member_name: str,
     prefix: bytes,
+    authority: _PrivateBuildAuthority,
 ) -> Iterator[tuple[int, int, tuple[tuple[int, bytes, bytes], ...]]]:
-    descriptor = _open_member_file(members_fd, member_name)
-    try:
+    with _open_member_file(
+        members_fd,
+        member_name,
+        authority,
+    ) as descriptor:
         source_row = 0
         for _offset, line in _iter_descriptor_lines(
             descriptor,
@@ -2567,8 +2947,6 @@ def _iter_alias_member_rows(
                     (position, normalized_bytes, display_bytes)
                 )
             yield source_row, _alias_key(prefix, numeric_id), tuple(aliases)
-    finally:
-        os.close(descriptor)
 
 
 def _build_alias_artifacts(
@@ -2596,6 +2974,7 @@ def _build_alias_artifacts(
             members_fd,
             member_name,
             prefix,
+            authority,
         ):
             canonical_sorter.add(_UINT64.pack(canonical_key))
             for position, normalized, display in aliases:
@@ -3794,6 +4173,283 @@ def _allocate_build_directory(
     raise FileExistsError("could not allocate a private derived-view sibling")
 
 
+def _private_file_parent(
+    authority: _PrivateBuildAuthority,
+    relative_path: str,
+) -> tuple[int, str]:
+    parts = relative_path.split("/")
+    if len(parts) == 1:
+        return authority.descriptor, parts[0]
+    if len(parts) == 2 and parts[0] in authority.directory_descriptors:
+        return authority.directory_descriptors[parts[0]], parts[1]
+    raise ValueError("private file path is outside build authority")
+
+
+def _expected_private_inventory(
+    authority: _PrivateBuildAuthority,
+) -> tuple[tuple[str, ...], dict[str, tuple[str, ...]]]:
+    paths = {
+        *authority.pending_file_identities,
+        *authority.file_authorities,
+    }
+    child_entries: dict[str, list[str]] = {
+        name: [] for name in authority.directory_descriptors
+    }
+    root_files: list[str] = []
+    for relative_path in paths:
+        parts = relative_path.split("/")
+        if len(parts) == 1:
+            root_files.append(parts[0])
+        elif len(parts) == 2 and parts[0] in child_entries:
+            child_entries[parts[0]].append(parts[1])
+        else:
+            raise ValueError("private file inventory is outside authority")
+    root_entries = tuple(
+        sorted(
+            (*authority.directory_descriptors, *root_files),
+            key=_byte_key,
+        )
+    )
+    return root_entries, {
+        name: tuple(sorted(entries, key=_byte_key))
+        for name, entries in child_entries.items()
+    }
+
+
+def _capture_private_directory_identity(
+    descriptor: int,
+    description: str,
+) -> _PrivateFileIdentity:
+    metadata = os.fstat(descriptor)
+    _require_derived_mode(
+        metadata,
+        directory=True,
+        description=description,
+    )
+    return _private_file_identity(metadata)
+
+
+def _verify_private_build_files(
+    authority: _PrivateBuildAuthority,
+) -> None:
+    if authority.pending_file_identities:
+        raise ValueError("private candidate has unfinalized files")
+    for relative_path in sorted(authority.file_authorities, key=_byte_key):
+        parent_fd, name = _private_file_parent(authority, relative_path)
+        file_authority = authority.file_authorities[relative_path]
+        descriptor = -1
+        body_error: BaseException | None = None
+        try:
+            descriptor, metadata = open_regular_file_at(parent_fd, name)
+            _require_derived_mode(
+                metadata,
+                directory=False,
+                description=f"private candidate file {relative_path}",
+            )
+            _verify_open_private_file(
+                parent_fd,
+                name,
+                descriptor,
+                file_authority,
+                f"private candidate file {relative_path}",
+                rewind=False,
+            )
+        except BaseException as error:
+            body_error = error
+            raise
+        finally:
+            close_error = _close_descriptors_exhaustively((descriptor,))
+            if close_error is not None:
+                if body_error is None:
+                    raise close_error
+                body_error.add_note(
+                    f"private candidate file close also failed: "
+                    f"{close_error!r}"
+                )
+
+
+def _seal_private_build_authority(
+    authority: _PrivateBuildAuthority,
+) -> None:
+    if (
+        authority.sealed_root_identity is not None
+        or authority.sealed_directory_identities
+    ):
+        raise ValueError("private build authority is already sealed")
+    _check_named_derived_directory(
+        authority.namespace_fd,
+        authority.name,
+        authority.descriptor,
+        authority.identity,
+        "private candidate root while sealing",
+    )
+    root_entries, child_entries = _expected_private_inventory(authority)
+    if list_entries(authority.descriptor) != root_entries:
+        raise ValueError("private candidate root inventory drift")
+    before_root = _capture_private_directory_identity(
+        authority.descriptor,
+        "private candidate root",
+    )
+    before_children: dict[str, _PrivateFileIdentity] = {}
+    for directory_name in sorted(
+        authority.directory_descriptors,
+        key=_byte_key,
+    ):
+        descriptor = authority.directory_descriptors[directory_name]
+        _check_named_derived_directory(
+            authority.descriptor,
+            directory_name,
+            descriptor,
+            authority.directory_identities[directory_name],
+            f"private candidate child {directory_name}",
+        )
+        if list_entries(descriptor) != child_entries[directory_name]:
+            raise ValueError(
+                f"private candidate {directory_name} inventory drift"
+            )
+        before_children[directory_name] = (
+            _capture_private_directory_identity(
+                descriptor,
+                f"private candidate child {directory_name}",
+            )
+        )
+    _verify_private_build_files(authority)
+    after_root = _capture_private_directory_identity(
+        authority.descriptor,
+        "private candidate root",
+    )
+    if after_root != before_root or list_entries(authority.descriptor) != root_entries:
+        raise ValueError("private candidate root identity drift")
+    for directory_name, expected_identity in before_children.items():
+        descriptor = authority.directory_descriptors[directory_name]
+        if (
+            _capture_private_directory_identity(
+                descriptor,
+                f"private candidate child {directory_name}",
+            )
+            != expected_identity
+            or list_entries(descriptor) != child_entries[directory_name]
+        ):
+            raise ValueError(
+                f"private candidate {directory_name} identity drift"
+            )
+    authority.sealed_root_identity = before_root
+    authority.sealed_directory_identities = before_children
+
+
+def _verify_sealed_private_build(
+    authority: _PrivateBuildAuthority,
+    *,
+    root_name: str,
+    expected_root_identity: _PrivateFileIdentity,
+) -> None:
+    if (
+        authority.sealed_root_identity is None
+        or set(authority.sealed_directory_identities)
+        != set(authority.directory_descriptors)
+    ):
+        raise ValueError("private build authority is not sealed")
+    _check_named_derived_directory(
+        authority.namespace_fd,
+        root_name,
+        authority.descriptor,
+        authority.identity,
+        "sealed private candidate root",
+    )
+    root_entries, child_entries = _expected_private_inventory(authority)
+    if (
+        _capture_private_directory_identity(
+            authority.descriptor,
+            "sealed private candidate root",
+        )
+        != expected_root_identity
+        or list_entries(authority.descriptor) != root_entries
+    ):
+        raise ValueError("sealed private candidate root identity drift")
+    for directory_name, expected_identity in (
+        authority.sealed_directory_identities.items()
+    ):
+        descriptor = authority.directory_descriptors[directory_name]
+        _check_named_derived_directory(
+            authority.descriptor,
+            directory_name,
+            descriptor,
+            authority.directory_identities[directory_name],
+            f"sealed private candidate child {directory_name}",
+        )
+        if (
+            _capture_private_directory_identity(
+                descriptor,
+                f"sealed private candidate child {directory_name}",
+            )
+            != expected_identity
+            or list_entries(descriptor) != child_entries[directory_name]
+        ):
+            raise ValueError(
+                f"sealed private candidate {directory_name} identity drift"
+            )
+    _verify_private_build_files(authority)
+    if (
+        _capture_private_directory_identity(
+            authority.descriptor,
+            "sealed private candidate root",
+        )
+        != expected_root_identity
+        or list_entries(authority.descriptor) != root_entries
+    ):
+        raise ValueError("sealed private candidate root identity drift")
+    for directory_name, expected_identity in (
+        authority.sealed_directory_identities.items()
+    ):
+        descriptor = authority.directory_descriptors[directory_name]
+        if (
+            _capture_private_directory_identity(
+                descriptor,
+                f"sealed private candidate child {directory_name}",
+            )
+            != expected_identity
+            or list_entries(descriptor) != child_entries[directory_name]
+        ):
+            raise ValueError(
+                f"sealed private candidate {directory_name} identity drift"
+            )
+
+
+def _quarantine_published_candidate(
+    authority: _PrivateBuildAuthority,
+    published_name: str,
+) -> str:
+    _check_named_derived_directory(
+        authority.namespace_fd,
+        published_name,
+        authority.descriptor,
+        authority.identity,
+        "published candidate before quarantine",
+    )
+    prefix = f".quarantine-{published_name[:16]}-"
+    for _attempt in range(32):
+        quarantine_name = prefix + secrets.token_hex(8)
+        try:
+            atomic_rename_noreplace(
+                authority.namespace_fd,
+                published_name,
+                authority.namespace_fd,
+                quarantine_name,
+            )
+        except FileExistsError:
+            continue
+        _check_named_derived_directory(
+            authority.namespace_fd,
+            quarantine_name,
+            authority.descriptor,
+            authority.identity,
+            "quarantined candidate root",
+        )
+        fsync_directory(authority.namespace_fd)
+        return quarantine_name
+    raise FileExistsError("could not allocate candidate quarantine name")
+
+
 def _cleanup_private_build(authority: _PrivateBuildAuthority) -> None:
     _check_named_derived_directory(
         authority.namespace_fd,
@@ -3812,20 +4468,13 @@ def _cleanup_private_build(authority: _PrivateBuildAuthority) -> None:
         )
 
     for relative_path in sorted(
-        tuple(authority.file_identities),
+        tuple(authority.file_authorities),
         key=_byte_key,
     ):
-        parts = relative_path.split("/")
-        if len(parts) == 1:
-            parent_fd = authority.descriptor
-            name = parts[0]
-        elif len(parts) == 2 and parts[0] in authority.directory_descriptors:
-            parent_fd = authority.directory_descriptors[parts[0]]
-            name = parts[1]
-        else:
-            raise ValueError("private cleanup file path is outside authority")
-        expected_identity = authority.file_identities[relative_path]
+        parent_fd, name = _private_file_parent(authority, relative_path)
+        file_authority = authority.file_authorities[relative_path]
         descriptor = -1
+        body_error: BaseException | None = None
         try:
             descriptor, metadata = open_regular_file_at(parent_fd, name)
             _require_derived_mode(
@@ -3833,18 +4482,64 @@ def _cleanup_private_build(authority: _PrivateBuildAuthority) -> None:
                 directory=False,
                 description=f"private cleanup file {relative_path}",
             )
-            _check_named_derived_file(
+            _verify_open_private_file(
+                parent_fd,
+                name,
+                descriptor,
+                file_authority,
+                f"private cleanup file {relative_path}",
+                rewind=False,
+            )
+            os.unlink(name, dir_fd=parent_fd)
+            authority.forget_file(relative_path, file_authority)
+        except BaseException as error:
+            body_error = error
+            raise
+        finally:
+            close_error = _close_descriptors_exhaustively((descriptor,))
+            if close_error is not None:
+                if body_error is None:
+                    raise close_error
+                body_error.add_note(
+                    f"private cleanup file close also failed: "
+                    f"{close_error!r}"
+                )
+
+    for relative_path in sorted(
+        tuple(authority.pending_file_identities),
+        key=_byte_key,
+    ):
+        parent_fd, name = _private_file_parent(authority, relative_path)
+        expected_identity = authority.pending_file_identities[relative_path]
+        descriptor = -1
+        body_error = None
+        try:
+            descriptor, metadata = open_regular_file_at(parent_fd, name)
+            _require_derived_mode(
+                metadata,
+                directory=False,
+                description=f"pending private cleanup file {relative_path}",
+            )
+            _check_named_created_file(
                 parent_fd,
                 name,
                 descriptor,
                 expected_identity,
-                f"private cleanup file {relative_path}",
+                f"pending private cleanup file {relative_path}",
             )
             os.unlink(name, dir_fd=parent_fd)
-            authority.forget_file(relative_path, expected_identity)
+            del authority.pending_file_identities[relative_path]
+        except BaseException as error:
+            body_error = error
+            raise
         finally:
-            if descriptor >= 0:
-                os.close(descriptor)
+            close_error = _close_descriptors_exhaustively((descriptor,))
+            if close_error is not None:
+                if body_error is None:
+                    raise close_error
+                body_error.add_note(
+                    f"pending cleanup close also failed: {close_error!r}"
+                )
 
     for directory_name in sorted(
         tuple(authority.directory_identities),
@@ -3981,6 +4676,11 @@ def build_wikidata_derived_view(
                 members_fd,
                 authority,
             )
+            _derived_view_build_hook(
+                "after_members",
+                authority,
+                None,
+            )
             (
                 training_stream,
                 distinct_stream,
@@ -4093,18 +4793,20 @@ def build_wikidata_derived_view(
                 build_identity,
                 "private build directory after candidate verification",
             )
+            _seal_private_build_authority(authority)
 
         _derived_view_build_hook(
             "before_publish_check",
             authority,
             receipt_sha256,
         )
-        _check_named_derived_directory(
-            wikidata_fd,
-            build_name,
-            build_fd,
-            build_identity,
-            "private build directory before publication",
+        _verify_sealed_private_build(
+            authority,
+            root_name=build_name,
+            expected_root_identity=cast(
+                _PrivateFileIdentity,
+                authority.sealed_root_identity,
+            ),
         )
         try:
             atomic_rename_noreplace(
@@ -4122,25 +4824,60 @@ def build_wikidata_derived_view(
             )
             return winner
         published = True
-        _derived_view_build_hook(
-            "after_publish_rename",
-            authority,
-            receipt_sha256,
-        )
-        _check_named_derived_directory(
-            wikidata_fd,
-            receipt_sha256,
-            build_fd,
-            build_identity,
-            "published derived-view target",
-        )
         fsync_directory(wikidata_fd)
-        return _verify_derived_tree(
-            verified,
-            output_path / "wikidata" / receipt_sha256,
-            expected_generator_commit=generator_commit,
-            require_namespace=True,
-        )
+        try:
+            _derived_view_build_hook(
+                "after_publish_rename",
+                authority,
+                receipt_sha256,
+            )
+            _check_named_derived_directory(
+                wikidata_fd,
+                receipt_sha256,
+                build_fd,
+                build_identity,
+                "published derived-view target",
+            )
+            postrename_root_identity = (
+                _capture_private_directory_identity(
+                    build_fd,
+                    "published derived-view target",
+                )
+            )
+            _derived_view_build_hook(
+                "before_postpublish_verify",
+                authority,
+                receipt_sha256,
+            )
+            _verify_sealed_private_build(
+                authority,
+                root_name=receipt_sha256,
+                expected_root_identity=postrename_root_identity,
+            )
+            winner = _verify_derived_tree(
+                verified,
+                output_path / "wikidata" / receipt_sha256,
+                expected_generator_commit=generator_commit,
+                require_namespace=True,
+            )
+            _verify_sealed_private_build(
+                authority,
+                root_name=receipt_sha256,
+                expected_root_identity=postrename_root_identity,
+            )
+            return winner
+        except BaseException as error:
+            try:
+                _quarantine_published_candidate(
+                    authority,
+                    receipt_sha256,
+                )
+            except BaseException as quarantine_error:
+                error.add_note(
+                    f"published candidate quarantine also failed: "
+                    f"{quarantine_error!r}"
+                )
+            raise
     except OSError as error:
         wrapped = ValueError(
             "Wikidata derived-view publication is missing or unsafe"
@@ -4162,25 +4899,23 @@ def build_wikidata_derived_view(
                 _cleanup_private_build(authority)
             except BaseException as error:
                 secondary_error = error
-        for descriptor in (
-            work_fd,
-            indexes_fd,
-            streams_fd,
-            members_fd,
-            build_fd,
-            wikidata_fd,
-            output_fd,
-        ):
-            if descriptor >= 0:
-                try:
-                    os.close(descriptor)
-                except BaseException as error:
-                    if secondary_error is None:
-                        secondary_error = error
-                    else:
-                        secondary_error.add_note(
-                            f"descriptor close also failed: {error!r}"
-                        )
+        close_error = _close_descriptors_exhaustively(
+            (
+                work_fd,
+                indexes_fd,
+                streams_fd,
+                members_fd,
+                build_fd,
+                wikidata_fd,
+                output_fd,
+            )
+        )
+        if close_error is not None:
+            secondary_error = _append_secondary_error(
+                secondary_error,
+                close_error,
+                "outer build descriptor close failure",
+            )
         if secondary_error is not None:
             if primary_error is None:
                 raise secondary_error

@@ -1501,3 +1501,498 @@ def test_published_target_inode_swap_fails_before_content_verification(
         _build_view(archive_authority, output_root)
 
     assert swapped
+
+
+def _modify_restore_path_aba(path: Path) -> int:
+    metadata = path.stat()
+    payload = path.read_bytes()
+    assert payload
+    attacked = bytearray(payload)
+    attacked[len(attacked) // 2] ^= 1
+    with path.open("r+b") as stream:
+        stream.write(attacked)
+        stream.truncate()
+        stream.flush()
+        os.fsync(stream.fileno())
+        stream.seek(0)
+        stream.write(payload)
+        stream.truncate()
+        stream.flush()
+        os.fsync(stream.fileno())
+        os.fchmod(stream.fileno(), 0o400)
+        os.fchmod(stream.fileno(), 0o600)
+    os.utime(
+        path,
+        ns=(metadata.st_atime_ns, metadata.st_mtime_ns),
+        follow_symlinks=False,
+    )
+    assert path.stat().st_ino == metadata.st_ino
+    assert path.read_bytes() == payload
+    return metadata.st_ino
+
+
+def _modify_restore_at_aba(directory_fd: int, name: str) -> int:
+    descriptor = os.open(name, os.O_RDWR, dir_fd=directory_fd)
+    try:
+        metadata = os.fstat(descriptor)
+        payload = os.pread(descriptor, metadata.st_size, 0)
+        assert payload
+        attacked = bytearray(payload)
+        attacked[len(attacked) // 2] ^= 1
+        os.pwrite(descriptor, attacked, 0)
+        os.ftruncate(descriptor, len(attacked))
+        os.fsync(descriptor)
+        os.pwrite(descriptor, payload, 0)
+        os.ftruncate(descriptor, len(payload))
+        os.fsync(descriptor)
+        os.fchmod(descriptor, 0o400)
+        os.fchmod(descriptor, 0o600)
+    finally:
+        os.close(descriptor)
+    os.utime(
+        name,
+        ns=(metadata.st_atime_ns, metadata.st_mtime_ns),
+        dir_fd=directory_fd,
+        follow_symlinks=False,
+    )
+    restored = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+    assert restored.st_ino == metadata.st_ino
+    return metadata.st_ino
+
+
+def test_materialized_member_same_inode_modify_restore_aba_fails(
+    archive_authority: _AuthorityFixture,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    output_root = tmp_path / "derived"
+    attacked = False
+
+    def attack_member(phase, authority, _final_name):
+        nonlocal attacked
+        if phase != "after_members" or attacked:
+            return
+        attacked = True
+        _modify_restore_path_aba(
+            output_root
+            / "wikidata"
+            / authority.name
+            / "members"
+            / "wikidata5m_inductive_train.txt"
+        )
+
+    monkeypatch.setattr(
+        wikidata_source_module,
+        "_derived_view_build_hook",
+        attack_member,
+    )
+
+    with pytest.raises(ValueError, match="identity|digest|ABA"):
+        _build_view(archive_authority, output_root)
+
+    assert attacked
+    assert _published_view_names(output_root) == ()
+
+
+def test_external_sort_run_in_place_modify_restore_aba_fails(
+    archive_authority: _AuthorityFixture,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    output_root = tmp_path / "derived"
+    attacked = False
+
+    def attack_run(phase, work_fd, run):
+        nonlocal attacked
+        if phase != "before_open" or attacked:
+            return
+        attacked = True
+        _modify_restore_at_aba(work_fd, run.name)
+
+    monkeypatch.setattr(
+        wikidata_source_module,
+        "_external_sort_hook",
+        attack_run,
+    )
+    monkeypatch.setattr(wikidata_source_module, "_SORT_CHUNK_RECORDS", 1)
+
+    with pytest.raises(ValueError, match="identity|digest|ABA"):
+        _build_view(archive_authority, output_root)
+
+    assert attacked
+    assert _published_view_names(output_root) == ()
+
+
+def test_private_file_authority_binds_full_identity_and_sha256(
+    archive_authority: _AuthorityFixture,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    run_checked = False
+    candidate_checked = False
+
+    def check_run(phase, _work_fd, run):
+        nonlocal run_checked
+        if phase == "before_open":
+            run_checked = True
+            assert len(run.identity) == 9
+            assert len(run.sha256) == 64
+
+    def check_candidate(phase, authority, _final_name):
+        nonlocal candidate_checked
+        if phase != "before_publish_check":
+            return
+        candidate_checked = True
+        assert not authority.pending_file_identities
+        assert "receipt.json" in authority.file_authorities
+        assert any(
+            path.startswith("members/")
+            for path in authority.file_authorities
+        )
+        assert any(
+            path.startswith("streams/")
+            for path in authority.file_authorities
+        )
+        assert any(
+            path.startswith("indexes/")
+            for path in authority.file_authorities
+        )
+        for file_authority in authority.file_authorities.values():
+            assert len(file_authority.identity) == 9
+            assert len(file_authority.sha256) == 64
+
+    monkeypatch.setattr(
+        wikidata_source_module,
+        "_external_sort_hook",
+        check_run,
+    )
+    monkeypatch.setattr(
+        wikidata_source_module,
+        "_derived_view_build_hook",
+        check_candidate,
+    )
+    monkeypatch.setattr(wikidata_source_module, "_SORT_CHUNK_RECORDS", 1)
+
+    _build_view(archive_authority, tmp_path / "derived")
+
+    assert run_checked
+    assert candidate_checked
+
+
+@pytest.mark.parametrize(
+    "relative_path",
+    [
+        "streams/training.tsv",
+        "indexes/aliases.bin",
+        "receipt.json",
+    ],
+)
+def test_candidate_file_drift_after_verification_fails_before_publish(
+    archive_authority: _AuthorityFixture,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    relative_path: str,
+):
+    output_root = tmp_path / "derived"
+    attacked = False
+
+    def attack_candidate(phase, authority, _final_name):
+        nonlocal attacked
+        if phase != "before_publish_check" or attacked:
+            return
+        attacked = True
+        target = output_root / "wikidata" / authority.name / relative_path
+        payload = bytearray(target.read_bytes())
+        payload[len(payload) // 2] ^= 1
+        target.write_bytes(payload)
+
+    monkeypatch.setattr(
+        wikidata_source_module,
+        "_derived_view_build_hook",
+        attack_candidate,
+    )
+
+    with pytest.raises(ValueError, match="identity|digest|drift"):
+        _build_view(archive_authority, output_root)
+
+    assert attacked
+    assert _published_view_names(output_root) == ()
+
+
+def test_candidate_child_directory_drift_after_verification_fails_before_publish(
+    archive_authority: _AuthorityFixture,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    output_root = tmp_path / "derived"
+    attacked = False
+
+    def attack_child(phase, authority, _final_name):
+        nonlocal attacked
+        if phase != "before_publish_check" or attacked:
+            return
+        attacked = True
+        root = output_root / "wikidata" / authority.name
+        child = root / "streams"
+        displaced = root / "streams.displaced"
+        child.rename(displaced)
+        shutil.copytree(displaced, child)
+
+    monkeypatch.setattr(
+        wikidata_source_module,
+        "_derived_view_build_hook",
+        attack_child,
+    )
+
+    with pytest.raises(ValueError, match="identity|inventory|drift"):
+        _build_view(archive_authority, output_root)
+
+    assert attacked
+    assert _published_view_names(output_root) == ()
+
+
+def test_postpublish_drift_quarantines_exact_root_and_vacates_final_name(
+    archive_authority: _AuthorityFixture,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    output_root = tmp_path / "derived"
+    final_name: str | None = None
+    published_inode: int | None = None
+
+    def attack_published(phase, authority, receipt_sha256):
+        nonlocal final_name, published_inode
+        if phase != "before_postpublish_verify":
+            return
+        final_name = receipt_sha256
+        target = output_root / "wikidata" / receipt_sha256
+        published_inode = target.stat().st_ino
+        stream = target / "streams/training.tsv"
+        payload = bytearray(stream.read_bytes())
+        payload[len(payload) // 2] ^= 1
+        stream.write_bytes(payload)
+        assert published_inode == authority.identity[1]
+
+    monkeypatch.setattr(
+        wikidata_source_module,
+        "_derived_view_build_hook",
+        attack_published,
+    )
+
+    with pytest.raises(ValueError, match="identity|digest|drift"):
+        _build_view(archive_authority, output_root)
+
+    assert final_name is not None
+    namespace = output_root / "wikidata"
+    assert not (namespace / final_name).exists()
+    quarantines = tuple(
+        path
+        for path in namespace.iterdir()
+        if path.name.startswith(".quarantine-")
+    )
+    assert len(quarantines) == 1
+    assert quarantines[0].stat().st_ino == published_inode
+    assert quarantines[0].stat().st_mode & 0o777 == 0o700
+
+
+def test_postpublish_root_swap_preserves_concurrent_winner(
+    archive_authority: _AuthorityFixture,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    output_root = tmp_path / "derived"
+    final_name: str | None = None
+    winner_inode: int | None = None
+    swapped = False
+
+    def install_winner(phase, _authority, receipt_sha256):
+        nonlocal final_name, winner_inode, swapped
+        if phase != "before_postpublish_verify" or swapped:
+            return
+        swapped = True
+        final_name = receipt_sha256
+        namespace = output_root / "wikidata"
+        target = namespace / receipt_sha256
+        displaced = namespace / f"{receipt_sha256}.published-displaced"
+        target.rename(displaced)
+        shutil.copytree(displaced, target)
+        winner_inode = target.stat().st_ino
+
+    monkeypatch.setattr(
+        wikidata_source_module,
+        "_derived_view_build_hook",
+        install_winner,
+    )
+
+    with pytest.raises(ValueError, match="identity|drift"):
+        _build_view(archive_authority, output_root)
+
+    assert swapped
+    assert final_name is not None
+    winner = output_root / "wikidata" / final_name
+    assert winner.is_dir()
+    assert winner.stat().st_ino == winner_inode
+    assert not tuple(
+        path
+        for path in winner.parent.iterdir()
+        if path.name.startswith(".quarantine-")
+    )
+    verified = wikidata_source_module.verify_wikidata_derived_view(
+        archive_authority.source_lock_path,
+        archive_authority.source_root,
+        winner,
+        expected_generator_commit=EXPECTED_GENERATOR_COMMIT,
+    )
+    assert verified.root == winner
+
+
+def test_open_sorted_run_close_failure_preserves_body_error_and_closes_all(
+    archive_authority: _AuthorityFixture,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    active = False
+    raised_close = False
+    attempted: list[int] = []
+    real_close = os.close
+
+    def fail_body(phase, _work_fd, _run):
+        nonlocal active
+        if phase == "before_record_yield":
+            active = True
+            raise RuntimeError("sort consumer body failure")
+
+    def injected_close(descriptor):
+        nonlocal raised_close
+        if not active:
+            real_close(descriptor)
+            return
+        attempted.append(descriptor)
+        real_close(descriptor)
+        if not raised_close:
+            raised_close = True
+            raise OSError("injected sorted-run close failure")
+
+    monkeypatch.setattr(
+        wikidata_source_module,
+        "_external_sort_hook",
+        fail_body,
+    )
+    monkeypatch.setattr(
+        wikidata_source_module,
+        "_close_descriptor",
+        injected_close,
+        raising=False,
+    )
+
+    with pytest.raises(RuntimeError, match="sort consumer body failure"):
+        _build_view(archive_authority, tmp_path / "derived")
+
+    assert raised_close
+    assert attempted
+    for descriptor in attempted:
+        with pytest.raises(OSError):
+            os.fstat(descriptor)
+
+
+def test_merge_close_failures_attempt_every_input_and_output_descriptor(
+    archive_authority: _AuthorityFixture,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    active = False
+    failures_remaining = 2
+    attempted: list[int] = []
+    real_close = os.close
+
+    def start_injection(phase, _work_fd, _run):
+        nonlocal active
+        if phase == "before_merge_close":
+            active = True
+
+    def injected_close(descriptor):
+        nonlocal failures_remaining
+        if not active:
+            real_close(descriptor)
+            return
+        attempted.append(descriptor)
+        real_close(descriptor)
+        if failures_remaining:
+            failures_remaining -= 1
+            raise OSError("injected merge close failure")
+
+    monkeypatch.setattr(
+        wikidata_source_module,
+        "_external_sort_hook",
+        start_injection,
+    )
+    monkeypatch.setattr(
+        wikidata_source_module,
+        "_close_descriptor",
+        injected_close,
+        raising=False,
+    )
+    monkeypatch.setattr(wikidata_source_module, "_SORT_CHUNK_RECORDS", 1)
+
+    with pytest.raises(ValueError, match="publication|close"):
+        _build_view(archive_authority, tmp_path / "derived")
+
+    assert failures_remaining == 0
+    assert len(attempted) >= 3
+    for descriptor in attempted:
+        with pytest.raises(OSError):
+            os.fstat(descriptor)
+
+
+def test_outer_close_failures_attempt_every_retained_descriptor(
+    archive_authority: _AuthorityFixture,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    active = False
+    failures_remaining = 2
+    retained: list[int] = []
+    attempted: list[int] = []
+    real_close = os.close
+
+    def fail_build(phase, authority, _final_name):
+        nonlocal active
+        if phase != "before_candidate_verify":
+            return
+        retained.append(authority.descriptor)
+        retained.extend(authority.directory_descriptors.values())
+        active = True
+        raise RuntimeError("primary build failure")
+
+    def injected_close(descriptor):
+        nonlocal failures_remaining
+        if not active:
+            real_close(descriptor)
+            return
+        attempted.append(descriptor)
+        real_close(descriptor)
+        if failures_remaining:
+            failures_remaining -= 1
+            raise OSError("injected outer close failure")
+
+    monkeypatch.setattr(
+        wikidata_source_module,
+        "_derived_view_build_hook",
+        fail_build,
+    )
+    monkeypatch.setattr(
+        wikidata_source_module,
+        "_close_descriptor",
+        injected_close,
+        raising=False,
+    )
+
+    with pytest.raises(RuntimeError, match="primary build failure") as raised:
+        _build_view(archive_authority, tmp_path / "derived")
+
+    assert "injected outer close failure" not in str(raised.value)
+    assert failures_remaining == 0
+    assert set(retained) <= set(attempted)
+    for descriptor in retained:
+        with pytest.raises(OSError):
+            os.fstat(descriptor)
