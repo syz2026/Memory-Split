@@ -98,8 +98,13 @@ class RunBindingV3:
     snapshot_version: int
     training_run_id: str
     config_fingerprint: str
+    training_config_sha256: str
     model_config_sha256: str
+    model_identity: str
     data_provenance_sha256: str
+    data_receipt_sha256: str
+    data_build_id: str
+    ordered_stream_sha256: str
     world_size: int
     tokens_per_step: int
     sealed_evaluation_release_sha256: str
@@ -141,8 +146,13 @@ class RunBindingV3:
             "snapshot_version",
             "training_run_id",
             "config_fingerprint",
+            "training_config_sha256",
             "model_config_sha256",
+            "model_identity",
             "data_provenance_sha256",
+            "data_receipt_sha256",
+            "data_build_id",
+            "ordered_stream_sha256",
             "world_size",
             "tokens_per_step",
             "sealed_evaluation_release_sha256",
@@ -239,8 +249,13 @@ class RunBindingV3:
             snapshot_version=self.snapshot_version,
             training_run_id=self.training_run_id,
             config_fingerprint=self.config_fingerprint,
+            training_config_sha256=self.training_config_sha256,
             model_config_sha256=self.model_config_sha256,
+            model_identity=self.model_identity,
             data_provenance_sha256=self.data_provenance_sha256,
+            data_receipt_sha256=self.data_receipt_sha256,
+            data_build_id=self.data_build_id,
+            ordered_stream_sha256=self.ordered_stream_sha256,
             world_size=self.world_size,
             tokens_per_step=self.tokens_per_step,
         )
@@ -326,13 +341,38 @@ class RunBindingV3:
         )
         object.__setattr__(
             self,
+            "training_config_sha256",
+            snapshot.training_config_sha256,
+        )
+        object.__setattr__(
+            self,
             "model_config_sha256",
             snapshot.model_config_sha256,
         )
         object.__setattr__(
             self,
+            "model_identity",
+            snapshot.model_identity,
+        )
+        object.__setattr__(
+            self,
             "data_provenance_sha256",
             snapshot.data_provenance_sha256,
+        )
+        object.__setattr__(
+            self,
+            "data_receipt_sha256",
+            snapshot.data_receipt_sha256,
+        )
+        object.__setattr__(
+            self,
+            "data_build_id",
+            snapshot.data_build_id,
+        )
+        object.__setattr__(
+            self,
+            "ordered_stream_sha256",
+            snapshot.ordered_stream_sha256,
         )
         object.__setattr__(
             self,
@@ -446,8 +486,13 @@ class RunBindingV3:
             "snapshot_version": self.snapshot_version,
             "training_run_id": self.training_run_id,
             "config_fingerprint": self.config_fingerprint,
+            "training_config_sha256": self.training_config_sha256,
             "model_config_sha256": self.model_config_sha256,
+            "model_identity": self.model_identity,
             "data_provenance_sha256": self.data_provenance_sha256,
+            "data_receipt_sha256": self.data_receipt_sha256,
+            "data_build_id": self.data_build_id,
+            "ordered_stream_sha256": self.ordered_stream_sha256,
             "world_size": self.world_size,
             "tokens_per_step": self.tokens_per_step,
             "sealed_evaluation_release_sha256": (
@@ -575,8 +620,13 @@ def _build_snapshot_evaluation_plans(
             snapshot_version=snapshot.snapshot_version,
             training_run_id=snapshot.training_run_id,
             config_fingerprint=snapshot.config_fingerprint,
+            training_config_sha256=snapshot.training_config_sha256,
             model_config_sha256=snapshot.model_config_sha256,
+            model_identity=snapshot.model_identity,
             data_provenance_sha256=snapshot.data_provenance_sha256,
+            data_receipt_sha256=snapshot.data_receipt_sha256,
+            data_build_id=snapshot.data_build_id,
+            ordered_stream_sha256=snapshot.ordered_stream_sha256,
             world_size=snapshot.world_size,
             tokens_per_step=snapshot.tokens_per_step,
             sealed_evaluation_release_sha256=(

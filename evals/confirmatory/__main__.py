@@ -4,8 +4,12 @@ from __future__ import annotations
 
 import argparse
 import json
+from pathlib import Path
 import sys
 from typing import Sequence
+
+if __name__ == "__main__" and __package__ in (None, ""):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from evals.confirmatory.runner import (
     MSCTL_EVALUATOR_CONTRACT,
@@ -151,6 +155,10 @@ def main(
                         "selected_provider": result.selected_provider,
                         "production_qualified": result.production_qualified,
                         "snapshot_sha256": result.snapshot_sha256,
+                        "authoritative_commitment": (
+                            result.authoritative_commitment
+                        ),
+                        "path_authority": result.path_authority,
                     }
                 )
             print("confirmatory evidence published", file=sys.stderr)

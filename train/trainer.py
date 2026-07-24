@@ -104,8 +104,13 @@ _SELECTED_STUDY_SNAPSHOT_FIELDS = _SNAPSHOT_FIELDS | {
 _STUDY_IDENTITY_FIELDS = {
     "arm",
     "cohort_id",
+    "config_sha256",
+    "data_build_id",
     "data_provenance_sha256",
+    "data_receipt_sha256",
     "model_cfg_sha256",
+    "model_identity",
+    "ordered_stream_sha256",
     "run_id",
     "seed",
     "tokens_per_step",
@@ -1347,13 +1352,50 @@ class Trainer:
             raise ValueError("study snapshot config identity is invalid")
         if type(model_cfg) is not dict or type(data_provenance) is not dict:
             raise ValueError("study snapshot provenance must be dictionaries")
+        data_receipt_sha256 = data_provenance.get("receipt_sha256")
+        data_build_id = data_provenance.get("build_id")
+        ordered_stream_sha256 = data_provenance.get(
+            "ordered_stream_sha256"
+        )
+        if any(
+            not isinstance(value, str)
+            or re.fullmatch(r"[0-9a-f]{64}", value) is None
+            for value in (
+                data_receipt_sha256,
+                data_build_id,
+                ordered_stream_sha256,
+            )
+        ):
+            raise ValueError(
+                "study snapshot data receipt/build/order identity is invalid"
+            )
+        import yaml
+
+        config_sha256 = hashlib.sha256(
+            yaml.safe_dump(
+                _jsonable(self.cfg),
+                sort_keys=False,
+            ).encode("utf-8")
+        ).hexdigest()
+        model_cfg_sha256 = _canonical_json_hash(model_cfg)
+        model_selector = self.cfg.get("model")
+        model_identity = (
+            model_selector
+            if isinstance(model_selector, str)
+            else f"inline-sha256:{model_cfg_sha256}"
+        )
         return {
             "arm": arm,
             "cohort_id": cohort_id,
+            "config_sha256": config_sha256,
+            "data_build_id": data_build_id,
             "data_provenance_sha256": _canonical_json_hash(
                 data_provenance
             ),
-            "model_cfg_sha256": _canonical_json_hash(model_cfg),
+            "data_receipt_sha256": data_receipt_sha256,
+            "model_cfg_sha256": model_cfg_sha256,
+            "model_identity": model_identity,
+            "ordered_stream_sha256": ordered_stream_sha256,
             "run_id": run_id,
             "seed": seed,
             "tokens_per_step": self.tokens_per_step,

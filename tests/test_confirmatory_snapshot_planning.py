@@ -85,9 +85,18 @@ def _lock() -> StudyLockV3:
                         "config_fingerprint": _digest(
                             f"config:{seed}:{arm}"
                         ),
+                        "training_config_sha256": _digest(
+                            f"config-bytes:{seed}:{arm}"
+                        ),
                         "model_config_sha256": _digest("model-config"),
+                        "model_identity": "d360m",
                         "data_provenance_sha256": _digest(
                             f"data:{seed}:{arm}"
+                        ),
+                        "data_receipt_sha256": _digest("data-receipt"),
+                        "data_build_id": _digest("data-build"),
+                        "ordered_stream_sha256": _digest(
+                            "ordered-stream"
                         ),
                         "world_size": 4,
                         "tokens_per_step": 524_288,

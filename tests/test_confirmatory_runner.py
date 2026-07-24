@@ -6,6 +6,7 @@ import hashlib
 import importlib
 import importlib.util
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -1447,3 +1448,50 @@ def test_module_and_direct_cli_help_match_machine_contract(mode):
         "--output-dir",
     ]
     assert "usage:" in completed.stderr
+
+
+@pytest.mark.parametrize(
+    "entrypoint",
+    ["module", "package-main", "runner-script"],
+)
+def test_cli_bootstraps_from_clean_environment_outside_repository(
+    tmp_path,
+    entrypoint,
+):
+    root = Path(__file__).resolve().parents[1]
+    environment = dict(os.environ)
+    environment.pop("PYTHONPATH", None)
+    environment.pop("PYTHONHOME", None)
+    environment["PYTHONDONTWRITEBYTECODE"] = "1"
+    if entrypoint == "module":
+        command = [sys.executable, "-m", "evals.confirmatory", "--help"]
+        cwd = root
+    elif entrypoint == "package-main":
+        command = [
+            sys.executable,
+            str(root / "evals" / "confirmatory" / "__main__.py"),
+            "--help",
+        ]
+        cwd = tmp_path
+    else:
+        command = [
+            sys.executable,
+            str(root / "evals" / "confirmatory" / "runner.py"),
+            "--help",
+        ]
+        cwd = tmp_path
+
+    completed = subprocess.run(
+        command,
+        cwd=cwd,
+        env=environment,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert len(completed.stdout.splitlines()) == 1
+    payload = json.loads(completed.stdout)
+    assert payload["status"] == "help"
+    assert payload["contract"] == "memorysplit-confirmatory-evaluator-v1"

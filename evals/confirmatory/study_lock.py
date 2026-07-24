@@ -373,8 +373,13 @@ class StudySnapshotBinding:
     snapshot_version: int
     training_run_id: str
     config_fingerprint: str
+    training_config_sha256: str
     model_config_sha256: str
+    model_identity: str
     data_provenance_sha256: str
+    data_receipt_sha256: str
+    data_build_id: str
+    ordered_stream_sha256: str
     world_size: int
     tokens_per_step: int
 
@@ -394,8 +399,13 @@ class StudySnapshotBinding:
             "snapshot_version",
             "training_run_id",
             "config_fingerprint",
+            "training_config_sha256",
             "model_config_sha256",
+            "model_identity",
             "data_provenance_sha256",
+            "data_receipt_sha256",
+            "data_build_id",
+            "ordered_stream_sha256",
             "world_size",
             "tokens_per_step",
         }
@@ -422,7 +432,7 @@ class StudySnapshotBinding:
         if object_key != expected_key:
             raise ValueError(
                 "S3 object key is not the canonical content-addressed "
-                "checkpoint key"
+                "model snapshot key"
             )
         version_id = _s3_version_id(self.s3_version_id, "S3 version ID")
         receipt_digest = _hash(
@@ -465,13 +475,33 @@ class StudySnapshotBinding:
             self.config_fingerprint,
             "snapshot config fingerprint",
         )
+        training_config_sha256 = _hash(
+            self.training_config_sha256,
+            "snapshot training config SHA-256",
+        )
         model_config_sha256 = _hash(
             self.model_config_sha256,
             "snapshot model config SHA-256",
         )
+        model_identity = _string(
+            self.model_identity,
+            "snapshot model identity",
+        )
         data_provenance_sha256 = _hash(
             self.data_provenance_sha256,
             "snapshot data provenance SHA-256",
+        )
+        data_receipt_sha256 = _hash(
+            self.data_receipt_sha256,
+            "snapshot data receipt SHA-256",
+        )
+        data_build_id = _hash(
+            self.data_build_id,
+            "snapshot data build ID",
+        )
+        ordered_stream_sha256 = _hash(
+            self.ordered_stream_sha256,
+            "snapshot ordered stream SHA-256",
         )
         if type(self.world_size) is not int or self.world_size != 4:
             raise ValueError("study snapshot world_size must be exactly 4")
@@ -519,13 +549,30 @@ class StudySnapshotBinding:
         )
         object.__setattr__(
             self,
+            "training_config_sha256",
+            training_config_sha256,
+        )
+        object.__setattr__(
+            self,
             "model_config_sha256",
             model_config_sha256,
         )
+        object.__setattr__(self, "model_identity", model_identity)
         object.__setattr__(
             self,
             "data_provenance_sha256",
             data_provenance_sha256,
+        )
+        object.__setattr__(
+            self,
+            "data_receipt_sha256",
+            data_receipt_sha256,
+        )
+        object.__setattr__(self, "data_build_id", data_build_id)
+        object.__setattr__(
+            self,
+            "ordered_stream_sha256",
+            ordered_stream_sha256,
         )
 
     @classmethod
@@ -555,8 +602,13 @@ class StudySnapshotBinding:
             "snapshot_version": self.snapshot_version,
             "training_run_id": self.training_run_id,
             "config_fingerprint": self.config_fingerprint,
+            "training_config_sha256": self.training_config_sha256,
             "model_config_sha256": self.model_config_sha256,
+            "model_identity": self.model_identity,
             "data_provenance_sha256": self.data_provenance_sha256,
+            "data_receipt_sha256": self.data_receipt_sha256,
+            "data_build_id": self.data_build_id,
+            "ordered_stream_sha256": self.ordered_stream_sha256,
             "world_size": self.world_size,
             "tokens_per_step": self.tokens_per_step,
         }
@@ -631,6 +683,77 @@ class StudyLockV3:
             raise ValueError(
                 "every snapshot must share the cohort provider selection"
             )
+        per_run_invariants: dict[tuple[int, StudyArm], tuple[object, ...]] = {}
+        for snapshot in snapshots:
+            key = snapshot.seed, snapshot.arm
+            invariant = (
+                snapshot.snapshot_version,
+                snapshot.training_run_id,
+                snapshot.config_fingerprint,
+                snapshot.training_config_sha256,
+                snapshot.model_config_sha256,
+                snapshot.model_identity,
+                snapshot.data_provenance_sha256,
+                snapshot.data_receipt_sha256,
+                snapshot.data_build_id,
+                snapshot.ordered_stream_sha256,
+                snapshot.world_size,
+                snapshot.tokens_per_step,
+                snapshot.provider_selection_sha256,
+                snapshot.provider_selection_s3_version_id,
+            )
+            previous = per_run_invariants.setdefault(key, invariant)
+            if previous != invariant:
+                raise ValueError(
+                    "study lock cross-step provenance invariant drift"
+                )
+        for seed in SEEDS:
+            dense = per_run_invariants[(seed, StudyArm.DENSE)]
+            split90 = per_run_invariants[(seed, StudyArm.SPLIT90)]
+            dense_matched = (
+                dense[0],
+                dense[4],
+                dense[5],
+                dense[7],
+                dense[8],
+                dense[9],
+                dense[10],
+                dense[11],
+                dense[12],
+                dense[13],
+            )
+            split90_matched = (
+                split90[0],
+                split90[4],
+                split90[5],
+                split90[7],
+                split90[8],
+                split90[9],
+                split90[10],
+                split90[11],
+                split90[12],
+                split90[13],
+            )
+            if dense_matched != split90_matched:
+                raise ValueError(
+                    "study lock cross-arm matched invariant drift"
+                )
+        cohort_matched = tuple(
+            (
+                snapshot.model_config_sha256,
+                snapshot.model_identity,
+                snapshot.data_receipt_sha256,
+                snapshot.data_build_id,
+                snapshot.ordered_stream_sha256,
+                snapshot.world_size,
+                snapshot.tokens_per_step,
+                snapshot.provider_selection_sha256,
+                snapshot.provider_selection_s3_version_id,
+            )
+            for snapshot in snapshots
+        )
+        if len(set(cohort_matched)) != 1:
+            raise ValueError("study lock cohort matched invariant drift")
         checkpoint_hashes = tuple(
             snapshot.checkpoint_sha256 for snapshot in snapshots
         )

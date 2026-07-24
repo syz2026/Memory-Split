@@ -204,11 +204,24 @@ def _study_lock() -> StudyLockV3:
                         "config_fingerprint": hashlib.sha256(
                             f"config:{seed}:{arm}".encode("ascii")
                         ).hexdigest(),
+                        "training_config_sha256": hashlib.sha256(
+                            f"config-bytes:{seed}:{arm}".encode("ascii")
+                        ).hexdigest(),
                         "model_config_sha256": hashlib.sha256(
                             b"model-config"
                         ).hexdigest(),
+                        "model_identity": "d360m",
                         "data_provenance_sha256": hashlib.sha256(
                             f"data:{seed}:{arm}".encode("ascii")
+                        ).hexdigest(),
+                        "data_receipt_sha256": hashlib.sha256(
+                            b"data-receipt"
+                        ).hexdigest(),
+                        "data_build_id": hashlib.sha256(
+                            b"data-build"
+                        ).hexdigest(),
+                        "ordered_stream_sha256": hashlib.sha256(
+                            b"ordered-stream"
                         ).hexdigest(),
                         "world_size": 4,
                         "tokens_per_step": 524_288,
@@ -551,8 +564,13 @@ def test_v3_outcome_binding_rejects_checkpoint_and_object_replacements():
         snapshot_version=snapshot.snapshot_version,
         training_run_id=snapshot.training_run_id,
         config_fingerprint=snapshot.config_fingerprint,
+        training_config_sha256=snapshot.training_config_sha256,
         model_config_sha256=snapshot.model_config_sha256,
+        model_identity=snapshot.model_identity,
         data_provenance_sha256=snapshot.data_provenance_sha256,
+        data_receipt_sha256=snapshot.data_receipt_sha256,
+        data_build_id=snapshot.data_build_id,
+        ordered_stream_sha256=snapshot.ordered_stream_sha256,
         world_size=snapshot.world_size,
         tokens_per_step=snapshot.tokens_per_step,
     )

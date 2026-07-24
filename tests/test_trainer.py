@@ -681,6 +681,13 @@ def test_v3_save_snapshot_emits_model_only_study_provenance(tmp_path):
         }
     )
     trainer = Trainer(cfg)
+    trainer.data.provenance.update(
+        {
+            "receipt_sha256": "a" * 64,
+            "build_id": "b" * 64,
+            "ordered_stream_sha256": "c" * 64,
+        }
+    )
     trainer.step = 1_358
 
     trainer.save_snapshot()
@@ -704,15 +711,29 @@ def test_v3_save_snapshot_emits_model_only_study_provenance(tmp_path):
     assert snapshot["snapshot_version"] == 2
     assert snapshot["step"] == 1_358
     assert snapshot["config_fingerprint"] == trainer.config_fingerprint
+    import yaml
+
+    training_config_sha256 = hashlib.sha256(
+        yaml.safe_dump(
+            trainer_module._jsonable(cfg),
+            sort_keys=False,
+        ).encode("utf-8")
+    ).hexdigest()
+    model_cfg_sha256 = trainer_module._canonical_json_hash(
+        snapshot["model_cfg"]
+    )
     assert snapshot["study_identity"] == {
         "arm": "dense",
         "cohort_id": "memorysplit-confirmatory-v3-360m-n10-aws",
+        "config_sha256": training_config_sha256,
+        "data_build_id": "b" * 64,
         "data_provenance_sha256": trainer_module._canonical_json_hash(
             snapshot["data_provenance"]
         ),
-        "model_cfg_sha256": trainer_module._canonical_json_hash(
-            snapshot["model_cfg"]
-        ),
+        "data_receipt_sha256": "a" * 64,
+        "model_cfg_sha256": model_cfg_sha256,
+        "model_identity": f"inline-sha256:{model_cfg_sha256}",
+        "ordered_stream_sha256": "c" * 64,
         "run_id": "memorysplit-v3-360m-s7-dense",
         "seed": 7,
         "tokens_per_step": 524_288,

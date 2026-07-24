@@ -93,11 +93,24 @@ def _snapshots() -> list[dict]:
                         "config_fingerprint": hashlib.sha256(
                             f"config:{seed}:{arm}".encode("ascii")
                         ).hexdigest(),
+                        "training_config_sha256": hashlib.sha256(
+                            f"config-bytes:{seed}:{arm}".encode("ascii")
+                        ).hexdigest(),
                         "model_config_sha256": hashlib.sha256(
                             b"model-config"
                         ).hexdigest(),
+                        "model_identity": "d360m",
                         "data_provenance_sha256": hashlib.sha256(
                             f"data:{seed}:{arm}".encode("ascii")
+                        ).hexdigest(),
+                        "data_receipt_sha256": hashlib.sha256(
+                            b"data-receipt"
+                        ).hexdigest(),
+                        "data_build_id": hashlib.sha256(
+                            b"data-build"
+                        ).hexdigest(),
+                        "ordered_stream_sha256": hashlib.sha256(
+                            b"ordered-stream"
                         ).hexdigest(),
                         "world_size": 4,
                         "tokens_per_step": 524_288,
@@ -299,6 +312,61 @@ def test_v3_study_lock_binds_frozen_preregistration_and_sealed_release_hashes():
         StudyLockV3.from_dict(
             _lock(sealed_evaluation_release_sha256=None)
         )
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "training_run_id",
+        "config_fingerprint",
+        "training_config_sha256",
+        "model_config_sha256",
+        "model_identity",
+        "data_provenance_sha256",
+        "data_receipt_sha256",
+        "data_build_id",
+        "ordered_stream_sha256",
+    ],
+)
+def test_v3_study_lock_rejects_cross_step_provenance_drift(field):
+    snapshots = _snapshots()
+    assert snapshots[0]["seed"] == snapshots[1]["seed"] == 0
+    assert snapshots[0]["arm"] == snapshots[1]["arm"] == "dense"
+    snapshots[1][field] = (
+        "other-model"
+        if field in {"training_run_id", "model_identity"}
+        else "0" * 64
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="cross.step|provenance|invariant|training run identity",
+    ):
+        StudyLockV3.from_dict(_lock(snapshots=snapshots))
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "model_config_sha256",
+        "model_identity",
+        "data_receipt_sha256",
+        "data_build_id",
+        "ordered_stream_sha256",
+    ],
+)
+def test_v3_study_lock_rejects_cross_arm_matched_invariant_drift(field):
+    snapshots = _snapshots()
+    split90_index = len(SNAPSHOT_STEPS)
+    assert snapshots[0]["seed"] == snapshots[split90_index]["seed"] == 0
+    assert snapshots[0]["arm"] == "dense"
+    assert snapshots[split90_index]["arm"] == "split90"
+    snapshots[split90_index][field] = (
+        "other-model" if field == "model_identity" else "0" * 64
+    )
+
+    with pytest.raises(ValueError, match="cross.arm|matched|invariant"):
+        StudyLockV3.from_dict(_lock(snapshots=snapshots))
 
 
 def test_v3_study_lock_requires_one_selection_for_every_snapshot():

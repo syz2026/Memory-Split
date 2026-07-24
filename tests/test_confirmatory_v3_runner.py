@@ -242,6 +242,13 @@ def _write_trainer_snapshot(
         "ckpt_minutes": 999,
     }
     trainer = Trainer(run_config)
+    trainer.data.provenance.update(
+        {
+            "receipt_sha256": _digest("data-receipt"),
+            "build_id": _digest("data-build"),
+            "ordered_stream_sha256": _digest("ordered-stream"),
+        }
+    )
     model = trainer._raw_model()
     with torch.no_grad():
         for parameter in model.parameters():
@@ -307,6 +314,7 @@ def _build_v3_fixture(tmp_path: Path) -> _V3Fixture:
         for arm in ARMS:
             for step in SNAPSHOT_STEPS:
                 selected = (seed, arm, step) == (0, "dense", 1_358)
+                same_training_run = seed == 0 and arm == "dense"
                 snapshot_sha256 = (
                     selected_snapshot_sha256
                     if selected
@@ -341,22 +349,33 @@ def _build_v3_fixture(tmp_path: Path) -> _V3Fixture:
                         ),
                         "config_fingerprint": (
                             snapshot_state["config_fingerprint"]
-                            if selected
+                            if same_training_run
                             else _digest(f"config:{seed}:{arm}")
                         ),
-                        "model_config_sha256": (
+                        "training_config_sha256": (
                             snapshot_state["study_identity"][
-                                "model_cfg_sha256"
+                                "config_sha256"
                             ]
-                            if selected
-                            else _digest("model-config")
+                            if same_training_run
+                            else _digest(f"config-bytes:{seed}:{arm}")
                         ),
+                        "model_config_sha256": snapshot_state[
+                            "study_identity"
+                        ]["model_cfg_sha256"],
+                        "model_identity": snapshot_state["study_identity"][
+                            "model_identity"
+                        ],
                         "data_provenance_sha256": (
                             snapshot_state["study_identity"][
                                 "data_provenance_sha256"
                             ]
-                            if selected
+                            if same_training_run
                             else _digest(f"data:{seed}:{arm}")
+                        ),
+                        "data_receipt_sha256": _digest("data-receipt"),
+                        "data_build_id": _digest("data-build"),
+                        "ordered_stream_sha256": _digest(
+                            "ordered-stream"
                         ),
                         "world_size": 4,
                         "tokens_per_step": 524_288,
@@ -1055,6 +1074,10 @@ def test_v3_evaluate_publishes_bound_snapshot_evidence_without_conclusion(
         "fixture"
     )
     assert result.production_qualified is False
+    assert result.authoritative_commitment == hashlib.sha256(
+        fixture.output.joinpath("output.json").read_bytes()
+    ).hexdigest()
+    assert result.path_authority == "informational_reopen_required"
     assert [artifact["path"] for artifact in manifest["artifacts"]] == sorted(
         artifact["path"] for artifact in manifest["artifacts"]
     )
@@ -1389,6 +1412,119 @@ def test_v3_output_quarantines_installed_tree_on_final_identity_failure(
     assert not fixture.output.exists()
     assert len(quarantines) == 1
     assert quarantines[0].joinpath("output.json").is_file()
+
+
+def test_v3_output_final_authority_rejects_installed_name_replacement(
+    tmp_path,
+    monkeypatch,
+):
+    fixture = _build_v3_fixture(tmp_path)
+    replacement_payload = b"replacement owner"
+    displaced_name = "displaced-installed-output"
+
+    def replace_after_prior_checks(event, **context):
+        if event != "before_final_output_authority":
+            return
+        parent_fd = context["parent_fd"]
+        output_name = context["output_name"]
+        os.rename(
+            output_name,
+            displaced_name,
+            src_dir_fd=parent_fd,
+            dst_dir_fd=parent_fd,
+        )
+        os.mkdir(output_name, 0o700, dir_fd=parent_fd)
+        replacement_fd = os.open(
+            output_name,
+            os.O_RDONLY | os.O_DIRECTORY,
+            dir_fd=parent_fd,
+        )
+        try:
+            descriptor = os.open(
+                "sentinel",
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                0o600,
+                dir_fd=replacement_fd,
+            )
+            try:
+                os.write(descriptor, replacement_payload)
+            finally:
+                os.close(descriptor)
+        finally:
+            os.close(replacement_fd)
+
+    monkeypatch.setattr(
+        runner_module,
+        "_run_output_mutation_hook",
+        replace_after_prior_checks,
+        raising=False,
+    )
+
+    with pytest.raises(ValueError, match="output.*replaced|final.*authority"):
+        evaluate(
+            run=fixture.run,
+            sealed_release=fixture.release,
+            expected_study_lock_sha256=fixture.lock_sha256,
+            output_dir=fixture.output,
+            model_adapter=DeterministicFixtureAdapter(fixture.submissions),
+        )
+    assert fixture.output.joinpath("sentinel").read_bytes() == (
+        replacement_payload
+    )
+    quarantines = [
+        path
+        for path in tmp_path.iterdir()
+        if path.name.startswith(
+            f".{fixture.output.name}.confirmatory-v3-quarantine-"
+        )
+    ]
+    assert len(quarantines) == 1
+    assert quarantines[0].joinpath("output.json").is_file()
+
+
+def test_v3_output_failure_quarantines_without_pathname_deletion(
+    tmp_path,
+    monkeypatch,
+):
+    fixture = _build_v3_fixture(tmp_path)
+    original = runner_module._publish_file_at
+    writes = 0
+
+    def fail_third_write(*args, **kwargs):
+        nonlocal writes
+        writes += 1
+        if writes == 3:
+            raise OSError("injected v3 output write failure")
+        return original(*args, **kwargs)
+
+    def forbid_deletion(*_args, **_kwargs):
+        raise AssertionError("v3 output authority must not delete pathnames")
+
+    monkeypatch.setattr(runner_module, "_publish_file_at", fail_third_write)
+    monkeypatch.setattr(runner_module.os, "unlink", forbid_deletion)
+    monkeypatch.setattr(runner_module.os, "rmdir", forbid_deletion)
+
+    with pytest.raises(OSError, match="injected v3 output write failure"):
+        evaluate(
+            run=fixture.run,
+            sealed_release=fixture.release,
+            expected_study_lock_sha256=fixture.lock_sha256,
+            output_dir=fixture.output,
+            model_adapter=DeterministicFixtureAdapter(fixture.submissions),
+        )
+    quarantines = [
+        path
+        for path in tmp_path.iterdir()
+        if path.name.startswith(
+            f".{fixture.output.name}.confirmatory-v3-quarantine-"
+        )
+    ]
+    assert not fixture.output.exists()
+    assert len(quarantines) == 1
+    assert {path.name for path in quarantines[0].iterdir()} == {
+        "inference.json",
+        "items.jsonl",
+    }
 
 
 def test_v3_preflight_rejects_model_visible_release_drift_without_gold(tmp_path):

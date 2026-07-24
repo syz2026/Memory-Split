@@ -23,6 +23,12 @@ import tempfile
 from types import MappingProxyType
 from typing import Any, Protocol
 
+if __name__ == "__main__" and __package__ in (None, ""):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+    from evals.confirmatory.__main__ import main
+
+    raise SystemExit(main())
+
 from cluster.aws.gpu_profile import (
     parse_aws_gpu_profile_bytes,
     read_secure_regular_file,
@@ -36,12 +42,6 @@ from msctl.aws_hardware import (
     parse_aws_runtime_lock_bytes,
     verify_aws_instance_identity_pkcs7,
 )
-
-if __name__ == "__main__" and __package__ in (None, ""):
-    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-    from evals.confirmatory.__main__ import main
-
-    raise SystemExit(main())
 
 from evals.confirmatory import (
     metrics,
@@ -112,8 +112,13 @@ _MODEL_SNAPSHOT_IDENTITY_FIELDS_V2 = frozenset(
     {
         "arm",
         "cohort_id",
+        "config_sha256",
+        "data_build_id",
         "data_provenance_sha256",
+        "data_receipt_sha256",
         "model_cfg_sha256",
+        "model_identity",
+        "ordered_stream_sha256",
         "run_id",
         "seed",
         "tokens_per_step",
@@ -285,6 +290,8 @@ class EvaluationResult:
     selected_provider: str | None = None
     production_qualified: bool = False
     snapshot_sha256: str | None = None
+    authoritative_commitment: str | None = None
+    path_authority: str | None = None
 
 
 @dataclass(frozen=True)
@@ -1074,8 +1081,13 @@ def _parse_bound_model_snapshot(
     expected_identity = {
         "arm": binding.arm.value,
         "cohort_id": "memorysplit-confirmatory-v3-360m-n10-aws",
+        "config_sha256": binding.training_config_sha256,
+        "data_build_id": binding.data_build_id,
         "data_provenance_sha256": data_provenance_sha256,
+        "data_receipt_sha256": binding.data_receipt_sha256,
         "model_cfg_sha256": model_cfg_sha256,
+        "model_identity": binding.model_identity,
+        "ordered_stream_sha256": binding.ordered_stream_sha256,
         "run_id": binding.training_run_id,
         "seed": binding.seed,
         "tokens_per_step": binding.tokens_per_step,
@@ -2452,22 +2464,234 @@ def _publish_file_at(
         os.close(descriptor)
 
 
-def _cleanup_v3_staging(
-    parent_fd: int,
-    staging_fd: int,
-    staging_name: str,
-    written_names: tuple[str, ...],
-) -> None:
-    for name in reversed(written_names):
+@dataclass(frozen=True)
+class _V3OutputFileSnapshot:
+    name: str
+    state: tuple[int, int, int, int, int, int, int, int, int]
+    sha256: str
+
+
+@dataclass(frozen=True)
+class _V3OutputDirectorySnapshot:
+    identity: tuple[int, int, int, int, int]
+    modified_ns: int
+    changed_ns: int
+    files: tuple[_V3OutputFileSnapshot, ...]
+
+
+def _v3_output_file_state(
+    details: os.stat_result,
+    *,
+    label: str,
+) -> tuple[int, int, int, int, int, int, int, int, int]:
+    mode = stat.S_IMODE(details.st_mode)
+    if (
+        not stat.S_ISREG(details.st_mode)
+        or details.st_uid != os.geteuid()
+        or details.st_nlink != 1
+        or mode != 0o600
+    ):
+        raise ValueError(f"{label} metadata is unsafe")
+    return (
+        details.st_dev,
+        details.st_ino,
+        mode,
+        details.st_uid,
+        details.st_gid,
+        details.st_nlink,
+        details.st_size,
+        details.st_mtime_ns,
+        details.st_ctime_ns,
+    )
+
+
+def _capture_v3_output_snapshot(
+    directory_fd: int,
+) -> _V3OutputDirectorySnapshot:
+    expected_names = tuple(sorted((*_V3_OUTPUT_ARTIFACTS, "output.json")))
+    before = os.fstat(directory_fd)
+    identity = _output_parent_identity(
+        before,
+        label="installed v3 output",
+    )
+    names = tuple(sorted(os.listdir(directory_fd)))
+    if names != expected_names:
+        raise ValueError("installed v3 output membership is not exact")
+    files = []
+    for name in names:
+        descriptor = os.open(
+            name,
+            os.O_RDONLY
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=directory_fd,
+        )
         try:
-            os.unlink(name, dir_fd=staging_fd)
-        except FileNotFoundError:
-            pass
-    os.close(staging_fd)
+            initial = _v3_output_file_state(
+                os.fstat(descriptor),
+                label=f"installed v3 output {name}",
+            )
+            digest = hashlib.sha256()
+            offset = 0
+            while offset < initial[6]:
+                chunk = os.pread(
+                    descriptor,
+                    min(1 << 20, initial[6] - offset),
+                    offset,
+                )
+                if not chunk:
+                    raise ValueError(
+                        f"installed v3 output {name} changed while read"
+                    )
+                digest.update(chunk)
+                offset += len(chunk)
+            if os.pread(descriptor, 1, initial[6]):
+                raise ValueError(
+                    f"installed v3 output {name} grew while read"
+                )
+            final = _v3_output_file_state(
+                os.fstat(descriptor),
+                label=f"installed v3 output {name}",
+            )
+            named = _v3_output_file_state(
+                os.stat(name, dir_fd=directory_fd, follow_symlinks=False),
+                label=f"installed v3 output {name}",
+            )
+            if initial != final or final != named:
+                raise ValueError(
+                    f"installed v3 output {name} identity changed"
+                )
+            files.append(
+                _V3OutputFileSnapshot(
+                    name=name,
+                    state=final,
+                    sha256=digest.hexdigest(),
+                )
+            )
+        finally:
+            os.close(descriptor)
+    after = os.fstat(directory_fd)
+    if (
+        _output_parent_identity(after, label="installed v3 output")
+        != identity
+        or before.st_mtime_ns != after.st_mtime_ns
+        or before.st_ctime_ns != after.st_ctime_ns
+    ):
+        raise ValueError("installed v3 output changed during validation")
+    return _V3OutputDirectorySnapshot(
+        identity=identity,
+        modified_ns=after.st_mtime_ns,
+        changed_ns=after.st_ctime_ns,
+        files=tuple(files),
+    )
+
+
+def _run_output_mutation_hook(event: str, **context: object) -> None:
+    del event, context
+
+
+def _assert_final_output_authority(
+    *,
+    parent_path: Path,
+    parent_fd: int,
+    output_name: str,
+    output_fd: int,
+    expected: _V3OutputDirectorySnapshot,
+    expected_parent: tuple[int, int, int, int, int],
+) -> None:
+    _assert_output_parent(parent_path, parent_fd, expected_parent)
     try:
-        os.rmdir(staging_name, dir_fd=parent_fd)
-    except FileNotFoundError:
-        pass
+        named = _output_parent_identity(
+            os.stat(
+                output_name,
+                dir_fd=parent_fd,
+                follow_symlinks=False,
+            ),
+            label="installed v3 output",
+        )
+        reopened = os.open(
+            output_name,
+            os.O_RDONLY
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=parent_fd,
+        )
+    except OSError as exc:
+        raise ValueError("final output authority was replaced") from exc
+    try:
+        reopened_identity = _output_parent_identity(
+            os.fstat(reopened),
+            label="installed v3 output",
+        )
+    finally:
+        os.close(reopened)
+    observed = _capture_v3_output_snapshot(output_fd)
+    _assert_output_parent(parent_path, parent_fd, expected_parent)
+    final_named = _output_parent_identity(
+        os.stat(
+            output_name,
+            dir_fd=parent_fd,
+            follow_symlinks=False,
+        ),
+        label="installed v3 output",
+    )
+    if (
+        named != expected.identity
+        or reopened_identity != expected.identity
+        or observed != expected
+        or final_named != expected.identity
+    ):
+        raise ValueError("final output authority was replaced or changed")
+
+
+def _find_pinned_output_name(
+    parent_fd: int,
+    output_fd: int,
+) -> str:
+    expected = os.fstat(output_fd)
+    matches = []
+    for name in tuple(sorted(os.listdir(parent_fd))):
+        try:
+            details = os.stat(
+                name,
+                dir_fd=parent_fd,
+                follow_symlinks=False,
+            )
+        except OSError:
+            continue
+        if (
+            stat.S_ISDIR(details.st_mode)
+            and (details.st_dev, details.st_ino)
+            == (expected.st_dev, expected.st_ino)
+        ):
+            matches.append(name)
+    if len(matches) != 1:
+        raise ValueError(
+            "pinned failed v3 output has no unique parent pathname"
+        )
+    return matches[0]
+
+
+def _quarantine_v3_output(
+    parent_fd: int,
+    output_fd: int,
+    output_name: str,
+) -> str:
+    source_name = _find_pinned_output_name(parent_fd, output_fd)
+    quarantine_name = (
+        f".{output_name}.confirmatory-v3-quarantine-"
+        f"{os.urandom(16).hex()}"
+    )
+    rename_noreplace_at(
+        parent_fd,
+        source_name,
+        parent_fd,
+        quarantine_name,
+    )
+    os.fsync(output_fd)
+    os.fsync(parent_fd)
+    return quarantine_name
 
 
 def _publish_v3_evidence(
@@ -2516,8 +2740,6 @@ def _publish_v3_evidence(
             )
         )
         staging_fd: int | None = None
-        written: list[str] = []
-        installed = False
         try:
             _assert_output_parent(parent, parent_fd, expected_parent)
             staging_fd = os.open(
@@ -2534,10 +2756,22 @@ def _publish_v3_evidence(
             )
             for name in _V3_OUTPUT_ARTIFACTS:
                 _publish_file_at(staging_fd, name, artifacts[name])
-                written.append(name)
             _publish_file_at(staging_fd, "output.json", manifest)
-            written.append("output.json")
             os.fsync(staging_fd)
+            staged_snapshot = _capture_v3_output_snapshot(staging_fd)
+            expected_contents = {
+                **dict(artifacts),
+                "output.json": manifest,
+            }
+            if any(
+                file.sha256
+                != hashlib.sha256(expected_contents[file.name]).hexdigest()
+                or file.state[6] != len(expected_contents[file.name])
+                for file in staged_snapshot.files
+            ):
+                raise ValueError(
+                    "staged v3 output content validation failed"
+                )
             _assert_output_parent(parent, parent_fd, expected_parent)
             rename_noreplace_at(
                 parent_fd,
@@ -2545,46 +2779,50 @@ def _publish_v3_evidence(
                 parent_fd,
                 output.name,
             )
-            installed = True
-            installed = _output_parent_identity(
-                os.stat(
-                    output.name,
-                    dir_fd=parent_fd,
-                    follow_symlinks=False,
-                ),
-                label="installed v3 output",
-            )
-            if installed != staging_identity:
-                raise ValueError("installed v3 output identity was replaced")
             os.fsync(parent_fd)
-            _assert_output_parent(parent, parent_fd, expected_parent)
+            installed_snapshot = _capture_v3_output_snapshot(staging_fd)
+            if (
+                installed_snapshot.identity != staging_identity
+                or tuple(
+                    (file.name, file.sha256, file.state[6])
+                    for file in installed_snapshot.files
+                )
+                != tuple(
+                    (file.name, file.sha256, file.state[6])
+                    for file in staged_snapshot.files
+                )
+            ):
+                raise ValueError(
+                    "installed v3 output content differs from staging"
+                )
+            _run_output_mutation_hook(
+                "before_final_output_authority",
+                parent_fd=parent_fd,
+                output_name=output.name,
+                output_fd=staging_fd,
+            )
+            _assert_final_output_authority(
+                parent_path=parent,
+                parent_fd=parent_fd,
+                output_name=output.name,
+                output_fd=staging_fd,
+                expected=installed_snapshot,
+                expected_parent=expected_parent,
+            )
             os.close(staging_fd)
             staging_fd = None
         except BaseException:
-            if installed:
-                quarantine_name = (
-                    f".{output.name}.confirmatory-v3-quarantine-"
-                    f"{os.getpid()}-{id(output):x}"
-                )
-                rename_noreplace_at(
-                    parent_fd,
-                    output.name,
-                    parent_fd,
-                    quarantine_name,
-                )
-                os.fsync(parent_fd)
-                if staging_fd is not None:
+            if staging_fd is not None:
+                try:
+                    _quarantine_v3_output(
+                        parent_fd,
+                        staging_fd,
+                        output.name,
+                    )
+                finally:
                     os.close(staging_fd)
                     staging_fd = None
             raise
-        finally:
-            if staging_fd is not None and not installed:
-                _cleanup_v3_staging(
-                    parent_fd,
-                    staging_fd,
-                    staging.name,
-                    tuple(written),
-                )
     finally:
         os.close(parent_fd)
     return hashlib.sha256(manifest).hexdigest()
@@ -2652,8 +2890,13 @@ def _v3_snapshot_for_binding(lock, binding: RunBindingV3):
         ("snapshot_version", "snapshot_version"),
         ("training_run_id", "training_run_id"),
         ("config_fingerprint", "config_fingerprint"),
+        ("training_config_sha256", "training_config_sha256"),
         ("model_config_sha256", "model_config_sha256"),
+        ("model_identity", "model_identity"),
         ("data_provenance_sha256", "data_provenance_sha256"),
+        ("data_receipt_sha256", "data_receipt_sha256"),
+        ("data_build_id", "data_build_id"),
+        ("ordered_stream_sha256", "ordered_stream_sha256"),
         ("world_size", "world_size"),
         ("tokens_per_step", "tokens_per_step"),
     ):
@@ -3170,6 +3413,8 @@ def _evaluate_prepared_v3(
         selected_provider=binding.selected_provider,
         production_qualified=provider_qualified,
         snapshot_sha256=binding.snapshot_sha256,
+        authoritative_commitment=report_hash,
+        path_authority="informational_reopen_required",
     )
 
 
