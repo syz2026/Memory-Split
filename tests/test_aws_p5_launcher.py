@@ -5,6 +5,7 @@ import fcntl
 import hashlib
 import json
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -12,6 +13,7 @@ import time
 import zipfile
 from copy import deepcopy
 from pathlib import Path
+from types import SimpleNamespace
 from urllib.error import HTTPError
 
 import pytest
@@ -20,6 +22,12 @@ import yaml
 import cluster.aws.p5.interruption_checkpoint as interruption_module
 import cluster.aws.p5.bootstrap as bootstrap_module
 import cluster.aws.p5.launch_seed_pair as launch_module
+from cluster.aws.p5.checkpoint_mirror import (
+    CheckpointReceiptRef,
+    CheckpointStaleError,
+    PublishedCheckpointPair,
+    VersionedUploadedObject,
+)
 from cluster.aws.p5.bootstrap import (
     BootstrapError,
     build_bootstrap_receipt,
@@ -1736,6 +1744,323 @@ def test_signal_shutdown_kills_running_containers_before_unlock(tmp_path):
     assert dense.container_events == ["stop", "verify", "kill", "verify"]
     assert split90.container_events == ["stop", "verify", "kill", "verify"]
     assert lock_observations and all(lock_observations)
+
+
+def _v3_mirror_fixture(tmp_path, seed: int = 1) -> dict:
+    fixture = _launcher_fixture(tmp_path, seed=seed)
+    fixture["manifest"].update(
+        {
+            "dataset_receipt_sha256": fixture["manifest"][
+                "corpus_receipt"
+            ]["sha256"],
+            "environment_receipt_sha256": "2" * 64,
+            "release_receipt_sha256": "3" * 64,
+            "run_manifest_sha256": "4" * 64,
+            "schema_version": 2,
+            "source_tree": "5" * 40,
+        }
+    )
+    _write_json(fixture["manifest_path"], fixture["manifest"])
+    return fixture
+
+
+def test_production_checkpoint_request_factory_builds_real_requests(tmp_path):
+    plan = _load_fixture_plan(_v3_mirror_fixture(tmp_path, seed=1))
+    rank_zero_pids = {"dense": 101, "split90": 102}
+
+    scheduler, request_factory = launch_module._production_checkpoint_scheduler(
+        plan,
+        rank_zero_pids,
+    )
+    request = request_factory("periodic")
+
+    assert isinstance(
+        scheduler,
+        launch_module.CheckpointMirrorScheduler,
+    )
+    assert scheduler.active is False
+    assert request.seed == plan.seed
+    assert request.reason == "periodic"
+    assert re.fullmatch(r"[0-9a-f]{32}", request.request_id) is not None
+    assert request_factory("interruption").request_id != request.request_id
+    assert request.instance_id == plan.instance_id
+    assert request.boot_id == plan.boot_id
+    assert request.run_manifest_sha256 == plan.run_manifest_sha256
+    assert request.dataset_receipt_sha256 == plan.dataset_receipt_sha256
+    assert request.ordered_stream_sha256 == plan.ordered_stream_sha256
+    assert request.source_tree == plan.source_tree
+    assert request.rank_zero_pids == rank_zero_pids
+    assert request.s3_root == plan.runtime.s3_root
+
+
+class _CancelRecordingScheduler:
+    """Mirror scheduler stub whose active attempt records cancellation."""
+
+    def __init__(self, *, latest=None):
+        self.latest = latest
+        self.active = True
+        self.cancelled = False
+
+    def maybe_start(self, _request, *, now=None, immediate=False):
+        del now, immediate
+        return False
+
+    def poll(self, *, now=None):
+        del now
+        return None
+
+    def cancel_active(self):
+        self.cancelled = True
+        self.active = False
+
+
+class _StaleRaisingScheduler(_CancelRecordingScheduler):
+    def poll(self, *, now=None):
+        del now
+        raise CheckpointStaleError(
+            "CHECKPOINT_STALE: paired durability deadline expired"
+        )
+
+
+def _published_pair_fixture():
+    return PublishedCheckpointPair(
+        receipt=CheckpointReceiptRef(
+            uri="s3://bucket/receipt.json",
+            sha256="a" * 64,
+            version_id="receipt-version",
+            bytes=123,
+        ),
+        checkpoints=(
+            VersionedUploadedObject(
+                "s3://bucket/dense.pt",
+                "b" * 64,
+                10,
+                "dense-version",
+            ),
+            VersionedUploadedObject(
+                "s3://bucket/split90.pt",
+                "c" * 64,
+                10,
+                "split90-version",
+            ),
+        ),
+        value={},
+    )
+
+
+def test_supervisor_stale_fail_stop_terminates_and_cancels_active_attempt(
+    tmp_path,
+):
+    plan = _load_fixture_plan(_launcher_fixture(tmp_path))
+    dense = _FakeProcess(101, [None])
+    split90 = _FakeProcess(202, [None])
+    scheduler = _StaleRaisingScheduler()
+
+    result = supervise_pair(
+        plan,
+        spawner=_FakeSpawner({"dense": dense, "split90": split90}),
+        sleep=lambda _delay: None,
+        trainer_preflight=_pass_trainer_preflight,
+        rank_zero_resolver=_pass_rank_zero_resolver,
+        checkpoint_scheduler_factory=lambda _plan, _pids: (
+            scheduler,
+            lambda reason: SimpleNamespace(reason=reason),
+        ),
+    )
+
+    assert result.status == "CHECKPOINT_STALE"
+    assert result.returncode == 74
+    assert dense.terminated is True
+    assert split90.terminated is True
+    assert scheduler.cancelled is True
+
+
+@pytest.mark.parametrize(
+    "exit_path",
+    [
+        "requested-shutdown",
+        "clean-exit",
+        "peer-failure",
+        "notice-poll-failure",
+        "legacy-interruption",
+    ],
+)
+def test_supervisor_cancels_active_mirror_attempt_on_every_exit_path(
+    tmp_path,
+    exit_path,
+):
+    plan = _load_fixture_plan(_launcher_fixture(tmp_path))
+    scheduler = _CancelRecordingScheduler()
+    polls = {
+        "requested-shutdown": ([None], [None]),
+        "clean-exit": ([0], [0]),
+        "peer-failure": ([7], [None]),
+        "notice-poll-failure": ([None], [None]),
+        "legacy-interruption": ([None], [None]),
+    }[exit_path]
+    dense = _FakeProcess(101, list(polls[0]))
+    split90 = _FakeProcess(202, list(polls[1]))
+    request_factory = (
+        None
+        if exit_path == "legacy-interruption"
+        else (lambda reason: SimpleNamespace(reason=reason))
+    )
+    arguments = {
+        "spawner": _FakeSpawner({"dense": dense, "split90": split90}),
+        "sleep": lambda _delay: None,
+        "trainer_preflight": _pass_trainer_preflight,
+        "rank_zero_resolver": _pass_rank_zero_resolver,
+        "checkpoint_scheduler_factory": lambda _plan, _pids: (
+            scheduler,
+            request_factory,
+        ),
+    }
+    if exit_path == "requested-shutdown":
+        arguments["shutdown_source"] = lambda: signal.SIGTERM
+    if exit_path == "notice-poll-failure":
+        arguments["notice_source"] = lambda: (_ for _ in ()).throw(
+            RuntimeError("IMDS poll failed")
+        )
+    if exit_path == "legacy-interruption":
+        arguments["notice_source"] = lambda: "spot-interruption"
+        arguments["interruption_handler"] = (
+            lambda _plan, _pids, _notice: SimpleNamespace(
+                exit_code=75,
+                resumable=True,
+                receipt_path=tmp_path / "legacy-receipt.json",
+            )
+        )
+
+    if exit_path == "notice-poll-failure":
+        with pytest.raises(LaunchError, match="notice polling failed"):
+            supervise_pair(plan, **arguments)
+    else:
+        result = supervise_pair(plan, **arguments)
+        expected_status = {
+            "requested-shutdown": "terminated",
+            "clean-exit": "completed",
+            "peer-failure": "failed",
+            "legacy-interruption": "interrupted",
+        }[exit_path]
+        assert result.status == expected_status
+
+    assert scheduler.cancelled is True, (
+        "the active mirror attempt must not continue publishing after "
+        f"the supervisor returns through {exit_path}"
+    )
+
+
+@pytest.mark.parametrize(
+    "exit_path",
+    ["scheduler-poll-failure", "keyboard-interrupt"],
+)
+def test_scheduler_poll_exit_cancels_attempt_and_terminates_pair(
+    tmp_path,
+    exit_path,
+):
+    plan = _load_fixture_plan(_launcher_fixture(tmp_path))
+
+    class Scheduler(_CancelRecordingScheduler):
+        def poll(self, *, now=None):
+            del now
+            if exit_path == "scheduler-poll-failure":
+                raise RuntimeError("checkpoint scheduler poll failed")
+            raise KeyboardInterrupt
+
+    scheduler = Scheduler()
+    dense = _FakeProcess(101, [None])
+    split90 = _FakeProcess(202, [None])
+
+    def run_supervisor():
+        return supervise_pair(
+            plan,
+            spawner=_FakeSpawner({"dense": dense, "split90": split90}),
+            sleep=lambda _delay: None,
+            trainer_preflight=_pass_trainer_preflight,
+            rank_zero_resolver=_pass_rank_zero_resolver,
+            checkpoint_scheduler_factory=lambda _plan, _pids: (
+                scheduler,
+                lambda reason: SimpleNamespace(reason=reason),
+            ),
+        )
+
+    if exit_path == "scheduler-poll-failure":
+        with pytest.raises(
+            RuntimeError,
+            match="checkpoint scheduler poll failed",
+        ):
+            run_supervisor()
+    else:
+        result = run_supervisor()
+        assert result.status == "interrupted"
+        assert result.returncode == 130
+
+    assert scheduler.cancelled is True
+    assert dense.terminated is True
+    assert split90.terminated is True
+    assert dense.container_running is False
+    assert split90.container_running is False
+
+
+@pytest.mark.parametrize("has_last_complete", [True, False])
+def test_notice_loop_stops_immediately_on_stale_and_falls_back(
+    tmp_path,
+    has_last_complete,
+):
+    plan = _load_fixture_plan(_launcher_fixture(tmp_path))
+    published = _published_pair_fixture() if has_last_complete else None
+
+    class Scheduler(_CancelRecordingScheduler):
+        def __init__(self):
+            super().__init__(latest=published)
+            self.stale_raises = 0
+
+        def maybe_start(self, _request, *, now=None, immediate=False):
+            del now
+            if immediate:
+                self.stale_raises += 1
+                raise CheckpointStaleError(
+                    "CHECKPOINT_STALE: paired durability deadline expired"
+                )
+            return False
+
+    scheduler = Scheduler()
+    dense = _FakeProcess(101, [None])
+    split90 = _FakeProcess(202, [None])
+    sleeps = []
+
+    def sleep(delay):
+        sleeps.append(delay)
+        if len(sleeps) >= 3:
+            dense._polls.append(0)
+
+    result = supervise_pair(
+        plan,
+        spawner=_FakeSpawner({"dense": dense, "split90": split90}),
+        sleep=sleep,
+        notice_source=lambda: "spot-interruption",
+        trainer_preflight=_pass_trainer_preflight,
+        rank_zero_resolver=_pass_rank_zero_resolver,
+        checkpoint_scheduler_factory=lambda _plan, _pids: (
+            scheduler,
+            lambda reason: SimpleNamespace(reason=reason),
+        ),
+    )
+
+    assert scheduler.stale_raises == 1, (
+        "a stale durability window must stop the interruption notice "
+        "loop immediately instead of burning the notice budget"
+    )
+    assert scheduler.cancelled is True
+    assert result.status == "interrupted"
+    if has_last_complete:
+        assert result.returncode == 75
+        assert result.resumable is True
+        assert result.interruption_receipt == published.receipt.uri
+    else:
+        assert result.returncode == 74
+        assert result.resumable is False
+        assert result.interruption_receipt is None
 
 
 def test_docker_cleanup_uses_full_cidfile_id_and_bounded_argv(tmp_path):

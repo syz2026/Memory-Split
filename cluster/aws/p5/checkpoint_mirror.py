@@ -34,6 +34,7 @@ _SIDECARS = {
     "dense": "dense_target_weights",
     "split90": "split90_target_weights",
 }
+_MetadataGeneration = tuple[int, int, int, int, int]
 PAIR_CHECKPOINT_MAX_AGE_SECONDS = 1200
 PAIR_CHECKPOINT_ATTEMPT_SECONDS = 120
 PAIR_CHECKPOINT_TRIGGER_AGE_SECONDS = 1080
@@ -520,6 +521,11 @@ class CheckpointMirrorScheduler:
         now: float | None = None,
     ) -> PublishedCheckpointPair | None:
         current = self._monotonic() if now is None else float(now)
+        if current >= self._fresh_at + PAIR_CHECKPOINT_MAX_AGE_SECONDS:
+            self.cancel_active()
+            raise CheckpointStaleError(
+                "CHECKPOINT_STALE: paired durability deadline expired"
+            )
         if self._attempt is not None:
             complete, result = self._attempt.poll()
             attempt_started = self._attempt_started_at
@@ -549,14 +555,6 @@ class CheckpointMirrorScheduler:
                 self._next_retry_at = (
                     current + PAIR_CHECKPOINT_RETRY_SECONDS
                 )
-        if current >= self._fresh_at + PAIR_CHECKPOINT_MAX_AGE_SECONDS:
-            if self._attempt is not None:
-                self._attempt.cancel()
-                self._attempt = None
-                self._attempt_started_at = None
-            raise CheckpointStaleError(
-                "CHECKPOINT_STALE: paired durability deadline expired"
-            )
         return None
 
 
@@ -770,12 +768,15 @@ def _installed_identity(metadata: os.stat_result) -> dict[str, int]:
     }
 
 
-def read_trainer_checkpoint_metadata(
+def _read_trainer_checkpoint_generation(
     checkpoint_path: str | Path,
     *,
     allow_legacy_absent: bool = False,
-) -> TrainerCheckpointMetadata | None:
-    """Read adjacent trainer metadata, allowing absence only when explicit."""
+) -> tuple[
+    TrainerCheckpointMetadata | None,
+    _MetadataGeneration | None,
+]:
+    """Read and validate one descriptor-pinned metadata/checkpoint generation."""
 
     if type(allow_legacy_absent) is not bool:
         raise ValueError("allow_legacy_absent must be boolean")
@@ -784,10 +785,10 @@ def read_trainer_checkpoint_metadata(
     if not os.path.lexists(metadata_path):
         if allow_legacy_absent:
             _stat_regular(checkpoint, label="legacy trainer checkpoint")
-            return None
+            return None, None
         raise ValueError("trainer checkpoint metadata is missing")
     try:
-        payload, _metadata_stat = _read_regular(
+        payload, metadata_stat = _read_regular(
             metadata_path,
             label="trainer checkpoint metadata",
         )
@@ -879,17 +880,40 @@ def read_trainer_checkpoint_metadata(
         raise ValueError(
             "trainer checkpoint metadata does not match installed checkpoint"
         )
-    return TrainerCheckpointMetadata(
-        checkpoint_version=value["checkpoint_version"],
-        step=value["step"],
-        world_size=value["world_size"],
-        config_fingerprint=value["config_fingerprint"],
-        data=dict(data),
-        installed=dict(installed),
+    return (
+        TrainerCheckpointMetadata(
+            checkpoint_version=value["checkpoint_version"],
+            step=value["step"],
+            world_size=value["world_size"],
+            config_fingerprint=value["config_fingerprint"],
+            data=dict(data),
+            installed=dict(installed),
+        ),
+        (
+            metadata_stat.st_dev,
+            metadata_stat.st_ino,
+            metadata_stat.st_size,
+            metadata_stat.st_mtime_ns,
+            metadata_stat.st_ctime_ns,
+        ),
     )
 
 
-def _metadata_generation(checkpoint: Path) -> tuple[int, int, int, int, int] | None:
+def read_trainer_checkpoint_metadata(
+    checkpoint_path: str | Path,
+    *,
+    allow_legacy_absent: bool = False,
+) -> TrainerCheckpointMetadata | None:
+    """Read adjacent trainer metadata, allowing absence only when explicit."""
+
+    metadata, _generation = _read_trainer_checkpoint_generation(
+        checkpoint_path,
+        allow_legacy_absent=allow_legacy_absent,
+    )
+    return metadata
+
+
+def _metadata_generation(checkpoint: Path) -> _MetadataGeneration | None:
     metadata_path = checkpoint.with_name("ckpt.meta.json")
     try:
         metadata = metadata_path.stat(follow_symlinks=False)
@@ -910,10 +934,21 @@ def _metadata_generation(checkpoint: Path) -> tuple[int, int, int, int, int] | N
     )
 
 
+def _validated_metadata_generation(
+    checkpoint: Path,
+) -> _MetadataGeneration | None:
+    metadata_path = checkpoint.with_name("ckpt.meta.json")
+    if not os.path.lexists(metadata_path):
+        return None
+    metadata, generation = _read_trainer_checkpoint_generation(checkpoint)
+    assert metadata is not None and generation is not None
+    return generation
+
+
 def _stage_generation(
     request: CheckpointMirrorRequest,
     arm: str,
-    baseline: tuple[int, int, int, int, int] | None,
+    baseline: _MetadataGeneration | None,
     staging: Path,
     *,
     deadline: float,
@@ -1096,12 +1131,11 @@ def publish_paired_checkpoint(
 
     if not isinstance(request, CheckpointMirrorRequest):
         raise ValueError("checkpoint mirror request is invalid")
-    baselines: dict[str, tuple[int, int, int, int, int] | None] = {}
+    baselines: dict[str, _MetadataGeneration | None] = {}
     for arm in _ARMS:
-        generation = _metadata_generation(request.checkpoint_paths[arm])
-        if generation is not None:
-            read_trainer_checkpoint_metadata(request.checkpoint_paths[arm])
-        baselines[arm] = generation
+        baselines[arm] = _validated_metadata_generation(
+            request.checkpoint_paths[arm]
+        )
     signal_errors = []
     for arm in _ARMS:
         try:

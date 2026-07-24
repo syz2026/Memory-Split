@@ -10,6 +10,7 @@ import json
 import math
 import os
 import re
+import secrets
 import signal
 import socket
 import stat
@@ -2173,6 +2174,8 @@ def _supervise_pair_locked(
     _revalidate_files(plan)
     trainer_preflight(plan)
     processes: dict[str, ProcessHandle] = {}
+    checkpoint_scheduler = None
+    checkpoint_request_factory = None
     try:
         for launch in plan.arms:
             _materialize_runtime_config(launch)
@@ -2234,8 +2237,6 @@ def _supervise_pair_locked(
         ):
             _terminate_all(tuple(processes.values()))
             raise LaunchError("both pre-existing rank-zero PID files are required")
-        checkpoint_scheduler = None
-        checkpoint_request_factory = None
         if checkpoint_scheduler_factory is not None:
             try:
                 (
@@ -2279,6 +2280,9 @@ def _supervise_pair_locked(
                         child_pids=child_pids,
                         peer_terminated=True,
                     )
+                except Exception:
+                    _terminate_all(tuple(processes.values()))
+                    raise
             if notice_source is not None:
                 try:
                     notice = notice_source()
@@ -2325,7 +2329,10 @@ def _supervise_pair_locked(
                                     now=now
                                 )
                             except CheckpointStaleError:
-                                completed = None
+                                # A stale durability window cannot recover
+                                # within this notice: stop immediately and
+                                # fall back to the last complete receipt.
+                                break
                             if completed is not None:
                                 last_complete = completed
                                 break
@@ -2420,6 +2427,11 @@ def _supervise_pair_locked(
                 arm: process.pid for arm, process in processes.items()
             },
         )
+    finally:
+        # No supervisor exit path may leave a forked mirror attempt alive
+        # and publishing after the pair has been terminated.
+        if checkpoint_scheduler is not None:
+            checkpoint_scheduler.cancel_active()
 
 
 def _read_rank_zero_pid(

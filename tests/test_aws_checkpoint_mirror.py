@@ -11,6 +11,7 @@ from typing import Mapping
 
 import pytest
 
+from cluster.aws.p5 import checkpoint_mirror as checkpoint_mirror_module
 from cluster.aws.p5.checkpoint_mirror import (
     CheckpointMirrorScheduler,
     CheckpointMirrorRequest,
@@ -22,6 +23,7 @@ from cluster.aws.p5.checkpoint_mirror import (
     publish_paired_checkpoint,
     read_trainer_checkpoint_metadata,
 )
+from msctl import aws_resume_launch as aws_resume_launch_module
 from msctl.aws_contracts import checkpoint_object_key, checkpoint_receipt_key
 from msctl.contracts import (
     parse_paired_checkpoint_receipt_v3,
@@ -355,6 +357,65 @@ def test_both_arms_require_fresh_post_signal_generations(tmp_path: Path) -> None
             sleep=sleep,
         )
 
+    assert store.put_order == []
+
+
+def test_baseline_pins_the_generation_validated_before_signal(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    request = _request(tmp_path)
+    store = _MemoryVersionedStore()
+    dense_checkpoint = request.checkpoint_paths["dense"]
+    dense_metadata = dense_checkpoint.with_name("ckpt.meta.json")
+    original_read_regular = checkpoint_mirror_module._read_regular
+    replaced = False
+
+    def replace_before_metadata_validation(path: Path, *, label: str):
+        nonlocal replaced
+        if Path(path) == dense_metadata and not replaced:
+            replaced = True
+            dense_checkpoint.write_bytes(b"published-before-baseline-validation")
+            _write_metadata(
+                dense_checkpoint,
+                step=22,
+                sidecar_name="dense_target_weights",
+            )
+        return original_read_regular(path, label=label)
+
+    monkeypatch.setattr(
+        checkpoint_mirror_module,
+        "_read_regular",
+        replace_before_metadata_validation,
+    )
+    now = [0.0]
+
+    def signal_process(pid: int, _signum: int) -> None:
+        if pid != 102:
+            return
+        split_checkpoint = request.checkpoint_paths["split90"]
+        split_checkpoint.write_bytes(b"fresh-split90")
+        _write_metadata(
+            split_checkpoint,
+            step=2,
+            sidecar_name="split90_target_weights",
+        )
+
+    def sleep(seconds: float) -> None:
+        now[0] += max(seconds, 0.01)
+
+    with pytest.raises(TimeoutError, match="dense.*fresh"):
+        publish_paired_checkpoint(
+            request,
+            object_store=store,
+            signal_process=signal_process,
+            staging_root=tmp_path / "staging",
+            monotonic=lambda: now[0],
+            sleep=sleep,
+            staged_at=lambda: "2026-07-23T12:01:00Z",
+        )
+
+    assert replaced is True
     assert store.put_order == []
 
 
@@ -1450,6 +1511,168 @@ def test_v3_package_requires_checkpoint_producer_and_resume_dependencies() -> No
     } <= packager.REQUIRED_MEMBERS
 
 
+@pytest.mark.parametrize("seed", [0, 9])
+def test_v3_resume_output_archival_accepts_seed_bounds(
+    tmp_path: Path,
+    seed: int,
+) -> None:
+    scratch = tmp_path / f"seed-{seed}"
+    scratch.mkdir()
+
+    archive = aws_resume_launch_module.prepare_resume_output_roots(
+        scratch,
+        seed=seed,
+        checkpoint_receipt_sha256="a" * 64,
+    )
+
+    assert archive == (
+        scratch.resolve()
+        / "resume-history"
+        / f"seed-{seed}"
+        / ("a" * 64)
+    )
+
+
+@pytest.mark.parametrize("seed", [True, 10])
+def test_v3_resume_output_archival_rejects_non_exact_seed(
+    tmp_path: Path,
+    seed: object,
+) -> None:
+    scratch = tmp_path / "invalid-seed"
+    scratch.mkdir()
+
+    with pytest.raises(
+        aws_resume_launch_module.ResumeLaunchError,
+        match="seed",
+    ):
+        aws_resume_launch_module.prepare_resume_output_roots(
+            scratch,
+            seed=seed,
+            checkpoint_receipt_sha256="a" * 64,
+        )
+
+
+def test_v3_resume_installs_paired_checkpoint_scheduler_without_legacy_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    plan = SimpleNamespace(seed=0, run_manifest_sha256="b" * 64)
+    production_scheduler_factory = object()
+    legacy_interruption_handler = object()
+    observed: dict[str, object] = {}
+
+    monkeypatch.setattr(
+        aws_resume_launch_module,
+        "_verify_launcher_path",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        aws_resume_launch_module,
+        "_verify_checkpoint_receipt",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        aws_resume_launch_module,
+        "bind_resume_checkpoints",
+        lambda launch_plan, **_kwargs: launch_plan,
+    )
+    monkeypatch.setattr(
+        aws_resume_launch_module,
+        "prepare_resume_output_roots",
+        lambda *_args, **_kwargs: tmp_path / "archive",
+    )
+    monkeypatch.setattr(
+        aws_resume_launch_module.reviewed_launcher,
+        "load_launch_plan",
+        lambda **_kwargs: plan,
+    )
+    monkeypatch.setattr(
+        aws_resume_launch_module.reviewed_launcher,
+        "_production_checkpoint_scheduler",
+        production_scheduler_factory,
+    )
+    monkeypatch.setattr(
+        aws_resume_launch_module.reviewed_launcher,
+        "_production_interruption_handler",
+        legacy_interruption_handler,
+    )
+
+    class Client:
+        def interruption_notice(self) -> None:
+            return None
+
+    class ShutdownHandlers:
+        def __enter__(self):
+            return lambda: None
+
+        def __exit__(self, *_args) -> None:
+            return None
+
+    def supervise_pair(_plan, **kwargs):
+        observed.update(kwargs)
+        return SimpleNamespace(
+            child_pids={"dense": 101, "split90": 102},
+            failed_arm=None,
+            interruption_receipt=None,
+            peer_terminated=False,
+            resumable=False,
+            returncode=0,
+            status="completed",
+        )
+
+    monkeypatch.setattr(
+        aws_resume_launch_module.reviewed_launcher,
+        "ImdsV2Client",
+        Client,
+    )
+    monkeypatch.setattr(
+        aws_resume_launch_module.reviewed_launcher,
+        "installed_shutdown_handlers",
+        lambda: ShutdownHandlers(),
+    )
+    monkeypatch.setattr(
+        aws_resume_launch_module.reviewed_launcher,
+        "supervise_pair",
+        supervise_pair,
+    )
+
+    result = aws_resume_launch_module.main(
+        [
+            "--seed",
+            "0",
+            "--manifest",
+            str(tmp_path / "manifest.json"),
+            "--profile",
+            str(tmp_path / "profile.toml"),
+            "--repo-root",
+            str(tmp_path),
+            "--scratch-root",
+            str(tmp_path),
+            "--launcher",
+            str(tmp_path / "launch_seed_pair.py"),
+            "--checkpoint-receipt",
+            str(tmp_path / "receipt.json"),
+            "--checkpoint-receipt-sha256",
+            "a" * 64,
+            "--checkpoint-receipt-uri",
+            "s3://bucket/receipt.json",
+            "--checkpoint-receipt-version-id",
+            "receipt-version",
+            "--run-manifest-sha256",
+            "b" * 64,
+            "--checkpoint",
+            "{}",
+            "--apply",
+        ]
+    )
+
+    assert result == 0
+    assert observed["checkpoint_scheduler_factory"] is production_scheduler_factory
+    assert observed["interruption_handler"] is None
+    capsys.readouterr()
+
+
 def test_receipt_seed_nine_passes_and_seed_ten_fails(tmp_path: Path) -> None:
     request = replace(
         _request(tmp_path),
@@ -1674,6 +1897,51 @@ def test_scheduler_resets_freshness_only_after_verified_pair(
     assert scheduler.fresh_at == 1081.0
     assert scheduler.latest is pair
     assert scheduler.maybe_start(request, now=2160.999) is False
+
+
+def test_scheduler_rejects_completed_attempt_at_durability_deadline(
+    tmp_path: Path,
+) -> None:
+    request = _request(tmp_path)
+    attempt = _ControlledAttempt()
+    pair = PublishedCheckpointPair(
+        receipt=CheckpointReceiptRef(
+            uri="s3://bucket/late-receipt.json",
+            sha256="4" * 64,
+            version_id="late-receipt-version",
+            bytes=10,
+        ),
+        checkpoints=(
+            VersionedUploadedObject(
+                "s3://bucket/late-dense.pt",
+                "5" * 64,
+                5,
+                "late-dense-version",
+            ),
+            VersionedUploadedObject(
+                "s3://bucket/late-split90.pt",
+                "6" * 64,
+                5,
+                "late-split90-version",
+            ),
+        ),
+        value={},
+    )
+    scheduler = CheckpointMirrorScheduler(
+        lambda _request: attempt,
+        started_at=0.0,
+    )
+
+    assert scheduler.maybe_start(request, now=1080.0) is True
+    attempt.complete = True
+    attempt.result = pair
+
+    with pytest.raises(CheckpointStaleError, match="CHECKPOINT_STALE"):
+        scheduler.poll(now=1200.0)
+
+    assert attempt.cancelled is True
+    assert scheduler.latest is None
+    assert scheduler.fresh_at == 0.0
 
 
 def test_s3_lost_put_response_recovers_only_through_exact_head(

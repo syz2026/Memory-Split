@@ -309,7 +309,7 @@ def prepare_resume_output_roots(
 ) -> Path:
     """Atomically archive a prior paired output before a resume attempt."""
 
-    if type(seed) is not int or seed not in {1, 2, 3, 4}:
+    if type(seed) is not int or seed not in range(10):
         raise ResumeLaunchError("resume seed is not assigned to AWS")
     receipt_sha256 = _sha256(
         checkpoint_receipt_sha256,
@@ -670,14 +670,22 @@ def main(argv: Sequence[str] | None = None) -> int:
             ),
         )
         client = reviewed_launcher.ImdsV2Client()
+        is_v3 = getattr(plan, "run_manifest_sha256", None) is not None
         with reviewed_launcher.installed_shutdown_handlers() as shutdown_source:
             result = reviewed_launcher.supervise_pair(
                 plan,
                 notice_source=client.interruption_notice,
                 interruption_handler=(
-                    reviewed_launcher._production_interruption_handler
+                    None
+                    if is_v3
+                    else reviewed_launcher._production_interruption_handler
                 ),
                 shutdown_source=shutdown_source,
+                checkpoint_scheduler_factory=(
+                    reviewed_launcher._production_checkpoint_scheduler
+                    if is_v3
+                    else None
+                ),
             )
         report = {
             "child_pids": dict(sorted(result.child_pids.items())),
