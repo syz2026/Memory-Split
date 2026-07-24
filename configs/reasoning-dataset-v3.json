@@ -1,0 +1,164 @@
+{
+  "base_corpus": {
+    "contract_id": "memorysplit-parallel-corpus-v2",
+    "ordered_stream_sha256": "ae7a334cd2d73689d7ff439d9b736ebf06e5f992ae59b52ebdd32a1426bac40f",
+    "packed_stream_sha256": "dc0134131c57ec339997f9cee9c22f14a7414200671805c63d7cd7a7a3d5738d",
+    "raw_target_tokens": 7120879616,
+    "receipt_sha256": "65eda881f59acac356df0c3fbbb62df46d60bc013df05b72e8baacba7640b027"
+  },
+  "composite": {
+    "ordering": "frozen-v2-prefix-then-reasoning-extension",
+    "raw_target_tokens": 8169455616,
+    "terminal_updates": 15582
+  },
+  "contract_id": "memorysplit-reasoning-dataset-v3",
+  "extension": {
+    "format": "memorysplit-reasoning-extension-v1",
+    "max_record_tokens": 1024,
+    "raw_target_tokens": 1048576000,
+    "tasks": [
+      {
+        "config": {
+          "allow_reuse": true,
+          "max_inputs": 5,
+          "max_terms": 7,
+          "min_inputs": 2,
+          "min_terms": 4,
+          "neg_prob": 0.35
+        },
+        "dataset": "circuit_logic",
+        "module": "logic.circuit_logic",
+        "weight": 1
+      },
+      {
+        "config": {},
+        "dataset": "self_reference",
+        "module": "logic.self_reference",
+        "weight": 1
+      },
+      {
+        "config": {},
+        "dataset": "syllogism",
+        "module": "logic.syllogisms",
+        "weight": 1
+      },
+      {
+        "config": {},
+        "dataset": "family_relationships",
+        "module": "graphs.family_relationships",
+        "weight": 1
+      },
+      {
+        "config": {},
+        "dataset": "course_schedule",
+        "module": "graphs.course_schedule",
+        "weight": 1
+      },
+      {
+        "config": {},
+        "dataset": "largest_island",
+        "module": "graphs.largest_island",
+        "weight": 1
+      },
+      {
+        "config": {},
+        "dataset": "path_star",
+        "module": "graphs.path_star",
+        "weight": 1
+      },
+      {
+        "config": {
+          "height": 30,
+          "max_rectangles": 12,
+          "width": 30
+        },
+        "dataset": "rectangle_count",
+        "module": "cognition.rectangle_count",
+        "weight": 1
+      },
+      {
+        "config": {
+          "max_divisor": 17,
+          "max_holes": 5,
+          "max_target": 9,
+          "size_x": 12,
+          "size_y": 12
+        },
+        "dataset": "modulo_grid",
+        "module": "cognition.modulo_grid",
+        "weight": 1
+      },
+      {
+        "config": {
+          "max_string_len": 12,
+          "max_substring_palindrome_len": 5,
+          "min_string_len": 7,
+          "min_substring_palindrome_len": 1
+        },
+        "dataset": "palindrome_partitioning",
+        "module": "algorithmic.palindrome_partitioning",
+        "weight": 1
+      },
+      {
+        "config": {
+          "max_n": 20,
+          "min_n": 10,
+          "p_oranges": 0.85,
+          "p_rotten": 0.1
+        },
+        "dataset": "rotten_oranges",
+        "module": "algorithmic.rotten_oranges",
+        "weight": 1
+      },
+      {
+        "config": {
+          "max_disks": 6,
+          "max_pegs": 4,
+          "min_disks": 4,
+          "min_pegs": 3,
+          "visualize": false
+        },
+        "dataset": "tower_of_hanoi",
+        "module": "games.tower_of_hanoi",
+        "weight": 1
+      },
+      {
+        "config": {},
+        "dataset": "mahjong_puzzle",
+        "module": "games.mahjong",
+        "weight": 1
+      },
+      {
+        "config": {},
+        "dataset": "quantum_lock",
+        "module": "graphs.quantum_lock",
+        "weight": 1
+      },
+      {
+        "config": {},
+        "dataset": "kakurasu",
+        "module": "games.kakurasu",
+        "weight": 1
+      },
+      {
+        "config": {},
+        "dataset": "mini_sudoku",
+        "module": "games.mini_sudoku",
+        "weight": 1
+      }
+    ],
+    "targets_per_update": 524288,
+    "terminal_updates": 2000
+  },
+  "reasoning_gym": {
+    "source_stage_receipt_sha256": "ba83813d73ebccd4812c8297be58176efca8f9e36368dfa04058408fd658ea0c",
+    "staged_relative_path": "objective_auxiliary/reasoning_gym_exact_answer/reasoning_gym",
+    "version": "0.1.19"
+  },
+  "schema_version": 1,
+  "scientific_scope": {
+    "may_replace_frozen_v2_n10_dataset": false,
+    "status": "successor_exploratory_unpreregistered",
+    "target_weight_policy": "all_extension_reasoning_targets_are_internal_in_both_arms"
+  }
+}
