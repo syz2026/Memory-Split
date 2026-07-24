@@ -1,227 +1,243 @@
-# Task 2 report: current seven-lane compiler and packaged smoke corpus
+# Task 2 report: deterministic closed-world builder package
 
-## Outcome
+Date: 2026-07-24
+Branch: `feat/aws-corpus-builder`
+Base: `98f43e2241ed5cd4dc45be581f178d8dbc744b2f`
+Status: `DONE_WITH_CONCERNS`
 
-Task 2 is implemented on `feat/relational-core` from base `ce203d9`.
+## Commits
 
-Implementation commit:
-
-- `445d090` — `feat: compile current seven-lane dataset`
-
-The implementation does not add or modify cluster manifests, collaborator
-assignments, or outer ZIP publication.
+- Implementation:
+  `59e9bdb9c2b6eea70f5f4fcdfc19464a6a82f097` —
+  `feat: package deterministic AWS corpus builder`
+- The report-only commit is returned in the task handoff. It cannot record its
+  own hash without changing that hash.
 
 ## Files changed
 
-Compiler and graph protocol:
+- Added `cluster/aws/corpus_builder/package.py`.
+- Added `scripts/package_aws_corpus_builder.py`.
+- Added `tests/test_package_aws_corpus_builder.py`.
+- Replaced the stale unrelated contents of
+  `.superpowers/sdd/task-2-report.md` with this report.
 
-- Added `corpusgen/current_dataset.py`.
-- Modified `corpusgen/graph_records.py`.
-- Modified `corpusgen/graph_trace.py`.
-- Modified `corpusgen/relational_build.py`.
-- Modified `train/tokenizer.py`.
-- Modified `organizer/graph_store.py`.
-- Modified `evals/constrain.py`.
-- Modified `evals/relational_generate.py`.
+No Task 1 file, corpus scientific file, progress file, other worktree, or AWS
+resource was modified.
 
-Command-line and runtime integration:
+## Implemented contract
 
-- Added `scripts/build_current_dataset.py`.
-- Added `scripts/build_current_smoke.py`.
-- Modified `scripts/build_relational_corpus.py`.
-- Modified `scripts/relational_smoke_test.py`.
-- Modified `scripts/run_relational_evals.py`.
+- Exposes the exact `PackageError`, frozen `BuilderPackage`, and
+  `build_corpus_builder_package(source_root, output_dir)` API from the brief.
+- Uses the exact `REQUIRED_PREFIXES` and `REQUIRED_FILES` tuples.
+- Requires a real clean Git worktree root and a stable full `HEAD` commit before
+  and after collection. Untracked files, tracked modifications, and a moving
+  revision fail closed.
+- Reads selected bytes and Git modes/object IDs from the committed tree through
+  `ls-tree` and `cat-file`, never from uncommitted worktree files.
+- Requires the checked-in builder contracts/profile, corpus adapters/catalog
+  and publication code, reasoning-v2 catalog/source-lock code, frozen recipe
+  and source locks, Wikidata notice/lock, both tokenizer assets, executable
+  entry points, and focused test authorities.
+- Excludes cache, output, checkpoint, and explicit pilot-artifact path
+  components. Selected symlinks, submodules, non-blob modes, unsafe paths,
+  credential paths, secret-like files, raw token/key material, and structured
+  JSON/YAML secret fields are rejected.
+- Emits sorted regular-file tar members with Git-derived normalized `0644` or
+  `0755` modes, uid/gid zero, empty owner/group names, mtime zero, deterministic
+  gzip metadata, and no directory members.
+- Emits canonical compact JSON containing the source revision, archive
+  identity, and each member's path, mode, byte count, Git object ID, and
+  SHA-256. It also emits the conventional archive SHA-256 sidecar.
+- The CLI accepts only the required source/output arguments and prints the
+  canonical manifest exactly.
 
-Tests:
+## TDD evidence
 
-- Added `tests/test_current_dataset.py`.
-- Modified `tests/test_graph_store.py`.
-- Modified `tests/test_graph_trace.py`.
-- Modified `tests/test_tokenizer.py`.
-- Modified `tests/test_constrain.py`.
-- Modified `tests/test_relational_generate.py`.
-- Modified `tests/test_relational_smoke.py`.
+### Initial RED
 
-Generated fixture:
-
-- Added `fixtures/current-smoke/manifest.json` and `report.json`.
-- Added `train.bin` plus aligned Dense, Split, and Random sidecars.
-- Added the schedule, factual-span ledger, mask ledger, graph records,
-  Wikidata provenance, source provenance, and their manifests.
-- Added the packaged 12-slot evaluation graph and item.
-
-The committed fixture has 17 files, 16 hash-listed artifacts plus
-`manifest.json`, and is approximately 1.2 MiB. It contains no source archive.
-
-## Key interface and implementation choices
-
-### Locked scientific contract
-
-- `CurrentBuildConfig(profile, scale, fact_load, data_seed, total_tokens)` is a
-  frozen validated dataclass.
-- `build_current_dataset(config, sources, out_dir) -> dict` accepts a verified
-  Task 1 source root or source-manifest path for full builds. Full builds reject
-  the in-memory smoke source adapter.
-- `verify_current_dataset(out_dir, expected_profile) -> dict` verifies safe
-  relative paths, complete artifact hashes, profile/scientific identity,
-  `uint16` token size, aligned binary `uint8` sidecars, mask counts, and full
-  scientific checks.
-- Lane shares, context length, action/read limits, scale floors, fact-load
-  labels, random-mask bins, ARC transform bounds, and Wikidata coverage modes
-  are derived from `configs/current-dataset-lock.json` through Task 1's loader.
-- Full profiles enforce the locked token floor, exact consumed-prefix maximum
-  share deviation of `0.0025`, and complete-once accepted Wikidata coverage.
-  Smoke is explicitly `scientific_result: false`.
-- The 29M full profile uses a deterministic per-split/per-relation hash-balanced
-  sample capped so one complete formatted pass fits the graph-lane budget.
-  The 160M and 360M modes retain the complete accepted training graph.
-
-### Streaming and scheduling
-
-- Verified FineWeb, Wikidata training triples, aliases, and puzzle tasks stream
-  into an on-disk SQLite spool. Large source collections and emitted-coverage
-  bookkeeping do not require an in-memory corpus-sized set.
-- Exact duplicate triples collapse on canonical `(QID, PID, QID)` identity.
-- FineWeb excludes the locked holdout prefix and cycles verified non-holdout
-  rows. Long source text is split only at lossless BPE boundaries.
-- The scheduler is largest-token-deficit with stable lane order and measures
-  the exact consumed prefix. All records are at most 1,024 tokens.
-- Synthetic graph and reasoning lanes reuse deterministic SRGM worlds.
-  Wikidata reasoning uses only functional addresses from the accepted training
-  graph. Refinement records use deterministic corrupt/correct states.
-- Puzzle records include the original and at most 63 unique transforms,
-  deduplicated by canonical task hash and ordered by canonical parameter hash.
-
-### Sidecars and ledgers
-
-- `train.bin` is `uint16`; every sidecar is one `uint8` byte per token.
-- Dense is all one.
-- Split masks only externally routed `payload` spans.
-- Every factual payload is recorded in `factual-span-ledger.jsonl`; mask actions
-  are recorded in `mask-ledger.jsonl`.
-- Random controls are selected deterministically within exact
-  `(source, record_type, payload_token_length, packed_position_bin)` strata.
-  Position uses ten bins and factual records do not cross a bin boundary.
-- Random and Split have exactly equal zero-token counts. Query, rule, action,
-  candidate-state, provisional-answer, final-answer, and boundary spans are
-  never selected as factual masks.
-
-### Paged graph protocol
-
-- `GraphAddress` adds `page` and accepts legacy integer or canonical text entity
-  identities. `GraphRow` adds page-aware set-valued `targets` while preserving
-  scalar `target` and legacy page-zero JSON where possible.
-- Wikidata objects are distinct and numerically QID-sorted. Stable largest
-  prefixes become pages before a formatted record can exceed 1,024 tokens;
-  functional rows remain page zero.
-- Arbitrary PID text and decimal pages are framed by four reserved delimiters
-  in IDs 50292–50295. `VOCAB_SIZE` remains exactly 50,304.
-- `GraphActionTrie` constrains finite arbitrary-PID/page candidates. Exact page
-  reads flow through the store and decoder.
-- Current traces use 12 action slots, one through six training reads,
-  deterministic post-HALT no-ops, and a hard ten-read decoding limit. Legacy
-  six-slot, fixed-`r0`–`r15`, page-zero pilot records remain accepted.
-
-### Publication and packaged smoke
-
-- Builds write only to `.<name>.partial-<pid>`, fsync the tree, create and verify
-  a relative hash-complete manifest, then atomically rename.
-- An existing matching output verifies and returns; conflicting, malformed, or
-  unsafe output fails closed.
-- `fixtures/current-smoke/` contains exactly 131,072 token IDs, all seven lanes,
-  all three aligned sidecars, graph/provenance/ledger/manifests, and no source
-  archives.
-- The smoke runner verifies the packaged fixture before use, trains Dense and
-  Split for two CPU steps from the same packaged token stream, checks exact
-  resume state and one resumed step, executes memory OFF and ON evaluation, and
-  confirms fixture hashes remain unchanged.
-- The legacy `SMOKE_FIXTURE` public constant is retained for existing packaging
-  and preflight consumers; the current runner itself consumes packaged bytes.
-
-## TDD and verification evidence
-
-Representative red tests were observed before implementation:
-
-- Initial current-dataset tests failed collection because
-  `corpusgen.current_dataset` did not exist.
-- Paged trace and constraint tests initially failed because
-  `parse_serialized_action` and `GraphActionTrie` did not exist.
-- The exact-page decoder test exposed string-QID coercion through
-  `ValueError: invalid literal for int() with base 10: 'Q1'`.
-- The balanced 29M sampling test first failed with
-  `AttributeError: '_SourceSpool' object has no attribute
-  'select_balanced_training_sample'`.
-
-Final focused command:
+Command:
 
 ```bash
-PYTHONDONTWRITEBYTECODE=1 python -m pytest -p no:cacheprovider \
-  tests/test_current_dataset.py tests/test_graph_store.py \
-  tests/test_graph_trace.py tests/test_tokenizer.py tests/test_constrain.py \
-  tests/test_relational_generate.py tests/test_relational_build.py \
-  tests/test_relational_smoke.py tests/test_data.py tests/test_trainer.py -q
+python -m pytest -q tests/test_package_aws_corpus_builder.py
 ```
 
-Result: `118 passed in 12.31s`.
+Exact result:
 
-Complete repository command:
+```text
+ERROR collecting tests/test_package_aws_corpus_builder.py
+ModuleNotFoundError: No module named 'cluster.aws.corpus_builder.package'
+1 error in 0.37s
+```
+
+### Credential-path review RED
+
+Command:
 
 ```bash
-PYTHONDONTWRITEBYTECODE=1 python -m pytest -p no:cacheprovider -q
+python -m pytest -q \
+  'tests/test_package_aws_corpus_builder.py::test_builder_package_rejects_dirty_tree_secret_and_unreviewed_member[credential-path]'
 ```
 
-Result: `506 passed, 2 deselected, 1 warning in 61.06s`. The warning is an
-existing `dateutil` deprecation warning from `tests/test_stats.py`.
+Exact result before the path-level credential rejection:
 
-Final deterministic fixture check:
+```text
+F                                                                        [100%]
+Failed: DID NOT RAISE <class 'cluster.aws.corpus_builder.package.PackageError'>
+1 failed in 0.39s
+```
+
+The same command after the fix reported:
+
+```text
+.                                                                        [100%]
+1 passed in 0.35s
+```
+
+### GREEN
+
+Command:
 
 ```bash
-tmpdir=$(mktemp -d)
-PYTHONDONTWRITEBYTECODE=1 python scripts/build_current_smoke.py --out "$tmpdir/a"
-PYTHONDONTWRITEBYTECODE=1 python scripts/build_current_smoke.py --out "$tmpdir/b"
-diff -ru "$tmpdir/a" "$tmpdir/b"
-diff -ru fixtures/current-smoke "$tmpdir/a"
+python -m pytest -q tests/test_package_aws_corpus_builder.py
 ```
 
-Result: both fresh outputs and the committed fixture were byte-identical.
+Exact result:
 
-Additional checks:
+```text
+............................                                             [100%]
+28 passed in 7.78s
+```
 
-- `git diff --check` passed.
-- IDE lint diagnostics reported no errors in the changed source and script
-  files.
-- The committed smoke manifest reports `profile: smoke`,
-  `scientific_result: false`, 131,072 tokens, all seven lanes, complete-once
-  fixture coverage, aligned sidecars, Dense all-one, and equal Split/Random
-  zero counts.
+The suite covers the exact allowlist, deterministic independent builds,
+canonical manifest rows, tar/gzip metadata, normalized executable modes,
+authority gates, dirty/untracked trees, tracked secrets, structured secrets,
+credential paths, symlinks, non-repositories, internal outputs, and CLI output.
 
-## Requirement self-review
+### Focused regression
 
-- Seven exact raw-token lane shares: implemented from the Task 1 lock.
-- Full exact-prefix deviation `<= 0.0025`: enforced.
-- Every smoke lane and non-scientific identity: enforced and verified.
-- `uint16` tokens and three aligned binary `uint8` sidecars: enforced.
-- Exact matched-random strata and equal zero mass: enforced and tested.
-- Paged, set-valued graph records and 12-slot traces: implemented and tested.
-- Arbitrary PID without vocabulary growth: implemented and tested.
-- Bounded-memory verified-source build and complete-once before replay:
-  implemented with SQLite and enforced for full builds.
-- Deterministic source-archive-free smoke: generated, rebuilt twice, and
-  byte-compared.
-- Transactional/idempotent hash-complete publication: implemented and tested.
-- Packaged CPU Dense/Split, resume, memory OFF/ON, fixture immutability:
-  implemented and tested.
-- Cluster manifests, collaborator assignments, and outer ZIP publication:
-  intentionally untouched and excluded from the implementation commit.
+Command:
 
-## Concerns and follow-up
+```bash
+python -m pytest -q \
+  tests/test_package_aws_corpus_builder.py \
+  tests/test_aws_corpus_builder_contracts.py \
+  tests/test_parallel_corpus.py \
+  tests/test_reasoning_v2_contracts_strict.py \
+  tests/test_reasoning_v2_contracts.py \
+  tests/test_reasoning_v2_catalog.py \
+  tests/test_reasoning_v2_source_lock.py
+```
 
-- A production multi-billion-token full build was not executed locally because
-  the verified source root and cluster-scale storage/compute were outside this
-  task's local verification environment. The full path is fail-closed on Task 1
-  verification and is covered by focused contract tests, but its wall-clock and
-  disk requirements should be measured during the first cluster build.
-- Concurrent, untracked outer-publication files
-  `artifacts/memorysplit-current-smoke-training.zip` and
-  `scripts/package_quick_smoke_zip.py` were observed late in the worktree. They
-  were not read, modified, staged, or committed as part of Task 2.
+Exact result:
+
+```text
+354 passed in 26.20s
+```
+
+Compilation and whitespace commands:
+
+```bash
+python -m py_compile \
+  cluster/aws/corpus_builder/package.py \
+  scripts/package_aws_corpus_builder.py \
+  tests/test_package_aws_corpus_builder.py
+git diff --check
+```
+
+Both were silent with exit code zero before the implementation commit.
+
+## Deterministic committed-tree rebuild
+
+Both builds used the clean implementation commit
+`59e9bdb9c2b6eea70f5f4fcdfc19464a6a82f097`.
+
+Commands:
+
+```bash
+python scripts/package_aws_corpus_builder.py \
+  --source-root . \
+  --output-dir /tmp/memorysplit-corpus-package-a
+python scripts/package_aws_corpus_builder.py \
+  --source-root . \
+  --output-dir /tmp/memorysplit-corpus-package-b
+cmp \
+  /tmp/memorysplit-corpus-package-a/memorysplit-corpus-builder.tar.gz \
+  /tmp/memorysplit-corpus-package-b/memorysplit-corpus-builder.tar.gz
+cmp \
+  /tmp/memorysplit-corpus-package-a/memorysplit-corpus-builder.manifest.json \
+  /tmp/memorysplit-corpus-package-b/memorysplit-corpus-builder.manifest.json
+cmp \
+  /tmp/memorysplit-corpus-package-a/memorysplit-corpus-builder.tar.gz.sha256 \
+  /tmp/memorysplit-corpus-package-b/memorysplit-corpus-builder.tar.gz.sha256
+```
+
+All three comparisons were silent with exit code zero. Exact shared archive
+identity:
+
+```text
+sha256: ba4b29017a7cae6deb45b603a751b7c067bf2e7d06011f58faeb1fc6729b1941
+bytes: 772286
+regular-file members: 97
+revision: 59e9bdb9c2b6eea70f5f4fcdfc19464a6a82f097
+```
+
+`shasum -a 256` printed the same hash for both archives, `wc -c` printed
+`772286` for each, and `tar -tzf ... | wc -l` printed `97`.
+
+## Complete-suite evidence
+
+Command:
+
+```bash
+python -m pytest -q
+```
+
+Exact summary:
+
+```text
+3 failed, 1747 passed, 2 deselected, 1 warning in 267.82s (0:04:27)
+```
+
+Failures:
+
+```text
+tests/test_reasoning_v2_semantic.py::test_route_index_open_rejects_namespace_aba_to_different_sqlite_inode
+tests/test_verify_cohort_releases.py::test_accepts_release_built_by_final_aws_packager
+tests/test_verify_cohort_releases.py::test_runbook_is_dry_run_first_and_covers_complete_p5_lifecycle
+```
+
+An isolated rerun reported `2 failed, 1 passed in 1.49s`: the SQLite
+namespace-ABA case passed, while both cohort-release integration tests failed
+again. Their traces point to pre-existing semantic/P5 integration and runbook
+files outside the Task 2 diff. Per the ownership boundary, they were not
+changed.
+
+## Self-review
+
+- The archive is sourced only from committed blobs under the exact allowlist;
+  unrelated tracked files and all untracked files cannot enter it.
+- Member order and every tar/gzip metadata field named in the brief are
+  explicitly normalized and verified before publication.
+- Manifest member rows bind both Git identity and content SHA-256 and are
+  emitted in archive order.
+- Secret checks reuse the established P5 release patterns and add path-level
+  credential rejection; tests prove both raw and structured rejection.
+- Required authorities are checked independently from archive selection so
+  focused tests must exist without broadening the package to `tests/`.
+- Output is required outside the source worktree and each artifact is staged
+  with exclusive creation, fsynced, and atomically replaced.
+- No network call, AWS command, push, or amendment was performed.
+
+## Concerns
+
+1. The repository has no `pyproject.toml` in this branch or its history.
+   `pyproject.toml` remains in the exact required-file allowlist and is packaged
+   when committed, but the real 97-member package cannot contain a file absent
+   from the committed tree. `requirements.txt` and both required scripts are
+   present and gated.
+2. Base commit `98f43e2` still exposes `UnsupportedProductionRenderer`; this
+   deterministic package does not by itself satisfy the design's separate
+   pre-launch requirement for completed production renderers. A later
+   integration revision must replace that fail-closed path before AWS launch.
+3. The complete repository suite is not green for the three out-of-scope
+   failures recorded above. Task 2's 354-test focused regression is green.
