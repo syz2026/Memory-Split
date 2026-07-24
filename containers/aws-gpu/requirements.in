@@ -1,0 +1,10 @@
+# torch==2.9.0 is supplied and cryptographically fixed by the digest-pinned DLC.
+# The Dockerfile verifies its public version before the image can complete.
+numpy>=1.26
+tiktoken>=0.7
+pyyaml>=6.0
+tqdm>=4.66
+matplotlib>=3.8
+datasets>=2.19
+huggingface_hub>=0.23
+pytest>=8.0

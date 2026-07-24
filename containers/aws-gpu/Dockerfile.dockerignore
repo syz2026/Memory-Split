@@ -1,0 +1,4 @@
+**
+!containers/
+!containers/aws-gpu/
+!containers/aws-gpu/requirements.lock
