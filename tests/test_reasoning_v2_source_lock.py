@@ -927,6 +927,184 @@ def test_forged_duplicate_quarantine_fails_after_valid_final(
         )
 
 
+def _build_matching_duplicate(
+    canonical,
+    fixture_source_lock,
+    monkeypatch,
+):
+    installed = False
+
+    def install_winner(
+        phase,
+        _sources_fd,
+        stage_name,
+        final_name,
+        _stage_fd,
+    ):
+        nonlocal installed
+        if phase == "before_publish" and not installed:
+            installed = True
+            _copy_concurrent_winner(
+                canonical,
+                stage_name,
+                final_name,
+                conflict=False,
+            )
+
+    monkeypatch.setattr(
+        source_lock_module,
+        "_stage_publish_hook",
+        install_winner,
+    )
+    return stage_source_lock(
+        fixture_source_lock.lock,
+        fixture_source_lock.download_root,
+        canonical,
+    )
+
+
+def test_winner_mutation_during_duplicate_validation_fails_final_replay(
+    tmp_path,
+    fixture_source_lock,
+    monkeypatch,
+):
+    canonical = tmp_path / "canonical"
+    winner = _build_matching_duplicate(
+        canonical,
+        fixture_source_lock,
+        monkeypatch,
+    )
+    mutated = False
+
+    def mutate(phase, _duplicate_fd, _name, _names):
+        nonlocal mutated
+        if phase == "after_initial_snapshot" and not mutated:
+            mutated = True
+            victim = next(path for path in winner.rglob("*") if path.is_file())
+            payload = victim.read_bytes()
+            victim.unlink()
+            victim.write_bytes(payload)
+
+    monkeypatch.setattr(
+        source_lock_module,
+        "_duplicate_quarantine_hook",
+        mutate,
+        raising=False,
+    )
+    with pytest.raises(ValueError, match="winner changed during duplicate"):
+        stage_source_lock(
+            fixture_source_lock.lock,
+            fixture_source_lock.download_root,
+            canonical,
+        )
+
+
+def test_duplicate_namespace_transient_entry_race_fails(
+    tmp_path,
+    fixture_source_lock,
+    monkeypatch,
+):
+    canonical = tmp_path / "canonical"
+    _build_matching_duplicate(canonical, fixture_source_lock, monkeypatch)
+    duplicate_root = canonical / "duplicate-quarantines"
+    transient = duplicate_root / "transient-race"
+    mutated = False
+
+    def mutate(phase, _duplicate_fd, _name, _names):
+        nonlocal mutated
+        if phase == "after_initial_snapshot" and not mutated:
+            transient.write_bytes(b"race")
+        elif phase == "before_final_snapshot" and not mutated:
+            transient.unlink()
+            mutated = True
+
+    monkeypatch.setattr(
+        source_lock_module,
+        "_duplicate_quarantine_hook",
+        mutate,
+        raising=False,
+    )
+    with pytest.raises(ValueError, match="duplicate quarantine.*race"):
+        stage_source_lock(
+            fixture_source_lock.lock,
+            fixture_source_lock.download_root,
+            canonical,
+        )
+
+
+def test_duplicate_namespace_same_name_replacement_fails(
+    tmp_path,
+    fixture_source_lock,
+    monkeypatch,
+):
+    canonical = tmp_path / "canonical"
+    _build_matching_duplicate(canonical, fixture_source_lock, monkeypatch)
+    duplicate_root = canonical / "duplicate-quarantines"
+    marker = next(duplicate_root.glob("*.json"))
+    mutated = False
+
+    def mutate(phase, _duplicate_fd, _name, _names):
+        nonlocal mutated
+        if phase == "after_initial_snapshot" and not mutated:
+            mutated = True
+            payload = marker.read_bytes()
+            marker.unlink()
+            marker.write_bytes(payload)
+
+    monkeypatch.setattr(
+        source_lock_module,
+        "_duplicate_quarantine_hook",
+        mutate,
+        raising=False,
+    )
+    with pytest.raises(ValueError, match="duplicate quarantine.*race|drift"):
+        stage_source_lock(
+            fixture_source_lock.lock,
+            fixture_source_lock.download_root,
+            canonical,
+        )
+
+
+def test_duplicate_nested_tree_mutation_during_child_work_fails(
+    tmp_path,
+    fixture_source_lock,
+    monkeypatch,
+):
+    canonical = tmp_path / "canonical"
+    _build_matching_duplicate(canonical, fixture_source_lock, monkeypatch)
+    duplicate_root = canonical / "duplicate-quarantines"
+    quarantine = next(path for path in duplicate_root.iterdir() if path.is_dir())
+    mutated = False
+
+    def mutate(phase, _duplicate_fd, name, _names):
+        nonlocal mutated
+        if (
+            phase == "after_child_verification"
+            and name == quarantine.name
+            and not mutated
+        ):
+            mutated = True
+            victim = next(
+                path for path in quarantine.rglob("*") if path.is_file()
+            )
+            payload = victim.read_bytes()
+            victim.unlink()
+            victim.write_bytes(payload)
+
+    monkeypatch.setattr(
+        source_lock_module,
+        "_duplicate_quarantine_hook",
+        mutate,
+        raising=False,
+    )
+    with pytest.raises(ValueError, match="duplicate quarantine.*race|drift"):
+        stage_source_lock(
+            fixture_source_lock.lock,
+            fixture_source_lock.download_root,
+            canonical,
+        )
+
+
 def _offline_finemath_selection(
     tmp_path,
     *,

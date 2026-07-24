@@ -1423,6 +1423,7 @@ def _verify_source_tree_fd(
     *,
     _run_finemath_proof: bool = True,
     _expected_snapshot: _SourceTreeSnapshot | None = None,
+    _snapshot_sink: list[_SourceTreeSnapshot] | None = None,
 ) -> dict[str, object]:
     root_metadata = os.fstat(root_fd)
     _require_owned_mode(
@@ -1699,6 +1700,8 @@ def _verify_source_tree_fd(
         )
         if _expected_snapshot is not None and snapshot != _expected_snapshot:
             raise ValueError("source tree changed during FineMath proof")
+        if _snapshot_sink is not None:
+            _snapshot_sink.append(snapshot)
         result = {
             "bytes": total_bytes,
             "dataset_id": lock.dataset_id,
@@ -2351,6 +2354,81 @@ def _duplicate_marker(
     }
 
 
+def _open_verified_winner(
+    lock: SourceLock,
+    sources_fd: int,
+    final_name: str,
+) -> tuple[
+    int,
+    tuple[int, int, int, int],
+    _SourceTreeSnapshot,
+]:
+    final_fd, final_identity = _open_bound_directory(
+        sources_fd,
+        final_name,
+        description="published source stage",
+    )
+    snapshots: list[_SourceTreeSnapshot] = []
+    try:
+        _verify_source_tree_fd(
+            lock,
+            final_fd,
+            _snapshot_sink=snapshots,
+        )
+        _require_named_directory_identity(
+            sources_fd,
+            final_name,
+            final_fd,
+            final_identity,
+            description="published source stage",
+        )
+        if len(snapshots) != 1:
+            raise ValueError("winner verification snapshot is incomplete")
+        return final_fd, final_identity, snapshots[0]
+    except BaseException:
+        os.close(final_fd)
+        raise
+
+
+def _replay_verified_winner(
+    lock: SourceLock,
+    sources_fd: int,
+    final_name: str,
+    final_fd: int,
+    final_identity: tuple[int, int, int, int],
+    expected_snapshot: _SourceTreeSnapshot,
+) -> None:
+    snapshots: list[_SourceTreeSnapshot] = []
+    try:
+        _verify_source_tree_fd(
+            lock,
+            final_fd,
+            _snapshot_sink=snapshots,
+        )
+        if len(snapshots) != 1 or snapshots[0] != expected_snapshot:
+            raise ValueError("winner snapshot drift")
+        _require_named_directory_identity(
+            sources_fd,
+            final_name,
+            final_fd,
+            final_identity,
+            description="published source stage",
+        )
+    except (OSError, ValueError) as error:
+        raise ValueError(
+            "winner changed during duplicate processing"
+        ) from error
+
+
+def _duplicate_quarantine_hook(
+    phase: str,
+    duplicate_fd: int,
+    name: str,
+    names: tuple[str, ...],
+) -> None:
+    del phase, duplicate_fd, name, names
+
+
 def _verify_duplicate_quarantines(
     lock: SourceLock,
     canonical_fd: int,
@@ -2363,7 +2441,15 @@ def _verify_duplicate_quarantines(
         description="duplicate quarantine directory",
     )
     try:
+        directory_before = os.fstat(duplicate_fd)
+        identity_before = _directory_identity(directory_before)
         names = list_entries(duplicate_fd)
+        _duplicate_quarantine_hook(
+            "after_initial_snapshot",
+            duplicate_fd,
+            "",
+            names,
+        )
         directories = {
             name
             for name in names
@@ -2383,6 +2469,14 @@ def _verify_duplicate_quarantines(
             raise ValueError(
                 "duplicate quarantine namespace is unexpected or conflicting"
             )
+        marker_snapshots: dict[
+            str,
+            tuple[
+                bytes,
+                tuple[int, int, int, int, int, int, int | None, int | None],
+            ],
+        ] = {}
+        child_snapshots: dict[str, _SourceTreeSnapshot] = {}
         for quarantine_name in sorted(directories, key=_byte_key):
             marker_name = f"{quarantine_name}.json"
             marker_bytes = _read_regular_at(
@@ -2414,13 +2508,29 @@ def _verify_duplicate_quarantines(
                 raise ValueError(
                     f"duplicate quarantine marker drift: {marker_name}"
                 )
+            marker_metadata = entry_lstat(duplicate_fd, marker_name)
+            marker_snapshots[marker_name] = (
+                marker_bytes,
+                _file_identity(marker_metadata),
+            )
             quarantine_fd, quarantine_identity = _open_bound_directory(
                 duplicate_fd,
                 quarantine_name,
                 description=f"benign duplicate quarantine {quarantine_name}",
             )
             try:
-                verification = _verify_source_tree_fd(lock, quarantine_fd)
+                snapshots: list[_SourceTreeSnapshot] = []
+                verification = _verify_source_tree_fd(
+                    lock,
+                    quarantine_fd,
+                    _snapshot_sink=snapshots,
+                )
+                if len(snapshots) != 1:
+                    raise ValueError(
+                        f"duplicate quarantine snapshot missing: "
+                        f"{quarantine_name}"
+                    )
+                child_snapshots[quarantine_name] = snapshots[0]
                 metadata = os.fstat(quarantine_fd)
                 if (
                     marker["directory_identity"]
@@ -2441,6 +2551,79 @@ def _verify_duplicate_quarantines(
                 )
             finally:
                 os.close(quarantine_fd)
+            _duplicate_quarantine_hook(
+                "after_child_verification",
+                duplicate_fd,
+                quarantine_name,
+                names,
+            )
+        _duplicate_quarantine_hook(
+            "before_final_snapshot",
+            duplicate_fd,
+            "",
+            names,
+        )
+        for quarantine_name in sorted(directories, key=_byte_key):
+            marker_name = f"{quarantine_name}.json"
+            marker_bytes = _read_regular_at(
+                duplicate_fd,
+                marker_name,
+                description=f"duplicate quarantine marker {marker_name}",
+            )
+            marker_metadata = entry_lstat(duplicate_fd, marker_name)
+            if marker_snapshots[marker_name] != (
+                marker_bytes,
+                _file_identity(marker_metadata),
+            ):
+                raise ValueError(
+                    f"duplicate quarantine marker replay drift: {marker_name}"
+                )
+            marker = _strict_json_bytes(
+                marker_bytes,
+                f"duplicate quarantine marker {marker_name}",
+            )
+            quarantine_fd, quarantine_identity = _open_bound_directory(
+                duplicate_fd,
+                quarantine_name,
+                description=f"benign duplicate quarantine {quarantine_name}",
+            )
+            try:
+                snapshots = []
+                verification = _verify_source_tree_fd(
+                    lock,
+                    quarantine_fd,
+                    _snapshot_sink=snapshots,
+                )
+                metadata = os.fstat(quarantine_fd)
+                if (
+                    len(snapshots) != 1
+                    or snapshots[0] != child_snapshots[quarantine_name]
+                    or marker["directory_identity"]
+                    != list(_directory_identity(metadata))
+                    or marker["tree_verification"] != verification
+                ):
+                    raise ValueError(
+                        f"duplicate quarantine child replay drift: "
+                        f"{quarantine_name}"
+                    )
+                _require_named_directory_identity(
+                    duplicate_fd,
+                    quarantine_name,
+                    quarantine_fd,
+                    quarantine_identity,
+                    description=(
+                        f"benign duplicate quarantine {quarantine_name}"
+                    ),
+                )
+            finally:
+                os.close(quarantine_fd)
+        final_names = list_entries(duplicate_fd)
+        directory_after = os.fstat(duplicate_fd)
+        if (
+            final_names != names
+            or _directory_identity(directory_after) != identity_before
+        ):
+            raise ValueError("duplicate quarantine namespace race")
         _require_named_directory_identity(
             canonical_fd,
             _DUPLICATE_QUARANTINE_DIRECTORY,
@@ -2449,6 +2632,8 @@ def _verify_duplicate_quarantines(
             description="duplicate quarantine directory",
         )
         return len(directories)
+    except (FileNotFoundError, OSError) as error:
+        raise ValueError("duplicate quarantine namespace race") from error
     finally:
         os.close(duplicate_fd)
 
@@ -2627,28 +2812,33 @@ def stage_source_lock(
         )
 
         if entry_exists(sources_fd, final_name):
+            final_fd = -1
             try:
-                final_fd, final_identity = _open_bound_directory(
+                (
+                    final_fd,
+                    final_identity,
+                    winner_snapshot,
+                ) = _open_verified_winner(
+                    lock,
                     sources_fd,
                     final_name,
-                    description="published source stage",
                 )
-                try:
-                    _verify_source_tree_fd(lock, final_fd)
-                    _require_named_directory_identity(
-                        sources_fd,
-                        final_name,
-                        final_fd,
-                        final_identity,
-                        description="published source stage",
-                    )
-                finally:
-                    os.close(final_fd)
             except (OSError, ValueError) as error:
                 raise ValueError(
                     f"conflicting source stage: {final_path}"
                 ) from error
-            _verify_duplicate_quarantines(lock, canonical_fd)
+            try:
+                _verify_duplicate_quarantines(lock, canonical_fd)
+                _replay_verified_winner(
+                    lock,
+                    sources_fd,
+                    final_name,
+                    final_fd,
+                    final_identity,
+                    winner_snapshot,
+                )
+            finally:
+                os.close(final_fd)
             _require_named_directory_identity(
                 canonical_fd,
                 "sources",
@@ -2770,34 +2960,40 @@ def stage_source_lock(
                 final_name,
             )
         except FileExistsError:
-            final_fd, final_identity = _open_bound_directory(
-                sources_fd,
-                final_name,
-                description="published source stage",
-            )
+            final_fd = -1
             try:
-                _verify_source_tree_fd(lock, final_fd)
-                _require_named_directory_identity(
-                    sources_fd,
-                    final_name,
+                (
                     final_fd,
                     final_identity,
-                    description="published source stage",
+                    winner_snapshot,
+                ) = _open_verified_winner(
+                    lock,
+                    sources_fd,
+                    final_name,
                 )
             except (OSError, ValueError) as error:
                 raise ValueError(
                     f"conflicting source stage: {final_path}"
                 ) from error
+            try:
+                _preserve_benign_duplicate(
+                    lock,
+                    canonical_fd,
+                    sources_fd,
+                    stage_name,
+                    stage_fd,
+                    stage_identity,
+                )
+                _replay_verified_winner(
+                    lock,
+                    sources_fd,
+                    final_name,
+                    final_fd,
+                    final_identity,
+                    winner_snapshot,
+                )
             finally:
                 os.close(final_fd)
-            _preserve_benign_duplicate(
-                lock,
-                canonical_fd,
-                sources_fd,
-                stage_name,
-                stage_fd,
-                stage_identity,
-            )
             stage_name = ""
         else:
             fsync_directory(sources_fd)
