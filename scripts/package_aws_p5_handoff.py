@@ -223,6 +223,9 @@ _SHARED_TEST_FIXTURES = {
     "tests/fixtures/current_sources/README.md",
     "tests/fixtures/relational-smoke-route-policy.json",
 }
+_APPROVED_TEST_MODULES = {
+    "tests/test_package_aws_p5_handoff.py",
+}
 _LEGACY_CONFIG_PREFIXES = (
     "configs/29m/",
     "configs/160m/",
@@ -1017,6 +1020,10 @@ def _classification(path: str) -> str:
         return "excluded"
     if path in PROVIDER_BRIDGE_MEMBERS:
         return "included"
+    if parts[0] == "tests":
+        if path in _APPROVED_TEST_MODULES or path in _SHARED_TEST_FIXTURES:
+            return "included"
+        return "excluded"
     if path in _ROOT_INCLUDED:
         return "included"
     if (
@@ -1039,8 +1046,6 @@ def _classification(path: str) -> str:
         ):
             return "included"
         return "excluded"
-    if path in _SHARED_TEST_FIXTURES:
-        return "included"
     if path in _APPROVED_SOURCES or path in _APPROVED_VENDOR:
         return "included"
     if parts[0] in {"sources", "vendor"}:
