@@ -472,6 +472,7 @@ def test_archive_authority_hashes_and_parses_the_same_descriptor(
     with _open_verified_archives(
         archive_authority.source_lock_path,
         archive_authority.source_root,
+        expected_generator_commit=EXPECTED_GENERATOR_COMMIT,
     ) as verified:
         assert tuple(record.path for record in verified.archives) == ARCHIVE_PATHS
         assert {
@@ -517,6 +518,7 @@ def test_archive_authority_hashes_and_parses_the_same_descriptor(
         with _open_verified_archives(
             archive_authority.source_lock_path,
             archive_authority.source_root,
+            expected_generator_commit=EXPECTED_GENERATOR_COMMIT,
         ):
             pass
 
@@ -558,6 +560,7 @@ def test_archive_authority_rejects_extra_wikidata_archive_lock_row(
         with _open_verified_archives(
             archive_authority.source_lock_path,
             archive_authority.source_root,
+            expected_generator_commit=EXPECTED_GENERATOR_COMMIT,
         ):
             pass
 
@@ -580,6 +583,7 @@ def test_archive_authority_rejects_path_inode_parent_and_aba_drift(
             with _open_verified_archives(
                 archive_authority.source_lock_path,
                 archive_authority.source_root,
+                expected_generator_commit=EXPECTED_GENERATOR_COMMIT,
             ):
                 pass
         return
@@ -588,6 +592,7 @@ def test_archive_authority_rejects_path_inode_parent_and_aba_drift(
         with _open_verified_archives(
             archive_authority.source_lock_path,
             archive_authority.source_root,
+            expected_generator_commit=EXPECTED_GENERATOR_COMMIT,
         ):
             if attack == "archive_inode":
                 displaced = victim.with_name(victim.name + ".displaced")
@@ -691,6 +696,7 @@ def test_archive_authority_rejects_unsafe_or_undeclared_members(
         with _open_verified_archives(
             authority.source_lock_path,
             authority.source_root,
+            expected_generator_commit=EXPECTED_GENERATOR_COMMIT,
         ):
             pass
 
@@ -749,6 +755,7 @@ def test_archive_authority_rejects_open_physical_archive_envelope(
         with _open_verified_archives(
             authority.source_lock_path,
             authority.source_root,
+            expected_generator_commit=EXPECTED_GENERATOR_COMMIT,
         ):
             pass
 
@@ -773,6 +780,7 @@ def test_archive_authority_rejects_local_pax_size_override_hiding_member(
         with _open_verified_archives(
             authority.source_lock_path,
             authority.source_root,
+            expected_generator_commit=EXPECTED_GENERATOR_COMMIT,
         ):
             pass
 
@@ -797,6 +805,7 @@ def test_archive_authority_rejects_global_pax_size_override_hiding_member(
         with _open_verified_archives(
             authority.source_lock_path,
             authority.source_root,
+            expected_generator_commit=EXPECTED_GENERATOR_COMMIT,
         ):
             pass
 
@@ -824,6 +833,7 @@ def test_archive_authority_leaves_source_root_byte_identical(
     with _open_verified_archives(
         archive_authority.source_lock_path,
         archive_authority.source_root,
+        expected_generator_commit=EXPECTED_GENERATOR_COMMIT,
     ) as verified:
         assert len(verified.archives) == 3
         assert len(verified.members) == 8
@@ -868,6 +878,31 @@ def _build_view(authority: _AuthorityFixture, output_root: Path):
         authority.source_root,
         output_root,
         expected_generator_commit=EXPECTED_GENERATOR_COMMIT,
+    )
+
+
+def _rewrite_source_lock_generator(
+    authority: _AuthorityFixture,
+    generator_commit: str,
+) -> None:
+    value = json.loads(
+        authority.source_lock_path.read_text(encoding="utf-8")
+    )
+    value["generator_commit"] = generator_commit
+    authority.source_lock_path.write_bytes(canonical_json_bytes(value))
+
+
+def _published_view_names(output_root: Path) -> tuple[str, ...]:
+    namespace = output_root / "wikidata"
+    if not namespace.exists():
+        return ()
+    return tuple(
+        sorted(
+            path.name
+            for path in namespace.iterdir()
+            if len(path.name) == 64
+            and all(character in "0123456789abcdef" for character in path.name)
+        )
     )
 
 
@@ -1190,3 +1225,279 @@ def test_stream_or_index_drift_fails_verification(
             view.root,
             expected_generator_commit=EXPECTED_GENERATOR_COMMIT,
         )
+
+
+def test_build_rejects_mismatched_source_lock_generator_before_output(
+    archive_authority: _AuthorityFixture,
+    tmp_path: Path,
+):
+    _rewrite_source_lock_generator(archive_authority, "b" * 40)
+    output_root = tmp_path / "derived"
+
+    with pytest.raises(ValueError, match="generator commit"):
+        _build_view(archive_authority, output_root)
+
+    assert not output_root.exists()
+
+
+def test_verify_rejects_stale_source_lock_generator_authority(
+    archive_authority: _AuthorityFixture,
+    tmp_path: Path,
+):
+    view = _build_view(archive_authority, tmp_path / "derived")
+    _rewrite_source_lock_generator(archive_authority, "b" * 40)
+
+    with pytest.raises(ValueError, match="generator commit"):
+        wikidata_source_module.verify_wikidata_derived_view(
+            archive_authority.source_lock_path,
+            archive_authority.source_root,
+            view.root,
+            expected_generator_commit=EXPECTED_GENERATOR_COMMIT,
+        )
+
+
+def test_build_directory_swap_fails_before_final_target_occupation(
+    archive_authority: _AuthorityFixture,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    output_root = tmp_path / "derived"
+    swapped = False
+
+    def swap_before_publish(phase, authority, _final_name):
+        nonlocal swapped
+        if phase != "before_publish_check" or swapped:
+            return
+        swapped = True
+        namespace = output_root / "wikidata"
+        original = namespace / authority.name
+        original.rename(namespace / f"{authority.name}.displaced")
+        original.mkdir(mode=0o700)
+
+    monkeypatch.setattr(
+        wikidata_source_module,
+        "_derived_view_build_hook",
+        swap_before_publish,
+        raising=False,
+    )
+
+    with pytest.raises(ValueError, match="identity drift"):
+        _build_view(archive_authority, output_root)
+
+    assert swapped
+    assert _published_view_names(output_root) == ()
+
+
+def test_external_sort_run_swap_fails_closed_and_closes_opened_descriptor(
+    archive_authority: _AuthorityFixture,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    output_root = tmp_path / "derived"
+    opened_run_fds: list[int] = []
+    swapped = False
+    original_open = wikidata_source_module.open_regular_file_at
+
+    def record_run_open(directory_fd, name):
+        descriptor, metadata = original_open(directory_fd, name)
+        if "-l" in name and name.endswith(".bin"):
+            opened_run_fds.append(descriptor)
+        return descriptor, metadata
+
+    def swap_run(phase, work_fd, run):
+        nonlocal swapped
+        if phase != "before_open" or swapped:
+            return
+        swapped = True
+        os.rename(
+            run.name,
+            f"{run.name}.displaced",
+            src_dir_fd=work_fd,
+            dst_dir_fd=work_fd,
+        )
+        replacement = os.open(
+            run.name,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+            0o600,
+            dir_fd=work_fd,
+        )
+        os.write(replacement, b"substituted run")
+        os.close(replacement)
+
+    monkeypatch.setattr(
+        wikidata_source_module,
+        "open_regular_file_at",
+        record_run_open,
+    )
+    monkeypatch.setattr(
+        wikidata_source_module,
+        "_external_sort_hook",
+        swap_run,
+        raising=False,
+    )
+    monkeypatch.setattr(wikidata_source_module, "_SORT_CHUNK_RECORDS", 1)
+
+    with pytest.raises(ValueError, match="identity drift"):
+        _build_view(archive_authority, output_root)
+
+    assert swapped
+    assert opened_run_fds
+    for descriptor in opened_run_fds:
+        with pytest.raises(OSError):
+            os.fstat(descriptor)
+    assert _published_view_names(output_root) == ()
+
+
+@pytest.mark.parametrize(
+    ("consumer", "directory_name"),
+    [
+        ("lookup", "indexes"),
+        ("iteration", "streams"),
+        ("iteration", "members"),
+    ],
+)
+def test_public_consumers_postcheck_child_directory_identity(
+    archive_authority: _AuthorityFixture,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    consumer: str,
+    directory_name: str,
+):
+    view = _build_view(archive_authority, tmp_path / "derived")
+    swapped = False
+
+    def swap_child(phase, hooked_view):
+        nonlocal swapped
+        if phase != "before_postcheck" or swapped:
+            return
+        swapped = True
+        child = hooked_view.root / directory_name
+        child.rename(hooked_view.root / f"{directory_name}.displaced")
+        child.mkdir(mode=0o700)
+
+    monkeypatch.setattr(
+        wikidata_source_module,
+        "_view_authority_hook",
+        swap_child,
+        raising=False,
+    )
+
+    with pytest.raises(ValueError, match="identity drift"):
+        if consumer == "lookup":
+            wikidata_source_module.lookup_alias(view, "Q1")
+        else:
+            list(wikidata_source_module.iter_v2_aliases(view))
+
+    assert swapped
+
+
+def test_cleanup_never_deletes_substituted_private_build_directory(
+    archive_authority: _AuthorityFixture,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    output_root = tmp_path / "derived"
+    replacement: Path | None = None
+    displaced: Path | None = None
+    captured_fd = -1
+
+    def fail_then_swap(phase, authority, _final_name):
+        nonlocal replacement, displaced, captured_fd
+        captured_fd = authority.descriptor
+        if phase == "before_candidate_verify":
+            raise RuntimeError("primary build failure")
+        if phase == "before_cleanup":
+            namespace = output_root / "wikidata"
+            replacement = namespace / authority.name
+            displaced = namespace / f"{authority.name}.displaced"
+            replacement.rename(displaced)
+            replacement.mkdir(mode=0o700)
+            (replacement / "marker").write_bytes(b"do not delete")
+
+    monkeypatch.setattr(
+        wikidata_source_module,
+        "_derived_view_build_hook",
+        fail_then_swap,
+        raising=False,
+    )
+
+    with pytest.raises(RuntimeError, match="primary build failure"):
+        _build_view(archive_authority, output_root)
+
+    assert replacement is not None and (replacement / "marker").is_file()
+    assert displaced is not None and displaced.is_dir()
+    with pytest.raises(OSError):
+        os.fstat(captured_fd)
+    assert _published_view_names(output_root) == ()
+
+
+def test_cleanup_failure_preserves_primary_error_and_closes_all_descriptors(
+    archive_authority: _AuthorityFixture,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    captured_fds: list[int] = []
+
+    def fail_build(phase, authority, _final_name):
+        if phase == "before_candidate_verify":
+            captured_fds.append(authority.descriptor)
+            captured_fds.extend(authority.directory_descriptors.values())
+            raise RuntimeError("primary build failure")
+
+    def fail_cleanup(_authority):
+        raise OSError("cleanup failure")
+
+    monkeypatch.setattr(
+        wikidata_source_module,
+        "_derived_view_build_hook",
+        fail_build,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        wikidata_source_module,
+        "_cleanup_private_build",
+        fail_cleanup,
+        raising=False,
+    )
+
+    with pytest.raises(RuntimeError, match="primary build failure") as raised:
+        _build_view(archive_authority, tmp_path / "derived")
+
+    assert "cleanup failure" not in str(raised.value)
+    assert captured_fds
+    for descriptor in captured_fds:
+        with pytest.raises(OSError):
+            os.fstat(descriptor)
+
+
+def test_published_target_inode_swap_fails_before_content_verification(
+    archive_authority: _AuthorityFixture,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    output_root = tmp_path / "derived"
+    swapped = False
+
+    def swap_published_target(phase, authority, final_name):
+        nonlocal swapped
+        if phase != "after_publish_rename" or swapped:
+            return
+        swapped = True
+        namespace = output_root / "wikidata"
+        target = namespace / final_name
+        displaced = namespace / f"{final_name}.displaced"
+        target.rename(displaced)
+        shutil.copytree(displaced, target)
+        assert target.stat().st_ino != authority.identity[1]
+
+    monkeypatch.setattr(
+        wikidata_source_module,
+        "_derived_view_build_hook",
+        swap_published_target,
+        raising=False,
+    )
+
+    with pytest.raises(ValueError, match="identity drift"):
+        _build_view(archive_authority, output_root)
+
+    assert swapped
