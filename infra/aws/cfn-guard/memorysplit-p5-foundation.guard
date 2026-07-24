@@ -26,9 +26,6 @@ let public_routes = Resources.*[
 ]
 
 let subnets = Resources.*[ Type == 'AWS::EC2::Subnet' ]
-let launch_templates = Resources.*[ Type == 'AWS::EC2::LaunchTemplate' ]
-let buckets = Resources.*[ Type == 'AWS::S3::Bucket' ]
-let repositories = Resources.*[ Type == 'AWS::ECR::Repository' ]
 
 rule no_ec2_instances {
   %ec2_instances empty
@@ -91,25 +88,29 @@ rule endpoint_ingress_is_https_only {
   Resources.EndpointSecurityGroup.Properties.SecurityGroupIngress[*].CidrIpv6 !exists
 }
 
-rule launch_template_is_private_imdsv2_p5 when %launch_templates !empty {
-  %launch_templates.Properties.LaunchTemplateData.InstanceType == 'p5.48xlarge'
-  %launch_templates.Properties.LaunchTemplateData.KeyName !exists
-  %launch_templates.Properties.LaunchTemplateData.MetadataOptions.HttpTokens == 'required'
-  %launch_templates.Properties.LaunchTemplateData.MetadataOptions.HttpEndpoint == 'enabled'
-  %launch_templates.Properties.LaunchTemplateData.MetadataOptions.HttpPutResponseHopLimit == 1
-  %launch_templates.Properties.LaunchTemplateData.NetworkInterfaces[*].AssociatePublicIpAddress == false
-  %launch_templates.Properties.LaunchTemplateData.BlockDeviceMappings[*].Ebs.Encrypted == true
+rule launch_template_is_private_imdsv2_p5 {
+  Resources.P5LaunchTemplate.Type == 'AWS::EC2::LaunchTemplate'
+  Resources.P5LaunchTemplate.Properties.LaunchTemplateData.InstanceType == 'p5.48xlarge'
+  Resources.P5LaunchTemplate.Properties.LaunchTemplateData.KeyName !exists
+  Resources.P5LaunchTemplate.Properties.LaunchTemplateData.MetadataOptions.HttpTokens == 'required'
+  Resources.P5LaunchTemplate.Properties.LaunchTemplateData.MetadataOptions.HttpEndpoint == 'enabled'
+  Resources.P5LaunchTemplate.Properties.LaunchTemplateData.MetadataOptions.HttpPutResponseHopLimit == 1
+  Resources.P5LaunchTemplate.Properties.LaunchTemplateData.NetworkInterfaces[*].AssociatePublicIpAddress == false
+  Resources.P5LaunchTemplate.Properties.LaunchTemplateData.NetworkInterfaces[*].SubnetId.Ref == 'PrivateSubnetA'
+  Resources.P5LaunchTemplate.Properties.LaunchTemplateData.BlockDeviceMappings[*].Ebs.Encrypted == true
+  Resources.P5LaunchTemplate.Properties.LaunchTemplateData.DisableApiTermination == false
 }
 
-rule retained_versioned_kms_bucket when %buckets !empty {
-  %buckets.DeletionPolicy == 'Retain'
-  %buckets.UpdateReplacePolicy == 'Retain'
-  %buckets.Properties.VersioningConfiguration.Status == 'Enabled'
-  %buckets.Properties.BucketEncryption.ServerSideEncryptionConfiguration[*].ServerSideEncryptionByDefault.SSEAlgorithm == 'aws:kms'
-  %buckets.Properties.PublicAccessBlockConfiguration.BlockPublicAcls == true
-  %buckets.Properties.PublicAccessBlockConfiguration.BlockPublicPolicy == true
-  %buckets.Properties.PublicAccessBlockConfiguration.IgnorePublicAcls == true
-  %buckets.Properties.PublicAccessBlockConfiguration.RestrictPublicBuckets == true
+rule retained_versioned_kms_bucket {
+  Resources.ArtifactBucket.Type == 'AWS::S3::Bucket'
+  Resources.ArtifactBucket.DeletionPolicy == 'Retain'
+  Resources.ArtifactBucket.UpdateReplacePolicy == 'Retain'
+  Resources.ArtifactBucket.Properties.VersioningConfiguration.Status == 'Enabled'
+  Resources.ArtifactBucket.Properties.BucketEncryption.ServerSideEncryptionConfiguration[*].ServerSideEncryptionByDefault.SSEAlgorithm == 'aws:kms'
+  Resources.ArtifactBucket.Properties.PublicAccessBlockConfiguration.BlockPublicAcls == true
+  Resources.ArtifactBucket.Properties.PublicAccessBlockConfiguration.BlockPublicPolicy == true
+  Resources.ArtifactBucket.Properties.PublicAccessBlockConfiguration.IgnorePublicAcls == true
+  Resources.ArtifactBucket.Properties.PublicAccessBlockConfiguration.RestrictPublicBuckets == true
 }
 
 rule retained_symmetric_data_key {
@@ -129,18 +130,48 @@ rule retained_p384_approval_key {
   Resources.ApprovalSigningKey.Properties.KeyUsage == 'SIGN_VERIFY'
 }
 
-rule immutable_kms_ecr when %repositories !empty {
-  %repositories.DeletionPolicy == 'Retain'
-  %repositories.UpdateReplacePolicy == 'Retain'
-  %repositories.Properties.ImageTagMutability == 'IMMUTABLE'
-  %repositories.Properties.ImageScanningConfiguration.ScanOnPush == true
-  %repositories.Properties.EncryptionConfiguration.EncryptionType == 'KMS'
+rule immutable_kms_ecr {
+  Resources.ContainerRepository.Type == 'AWS::ECR::Repository'
+  Resources.ContainerRepository.DeletionPolicy == 'Retain'
+  Resources.ContainerRepository.UpdateReplacePolicy == 'Retain'
+  Resources.ContainerRepository.Properties.ImageTagMutability == 'IMMUTABLE'
+  Resources.ContainerRepository.Properties.ImageScanningConfiguration.ScanOnPush == true
+  Resources.ContainerRepository.Properties.EncryptionConfiguration.EncryptionType == 'KMS'
 }
 
 rule separate_operation_roles {
   Resources.TrainRole.Type == 'AWS::IAM::Role'
   Resources.EvaluatorRole.Type == 'AWS::IAM::Role'
   Resources.ControllerRole.Type == 'AWS::IAM::Role'
+  Resources.ControllerOperationsPolicy.Type == 'AWS::IAM::Policy'
   Resources.SignerRole.Type == 'AWS::IAM::Role'
   Resources.TrainInstanceProfile.Type == 'AWS::IAM::InstanceProfile'
+}
+
+rule meaningful_role_policy_invariants {
+  Resources.TrainRole.Properties.AssumeRolePolicyDocument.Statement[ Sid == 'Ec2AssumeRole' ].Principal.Service == 'ec2.amazonaws.com'
+  Resources.TrainRole.Properties.Policies[*].PolicyDocument.Statement[ Sid == 'ListTrainPrefixes' ] !empty
+  Resources.TrainRole.Properties.Policies[*].PolicyDocument.Statement[ Sid == 'ListTrainPrefixes' ].Condition exists
+  Resources.EvaluatorRole.Properties.Policies[*].PolicyDocument.Statement[ Sid == 'ListEvaluatorPrefixes' ] !empty
+  Resources.EvaluatorRole.Properties.Policies[*].PolicyDocument.Statement[ Sid == 'ListEvaluatorPrefixes' ].Condition exists
+
+  Resources.ControllerOperationsPolicy.Properties.PolicyDocument.Statement[ Sid == 'RunApprovedLaunchTemplate' ] {
+    Action == 'ec2:RunInstances'
+    Condition.Bool[ keys == 'ec2:IsLaunchTemplateResource' ] == 'true'
+  }
+  Resources.ControllerOperationsPolicy.Properties.PolicyDocument.Statement[ Sid == 'TerminateBoundInstance' ] {
+    Action == 'ec2:TerminateInstances'
+    Condition.StringEquals[ keys == 'ec2:ResourceTag/MemorySplitManaged' ] == 'true'
+  }
+  Resources.ControllerOperationsPolicy.Properties.PolicyDocument.Statement[ Sid == 'SendToTaggedInstances' ] {
+    Action == 'ssm:SendCommand'
+    Condition.StringEquals[ keys == 'ssm:resourceTag/MemorySplitManaged' ] == 'true'
+  }
+  Resources.ControllerOperationsPolicy.Properties.PolicyDocument.Statement[ Sid == 'CreateEbsGrant' ] {
+    Action == 'kms:CreateGrant'
+    Condition.Bool[ keys == 'kms:GrantIsForAWSResource' ] == 'true'
+  }
+  Resources.SignerRole.Properties.Policies[*].PolicyDocument.Statement[ Sid == 'SignWithApprovalKey' ] {
+    some Action[*] == 'kms:Sign'
+  }
 }

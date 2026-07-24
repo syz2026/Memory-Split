@@ -8,6 +8,12 @@ Parameters:
   P5AmiId:
     Type: AWS::EC2::Image::Id
     Description: Immutable AMI ID qualified separately for p5.48xlarge.
+  TrainingAvailabilityZone:
+    Type: AWS::EC2::AvailabilityZone::Name
+    Description: Availability Zone where p5.48xlarge offering discovery passed.
+  SecondaryAvailabilityZone:
+    Type: AWS::EC2::AvailabilityZone::Name
+    Description: Distinct Availability Zone for private endpoint resilience.
   VpcCidr:
     Type: String
     Default: 10.42.0.0/16
@@ -23,6 +29,13 @@ Parameters:
     Default: 10.42.16.0/20
     AllowedPattern: '^(10\.[0-9]{1,3}|172\.(1[6-9]|2[0-9]|3[0-1])|192\.168)\.[0-9]{1,3}\.[0-9]{1,3}/(1[6-9]|2[0-8])$'
     Description: RFC1918 IPv4 CIDR for private subnet B.
+  ArtifactRootPrefix:
+    Type: String
+    Default: memorysplit-v3
+    AllowedPattern: '^[a-z0-9](?:[a-z0-9._-]{0,61}[a-z0-9])?(?:/[a-z0-9](?:[a-z0-9._-]{0,61}[a-z0-9])?)*$'
+    MinLength: 1
+    MaxLength: 127
+    Description: Durable S3 key prefix used as MS_S3_ROOT.
   RootVolumeSizeGiB:
     Type: Number
     Default: 500
@@ -39,6 +52,16 @@ Parameters:
     AllowedPattern: '^[^@\s]+@[^@\s]+\.[^@\s]+$'
     ConstraintDescription: Must be a valid email address.
     Description: Email address that confirms and receives AWS Budget alerts.
+
+Rules:
+  DistinctPrivateAvailabilityZones:
+    Assertions:
+      - Assert:
+          Fn::Not:
+            - Fn::Equals:
+                - Ref: TrainingAvailabilityZone
+                - Ref: SecondaryAvailabilityZone
+        AssertDescription: Training and secondary Availability Zones must differ.
 
 Resources:
   Vpc:
@@ -60,9 +83,7 @@ Resources:
     Type: AWS::EC2::Subnet
     Properties:
       AvailabilityZone:
-        Fn::Select:
-          - 0
-          - Fn::GetAZs: ""
+        Ref: TrainingAvailabilityZone
       CidrBlock:
         Ref: PrivateSubnetACidr
       MapPublicIpOnLaunch: false
@@ -79,9 +100,7 @@ Resources:
     Type: AWS::EC2::Subnet
     Properties:
       AvailabilityZone:
-        Fn::Select:
-          - 1
-          - Fn::GetAZs: ""
+        Ref: SecondaryAvailabilityZone
       CidrBlock:
         Ref: PrivateSubnetBCidr
       MapPublicIpOnLaunch: false
@@ -181,6 +200,33 @@ Resources:
                 Fn::Sub: arn:${AWS::Partition}:iam::${AWS::AccountId}:root
             Action: kms:*
             Resource: "*"
+          - Sid: AllowControllerDataAndEbsUse
+            Effect: Allow
+            Principal:
+              AWS:
+                Fn::GetAtt:
+                  - ControllerRole
+                  - Arn
+            Action:
+              - kms:Decrypt
+              - kms:DescribeKey
+              - kms:GenerateDataKey
+              - kms:GenerateDataKeyWithoutPlaintext
+              - kms:ReEncryptFrom
+              - kms:ReEncryptTo
+            Resource: "*"
+          - Sid: AllowControllerEbsGrant
+            Effect: Allow
+            Principal:
+              AWS:
+                Fn::GetAtt:
+                  - ControllerRole
+                  - Arn
+            Action: kms:CreateGrant
+            Resource: "*"
+            Condition:
+              Bool:
+                kms:GrantIsForAWSResource: "true"
       KeySpec: SYMMETRIC_DEFAULT
       KeyUsage: ENCRYPT_DECRYPT
       MultiRegion: false
@@ -328,17 +374,48 @@ Resources:
           PolicyDocument:
             Version: "2012-10-17"
             Statement:
-              - Sid: ListArtifactVersions
+              - Sid: LocateArtifactBucket
+                Effect: Allow
+                Action: s3:GetBucketLocation
+                Resource:
+                  Fn::GetAtt:
+                    - ArtifactBucket
+                    - Arn
+              - Sid: ListTrainPrefixes
                 Effect: Allow
                 Action:
-                  - s3:GetBucketLocation
                   - s3:ListBucket
                   - s3:ListBucketVersions
                 Resource:
                   Fn::GetAtt:
                     - ArtifactBucket
                     - Arn
-              - Sid: ReadWriteVersionedArtifacts
+                Condition:
+                  "ForAnyValue:StringLike":
+                    s3:prefix:
+                      - Fn::Sub: ${ArtifactRootPrefix}/canary-roundtrip
+                      - Fn::Sub: ${ArtifactRootPrefix}/canary-roundtrip/*
+                      - Fn::Sub: ${ArtifactRootPrefix}/checkpoints
+                      - Fn::Sub: ${ArtifactRootPrefix}/checkpoints/*
+                      - Fn::Sub: ${ArtifactRootPrefix}/dataset
+                      - Fn::Sub: ${ArtifactRootPrefix}/dataset/*
+                      - Fn::Sub: ${ArtifactRootPrefix}/operations
+                      - Fn::Sub: ${ArtifactRootPrefix}/operations/*
+                      - Fn::Sub: ${ArtifactRootPrefix}/receipts
+                      - Fn::Sub: ${ArtifactRootPrefix}/receipts/*
+                      - Fn::Sub: ${ArtifactRootPrefix}/releases
+                      - Fn::Sub: ${ArtifactRootPrefix}/releases/*
+              - Sid: ReadBootstrapInputs
+                Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:GetObjectAttributes
+                  - s3:GetObjectTagging
+                  - s3:GetObjectVersion
+                Resource:
+                  - Fn::Sub: ${ArtifactBucket.Arn}/${ArtifactRootPrefix}/dataset/*
+                  - Fn::Sub: ${ArtifactBucket.Arn}/${ArtifactRootPrefix}/releases/*
+              - Sid: ReadWriteTrainingState
                 Effect: Allow
                 Action:
                   - s3:AbortMultipartUpload
@@ -350,7 +427,10 @@ Resources:
                   - s3:PutObject
                   - s3:PutObjectTagging
                 Resource:
-                  Fn::Sub: ${ArtifactBucket.Arn}/*
+                  - Fn::Sub: ${ArtifactBucket.Arn}/${ArtifactRootPrefix}/canary-roundtrip/*
+                  - Fn::Sub: ${ArtifactBucket.Arn}/${ArtifactRootPrefix}/checkpoints/*
+                  - Fn::Sub: ${ArtifactBucket.Arn}/${ArtifactRootPrefix}/operations/*
+                  - Fn::Sub: ${ArtifactBucket.Arn}/${ArtifactRootPrefix}/receipts/*
               - Sid: UseDataKey
                 Effect: Allow
                 Action:
@@ -408,17 +488,46 @@ Resources:
           PolicyDocument:
             Version: "2012-10-17"
             Statement:
-              - Sid: ListEvaluationInputs
+              - Sid: LocateArtifactBucket
+                Effect: Allow
+                Action: s3:GetBucketLocation
+                Resource:
+                  Fn::GetAtt:
+                    - ArtifactBucket
+                    - Arn
+              - Sid: ListEvaluatorPrefixes
                 Effect: Allow
                 Action:
-                  - s3:GetBucketLocation
                   - s3:ListBucket
                   - s3:ListBucketVersions
                 Resource:
                   Fn::GetAtt:
                     - ArtifactBucket
                     - Arn
-              - Sid: ReadInputsAndWriteEvaluationReceipts
+                Condition:
+                  "ForAnyValue:StringLike":
+                    s3:prefix:
+                      - Fn::Sub: ${ArtifactRootPrefix}/checkpoints
+                      - Fn::Sub: ${ArtifactRootPrefix}/checkpoints/*
+                      - Fn::Sub: ${ArtifactRootPrefix}/evaluations
+                      - Fn::Sub: ${ArtifactRootPrefix}/evaluations/*
+                      - Fn::Sub: ${ArtifactRootPrefix}/receipts/checkpoints
+                      - Fn::Sub: ${ArtifactRootPrefix}/receipts/checkpoints/*
+                      - Fn::Sub: ${ArtifactRootPrefix}/receipts/evaluations
+                      - Fn::Sub: ${ArtifactRootPrefix}/receipts/evaluations/*
+                      - Fn::Sub: ${ArtifactRootPrefix}/sealed
+                      - Fn::Sub: ${ArtifactRootPrefix}/sealed/*
+              - Sid: ReadEvaluationInputs
+                Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:GetObjectAttributes
+                  - s3:GetObjectVersion
+                Resource:
+                  - Fn::Sub: ${ArtifactBucket.Arn}/${ArtifactRootPrefix}/checkpoints/*
+                  - Fn::Sub: ${ArtifactBucket.Arn}/${ArtifactRootPrefix}/receipts/checkpoints/*
+                  - Fn::Sub: ${ArtifactBucket.Arn}/${ArtifactRootPrefix}/sealed/*
+              - Sid: ReadWriteEvaluationEvidence
                 Effect: Allow
                 Action:
                   - s3:GetObject
@@ -427,7 +536,8 @@ Resources:
                   - s3:PutObject
                   - s3:PutObjectTagging
                 Resource:
-                  Fn::Sub: ${ArtifactBucket.Arn}/*
+                  - Fn::Sub: ${ArtifactBucket.Arn}/${ArtifactRootPrefix}/evaluations/*
+                  - Fn::Sub: ${ArtifactBucket.Arn}/${ArtifactRootPrefix}/receipts/evaluations/*
               - Sid: UseDataKey
                 Effect: Allow
                 Action:
@@ -480,100 +590,179 @@ Resources:
                 Fn::Sub: arn:${AWS::Partition}:iam::${AWS::AccountId}:root
             Action: sts:AssumeRole
       Description: Operator role for separately approved instance lifecycle actions.
-      Policies:
-        - PolicyName: ControllerOperations
-          PolicyDocument:
-            Version: "2012-10-17"
-            Statement:
-              - Sid: InspectAndControlApprovedCapacity
-                Effect: Allow
-                Action:
-                  - ec2:CreateTags
-                  - ec2:DescribeAvailabilityZones
-                  - ec2:DescribeImages
-                  - ec2:DescribeInstances
-                  - ec2:DescribeInstanceStatus
-                  - ec2:DescribeInstanceTypeOfferings
-                  - ec2:DescribeLaunchTemplateVersions
-                  - ec2:DescribeLaunchTemplates
-                  - ec2:DescribeSecurityGroups
-                  - ec2:DescribeSubnets
-                  - ec2:RunInstances
-                  - ec2:StartInstances
-                  - ec2:StopInstances
-                  - ec2:TerminateInstances
-                Resource: "*"
-              - Sid: PassOnlyTrainRoleToEc2
-                Effect: Allow
-                Action: iam:PassRole
-                Resource:
-                  Fn::GetAtt:
-                    - TrainRole
-                    - Arn
-                Condition:
-                  StringEquals:
-                    iam:PassedToService: ec2.amazonaws.com
-              - Sid: SendCanonicalArgvDocument
-                Effect: Allow
-                Action:
-                  - ssm:GetDocument
-                  - ssm:SendCommand
-                Resource:
-                  - Fn::Sub: arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:document/MemorySplit-ArgvV1
-                  - Fn::Sub: arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:instance/*
-              - Sid: InspectCommandReceipts
-                Effect: Allow
-                Action:
-                  - ssm:GetCommandInvocation
-                  - ssm:ListCommandInvocations
-                  - ssm:ListCommands
-                Resource: "*"
-              - Sid: ReadWriteOperationIntents
-                Effect: Allow
-                Action:
-                  - s3:GetBucketLocation
-                  - s3:GetObject
-                  - s3:GetObjectAttributes
-                  - s3:GetObjectVersion
-                  - s3:ListBucket
-                  - s3:ListBucketVersions
-                  - s3:PutObject
-                  - s3:PutObjectTagging
-                Resource:
-                  - Fn::GetAtt:
-                      - ArtifactBucket
-                      - Arn
-                  - Fn::Sub: ${ArtifactBucket.Arn}/*
-              - Sid: UseDataKey
-                Effect: Allow
-                Action:
-                  - kms:Decrypt
-                  - kms:DescribeKey
-                  - kms:Encrypt
-                  - kms:GenerateDataKey
-                Resource:
-                  Fn::GetAtt:
-                    - DataKey
-                    - Arn
-              - Sid: VerifyApproval
-                Effect: Allow
-                Action:
-                  - kms:DescribeKey
-                  - kms:GetPublicKey
-                  - kms:Verify
-                Resource:
-                  Fn::GetAtt:
-                    - ApprovalSigningKey
-                    - Arn
-              - Sid: InspectFoundationAndBudget
-                Effect: Allow
-                Action:
-                  - budgets:ViewBudget
-                  - cloudformation:DescribeStacks
-                Resource: "*"
       Tags:
         - Key: memorysplit:role
           Value: controller
+
+  ControllerOperationsPolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: ControllerOperations
+      Roles:
+        - Ref: ControllerRole
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: InspectEc2State
+            Effect: Allow
+            Action:
+              - ec2:DescribeImages
+              - ec2:DescribeInstanceAttribute
+              - ec2:DescribeInstances
+              - ec2:DescribeInstanceTypeOfferings
+            Resource: "*"
+          - Sid: RunApprovedLaunchTemplate
+            Effect: Allow
+            Action: ec2:RunInstances
+            Resource: "*"
+            Condition:
+              ArnEquals:
+                ec2:LaunchTemplate:
+                  Fn::Sub: arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:launch-template/${P5LaunchTemplate}
+              Bool:
+                ec2:IsLaunchTemplateResource: "true"
+              StringEquals:
+                aws:RequestTag/MemorySplitManaged: "true"
+                ec2:InstanceType: p5.48xlarge
+                ec2:MetadataHttpTokens: required
+          - Sid: TagApprovedLaunchResources
+            Effect: Allow
+            Action: ec2:CreateTags
+            Resource:
+              - Fn::Sub: arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:instance/*
+              - Fn::Sub: arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:volume/*
+            Condition:
+              StringEquals:
+                aws:RequestTag/MemorySplitManaged: "true"
+                ec2:CreateAction: RunInstances
+              "ForAllValues:StringEquals":
+                aws:TagKeys:
+                  - MemorySplitManaged
+                  - Name
+          - Sid: BindApprovedInstance
+            Effect: Allow
+            Action: ec2:CreateTags
+            Resource:
+              Fn::Sub: arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:instance/*
+            Condition:
+              StringEquals:
+                aws:RequestTag/MemorySplitProvider: aws-p5.48xlarge
+                ec2:ResourceTag/MemorySplitManaged: "true"
+              "ForAllValues:StringEquals":
+                aws:TagKeys:
+                  - MemorySplitCohortSHA256
+                  - MemorySplitContainerDigest
+                  - MemorySplitDatasetSHA256
+                  - MemorySplitProfileSHA256
+                  - MemorySplitProvider
+                  - MemorySplitReleaseSHA256
+                  - MemorySplitRunManifestSHA256
+                  - MemorySplitRuntimeSHA256
+                  - MemorySplitSeed
+                  - MemorySplitTerminateAt
+          - Sid: SetApprovedInstanceShutdown
+            Effect: Allow
+            Action: ec2:ModifyInstanceAttribute
+            Resource:
+              Fn::Sub: arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:instance/*
+            Condition:
+              StringEquals:
+                ec2:ResourceTag/MemorySplitManaged: "true"
+          - Sid: TerminateBoundInstance
+            Effect: Allow
+            Action: ec2:TerminateInstances
+            Resource:
+              Fn::Sub: arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:instance/*
+            Condition:
+              StringEquals:
+                ec2:ResourceTag/MemorySplitManaged: "true"
+                ec2:ResourceTag/MemorySplitProvider: aws-p5.48xlarge
+          - Sid: PassOnlyTrainRoleToEc2
+            Effect: Allow
+            Action: iam:PassRole
+            Resource:
+              Fn::GetAtt:
+                - TrainRole
+                - Arn
+            Condition:
+              StringEquals:
+                iam:PassedToService: ec2.amazonaws.com
+          - Sid: CreateCanonicalArgvDocument
+            Effect: Allow
+            Action: ssm:CreateDocument
+            Resource:
+              Fn::Sub: arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:document/MemorySplit-ArgvV1
+          - Sid: ListCanonicalDocuments
+            Effect: Allow
+            Action: ssm:ListDocuments
+            Resource: "*"
+          - Sid: SendCanonicalArgvDocument
+            Effect: Allow
+            Action: ssm:SendCommand
+            Resource:
+              Fn::Sub: arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:document/MemorySplit-ArgvV1
+          - Sid: SendToTaggedInstances
+            Effect: Allow
+            Action: ssm:SendCommand
+            Resource:
+              Fn::Sub: arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:instance/*
+            Condition:
+              StringEquals:
+                ssm:resourceTag/MemorySplitManaged: "true"
+                ssm:resourceTag/MemorySplitProvider: aws-p5.48xlarge
+          - Sid: InspectSsmState
+            Effect: Allow
+            Action:
+              - ssm:CancelCommand
+              - ssm:DescribeInstanceInformation
+              - ssm:GetCommandInvocation
+              - ssm:ListCommands
+            Resource: "*"
+          - Sid: ReadWriteOperationIntents
+            Effect: Allow
+            Action:
+              - s3:GetObject
+              - s3:GetObjectVersion
+              - s3:PutObject
+            Resource:
+              Fn::Sub: ${ArtifactBucket.Arn}/${ArtifactRootPrefix}/*
+          - Sid: UseDataKeyForObjectsAndEbs
+            Effect: Allow
+            Action:
+              - kms:Decrypt
+              - kms:DescribeKey
+              - kms:GenerateDataKey
+              - kms:GenerateDataKeyWithoutPlaintext
+              - kms:ReEncryptFrom
+              - kms:ReEncryptTo
+            Resource:
+              Fn::GetAtt:
+                - DataKey
+                - Arn
+          - Sid: CreateEbsGrant
+            Effect: Allow
+            Action: kms:CreateGrant
+            Resource:
+              Fn::GetAtt:
+                - DataKey
+                - Arn
+            Condition:
+              Bool:
+                kms:GrantIsForAWSResource: "true"
+          - Sid: VerifyApproval
+            Effect: Allow
+            Action:
+              - kms:DescribeKey
+              - kms:GetPublicKey
+              - kms:Verify
+            Resource:
+              Fn::GetAtt:
+                - ApprovalSigningKey
+                - Arn
+          - Sid: IdentifyControllerSession
+            Effect: Allow
+            Action: sts:GetCallerIdentity
+            Resource: "*"
 
   SignerRole:
     Type: AWS::IAM::Role
@@ -655,7 +844,7 @@ Resources:
               VolumeSize:
                 Ref: RootVolumeSizeGiB
               VolumeType: gp3
-        DisableApiTermination: true
+        DisableApiTermination: false
         EbsOptimized: true
         IamInstanceProfile:
           Arn:
@@ -682,17 +871,19 @@ Resources:
               - Fn::GetAtt:
                   - TrainSecurityGroup
                   - GroupId
+            SubnetId:
+              Ref: PrivateSubnetA
         TagSpecifications:
           - ResourceType: instance
             Tags:
               - Key: Name
                 Value:
                   Fn::Sub: ${AWS::StackName}-approved-p5
-              - Key: memorysplit:managed
+              - Key: MemorySplitManaged
                 Value: "true"
           - ResourceType: volume
             Tags:
-              - Key: memorysplit:managed
+              - Key: MemorySplitManaged
                 Value: "true"
       TagSpecifications:
         - ResourceType: launch-template
@@ -731,7 +922,7 @@ Resources:
               - s3:PutObject
               - s3:PutObjectTagging
             Resource:
-              Fn::Sub: ${ArtifactBucket.Arn}/*
+              Fn::Sub: ${ArtifactBucket.Arn}/${ArtifactRootPrefix}/*
           - Sid: EcrLayerDownloads
             Effect: Allow
             Principal: "*"

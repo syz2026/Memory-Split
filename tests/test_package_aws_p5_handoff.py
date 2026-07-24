@@ -373,8 +373,8 @@ def _minimal_repo(
         "vendor/tiktoken/6c7ea1a7e38e3a7f062df639a5b80947f075ffe6": (
             b"tokenizer fixture"
         ),
-        # Provider-specific and materialized paths are deliberately tracked
-        # so the fixture proves they are excluded rather than merely absent.
+        # Provider-specific and disposable paths are deliberately tracked so
+        # the fixture proves they are excluded rather than merely absent.
         "AGENT-START.md": "# Illumina guide\n",
         "DATASET-POINTER.json": '{"provider":"illumina-usfc-prd"}\n',
         "cluster/profiles/illumina-usfc-prd.json": (
@@ -386,14 +386,9 @@ def _minimal_repo(
             "def test_fixture(): assert True\n"
         ),
         "configs/360m/legacy.yaml": "seed: 0\n",
-        "data/full-corpus.bin": b"excluded corpus",
         "fixtures/current-smoke/train.bin": b"excluded smoke data",
         "artifacts/seed0.zip": b"excluded artifact",
         "docs/history.md": "excluded history\n",
-        "outputs/seed-0/checkpoint.pt": b"excluded output",
-        "logs/train.log": "excluded log\n",
-        "checkpoints/model.pt": b"excluded checkpoint",
-        "sealed/gold.json": '{"answer":"excluded"}\n',
         ".cache/compiler.bin": b"excluded cache",
     }
     for seed in range(10):
@@ -865,7 +860,7 @@ def test_packager_rejects_cross_version_substitution(
         )
 
 
-def test_archive_excludes_materialized_provider_and_sealed_content(tmp_path):
+def test_archive_excludes_provider_history_and_disposable_content(tmp_path):
     module = _load_module()
     source = _minimal_repo(tmp_path)
     artifacts = _build(module, source, tmp_path / "out")
@@ -876,12 +871,7 @@ def test_archive_excludes_materialized_provider_and_sealed_content(tmp_path):
     forbidden_roots = {
         ".cache",
         "artifacts",
-        "checkpoints",
-        "data",
         "fixtures",
-        "logs",
-        "outputs",
-        "sealed",
     }
     assert not any(
         PurePosixPath(name).parts
@@ -902,7 +892,7 @@ def test_archive_excludes_materialized_provider_and_sealed_content(tmp_path):
     assert not any(name.startswith("configs/360m-v2/") for name in names)
 
 
-def test_archive_excludes_tracked_infra_and_future_runtime_trees(tmp_path):
+def test_archive_excludes_only_explicit_current_operator_side_members(tmp_path):
     module = _load_module()
     source = _minimal_repo(tmp_path)
     excluded_members = {
@@ -912,12 +902,11 @@ def test_archive_excludes_tracked_infra_and_future_runtime_trees(tmp_path):
         "infra/aws/cfn-guard/memorysplit-p5-foundation.guard": (
             "rule fixture { true }\n"
         ),
-        "runtime/aws-p5/README.md": "# Future runtime fixture\n",
-        "runtime/aws-p5/runtime.lock": '{"schema_version":1}\n',
+        "infra/aws/requirements-dev.txt": "cfn-lint==1.53.2\n",
     }
     for relative, payload in excluded_members.items():
         _write(source / relative, payload)
-    _commit(source, "add separately distributed infrastructure and runtime")
+    _commit(source, "add separately distributed infrastructure")
 
     for relative in excluded_members:
         assert module._classification(relative) == "excluded"
@@ -933,6 +922,66 @@ def test_archive_excludes_tracked_infra_and_future_runtime_trees(tmp_path):
         or name.startswith("runtime/")
         for name in names
     )
+
+
+@pytest.mark.parametrize(
+    "relative",
+    [
+        "infra/aws/unreviewed.yaml",
+        "runtime/aws-p5/README.md",
+        "runtime/aws-p5/runtime.lock",
+    ],
+)
+def test_packager_rejects_unallowlisted_operator_side_paths(tmp_path, relative):
+    module = _load_module()
+    source = _minimal_repo(tmp_path)
+    _write(source / relative, "operator-side fixture\n")
+    _commit(source, "add unreviewed operator-side path")
+
+    assert module._classification(relative) == "unknown"
+    with pytest.raises(module.PackageError, match="unknown|allowlist"):
+        _build(module, source, tmp_path / "out")
+
+
+@pytest.mark.parametrize(
+    "relative",
+    [
+        "data/full-corpus.bin",
+        "outputs/seed-0/checkpoint.pt",
+        "logs/train.log",
+        "checkpoints/model.pt",
+        "snapshots/model.pt",
+        "sealed/gold.json",
+        "docs/private-keys/key.txt",
+        "infra/aws/private-keys/key.txt",
+        "runtime/logs/run.txt",
+    ],
+)
+def test_forbidden_components_precede_top_level_exclusion(tmp_path, relative):
+    module = _load_module()
+    source = _minimal_repo(tmp_path)
+    _write(source / relative, b"forbidden tracked content\n")
+    _commit(source, "add forbidden component")
+
+    assert module._classification(relative) == "forbidden"
+    with pytest.raises(module.PackageError, match="forbidden"):
+        _build(module, source, tmp_path / "out")
+
+
+def test_packager_secret_scans_excluded_operator_side_members(tmp_path):
+    module = _load_module()
+    source = _minimal_repo(tmp_path)
+    secret_name = "AWS_SECRET" + "_ACCESS_KEY"
+    secret_value = "operator-side-secret-must-not-be-echoed"
+    relative = "infra/aws/cloudformation/memorysplit-p5-foundation.yaml"
+    _write(source / relative, f'{secret_name} = "{secret_value}"\n')
+    _commit(source, "add secret to omitted operator-side member")
+
+    assert module._classification(relative) == "excluded"
+    with pytest.raises(module.PackageError) as caught:
+        _build(module, source, tmp_path / "out")
+    assert "secret" in str(caught.value).lower()
+    assert secret_value not in str(caught.value)
 
 
 def test_zip_metadata_is_normalized_and_preserves_git_executable_modes(tmp_path):
