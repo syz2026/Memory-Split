@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 from collections import defaultdict
 from collections.abc import Mapping
 import ctypes
@@ -22,6 +23,20 @@ import tempfile
 from types import MappingProxyType
 from typing import Any, Protocol
 
+from cluster.aws.gpu_profile import (
+    parse_aws_gpu_profile_bytes,
+    read_secure_regular_file,
+)
+from msctl.aws_contracts import (
+    AWS_ENVIRONMENT_RECEIPT_V2_FIELDS,
+    AWS_RUNTIME_VERSION_FIELDS,
+)
+from msctl.fsutil import open_directory, rename_noreplace_at
+from msctl.aws_hardware import (
+    parse_aws_runtime_lock_bytes,
+    verify_aws_instance_identity_pkcs7,
+)
+
 if __name__ == "__main__" and __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
     from evals.confirmatory.__main__ import main
@@ -37,7 +52,6 @@ from evals.confirmatory import (
 from evals.confirmatory.actions import ActionOp, ActionSlot, validate_action_slots
 from evals.confirmatory.aggregate import (
     RUN_BINDING_SCHEMA_V3,
-    STUDY_LOCK_FILE_NAME,
     RunBindingV3,
 )
 from evals.confirmatory.contracts import (
@@ -81,6 +95,63 @@ _V3_OUTPUT_ARTIFACTS = (
     "sealed-release.json",
     "stores.jsonl",
     "study-lock.json",
+)
+_MODEL_SNAPSHOT_FIELDS_V2 = frozenset(
+    {
+        "config_fingerprint",
+        "data_provenance",
+        "model",
+        "model_cfg",
+        "snapshot_version",
+        "step",
+        "study_identity",
+        "world_size",
+    }
+)
+_MODEL_SNAPSHOT_IDENTITY_FIELDS_V2 = frozenset(
+    {
+        "arm",
+        "cohort_id",
+        "data_provenance_sha256",
+        "model_cfg_sha256",
+        "run_id",
+        "seed",
+        "tokens_per_step",
+    }
+)
+_MAX_RUN_BINDING_BYTES = 262_144
+_MAX_STUDY_LOCK_BYTES = 2 * 1024 * 1024
+_MAX_MODEL_SNAPSHOT_BYTES = 16 * 1024 * 1024 * 1024
+_MAX_EXECUTION_EVIDENCE_BYTES = 2 * 1024 * 1024
+_AWS_IDENTITY_REQUIRED_FIELDS = frozenset(
+    {
+        "accountId",
+        "architecture",
+        "imageId",
+        "instanceId",
+        "privateIp",
+        "region",
+    }
+)
+_AWS_IDENTITY_OPTIONAL_FIELDS = frozenset(
+    {
+        "availabilityZone",
+        "billingProducts",
+        "devpayProductCodes",
+        "instanceType",
+        "kernelId",
+        "marketplaceProductCodes",
+        "pendingTime",
+        "ramdiskId",
+        "version",
+    }
+)
+_AWS_ACCOUNT_ID_RE = re.compile(r"[0-9]{12}")
+_AWS_INSTANCE_ID_RE = re.compile(r"i-[0-9a-f]{8,17}")
+_AWS_REGION_RE = re.compile(r"[a-z]{2}(?:-[a-z0-9]+)+-[0-9]+")
+_BOOT_ID_RE = re.compile(
+    r"[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-"
+    r"[89ab][0-9a-f]{3}-[0-9a-f]{12}"
 )
 PRIMARY_CONTRAST_ID = (
     "primary_omnibus_pair_and_proof__graph_non_path__"
@@ -212,6 +283,8 @@ class EvaluationResult:
     optimizer_step: int | None = None
     output_id: str | None = None
     selected_provider: str | None = None
+    production_qualified: bool = False
+    snapshot_sha256: str | None = None
 
 
 @dataclass(frozen=True)
@@ -224,6 +297,7 @@ class PreflightResult:
     optimizer_step: int | None = None
     output_id: str | None = None
     selected_provider: str | None = None
+    snapshot_sha256: str | None = None
 
 
 @dataclass(frozen=True)
@@ -279,6 +353,7 @@ class _PreparedEvaluationV3:
     binding: RunBindingV3
     run_content: bytes
     lock_content: bytes
+    snapshot_content: bytes
     release_manifest_content: bytes
     release_manifest: Mapping[str, Any]
     selected_ids: tuple[str, ...]
@@ -557,85 +632,48 @@ class RepositoryGPTAdapter:
         binding: RunBindingV3,
         device: str,
     ) -> "RepositoryGPTAdapter":
-        """Load a v3 checkpoint whose hash binds its architecture metadata."""
+        """Load one exact model-only Trainer snapshot."""
 
-        import torch
         from train.model import GPT, GPTConfig
         from train.tokenizer import get_tok
 
         run_root = _directory(run, "run")
-        checkpoint_path = _relative_file(
+        model_snapshot_path = _relative_file(
             run_root,
-            binding.checkpoint_path,
-            "checkpoint_path",
+            binding.snapshot_path,
+            "snapshot_path",
         )
-        checkpoint_content = _read_regular_file(
-            checkpoint_path,
-            "checkpoint",
+        snapshot_content = _read_v3_input(
+            model_snapshot_path,
+            "model snapshot",
+            max_bytes=_MAX_MODEL_SNAPSHOT_BYTES,
         )
         if (
-            hashlib.sha256(checkpoint_content).hexdigest()
-            != binding.checkpoint_sha256
+            hashlib.sha256(snapshot_content).hexdigest()
+            != binding.snapshot_sha256
         ):
-            raise ValueError("checkpoint hash mismatch while loading model")
+            raise ValueError("model snapshot hash mismatch while loading model")
+        state = _parse_bound_model_snapshot(snapshot_content, binding)
+        raw_model_config = state["model_cfg"]
         try:
-            state = torch.load(
-                io.BytesIO(checkpoint_content),
-                map_location="cpu",
-                weights_only=True,
-            )
-        except Exception as exc:
-            raise ValueError("checkpoint state could not be safely loaded") from exc
-        if not isinstance(state, Mapping):
-            raise ValueError("checkpoint state must be an object")
-        if (
-            type(state.get("step")) is not int
-            or state["step"] != binding.optimizer_step
-        ):
-            raise ValueError("checkpoint optimizer step mismatch")
-        config = state.get("cfg")
-        if not isinstance(config, Mapping):
-            raise ValueError("checkpoint config state must be an object")
-        if (
-            _integer(config.get("seed"), "checkpoint config seed")
-            != binding.seed
-        ):
-            raise ValueError("checkpoint config seed mismatch")
-        if (
-            _condition(
-                config.get("condition"),
-                "checkpoint config condition",
-            )
-            != binding.condition_id
-        ):
-            raise ValueError("checkpoint config condition mismatch")
-        expected_config = cls._model_config(config)
-        raw_model_config = state.get("model_cfg")
-        if raw_model_config is not None:
-            if not isinstance(raw_model_config, Mapping):
-                raise ValueError("checkpoint model_cfg state must be an object")
-            try:
-                checkpoint_config = GPTConfig(**dict(raw_model_config))
-            except (AssertionError, TypeError, ValueError) as exc:
-                raise ValueError(
-                    "checkpoint model_cfg architecture is invalid"
-                ) from exc
-            if asdict(checkpoint_config) != asdict(expected_config):
-                raise ValueError("checkpoint config architecture mismatch")
+            expected_config = GPTConfig(**dict(raw_model_config))
+            _ = expected_config.head_dim
+        except (AssertionError, TypeError, ValueError) as exc:
+            raise ValueError(
+                "model snapshot model_cfg architecture is invalid"
+            ) from exc
         state_dict = state.get("model")
-        if not isinstance(state_dict, Mapping) or not state_dict:
-            raise ValueError("checkpoint model state is missing")
         try:
             model = GPT(expected_config)
             model.load_state_dict(dict(state_dict), strict=True)
         except (AssertionError, RuntimeError, TypeError, ValueError) as exc:
-            raise ValueError("checkpoint model state mismatch") from exc
+            raise ValueError("model snapshot state mismatch") from exc
         resolved_device = cls._device(device)
         try:
             model.to(resolved_device).eval()
         except (RuntimeError, TypeError, ValueError) as exc:
             raise RuntimeError(
-                "checkpoint could not be loaded on selected device"
+                "model snapshot could not be loaded on selected device"
             ) from exc
         return cls(model, get_tok(), resolved_device)
 
@@ -951,6 +989,381 @@ def _canonical_object(content: bytes, name: str) -> Mapping[str, Any]:
     return raw
 
 
+def _canonical_structure_sha256(value: object, name: str) -> str:
+    try:
+        payload = json.dumps(
+            value,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+            allow_nan=False,
+        ).encode("utf-8")
+    except (TypeError, UnicodeError, ValueError) as exc:
+        raise ValueError(f"{name} is not canonical JSON data") from exc
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _parse_bound_model_snapshot(
+    content: bytes,
+    binding: RunBindingV3,
+) -> Mapping[str, Any]:
+    import torch
+
+    try:
+        state = torch.load(
+            io.BytesIO(content),
+            map_location="cpu",
+            weights_only=True,
+        )
+    except Exception as exc:
+        raise ValueError(
+            "model snapshot could not be safely loaded with weights_only"
+        ) from exc
+    if type(state) is not dict:
+        raise ValueError("model snapshot must be an exact dictionary")
+    fields = set(state)
+    if fields != _MODEL_SNAPSHOT_FIELDS_V2:
+        if fields & {"cfg", "data", "opt", "rng_by_rank"}:
+            raise ValueError(
+                "full optimizer/RNG checkpoint is not a model-only snapshot"
+            )
+        raise ValueError("model snapshot fields are not exact")
+    if (
+        type(state["snapshot_version"]) is not int
+        or state["snapshot_version"] != binding.snapshot_version
+    ):
+        raise ValueError("model snapshot version binding mismatch")
+    if type(state["step"]) is not int or state["step"] != binding.optimizer_step:
+        raise ValueError("model snapshot step binding mismatch")
+    if (
+        type(state["world_size"]) is not int
+        or state["world_size"] != binding.world_size
+    ):
+        raise ValueError("model snapshot world_size binding mismatch")
+    config_fingerprint = _sha256(
+        state["config_fingerprint"],
+        "model snapshot config fingerprint",
+    )
+    if config_fingerprint != binding.config_fingerprint:
+        raise ValueError("model snapshot config fingerprint mismatch")
+    model_cfg = state["model_cfg"]
+    if type(model_cfg) is not dict:
+        raise ValueError("model snapshot model_cfg must be an exact dictionary")
+    model_cfg_sha256 = _canonical_structure_sha256(
+        model_cfg,
+        "model snapshot model_cfg",
+    )
+    if model_cfg_sha256 != binding.model_config_sha256:
+        raise ValueError("model snapshot model config binding mismatch")
+    data_provenance = state["data_provenance"]
+    if type(data_provenance) is not dict:
+        raise ValueError(
+            "model snapshot data_provenance must be an exact dictionary"
+        )
+    data_provenance_sha256 = _canonical_structure_sha256(
+        data_provenance,
+        "model snapshot data_provenance",
+    )
+    if data_provenance_sha256 != binding.data_provenance_sha256:
+        raise ValueError("model snapshot data provenance binding mismatch")
+    identity = _strict_mapping(
+        state["study_identity"],
+        _MODEL_SNAPSHOT_IDENTITY_FIELDS_V2,
+        "model snapshot study identity",
+    )
+    expected_identity = {
+        "arm": binding.arm.value,
+        "cohort_id": "memorysplit-confirmatory-v3-360m-n10-aws",
+        "data_provenance_sha256": data_provenance_sha256,
+        "model_cfg_sha256": model_cfg_sha256,
+        "run_id": binding.training_run_id,
+        "seed": binding.seed,
+        "tokens_per_step": binding.tokens_per_step,
+    }
+    if identity != expected_identity:
+        raise ValueError("model snapshot study arm/provenance identity mismatch")
+    model = state["model"]
+    if not isinstance(model, Mapping) or not model:
+        raise ValueError("model snapshot state is missing")
+    return state
+
+
+def _default_execution_probe(device: str) -> Mapping[str, Any]:
+    import torch
+
+    device_type = torch.device(device).type
+    cuda_available = bool(torch.cuda.is_available())
+    device_count = int(torch.cuda.device_count()) if cuda_available else 0
+    if device_type == "cuda" and cuda_available:
+        selected = torch.cuda.current_device()
+        device_name = str(torch.cuda.get_device_name(selected))
+        capability = list(torch.cuda.get_device_capability(selected))
+    else:
+        device_name = ""
+        capability = []
+    return {
+        "device_type": device_type,
+        "cuda_available": cuda_available,
+        "torch_version": str(torch.__version__),
+        "cuda_version": str(torch.version.cuda or "unavailable"),
+        "device_count": device_count,
+        "device_name": device_name,
+        "device_capability": capability,
+    }
+
+
+def _execution_probe_value(
+    device: str,
+    execution_probe,
+) -> dict[str, Any]:
+    probe = _strict_mapping(
+        (execution_probe or _default_execution_probe)(device),
+        frozenset(
+            {
+                "device_type",
+                "cuda_available",
+                "torch_version",
+                "cuda_version",
+                "device_count",
+                "device_name",
+                "device_capability",
+            }
+        ),
+        "evaluator execution probe",
+    )
+    if (
+        not isinstance(probe["device_type"], str)
+        or type(probe["cuda_available"]) is not bool
+        or not isinstance(probe["torch_version"], str)
+        or not probe["torch_version"]
+        or not isinstance(probe["cuda_version"], str)
+        or not probe["cuda_version"]
+        or type(probe["device_count"]) is not int
+        or probe["device_count"] < 0
+        or not isinstance(probe["device_name"], str)
+        or not isinstance(probe["device_capability"], list)
+        or any(
+            type(part) is not int or part < 0
+            for part in probe["device_capability"]
+        )
+    ):
+        raise ValueError("evaluator execution probe values are invalid")
+    return dict(probe)
+
+
+def _nonproduction_execution_identity(
+    *,
+    binding: RunBindingV3,
+    device: str,
+    model_adapter: ModelAdapter | None,
+    execution_probe,
+) -> dict[str, Any]:
+    return {
+        "production_qualified": False,
+        "adapter_kind": (
+            "repository"
+            if model_adapter is None
+            or isinstance(model_adapter, RepositoryGPTAdapter)
+            else "fixture"
+        ),
+        "selected_provider": binding.selected_provider,
+        "profile_sha256": binding.evaluator_profile_sha256,
+        "runtime_lock_sha256": binding.evaluator_runtime_lock_sha256,
+        "environment_receipt_sha256": (
+            binding.evaluator_environment_receipt_sha256
+        ),
+        **_execution_probe_value(device, execution_probe),
+    }
+
+
+def _authenticate_evaluator_execution(
+    *,
+    run: Path,
+    binding: RunBindingV3,
+    device: str,
+    identity_verifier,
+    execution_probe,
+) -> dict[str, Any]:
+    if device != "cuda":
+        raise ValueError(
+            "provider-qualified publication requires actual cuda execution"
+        )
+    profile_path = _relative_file(
+        run,
+        binding.evaluator_profile_path,
+        "evaluator_profile_path",
+    )
+    runtime_lock_path = _relative_file(
+        run,
+        binding.evaluator_runtime_lock_path,
+        "evaluator_runtime_lock_path",
+    )
+    environment_path = _relative_file(
+        run,
+        binding.evaluator_environment_receipt_path,
+        "evaluator_environment_receipt_path",
+    )
+    profile_data = _read_v3_input(
+        profile_path,
+        "evaluator profile",
+        max_bytes=_MAX_EXECUTION_EVIDENCE_BYTES,
+    )
+    runtime_lock_data = _read_v3_input(
+        runtime_lock_path,
+        "evaluator runtime lock",
+        max_bytes=_MAX_EXECUTION_EVIDENCE_BYTES,
+    )
+    environment_data = _read_v3_input(
+        environment_path,
+        "evaluator environment receipt",
+        max_bytes=_MAX_EXECUTION_EVIDENCE_BYTES,
+    )
+    if hashlib.sha256(profile_data).hexdigest() != (
+        binding.evaluator_profile_sha256
+    ):
+        raise ValueError("evaluator profile hash binding mismatch")
+    if hashlib.sha256(runtime_lock_data).hexdigest() != (
+        binding.evaluator_runtime_lock_sha256
+    ):
+        raise ValueError("evaluator runtime-lock hash binding mismatch")
+    if hashlib.sha256(environment_data).hexdigest() != (
+        binding.evaluator_environment_receipt_sha256
+    ):
+        raise ValueError("evaluator environment-receipt hash mismatch")
+    profile = parse_aws_gpu_profile_bytes(profile_data)
+    runtime_lock = parse_aws_runtime_lock_bytes(runtime_lock_data)
+    if (
+        profile.profile_id != binding.evaluator_profile_id
+        or profile.provider != binding.selected_provider
+        or profile.sha256 != binding.evaluator_profile_sha256
+        or runtime_lock.profile_sha256 != profile.sha256
+        or runtime_lock.sha256 != binding.evaluator_runtime_lock_sha256
+    ):
+        raise ValueError("evaluator profile/runtime identity is crossed")
+    environment = _strict_mapping(
+        _canonical_object(
+            environment_data,
+            "evaluator environment receipt",
+        ),
+        frozenset(AWS_ENVIRONMENT_RECEIPT_V2_FIELDS),
+        "evaluator environment receipt",
+    )
+    if (
+        type(environment["schema_version"]) is not int
+        or environment["schema_version"] != 2
+        or environment["receipt_type"] != "memorysplit-aws-environment-v2"
+        or environment["provider"] != profile.provider
+        or environment["profile_sha256"] != profile.sha256
+        or environment["runtime_lock_sha256"] != runtime_lock.sha256
+        or environment["control_bundle_sha256"]
+        != runtime_lock.control_bundle_sha256
+        or environment["source_commit"] != runtime_lock.source_commit
+        or environment["source_tree"] != runtime_lock.source_tree
+        or environment["ami_id"] != runtime_lock.ami_id
+        or environment["container_image"] != runtime_lock.container_image
+        or environment["container_image_digest"]
+        != runtime_lock.container_image_digest
+    ):
+        raise ValueError("evaluator environment differs from runtime authority")
+    runtime_facts = _strict_mapping(
+        environment["runtime_facts"],
+        frozenset(AWS_RUNTIME_VERSION_FIELDS),
+        "evaluator environment runtime facts",
+    )
+    if runtime_facts != dict(runtime_lock.versions):
+        raise ValueError("evaluator runtime facts differ from runtime lock")
+    identity = environment["aws_instance_identity_document"]
+    pkcs7 = environment["aws_instance_identity_pkcs7"]
+    if not isinstance(identity, Mapping) or not isinstance(pkcs7, str):
+        raise ValueError("evaluator AWS identity evidence is invalid")
+    identity_fields = set(identity)
+    if (
+        not _AWS_IDENTITY_REQUIRED_FIELDS <= identity_fields
+        or not identity_fields
+        <= _AWS_IDENTITY_REQUIRED_FIELDS | _AWS_IDENTITY_OPTIONAL_FIELDS
+        or any(
+            not isinstance(identity[field], str) or not identity[field]
+            for field in _AWS_IDENTITY_REQUIRED_FIELDS
+        )
+        or _AWS_ACCOUNT_ID_RE.fullmatch(identity["accountId"]) is None
+        or _AWS_INSTANCE_ID_RE.fullmatch(identity["instanceId"]) is None
+        or _AWS_REGION_RE.fullmatch(identity["region"]) is None
+        or not isinstance(environment["boot_id"], str)
+        or _BOOT_ID_RE.fullmatch(environment["boot_id"]) is None
+    ):
+        raise ValueError("evaluator AWS identity fields are invalid")
+    try:
+        decoded_pkcs7 = base64.b64decode(pkcs7, validate=True)
+    except ValueError as exc:
+        raise ValueError("evaluator AWS identity signature is invalid") from exc
+    if (
+        not decoded_pkcs7
+        or base64.b64encode(decoded_pkcs7).decode("ascii") != pkcs7
+        or environment["account_id"] != identity.get("accountId")
+        or environment["instance_id"] != identity.get("instanceId")
+        or environment["region"] != identity.get("region")
+        or environment["ami_id"] != identity.get("imageId")
+        or identity.get("architecture") != profile.architecture
+    ):
+        raise ValueError("evaluator AWS identity fields are crossed")
+    if not callable(identity_verifier):
+        raise TypeError("evaluator execution identity verifier is required")
+    try:
+        verified = identity_verifier(
+            identity,
+            pkcs7,
+            environment["region"],
+        )
+    except Exception as exc:
+        raise ValueError(
+            "evaluator execution identity verification failed"
+        ) from exc
+    if verified is not True:
+        raise ValueError("evaluator execution identity signature is invalid")
+    probe = _execution_probe_value(device, execution_probe)
+    if (
+        probe["device_type"] != "cuda"
+        or probe["cuda_available"] is not True
+        or probe["device_count"] != profile.allocated_gpus
+        or not probe["device_name"]
+        or profile.gpu_model.lower() not in probe["device_name"].lower()
+        or len(probe["device_capability"]) != 2
+        or probe["torch_version"] != runtime_facts["pytorch"]
+        or probe["cuda_version"] != runtime_facts["cuda"]
+    ):
+        raise ValueError(
+            "actual cuda/torch execution differs from evaluator authority"
+        )
+    return {
+        "production_qualified": True,
+        "adapter_kind": "repository",
+        "selected_provider": binding.selected_provider,
+        "profile_id": profile.profile_id,
+        "profile_sha256": profile.sha256,
+        "runtime_lock_sha256": runtime_lock.sha256,
+        "qualification_evidence_sha256": (
+            binding.evaluator_qualification_evidence_sha256
+        ),
+        "environment_receipt_sha256": (
+            binding.evaluator_environment_receipt_sha256
+        ),
+        "canary_receipt_sha256": (
+            binding.evaluator_canary_receipt_sha256
+        ),
+        "approval_receipt_sha256": (
+            binding.evaluator_approval_receipt_sha256
+        ),
+        "approval_public_key_sha256": (
+            binding.evaluator_approval_public_key_sha256
+        ),
+        "account_id": environment["account_id"],
+        "instance_id": environment["instance_id"],
+        "boot_id": environment["boot_id"],
+        "region": environment["region"],
+        **probe,
+    }
+
+
 def _read_regular_file(path: Path, name: str) -> bytes:
     try:
         status = path.lstat()
@@ -959,6 +1372,19 @@ def _read_regular_file(path: Path, name: str) -> bytes:
     if stat.S_ISLNK(status.st_mode) or not stat.S_ISREG(status.st_mode):
         raise ValueError(f"{name} must be a regular non-symlink file")
     return path.read_bytes()
+
+
+def _read_v3_input(
+    path: Path,
+    name: str,
+    *,
+    max_bytes: int,
+) -> bytes:
+    return read_secure_regular_file(
+        path,
+        label=name,
+        max_bytes=max_bytes,
+    )
 
 
 def _directory(path: str | Path, name: str) -> Path:
@@ -1011,16 +1437,13 @@ def _canonical_jsonl(
     return tuple(result)
 
 
-def _load_run_binding(run: Path) -> RunBinding | RunBindingV3:
-    parsed = _canonical_object(
-        _read_regular_file(run / "run.json", "run binding"),
-        "run.json",
-    )
+def _parse_run_binding_content(content: bytes) -> RunBinding | RunBindingV3:
+    parsed = _canonical_object(content, "run.json")
     if parsed.get("record_type") == RUN_BINDING_SCHEMA_V3:
         return RunBindingV3.from_dict(parsed)
-    raw = _strict_mapping(parsed, _RUN_FIELDS, "run binding")
-    if raw["record_type"] != RUN_BINDING_SCHEMA:
+    if parsed.get("record_type") != RUN_BINDING_SCHEMA:
         raise ValueError("run binding record_type is invalid")
+    raw = _strict_mapping(parsed, _RUN_FIELDS, "run binding")
     if (
         type(raw["schema_version"]) is not int
         or raw["schema_version"] != CONTRACT_VERSION
@@ -1049,6 +1472,12 @@ def _load_run_binding(run: Path) -> RunBinding | RunBindingV3:
         code_sha256=_sha256(raw["code_sha256"], "code_sha256"),
         seed=_integer(raw["seed"], "seed"),
         condition_id=_condition(raw["condition_id"], "run condition_id"),
+    )
+
+
+def _load_run_binding(run: Path) -> RunBinding | RunBindingV3:
+    return _parse_run_binding_content(
+        _read_regular_file(run / "run.json", "run binding")
     )
 
 
@@ -1458,7 +1887,7 @@ def _study_submission_outcome(
         "family": item.family.value,
         "seed": binding.seed,
         "world_id": item.world_id,
-        "checkpoint_sha256": binding.checkpoint_sha256,
+        "checkpoint_sha256": binding.snapshot_sha256,
         "arm": binding.arm.value,
         "condition_id": binding.condition_id,
         "optimizer_step": binding.optimizer_step,
@@ -1579,7 +2008,7 @@ def _aggregate_scored_study_pairs(
             )
             for family, total in family_totals.items()
         },
-        checkpoint_sha256=binding.checkpoint_sha256,
+        checkpoint_sha256=binding.snapshot_sha256,
         seed=binding.seed,
         arm=binding.arm,
         condition_id=binding.condition_id,
@@ -1631,7 +2060,6 @@ def _score_and_summarize_v3(
             if getattr(study_outcome, field) != getattr(item, field):
                 raise ValueError(f"v3 output item binding mismatch: {field}")
         for field in (
-            "checkpoint_sha256",
             "seed",
             "optimizer_step",
             "raw_token_count",
@@ -1640,6 +2068,10 @@ def _score_and_summarize_v3(
                 raise ValueError(
                     f"v3 output checkpoint binding mismatch: {field}"
                 )
+        if study_outcome.checkpoint_sha256 != binding.snapshot_sha256:
+            raise ValueError(
+                "v3 output model snapshot hash binding mismatch"
+            )
         if (
             study_outcome.arm != binding.arm
             or study_outcome.condition_id.value != binding.condition_id
@@ -1680,7 +2112,7 @@ def _score_and_summarize_v3(
                 "seed": binding.seed,
                 "arm": binding.arm.value,
                 "optimizer_step": binding.optimizer_step,
-                "checkpoint_sha256": binding.checkpoint_sha256,
+                "snapshot_sha256": binding.snapshot_sha256,
                 "summaries": summaries,
             }
         ),
@@ -1698,7 +2130,7 @@ def _inference_bytes_v3(binding: RunBindingV3) -> bytes:
             "seed": binding.seed,
             "arm": binding.arm.value,
             "optimizer_step": binding.optimizer_step,
-            "checkpoint_sha256": binding.checkpoint_sha256,
+            "snapshot_sha256": binding.snapshot_sha256,
             "cohort_aggregation_status": "not_implemented",
             "final_conclusion": None,
         }
@@ -1902,6 +2334,9 @@ def _snapshot_output_manifest_bytes(
     *,
     binding: RunBindingV3,
     artifacts: Mapping[str, bytes],
+    execution_identity_before: Mapping[str, Any],
+    execution_identity_after: Mapping[str, Any],
+    production_qualified: bool,
 ) -> bytes:
     if tuple(artifacts) != _V3_OUTPUT_ARTIFACTS:
         raise ValueError("v3 snapshot output artifacts are not exact")
@@ -1923,13 +2358,21 @@ def _snapshot_output_manifest_bytes(
             "provider_selection_s3_version_id": (
                 binding.provider_selection_s3_version_id
             ),
-            "checkpoint_sha256": binding.checkpoint_sha256,
+            "snapshot_sha256": binding.snapshot_sha256,
             "seed": binding.seed,
             "arm": binding.arm.value,
             "optimizer_step": binding.optimizer_step,
             "scope": "single_snapshot",
             "inference_scope": "cohort",
             "final_conclusion": None,
+            "production_qualified": production_qualified,
+            "publication_class": (
+                "provider_qualified"
+                if production_qualified
+                else "test_only"
+            ),
+            "execution_identity_before": execution_identity_before,
+            "execution_identity_after": execution_identity_after,
             "artifacts": [
                 {
                     "path": name,
@@ -1942,11 +2385,99 @@ def _snapshot_output_manifest_bytes(
     )
 
 
+def _output_parent_identity(
+    details: os.stat_result,
+    *,
+    label: str,
+) -> tuple[int, int, int, int, int]:
+    mode = stat.S_IMODE(details.st_mode)
+    if (
+        not stat.S_ISDIR(details.st_mode)
+        or details.st_uid != os.geteuid()
+        or mode & 0o022
+        or details.st_nlink < 1
+    ):
+        raise ValueError(f"{label} is not an owned safe directory")
+    return (
+        details.st_dev,
+        details.st_ino,
+        mode,
+        details.st_uid,
+        details.st_gid,
+    )
+
+
+def _assert_output_parent(
+    path: Path,
+    descriptor: int,
+    expected: tuple[int, int, int, int, int],
+) -> None:
+    pinned = _output_parent_identity(
+        os.fstat(descriptor),
+        label="output parent",
+    )
+    try:
+        named = _output_parent_identity(
+            os.stat(path, follow_symlinks=False),
+            label="output parent",
+        )
+    except OSError as exc:
+        raise ValueError("output parent changed or was replaced") from exc
+    if pinned != expected or named != expected:
+        raise ValueError("output parent changed or was replaced")
+
+
+def _publish_file_at(
+    directory_fd: int,
+    name: str,
+    content: bytes,
+) -> None:
+    flags = (
+        os.O_WRONLY
+        | os.O_CREAT
+        | os.O_EXCL
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    descriptor = os.open(name, flags, 0o600, dir_fd=directory_fd)
+    try:
+        view = memoryview(content)
+        while view:
+            written = os.write(descriptor, view)
+            if written <= 0:
+                raise OSError("short write while publishing v3 evidence")
+            view = view[written:]
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _cleanup_v3_staging(
+    parent_fd: int,
+    staging_fd: int,
+    staging_name: str,
+    written_names: tuple[str, ...],
+) -> None:
+    for name in reversed(written_names):
+        try:
+            os.unlink(name, dir_fd=staging_fd)
+        except FileNotFoundError:
+            pass
+    os.close(staging_fd)
+    try:
+        os.rmdir(staging_name, dir_fd=parent_fd)
+    except FileNotFoundError:
+        pass
+
+
 def _publish_v3_evidence(
     *,
     output: Path,
     binding: RunBindingV3,
     artifacts: Mapping[str, bytes],
+    execution_identity_before: Mapping[str, Any],
+    execution_identity_after: Mapping[str, Any],
+    production_qualified: bool,
 ) -> str:
     if output.name != binding.output_id:
         raise ValueError("output directory name disagrees with output identity")
@@ -1954,46 +2485,108 @@ def _publish_v3_evidence(
         raise ValueError("output must name a directory")
     parent = output.parent
     try:
-        parent_status = parent.lstat()
-    except FileNotFoundError:
-        raise ValueError("output parent directory is missing") from None
-    if stat.S_ISLNK(parent_status.st_mode) or not stat.S_ISDIR(
-        parent_status.st_mode
-    ):
-        raise ValueError("output parent must be a regular non-symlink directory")
-    if output.exists() or output.is_symlink():
-        raise FileExistsError(f"output directory already exists: {output}")
-    manifest = _snapshot_output_manifest_bytes(
-        binding=binding,
-        artifacts=artifacts,
+        parent_fd = open_directory(parent, label="output parent")
+    except (OSError, ValueError) as exc:
+        raise ValueError("output parent is missing or unsafe") from exc
+    expected_parent = _output_parent_identity(
+        os.fstat(parent_fd),
+        label="output parent",
     )
-    staging = Path(
-        tempfile.mkdtemp(
-            prefix=f".{output.name}.confirmatory-v3-",
-            dir=parent,
-        )
-    )
-    published = False
+    _assert_output_parent(parent, parent_fd, expected_parent)
     try:
-        for name in _V3_OUTPUT_ARTIFACTS:
-            _publish_file(staging / name, artifacts[name])
-        _publish_file(staging / "output.json", manifest)
-        _fsync_directory(staging)
-        _atomic_publish_directory(staging, output)
-        published = True
         try:
-            _fsync_directory(parent)
-        except OSError:
-            quarantine = parent / (
-                f".{output.name}.confirmatory-v3-quarantine-"
-                f"{os.getpid()}-{id(output):x}"
+            os.stat(output.name, dir_fd=parent_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            pass
+        else:
+            raise FileExistsError(
+                f"output directory already exists: {output}"
             )
-            _atomic_publish_directory(output, quarantine)
-            _fsync_directory(parent)
+        manifest = _snapshot_output_manifest_bytes(
+            binding=binding,
+            artifacts=artifacts,
+            execution_identity_before=execution_identity_before,
+            execution_identity_after=execution_identity_after,
+            production_qualified=production_qualified,
+        )
+        staging = Path(
+            tempfile.mkdtemp(
+                prefix=f".{output.name}.confirmatory-v3-",
+                dir=parent,
+            )
+        )
+        staging_fd: int | None = None
+        written: list[str] = []
+        installed = False
+        try:
+            _assert_output_parent(parent, parent_fd, expected_parent)
+            staging_fd = os.open(
+                staging.name,
+                os.O_RDONLY
+                | getattr(os, "O_DIRECTORY", 0)
+                | getattr(os, "O_CLOEXEC", 0)
+                | getattr(os, "O_NOFOLLOW", 0),
+                dir_fd=parent_fd,
+            )
+            staging_identity = _output_parent_identity(
+                os.fstat(staging_fd),
+                label="v3 output staging",
+            )
+            for name in _V3_OUTPUT_ARTIFACTS:
+                _publish_file_at(staging_fd, name, artifacts[name])
+                written.append(name)
+            _publish_file_at(staging_fd, "output.json", manifest)
+            written.append("output.json")
+            os.fsync(staging_fd)
+            _assert_output_parent(parent, parent_fd, expected_parent)
+            rename_noreplace_at(
+                parent_fd,
+                staging.name,
+                parent_fd,
+                output.name,
+            )
+            installed = True
+            installed = _output_parent_identity(
+                os.stat(
+                    output.name,
+                    dir_fd=parent_fd,
+                    follow_symlinks=False,
+                ),
+                label="installed v3 output",
+            )
+            if installed != staging_identity:
+                raise ValueError("installed v3 output identity was replaced")
+            os.fsync(parent_fd)
+            _assert_output_parent(parent, parent_fd, expected_parent)
+            os.close(staging_fd)
+            staging_fd = None
+        except BaseException:
+            if installed:
+                quarantine_name = (
+                    f".{output.name}.confirmatory-v3-quarantine-"
+                    f"{os.getpid()}-{id(output):x}"
+                )
+                rename_noreplace_at(
+                    parent_fd,
+                    output.name,
+                    parent_fd,
+                    quarantine_name,
+                )
+                os.fsync(parent_fd)
+                if staging_fd is not None:
+                    os.close(staging_fd)
+                    staging_fd = None
             raise
+        finally:
+            if staging_fd is not None and not installed:
+                _cleanup_v3_staging(
+                    parent_fd,
+                    staging_fd,
+                    staging.name,
+                    tuple(written),
+                )
     finally:
-        if not published:
-            _quarantine_or_clean_staging(staging, parent)
+        os.close(parent_fd)
     return hashlib.sha256(manifest).hexdigest()
 
 
@@ -2020,22 +2613,6 @@ def _validate_model_visible_protocol(
         raise ValueError("store uses an unsupported frozen relation vocabulary")
 
 
-def _has_v3_release_manifest(release: Path) -> bool:
-    try:
-        release.joinpath(sealing.SEALED_RELEASE_MANIFEST).lstat()
-    except FileNotFoundError:
-        return False
-    return True
-
-
-def _has_v3_run_lock(run: Path) -> bool:
-    try:
-        run.joinpath(STUDY_LOCK_FILE_NAME).lstat()
-    except FileNotFoundError:
-        return False
-    return True
-
-
 def _v3_snapshot_for_binding(lock, binding: RunBindingV3):
     matches = [
         snapshot
@@ -2055,9 +2632,9 @@ def _v3_snapshot_for_binding(lock, binding: RunBindingV3):
         raise ValueError("study lock does not contain one exact snapshot slot")
     snapshot = matches[0]
     for run_field, snapshot_field in (
-        ("checkpoint_sha256", "checkpoint_sha256"),
-        ("checkpoint_s3_object_key", "s3_object_key"),
-        ("checkpoint_s3_version_id", "s3_version_id"),
+        ("snapshot_sha256", "checkpoint_sha256"),
+        ("snapshot_s3_object_key", "s3_object_key"),
+        ("snapshot_s3_version_id", "s3_version_id"),
         ("checkpoint_receipt_sha256", "checkpoint_receipt_sha256"),
         (
             "checkpoint_receipt_s3_object_key",
@@ -2072,6 +2649,13 @@ def _v3_snapshot_for_binding(lock, binding: RunBindingV3):
             "provider_selection_s3_version_id",
             "provider_selection_s3_version_id",
         ),
+        ("snapshot_version", "snapshot_version"),
+        ("training_run_id", "training_run_id"),
+        ("config_fingerprint", "config_fingerprint"),
+        ("model_config_sha256", "model_config_sha256"),
+        ("data_provenance_sha256", "data_provenance_sha256"),
+        ("world_size", "world_size"),
+        ("tokens_per_step", "tokens_per_step"),
     ):
         if getattr(binding, run_field) != getattr(snapshot, snapshot_field):
             raise ValueError(
@@ -2098,6 +2682,19 @@ def _validate_v3_selection_binding(lock, binding: RunBindingV3) -> None:
             "evaluator_qualification_evidence_sha256",
             "qualification_evidence_sha256",
         ),
+        (
+            "evaluator_environment_receipt_sha256",
+            "environment_receipt_sha256",
+        ),
+        ("evaluator_canary_receipt_sha256", "canary_receipt_sha256"),
+        (
+            "evaluator_approval_receipt_sha256",
+            "approval_receipt_sha256",
+        ),
+        (
+            "evaluator_approval_public_key_sha256",
+            "approval_public_key_sha256",
+        ),
     ):
         if getattr(binding, run_field) != getattr(selection, selection_field):
             raise ValueError(
@@ -2110,13 +2707,11 @@ def _prepare_evaluation_v3(
     run_root: Path,
     release: Path,
     expected_study_lock_sha256: str,
+    binding: RunBindingV3,
+    run_content: bytes,
 ) -> _PreparedEvaluationV3:
     from evals.confirmatory.study_lock import StudyLockV3
 
-    binding = _load_run_binding(run_root)
-    if not isinstance(binding, RunBindingV3):
-        raise ValueError("v3 sealed release requires a v3 run binding")
-    run_content = _read_regular_file(run_root / "run.json", "run.json")
     if run_content != canonical_json_bytes(binding.to_dict()):
         raise ValueError("run.json changed or is not the canonical binding")
     expected_lock = _sha256(
@@ -2130,7 +2725,11 @@ def _prepare_evaluation_v3(
         binding.study_lock_path,
         "study_lock_path",
     )
-    lock_content = _read_regular_file(lock_path, "study-lock.json")
+    lock_content = _read_v3_input(
+        lock_path,
+        "study-lock.json",
+        max_bytes=_MAX_STUDY_LOCK_BYTES,
+    )
     if hashlib.sha256(lock_content).hexdigest() != expected_lock:
         raise ValueError("study lock disagrees with run/external commitment")
     lock = StudyLockV3.from_dict(
@@ -2143,20 +2742,22 @@ def _prepare_evaluation_v3(
     _validate_v3_selection_binding(lock, binding)
     _v3_snapshot_for_binding(lock, binding)
 
-    checkpoint_path = _relative_file(
+    model_snapshot_path = _relative_file(
         run_root,
-        binding.checkpoint_path,
-        "checkpoint_path",
+        binding.snapshot_path,
+        "snapshot_path",
     )
-    checkpoint_content = _read_regular_file(
-        checkpoint_path,
-        "checkpoint",
+    snapshot_content = _read_v3_input(
+        model_snapshot_path,
+        "model snapshot",
+        max_bytes=_MAX_MODEL_SNAPSHOT_BYTES,
     )
     if (
-        hashlib.sha256(checkpoint_content).hexdigest()
-        != binding.checkpoint_sha256
+        hashlib.sha256(snapshot_content).hexdigest()
+        != binding.snapshot_sha256
     ):
-        raise ValueError("checkpoint file hash disagrees with run binding")
+        raise ValueError("model snapshot hash disagrees with run binding")
+    _parse_bound_model_snapshot(snapshot_content, binding)
 
     visible_preflight = sealing.preflight_model_visible_release(
         release_dir=release,
@@ -2232,9 +2833,23 @@ def _prepare_evaluation_v3(
     )
     if final_preflight != visible_preflight:
         raise ValueError("sealed release changed during evaluator preflight")
-    if _read_regular_file(run_root / "run.json", "run.json") != run_content:
+    if (
+        _read_v3_input(
+            run_root / "run.json",
+            "run.json",
+            max_bytes=_MAX_RUN_BINDING_BYTES,
+        )
+        != run_content
+    ):
         raise ValueError("run.json changed during evaluator preflight")
-    if _read_regular_file(lock_path, "study-lock.json") != lock_content:
+    if (
+        _read_v3_input(
+            lock_path,
+            "study-lock.json",
+            max_bytes=_MAX_STUDY_LOCK_BYTES,
+        )
+        != lock_content
+    ):
         raise ValueError("study-lock.json changed during evaluator preflight")
     return _PreparedEvaluationV3(
         run=run_root,
@@ -2242,6 +2857,7 @@ def _prepare_evaluation_v3(
         binding=binding,
         run_content=run_content,
         lock_content=lock_content,
+        snapshot_content=snapshot_content,
         release_manifest_content=manifest_content,
         release_manifest=MappingProxyType(dict(manifest)),
         selected_ids=selected_ids,
@@ -2260,11 +2876,19 @@ def _prepare_evaluation(
 ) -> _PreparedEvaluation | _PreparedEvaluationV3:
     release = _directory(sealed_release, "sealed release")
     run_root = _directory(run, "run")
-    if _has_v3_release_manifest(release) and _has_v3_run_lock(run_root):
+    run_content = _read_v3_input(
+        run_root / "run.json",
+        "run.json",
+        max_bytes=_MAX_RUN_BINDING_BYTES,
+    )
+    parsed_binding = _parse_run_binding_content(run_content)
+    if isinstance(parsed_binding, RunBindingV3):
         return _prepare_evaluation_v3(
             run_root=run_root,
             release=release,
             expected_study_lock_sha256=expected_study_lock_sha256,
+            binding=parsed_binding,
+            run_content=run_content,
         )
     lock = _load_study_lock(release, expected_study_lock_sha256)
     validity_content = _load_complete_readiness(release, lock)
@@ -2330,13 +2954,14 @@ def preflight(
     if isinstance(prepared, _PreparedEvaluationV3):
         return PreflightResult(
             study_lock_sha256=prepared.binding.study_lock_sha256,
-            checkpoint_sha256=prepared.binding.checkpoint_sha256,
+            checkpoint_sha256=prepared.binding.snapshot_sha256,
             condition_id=prepared.binding.condition_id,
             seed=prepared.binding.seed,
             item_count=len(prepared.items),
             optimizer_step=prepared.binding.optimizer_step,
             output_id=prepared.binding.output_id,
             selected_provider=prepared.binding.selected_provider,
+            snapshot_sha256=prepared.binding.snapshot_sha256,
         )
     return PreflightResult(
         study_lock_sha256=prepared.lock.sha256,
@@ -2353,10 +2978,33 @@ def _evaluate_prepared_v3(
     output: Path,
     model_adapter: ModelAdapter | None,
     device: str,
+    provider_qualified: bool,
+    execution_identity_verifier,
+    execution_probe,
 ) -> EvaluationResult:
     binding = prepared.binding
     if output.name != binding.output_id:
         raise ValueError("output directory name disagrees with output identity")
+    if provider_qualified:
+        if model_adapter is not None:
+            raise ValueError(
+                "fixture or injected adapters cannot produce "
+                "provider-qualified output"
+            )
+        execution_identity_before = _authenticate_evaluator_execution(
+            run=prepared.run,
+            binding=binding,
+            device=device,
+            identity_verifier=execution_identity_verifier,
+            execution_probe=execution_probe,
+        )
+    else:
+        execution_identity_before = _nonproduction_execution_identity(
+            binding=binding,
+            device=device,
+            model_adapter=model_adapter,
+            execution_probe=execution_probe,
+        )
     if model_adapter is None:
         model_adapter = RepositoryGPTAdapter.from_bound_run(
             prepared.run,
@@ -2365,6 +3013,13 @@ def _evaluate_prepared_v3(
         )
     if not callable(getattr(model_adapter, "generate", None)):
         raise TypeError("model_adapter must expose generate(item, store)")
+    if provider_qualified and not isinstance(
+        model_adapter,
+        RepositoryGPTAdapter,
+    ):
+        raise ValueError(
+            "provider-qualified output requires RepositoryGPTAdapter"
+        )
 
     submissions: dict[str, Submission] = {}
     for item_id in prepared.selected_ids:
@@ -2387,20 +3042,48 @@ def _evaluate_prepared_v3(
     if tuple(submissions) != prepared.selected_ids:
         raise ValueError("model adapter omitted a required item submission")
 
-    checkpoint_path = _relative_file(
+    if provider_qualified:
+        execution_identity_after = _authenticate_evaluator_execution(
+            run=prepared.run,
+            binding=binding,
+            device=device,
+            identity_verifier=execution_identity_verifier,
+            execution_probe=execution_probe,
+        )
+        if execution_identity_after != execution_identity_before:
+            raise ValueError(
+                "evaluator execution identity changed during evaluation"
+            )
+    else:
+        execution_identity_after = _nonproduction_execution_identity(
+            binding=binding,
+            device=device,
+            model_adapter=model_adapter,
+            execution_probe=execution_probe,
+        )
+    model_snapshot_path = _relative_file(
         prepared.run,
-        binding.checkpoint_path,
-        "checkpoint_path",
+        binding.snapshot_path,
+        "snapshot_path",
+    )
+    current_snapshot_content = _read_v3_input(
+        model_snapshot_path,
+        "model snapshot",
+        max_bytes=_MAX_MODEL_SNAPSHOT_BYTES,
     )
     if (
-        hashlib.sha256(
-            _read_regular_file(checkpoint_path, "checkpoint")
-        ).hexdigest()
-        != binding.checkpoint_sha256
+        current_snapshot_content != prepared.snapshot_content
+        or hashlib.sha256(current_snapshot_content).hexdigest()
+        != binding.snapshot_sha256
     ):
-        raise ValueError("checkpoint changed after evaluator preflight")
-    if _read_regular_file(prepared.run / "run.json", "run.json") != (
-        prepared.run_content
+        raise ValueError("model snapshot changed after evaluator preflight")
+    if (
+        _read_v3_input(
+            prepared.run / "run.json",
+            "run.json",
+            max_bytes=_MAX_RUN_BINDING_BYTES,
+        )
+        != prepared.run_content
     ):
         raise ValueError("run.json changed before scoring")
     lock_path = _relative_file(
@@ -2409,7 +3092,11 @@ def _evaluate_prepared_v3(
         "study_lock_path",
     )
     if (
-        _read_regular_file(lock_path, "study-lock.json")
+        _read_v3_input(
+            lock_path,
+            "study-lock.json",
+            max_bytes=_MAX_STUDY_LOCK_BYTES,
+        )
         != prepared.lock_content
     ):
         raise ValueError("study-lock.json changed before scoring")
@@ -2466,11 +3153,14 @@ def _evaluate_prepared_v3(
         output=output,
         binding=binding,
         artifacts=artifacts,
+        execution_identity_before=execution_identity_before,
+        execution_identity_after=execution_identity_after,
+        production_qualified=provider_qualified,
     )
     return EvaluationResult(
         output_dir=output,
         study_lock_sha256=binding.study_lock_sha256,
-        checkpoint_sha256=binding.checkpoint_sha256,
+        checkpoint_sha256=binding.snapshot_sha256,
         condition_id=binding.condition_id,
         seed=binding.seed,
         item_count=len(prepared.items),
@@ -2478,6 +3168,8 @@ def _evaluate_prepared_v3(
         optimizer_step=binding.optimizer_step,
         output_id=binding.output_id,
         selected_provider=binding.selected_provider,
+        production_qualified=provider_qualified,
+        snapshot_sha256=binding.snapshot_sha256,
     )
 
 
@@ -2489,6 +3181,9 @@ def evaluate(
     output_dir: str | Path,
     model_adapter: ModelAdapter | None = None,
     device: str = "cpu",
+    provider_qualified: bool = False,
+    execution_identity_verifier=verify_aws_instance_identity_pkcs7,
+    execution_probe=None,
 ) -> EvaluationResult:
     """Evaluate one hash-bound checkpoint without exposing sealed gold."""
 
@@ -2506,6 +3201,13 @@ def evaluate(
             output=output,
             model_adapter=model_adapter,
             device=device,
+            provider_qualified=provider_qualified,
+            execution_identity_verifier=execution_identity_verifier,
+            execution_probe=execution_probe,
+        )
+    if provider_qualified:
+        raise ValueError(
+            "provider-qualified publication requires a v3 run binding"
         )
     release = prepared.release
     lock = prepared.lock

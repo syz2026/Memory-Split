@@ -12,11 +12,12 @@ from evals.confirmatory.contracts import (
     CONTRACT_VERSION,
     ConditionId,
     STUDY_CONTRACT_VERSION,
+    STUDY_TARGETS_PER_UPDATE,
     StudyArm,
     canonical_sha256,
 )
 from msctl.aws_contracts import ARMS, SEEDS, SNAPSHOT_STEPS
-from msctl.aws_contracts import checkpoint_object_key, checkpoint_receipt_key
+from msctl.aws_contracts import checkpoint_receipt_key, snapshot_object_key
 from msctl.aws_hardware import (
     AWS_HARDWARE_AMENDMENT_SHA256,
     PROVIDER_SELECTION_S3_KEY,
@@ -182,6 +183,10 @@ class ProviderSelectionBinding:
     profile_sha256: str
     runtime_lock_sha256: str
     qualification_evidence_sha256: str
+    environment_receipt_sha256: str
+    canary_receipt_sha256: str
+    approval_receipt_sha256: str
+    approval_public_key_sha256: str
 
     FIELDS: ClassVar[frozenset[str]] = frozenset(
         {
@@ -195,6 +200,10 @@ class ProviderSelectionBinding:
             "profile_sha256",
             "runtime_lock_sha256",
             "qualification_evidence_sha256",
+            "environment_receipt_sha256",
+            "canary_receipt_sha256",
+            "approval_receipt_sha256",
+            "approval_public_key_sha256",
         }
     )
 
@@ -230,6 +239,22 @@ class ProviderSelectionBinding:
             self.qualification_evidence_sha256,
             "qualification evidence SHA-256",
         )
+        environment = _hash(
+            self.environment_receipt_sha256,
+            "environment receipt SHA-256",
+        )
+        canary = _hash(
+            self.canary_receipt_sha256,
+            "canary receipt SHA-256",
+        )
+        approval = _hash(
+            self.approval_receipt_sha256,
+            "approval receipt SHA-256",
+        )
+        approval_key = _hash(
+            self.approval_public_key_sha256,
+            "approval public-key SHA-256",
+        )
         object.__setattr__(self, "provider_selection_sha256", selection)
         object.__setattr__(
             self,
@@ -245,6 +270,18 @@ class ProviderSelectionBinding:
             self,
             "qualification_evidence_sha256",
             qualification,
+        )
+        object.__setattr__(
+            self,
+            "environment_receipt_sha256",
+            environment,
+        )
+        object.__setattr__(self, "canary_receipt_sha256", canary)
+        object.__setattr__(self, "approval_receipt_sha256", approval)
+        object.__setattr__(
+            self,
+            "approval_public_key_sha256",
+            approval_key,
         )
 
     @classmethod
@@ -281,6 +318,14 @@ class ProviderSelectionBinding:
             qualification_evidence_sha256=(
                 binding.qualification_evidence_sha256
             ),
+            environment_receipt_sha256=(
+                binding.environment_receipt_sha256
+            ),
+            canary_receipt_sha256=binding.canary_receipt_sha256,
+            approval_receipt_sha256=binding.approval_receipt_sha256,
+            approval_public_key_sha256=(
+                binding.approval_public_key_sha256
+            ),
         )
 
     def to_dict(self) -> dict[str, str]:
@@ -298,6 +343,14 @@ class ProviderSelectionBinding:
             "runtime_lock_sha256": self.runtime_lock_sha256,
             "qualification_evidence_sha256": (
                 self.qualification_evidence_sha256
+            ),
+            "environment_receipt_sha256": (
+                self.environment_receipt_sha256
+            ),
+            "canary_receipt_sha256": self.canary_receipt_sha256,
+            "approval_receipt_sha256": self.approval_receipt_sha256,
+            "approval_public_key_sha256": (
+                self.approval_public_key_sha256
             ),
         }
 
@@ -317,6 +370,13 @@ class StudySnapshotBinding:
     checkpoint_receipt_s3_version_id: str
     provider_selection_sha256: str
     provider_selection_s3_version_id: str
+    snapshot_version: int
+    training_run_id: str
+    config_fingerprint: str
+    model_config_sha256: str
+    data_provenance_sha256: str
+    world_size: int
+    tokens_per_step: int
 
     FIELDS: ClassVar[frozenset[str]] = frozenset(
         {
@@ -331,6 +391,13 @@ class StudySnapshotBinding:
             "checkpoint_receipt_s3_version_id",
             "provider_selection_sha256",
             "provider_selection_s3_version_id",
+            "snapshot_version",
+            "training_run_id",
+            "config_fingerprint",
+            "model_config_sha256",
+            "data_provenance_sha256",
+            "world_size",
+            "tokens_per_step",
         }
     )
 
@@ -340,7 +407,12 @@ class StudySnapshotBinding:
             arm = StudyArm(self.arm)
         except (TypeError, ValueError) as exc:
             raise ValueError("study snapshot arm must be dense or split90") from exc
-        expected_key = checkpoint_object_key(self.seed, arm.value, digest)
+        expected_key = snapshot_object_key(
+            self.seed,
+            arm.value,
+            self.optimizer_step,
+            digest,
+        )
         if (
             type(self.optimizer_step) is not int
             or self.optimizer_step not in SNAPSHOT_STEPS
@@ -381,6 +453,35 @@ class StudySnapshotBinding:
             self.provider_selection_s3_version_id,
             "provider selection S3 version ID",
         )
+        if type(self.snapshot_version) is not int or self.snapshot_version != 2:
+            raise ValueError("study snapshot version must be integer 2")
+        expected_training_run_id = (
+            f"memorysplit-v3-360m-s{self.seed}-{arm.value}"
+        )
+        training_run_id = _string(self.training_run_id, "training run ID")
+        if training_run_id != expected_training_run_id:
+            raise ValueError("study snapshot training run identity is invalid")
+        config_fingerprint = _hash(
+            self.config_fingerprint,
+            "snapshot config fingerprint",
+        )
+        model_config_sha256 = _hash(
+            self.model_config_sha256,
+            "snapshot model config SHA-256",
+        )
+        data_provenance_sha256 = _hash(
+            self.data_provenance_sha256,
+            "snapshot data provenance SHA-256",
+        )
+        if type(self.world_size) is not int or self.world_size != 4:
+            raise ValueError("study snapshot world_size must be exactly 4")
+        if (
+            type(self.tokens_per_step) is not int
+            or self.tokens_per_step != STUDY_TARGETS_PER_UPDATE
+        ):
+            raise ValueError(
+                "study snapshot tokens_per_step must be exactly 524288"
+            )
         object.__setattr__(self, "checkpoint_sha256", digest)
         object.__setattr__(self, "arm", arm)
         object.__setattr__(self, "s3_object_key", object_key)
@@ -410,6 +511,22 @@ class StudySnapshotBinding:
             "provider_selection_s3_version_id",
             selection_version_id,
         )
+        object.__setattr__(self, "training_run_id", training_run_id)
+        object.__setattr__(
+            self,
+            "config_fingerprint",
+            config_fingerprint,
+        )
+        object.__setattr__(
+            self,
+            "model_config_sha256",
+            model_config_sha256,
+        )
+        object.__setattr__(
+            self,
+            "data_provenance_sha256",
+            data_provenance_sha256,
+        )
 
     @classmethod
     def from_dict(cls, raw: Mapping[str, Any]) -> "StudySnapshotBinding":
@@ -435,6 +552,13 @@ class StudySnapshotBinding:
             "provider_selection_s3_version_id": (
                 self.provider_selection_s3_version_id
             ),
+            "snapshot_version": self.snapshot_version,
+            "training_run_id": self.training_run_id,
+            "config_fingerprint": self.config_fingerprint,
+            "model_config_sha256": self.model_config_sha256,
+            "data_provenance_sha256": self.data_provenance_sha256,
+            "world_size": self.world_size,
+            "tokens_per_step": self.tokens_per_step,
         }
 
 

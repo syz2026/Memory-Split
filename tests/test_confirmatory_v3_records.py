@@ -41,8 +41,8 @@ from msctl.aws_contracts import (
     ARMS,
     SEEDS,
     SNAPSHOT_STEPS,
-    checkpoint_object_key,
     checkpoint_receipt_key,
+    snapshot_object_key,
 )
 from msctl.aws_hardware import (
     AWS_HARDWARE_AMENDMENT_SHA256,
@@ -179,9 +179,10 @@ def _study_lock() -> StudyLockV3:
                         "arm": arm,
                         "optimizer_step": step,
                         "checkpoint_sha256": digest,
-                        "s3_object_key": checkpoint_object_key(
+                        "s3_object_key": snapshot_object_key(
                             seed,
                             arm,
+                            step,
                             digest,
                         ),
                         "s3_version_id": f"version-{seed}-{arm}-{step}",
@@ -196,6 +197,21 @@ def _study_lock() -> StudyLockV3:
                         "provider_selection_s3_version_id": (
                             selection_version_id
                         ),
+                        "snapshot_version": 2,
+                        "training_run_id": (
+                            f"memorysplit-v3-360m-s{seed}-{arm}"
+                        ),
+                        "config_fingerprint": hashlib.sha256(
+                            f"config:{seed}:{arm}".encode("ascii")
+                        ).hexdigest(),
+                        "model_config_sha256": hashlib.sha256(
+                            b"model-config"
+                        ).hexdigest(),
+                        "data_provenance_sha256": hashlib.sha256(
+                            f"data:{seed}:{arm}".encode("ascii")
+                        ).hexdigest(),
+                        "world_size": 4,
+                        "tokens_per_step": 524_288,
                     }
                 )
     return StudyLockV3.from_dict(
@@ -217,6 +233,10 @@ def _study_lock() -> StudyLockV3:
                 ),
                 "runtime_lock_sha256": "7" * 64,
                 "qualification_evidence_sha256": "8" * 64,
+                "environment_receipt_sha256": "9" * 64,
+                "canary_receipt_sha256": "a" * 64,
+                "approval_receipt_sha256": "b" * 64,
+                "approval_public_key_sha256": "c" * 64,
             },
             "snapshots": snapshots,
         }
@@ -511,9 +531,10 @@ def test_v3_outcome_binding_rejects_checkpoint_and_object_replacements():
         arm=snapshot.arm,
         optimizer_step=snapshot.optimizer_step,
         checkpoint_sha256=replacement_hash,
-        s3_object_key=checkpoint_object_key(
+        s3_object_key=snapshot_object_key(
             snapshot.seed,
             snapshot.arm,
+            snapshot.optimizer_step,
             replacement_hash,
         ),
         s3_version_id="replacement-version",
@@ -527,6 +548,13 @@ def test_v3_outcome_binding_rejects_checkpoint_and_object_replacements():
         provider_selection_s3_version_id=(
             snapshot.provider_selection_s3_version_id
         ),
+        snapshot_version=snapshot.snapshot_version,
+        training_run_id=snapshot.training_run_id,
+        config_fingerprint=snapshot.config_fingerprint,
+        model_config_sha256=snapshot.model_config_sha256,
+        data_provenance_sha256=snapshot.data_provenance_sha256,
+        world_size=snapshot.world_size,
+        tokens_per_step=snapshot.tokens_per_step,
     )
     with pytest.raises(ValueError, match="lock|object|checkpoint"):
         validate_study_outcome_binding(

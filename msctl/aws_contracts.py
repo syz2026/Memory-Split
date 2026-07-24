@@ -283,6 +283,27 @@ def checkpoint_object_key(seed: object, arm: object, sha256: object) -> str:
     return f"checkpoints/seed-{seed}/{arm}/sha256/{digest}.pt"
 
 
+def snapshot_object_key(
+    seed: object,
+    arm: object,
+    optimizer_step: object,
+    sha256: object,
+) -> str:
+    """Return one content-addressed model-only snapshot object key."""
+
+    if type(seed) is not int or seed not in SEEDS:
+        raise ValueError("snapshot seed must be an exact integer from 0 to 9")
+    if arm not in ARMS:
+        raise ValueError("snapshot arm must be dense or split90")
+    if type(optimizer_step) is not int or optimizer_step not in SNAPSHOT_STEPS:
+        raise ValueError("snapshot step must be one of the five frozen steps")
+    digest = validate_sha256(sha256)
+    return (
+        f"snapshots/seed-{seed}/{arm}/step-{optimizer_step:07d}/"
+        f"sha256/{digest}.pt"
+    )
+
+
 def checkpoint_receipt_key(seed: object, sha256: object) -> str:
     """Return one content-addressed v3 pair-receipt object key."""
 

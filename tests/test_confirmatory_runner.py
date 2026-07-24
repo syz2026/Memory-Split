@@ -690,6 +690,26 @@ def test_v2_runner_behavior_is_unchanged_by_an_unrelated_v3_marker(tmp_path):
     assert result.output_id is None
 
 
+def test_v2_run_identity_wins_over_dual_v3_marker_files(tmp_path):
+    runner = _runner()
+    fixture = _sealed_fixture(tmp_path)
+    fixture.release.joinpath("sealed-release.json").write_bytes(
+        canonical_json_bytes({"unrelated": True})
+    )
+    fixture.run.joinpath("study-lock.json").write_bytes(
+        fixture.release.joinpath("study-lock.json").read_bytes()
+    )
+
+    result = runner.preflight(
+        run=fixture.run,
+        sealed_release=fixture.release,
+        expected_study_lock_sha256=fixture.expected_study_lock_sha256,
+    )
+
+    assert result.condition_id == "split90"
+    assert result.optimizer_step is None
+
+
 @pytest.mark.parametrize(
     ("mutation", "message"),
     [

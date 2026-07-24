@@ -65,6 +65,10 @@ def _parser() -> argparse.ArgumentParser:
         choices=("cpu", "cuda", "mps"),
     )
     evaluate_parser.add_argument("--output-dir")
+    evaluate_parser.add_argument(
+        "--provider-qualified",
+        action="store_true",
+    )
     return parser
 
 
@@ -113,6 +117,7 @@ def main(
                         "optimizer_step": result.optimizer_step,
                         "output_id": result.output_id,
                         "selected_provider": result.selected_provider,
+                        "snapshot_sha256": result.snapshot_sha256,
                     }
                 )
             print("confirmatory evaluation dry-run verified", file=sys.stderr)
@@ -125,6 +130,7 @@ def main(
                 output_dir=arguments.output_dir,
                 model_adapter=model_adapter,
                 device=arguments.device,
+                provider_qualified=arguments.provider_qualified,
             )
             payload = {
                 "status": "published",
@@ -143,6 +149,8 @@ def main(
                         "optimizer_step": result.optimizer_step,
                         "output_id": result.output_id,
                         "selected_provider": result.selected_provider,
+                        "production_qualified": result.production_qualified,
+                        "snapshot_sha256": result.snapshot_sha256,
                     }
                 )
             print("confirmatory evidence published", file=sys.stderr)

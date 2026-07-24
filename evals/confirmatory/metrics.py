@@ -36,7 +36,7 @@ from evals.confirmatory.solver import (
     registered_solver,
     verify_proof_and_answer,
 )
-from msctl.aws_contracts import checkpoint_object_key
+from msctl.aws_contracts import snapshot_object_key
 
 
 _SHA256_RE = re.compile(r"[0-9a-f]{64}")
@@ -420,9 +420,10 @@ def validate_study_outcome_binding(
     ):
         if getattr(snapshot, field) != getattr(checkpoint, field):
             raise ValueError(f"study lock snapshot mismatch: {field}")
-    expected_key = checkpoint_object_key(
+    expected_key = snapshot_object_key(
         checkpoint.seed,
         checkpoint.arm.value,
+        checkpoint.optimizer_step,
         checkpoint.checkpoint_sha256,
     )
     if snapshot.s3_object_key != expected_key:

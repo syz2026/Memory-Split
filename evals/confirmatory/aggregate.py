@@ -28,8 +28,12 @@ from evals.confirmatory.study_lock import (
 
 
 RUN_BINDING_SCHEMA_V3 = "memorysplit.confirmatory.run-binding.v3"
-CHECKPOINT_FILE_NAME = "checkpoint.pt"
 STUDY_LOCK_FILE_NAME = "study-lock.json"
+EVALUATOR_PROFILE_FILE_NAME = "evaluator-profile.json"
+EVALUATOR_RUNTIME_LOCK_FILE_NAME = "evaluator-runtime-lock.json"
+EVALUATOR_ENVIRONMENT_RECEIPT_FILE_NAME = (
+    "evaluator-environment-receipt.json"
+)
 _SHA256_RE = re.compile(r"[0-9a-f]{64}")
 
 
@@ -69,6 +73,10 @@ def _output_name(run_id: str) -> str:
     return f"snapshot-evaluation-{run_id}"
 
 
+def snapshot_path(optimizer_step: int) -> str:
+    return f"snapshots/step{optimizer_step:07d}.pt"
+
+
 @dataclass(frozen=True)
 class RunBindingV3:
     """Closed, step-aware identity for one isolated v3 evaluation."""
@@ -76,17 +84,24 @@ class RunBindingV3:
     record_type: str
     schema_version: int
     run_id: str
-    checkpoint_path: str
+    snapshot_path: str
     study_lock_path: str
     seed: int
     arm: StudyArm
     optimizer_step: int
-    checkpoint_sha256: str
-    checkpoint_s3_object_key: str
-    checkpoint_s3_version_id: str
+    snapshot_sha256: str
+    snapshot_s3_object_key: str
+    snapshot_s3_version_id: str
     checkpoint_receipt_sha256: str
     checkpoint_receipt_s3_object_key: str
     checkpoint_receipt_s3_version_id: str
+    snapshot_version: int
+    training_run_id: str
+    config_fingerprint: str
+    model_config_sha256: str
+    data_provenance_sha256: str
+    world_size: int
+    tokens_per_step: int
     sealed_evaluation_release_sha256: str
     study_lock_sha256: str
     provider_selection_s3_key: str
@@ -95,9 +110,16 @@ class RunBindingV3:
     hardware_amendment_sha256: str
     selected_provider: str
     evaluator_profile_id: str
+    evaluator_profile_path: str
     evaluator_profile_sha256: str
+    evaluator_runtime_lock_path: str
     evaluator_runtime_lock_sha256: str
     evaluator_qualification_evidence_sha256: str
+    evaluator_environment_receipt_path: str
+    evaluator_environment_receipt_sha256: str
+    evaluator_canary_receipt_sha256: str
+    evaluator_approval_receipt_sha256: str
+    evaluator_approval_public_key_sha256: str
     output_id: str
 
     FIELDS: ClassVar[frozenset[str]] = frozenset(
@@ -105,17 +127,24 @@ class RunBindingV3:
             "record_type",
             "schema_version",
             "run_id",
-            "checkpoint_path",
+            "snapshot_path",
             "study_lock_path",
             "seed",
             "arm",
             "optimizer_step",
-            "checkpoint_sha256",
-            "checkpoint_s3_object_key",
-            "checkpoint_s3_version_id",
+            "snapshot_sha256",
+            "snapshot_s3_object_key",
+            "snapshot_s3_version_id",
             "checkpoint_receipt_sha256",
             "checkpoint_receipt_s3_object_key",
             "checkpoint_receipt_s3_version_id",
+            "snapshot_version",
+            "training_run_id",
+            "config_fingerprint",
+            "model_config_sha256",
+            "data_provenance_sha256",
+            "world_size",
+            "tokens_per_step",
             "sealed_evaluation_release_sha256",
             "study_lock_sha256",
             "provider_selection_s3_key",
@@ -124,9 +153,16 @@ class RunBindingV3:
             "hardware_amendment_sha256",
             "selected_provider",
             "evaluator_profile_id",
+            "evaluator_profile_path",
             "evaluator_profile_sha256",
+            "evaluator_runtime_lock_path",
             "evaluator_runtime_lock_sha256",
             "evaluator_qualification_evidence_sha256",
+            "evaluator_environment_receipt_path",
+            "evaluator_environment_receipt_sha256",
+            "evaluator_canary_receipt_sha256",
+            "evaluator_approval_receipt_sha256",
+            "evaluator_approval_public_key_sha256",
             "output_id",
         }
     )
@@ -161,18 +197,34 @@ class RunBindingV3:
         )
         if self.run_id != expected_run_id:
             raise ValueError("v3 run binding run identity is invalid")
-        if self.checkpoint_path != CHECKPOINT_FILE_NAME:
-            raise ValueError("v3 checkpoint path is not the fixed local name")
+        if self.snapshot_path != snapshot_path(optimizer_step):
+            raise ValueError(
+                "v3 snapshot path is not the canonical step snapshot"
+            )
         if self.study_lock_path != STUDY_LOCK_FILE_NAME:
             raise ValueError("v3 study-lock path is not the fixed local name")
+        if self.evaluator_profile_path != EVALUATOR_PROFILE_FILE_NAME:
+            raise ValueError("v3 evaluator profile path is not fixed")
+        if (
+            self.evaluator_runtime_lock_path
+            != EVALUATOR_RUNTIME_LOCK_FILE_NAME
+        ):
+            raise ValueError("v3 evaluator runtime-lock path is not fixed")
+        if (
+            self.evaluator_environment_receipt_path
+            != EVALUATOR_ENVIRONMENT_RECEIPT_FILE_NAME
+        ):
+            raise ValueError(
+                "v3 evaluator environment-receipt path is not fixed"
+            )
 
         snapshot = StudySnapshotBinding(
             seed=seed,
             arm=arm,
             optimizer_step=optimizer_step,
-            checkpoint_sha256=self.checkpoint_sha256,
-            s3_object_key=self.checkpoint_s3_object_key,
-            s3_version_id=self.checkpoint_s3_version_id,
+            checkpoint_sha256=self.snapshot_sha256,
+            s3_object_key=self.snapshot_s3_object_key,
+            s3_version_id=self.snapshot_s3_version_id,
             checkpoint_receipt_sha256=self.checkpoint_receipt_sha256,
             checkpoint_receipt_s3_object_key=(
                 self.checkpoint_receipt_s3_object_key
@@ -184,6 +236,13 @@ class RunBindingV3:
             provider_selection_s3_version_id=(
                 self.provider_selection_s3_version_id
             ),
+            snapshot_version=self.snapshot_version,
+            training_run_id=self.training_run_id,
+            config_fingerprint=self.config_fingerprint,
+            model_config_sha256=self.model_config_sha256,
+            data_provenance_sha256=self.data_provenance_sha256,
+            world_size=self.world_size,
+            tokens_per_step=self.tokens_per_step,
         )
         release = _sha256(
             self.sealed_evaluation_release_sha256,
@@ -205,6 +264,18 @@ class RunBindingV3:
             qualification_evidence_sha256=(
                 self.evaluator_qualification_evidence_sha256
             ),
+            environment_receipt_sha256=(
+                self.evaluator_environment_receipt_sha256
+            ),
+            canary_receipt_sha256=(
+                self.evaluator_canary_receipt_sha256
+            ),
+            approval_receipt_sha256=(
+                self.evaluator_approval_receipt_sha256
+            ),
+            approval_public_key_sha256=(
+                self.evaluator_approval_public_key_sha256
+            ),
         )
         expected_output = _output_name(expected_run_id)
         if self.output_id != expected_output:
@@ -215,17 +286,17 @@ class RunBindingV3:
         object.__setattr__(self, "optimizer_step", optimizer_step)
         object.__setattr__(
             self,
-            "checkpoint_sha256",
+            "snapshot_sha256",
             snapshot.checkpoint_sha256,
         )
         object.__setattr__(
             self,
-            "checkpoint_s3_object_key",
+            "snapshot_s3_object_key",
             snapshot.s3_object_key,
         )
         object.__setattr__(
             self,
-            "checkpoint_s3_version_id",
+            "snapshot_s3_version_id",
             snapshot.s3_version_id,
         )
         object.__setattr__(
@@ -242,6 +313,26 @@ class RunBindingV3:
             self,
             "checkpoint_receipt_s3_version_id",
             snapshot.checkpoint_receipt_s3_version_id,
+        )
+        object.__setattr__(
+            self,
+            "training_run_id",
+            snapshot.training_run_id,
+        )
+        object.__setattr__(
+            self,
+            "config_fingerprint",
+            snapshot.config_fingerprint,
+        )
+        object.__setattr__(
+            self,
+            "model_config_sha256",
+            snapshot.model_config_sha256,
+        )
+        object.__setattr__(
+            self,
+            "data_provenance_sha256",
+            snapshot.data_provenance_sha256,
         )
         object.__setattr__(
             self,
@@ -294,6 +385,26 @@ class RunBindingV3:
             "evaluator_qualification_evidence_sha256",
             selection.qualification_evidence_sha256,
         )
+        object.__setattr__(
+            self,
+            "evaluator_environment_receipt_sha256",
+            selection.environment_receipt_sha256,
+        )
+        object.__setattr__(
+            self,
+            "evaluator_canary_receipt_sha256",
+            selection.canary_receipt_sha256,
+        )
+        object.__setattr__(
+            self,
+            "evaluator_approval_receipt_sha256",
+            selection.approval_receipt_sha256,
+        )
+        object.__setattr__(
+            self,
+            "evaluator_approval_public_key_sha256",
+            selection.approval_public_key_sha256,
+        )
 
     @classmethod
     def from_dict(cls, raw: Mapping[str, Any]) -> "RunBindingV3":
@@ -317,14 +428,14 @@ class RunBindingV3:
             "record_type": self.record_type,
             "schema_version": self.schema_version,
             "run_id": self.run_id,
-            "checkpoint_path": self.checkpoint_path,
+            "snapshot_path": self.snapshot_path,
             "study_lock_path": self.study_lock_path,
             "seed": self.seed,
             "arm": self.arm.value,
             "optimizer_step": self.optimizer_step,
-            "checkpoint_sha256": self.checkpoint_sha256,
-            "checkpoint_s3_object_key": self.checkpoint_s3_object_key,
-            "checkpoint_s3_version_id": self.checkpoint_s3_version_id,
+            "snapshot_sha256": self.snapshot_sha256,
+            "snapshot_s3_object_key": self.snapshot_s3_object_key,
+            "snapshot_s3_version_id": self.snapshot_s3_version_id,
             "checkpoint_receipt_sha256": self.checkpoint_receipt_sha256,
             "checkpoint_receipt_s3_object_key": (
                 self.checkpoint_receipt_s3_object_key
@@ -332,6 +443,13 @@ class RunBindingV3:
             "checkpoint_receipt_s3_version_id": (
                 self.checkpoint_receipt_s3_version_id
             ),
+            "snapshot_version": self.snapshot_version,
+            "training_run_id": self.training_run_id,
+            "config_fingerprint": self.config_fingerprint,
+            "model_config_sha256": self.model_config_sha256,
+            "data_provenance_sha256": self.data_provenance_sha256,
+            "world_size": self.world_size,
+            "tokens_per_step": self.tokens_per_step,
             "sealed_evaluation_release_sha256": (
                 self.sealed_evaluation_release_sha256
             ),
@@ -344,12 +462,31 @@ class RunBindingV3:
             "hardware_amendment_sha256": self.hardware_amendment_sha256,
             "selected_provider": self.selected_provider,
             "evaluator_profile_id": self.evaluator_profile_id,
+            "evaluator_profile_path": self.evaluator_profile_path,
             "evaluator_profile_sha256": self.evaluator_profile_sha256,
+            "evaluator_runtime_lock_path": (
+                self.evaluator_runtime_lock_path
+            ),
             "evaluator_runtime_lock_sha256": (
                 self.evaluator_runtime_lock_sha256
             ),
             "evaluator_qualification_evidence_sha256": (
                 self.evaluator_qualification_evidence_sha256
+            ),
+            "evaluator_environment_receipt_path": (
+                self.evaluator_environment_receipt_path
+            ),
+            "evaluator_environment_receipt_sha256": (
+                self.evaluator_environment_receipt_sha256
+            ),
+            "evaluator_canary_receipt_sha256": (
+                self.evaluator_canary_receipt_sha256
+            ),
+            "evaluator_approval_receipt_sha256": (
+                self.evaluator_approval_receipt_sha256
+            ),
+            "evaluator_approval_public_key_sha256": (
+                self.evaluator_approval_public_key_sha256
             ),
             "output_id": self.output_id,
         }
@@ -418,14 +555,14 @@ def _build_snapshot_evaluation_plans(
             record_type=RUN_BINDING_SCHEMA_V3,
             schema_version=STUDY_CONTRACT_VERSION,
             run_id=run_id,
-            checkpoint_path=CHECKPOINT_FILE_NAME,
+            snapshot_path=snapshot_path(snapshot.optimizer_step),
             study_lock_path=STUDY_LOCK_FILE_NAME,
             seed=snapshot.seed,
             arm=snapshot.arm,
             optimizer_step=snapshot.optimizer_step,
-            checkpoint_sha256=snapshot.checkpoint_sha256,
-            checkpoint_s3_object_key=snapshot.s3_object_key,
-            checkpoint_s3_version_id=snapshot.s3_version_id,
+            snapshot_sha256=snapshot.checkpoint_sha256,
+            snapshot_s3_object_key=snapshot.s3_object_key,
+            snapshot_s3_version_id=snapshot.s3_version_id,
             checkpoint_receipt_sha256=(
                 snapshot.checkpoint_receipt_sha256
             ),
@@ -435,6 +572,13 @@ def _build_snapshot_evaluation_plans(
             checkpoint_receipt_s3_version_id=(
                 snapshot.checkpoint_receipt_s3_version_id
             ),
+            snapshot_version=snapshot.snapshot_version,
+            training_run_id=snapshot.training_run_id,
+            config_fingerprint=snapshot.config_fingerprint,
+            model_config_sha256=snapshot.model_config_sha256,
+            data_provenance_sha256=snapshot.data_provenance_sha256,
+            world_size=snapshot.world_size,
+            tokens_per_step=snapshot.tokens_per_step,
             sealed_evaluation_release_sha256=(
                 study_lock.sealed_evaluation_release_sha256
             ),
@@ -451,10 +595,29 @@ def _build_snapshot_evaluation_plans(
             ),
             selected_provider=selection.selected_provider,
             evaluator_profile_id=selection.profile_id,
+            evaluator_profile_path=EVALUATOR_PROFILE_FILE_NAME,
             evaluator_profile_sha256=selection.profile_sha256,
+            evaluator_runtime_lock_path=(
+                EVALUATOR_RUNTIME_LOCK_FILE_NAME
+            ),
             evaluator_runtime_lock_sha256=selection.runtime_lock_sha256,
             evaluator_qualification_evidence_sha256=(
                 selection.qualification_evidence_sha256
+            ),
+            evaluator_environment_receipt_path=(
+                EVALUATOR_ENVIRONMENT_RECEIPT_FILE_NAME
+            ),
+            evaluator_environment_receipt_sha256=(
+                selection.environment_receipt_sha256
+            ),
+            evaluator_canary_receipt_sha256=(
+                selection.canary_receipt_sha256
+            ),
+            evaluator_approval_receipt_sha256=(
+                selection.approval_receipt_sha256
+            ),
+            evaluator_approval_public_key_sha256=(
+                selection.approval_public_key_sha256
             ),
             output_id=output_name,
         )
@@ -536,13 +699,16 @@ validate_snapshot_evaluation_plan = validate_snapshot_evaluation_plans
 
 
 __all__ = [
-    "CHECKPOINT_FILE_NAME",
+    "EVALUATOR_ENVIRONMENT_RECEIPT_FILE_NAME",
+    "EVALUATOR_PROFILE_FILE_NAME",
+    "EVALUATOR_RUNTIME_LOCK_FILE_NAME",
     "RUN_BINDING_SCHEMA_V3",
     "RunBindingV3",
     "STUDY_LOCK_FILE_NAME",
     "SnapshotEvaluationPlan",
     "build_snapshot_evaluation_plans",
     "plan_snapshot_evaluations",
+    "snapshot_path",
     "validate_snapshot_evaluation_plan",
     "validate_snapshot_evaluation_plans",
 ]

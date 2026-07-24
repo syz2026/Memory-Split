@@ -666,6 +666,89 @@ def test_explicit_snapshot_steps_save_only_the_declared_steps(tmp_path):
     trainer.close()
 
 
+def test_v3_save_snapshot_emits_model_only_study_provenance(tmp_path):
+    bp, mp = write_corpus(tmp_path, n=524_288)
+    cfg = tiny_cfg(tmp_path, bp, mp, max_steps=1_358)
+    cfg.pop("snap_frac")
+    cfg.update(
+        {
+            "schema_version": 2,
+            "cohort_id": "memorysplit-confirmatory-v3-360m-n10-aws",
+            "run_id": "memorysplit-v3-360m-s7-dense",
+            "condition": "dense",
+            "snapshot_steps": [1_358],
+            "tokens_per_step": 524_288,
+        }
+    )
+    trainer = Trainer(cfg)
+    trainer.step = 1_358
+
+    trainer.save_snapshot()
+
+    snapshot_path = trainer.out_dir / "snapshots" / "step0001358.pt"
+    snapshot = torch.load(
+        snapshot_path,
+        map_location="cpu",
+        weights_only=True,
+    )
+    assert set(snapshot) == {
+        "config_fingerprint",
+        "data_provenance",
+        "model",
+        "model_cfg",
+        "snapshot_version",
+        "step",
+        "study_identity",
+        "world_size",
+    }
+    assert snapshot["snapshot_version"] == 2
+    assert snapshot["step"] == 1_358
+    assert snapshot["config_fingerprint"] == trainer.config_fingerprint
+    assert snapshot["study_identity"] == {
+        "arm": "dense",
+        "cohort_id": "memorysplit-confirmatory-v3-360m-n10-aws",
+        "data_provenance_sha256": trainer_module._canonical_json_hash(
+            snapshot["data_provenance"]
+        ),
+        "model_cfg_sha256": trainer_module._canonical_json_hash(
+            snapshot["model_cfg"]
+        ),
+        "run_id": "memorysplit-v3-360m-s7-dense",
+        "seed": 7,
+        "tokens_per_step": 524_288,
+    }
+    assert not {"cfg", "data", "opt", "rng_by_rank"} & set(snapshot)
+    trainer.close()
+
+
+def test_legacy_run_and_condition_snapshot_writes_remain_legacy(tmp_path):
+    bp, mp = write_corpus(tmp_path, n=64)
+    cfg = tiny_cfg(tmp_path, bp, mp, max_steps=1)
+    cfg.update(
+        {
+            "run_id": "legacy-dense-run",
+            "condition": "dense",
+        }
+    )
+    trainer = Trainer(cfg)
+
+    trainer.save_snapshot()
+
+    snapshot = torch.load(
+        trainer.out_dir / "snapshots" / "step0000000.pt",
+        map_location="cpu",
+        weights_only=True,
+    )
+    assert set(snapshot) == {
+        "data_provenance",
+        "model",
+        "model_cfg",
+        "step",
+        "world_size",
+    }
+    trainer.close()
+
+
 def test_fresh_launch_refuses_even_an_empty_existing_output_before_mutation(tmp_path):
     bp, mp = write_corpus(tmp_path)
     cfg = base_cfg(tmp_path, bp, mp)

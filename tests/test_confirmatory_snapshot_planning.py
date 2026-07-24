@@ -29,8 +29,8 @@ from msctl.aws_contracts import (
     ARMS,
     SEEDS,
     SNAPSHOT_STEPS,
-    checkpoint_object_key,
     checkpoint_receipt_key,
+    snapshot_object_key,
 )
 from msctl.aws_hardware import (
     AWS_HARDWARE_AMENDMENT_SHA256,
@@ -62,9 +62,10 @@ def _lock() -> StudyLockV3:
                         "arm": arm,
                         "optimizer_step": step,
                         "checkpoint_sha256": checkpoint_sha256,
-                        "s3_object_key": checkpoint_object_key(
+                        "s3_object_key": snapshot_object_key(
                             seed,
                             arm,
+                            step,
                             checkpoint_sha256,
                         ),
                         "s3_version_id": f"checkpoint-version-{seed}-{arm}-{step}",
@@ -77,6 +78,19 @@ def _lock() -> StudyLockV3:
                         ),
                         "provider_selection_sha256": selection_sha256,
                         "provider_selection_s3_version_id": selection_version,
+                        "snapshot_version": 2,
+                        "training_run_id": (
+                            f"memorysplit-v3-360m-s{seed}-{arm}"
+                        ),
+                        "config_fingerprint": _digest(
+                            f"config:{seed}:{arm}"
+                        ),
+                        "model_config_sha256": _digest("model-config"),
+                        "data_provenance_sha256": _digest(
+                            f"data:{seed}:{arm}"
+                        ),
+                        "world_size": 4,
+                        "tokens_per_step": 524_288,
                     }
                 )
     return StudyLockV3.from_dict(
@@ -96,6 +110,10 @@ def _lock() -> StudyLockV3:
                 "profile_sha256": P5_PROFILE_SHA256,
                 "runtime_lock_sha256": "b" * 64,
                 "qualification_evidence_sha256": "c" * 64,
+                "environment_receipt_sha256": "d" * 64,
+                "canary_receipt_sha256": "e" * 64,
+                "approval_receipt_sha256": "f" * 64,
+                "approval_public_key_sha256": "1" * 64,
             },
             "snapshots": snapshots,
         }
@@ -132,7 +150,19 @@ def test_planner_emits_exact_canonical_100_snapshot_run_bindings():
     assert first.binding.record_type == RUN_BINDING_SCHEMA_V3
     assert first.binding.schema_version == STUDY_CONTRACT_VERSION
     assert first.binding.arm.value == "dense"
-    assert first.binding.checkpoint_path == "checkpoint.pt"
+    assert first.binding.snapshot_path == "snapshots/step0001358.pt"
+    assert first.binding.snapshot_sha256 == (
+        lock.snapshots[0].checkpoint_sha256
+    )
+    assert first.binding.snapshot_s3_object_key.startswith("snapshots/")
+    assert "checkpoints/" not in first.binding.snapshot_s3_object_key
+    assert first.binding.snapshot_version == 2
+    assert first.binding.training_run_id == (
+        "memorysplit-v3-360m-s0-dense"
+    )
+    assert first.binding.world_size == 4
+    assert first.binding.tokens_per_step == 524_288
+    assert not hasattr(first.binding, "checkpoint_path")
     assert first.binding.study_lock_path == "study-lock.json"
     assert first.binding.study_lock_sha256 == lock_sha256
     assert (
@@ -145,6 +175,14 @@ def test_planner_emits_exact_canonical_100_snapshot_run_bindings():
     assert first.binding.evaluator_profile_sha256 == P5_PROFILE_SHA256
     assert first.binding.evaluator_runtime_lock_sha256 == "b" * 64
     assert first.binding.evaluator_qualification_evidence_sha256 == "c" * 64
+    assert first.binding.evaluator_environment_receipt_sha256 == "d" * 64
+    assert first.binding.evaluator_profile_path == "evaluator-profile.json"
+    assert first.binding.evaluator_runtime_lock_path == (
+        "evaluator-runtime-lock.json"
+    )
+    assert first.binding.evaluator_environment_receipt_path == (
+        "evaluator-environment-receipt.json"
+    )
     assert first.run_json_bytes == canonical_json_bytes(first.binding.to_dict())
     assert RunBindingV3.from_dict(
         json.loads(first.run_json_bytes)
@@ -251,8 +289,12 @@ def test_plan_validator_rejects_non_exact_slot_registries(mutation):
     [
         ("optimizer_step", 1_357, "optimizer_step"),
         ("arm", "split", "arm"),
-        ("checkpoint_s3_object_key", "wrong", "checkpoint.*key"),
+        ("snapshot_s3_object_key", "wrong", "snapshot.*key|object key"),
         ("checkpoint_receipt_s3_object_key", "wrong", "receipt.*key"),
+        ("snapshot_version", 1, "snapshot.*version"),
+        ("training_run_id", "other-run", "training.*run|identity"),
+        ("world_size", 8, "world.size"),
+        ("tokens_per_step", 1, "tokens.per.step"),
         ("selected_provider", "aws-p6-b300.48xlarge", "provider|profile"),
         ("evaluator_profile_sha256", "0" * 64, "profile"),
         ("output_id", "aliased-output", "output"),

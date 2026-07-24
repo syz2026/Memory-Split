@@ -21,8 +21,8 @@ from msctl.aws_contracts import (
     ARMS,
     SEEDS,
     SNAPSHOT_STEPS,
-    checkpoint_object_key,
     checkpoint_receipt_key,
+    snapshot_object_key,
 )
 
 
@@ -44,6 +44,10 @@ def _provider_selection(**changes) -> dict:
         ),
         "runtime_lock_sha256": "b" * 64,
         "qualification_evidence_sha256": "c" * 64,
+        "environment_receipt_sha256": "d" * 64,
+        "canary_receipt_sha256": "e" * 64,
+        "approval_receipt_sha256": "f" * 64,
+        "approval_public_key_sha256": "1" * 64,
     }
     value.update(changes)
     return value
@@ -64,9 +68,10 @@ def _snapshots() -> list[dict]:
                         "arm": arm,
                         "optimizer_step": step,
                         "checkpoint_sha256": digest,
-                        "s3_object_key": checkpoint_object_key(
+                        "s3_object_key": snapshot_object_key(
                             seed,
                             arm,
+                            step,
                             digest,
                         ),
                         "s3_version_id": f"version-{seed}-{arm}-{step}",
@@ -81,6 +86,21 @@ def _snapshots() -> list[dict]:
                         "provider_selection_s3_version_id": (
                             "selection-version-p5"
                         ),
+                        "snapshot_version": 2,
+                        "training_run_id": (
+                            f"memorysplit-v3-360m-s{seed}-{arm}"
+                        ),
+                        "config_fingerprint": hashlib.sha256(
+                            f"config:{seed}:{arm}".encode("ascii")
+                        ).hexdigest(),
+                        "model_config_sha256": hashlib.sha256(
+                            b"model-config"
+                        ).hexdigest(),
+                        "data_provenance_sha256": hashlib.sha256(
+                            f"data:{seed}:{arm}".encode("ascii")
+                        ).hexdigest(),
+                        "world_size": 4,
+                        "tokens_per_step": 524_288,
                     }
                 )
     return snapshots
@@ -121,9 +141,10 @@ def test_v3_study_lock_binds_the_exact_ordered_100_snapshot_cohort():
     } == {lock.provider_selection.provider_selection_s3_version_id}
 
     first = lock.snapshots[0]
-    assert first.s3_object_key == checkpoint_object_key(
+    assert first.s3_object_key == snapshot_object_key(
         first.seed,
         first.arm,
+        first.optimizer_step,
         first.checkpoint_sha256,
     )
     assert first.s3_version_id
@@ -132,6 +153,10 @@ def test_v3_study_lock_binds_the_exact_ordered_100_snapshot_cohort():
         first.checkpoint_receipt_sha256,
     )
     assert first.checkpoint_receipt_s3_version_id
+    assert first.snapshot_version == 2
+    assert first.training_run_id == "memorysplit-v3-360m-s0-dense"
+    assert first.world_size == 4
+    assert first.tokens_per_step == 524_288
 
     with pytest.raises(FrozenInstanceError):
         first.checkpoint_sha256 = "0" * 64
@@ -150,7 +175,12 @@ def test_v3_study_lock_is_exact_and_slots_cannot_be_replaced(mutation):
         snapshots[1]["checkpoint_sha256"] = snapshots[0][
             "checkpoint_sha256"
         ]
-        snapshots[1]["s3_object_key"] = snapshots[0]["s3_object_key"]
+        snapshots[1]["s3_object_key"] = snapshot_object_key(
+            snapshots[1]["seed"],
+            snapshots[1]["arm"],
+            snapshots[1]["optimizer_step"],
+            snapshots[0]["checkpoint_sha256"],
+        )
         snapshots[1]["s3_version_id"] = snapshots[0]["s3_version_id"]
 
     with pytest.raises(ValueError, match="exact|ordered|100|slot|alias|reuse"):
@@ -299,12 +329,13 @@ def test_v3_study_lock_requires_one_selection_for_every_snapshot():
         },
         {"runtime_lock_sha256": None},
         {"qualification_evidence_sha256": None},
+        {"environment_receipt_sha256": None},
     ],
 )
 def test_v3_study_lock_rejects_cross_profile_or_unbound_evidence(changes):
     with pytest.raises(
         ValueError,
-        match="amendment|profile|provider|runtime|evidence",
+        match="amendment|profile|provider|runtime|evidence|environment",
     ):
         StudyLockV3.from_dict(
             _lock(provider_selection=_provider_selection(**changes))

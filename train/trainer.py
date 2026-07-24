@@ -92,6 +92,29 @@ _LEGACY_SNAPSHOT_FIELDS = {
 _SNAPSHOT_FIELDS = _LEGACY_SNAPSHOT_FIELDS | OPERATIONAL_METADATA_FIELDS | {
     "config_fingerprint",
 }
+_STUDY_SNAPSHOT_FIELDS = _LEGACY_SNAPSHOT_FIELDS | {
+    "config_fingerprint",
+    "snapshot_version",
+    "study_identity",
+}
+_SELECTED_STUDY_SNAPSHOT_FIELDS = _SNAPSHOT_FIELDS | {
+    "snapshot_version",
+    "study_identity",
+}
+_STUDY_IDENTITY_FIELDS = {
+    "arm",
+    "cohort_id",
+    "data_provenance_sha256",
+    "model_cfg_sha256",
+    "run_id",
+    "seed",
+    "tokens_per_step",
+}
+_STUDY_COHORT_ID = "memorysplit-confirmatory-v3-360m-n10-aws"
+_STUDY_ARMS = ("dense", "split90")
+_STUDY_SEEDS = tuple(range(10))
+_STUDY_SNAPSHOT_STEPS = (1_358, 3_396, 6_791, 10_187, 13_582)
+_STUDY_TOKENS_PER_STEP = 524_288
 _SNAPSHOT_NAME = re.compile(r"^step([0-9]{7})\.pt$")
 _QUARANTINED_SNAPSHOT_NAME = re.compile(
     r"^\.quarantine-step([0-9]{7})\.pt-after-step"
@@ -428,20 +451,55 @@ def parse_model_snapshot_bytes(
             raise ValueError(
                 "legacy model snapshot requires explicit legacy admission"
             )
-    elif fields == _SNAPSHOT_FIELDS:
+    elif fields in (
+        _SNAPSHOT_FIELDS,
+        _STUDY_SNAPSHOT_FIELDS,
+        _SELECTED_STUDY_SNAPSHOT_FIELDS,
+    ):
         fingerprint = state["config_fingerprint"]
         if (
             not isinstance(fingerprint, str)
             or re.fullmatch(r"[0-9a-f]{64}", fingerprint) is None
         ):
             raise ValueError("model snapshot config fingerprint is invalid")
-        operational = {
-            field: state[field] for field in OPERATIONAL_METADATA_FIELDS
-        }
-        validate_lifecycle_operational_metadata(
-            operational,
-            expected=expected_operational_metadata,
-        )
+        if fields in (_SNAPSHOT_FIELDS, _SELECTED_STUDY_SNAPSHOT_FIELDS):
+            operational = {
+                field: state[field] for field in OPERATIONAL_METADATA_FIELDS
+            }
+            validate_lifecycle_operational_metadata(
+                operational,
+                expected=expected_operational_metadata,
+            )
+        elif expected_operational_metadata is not None:
+            raise ValueError(
+                "model snapshot is missing provider lifecycle metadata"
+            )
+        if fields in (
+            _STUDY_SNAPSHOT_FIELDS,
+            _SELECTED_STUDY_SNAPSHOT_FIELDS,
+        ):
+            identity = state["study_identity"]
+            if (
+                type(state["snapshot_version"]) is not int
+                or state["snapshot_version"] != 2
+                or type(identity) is not dict
+                or set(identity) != _STUDY_IDENTITY_FIELDS
+                or identity["cohort_id"] != _STUDY_COHORT_ID
+                or type(identity["seed"]) is not int
+                or identity["seed"] not in _STUDY_SEEDS
+                or identity["arm"] not in _STUDY_ARMS
+                or identity["run_id"]
+                != (
+                    f"memorysplit-v3-360m-s{identity['seed']}-"
+                    f"{identity['arm']}"
+                )
+                or identity["tokens_per_step"] != _STUDY_TOKENS_PER_STEP
+                or identity["model_cfg_sha256"]
+                != _canonical_json_hash(state["model_cfg"])
+                or identity["data_provenance_sha256"]
+                != _canonical_json_hash(state["data_provenance"])
+            ):
+                raise ValueError("model snapshot study identity is invalid")
     else:
         raise ValueError("model snapshot fields are foreign")
     if (
@@ -1261,6 +1319,46 @@ class Trainer:
                 stale_seen = True
         return b"".join(retained), stale_seen or partial_tail
 
+    def _study_snapshot_identity(
+        self,
+        *,
+        model_cfg: dict,
+        data_provenance: dict,
+    ) -> dict | None:
+        cohort_id = self.cfg.get("cohort_id")
+        if cohort_id != _STUDY_COHORT_ID:
+            return None
+        if "run_id" not in self.cfg or "condition" not in self.cfg:
+            raise ValueError(
+                "study snapshot config has partial cohort/run/arm identity"
+            )
+        arm = self.cfg["condition"]
+        seed = self.cfg.get("seed")
+        run_id = self.cfg["run_id"]
+        expected_run_id = f"memorysplit-v3-360m-s{seed}-{arm}"
+        if (
+            cohort_id != _STUDY_COHORT_ID
+            or type(seed) is not int
+            or seed not in _STUDY_SEEDS
+            or arm not in _STUDY_ARMS
+            or run_id != expected_run_id
+            or self.tokens_per_step != _STUDY_TOKENS_PER_STEP
+        ):
+            raise ValueError("study snapshot config identity is invalid")
+        if type(model_cfg) is not dict or type(data_provenance) is not dict:
+            raise ValueError("study snapshot provenance must be dictionaries")
+        return {
+            "arm": arm,
+            "cohort_id": cohort_id,
+            "data_provenance_sha256": _canonical_json_hash(
+                data_provenance
+            ),
+            "model_cfg_sha256": _canonical_json_hash(model_cfg),
+            "run_id": run_id,
+            "seed": seed,
+            "tokens_per_step": self.tokens_per_step,
+        }
+
     def _validate_snapshot_bytes(
         self,
         payload: bytes,
@@ -1276,6 +1374,7 @@ class Trainer:
             )
         except ValueError as error:
             raise ValueError(f"resume snapshot is malformed: {name}") from error
+        study_snapshot = "study_identity" in state
         if (
             type(state["step"]) is not int
             or state["step"] != expected_step
@@ -1297,6 +1396,31 @@ class Trainer:
             self._raw_model().cfg.__dict__,
         ):
             raise ValueError(f"resume snapshot model config is invalid: {name}")
+        if study_snapshot:
+            if (
+                type(state["snapshot_version"]) is not int
+                or state["snapshot_version"] != 2
+                or state["config_fingerprint"] != self.config_fingerprint
+                or type(state["study_identity"]) is not dict
+                or set(state["study_identity"]) != _STUDY_IDENTITY_FIELDS
+            ):
+                raise ValueError(
+                    f"resume study snapshot identity is invalid: {name}"
+                )
+            expected_identity = self._study_snapshot_identity(
+                model_cfg=state["model_cfg"],
+                data_provenance=state["data_provenance"],
+            )
+            if (
+                expected_identity is None
+                or not strict_json_identity(
+                    state["study_identity"],
+                    expected_identity,
+                )
+            ):
+                raise ValueError(
+                    f"resume study snapshot provenance is invalid: {name}"
+                )
         self._validate_model_state(state["model"])
 
     def _inspect_resume_snapshots(
@@ -1788,16 +1912,34 @@ class Trainer:
             raw = self._raw_model()
             if self._output is None:
                 raise RuntimeError("durable output directory is not initialized")
+            model_cfg = dict(raw.cfg.__dict__)
+            data_provenance = dict(self.data.provenance)
             state = {
                 "model": raw.state_dict(),
                 "step": self.step,
-                "model_cfg": raw.cfg.__dict__,
+                "model_cfg": model_cfg,
                 "world_size": self.world_size,
-                "data_provenance": self.data.provenance,
+                "data_provenance": data_provenance,
             }
             if self.operational_metadata is not None:
                 state.update(self.operational_metadata)
                 state["config_fingerprint"] = self.config_fingerprint
+            study_identity = self._study_snapshot_identity(
+                model_cfg=model_cfg,
+                data_provenance=data_provenance,
+            )
+            if study_identity is not None:
+                if self.step not in _STUDY_SNAPSHOT_STEPS:
+                    raise ValueError(
+                        "study snapshot step is not one of the frozen steps"
+                    )
+                state.update(
+                    {
+                        "config_fingerprint": self.config_fingerprint,
+                        "snapshot_version": 2,
+                        "study_identity": study_identity,
+                    }
+                )
             self._output.snapshots.write_atomic(
                 f"step{self.step:07d}.pt",
                 lambda handle: torch.save(state, handle),
