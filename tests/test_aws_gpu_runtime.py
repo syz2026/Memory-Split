@@ -649,6 +649,13 @@ def test_container_inspection_contract_includes_inherited_and_selected_packages(
     }
     assert set(packages) == {"numpy", "torch"}
     assert artifact["os_packages"] == _os_package_inventory()
+    assert artifact["os_packages"]["database_files"] == [
+        {
+            "path": "/var/lib/dpkg/status",
+            "type": "regular",
+            "commitment_sha256": "e" * 64,
+        }
+    ]
     assert artifact["inventory_method"] == "importlib.metadata.distributions"
     assert artifact["installed_distribution_count"] == 2
     assert packages["numpy"]["provenance"] == {
@@ -684,6 +691,9 @@ def test_container_inspection_contract_includes_inherited_and_selected_packages(
     assert module.parse_inspection_artifact_bytes(
         module.canonical_json(artifact)
     ) == artifact
+    assert module.canonical_json(artifact).endswith(b"\n")
+    assert "--out" not in INSPECT_SCRIPT.read_text(encoding="utf-8")
+    assert "import torch" not in INSPECT_SCRIPT.read_text(encoding="utf-8")
 
 
 @pytest.mark.parametrize(
@@ -794,20 +804,34 @@ def test_explicit_apply_builds_then_pushes_and_emits_digest_binding(tmp_path):
         tuple(plan["commands"][name])
         for name in (
             "build",
-                "python_base",
-                "python_local",
+            "python_base",
+            "python_local",
             "inspect_base",
             "inspect_local",
             "facts_base",
             "facts_local",
-            "inspection_local",
-            "push",
         )
     ] + [
+        tuple(
+            module.container_inspection_argv(
+                plan["staging_tag"],
+                container_facts_json=_canonical(CONTAINER_FACTS)
+                .decode("ascii")
+                .rstrip("\n"),
+            )
+        ),
+        tuple(plan["commands"]["push"]),
         tuple(module.container_python_exists_argv(f"{PRIVATE_REPOSITORY}@{digest}")),
         tuple(module.final_image_inspect_argv(f"{PRIVATE_REPOSITORY}@{digest}")),
         tuple(module.container_facts_argv(f"{PRIVATE_REPOSITORY}@{digest}")),
-        tuple(module.container_inspection_argv(f"{PRIVATE_REPOSITORY}@{digest}")),
+        tuple(
+            module.container_inspection_argv(
+                f"{PRIVATE_REPOSITORY}@{digest}",
+                container_facts_json=_canonical(CONTAINER_FACTS)
+                .decode("ascii")
+                .rstrip("\n"),
+            )
+        ),
     ]
     assert all(call[1] == plan["environment"] for call in runner.calls)
     assert binding["schema_version"] == 2
@@ -846,6 +870,82 @@ def test_explicit_apply_builds_then_pushes_and_emits_digest_binding(tmp_path):
     }
     assert ":" not in binding["container_image"].split("@", 1)[0].rsplit("/", 1)[-1]
     assert module.canonical_json(binding).endswith(b"\n")
+
+
+def test_inventory_probe_is_restricted_root_and_framework_probe_is_nonroot():
+    build_module = _load_script(BUILD_SCRIPT)
+    attestation_module = _load_script(
+        ROOT / "cluster" / "aws" / "p5" / "attest_environment.py"
+    )
+    image = f"{PRIVATE_REPOSITORY}@{'sha256:' + '9' * 64}"
+
+    inventory_argv = build_module.container_inspection_argv(image)
+    assert inventory_argv == (
+        "/usr/bin/docker",
+        "run",
+        "--rm",
+        "--network",
+        "none",
+        "--pull",
+        "never",
+        "--user",
+        "0:0",
+        "--read-only",
+        "--security-opt",
+        "no-new-privileges",
+        "--cap-drop",
+        "ALL",
+        "--cap-add",
+        "DAC_READ_SEARCH",
+        "--entrypoint",
+        DLC_PYTHON,
+        image,
+        "-I",
+        "-P",
+        "/opt/memorysplit/inspect_container.py",
+        "--container-facts-json",
+        "__MEASURED_CONTAINER_FACTS__",
+    )
+    assert "--gpus" not in inventory_argv
+    assert "--mount" not in inventory_argv
+    assert "--volume" not in inventory_argv
+    assert "-v" not in inventory_argv
+    assert [item for item in inventory_argv if item == "--cap-add"] == ["--cap-add"]
+
+    for facts_argv in (
+        build_module.container_facts_argv(image),
+        attestation_module.container_facts_argv(image),
+    ):
+        assert facts_argv[facts_argv.index("--user") + 1] == "10001:10001"
+        assert facts_argv[facts_argv.index("--network") + 1] == "none"
+        assert facts_argv[facts_argv.index("--entrypoint") + 1] == DLC_PYTHON
+        assert "--gpus" in facts_argv and "all" in facts_argv
+        assert "--cap-add" not in facts_argv
+        assert "--mount" not in facts_argv
+    for exists_argv in (
+        build_module.container_python_exists_argv(image),
+        attestation_module.container_python_exists_argv(image),
+    ):
+        assert exists_argv[exists_argv.index("--user") + 1] == "10001:10001"
+
+
+@pytest.mark.parametrize(
+    "unsafe_argument",
+    ["--network=host", "--cap-add=SYS_ADMIN", "--mount", "--volume"],
+)
+def test_build_plan_rejects_extra_inventory_privilege(unsafe_argument, tmp_path):
+    module = _load_script(BUILD_SCRIPT)
+    plan = module.render_build_plan(
+        repository_uri=PRIVATE_REPOSITORY,
+        source_commit=SOURCE_COMMIT,
+        repository_root=ROOT,
+        docker_config=tmp_path / "docker",
+        repository_reader=_RepositoryReader(),
+    )
+    plan["commands"]["inspection_local"].insert(2, unsafe_argument)
+
+    with pytest.raises(module.BuildPlanError, match="plan|command|input|changed"):
+        module.execute_build_plan(plan, apply=False, runner=_ForbiddenRunner())
 
 
 @pytest.mark.parametrize(

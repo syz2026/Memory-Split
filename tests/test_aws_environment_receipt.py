@@ -947,7 +947,7 @@ def test_selected_gpu_attestation_measures_framework_only_in_locked_container(
 
     container_argv = module.container_facts_argv(IMAGE)
     assert container_argv in [argv for argv, _ in commands.calls]
-    assert container_argv[:8] == (
+    assert container_argv[:7] == (
         "/usr/bin/docker",
         "run",
         "--rm",
@@ -955,8 +955,9 @@ def test_selected_gpu_attestation_measures_framework_only_in_locked_container(
         "none",
         "--pull",
         "never",
-        "--gpus",
     )
+    assert container_argv[container_argv.index("--user") + 1] == "10001:10001"
+    assert container_argv[container_argv.index("--gpus") + 1] == "all"
     assert "all" in container_argv
     assert "--entrypoint" in container_argv
     assert container_argv[container_argv.index("--entrypoint") + 1] == (

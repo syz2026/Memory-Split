@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import argparse
 import hashlib
 import importlib.metadata
 import json
@@ -469,26 +470,6 @@ def collect_dpkg_inventory(
     return _validate_os_package_inventory(inventory)
 
 
-def _container_facts() -> dict[str, str]:
-    try:
-        import torch
-    except ImportError as error:
-        raise InspectionError("container does not provide PyTorch") from error
-    nccl = torch.cuda.nccl.version()
-    nccl_version = (
-        ".".join(map(str, nccl))
-        if isinstance(nccl, tuple)
-        else str(nccl or "")
-    )
-    return {
-        "python": platform.python_version(),
-        "pytorch": str(torch.__version__),
-        "cuda": str(torch.version.cuda or ""),
-        "cudnn": str(torch.backends.cudnn.version() or ""),
-        "nccl": nccl_version,
-    }
-
-
 def build_inspection_artifact(
     *,
     os_release_bytes: bytes,
@@ -675,8 +656,36 @@ def parse_inspection_artifact_bytes(data: bytes) -> dict[str, object]:
     return value
 
 
-def main() -> int:
+def _container_facts_argument(value: str) -> dict[str, object]:
     try:
+        facts = json.loads(value)
+    except json.JSONDecodeError as error:
+        raise InspectionError("measured container facts argument is invalid") from error
+    if (
+        not isinstance(facts, dict)
+        or set(facts) != _FACT_FIELDS
+        or value
+        != json.dumps(
+            facts,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+            allow_nan=False,
+        )
+    ):
+        raise InspectionError("measured container facts argument is not canonical")
+    return facts
+
+
+def _parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(allow_abbrev=False)
+    parser.add_argument("--container-facts-json", required=True)
+    return parser
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    try:
+        arguments = _parser().parse_args(argv)
         report_path = Path("/opt/memorysplit/project-install-report.json")
         artifact = build_inspection_artifact(
             os_release_bytes=Path("/etc/os-release").read_bytes(),
@@ -684,7 +693,9 @@ def main() -> int:
             distributions=tuple(importlib.metadata.distributions()),
             os_package_inventory=collect_dpkg_inventory(),
             base_image_digest=BASE_IMAGE_DIGEST,
-            container_facts=_container_facts(),
+            container_facts=_container_facts_argument(
+                arguments.container_facts_json
+            ),
             python_version=platform.python_version(),
             python_implementation=platform.python_implementation(),
             python_executable=sys.executable,

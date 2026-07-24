@@ -6,7 +6,9 @@ DONE on `feat/aws-gpu-runtime-build`, based exactly on
 `b3471e0969ca2a997d33acf60d2e777720afa1c4`. The original implementation is
 `c70f4cead3b1c921bfac931ac9033ef29f8b7d36`; this report includes the
 pinned-runtime review fixes in `213bf0b4ee69dac6b9997163f75740019d40c274`
-and the second re-review fixes layered on that commit.
+and second re-review fixes in
+`bee8a739af2ae3737babfdf9fa557e4e5dfca09a`. The final root-inventory fix is
+layered on that commit.
 
 ## Delivered
 
@@ -29,10 +31,10 @@ and the second re-review fixes layered on that commit.
   before emitting authority.
 - The apply path measures the base and local image before push, then reruns
   image inspection, framework measurement, and complete software inspection
-  through the final pushed digest. All container runs use `--network none`,
-  `--pull never`, `--gpus all`, a read-only root, and the exact digest. Python
-  3.12, PyTorch 2.9.0, CUDA 13.0, cuDNN, NCCL, and inherited entrypoint/CMD
-  must remain exact.
+  through the final pushed digest. Framework probes run explicitly as
+  `10001:10001` with GPU access; all probes use `--network none`, `--pull
+  never`, a read-only root, and the exact digest. Python 3.12, PyTorch 2.9.0,
+  CUDA 13.0, cuDNN, NCCL, and inherited entrypoint/CMD must remain exact.
 - Every framework and inventory probe uses `/opt/conda/bin/python`. Apply
   separately proves that executable exists in the base, local, and final
   digest images; `/usr/bin/python3` cannot supply container evidence.
@@ -73,6 +75,11 @@ and the second re-review fixes layered on that commit.
   pip-report archive hash; inherited DLC distributions carry the immutable
   base-image digest and installed-file commitments, never a null or mislabeled
   archive hash.
+- Only the full inventory probe runs as `0:0`. It has no GPU, network, mount,
+  or secret access; sets no-new-privileges; drops every capability; and adds
+  only `DAC_READ_SEARCH` so root-only dpkg/database/package files are readable.
+  Framework facts are passed in from the separately measured nonroot probe,
+  and the inspector emits only canonical stdout evidence.
 
 ## TDD Evidence
 
@@ -112,11 +119,15 @@ and the second re-review fixes layered on that commit.
 - SBOM v2 RED: 6 failures for absent dpkg/file/provenance closure; GREEN: 6
   focused inspection/build/runtime tests. A forged project archive had an
   independent RED then passed after lock cross-checking.
+- Root-inventory RED: the exact command still inherited the image user instead
+  of the restricted root boundary. GREEN: 5 new root/nonroot and
+  extra-network/capability/mount rejection cases, plus the existing inspection
+  and apply checks.
 
 ## Verification
 
 ```text
-387 passed in 78.48s
+392 passed in 49.83s
 ```
 
 The focused command covered `tests/test_aws_gpu_runtime.py`,
@@ -168,3 +179,5 @@ Modified for the review fix:
   Base-DLAMI qualification check.
 - `/usr/bin/nvlsm` and the complete dpkg/Python inventories are fixture-tested
   offline; their real Base-DLAMI output remains part of deferred qualification.
+- The restricted root command and nonroot framework command are argv-verified
+  offline; no privileged container was executed in this task.

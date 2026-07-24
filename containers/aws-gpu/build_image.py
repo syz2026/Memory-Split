@@ -322,6 +322,8 @@ def container_python_exists_argv(
         "none",
         "--pull",
         "never",
+        "--user",
+        "10001:10001",
         "--read-only",
         "--entrypoint",
         "/usr/bin/test",
@@ -344,6 +346,8 @@ def container_facts_argv(
         "none",
         "--pull",
         "never",
+        "--user",
+        "10001:10001",
         "--gpus",
         "all",
         "--read-only",
@@ -367,6 +371,7 @@ def container_inspection_argv(
     image: str,
     *,
     docker_binary: str = DEFAULT_DOCKER_BINARY,
+    container_facts_json: str = "__MEASURED_CONTAINER_FACTS__",
 ) -> tuple[str, ...]:
     return (
         docker_binary,
@@ -376,21 +381,23 @@ def container_inspection_argv(
         "none",
         "--pull",
         "never",
-        "--gpus",
-        "all",
+        "--user",
+        "0:0",
         "--read-only",
-        "--env",
-        "PYTHONDONTWRITEBYTECODE=1",
-        "--env",
-        "PYTHONNOUSERSITE=1",
-        "--workdir",
-        "/",
+        "--security-opt",
+        "no-new-privileges",
+        "--cap-drop",
+        "ALL",
+        "--cap-add",
+        "DAC_READ_SEARCH",
         "--entrypoint",
         DLC_PYTHON,
         image,
         "-I",
         "-P",
         "/opt/memorysplit/inspect_container.py",
+        "--container-facts-json",
+        container_facts_json,
     )
 
 
@@ -1325,8 +1332,16 @@ def execute_build_plan(
         )
         if local_facts != base_facts:
             raise BuildPlanError("built image changed inherited framework facts")
+        measured_facts_json = canonical_json(local_facts).decode("ascii").rstrip(
+            "\n"
+        )
+        local_inspection_argv = container_inspection_argv(
+            checked["staging_tag"],
+            docker_binary=commands["build"][0],
+            container_facts_json=measured_facts_json,
+        )
         local_artifact = _inspection_artifact(
-            run_bound("inspection_local", commands["inspection_local"]),
+            run_bound("inspection_local", local_inspection_argv),
             dependency_lock_bytes=pinned.bytes_for("dependency_lock_sha256"),
             expected_facts=local_facts,
         )
@@ -1344,10 +1359,6 @@ def execute_build_plan(
             docker_binary=docker_binary,
         )
         final_facts_argv = container_facts_argv(
-            final_image,
-            docker_binary=docker_binary,
-        )
-        final_artifact_argv = container_inspection_argv(
             final_image,
             docker_binary=docker_binary,
         )
@@ -1371,6 +1382,13 @@ def execute_build_plan(
         )
         if final_facts != local_facts:
             raise BuildPlanError("final digest framework facts differ after push")
+        final_artifact_argv = container_inspection_argv(
+            final_image,
+            docker_binary=docker_binary,
+            container_facts_json=canonical_json(final_facts)
+            .decode("ascii")
+            .rstrip("\n"),
+        )
         final_artifact = _inspection_artifact(
             run_bound("inspection_final", final_artifact_argv),
             dependency_lock_bytes=pinned.bytes_for("dependency_lock_sha256"),
