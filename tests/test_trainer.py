@@ -117,6 +117,182 @@ def test_run_train_capabilities_json_is_strict_and_does_not_require_config():
     )
 
 
+def test_operational_steps_preserve_config_fingerprint_and_resume_one_to_two(
+    tmp_path,
+):
+    bp, mp = write_corpus(tmp_path, n=64)
+    cfg = tiny_cfg(tmp_path, bp, mp, max_steps=4)
+    original = copy.deepcopy(cfg)
+
+    first = trainer_module.train(cfg, operational_steps=1)
+    first_checkpoint = torch.load(
+        first.ckpt_path,
+        map_location="cpu",
+        weights_only=False,
+    )
+    config_bytes = (first.out_dir / "config.yaml").read_bytes()
+    fingerprint = first.config_fingerprint
+
+    assert cfg == original
+    assert first.step == 1
+    assert first.data.global_cursor == cfg["tokens_per_step"]
+    assert first_checkpoint["cfg"] == original
+    assert first_checkpoint["config_fingerprint"] == fingerprint
+    assert first_checkpoint["step"] == 1
+    assert first_checkpoint["data"]["global_cursor"] == cfg["tokens_per_step"]
+    assert first.max_steps == 4
+    first.close()
+
+    resumed = trainer_module.train(
+        cfg,
+        resume="auto",
+        operational_steps=1,
+    )
+    resumed_checkpoint = torch.load(
+        resumed.ckpt_path,
+        map_location="cpu",
+        weights_only=False,
+    )
+
+    assert cfg == original
+    assert resumed.step == 2
+    assert resumed.data.global_cursor == 2 * cfg["tokens_per_step"]
+    assert resumed.config_fingerprint == fingerprint
+    assert resumed_checkpoint["cfg"] == original
+    assert resumed_checkpoint["config_fingerprint"] == fingerprint
+    assert resumed_checkpoint["step"] == 2
+    assert resumed_checkpoint["data"]["global_cursor"] == (
+        2 * cfg["tokens_per_step"]
+    )
+    assert resumed.max_steps == 4
+    assert (resumed.out_dir / "config.yaml").read_bytes() == config_bytes
+    resumed.close()
+
+
+def test_operational_steps_are_positive_exact_integers_and_cap_at_max_steps(
+    tmp_path,
+):
+    bp, mp = write_corpus(tmp_path, n=64)
+    cfg = tiny_cfg(tmp_path, bp, mp, max_steps=2)
+
+    for invalid in (True, 1.0, 0, -1, sys.maxsize + 1):
+        with pytest.raises(ValueError, match="operational_steps"):
+            trainer_module.train(cfg, operational_steps=invalid)
+        assert not Path(cfg["out_dir"]).exists()
+
+    first = trainer_module.train(cfg, operational_steps=1)
+    first.close()
+    resumed = trainer_module.train(
+        cfg,
+        resume="auto",
+        operational_steps=2,
+    )
+
+    assert resumed.step == 2
+    assert resumed.data.global_cursor == 2 * cfg["tokens_per_step"]
+    resumed.close()
+
+
+def test_operational_training_exposes_one_finite_metric_per_completed_update(
+    tmp_path,
+):
+    bp, mp = write_corpus(tmp_path, n=64)
+    cfg = tiny_cfg(tmp_path, bp, mp, max_steps=3)
+
+    trainer = trainer_module.train(cfg, operational_steps=2)
+
+    assert trainer.operational_start_step == 0
+    assert trainer.step == 2
+    assert len(trainer.operational_step_tok_s) == 2
+    assert all(
+        isinstance(value, float) and np.isfinite(value) and value > 0
+        for value in trainer.operational_step_tok_s
+    )
+    trainer.close()
+
+
+def test_run_train_emits_canonical_operational_metrics_without_config_mutation(
+    tmp_path,
+):
+    bp, mp = write_corpus(tmp_path, n=64)
+    cfg = tiny_cfg(tmp_path, bp, mp, max_steps=2)
+    config_path = tmp_path / "config.yaml"
+    import yaml
+
+    config_path.write_text(yaml.safe_dump(cfg, sort_keys=False), encoding="utf-8")
+    before = config_path.read_bytes()
+    root = Path(__file__).resolve().parents[1]
+
+    completed = subprocess.run(
+        [
+            sys.executable,
+            root / "scripts" / "run_train.py",
+            "--config",
+            config_path,
+            "--operational-steps",
+            "1",
+        ],
+        cwd=root,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    lines = completed.stdout.splitlines()
+    metrics = json.loads(lines[0])
+    assert completed.returncode == 0
+    assert completed.stderr == ""
+    assert metrics["receipt_type"] == "memorysplit-operational-training-v1"
+    assert metrics["start_step"] == 0
+    assert metrics["end_step"] == 1
+    assert metrics["updates"] == 1
+    assert len(metrics["step_tok_s"]) == 1
+    assert np.isfinite(metrics["step_tok_s"][0])
+    assert metrics["step_tok_s"][0] > 0
+    assert lines[1].startswith("done: step=1 out=")
+    assert config_path.read_bytes() == before
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        ["--operational-steps", "0"],
+        ["--operational-steps", "-1"],
+        ["--operational-steps", "1.0"],
+        ["--operational-steps", "true"],
+        ["--operational-steps", "+1"],
+        ["--operational-steps", "01"],
+        ["--operational-steps", str(sys.maxsize + 1)],
+        ["--operational-steps", "1", "--operational-steps", "2"],
+    ],
+)
+def test_run_train_operational_steps_cli_fails_closed_before_config_read(
+    tmp_path,
+    arguments,
+):
+    root = Path(__file__).resolve().parents[1]
+    missing_config = tmp_path / "must-not-be-read.yaml"
+
+    completed = subprocess.run(
+        [
+            sys.executable,
+            root / "scripts" / "run_train.py",
+            "--config",
+            missing_config,
+            *arguments,
+        ],
+        cwd=root,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert completed.returncode == 2
+    assert completed.stdout == ""
+    assert "operational-steps" in completed.stderr
+    assert "No such file" not in completed.stderr
+
+
 def test_preregistered_v2_snapshot_steps_are_preserved_exactly():
     expected = (1358, 3396, 6791, 10187, 13582)
 

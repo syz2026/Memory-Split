@@ -272,45 +272,58 @@ def _validate_intent(
     intent = _decode_object(payload, label="operation intent")
     if set(intent) != _BASE_FIELDS:
         raise RemoteIntentError("operation intent fields do not match the contract")
+    operation = intent["operation"]
+    is_canary = operation == "canary"
     if (
         intent["schema_version"] != 1
-        or intent["operation"] not in {"submit", "resume", "evaluate"}
+        or operation not in {"submit", "resume", "evaluate", "canary"}
         or intent["provider"] != "aws-p5.48xlarge"
         or isinstance(intent["seed"], bool)
-        or intent["seed"] not in {1, 2, 3, 4}
+        or intent["seed"]
+        not in (set(range(10)) if is_canary else {1, 2, 3, 4})
         or not isinstance(intent["instance_id"], str)
         or _INSTANCE_RE.fullmatch(intent["instance_id"]) is None
-        or not isinstance(intent["terminate_at"], str)
-        or not intent["terminate_at"].endswith("Z")
         or (
-            intent["operation"] == "resume"
+            is_canary
+            and intent["terminate_at"] is not None
+        )
+        or (
+            not is_canary
+            and (
+                not isinstance(intent["terminate_at"], str)
+                or not intent["terminate_at"].endswith("Z")
+            )
+        )
+        or (
+            operation == "resume"
             and not isinstance(intent["checkpoint_receipt"], dict)
         )
         or (
-            intent["operation"] != "resume"
+            operation != "resume"
             and intent["checkpoint_receipt"] is not None
         )
     ):
         raise RemoteIntentError("operation intent identity is invalid")
-    try:
-        deadline = datetime.fromisoformat(
-            str(intent["terminate_at"])[:-1] + "+00:00"
-        )
-    except ValueError as error:
-        raise RemoteIntentError(
-            "operation termination deadline is invalid"
-        ) from error
-    now = datetime.now(UTC)
-    if (
-        deadline.tzinfo is None
-        or deadline.utcoffset() != UTC.utcoffset(deadline)
-        or deadline <= now
-        or deadline > now + timedelta(minutes=1440)
-    ):
-        raise RemoteIntentError(
-            "operation termination deadline is expired or non-UTC"
-        )
-    if intent["operation"] == "resume":
+    if not is_canary:
+        try:
+            deadline = datetime.fromisoformat(
+                str(intent["terminate_at"])[:-1] + "+00:00"
+            )
+        except ValueError as error:
+            raise RemoteIntentError(
+                "operation termination deadline is invalid"
+            ) from error
+        now = datetime.now(UTC)
+        if (
+            deadline.tzinfo is None
+            or deadline.utcoffset() != UTC.utcoffset(deadline)
+            or deadline <= now
+            or deadline > now + timedelta(minutes=1440)
+        ):
+            raise RemoteIntentError(
+                "operation termination deadline is expired or non-UTC"
+            )
+    if operation == "resume":
         _validate_checkpoint_receipt(intent["checkpoint_receipt"])
     for field in (
         "release_sha256",
@@ -397,7 +410,7 @@ def _validate_intent(
         ):
             raise RemoteIntentError("operation step is not one safe absolute argv")
         names.append(name)
-    if intent["operation"] == "submit":
+    if operation == "submit":
         if (
             names[0] != "auto-termination"
             or "prepare-aws-private-home" not in names
@@ -407,6 +420,32 @@ def _validate_intent(
             raise RemoteIntentError(
                 "submit must establish expiry and private HOME before bootstrap"
             )
+    if is_canary:
+        if (
+            len(steps) != 1
+            or names != ["qualification-canary"]
+            or len(steps[0]["argv"]) < 2
+            or not str(steps[0]["argv"][1]).endswith(
+                "/cluster/aws/p5/canary.py"
+            )
+            or any(
+                item == "--operational-steps"
+                or item.startswith("--operational-steps=")
+                for item in steps[0]["argv"]
+            )
+        ):
+            raise RemoteIntentError(
+                "canary operation must execute only the qualification harness"
+            )
+    elif any(
+        item == "--operational-steps"
+        or item.startswith("--operational-steps=")
+        for step in steps
+        for item in step["argv"]
+    ):
+        raise RemoteIntentError(
+            "operational steps are forbidden outside the canary operation"
+        )
     return intent
 
 

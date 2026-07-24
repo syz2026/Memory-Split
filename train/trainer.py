@@ -19,6 +19,7 @@ import re
 import secrets
 import signal
 import stat
+import sys
 import time
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
@@ -628,6 +629,9 @@ class Trainer:
         )
 
         self.step = 0
+        self._capture_operational_metrics = False
+        self.operational_start_step: int | None = None
+        self.operational_step_tok_s: list[float] = []
         self.snapshot_steps = resolve_snapshot_steps(
             cfg,
             max_steps=self.max_steps,
@@ -1627,6 +1631,11 @@ class Trainer:
         tokens_seen = 0
         running = None
         while self.step < target:
+            operational_step_started = (
+                time.perf_counter()
+                if self._capture_operational_metrics
+                else None
+            )
             lr = cosine_lr(
                 self.step, self.cfg["lr"], self.cfg.get("warmup_steps", 300), self.max_steps
             )
@@ -1699,6 +1708,14 @@ class Trainer:
             self.step += 1
             step_loss = self._global_sum(loss_numerator) / global_denominator
             running = step_loss if running is None else 0.95 * running + 0.05 * step_loss
+            if operational_step_started is not None:
+                operational_elapsed = max(
+                    1e-9,
+                    time.perf_counter() - operational_step_started,
+                )
+                self.operational_step_tok_s.append(
+                    float(self.tokens_per_step / operational_elapsed)
+                )
 
             if self.step % self.log_every == 0 or self.step == target:
                 self._barrier()
@@ -1753,18 +1770,30 @@ def train(
     *,
     resume_path: str | Path | None = None,
     resume_sha256: str | None = None,
+    operational_steps: int | None = None,
 ) -> Trainer:
+    if operational_steps is not None and (
+        type(operational_steps) is not int
+        or operational_steps <= 0
+        or operational_steps > sys.maxsize
+    ):
+        raise ValueError(
+            "operational_steps must be a positive exact platform integer"
+        )
     trainer = Trainer(
         cfg,
         resume=resume,
         resume_path=resume_path,
         resume_sha256=resume_sha256,
     )
+    if operational_steps is not None:
+        trainer._capture_operational_metrics = True
+        trainer.operational_start_step = trainer.step
     if resume == "auto":
         if trainer.is_master:
             print(f"resumed from step {trainer.step}")
     try:
-        trainer.train_steps()
+        trainer.train_steps(operational_steps)
     except BaseException:
         trainer.close()
         raise

@@ -10,6 +10,7 @@ import os
 import re
 import subprocess
 import tempfile
+import time
 from collections.abc import Callable, Mapping, Sequence
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -21,6 +22,12 @@ from cluster.aws.p5.attest_environment import (
     parse_environment_receipt_bytes,
     parse_runtime_lock_bytes,
     read_regular_input,
+)
+from cluster.aws.p5.canary import (
+    CanaryError,
+    load_canary_plan,
+    parse_qualification_receipt_bytes,
+    qualification_roundtrip_blob,
 )
 
 from .approval import verify_scope_approval
@@ -92,6 +99,8 @@ _SAFE_PATH = "/usr/local/bin:/usr/bin:/bin"
 _MAX_PAID_RUNTIME = timedelta(minutes=1440)
 _AWS_PRIVATE_HOME = "/var/lib/memorysplit/aws-private-home"
 _V3_PROFILE_ID = "aws-p5.48xlarge-v3"
+_CANARY_REMOTE_TIMEOUT_SECONDS = 172_800.0
+_CANARY_POLL_SECONDS = 5.0
 _LOCAL_AWS_CONFIG = (
     "AWS_PROFILE",
     "AWS_CONFIG_FILE",
@@ -408,6 +417,8 @@ class AwsP5Backend:
             bool,
         ] = _verify_instance_identity_pkcs7,
         environ: Mapping[str, str] | None = None,
+        sleep: Callable[[float], None] = time.sleep,
+        monotonic: Callable[[], float] = time.monotonic,
     ) -> None:
         _validate_profile(profile)
         _validate_runtime(runtime)
@@ -428,6 +439,13 @@ class AwsP5Backend:
         self.corpus_verifier = corpus_verifier
         self.identity_verifier = identity_verifier
         self.environ = dict(os.environ if environ is None else environ)
+        if not callable(sleep) or not callable(monotonic):
+            raise MsctlError(
+                "AWS_RUNTIME_INVALID",
+                "AWS controller time boundaries must be callable",
+            )
+        self.sleep = sleep
+        self.monotonic = monotonic
         inherited_static = sorted(
             name
             for name in _STATIC_AWS_CREDENTIALS
@@ -2685,6 +2703,533 @@ class AwsP5Backend:
         ]
         return result
 
+    def canary_run(
+        self,
+        *,
+        release_root: Path | str,
+        release_receipt: Path | str,
+        run_manifest: Path | str,
+        dataset_receipt: Path | str,
+        environment_receipt: Path | str,
+        runtime_lock: Path | str,
+        instance_id: str,
+        boot_id: str,
+        output: Path | str,
+        apply: bool,
+    ) -> dict[str, object]:
+        """Validate and render one v3-only qualification operation."""
+
+        if getattr(self.profile, "profile_id", None) != _V3_PROFILE_ID:
+            raise MsctlError(
+                "CANARY_UNSUPPORTED",
+                "P5 qualification is enabled only for the exact v3 profile",
+            )
+        if type(apply) is not bool:
+            raise MsctlError("CLI_USAGE", "canary apply flag must be boolean")
+        output_path = Path(os.path.abspath(os.fspath(output)))
+        try:
+            plan = load_canary_plan(
+                release_root=release_root,
+                release_receipt_path=release_receipt,
+                run_manifest_path=run_manifest,
+                dataset_receipt_path=dataset_receipt,
+                environment_receipt_path=environment_receipt,
+                runtime_lock_path=runtime_lock,
+                instance_id=instance_id,
+                boot_id=boot_id,
+                scratch_root=output_path.parent,
+                output_path=output_path,
+                s3_root=self.runtime.s3_root,
+                dataset_verifier=self.corpus_verifier,
+            )
+            environment_bytes = read_regular_input(
+                environment_receipt,
+                label="AWS environment receipt",
+                maximum_bytes=1024 * 1024,
+            )
+            environment = parse_environment_receipt_bytes(environment_bytes)
+        except (CanaryError, AttestationError, OSError, TypeError, ValueError) as error:
+            raise MsctlError(
+                "CANARY_INPUT_INVALID",
+                "P5 qualification inputs do not form one authenticated tuple",
+            ) from error
+        identity = environment["aws_instance_identity_document"]
+        try:
+            signature_valid = self.identity_verifier(
+                identity,
+                str(environment["aws_instance_identity_pkcs7"]),
+                self.runtime.region,
+            )
+        except MsctlError:
+            raise
+        except Exception as error:
+            raise MsctlError(
+                "CANARY_INPUT_INVALID",
+                "P5 qualification environment signature verification failed",
+            ) from error
+        if signature_valid is not True:
+            raise MsctlError(
+                "CANARY_INPUT_INVALID",
+                "P5 qualification environment signature is invalid",
+            )
+
+        remote_argv = [
+            "/usr/bin/python3",
+            str(plan.release_root / "cluster" / "aws" / "p5" / "canary.py"),
+            "--release-root",
+            str(plan.release_root),
+            "--release-receipt",
+            str(Path(release_receipt)),
+            "--manifest",
+            str(Path(run_manifest)),
+            "--dataset-receipt",
+            str(Path(dataset_receipt)),
+            "--environment-receipt",
+            str(Path(environment_receipt)),
+            "--runtime-lock",
+            str(Path(runtime_lock)),
+            "--instance-id",
+            instance_id,
+            "--boot-id",
+            boot_id,
+            "--scratch-root",
+            str(output_path.parent),
+            "--output",
+            str(output_path),
+            "--s3-root",
+            self.runtime.s3_root,
+            "--apply",
+        ]
+        core = {
+            "schema_version": 1,
+            "operation": "canary",
+            "provider": AWS_P5_PROFILE,
+            "seed": plan.seed,
+            "release_sha256": plan.release_sha256,
+            "run_manifest_sha256": plan.run_manifest_sha256,
+            "dataset_sha256": plan.dataset_receipt_sha256,
+            "dataset_pointer_sha256": plan.dataset_pointer_sha256,
+            "dataset_verification_sha256": plan.dataset_receipt_sha256,
+            "environment_receipt_sha256": plan.environment_receipt_sha256,
+            "runtime_sha256": plan.runtime_lock_sha256,
+            "environment": {
+                "AWS_REGION": self.runtime.region,
+                "MS_AWS_AMI_ID": self.runtime.ami_id,
+                "MS_CONTAINER_DIGEST": self.runtime.container_digest,
+                "MS_CONTAINER_IMAGE": self.runtime.container_image,
+                "MS_RUNTIME_GID": str(getattr(self.runtime, "gid", 1000)),
+                "MS_RUNTIME_UID": str(getattr(self.runtime, "uid", 1000)),
+                "MS_S3_ROOT": self.runtime.s3_root,
+            },
+            "checkpoint_receipt": None,
+            "steps": [
+                {
+                    "name": "qualification-canary",
+                    "argv": remote_argv,
+                }
+            ],
+        }
+        operation_intent = self._operation_envelope(
+            core,
+            instance_id=instance_id,
+            terminate_at=None,
+        )
+        result = {
+            "provider": AWS_P5_PROFILE,
+            "profile_id": _V3_PROFILE_ID,
+            "qualification_tuple_sha256": plan.tuple_sha256,
+            "receipt_key_prefix": f"canaries/{plan.tuple_sha256}/",
+            "remote_canary_argv": remote_argv,
+            "operation_intent": operation_intent,
+            "operation_id": operation_intent["operation_id"],
+            "output": str(output_path),
+            "published": False,
+            "verified": True,
+        }
+        if not apply:
+            return result
+
+        instance_output = _aws_output_object(
+            self._run(
+                self._aws_argv(
+                    "ec2",
+                    "describe-instances",
+                    "--instance-ids",
+                    instance_id,
+                    query=(
+                        "{instance:{account_id:Reservations[0].OwnerId,"
+                        "instance_id:Reservations[0].Instances[0].InstanceId,"
+                        "image_id:Reservations[0].Instances[0].ImageId,"
+                        "instance_type:Reservations[0].Instances[0].InstanceType,"
+                        "state:Reservations[0].Instances[0].State.Name,"
+                        "architecture:Reservations[0].Instances[0].Architecture,"
+                        "private_ip:Reservations[0].Instances[0].PrivateIpAddress}}"
+                    ),
+                ),
+                operation="verify canary instance",
+            ),
+            {"instance"},
+            label="canary instance output",
+        )
+        selected = _aws_output_object(
+            instance_output["instance"],
+            {
+                "account_id",
+                "instance_id",
+                "image_id",
+                "instance_type",
+                "state",
+                "architecture",
+                "private_ip",
+            },
+            label="canary instance",
+        )
+        if (
+            selected["account_id"] != environment["account_id"]
+            or selected["instance_id"] != instance_id
+            or selected["image_id"] != environment["ami_id"]
+            or selected["instance_type"] != INSTANCE_TYPE
+            or selected["state"] != "running"
+            or selected["architecture"] != identity["architecture"]
+            or selected["private_ip"] != identity["privateIp"]
+        ):
+            raise MsctlError(
+                "CANARY_INPUT_INVALID",
+                "selected P5 differs from the authenticated environment",
+            )
+        self._require_ssm_online(instance_id)
+        self._ensure_argv_document()
+        published_intent = self._publish_operation_intent(operation_intent)
+        command_id = self._send_operation_intent(
+            instance_id=instance_id,
+            intent=operation_intent,
+            published=published_intent,
+            operation="send canary operation",
+        )
+        invocation_argv = self._aws_argv(
+            "ssm",
+            "get-command-invocation",
+            "--instance-id",
+            instance_id,
+            "--command-id",
+            command_id,
+            query=(
+                "{command:{command_id:CommandId,status:Status,"
+                "stdout:StandardOutputContent,"
+                "stderr:StandardErrorContent}}"
+            ),
+        )
+        deadline = self.monotonic() + _CANARY_REMOTE_TIMEOUT_SECONDS
+        while True:
+            try:
+                invocation_output = _aws_output_object(
+                    self._run(
+                        invocation_argv,
+                        operation="consume canary operation",
+                    ),
+                    {"command"},
+                    label="canary command output",
+                )
+            except MsctlError as error:
+                if (
+                    error.code != "AWS_COMMAND_FAILED"
+                    or self.monotonic() >= deadline
+                ):
+                    raise
+                self.sleep(_CANARY_POLL_SECONDS)
+                continue
+            invocation = _aws_output_object(
+                invocation_output["command"],
+                {"command_id", "status", "stdout", "stderr"},
+                label="canary command",
+            )
+            if (
+                invocation["command_id"] != command_id
+                or not isinstance(invocation["status"], str)
+                or not isinstance(invocation["stdout"], str)
+                or not isinstance(invocation["stderr"], str)
+                or invocation["stderr"] != ""
+            ):
+                raise MsctlError(
+                    "CANARY_REMOTE_FAILED",
+                    "remote P5 qualification returned invalid command evidence",
+                )
+            if invocation["status"] == "Success":
+                break
+            if invocation["status"] not in _ACTIVE_COMMAND_STATES:
+                raise MsctlError(
+                    "CANARY_REMOTE_FAILED",
+                    "remote P5 qualification failed before receipt production",
+                )
+            if self.monotonic() >= deadline:
+                raise MsctlError(
+                    "CANARY_REMOTE_FAILED",
+                    "remote P5 qualification exceeded its bounded deadline",
+                )
+            self.sleep(_CANARY_POLL_SECONDS)
+        candidates = []
+        for line in invocation["stdout"].splitlines():
+            try:
+                payload = (line + "\n").encode("ascii")
+                parsed = parse_qualification_receipt_bytes(
+                    payload,
+                    plan=plan,
+                )
+            except (UnicodeEncodeError, CanaryError):
+                continue
+            candidates.append((parsed, payload))
+        if len(candidates) != 1:
+            raise MsctlError(
+                "CANARY_RECEIPT_INVALID",
+                "remote command did not emit one exact qualification receipt",
+            )
+        qualification, receipt_bytes = candidates[0]
+        roundtrip = qualification["s3_roundtrip"]
+        roundtrip_uri = str(roundtrip["object_uri"])
+        prefix = self.runtime.s3_root.rstrip("/") + "/"
+        if not roundtrip_uri.startswith(prefix):
+            raise MsctlError(
+                "CANARY_RECEIPT_INVALID",
+                "roundtrip object is outside the pinned S3 root",
+            )
+        roundtrip_bucket, roundtrip_key = self._s3_location(
+            roundtrip_uri.removeprefix(prefix)
+        )
+        roundtrip_sha256 = str(roundtrip["sha256"])
+        roundtrip_checksum = base64.b64encode(
+            bytes.fromhex(roundtrip_sha256)
+        ).decode("ascii")
+        roundtrip_version = str(roundtrip["version_id"])
+        head_output = _aws_output_object(
+            self._run(
+                self._aws_argv(
+                    "s3api",
+                    "head-object",
+                    "--bucket",
+                    roundtrip_bucket,
+                    "--key",
+                    roundtrip_key,
+                    "--version-id",
+                    roundtrip_version,
+                    "--checksum-mode",
+                    "ENABLED",
+                    query=(
+                        "{object:{checksum_sha256:ChecksumSHA256,"
+                        "content_length:ContentLength,version_id:VersionId}}"
+                    ),
+                ),
+                operation="verify canary roundtrip object",
+            ),
+            {"object"},
+            label="canary roundtrip head output",
+        )
+        head = _aws_output_object(
+            head_output["object"],
+            {"checksum_sha256", "content_length", "version_id"},
+            label="canary roundtrip object",
+        )
+        if (
+            head["checksum_sha256"] != roundtrip_checksum
+            or type(head["content_length"]) is not int
+            or head["content_length"] != roundtrip["bytes"]
+            or head["version_id"] != roundtrip_version
+        ):
+            raise MsctlError(
+                "S3_OBJECT_MISMATCH",
+                "canary roundtrip object metadata does not match receipt",
+            )
+        with tempfile.TemporaryDirectory(
+            prefix="msctl-canary-roundtrip-",
+            dir=self.state_root,
+        ) as roundtrip_directory:
+            downloaded_path = Path(roundtrip_directory) / "roundtrip.json"
+            download_output = _aws_output_object(
+                self._run(
+                    self._aws_argv(
+                        "s3api",
+                        "get-object",
+                        "--bucket",
+                        roundtrip_bucket,
+                        "--key",
+                        roundtrip_key,
+                        "--version-id",
+                        roundtrip_version,
+                        "--checksum-mode",
+                        "ENABLED",
+                        str(downloaded_path),
+                        query=(
+                            "{object:{checksum_sha256:ChecksumSHA256,"
+                            "version_id:VersionId}}"
+                        ),
+                    ),
+                    operation="download canary roundtrip object",
+                ),
+                {"object"},
+                label="canary roundtrip download output",
+            )
+            downloaded = _aws_output_object(
+                download_output["object"],
+                {"checksum_sha256", "version_id"},
+                label="downloaded canary roundtrip object",
+            )
+            try:
+                downloaded_bytes = read_regular_input(
+                    downloaded_path,
+                    label="downloaded canary roundtrip object",
+                    maximum_bytes=1024 * 1024,
+                )
+            except (AttestationError, OSError) as error:
+                raise MsctlError(
+                    "S3_OBJECT_MISMATCH",
+                    "downloaded canary roundtrip object is unsafe",
+                ) from error
+        if (
+            downloaded["checksum_sha256"] != roundtrip_checksum
+            or downloaded["version_id"] != roundtrip_version
+            or downloaded_bytes != qualification_roundtrip_blob(plan)
+            or hashlib.sha256(downloaded_bytes).hexdigest()
+            != roundtrip_sha256
+        ):
+            raise MsctlError(
+                "S3_OBJECT_MISMATCH",
+                "downloaded canary roundtrip bytes do not match receipt",
+            )
+
+        receipt_sha256 = hashlib.sha256(receipt_bytes).hexdigest()
+        receipt_key = (
+            f"canaries/{plan.tuple_sha256}/{receipt_sha256}.json"
+        )
+        receipt_bucket, receipt_object_key = self._s3_location(receipt_key)
+        receipt_checksum = base64.b64encode(
+            bytes.fromhex(receipt_sha256)
+        ).decode("ascii")
+        put_version = None
+        with tempfile.TemporaryDirectory(
+            prefix="msctl-canary-receipt-",
+            dir=self.state_root,
+        ) as receipt_directory:
+            staged_receipt = Path(receipt_directory) / "qualification.json"
+            staged_receipt.write_bytes(receipt_bytes)
+            staged_receipt.chmod(0o600)
+            put_argv = self._aws_argv(
+                "s3api",
+                "put-object",
+                "--bucket",
+                receipt_bucket,
+                "--key",
+                receipt_object_key,
+                "--body",
+                str(staged_receipt),
+                "--content-length",
+                str(len(receipt_bytes)),
+                "--checksum-algorithm",
+                "SHA256",
+                "--checksum-sha256",
+                receipt_checksum,
+                "--metadata",
+                (
+                    f"qualification-tuple-sha256={plan.tuple_sha256},"
+                    f"receipt-sha256={receipt_sha256}"
+                ),
+                "--if-none-match",
+                "*",
+                query=(
+                    "{object:{checksum_sha256:ChecksumSHA256,"
+                    "version_id:VersionId}}"
+                ),
+            )
+            try:
+                put_output = _aws_output_object(
+                    self._run(
+                        put_argv,
+                        operation="publish canary receipt",
+                    ),
+                    {"object"},
+                    label="canary receipt publication output",
+                )
+            except MsctlError as error:
+                if error.code != "AWS_COMMAND_FAILED":
+                    raise
+            else:
+                put_object = _aws_output_object(
+                    put_output["object"],
+                    {"checksum_sha256", "version_id"},
+                    label="canary receipt publication",
+                )
+                if (
+                    put_object["checksum_sha256"] != receipt_checksum
+                    or not isinstance(put_object["version_id"], str)
+                    or put_object["version_id"] in {"", "null"}
+                ):
+                    raise MsctlError(
+                        "S3_OBJECT_MISMATCH",
+                        "published canary receipt lacks checksum or version",
+                    )
+                put_version = put_object["version_id"]
+        final_head_output = _aws_output_object(
+            self._run(
+                self._aws_argv(
+                    "s3api",
+                    "head-object",
+                    "--bucket",
+                    receipt_bucket,
+                    "--key",
+                    receipt_object_key,
+                    "--checksum-mode",
+                    "ENABLED",
+                    query=(
+                        "{object:{checksum_sha256:ChecksumSHA256,"
+                        "content_length:ContentLength,metadata:Metadata,"
+                        "version_id:VersionId}}"
+                    ),
+                ),
+                operation="verify canary receipt publication",
+            ),
+            {"object"},
+            label="canary receipt head output",
+        )
+        final_head = _aws_output_object(
+            final_head_output["object"],
+            {
+                "checksum_sha256",
+                "content_length",
+                "metadata",
+                "version_id",
+            },
+            label="published canary receipt",
+        )
+        version_id = final_head["version_id"]
+        if (
+            final_head["checksum_sha256"] != receipt_checksum
+            or type(final_head["content_length"]) is not int
+            or final_head["content_length"] != len(receipt_bytes)
+            or final_head["metadata"]
+            != {
+                "qualification-tuple-sha256": plan.tuple_sha256,
+                "receipt-sha256": receipt_sha256,
+            }
+            or not isinstance(version_id, str)
+            or version_id in {"", "null"}
+            or (put_version is not None and version_id != put_version)
+        ):
+            raise MsctlError(
+                "S3_OBJECT_MISMATCH",
+                "published canary receipt does not match verified bytes",
+            )
+        return {
+            **result,
+            "command_id": command_id,
+            "intent_sha256": published_intent["intent_sha256"],
+            "intent_uri": published_intent["intent_uri"],
+            "receipt_sha256": receipt_sha256,
+            "receipt_key": receipt_key,
+            "receipt_uri": (
+                f"{self.runtime.s3_root.rstrip('/')}/{receipt_key}"
+            ),
+            "published": True,
+            "version_id": version_id,
+        }
+
     def env_ensure(
         self,
         *,
@@ -4856,6 +5401,47 @@ class AwsP5Backend:
             return False, self.auth_check()
         if command == "capacity check":
             return False, self.capacity_check()
+        if command == "canary run":
+            apply = bool(getattr(args, "apply", False))
+            required = {
+                "release": getattr(args, "release", None),
+                "manifest": getattr(args, "manifest", None),
+                "dataset_receipt": getattr(args, "dataset_receipt", None),
+                "environment_receipt": getattr(
+                    args,
+                    "environment_receipt",
+                    None,
+                ),
+                "runtime_lock": getattr(args, "runtime_lock", None),
+                "instance_id": getattr(args, "instance_id", None),
+                "boot_id": getattr(args, "boot_id", None),
+                "output": getattr(args, "output", None),
+                "repo_root": getattr(args, "repo_root", None),
+            }
+            if any(value is None for value in required.values()):
+                raise MsctlError(
+                    "CLI_USAGE",
+                    "AWS v3 canary requires every explicit qualification input",
+                    details={
+                        "missing": [
+                            f"--{name.replace('_', '-')}"
+                            for name, value in required.items()
+                            if value is None
+                        ]
+                    },
+                )
+            return not apply, self.canary_run(
+                release_root=required["repo_root"],
+                release_receipt=required["release"],
+                run_manifest=required["manifest"],
+                dataset_receipt=required["dataset_receipt"],
+                environment_receipt=required["environment_receipt"],
+                runtime_lock=required["runtime_lock"],
+                instance_id=required["instance_id"],
+                boot_id=required["boot_id"],
+                output=required["output"],
+                apply=apply,
+            )
         if command == "env ensure":
             apply = bool(getattr(args, "apply", False))
             root_value = getattr(args, "root", None)

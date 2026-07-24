@@ -28,6 +28,7 @@ EXPECTED_CONFIGS = {
 }
 EXPECTED_EXECUTABLES = {
     "cluster/aws/p5/bootstrap.sh",
+    "cluster/aws/p5/canary.py",
     "cluster/aws/p5/interruption_checkpoint.py",
     "cluster/aws/p5/launch_seed_pair.py",
     "scripts/build_parallel_corpus.py",
@@ -306,6 +307,10 @@ def _minimal_repo(
         "cluster/aws/p5/attest_environment.py": (
             "#!/usr/bin/env python3\nraise SystemExit(0)\n"
         ),
+        "cluster/aws/p5/canary.py": (
+            "#!/usr/bin/env python3\nraise SystemExit(0)\n"
+        ),
+        "cluster/aws/p5/corpus_contract.py": "FORMAT = 2\n",
         "cluster/aws/p5/profile.py": (
             "def parse_aws_p5_profile_bytes(data):\n"
             "    return data\n"
@@ -336,6 +341,8 @@ def _minimal_repo(
         "organizer/__init__.py": "",
         "train/__init__.py": "",
         "train/model.py": "MODEL_PARAMETERS = 356_033_536\n",
+        "train/safeio.py": "SAFE_IO = True\n",
+        "train/trainer.py": "TRAINER = True\n",
         "scripts/build_parallel_corpus.py": (
             "#!/usr/bin/env python3\nraise SystemExit(0)\n"
         ),
@@ -501,6 +508,42 @@ def test_double_build_is_byte_identical_and_emits_external_receipts(tmp_path):
     assert "dataset_receipt_sha256" not in serialized
     assert "dataset_build_id" not in serialized
     assert "ordered_stream_sha256" not in serialized
+
+
+@pytest.mark.parametrize(
+    "missing",
+    [
+        "cluster/aws/p5/canary.py",
+        "cluster/aws/p5/corpus_contract.py",
+        "train/model.py",
+        "train/safeio.py",
+        "train/trainer.py",
+    ],
+)
+def test_packager_requires_canary_and_each_imported_runtime_dependency(
+    tmp_path,
+    missing,
+):
+    source = _minimal_repo(tmp_path)
+    runtime_members = {
+        "cluster/aws/p5/canary.py": "#!/usr/bin/env python3\n",
+        "cluster/aws/p5/corpus_contract.py": "FORMAT = 2\n",
+        "train/model.py": "MODEL_PARAMETERS = 356_033_536\n",
+        "train/safeio.py": "SAFE_IO = True\n",
+        "train/trainer.py": "TRAINER = True\n",
+    }
+    for relative, payload in runtime_members.items():
+        _write(
+            source / relative,
+            payload,
+            executable=relative == "cluster/aws/p5/canary.py",
+        )
+    _commit(source, "add qualification canary runtime")
+    (source / missing).unlink()
+    _commit(source, f"remove {missing}")
+
+    with pytest.raises(Exception, match=re.escape(missing)):
+        _build(_load_module(), source, tmp_path / "published")
 
 
 def test_packager_rejects_non_sha1_source_object_ids(tmp_path):

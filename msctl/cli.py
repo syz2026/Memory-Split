@@ -174,6 +174,23 @@ def build_parser() -> JsonArgumentParser:
     status.add_argument("--manifest", required=True)
     status.add_argument("--cached", action="store_true")
 
+    canary = _leaf(commands, "canary", help_text="P5 qualification canary")
+    canary_sub = canary.add_subparsers(dest="action", required=True)
+    canary_run = _leaf(
+        canary_sub,
+        "run",
+        help_text="plan or run one v3 P5 qualification",
+    )
+    canary_run.add_argument("--release", required=True)
+    canary_run.add_argument("--manifest", required=True)
+    canary_run.add_argument("--dataset-receipt", required=True)
+    canary_run.add_argument("--environment-receipt", required=True)
+    canary_run.add_argument("--runtime-lock", required=True)
+    canary_run.add_argument("--instance-id", required=True)
+    canary_run.add_argument("--boot-id", required=True)
+    canary_run.add_argument("--output", required=True)
+    canary_run.add_argument("--apply", action="store_true")
+
     collect = _leaf(commands, "collect", help_text="collect result evidence")
     collect.add_argument("--source", required=True)
     collect.add_argument("--out", required=True)
@@ -276,7 +293,7 @@ def dispatch(
     command = _command_name(args)
     default_profile_loader = (
         _load_cli_profile
-        if command in {"runs instantiate", "env ensure"}
+        if command in {"runs instantiate", "env ensure", "canary run"}
         else load_profile
     )
     profile = (profile_loader or default_profile_loader)(args.profile)
@@ -287,6 +304,14 @@ def dispatch(
             "PROVIDER_UNSUPPORTED",
             "profile provider is not supported",
             details={"provider": provider},
+        )
+    if command == "canary run" and (
+        provider != AWS_P5_PROFILE
+        or getattr(profile, "profile_id", None) != "aws-p5.48xlarge-v3"
+    ):
+        raise MsctlError(
+            "PROVIDER_UNSUPPORTED",
+            "P5 qualification canary requires the exact v3 AWS profile",
         )
     if command == "runs instantiate":
         if (

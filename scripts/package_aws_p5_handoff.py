@@ -60,6 +60,8 @@ REQUIRED_MEMBERS = EXPECTED_CONFIGS | {
     RUNBOOK_PATH,
     "cluster/aws/p5/attest_environment.py",
     "cluster/aws/p5/bootstrap.sh",
+    "cluster/aws/p5/canary.py",
+    "cluster/aws/p5/corpus_contract.py",
     "cluster/aws/p5/interruption_checkpoint.py",
     "cluster/aws/p5/launch_seed_pair.py",
     "cluster/aws/p5/profile.py",
@@ -76,6 +78,9 @@ REQUIRED_MEMBERS = EXPECTED_CONFIGS | {
     "tests/test_package_aws_p5_handoff.py",
     "train/__init__.py",
     "train/data.py",
+    "train/model.py",
+    "train/safeio.py",
+    "train/trainer.py",
 }
 _ROOT_INCLUDED = {
     "AWS-P5-START.md",
