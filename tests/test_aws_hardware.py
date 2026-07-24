@@ -2098,6 +2098,258 @@ def test_preexisting_single_version_never_becomes_retry_recoverable(tmp_path):
     assert store.get_calls == []
 
 
+def test_completion_record_binds_remote_local_version_and_intents(tmp_path):
+    from msctl.aws_hardware import (
+        PROVIDER_SELECTION_COMPLETION_LOCAL_PATH,
+        PROVIDER_SELECTION_MUTATION_ARCHIVE_LOCAL_PATH,
+        PROVIDER_SELECTION_PENDING_ARCHIVE_LOCAL_PATH,
+        PROVIDER_SELECTION_VERSION_LOCAL_PATH,
+        publish_provider_selection,
+    )
+
+    selection_data, runtime_lock, runtime_evidence = _write_authority_inputs(
+        tmp_path
+    )
+    authority_root = tmp_path / "authority-completion"
+    store = _MemorySelectionStore()
+    published = publish_provider_selection(
+        authority_root=authority_root,
+        repo_root=ROOT,
+        runtime_lock_path=runtime_lock,
+        runtime_evidence_path=runtime_evidence,
+        selection_data=selection_data,
+        store=store,
+        **_qualification_verification_kwargs(),
+    )
+    version_data = (
+        authority_root / PROVIDER_SELECTION_VERSION_LOCAL_PATH
+    ).read_bytes()
+    pending_archive_data = (
+        authority_root / PROVIDER_SELECTION_PENDING_ARCHIVE_LOCAL_PATH
+    ).read_bytes()
+    mutation_archive_data = (
+        authority_root / PROVIDER_SELECTION_MUTATION_ARCHIVE_LOCAL_PATH
+    ).read_bytes()
+    history_data = _canonical_json(
+        {
+            "delete_markers": [],
+            "key": SELECTION_S3_KEY,
+            "versions": [published.remote.version_id],
+        }
+    )
+    completion = json.loads(
+        (
+            authority_root / PROVIDER_SELECTION_COMPLETION_LOCAL_PATH
+        ).read_bytes()
+    )
+
+    assert completion == {
+        "expected_bytes": len(selection_data),
+        "history_commitment_sha256": hashlib.sha256(
+            history_data
+        ).hexdigest(),
+        "local_selection_sha256": hashlib.sha256(selection_data).hexdigest(),
+        "mutation_intent_sha256": hashlib.sha256(
+            mutation_archive_data
+        ).hexdigest(),
+        "pending_intent_sha256": hashlib.sha256(
+            pending_archive_data
+        ).hexdigest(),
+        "remote_version_id": published.remote.version_id,
+        "s3_key": SELECTION_S3_KEY,
+        "schema_version": 1,
+        "selection_sha256": published.selection.sha256,
+        "version_binding_sha256": hashlib.sha256(version_data).hexdigest(),
+    }
+
+
+@pytest.mark.parametrize(
+    "boundary",
+    [
+        "before-completion",
+        "after-completion",
+        "after-first-archive",
+        "after-second-archive",
+        "after-final-response",
+    ],
+)
+def test_terminal_completion_crashes_recover_identical_selection(
+    tmp_path,
+    monkeypatch,
+    boundary,
+):
+    import msctl.aws_hardware as hardware
+
+    selection_data, runtime_lock, runtime_evidence = _write_authority_inputs(
+        tmp_path
+    )
+    authority_root = tmp_path / f"authority-{boundary}"
+    store = _MemorySelectionStore()
+    failed = False
+    original_completion = getattr(hardware, "_publish_completion_record", None)
+    original_archive = getattr(hardware, "_archive_pending_selection")
+
+    if boundary in {"before-completion", "after-completion"}:
+        def completion_once(*args, **kwargs):
+            nonlocal failed
+            if not failed:
+                failed = True
+                if boundary == "after-completion":
+                    assert original_completion is not None
+                    original_completion(*args, **kwargs)
+                raise TimeoutError(f"synthetic crash {boundary}")
+            assert original_completion is not None
+            return original_completion(*args, **kwargs)
+
+        monkeypatch.setattr(
+            hardware,
+            "_publish_completion_record",
+            completion_once,
+            raising=False,
+        )
+    elif boundary in {"after-first-archive", "after-second-archive"}:
+        def archive_once(*args, **kwargs):
+            nonlocal failed
+            if not failed:
+                failed = True
+                if boundary == "after-first-archive":
+                    pending = Path(authority_root) / (
+                        hardware.PROVIDER_SELECTION_PENDING_LOCAL_PATH
+                    )
+                    archive = Path(authority_root) / (
+                        hardware.PROVIDER_SELECTION_PENDING_ARCHIVE_LOCAL_PATH
+                    )
+                    pending.rename(archive)
+                else:
+                    original_archive(*args, **kwargs)
+                raise TimeoutError(f"synthetic crash {boundary}")
+            return original_archive(*args, **kwargs)
+
+        monkeypatch.setattr(hardware, "_archive_pending_selection", archive_once)
+
+    if boundary == "after-final-response":
+        first = hardware.publish_provider_selection(
+            authority_root=authority_root,
+            repo_root=ROOT,
+            runtime_lock_path=runtime_lock,
+            runtime_evidence_path=runtime_evidence,
+            selection_data=selection_data,
+            store=store,
+            **_qualification_verification_kwargs(),
+        )
+        assert first.publication_state == "published"
+    else:
+        with pytest.raises(ValueError, match="uncertain|completion|crash"):
+            hardware.publish_provider_selection(
+                authority_root=authority_root,
+                repo_root=ROOT,
+                runtime_lock_path=runtime_lock,
+                runtime_evidence_path=runtime_evidence,
+                selection_data=selection_data,
+                store=store,
+                **_qualification_verification_kwargs(),
+            )
+
+    recovered = hardware.publish_provider_selection(
+        authority_root=authority_root,
+        repo_root=ROOT,
+        runtime_lock_path=runtime_lock,
+        runtime_evidence_path=runtime_evidence,
+        selection_data=selection_data,
+        store=store,
+        **_qualification_verification_kwargs(),
+    )
+    assert recovered.publication_state == "recovered"
+    assert len(store.put_calls) == 1
+
+
+@pytest.mark.parametrize(
+    "tamper",
+    [
+        "missing-completion",
+        "forged-completion",
+        "missing-pending-archive",
+        "missing-mutation-archive",
+        "forged-pending-archive",
+        "local-byte-drift",
+        "version-binding-drift",
+    ],
+)
+def test_admission_rejects_partial_or_forged_completion(tmp_path, tamper):
+    from msctl.aws_hardware import (
+        PROVIDER_SELECTION_COMPLETION_LOCAL_PATH,
+        PROVIDER_SELECTION_MUTATION_ARCHIVE_LOCAL_PATH,
+        PROVIDER_SELECTION_PENDING_ARCHIVE_LOCAL_PATH,
+        load_versioned_provider_selection_authority,
+        publish_provider_selection,
+    )
+
+    selection_data, runtime_lock, runtime_evidence = _write_authority_inputs(
+        tmp_path
+    )
+    authority_root = tmp_path / f"authority-{tamper}"
+    store = _MemorySelectionStore()
+    publish_provider_selection(
+        authority_root=authority_root,
+        repo_root=ROOT,
+        runtime_lock_path=runtime_lock,
+        runtime_evidence_path=runtime_evidence,
+        selection_data=selection_data,
+        store=store,
+        **_qualification_verification_kwargs(),
+    )
+    completion_path = authority_root / PROVIDER_SELECTION_COMPLETION_LOCAL_PATH
+    if tamper == "missing-completion":
+        completion_path.unlink()
+    elif tamper == "forged-completion":
+        completion = json.loads(completion_path.read_bytes())
+        completion["remote_version_id"] = "forged-version"
+        completion_path.write_bytes(_canonical_json(completion))
+        completion_path.chmod(0o600)
+    elif tamper == "missing-pending-archive":
+        (
+            authority_root / PROVIDER_SELECTION_PENDING_ARCHIVE_LOCAL_PATH
+        ).unlink()
+    else:
+        if tamper == "missing-mutation-archive":
+            (
+                authority_root
+                / PROVIDER_SELECTION_MUTATION_ARCHIVE_LOCAL_PATH
+            ).unlink()
+        elif tamper == "forged-pending-archive":
+            path = (
+                authority_root
+                / PROVIDER_SELECTION_PENDING_ARCHIVE_LOCAL_PATH
+            )
+            path.write_bytes(_canonical_json({"forged": True}))
+            path.chmod(0o600)
+        elif tamper == "local-byte-drift":
+            path = authority_root / SELECTION_LOCAL_PATH
+            path.write_bytes(b'{"drift":true}\n')
+            path.chmod(0o600)
+        elif tamper == "version-binding-drift":
+            path = authority_root / (
+                "memorysplit-confirmatory-v3-360m-n10-aws/"
+                "provider-selection-version.json"
+            )
+            version = json.loads(path.read_bytes())
+            version["version_id"] = "drift-version"
+            path.write_bytes(_canonical_json(version))
+            path.chmod(0o600)
+        else:  # pragma: no cover - parameter guard
+            raise AssertionError(tamper)
+
+    with pytest.raises(ValueError, match="completion|archive|authority"):
+        load_versioned_provider_selection_authority(
+            authority_root=authority_root,
+            repo_root=ROOT,
+            runtime_lock_path=runtime_lock,
+            runtime_evidence_path=runtime_evidence,
+            store=store,
+            **_qualification_verification_kwargs(),
+        )
+
+
 def test_published_version_is_persisted_and_required_for_exact_replay(tmp_path):
     from msctl.aws_hardware import (
         PROVIDER_SELECTION_VERSION_LOCAL_PATH,
@@ -2137,12 +2389,15 @@ def test_published_version_is_persisted_and_required_for_exact_replay(tmp_path):
         **_qualification_verification_kwargs(),
     )
     assert replayed == published.selection
-    assert store.get_calls == [
-        {
+    assert len(store.get_calls) == 3
+    assert all(
+        call
+        == {
             "key": published.remote.key,
             "version_id": published.remote.version_id,
         }
-    ]
+        for call in store.get_calls
+    )
 
     version_receipt["version_id"] = "other-version"
     version_path.write_bytes(_canonical_json(version_receipt))
@@ -2262,7 +2517,8 @@ def test_fixed_authority_publishes_local_and_versioned_store_once(tmp_path):
         }
     ]
     assert store.head_calls == [
-        {"key": PROVIDER_SELECTION_S3_KEY, "version_id": "version-1"}
+        {"key": PROVIDER_SELECTION_S3_KEY, "version_id": "version-1"},
+        {"key": PROVIDER_SELECTION_S3_KEY, "version_id": "version-1"},
     ]
 
     with pytest.raises(TypeError):
@@ -2370,7 +2626,8 @@ def test_fixed_store_recovers_only_exact_lost_put(tmp_path):
 
     assert published.remote.version_id == "version-1"
     assert store.head_calls == [
-        {"key": PROVIDER_SELECTION_S3_KEY, "version_id": None}
+        {"key": PROVIDER_SELECTION_S3_KEY, "version_id": None},
+        {"key": PROVIDER_SELECTION_S3_KEY, "version_id": "version-1"},
     ]
 
 
@@ -2692,7 +2949,7 @@ def test_authority_cli_is_dry_run_by_default_and_apply_is_explicit(tmp_path):
     assert applied["selection_sha256"] == hashlib.sha256(
         paths["selection"].read_bytes()
     ).hexdigest()
-    assert store.list_calls == [SELECTION_S3_KEY, SELECTION_S3_KEY]
+    assert store.list_calls == [SELECTION_S3_KEY] * 4
 
 
 def test_cli_apply_timeout_reports_uncertain_then_retry_reports_recovered(

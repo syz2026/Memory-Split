@@ -367,3 +367,52 @@ frozen profile/amendment/preregistration/cohort diff assertions
 
 No frozen profile, amendment, preregistration, or cohort bytes changed. No live
 AWS command or paid-capacity mutation was performed.
+
+## Terminal completion-record remediation (2026-07-24)
+
+- Before either live pending or remote-mutation intent can be archived, the
+  authority atomically installs one fixed no-replace completion record.
+- The completion record binds selection SHA-256 and byte count, fixed S3 key,
+  exact remote version ID, singleton-history commitment, local selection hash,
+  version-binding hash, and both live intent hashes.
+- Completion installation independently re-lists singleton history and
+  re-verifies exact-version HEAD and GET bytes before the record is published.
+- Retry, replay, admission, and resume authenticate the completion record,
+  local selection/version bindings, whichever live or archived form exists for
+  each intent, singleton history commitment, HEAD, GET, and exact bytes.
+- Completion recovery works with both live intents, either intent archived,
+  both intents archived, and after a successful final response. Intent
+  quarantine is idempotent only after completion is durable.
+- Missing, partial, forged, or mismatched completion/archives/bindings, byte
+  drift, conflicting selections, multiple remote versions, and delete markers
+  fail closed.
+
+### Terminal RED/GREEN evidence
+
+- RED reproduced missing completion authority and failed identical retry at
+  completion-write, first-archive, second-archive, and post-response windows.
+- GREEN passed completion binding, crashes before/after completion write,
+  crashes after each archive, post-response replay, conflicting selection, and
+  missing/forged/archive/local/version drift cases.
+
+### Terminal verification
+
+```text
+tests/test_aws_hardware.py tests/test_aws_p5_profile.py
+tests/test_cohort_assignment_v3.py
+=> 240 passed
+
+tests/test_aws_contract_roundtrip.py tests/test_run_manifest_v3.py
+tests/test_aws_environment_receipt.py tests/test_aws_canary.py
+tests/test_aws_p5_launcher.py
+=> 347 passed
+
+python -m py_compile cluster/aws/gpu_profile.py cluster/aws/p5/profile.py
+  msctl/aws_hardware.py tests/test_aws_hardware.py
+git diff --check
+frozen profile/amendment/preregistration/cohort diff assertions
+=> passed
+```
+
+No frozen profile, amendment, preregistration, or cohort bytes changed. No live
+AWS command or paid-capacity mutation was performed.

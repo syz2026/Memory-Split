@@ -63,6 +63,10 @@ PROVIDER_SELECTION_MUTATION_ARCHIVE_LOCAL_PATH = (
     "memorysplit-confirmatory-v3-360m-n10-aws/"
     "provider-selection-remote-mutation-completed.json"
 )
+PROVIDER_SELECTION_COMPLETION_LOCAL_PATH = (
+    "memorysplit-confirmatory-v3-360m-n10-aws/"
+    "provider-selection-completion.json"
+)
 AWS_HARDWARE_AMENDMENT_SHA256 = (
     "d4cf13b587c751d27756ad7881e538facb7ea79305a098990a568a7b28b6fb14"
 )
@@ -2203,6 +2207,18 @@ def _preflight_local_selection(
         )
 
 
+def _optional_private_bytes(path: Path, *, label: str) -> bytes | None:
+    try:
+        return _regular_bytes(path, label=label, private=True)
+    except ValueError as error:
+        cause = error.__cause__
+        if isinstance(cause, FileNotFoundError) or (
+            isinstance(cause, MsctlError) and cause.code == "FILE_NOT_FOUND"
+        ):
+            return None
+        raise
+
+
 def _matching_durable_selection_binding(
     *,
     authority_root: Path | str,
@@ -2374,83 +2390,64 @@ def _archive_pending_selection(
         pending.parent,
         label="provider selection authority parent",
     )
+
+    def archive_one(live: Path, completed: Path, *, label: str) -> None:
+        current = _optional_private_bytes(live, label=f"{label} live")
+        archived = _optional_private_bytes(
+            completed,
+            label=f"{label} archive",
+        )
+        if current is None:
+            if archived != pending_data:
+                raise SelectionPublicationError(
+                    f"{label} is missing or partially archived",
+                    publication_state="conflict",
+                )
+            return
+        if current != pending_data:
+            raise SelectionPublicationError(
+                f"{label} live bytes conflict",
+                publication_state="conflict",
+            )
+        if archived is None:
+            rename_noreplace_at(
+                parent_fd,
+                live.name,
+                parent_fd,
+                completed.name,
+            )
+            os.fsync(parent_fd)
+        else:
+            if archived != pending_data:
+                raise SelectionPublicationError(
+                    f"{label} archive conflicts",
+                    publication_state="conflict",
+                )
+            os.unlink(live.name, dir_fd=parent_fd)
+            os.fsync(parent_fd)
+        if _regular_bytes(
+            completed,
+            label=f"{label} archive",
+            private=True,
+        ) != pending_data:
+            raise SelectionPublicationError(
+                f"{label} archive is not durable",
+                publication_state="uncertain",
+            )
+
     try:
-        try:
-            rename_noreplace_at(
-                parent_fd,
-                pending.name,
-                parent_fd,
-                archive.name,
-            )
-            os.fsync(parent_fd)
-        except FileExistsError:
-            archived = _regular_bytes(
-                archive,
-                label="provider selection pending archive",
-                private=True,
-            )
-            current = _regular_bytes(
-                pending,
-                label="provider selection pending intent",
-                private=True,
-            )
-            if archived != pending_data or current != pending_data:
-                raise SelectionPublicationError(
-                    "provider selection pending archive conflicts",
-                    publication_state="conflict",
-                )
-            os.unlink(pending.name, dir_fd=parent_fd)
-            os.fsync(parent_fd)
-        try:
-            rename_noreplace_at(
-                parent_fd,
-                marker.name,
-                parent_fd,
-                marker_archive.name,
-            )
-            os.fsync(parent_fd)
-        except FileExistsError:
-            archived_marker = _regular_bytes(
-                marker_archive,
-                label="provider selection remote-mutation archive",
-                private=True,
-            )
-            current_marker = _regular_bytes(
-                marker,
-                label="provider selection remote-mutation marker",
-                private=True,
-            )
-            if (
-                archived_marker != pending_data
-                or current_marker != pending_data
-            ):
-                raise SelectionPublicationError(
-                    "provider selection remote-mutation archive conflicts",
-                    publication_state="conflict",
-                )
-            os.unlink(marker.name, dir_fd=parent_fd)
-            os.fsync(parent_fd)
+        archive_one(
+            pending,
+            archive,
+            label="provider selection pending intent",
+        )
+        archive_one(
+            marker,
+            marker_archive,
+            label="provider selection remote-mutation marker",
+        )
     finally:
         os.close(parent_fd)
-    archived = _regular_bytes(
-        archive,
-        label="provider selection pending archive",
-        private=True,
-    )
-    if archived != pending_data:
-        raise SelectionPublicationError(
-            "provider selection pending archive is not durable",
-            publication_state="uncertain",
-        )
-    if _regular_bytes(
-        marker_archive,
-        label="provider selection remote-mutation archive",
-        private=True,
-    ) != pending_data:
-        raise SelectionPublicationError(
-            "provider selection remote-mutation archive is not durable",
-            publication_state="uncertain",
-        )
     return archive
 
 
@@ -2648,6 +2645,275 @@ def _publish_version_binding(
     return destination
 
 
+def _selection_history_data(version_id: str) -> bytes:
+    return _canonical_json(
+        {
+            "delete_markers": [],
+            "key": PROVIDER_SELECTION_S3_KEY,
+            "versions": [version_id],
+        }
+    )
+
+
+def _completion_path(authority_root: Path | str) -> Path:
+    return Path(authority_root).joinpath(
+        *PROVIDER_SELECTION_COMPLETION_LOCAL_PATH.split("/")
+    )
+
+
+def _verify_remote_completion_bytes(
+    *,
+    data: bytes,
+    store: VersionedProviderSelectionStore,
+    version_id: str,
+) -> VersionedSelectionObject:
+    digest = hashlib.sha256(data).hexdigest()
+    _require_singleton_selection_history(store=store, version_id=version_id)
+    remote = _verified_remote_object(
+        store.head(
+            key=PROVIDER_SELECTION_S3_KEY,
+            version_id=version_id,
+        ),
+        expected_sha256=digest,
+        expected_bytes=len(data),
+        expected_version=version_id,
+    )
+    fetched = store.get_exact(
+        key=PROVIDER_SELECTION_S3_KEY,
+        version_id=version_id,
+    )
+    if (
+        not isinstance(fetched, VersionedSelectionRead)
+        or fetched.data != data
+        or fetched.object != remote
+    ):
+        raise SelectionPublicationError(
+            "completion exact-version GET differs from authority bytes",
+            publication_state="conflict",
+        )
+    _require_singleton_selection_history(store=store, version_id=version_id)
+    return remote
+
+
+def _publish_completion_record(
+    *,
+    authority_root: Path | str,
+    data: bytes,
+    selection: AwsProviderSelectionReceipt,
+    remote: VersionedSelectionObject,
+    store: VersionedProviderSelectionStore,
+) -> Path:
+    root = Path(authority_root)
+    verified_remote = _verify_remote_completion_bytes(
+        data=data,
+        store=store,
+        version_id=remote.version_id,
+    )
+    if verified_remote != remote:
+        raise SelectionPublicationError(
+            "completion remote identity differs from publication",
+            publication_state="conflict",
+        )
+    local_data = _regular_bytes(
+        root.joinpath(*PROVIDER_SELECTION_LOCAL_PATH.split("/")),
+        label="provider selection authority",
+        private=True,
+    )
+    version_data = _regular_bytes(
+        root.joinpath(*PROVIDER_SELECTION_VERSION_LOCAL_PATH.split("/")),
+        label="provider selection version authority",
+        private=True,
+    )
+    pending_data = _regular_bytes(
+        root.joinpath(*PROVIDER_SELECTION_PENDING_LOCAL_PATH.split("/")),
+        label="provider selection pending intent",
+        private=True,
+    )
+    mutation_data = _regular_bytes(
+        root.joinpath(*PROVIDER_SELECTION_MUTATION_LOCAL_PATH.split("/")),
+        label="provider selection remote-mutation marker",
+        private=True,
+    )
+    expected_intent = _pending_selection_data(data)
+    if (
+        local_data != data
+        or pending_data != expected_intent
+        or mutation_data != expected_intent
+    ):
+        raise SelectionPublicationError(
+            "completion inputs differ from durable authority",
+            publication_state="conflict",
+        )
+    completion = {
+        "expected_bytes": len(data),
+        "history_commitment_sha256": hashlib.sha256(
+            _selection_history_data(remote.version_id)
+        ).hexdigest(),
+        "local_selection_sha256": hashlib.sha256(local_data).hexdigest(),
+        "mutation_intent_sha256": hashlib.sha256(mutation_data).hexdigest(),
+        "pending_intent_sha256": hashlib.sha256(pending_data).hexdigest(),
+        "remote_version_id": remote.version_id,
+        "s3_key": PROVIDER_SELECTION_S3_KEY,
+        "schema_version": 1,
+        "selection_sha256": selection.sha256,
+        "version_binding_sha256": hashlib.sha256(version_data).hexdigest(),
+    }
+    completion_data = _canonical_json(completion)
+    destination = _completion_path(authority_root)
+    try:
+        _write_selection_noreplace(destination, completion_data)
+    except FileExistsError as error:
+        existing = _regular_bytes(
+            destination,
+            label="provider selection completion",
+            private=True,
+        )
+        if existing != completion_data:
+            raise SelectionPublicationError(
+                "provider selection completion conflicts",
+                publication_state="conflict",
+            ) from error
+    return destination
+
+
+def _completion_intent_hash(
+    *,
+    live: Path,
+    archive: Path,
+    expected: bytes,
+    label: str,
+) -> str:
+    live_data = _optional_private_bytes(live, label=f"{label} live")
+    archive_data = _optional_private_bytes(archive, label=f"{label} archive")
+    if live_data is None and archive_data is None:
+        raise SelectionPublicationError(
+            f"completion {label} archive/live bytes are missing",
+            publication_state="conflict",
+        )
+    for candidate in (live_data, archive_data):
+        if candidate is not None and candidate != expected:
+            raise SelectionPublicationError(
+                f"completion {label} archive/live bytes conflict",
+                publication_state="conflict",
+            )
+    return hashlib.sha256(expected).hexdigest()
+
+
+def _authenticate_completion_record(
+    *,
+    authority_root: Path | str,
+    data: bytes,
+    store: VersionedProviderSelectionStore,
+    allow_missing: bool,
+) -> VersionedSelectionObject | None:
+    root = Path(authority_root)
+    completion_data = _optional_private_bytes(
+        _completion_path(authority_root),
+        label="provider selection completion",
+    )
+    pending_archive = root.joinpath(
+        *PROVIDER_SELECTION_PENDING_ARCHIVE_LOCAL_PATH.split("/")
+    )
+    mutation_archive = root.joinpath(
+        *PROVIDER_SELECTION_MUTATION_ARCHIVE_LOCAL_PATH.split("/")
+    )
+    if completion_data is None:
+        if (
+            _optional_private_bytes(
+                pending_archive,
+                label="provider selection pending archive",
+            )
+            is not None
+            or _optional_private_bytes(
+                mutation_archive,
+                label="provider selection mutation archive",
+            )
+            is not None
+        ):
+            raise SelectionPublicationError(
+                "archived intents require a completion record",
+                publication_state="conflict",
+            )
+        if allow_missing:
+            return None
+        raise SelectionPublicationError(
+            "provider selection completion record is missing",
+            publication_state="conflict",
+        )
+    value = _json_object(completion_data, label="provider selection completion")
+    expected_fields = {
+        "expected_bytes",
+        "history_commitment_sha256",
+        "local_selection_sha256",
+        "mutation_intent_sha256",
+        "pending_intent_sha256",
+        "remote_version_id",
+        "s3_key",
+        "schema_version",
+        "selection_sha256",
+        "version_binding_sha256",
+    }
+    if completion_data != _canonical_json(value) or set(value) != expected_fields:
+        raise SelectionPublicationError(
+            "provider selection completion schema is invalid",
+            publication_state="conflict",
+        )
+    local_data = _regular_bytes(
+        root.joinpath(*PROVIDER_SELECTION_LOCAL_PATH.split("/")),
+        label="provider selection authority",
+        private=True,
+    )
+    version_data = _regular_bytes(
+        root.joinpath(*PROVIDER_SELECTION_VERSION_LOCAL_PATH.split("/")),
+        label="provider selection version authority",
+        private=True,
+    )
+    version = _json_object(version_data, label="provider selection version")
+    version_id = value["remote_version_id"]
+    expected_intent = _pending_selection_data(data)
+    pending_hash = _completion_intent_hash(
+        live=root.joinpath(*PROVIDER_SELECTION_PENDING_LOCAL_PATH.split("/")),
+        archive=pending_archive,
+        expected=expected_intent,
+        label="provider selection pending intent",
+    )
+    mutation_hash = _completion_intent_hash(
+        live=root.joinpath(*PROVIDER_SELECTION_MUTATION_LOCAL_PATH.split("/")),
+        archive=mutation_archive,
+        expected=expected_intent,
+        label="provider selection remote-mutation marker",
+    )
+    if (
+        type(value["schema_version"]) is not int
+        or value["schema_version"] != 1
+        or type(value["expected_bytes"]) is not int
+        or value["expected_bytes"] != len(data)
+        or value["s3_key"] != PROVIDER_SELECTION_S3_KEY
+        or value["selection_sha256"] != hashlib.sha256(data).hexdigest()
+        or value["local_selection_sha256"]
+        != hashlib.sha256(local_data).hexdigest()
+        or local_data != data
+        or value["version_binding_sha256"]
+        != hashlib.sha256(version_data).hexdigest()
+        or not isinstance(version_id, str)
+        or version.get("version_id") != version_id
+        or version.get("selection_sha256") != hashlib.sha256(data).hexdigest()
+        or value["pending_intent_sha256"] != pending_hash
+        or value["mutation_intent_sha256"] != mutation_hash
+        or value["history_commitment_sha256"]
+        != hashlib.sha256(_selection_history_data(version_id)).hexdigest()
+    ):
+        raise SelectionPublicationError(
+            "provider selection completion/version bindings differ",
+            publication_state="conflict",
+        )
+    return _verify_remote_completion_bytes(
+        data=data,
+        store=store,
+        version_id=version_id,
+    )
+
+
 def publish_provider_selection(
     *,
     authority_root: Path | str,
@@ -2673,6 +2939,28 @@ def publish_provider_selection(
         approval_verifier=approval_verifier,
         trusted_public_key_sha256=trusted_public_key_sha256,
     )
+    completed_remote = _authenticate_completion_record(
+        authority_root=authority_root,
+        data=selection_data,
+        store=store,
+        allow_missing=True,
+    )
+    if completed_remote is not None:
+        _archive_pending_selection(
+            authority_root=authority_root,
+            data=selection_data,
+        )
+        return PublishedProviderSelection(
+            selection=selection,
+            local_path=Path(authority_root).joinpath(
+                *PROVIDER_SELECTION_LOCAL_PATH.split("/")
+            ),
+            remote=completed_remote,
+            version_path=Path(authority_root).joinpath(
+                *PROVIDER_SELECTION_VERSION_LOCAL_PATH.split("/")
+            ),
+            publication_state="recovered",
+        )
     _preflight_local_selection(
         authority_root=authority_root,
         data=selection_data,
@@ -2705,6 +2993,13 @@ def publish_provider_selection(
             authority_root=authority_root,
             selection=selection,
             remote=remote,
+        )
+        _publish_completion_record(
+            authority_root=authority_root,
+            data=selection_data,
+            selection=selection,
+            remote=remote,
+            store=store,
         )
         _archive_pending_selection(
             authority_root=authority_root,
@@ -2804,7 +3099,17 @@ def load_versioned_provider_selection_authority(
         or version["version_id"] in {"", "null"}
         or selection_sha256 != hashlib.sha256(local_data).hexdigest()
     ):
-        raise ValueError("provider selection version identity is invalid")
+        raise ValueError(
+            "provider selection version authority identity is invalid"
+        )
+    completed_remote = _authenticate_completion_record(
+        authority_root=authority_root,
+        data=local_data,
+        store=store,
+        allow_missing=False,
+    )
+    if completed_remote is None or completed_remote.version_id != version["version_id"]:
+        raise ValueError("provider selection completion version differs")
     _require_singleton_selection_history(
         store=store,
         version_id=version["version_id"],
@@ -3164,6 +3469,7 @@ __all__ = [
     "P6_PROFILE_PATH",
     "OpenSslQualificationApprovalVerifier",
     "PREREGISTRATION_PATH",
+    "PROVIDER_SELECTION_COMPLETION_LOCAL_PATH",
     "PROVIDER_SELECTION_LOCAL_PATH",
     "PROVIDER_SELECTION_MUTATION_ARCHIVE_LOCAL_PATH",
     "PROVIDER_SELECTION_MUTATION_LOCAL_PATH",
