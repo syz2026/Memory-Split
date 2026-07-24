@@ -505,6 +505,30 @@ def test_public_resolver_rejects_unreviewed_request_before_transport(
         )
 
 
+def test_failed_public_resolution_preserves_partial_materialization(
+    tmp_path,
+    monkeypatch,
+):
+    request = next(
+        row
+        for row in source_lock_module.PUBLIC_REQUESTS
+        if row.source_id == "clrs_text"
+    )
+    monkeypatch.setattr(source_lock_module, "HfApi", lambda *, token: object())
+    resolver = PublicSourceResolver()
+
+    def fail_after_write(_request, _root, materialized):
+        (materialized / "partial").write_bytes(b"partial")
+        raise ValueError("fixture failure")
+
+    monkeypatch.setattr(resolver, "_resolve_git", fail_after_write)
+    with pytest.raises(ValueError, match="fixture failure"):
+        resolver.resolve(request, tmp_path / "downloads")
+    assert (
+        tmp_path / "downloads" / request.source_id / "partial"
+    ).read_bytes() == b"partial"
+
+
 def test_zero_byte_source_file_verifies_and_stages(
     tmp_path,
     fixture_source_lock,
@@ -664,6 +688,19 @@ def test_stage_detects_canonical_namespace_replacement_after_pinning(
         path.name.startswith(f".{fixture_source_lock.lock.sha256}.tmp-")
         for path in (displaced / "sources").iterdir()
     )
+    quarantines = tuple(
+        path
+        for path in (displaced / "sources").iterdir()
+        if path.name.startswith(".memorysplit-source-cleanup-")
+    )
+    assert len(quarantines) == 1
+    assert quarantines[0].is_dir()
+    with pytest.raises(ValueError, match="quarantine.*offline cleanup"):
+        stage_source_lock(
+            fixture_source_lock.lock,
+            fixture_source_lock.download_root,
+            displaced,
+        )
 
 
 def test_stage_reuse_detects_canonical_namespace_replacement(
@@ -681,11 +718,12 @@ def test_stage_reuse_detects_canonical_namespace_replacement(
     real_verify_fd = source_lock_module._verify_source_tree_fd
     calls = 0
 
-    def replace_during_reuse(lock, root_fd):
+    def replace_during_reuse(lock, root_fd, **kwargs):
         nonlocal calls
-        calls += 1
-        result = real_verify_fd(lock, root_fd)
-        if calls == 2:
+        if kwargs.get("_run_finemath_proof", True):
+            calls += 1
+        result = real_verify_fd(lock, root_fd, **kwargs)
+        if calls == 2 and kwargs.get("_run_finemath_proof", True):
             canonical.rename(displaced)
             canonical.mkdir(mode=0o700)
             (canonical / "sources").mkdir(mode=0o700)
@@ -1127,7 +1165,109 @@ def test_verify_detects_nested_insert_remove_race(
         )
 
 
-def _run_cleanup_with_hook(tmp_path, monkeypatch, setup, hook):
+def test_finemath_proof_detects_file_replacement(
+    fixture_source_lock,
+    monkeypatch,
+):
+    root = fixture_source_lock.download_root
+    victim = (
+        root
+        / "finemath"
+        / "finemath-4plus"
+        / "train-00000-of-00064.parquet"
+    )
+    mutated = False
+
+    def mutate(phase, _root_fd, _descriptors):
+        nonlocal mutated
+        if phase == "during_proof" and not mutated:
+            mutated = True
+            payload = victim.read_bytes()
+            victim.unlink()
+            victim.write_bytes(payload)
+
+    monkeypatch.setattr(
+        source_lock_module,
+        "_finemath_proof_hook",
+        mutate,
+        raising=False,
+    )
+    with pytest.raises(ValueError, match="changed during FineMath proof"):
+        verify_source_tree(
+            fixture_source_lock.lock,
+            root,
+        )
+
+
+def test_finemath_proof_detects_transient_entry(
+    fixture_source_lock,
+    monkeypatch,
+):
+    root = fixture_source_lock.download_root
+    transient = root / "proof-transient"
+    mutated = False
+
+    def mutate(phase, _root_fd, _descriptors):
+        nonlocal mutated
+        if phase == "during_proof" and not mutated:
+            mutated = True
+            transient.write_bytes(b"race")
+            transient.unlink()
+
+    monkeypatch.setattr(
+        source_lock_module,
+        "_finemath_proof_hook",
+        mutate,
+        raising=False,
+    )
+    with pytest.raises(ValueError, match="changed during FineMath proof"):
+        verify_source_tree(
+            fixture_source_lock.lock,
+            root,
+        )
+
+
+def test_finemath_proof_detects_directory_replacement(
+    tmp_path,
+    fixture_source_lock,
+    monkeypatch,
+):
+    root = fixture_source_lock.download_root
+    victim = root / "arc_agi_1" / "data" / "training"
+    displaced = tmp_path / "training-displaced"
+    mutated = False
+
+    def mutate(phase, _root_fd, _descriptors):
+        nonlocal mutated
+        if phase == "during_proof" and not mutated:
+            mutated = True
+            victim.rename(displaced)
+            victim.mkdir(mode=0o700)
+            (victim / "a.json").write_bytes(
+                (displaced / "a.json").read_bytes()
+            )
+
+    monkeypatch.setattr(
+        source_lock_module,
+        "_finemath_proof_hook",
+        mutate,
+        raising=False,
+    )
+    with pytest.raises(ValueError, match="changed during FineMath proof"):
+        verify_source_tree(
+            fixture_source_lock.lock,
+            root,
+        )
+
+
+def _run_cleanup_with_hook(
+    tmp_path,
+    monkeypatch,
+    setup,
+    hook,
+    *,
+    expect_failure=False,
+):
     parent = tmp_path / "cleanup-parent"
     stage = parent / "stage"
     stage.mkdir(parents=True, mode=0o700)
@@ -1143,8 +1283,17 @@ def _run_cleanup_with_hook(tmp_path, monkeypatch, setup, hook):
         raising=False,
     )
     try:
-        with pytest.raises(ValueError, match="cleanup.*identity|restore"):
-            source_lock_module._remove_owned_directory_at(
+        if expect_failure:
+            with pytest.raises(ValueError, match="cleanup.*identity|restore"):
+                source_lock_module._remove_owned_directory_at(
+                    parent_fd,
+                    "stage",
+                    source_lock_module._namespace_identity(stage.lstat()),
+                    description="cleanup test stage",
+                )
+            quarantine_name = None
+        else:
+            quarantine_name = source_lock_module._remove_owned_directory_at(
                 parent_fd,
                 "stage",
                 source_lock_module._namespace_identity(stage.lstat()),
@@ -1152,7 +1301,31 @@ def _run_cleanup_with_hook(tmp_path, monkeypatch, setup, hook):
             )
     finally:
         os.close(parent_fd)
-    return stage
+    return parent, quarantine_name
+
+
+def test_cleanup_preserves_verified_stage_as_quarantine(tmp_path):
+    parent = tmp_path / "cleanup-parent"
+    stage = parent / "stage"
+    stage.mkdir(parents=True, mode=0o700)
+    (stage / "payload").write_bytes(b"payload")
+    parent_fd = os.open(
+        parent,
+        os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+    )
+    try:
+        quarantine_name = source_lock_module._remove_owned_directory_at(
+            parent_fd,
+            "stage",
+            source_lock_module._namespace_identity(stage.lstat()),
+            description="cleanup test stage",
+        )
+    finally:
+        os.close(parent_fd)
+    assert not stage.exists()
+    quarantine = parent / quarantine_name
+    assert quarantine.is_dir()
+    assert (quarantine / "payload").read_bytes() == b"payload"
 
 
 def test_cleanup_never_unlinks_replacement_file(
@@ -1163,18 +1336,25 @@ def test_cleanup_never_unlinks_replacement_file(
         (stage / "victim").write_bytes(b"verified")
 
     def hook(phase, parent_fd, name, _quarantine, _descriptor, is_directory):
-        if phase == "before_quarantine" and name == "victim" and not is_directory:
+        if phase == "before_quarantine" and name == "stage" and is_directory:
+            stage_fd = _descriptor
             os.rename(
                 "victim",
                 "original-preserved",
-                src_dir_fd=parent_fd,
-                dst_dir_fd=parent_fd,
+                src_dir_fd=stage_fd,
+                dst_dir_fd=stage_fd,
             )
-            _write_file_at(parent_fd, "victim", b"replacement")
+            _write_file_at(stage_fd, "victim", b"replacement")
 
-    stage = _run_cleanup_with_hook(tmp_path, monkeypatch, setup, hook)
-    assert (stage / "original-preserved").read_bytes() == b"verified"
-    assert (stage / "victim").read_bytes() == b"replacement"
+    parent, quarantine_name = _run_cleanup_with_hook(
+        tmp_path,
+        monkeypatch,
+        setup,
+        hook,
+    )
+    quarantine = parent / quarantine_name
+    assert (quarantine / "original-preserved").read_bytes() == b"verified"
+    assert (quarantine / "victim").read_bytes() == b"replacement"
 
 
 def test_cleanup_never_removes_replacement_directory(
@@ -1187,27 +1367,38 @@ def test_cleanup_never_removes_replacement_directory(
         (child / "verified").write_bytes(b"verified")
 
     def hook(phase, parent_fd, name, _quarantine, _descriptor, is_directory):
-        if phase == "before_quarantine" and name == "victim-dir" and is_directory:
+        if phase == "before_quarantine" and name == "stage" and is_directory:
+            stage_fd = _descriptor
             os.rename(
                 "victim-dir",
                 "original-preserved",
-                src_dir_fd=parent_fd,
-                dst_dir_fd=parent_fd,
+                src_dir_fd=stage_fd,
+                dst_dir_fd=stage_fd,
             )
-            os.mkdir("victim-dir", mode=0o700, dir_fd=parent_fd)
+            os.mkdir("victim-dir", mode=0o700, dir_fd=stage_fd)
             replacement_fd = os.open(
                 "victim-dir",
                 os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
-                dir_fd=parent_fd,
+                dir_fd=stage_fd,
             )
             try:
                 _write_file_at(replacement_fd, "replacement", b"replacement")
             finally:
                 os.close(replacement_fd)
 
-    stage = _run_cleanup_with_hook(tmp_path, monkeypatch, setup, hook)
-    assert (stage / "original-preserved" / "verified").read_bytes() == b"verified"
-    assert (stage / "victim-dir" / "replacement").read_bytes() == b"replacement"
+    parent, quarantine_name = _run_cleanup_with_hook(
+        tmp_path,
+        monkeypatch,
+        setup,
+        hook,
+    )
+    quarantine = parent / quarantine_name
+    assert (
+        quarantine / "original-preserved" / "verified"
+    ).read_bytes() == b"verified"
+    assert (
+        quarantine / "victim-dir" / "replacement"
+    ).read_bytes() == b"replacement"
 
 
 def test_cleanup_restore_failure_preserves_quarantine_and_blocker(
@@ -1222,30 +1413,62 @@ def test_cleanup_restore_failure_preserves_quarantine_and_blocker(
     def hook(phase, parent_fd, name, _quarantine, _descriptor, is_directory):
         if (
             phase == "before_quarantine"
-            and name == "victim"
-            and not is_directory
+            and name == "stage"
+            and is_directory
         ):
             os.rename(
-                "victim",
+                "stage",
                 "original-preserved",
                 src_dir_fd=parent_fd,
                 dst_dir_fd=parent_fd,
             )
-            _write_file_at(parent_fd, "victim", b"replacement")
+            os.mkdir("stage", mode=0o700, dir_fd=parent_fd)
+            replacement_fd = os.open(
+                "stage",
+                os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+                dir_fd=parent_fd,
+            )
+            try:
+                _write_file_at(
+                    replacement_fd,
+                    "replacement",
+                    b"replacement",
+                )
+            finally:
+                os.close(replacement_fd)
             state["replaced"] = True
         elif (
             phase == "after_quarantine"
-            and name == "victim"
+            and name == "stage"
             and state["replaced"]
         ):
-            _write_file_at(parent_fd, "victim", b"restore-blocker")
+            os.mkdir("stage", mode=0o700, dir_fd=parent_fd)
+            blocker_fd = os.open(
+                "stage",
+                os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+                dir_fd=parent_fd,
+            )
+            try:
+                _write_file_at(blocker_fd, "blocker", b"restore-blocker")
+            finally:
+                os.close(blocker_fd)
 
-    stage = _run_cleanup_with_hook(tmp_path, monkeypatch, setup, hook)
-    assert (stage / "original-preserved").read_bytes() == b"verified"
-    assert (stage / "victim").read_bytes() == b"restore-blocker"
-    quarantines = tuple(stage.glob(".memorysplit-source-cleanup-*"))
+    parent, _quarantine_name = _run_cleanup_with_hook(
+        tmp_path,
+        monkeypatch,
+        setup,
+        hook,
+        expect_failure=True,
+    )
+    assert (
+        parent / "original-preserved" / "victim"
+    ).read_bytes() == b"verified"
+    assert (parent / "stage" / "blocker").read_bytes() == b"restore-blocker"
+    quarantines = tuple(parent.glob(".memorysplit-source-cleanup-*"))
     assert len(quarantines) == 1
-    assert quarantines[0].read_bytes() == b"replacement"
+    assert (
+        quarantines[0] / "replacement"
+    ).read_bytes() == b"replacement"
 
 
 def test_load_authority_requires_expected_generator_commit(

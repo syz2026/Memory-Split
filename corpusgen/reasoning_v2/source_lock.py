@@ -60,6 +60,7 @@ _FINEMATH_SELECTION_ALGORITHM = "nfc-fineweb-exact-dedup-gpt2-eot-v1"
 _FINEMATH_SHARD_RE = re.compile(
     r"train-(?P<index>[0-9]{5})-of-(?P<count>[0-9]{5})\.parquet\Z"
 )
+_CLEANUP_QUARANTINE_PREFIX = ".memorysplit-source-cleanup-"
 _FINEWEB_FILES = (
     "sample/10BT/000_00000.parquet",
     "sample/10BT/001_00000.parquet",
@@ -1375,6 +1376,35 @@ def _verify_finemath_selection_descriptors(
             )
 
 
+@dataclass(frozen=True)
+class _SourceTreeSnapshot:
+    lock_sha256: str
+    directories: tuple[
+        tuple[
+            str,
+            tuple[int, int, int, int, int, int, int | None, int | None],
+            tuple[str, ...],
+        ],
+        ...,
+    ]
+    files: tuple[
+        tuple[
+            str,
+            tuple[int, int, int, int, int, int, int | None, int | None],
+            str,
+        ],
+        ...,
+    ]
+
+
+def _finemath_proof_hook(
+    phase: str,
+    root_fd: int,
+    descriptors: dict[str, tuple[int, object]],
+) -> None:
+    del phase, root_fd, descriptors
+
+
 def _directory_verification_hook(
     phase: str,
     directory_fd: int,
@@ -1387,6 +1417,9 @@ def _directory_verification_hook(
 def _verify_source_tree_fd(
     lock: SourceLock,
     root_fd: int,
+    *,
+    _run_finemath_proof: bool = True,
+    _expected_snapshot: _SourceTreeSnapshot | None = None,
 ) -> dict[str, object]:
     root_metadata = os.fstat(root_fd)
     _require_owned_mode(
@@ -1420,13 +1453,31 @@ def _verify_source_tree_fd(
     finemath_proof = finemath_entry.finemath_selection
     if finemath_proof is None:
         raise ValueError("FineMath selection proof is missing")
-    proof_paths = {
-        *(f"fineweb_edu/{path}" for path in _FINEWEB_FILES),
-        *(f"finemath/{path}" for path in finemath_proof.selected_paths),
-    }
+    proof_paths = (
+        {
+            *(f"fineweb_edu/{path}" for path in _FINEWEB_FILES),
+            *(f"finemath/{path}" for path in finemath_proof.selected_paths),
+        }
+        if _run_finemath_proof
+        else set()
+    )
     proof_descriptors: dict[
         str,
         tuple[int, tuple[int, int, int, int, int, int, int | None, int | None]],
+    ] = {}
+    directory_snapshots: dict[
+        str,
+        tuple[
+            tuple[int, int, int, int, int, int, int | None, int | None],
+            tuple[str, ...],
+        ],
+    ] = {}
+    file_snapshots: dict[
+        str,
+        tuple[
+            tuple[int, int, int, int, int, int, int | None, int | None],
+            str,
+        ],
     ] = {}
     total_bytes = 0
 
@@ -1566,6 +1617,10 @@ def _verify_source_tree_fd(
             expected = expected_files[relative]
             if byte_count != expected.bytes or digest.hexdigest() != expected.sha256:
                 raise ValueError(f"source byte drift: {relative}")
+            file_snapshots[relative] = (
+                _file_identity(opened),
+                digest.hexdigest(),
+            )
             if payload_chunks is not None:
                 if byte_count > 1 << 20:
                     raise ValueError(
@@ -1588,6 +1643,10 @@ def _verify_source_tree_fd(
             or _directory_identity(directory_after) != identity_before
         ):
             raise ValueError(f"source directory entry race: {description}")
+        directory_snapshots[relative_directory] = (
+            identity_before,
+            initial_names,
+        )
 
     try:
         visit(root_fd, ())
@@ -1618,14 +1677,61 @@ def _verify_source_tree_fd(
             )
             if _license_from_bytes(payloads) != entry.license_spdx:
                 raise ValueError(f"license file SPDX drift: {entry.source_id}")
-        _verify_finemath_selection_descriptors(lock, proof_descriptors)
-        return {
+        snapshot = _SourceTreeSnapshot(
+            lock_sha256=lock.sha256,
+            directories=tuple(
+                (relative, identity, names)
+                for relative, (identity, names) in sorted(
+                    directory_snapshots.items(),
+                    key=lambda item: _byte_key(item[0]),
+                )
+            ),
+            files=tuple(
+                (relative, identity, digest)
+                for relative, (identity, digest) in sorted(
+                    file_snapshots.items(),
+                    key=lambda item: _byte_key(item[0]),
+                )
+            ),
+        )
+        if _expected_snapshot is not None and snapshot != _expected_snapshot:
+            raise ValueError("source tree changed during FineMath proof")
+        result = {
             "bytes": total_bytes,
             "dataset_id": lock.dataset_id,
             "files": len(actual_files),
             "passed": True,
             "source_lock_sha256": lock.sha256,
         }
+        if _run_finemath_proof:
+            _finemath_proof_hook(
+                "during_proof",
+                root_fd,
+                proof_descriptors,
+            )
+            try:
+                _verify_finemath_selection_descriptors(
+                    lock,
+                    proof_descriptors,
+                )
+            except ValueError as error:
+                if "file identity drift" in str(error):
+                    raise ValueError(
+                        "source tree changed during FineMath proof"
+                    ) from error
+                raise
+            try:
+                _verify_source_tree_fd(
+                    lock,
+                    root_fd,
+                    _run_finemath_proof=False,
+                    _expected_snapshot=snapshot,
+                )
+            except ValueError as error:
+                raise ValueError(
+                    "source tree changed during FineMath proof"
+                ) from error
+        return result
     finally:
         for descriptor, _identity in proof_descriptors.values():
             os.close(descriptor)
@@ -1889,7 +1995,7 @@ def _cleanup_quarantine_hook(
 def _cleanup_quarantine_name(name: str) -> str:
     digest = hashlib.sha256(name.encode("utf-8")).hexdigest()[:12]
     return (
-        f".memorysplit-source-cleanup-{digest}-{secrets.token_hex(12)}"
+        f"{_CLEANUP_QUARANTINE_PREFIX}{digest}-{secrets.token_hex(12)}"
     )
 
 
@@ -1954,35 +2060,6 @@ def _open_cleanup_child(
     raise ValueError(f"{description} is special during cleanup")
 
 
-def _delete_quarantined_directory_contents(
-    directory_fd: int,
-    *,
-    description: str,
-) -> None:
-    while True:
-        names = list_entries(directory_fd)
-        if not names:
-            return
-        child_name = names[0]
-        child_description = f"{description}/{child_name}"
-        child_fd, child_metadata, is_directory = _open_cleanup_child(
-            directory_fd,
-            child_name,
-            description=child_description,
-        )
-        try:
-            _quarantine_verified_cleanup_entry(
-                directory_fd,
-                child_name,
-                child_fd,
-                child_metadata,
-                is_directory=is_directory,
-                description=child_description,
-            )
-        finally:
-            os.close(child_fd)
-
-
 def _quarantine_verified_cleanup_entry(
     parent_fd: int,
     name: str,
@@ -1991,7 +2068,7 @@ def _quarantine_verified_cleanup_entry(
     *,
     is_directory: bool,
     description: str,
-) -> None:
+) -> str:
     expected_identity = (
         _directory_identity(pinned_metadata)
         if is_directory
@@ -2086,59 +2163,38 @@ def _quarantine_verified_cleanup_entry(
             )
             raise ValueError(f"{description} cleanup quarantine identity drift")
 
-        try:
-            if is_directory:
-                _delete_quarantined_directory_contents(
-                    quarantine_fd,
-                    description=description,
+        _cleanup_quarantine_hook(
+            "quarantine_verified",
+            parent_fd,
+            name,
+            quarantine_name,
+            pinned_fd,
+            is_directory,
+        )
+        pinned_final = os.fstat(pinned_fd)
+        quarantine_final = os.fstat(quarantine_fd)
+        named_final = entry_lstat(parent_fd, quarantine_name)
+        if is_directory:
+            if (
+                _namespace_identity(pinned_final)
+                != _namespace_identity(pinned_metadata)
+                or _namespace_identity(quarantine_final)
+                != _namespace_identity(pinned_metadata)
+                or _namespace_identity(named_final)
+                != _namespace_identity(pinned_metadata)
+            ):
+                raise ValueError(
+                    f"{description} cleanup directory identity drift"
                 )
-            _cleanup_quarantine_hook(
-                "before_delete",
-                parent_fd,
-                name,
-                quarantine_name,
-                pinned_fd,
-                is_directory,
-            )
-            pinned_final = os.fstat(pinned_fd)
-            quarantine_final = os.fstat(quarantine_fd)
-            named_final = entry_lstat(parent_fd, quarantine_name)
-            if is_directory:
-                if (
-                    _namespace_identity(pinned_final)
-                    != _namespace_identity(pinned_metadata)
-                    or _namespace_identity(quarantine_final)
-                    != _namespace_identity(pinned_metadata)
-                    or _namespace_identity(named_final)
-                    != _namespace_identity(pinned_metadata)
-                ):
-                    raise ValueError(
-                        f"{description} cleanup directory identity drift"
-                    )
-                os.rmdir(quarantine_name, dir_fd=parent_fd)
-            else:
-                if (
-                    _file_identity(pinned_final) != expected_identity
-                    or _file_identity(quarantine_final) != expected_identity
-                    or _file_identity(named_final) != expected_identity
-                ):
-                    raise ValueError(
-                        f"{description} cleanup file identity drift"
-                    )
-                os.unlink(quarantine_name, dir_fd=parent_fd)
-            fsync_directory(parent_fd)
-        except BaseException as error:
-            if entry_exists(parent_fd, quarantine_name):
-                try:
-                    _restore_cleanup_quarantine(
-                        parent_fd,
-                        quarantine_name,
-                        name,
-                        description=description,
-                    )
-                except ValueError as restore_error:
-                    raise restore_error from error
-            raise
+        elif (
+            _regular_inode_identity(pinned_final)
+            != _regular_inode_identity(pinned_metadata)
+            or _file_identity(quarantine_final) != _file_identity(pinned_final)
+            or _file_identity(named_final) != _file_identity(pinned_final)
+        ):
+            raise ValueError(f"{description} cleanup file identity drift")
+        fsync_directory(parent_fd)
+        return quarantine_name
     finally:
         if quarantine_fd >= 0:
             os.close(quarantine_fd)
@@ -2150,7 +2206,7 @@ def _remove_owned_directory_at(
     expected_identity: tuple[int, int, int, int],
     *,
     description: str,
-) -> None:
+) -> str:
     directory_fd, metadata, is_directory = _open_cleanup_child(
         parent_fd,
         name,
@@ -2159,7 +2215,7 @@ def _remove_owned_directory_at(
     try:
         if not is_directory or _namespace_identity(metadata) != expected_identity:
             raise ValueError(f"{description} identity drift during cleanup")
-        _quarantine_verified_cleanup_entry(
+        return _quarantine_verified_cleanup_entry(
             parent_fd,
             name,
             directory_fd,
@@ -2223,6 +2279,16 @@ def stage_source_lock(
             create=True,
             mode=0o700,
         )
+        retained_quarantines = tuple(
+            name
+            for name in list_entries(sources_fd)
+            if name.startswith(_CLEANUP_QUARANTINE_PREFIX)
+        )
+        if retained_quarantines:
+            raise ValueError(
+                "source stage quarantine requires explicit offline cleanup: "
+                f"{retained_quarantines[0]}"
+            )
         _require_named_directory_identity(
             canonical_parent_fd,
             canonical_name,
@@ -2386,13 +2452,17 @@ def stage_source_lock(
                 ) from error
             finally:
                 os.close(final_fd)
-            _remove_owned_directory_at(
+            quarantine_name = _remove_owned_directory_at(
                 sources_fd,
                 stage_name,
                 stage_identity,
                 description="private source stage",
             )
             stage_name = ""
+            raise ValueError(
+                "source stage race retained a quarantine for offline cleanup: "
+                f"{quarantine_name}"
+            )
         else:
             fsync_directory(sources_fd)
             final_fd, final_identity = _open_bound_directory(
@@ -2442,6 +2512,7 @@ def stage_source_lock(
                 stage_identity,
                 description="private source stage",
             )
+            stage_name = ""
         raise
     finally:
         if stage_fd >= 0:
@@ -2713,19 +2784,14 @@ class PublicSourceResolver:
                 f"source materialization already exists: {request.source_id}"
             )
         materialized.mkdir(mode=0o700)
-        try:
-            if request.transport == "git":
-                entry = self._resolve_git(request, root, materialized)
-            elif request.transport == "huggingface_dataset":
-                entry = self._resolve_huggingface(request, root, materialized)
-            else:
-                raise ValueError(f"unsupported source transport: {request.transport}")
-            _validate_resolved_entry(request, entry)
-            return entry
-        except BaseException:
-            if materialized.exists() and not materialized.is_symlink():
-                shutil.rmtree(materialized)
-            raise
+        if request.transport == "git":
+            entry = self._resolve_git(request, root, materialized)
+        elif request.transport == "huggingface_dataset":
+            entry = self._resolve_huggingface(request, root, materialized)
+        else:
+            raise ValueError(f"unsupported source transport: {request.transport}")
+        _validate_resolved_entry(request, entry)
+        return entry
 
     def _resolve_git(
         self,
