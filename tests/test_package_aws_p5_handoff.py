@@ -610,11 +610,15 @@ def _minimal_repo(
         "evals/__init__.py": "",
         "evals/confirmatory/__init__.py": "",
         "evals/confirmatory/contracts.py": "SCHEMA_VERSION = 2\n",
+        "evals/confirmatory/lock_builder.py": "LOCK_BUILDER_FORMAT = 3\n",
         "organizer/__init__.py": "",
         "train/__init__.py": "",
         "train/model.py": "MODEL_PARAMETERS = 356_033_536\n",
         "train/safeio.py": "SAFE_IO = True\n",
         "train/trainer.py": "TRAINER = True\n",
+        "scripts/build_confirmatory_study_lock.py": (
+            "#!/usr/bin/env python3\nraise SystemExit(0)\n"
+        ),
         "scripts/build_parallel_corpus.py": (
             "#!/usr/bin/env python3\nraise SystemExit(0)\n"
         ),
