@@ -942,3 +942,97 @@ and the final 14-test focused rerun passed.
 - No live paid AWS, versioned S3 bucket, P5, Docker, NCCL, or IMDS operation
   was performed. Filesystem, process, object-store, launcher, resume, and
   package boundaries are covered by deterministic injected tests.
+
+## Token re-review cleanup and legacy gating
+
+Starting point: `3972540`. The independent paired-state journal follow-up
+landed as `5678a7e` during this work and was preserved without overlapping
+these token-remediation hunks.
+
+Implementation commit:
+
+- `2cc4584` — `fix: harden token cleanup and legacy gating`
+
+### Finding 1: failed fork attempts retain cleanup authority
+
+`ForkedCheckpointMirrorAttempt.poll()` previously cleared
+`_cancel_cleanup` immediately after reaping the child, before checking exit
+status or decoding the pipe. Malformed/truncated payloads, child-reported
+publication failure, wrong result types, and abnormal exits therefore
+returned failure without removing pending request tokens.
+
+RED:
+
+```text
+test_forked_attempt_failure_runs_cleanup_exactly_once:
+  5 failed
+  - child-reported failure: cleanup count 0
+  - wrong result type: cleanup count 0
+  - malformed pickle: cleanup count 0
+  - truncated pickle: cleanup count 0
+  - abnormal exit with valid payload: invalid pair was accepted
+
+valid-success control: 1 passed
+```
+
+GREEN: `poll()` now checks normal zero exit, fully decodes an exact
+`PublishedCheckpointPair`, and only then clears cleanup. Every completed
+failure invokes cleanup once. Repeated `cancel()` remains idempotent, while a
+valid success never invokes cleanup.
+
+```text
+Focused failure/success plus existing cancel regressions: 8 passed
+Dedicated cleanup regression file:                        6 passed
+```
+
+### Finding 2: token environment is v3-only
+
+`load_launch_plan()` previously inserted `MS_CHECKPOINT_REQUEST_TOKEN_FILE`
+and `MS_CHECKPOINT_REQUEST_ARM` into both schema-1 legacy and schema-2 v3
+container argv. That changed legacy SIGUSR1 service from tokenless checkpoint
+behavior to a missing-token failure.
+
+RED:
+
+```text
+legacy launcher/service selection: 1 failed, 1 passed
+  launcher ArmLaunch.request_token_path was non-null and both token
+  environment variables were present in schema-1 argv;
+  the real tokenless Trainer SIGUSR1 service control still passed.
+```
+
+GREEN: legacy plans now retain `request_token_path=None` and omit both token
+environment entries while preserving `MS_RANK_ZERO_PID_FILE`. Schema-2 v3
+plans and rebound resumes retain exact per-arm token paths and environments;
+the production scheduler fails closed if a v3 path is absent.
+
+```text
+legacy launcher + real tokenless trainer + v3 launch/resume: 4 passed
+isolated final focused selection:                           10 passed
+```
+
+### Final bounded verification
+
+All pytest runs used `PYTHONDONTWRITEBYTECODE=1`,
+`-p no:cacheprovider`, and dedicated `/tmp/ms3c-rereview-*` roots:
+
+```text
+Final combined mirror/cleanup/launcher groups:              231 passed
+Trainer and DDP groups:                                      99 passed
+Run-manifest and package groups:                            172 passed
+Final combined msctl/resume group:                          159 passed
+```
+
+Non-overlapping required-group aggregate: **661 passed**.
+
+Changed-file `python -m py_compile`, staged/unstaged `git diff --check`, and
+an isolated patch verification all passed. Receipt schemas, timing constants,
+scientific configs, checkpoint payloads, the request-token acknowledgment
+protocol, and legacy tokenless trainer behavior remain unchanged except for
+the two corrections above.
+
+### Re-review concerns
+
+- No live paid AWS, P5, Docker, NCCL, IMDS, or versioned S3 operation was
+  performed; the failure, process, launcher, trainer, resume, and package
+  boundaries use deterministic local tests.
