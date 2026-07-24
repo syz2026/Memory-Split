@@ -438,6 +438,13 @@ class WikidataDerivedViewReceipt:
         return receipt
 
 
+@dataclass(frozen=True)
+class WikidataDerivedView:
+    root: Path
+    receipt_sha256: str
+    receipt: WikidataDerivedViewReceipt
+
+
 def parse_wikidata_derived_view_receipt(
     payload: bytes,
     *,
