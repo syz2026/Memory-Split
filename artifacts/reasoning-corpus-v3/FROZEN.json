@@ -1,0 +1,27 @@
+{
+  "base_receipt_sha256": "65eda881f59acac356df0c3fbbb62df46d60bc013df05b72e8baacba7640b027",
+  "composite_stream_sha256": {
+    "dense_target_weights": "917768b13ec169728cec51dc8294d118a113aee3c370ecd8c16ef0529f63f56e",
+    "packed_targets": "035ee111c329eb615c642eae9b9a7075314932ff8175e989aabb3317d6a4ef6f",
+    "split90_target_weights": "8a9c84c900e503d1742342b6a21092292c2968313087d0873e429b4268757144"
+  },
+  "contract_id": "memorysplit-reasoning-dataset-v3",
+  "extension_manifest_sha256": "558b70fd0ad55ba2bf91b1efeea1b49583c9fe3d0286c71571fa868686a8acc8",
+  "extension_packed_sha256": "e09d08cdede2317ce0841264faa247322c2fe48ead38a3d81a26572a8effdd31",
+  "extension_record_count": 7530527,
+  "extension_record_stream_sha256": "f3f0165dabc2ec4e2b8d9b72dfed6f4d6a9ffcd32c79985aad5bbca1a9c2c0cc",
+  "extension_tokens": 1048576000,
+  "format": "memorysplit-reasoning-publication-lock-v1",
+  "pointer_relative_path": "corpus-build/memorysplit-reasoning-corpus-v3.pointer.json",
+  "pointer_sha256": "12d302edcd0cb1eb04e07b39c3b441c96813a83fd6822e452ad54086da1b40e1",
+  "publication_relative_path": "corpus-build/memorysplit-reasoning-corpus-v3",
+  "receipt_sha256": "b1eabb1719f66876ab54cc0791b857ccdbbbddb0ffb8c5986ac2aaa7bf33b80d",
+  "recipe_sha256": "276c0f85e2551af5df66b866b2c424118e7a8ddbf9efe2eff805196ba4d60a2f",
+  "replayed_records": 7530527,
+  "schema_version": 1,
+  "scientific_scope": "successor_exploratory_unpreregistered",
+  "source_stage_receipt_sha256": "ba83813d73ebccd4812c8297be58176efca8f9e36368dfa04058408fd658ea0c",
+  "task_count": 14,
+  "total_tokens": 8169455616,
+  "verification": "pointer-bound post-publication semantic replay"
+}
