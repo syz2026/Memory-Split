@@ -23,7 +23,8 @@ from corpusgen.v2_materialize import (
 )
 
 _OBJECTIVE_ARTIFACT = "corpusgen/v2_objective.py"
-_PROVIDER = "reasoning_gym_exact_answer"
+_PRONTOQA_PROVIDER = "prontoqa"
+_REASONING_GYM_PROVIDER = "reasoning_gym_exact_answer"
 
 
 class MigrationError(RuntimeError):
@@ -111,13 +112,13 @@ def _audit_reasoning_gym(
     log_root: Path,
 ) -> dict[str, Any]:
     client = _ObjectiveWorkerClient(
-        _PROVIDER,
+        _REASONING_GYM_PROVIDER,
         reasoning_gym_root,
         python=objective_python,
         log_root=log_root,
     )
     try:
-        expected_runtime = identity["objective_runtime"][_PROVIDER]
+        expected_runtime = identity["objective_runtime"][_REASONING_GYM_PROVIDER]
         if client.runtime != expected_runtime["versions"]:
             raise MigrationError(
                 "Reasoning Gym runtime changed during objective migration"
@@ -169,13 +170,89 @@ def _audit_reasoning_gym(
         client.close()
 
 
+def _audit_prontoqa(
+    *,
+    identity: dict[str, Any],
+    objective_python: Path,
+    prontoqa_root: Path,
+    log_root: Path,
+) -> dict[str, Any]:
+    client = _ObjectiveWorkerClient(
+        _PRONTOQA_PROVIDER,
+        prontoqa_root,
+        python=objective_python,
+        log_root=log_root,
+    )
+    try:
+        expected_runtime = identity["objective_runtime"][_PRONTOQA_PROVIDER]
+        if client.runtime != expected_runtime["versions"]:
+            raise MigrationError("ProntoQA runtime changed during objective migration")
+        expected_hashes = expected_runtime["probe_record_sha256s"]
+        observed_hashes = [
+            _sha256(canonical_json_bytes(client.generate(index)))
+            for index in expected_runtime["probe_indices"]
+        ]
+        if observed_hashes != expected_hashes:
+            mismatches = [
+                index
+                for index, (observed, expected) in enumerate(
+                    zip(observed_hashes, expected_hashes)
+                )
+                if observed != expected
+            ]
+            raise MigrationError(f"frozen ProntoQA probes changed: {mismatches}")
+        repaired = client.generate(2317)
+        metadata = repaired.get("metadata", {})
+        repaired_sha256 = _sha256(canonical_json_bytes(repaired))
+        if (
+            repaired.get("answer") != "False"
+            or metadata.get("attempt") != 32
+            or metadata.get("deduction_steps") != 2
+            or metadata.get("depth_schedule_pass") != 1
+            or metadata.get("native_proof_trace_sha256")
+            != "c6b4d17c8efbd80a7211649219217adacd1569b19052047268592a07344bb20d"
+            or metadata.get("rejected_native_samples") != 160
+            or metadata.get("rejection_policy")
+            != "exhaust_primary_then_rotate_seed_depth_pairing"
+            or metadata.get("seed") != 187_038_367
+            or repaired_sha256
+            != "564e951df554411c9dbed55b29aeee2165acca4003bd27fe3e283a4492de470a"
+        ):
+            raise MigrationError(
+                "ProntoQA record 2317 did not use the reviewed native retry"
+            )
+        repeated = client.generate(2317)
+        if canonical_json_bytes(repaired) != canonical_json_bytes(repeated):
+            raise MigrationError("ProntoQA record 2317 is not deterministic")
+        return {
+            "record_2317_sha256": repaired_sha256,
+            "record_2317_validation": {
+                "answer": repaired["answer"],
+                "attempt": metadata["attempt"],
+                "deduction_steps": metadata["deduction_steps"],
+                "depth_schedule_pass": metadata["depth_schedule_pass"],
+                "native_proof_trace_sha256": (
+                    metadata["native_proof_trace_sha256"]
+                ),
+                "rejected_native_samples": metadata["rejected_native_samples"],
+                "rejection_policy": metadata["rejection_policy"],
+                "seed": metadata["seed"],
+            },
+            "unchanged_probe_count": len(observed_hashes),
+        }
+    finally:
+        client.close()
+
+
 def migrate_identity(
     work_root: Path,
     *,
+    migration: str,
     expected_old_objective_sha256: str,
     old_revision: str,
     objective_python: Path,
-    reasoning_gym_root: Path,
+    reasoning_gym_root: Path | None,
+    prontoqa_root: Path | None,
 ) -> dict[str, Any]:
     locks = _acquire_lane_locks(work_root)
     try:
@@ -216,12 +293,40 @@ def migrate_identity(
                 "objective lane has durable output; use a fresh work root"
             )
 
-        audit = _audit_reasoning_gym(
-            identity=old_identity,
-            objective_python=objective_python,
-            reasoning_gym_root=reasoning_gym_root,
-            log_root=work_root / "logs" / "objective-migration",
-        )
+        if migration == "reasoning-gym-invalid-oracle":
+            if reasoning_gym_root is None:
+                raise MigrationError("Reasoning Gym root is required")
+            audit = _audit_reasoning_gym(
+                identity=old_identity,
+                objective_python=objective_python,
+                reasoning_gym_root=reasoning_gym_root,
+                log_root=work_root / "logs" / "objective-migration",
+            )
+            reason = (
+                "reject invalid or trivial pinned Reasoning Gym metadata "
+                "oracles and retry complete native rows"
+            )
+            semantic_scope = (
+                "objective_auxiliary.invalid_native_oracle_rejection"
+            )
+        elif migration == "prontoqa-depth-rotation":
+            if prontoqa_root is None:
+                raise MigrationError("ProntoQA root is required")
+            audit = _audit_prontoqa(
+                identity=old_identity,
+                objective_python=objective_python,
+                prontoqa_root=prontoqa_root,
+                log_root=work_root / "logs" / "objective-migration",
+            )
+            reason = (
+                "rotate pinned ProntoQA seed/depth pairings only after "
+                "primary rejection exhaustion"
+            )
+            semantic_scope = (
+                "objective_auxiliary.prontoqa.seed_depth_retry_exhaustion"
+            )
+        else:
+            raise MigrationError(f"unsupported objective migration: {migration}")
         new_identity = dict(old_identity)
         new_identity["compiler_artifact_sha256s"] = current_artifacts
         new_bytes = canonical_json_bytes(new_identity)
@@ -240,12 +345,9 @@ def migrate_identity(
             "objective_audit": audit,
             "old_identity_sha256": _sha256(old_bytes),
             "old_revision": old_revision,
-            "reason": (
-                "reject invalid or trivial pinned Reasoning Gym metadata "
-                "oracles and retry complete native rows"
-            ),
+            "reason": reason,
             "semantic_change": True,
-            "semantic_scope": "objective_auxiliary.invalid_native_oracle_rejection",
+            "semantic_scope": semantic_scope,
         }
         receipt_bytes = canonical_json_bytes(receipt)
         receipt_path = (
@@ -274,19 +376,36 @@ def migrate_identity(
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--work-root", required=True, type=Path)
+    parser.add_argument(
+        "--migration",
+        choices=(
+            "prontoqa-depth-rotation",
+            "reasoning-gym-invalid-oracle",
+        ),
+        required=True,
+    )
     parser.add_argument("--expected-old-objective-sha256", required=True)
     parser.add_argument("--old-revision", required=True)
     parser.add_argument("--objective-python", required=True, type=Path)
-    parser.add_argument("--reasoning-gym-root", required=True, type=Path)
+    parser.add_argument("--reasoning-gym-root", type=Path)
+    parser.add_argument("--prontoqa-root", type=Path)
     args = parser.parse_args()
     report = migrate_identity(
         args.work_root.resolve(),
+        migration=args.migration,
         expected_old_objective_sha256=args.expected_old_objective_sha256,
         old_revision=args.old_revision,
         objective_python=Path(
             os.path.abspath(os.path.expanduser(str(args.objective_python)))
         ),
-        reasoning_gym_root=args.reasoning_gym_root.resolve(),
+        reasoning_gym_root=(
+            None
+            if args.reasoning_gym_root is None
+            else args.reasoning_gym_root.resolve()
+        ),
+        prontoqa_root=(
+            None if args.prontoqa_root is None else args.prontoqa_root.resolve()
+        ),
     )
     print(json.dumps(report, indent=2, sort_keys=True))
     return 0
