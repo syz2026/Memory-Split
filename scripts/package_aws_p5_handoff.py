@@ -19,7 +19,7 @@ import tempfile
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
-from typing import Iterator
+from typing import TYPE_CHECKING, Iterator
 
 import yaml
 
@@ -43,6 +43,18 @@ from msctl.aws_contracts import (
     SEEDS as AWS_SEEDS,
     SNAPSHOT_STEPS,
 )
+if TYPE_CHECKING:
+    from msctl.aws_lifecycle import AuthenticatedProviderLifecycle
+
+
+def admit_provider_lifecycle(**kwargs):
+    """Lazily enter selected authority without loading it for legacy CLI use."""
+
+    from msctl.aws_lifecycle import (
+        admit_provider_lifecycle as admit_lifecycle,
+    )
+
+    return admit_lifecycle(**kwargs)
 
 
 NORMALIZED_TIME = (1980, 1, 1, 0, 0, 0)
@@ -51,7 +63,38 @@ RUNBOOK_PATH = "docs/AWS-P5-360M-RUNBOOK.md"
 RELEASE_RECEIPT_NAME = "RELEASE-AWS-P5.json"
 CONTAINER_IMAGE_DIGEST_PATTERN = "^sha256:[0-9a-f]{64}$"
 EXPECTED_CONFIGS = frozenset(EXPECTED_CONFIG_PATHS)
-REQUIRED_MEMBERS = EXPECTED_CONFIGS | {
+PROVIDER_BRIDGE_MEMBERS = frozenset(
+    {
+        "cluster/aws/gpu_profile.py",
+        "cluster/aws/qualification.py",
+        "cluster/aws/qualification_worker.py",
+        "cluster/profiles/aws-p5.48xlarge-v3.json",
+        "cluster/profiles/aws-p6-b300.48xlarge-v3.json",
+        "configs/aws-hardware-amendment-v3.json",
+        "configs/objective-controls-amendment-v3.yaml",
+        "configs/29m-v3/manifest.json",
+        "configs/29m-v3/full_corpus_dense.yaml",
+        "configs/29m-v3/full_corpus_split90.yaml",
+        "configs/29m-v3/no_arc_conceptarc_dense.yaml",
+        "configs/29m-v3/no_arc_conceptarc_split90.yaml",
+        "configs/29m-v3/no_refinement_dense.yaml",
+        "configs/29m-v3/no_refinement_split90.yaml",
+        "configs/29m-v3/full_corpus_random_fact90.yaml",
+        "configs/29m-v3/full_corpus_matched_nonfactual_mask.yaml",
+        "containers/aws-gpu/Dockerfile",
+        "containers/aws-gpu/Dockerfile.dockerignore",
+        "containers/aws-gpu/build_image.py",
+        "containers/aws-gpu/host-candidate.json",
+        "containers/aws-gpu/inspect_container.py",
+        "containers/aws-gpu/requirements.in",
+        "containers/aws-gpu/requirements.lock",
+        "containers/aws-gpu/runtime_lock.py",
+        "msctl/aws_hardware.py",
+        "msctl/aws_lifecycle.py",
+        "msctl/objective_controls_v3.py",
+    }
+)
+REQUIRED_MEMBERS = EXPECTED_CONFIGS | PROVIDER_BRIDGE_MEMBERS | {
     "AWS-P5-START.md",
     DATASET_POINTER_PATH,
     COHORT_PATH,
@@ -381,6 +424,10 @@ class _Collected:
     dataset_pointer_sha256: str
     config_sha256: dict[str, str]
     seed_assignment: dict[str, object]
+    provider: str
+    profile_id: str
+    profile_path: str
+    lifecycle_fields: dict[str, object]
 
 
 @dataclass(frozen=True)
@@ -968,6 +1015,8 @@ def _classification(path: str) -> str:
         return "forbidden"
     if set(parts) & _DISPOSABLE_COMPONENTS:
         return "excluded"
+    if path in PROVIDER_BRIDGE_MEMBERS:
+        return "included"
     if path in _ROOT_INCLUDED:
         return "included"
     if (
@@ -1392,6 +1441,8 @@ def _collect_payload(
     tracked: list[_Tracked],
     revision: str,
     tree_id: str,
+    *,
+    lifecycle: AuthenticatedProviderLifecycle | None = None,
 ) -> _Collected:
     included: list[_Tracked] = []
     unknown: list[str] = []
@@ -1450,20 +1501,55 @@ def _collect_payload(
         path: _sha256(payload[path]) for path in sorted(EXPECTED_CONFIGS)
     }
     cohort_sha256 = _sha256(payload[COHORT_PATH])
-    profile_sha256 = _sha256(payload[PROFILE_PATH])
+    if lifecycle is None:
+        provider = PROVIDER
+        profile_id = "aws-p5.48xlarge-v3"
+        profile_path = PROFILE_PATH
+        lifecycle_fields: dict[str, object] = {}
+    else:
+        from msctl.aws_lifecycle import AuthenticatedProviderLifecycle
+
+        if not isinstance(lifecycle, AuthenticatedProviderLifecycle):
+            raise PackageError(
+                "authenticated provider lifecycle authority is invalid"
+            )
+        provider = lifecycle.binding.provider
+        profile_id = lifecycle.binding.profile_id
+        profile_path = {
+            "aws-p5.48xlarge-v3": PROFILE_PATH,
+            "aws-p6-b300.48xlarge-v3": (
+                "cluster/profiles/aws-p6-b300.48xlarge-v3.json"
+            ),
+        }.get(profile_id, "")
+        if not profile_path or profile_path not in payload:
+            raise PackageError(
+                "selected provider profile is not a reviewed release member"
+            )
+        lifecycle_fields = lifecycle.binding.to_dict()
+    profile_sha256 = _sha256(payload[profile_path])
+    if lifecycle is not None and (
+        profile_sha256 != lifecycle.binding.profile_sha256
+        or lifecycle.profile.provider != provider
+        or lifecycle.profile.profile_id != profile_id
+        or lifecycle.profile.sha256 != profile_sha256
+    ):
+        raise PackageError(
+            "selected provider profile bytes differ from authenticated authority"
+        )
     environment = _runtime_environment_contract(profile_sha256)
     dataset_pointer_sha256 = _sha256(payload[DATASET_POINTER_PATH])
     seed_assignment: dict[str, object] = {
         "cohort_id": assignment["cohort_id"],
-        "provider": PROVIDER,
+        "provider": provider,
         "seeds": list(AWS_SEEDS),
         "arms": list(ARMS),
     }
     payload["RELEASE-METADATA.json"] = _canonical_pretty(
         {
+            **lifecycle_fields,
             "schema_version": 1,
             "package_format_version": PACKAGE_FORMAT_VERSION,
-            "provider": PROVIDER,
+            "provider": provider,
             "source": {
                 "commit": revision,
                 "dirty": False,
@@ -1475,9 +1561,10 @@ def _collect_payload(
                 "sha256": cohort_sha256,
             },
             "profile": {
-                "path": PROFILE_PATH,
+                "path": profile_path,
                 "sha256": profile_sha256,
             },
+            **({"profile_id": profile_id} if lifecycle_fields else {}),
             "environment": environment,
             "dataset_pointer": {
                 "path": DATASET_POINTER_PATH,
@@ -1504,6 +1591,10 @@ def _collect_payload(
         dataset_pointer_sha256=dataset_pointer_sha256,
         config_sha256=config_sha256,
         seed_assignment=seed_assignment,
+        provider=provider,
+        profile_id=profile_id,
+        profile_path=profile_path,
+        lifecycle_fields=lifecycle_fields,
     )
 
 
@@ -1790,10 +1881,11 @@ def _build_staging(
         checksum_name = f"{archive_name}.sha256"
         checksum_bytes = f"{archive_hash}  {archive_name}\n".encode("ascii")
         release_value = {
+            **collected.lifecycle_fields,
             "schema_version": 1,
             "package_format_version": PACKAGE_FORMAT_VERSION,
             "release_id": release_id,
-            "provider": PROVIDER,
+            "provider": collected.provider,
             "archive": {
                 "path": archive_name,
                 "sha256": archive_hash,
@@ -1810,9 +1902,14 @@ def _build_staging(
                 "sha256": collected.cohort_sha256,
             },
             "profile": {
-                "path": PROFILE_PATH,
+                "path": collected.profile_path,
                 "sha256": collected.profile_sha256,
             },
+            **(
+                {"profile_id": collected.profile_id}
+                if collected.lifecycle_fields
+                else {}
+            ),
             "environment": collected.environment,
             "dataset_pointer": {
                 "path": DATASET_POINTER_PATH,
@@ -2197,11 +2294,12 @@ def _assert_external_output(
     return absolute
 
 
-def build_handoff(
+def _build_handoff(
     *,
     source_root: Path | str,
     out_dir: Path | str,
     apply: bool = False,
+    lifecycle: AuthenticatedProviderLifecycle | None = None,
 ) -> ReleaseArtifacts:
     """Validate a clean Git snapshot and optionally publish one release set."""
 
@@ -2219,6 +2317,7 @@ def build_handoff(
             tracked,
             revision,
             tree_id,
+            lifecycle=lifecycle,
         )
         release_suffix = collected.members_sha256[:16]
         release_id = f"aws-p5-r1-{release_suffix}"
@@ -2315,6 +2414,70 @@ def build_handoff(
             os.close(output_fd)
     finally:
         repository.close()
+
+
+def build_handoff(
+    *,
+    source_root: Path | str,
+    out_dir: Path | str,
+    apply: bool = False,
+) -> ReleaseArtifacts:
+    """Build the explicit legacy P5-compatible package."""
+
+    return _build_handoff(
+        source_root=source_root,
+        out_dir=out_dir,
+        apply=apply,
+    )
+
+
+def build_authenticated_handoff(
+    *,
+    source_root: Path | str,
+    out_dir: Path | str,
+    apply: bool,
+    authority_root: Path | str,
+    runtime_lock_path: Path | str,
+    runtime_evidence_path: Path | str,
+    runtime_sbom_path: Path | str,
+    objective_controls_amendment_path: Path | str,
+    store: object,
+    account_id: str,
+    instance_id: str,
+    boot_id: str,
+    seed: int,
+    expected_selection_version_id: str,
+    identity_verifier: object,
+    approval_verifier: object,
+    trusted_public_key_sha256: str,
+) -> ReleaseArtifacts:
+    """Build metadata only after fixed-byte provider authority admission."""
+
+    lifecycle = admit_provider_lifecycle(
+        authority_root=authority_root,
+        repo_root=source_root,
+        runtime_lock_path=runtime_lock_path,
+        runtime_evidence_path=runtime_evidence_path,
+        runtime_sbom_path=runtime_sbom_path,
+        objective_controls_amendment_path=(
+            objective_controls_amendment_path
+        ),
+        store=store,
+        account_id=account_id,
+        instance_id=instance_id,
+        boot_id=boot_id,
+        seed=seed,
+        expected_selection_version_id=expected_selection_version_id,
+        identity_verifier=identity_verifier,
+        approval_verifier=approval_verifier,
+        trusted_public_key_sha256=trusted_public_key_sha256,
+    )
+    return _build_handoff(
+        source_root=source_root,
+        out_dir=out_dir,
+        apply=apply,
+        lifecycle=lifecycle,
+    )
 
 
 def _emit(value: dict[str, object]) -> None:

@@ -4,7 +4,9 @@ import hashlib
 import json
 import math
 from copy import deepcopy
+from dataclasses import replace
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
@@ -26,6 +28,8 @@ from msctl.cohort import load_cohort_assignment
 from msctl.contracts import bind_release, load_release, load_run_manifest
 from msctl.errors import MsctlError
 from msctl.operations import instantiate_run_manifest
+from msctl.aws_lifecycle import LIFECYCLE_BINDING_FIELDS
+from tests.provider_lifecycle_fixtures import provider_lifecycle
 from tests.test_aws_p5_launcher import _launcher_fixture
 from tests.test_package_aws_p5_handoff import (
     _build,
@@ -40,10 +44,8 @@ ROOT = Path(__file__).resolve().parents[1]
 SEALED_EVALUATION_RELEASE_SHA256 = "e" * 64
 ESTIMATED_INSTANCE_HOURS = 2.5
 V3_FIELDS = {
+    *LIFECYCLE_BINDING_FIELDS,
     "schema_version",
-    "provider",
-    "cohort_id",
-    "seed",
     "release_sha256",
     "release_receipt_sha256",
     "profile_sha256",
@@ -77,6 +79,16 @@ V3_SHA256_FIELDS = {
     "cohort_assignment_sha256",
     "preregistration_sha256",
     "sealed_evaluation_release_sha256",
+    "hardware_amendment_sha256",
+    "provider_selection_sha256",
+    "runtime_lock_sha256",
+    "runtime_sbom_sha256",
+    "qualification_evidence_sha256",
+    "qualification_environment_receipt_sha256",
+    "qualification_canary_receipt_sha256",
+    "qualification_approval_receipt_sha256",
+    "qualification_approval_public_key_sha256",
+    "objective_controls_contract_sha256",
 }
 
 
@@ -177,9 +189,15 @@ def _build_default_verified_corpus(root: Path) -> dict[str, object]:
 def v3_case(tmp_path: Path) -> dict[str, object]:
     source = _minimal_repo(tmp_path, name="release-source")
     _copy_real_v3_contract(source)
-    packaged = _build(_load_module(), source, tmp_path / "published")
     dataset = _launcher_fixture(tmp_path / "task4", seed=0)
     profile = load_aws_p5_profile(source / PROFILE_PATH)
+    lifecycle = provider_lifecycle(profile)
+    packaged = _load_module()._build_handoff(
+        source_root=source,
+        out_dir=tmp_path / "published",
+        apply=True,
+        lifecycle=lifecycle,
+    )
 
     def verifier(
         receipt_path: Path,
@@ -199,6 +217,7 @@ def v3_case(tmp_path: Path) -> dict[str, object]:
         "packaged": packaged,
         "dataset": dataset,
         "profile": profile,
+        "lifecycle": lifecycle,
         "verifier": verifier,
     }
 
@@ -213,15 +232,14 @@ def _expected_manifest(
     packaged = case["packaged"]
     dataset = case["dataset"]
     profile = case["profile"]
+    lifecycle = provider_lifecycle(profile, seed=seed)
     release = load_release(packaged.release)
     cohort = load_cohort_assignment(source / COHORT_ASSIGNMENT_PATH)
     receipt_path = Path(dataset["corpus_path"])
     receipt = dataset["corpus"]
     return {
+        **lifecycle.binding.to_dict(),
         "schema_version": 3,
-        "provider": "aws-p5.48xlarge",
-        "cohort_id": COHORT_ID,
-        "seed": seed,
         "release_sha256": release.archive_sha256,
         "release_receipt_sha256": release.receipt_sha256,
         "profile_sha256": profile.sha256,
@@ -263,25 +281,54 @@ def _instantiate(
     ),
     estimated_instance_hours: object = ESTIMATED_INSTANCE_HOURS,
     dataset_verifier=None,
+    dataset=None,
 ) -> dict[str, object]:
     packaged = case["packaged"]
-    dataset = case["dataset"]
-    return instantiate_run_manifest(
-        profile=case["profile"],
-        release_path=packaged.release,
-        dataset_receipt=dataset["corpus_path"],
-        seed=seed,
-        out=out,
-        repo_root=case["source"],
-        apply=apply,
-        sealed_evaluation_release_sha256=sealed_evaluation_release_sha256,
-        estimated_instance_hours=estimated_instance_hours,
-        dataset_verifier=(
-            case["verifier"]
-            if dataset_verifier is None
-            else dataset_verifier
-        ),
-    )
+    selected_dataset = case["dataset"] if dataset is None else dataset
+    lifecycle = provider_lifecycle(case["profile"], seed=seed)
+    with patch(
+        "msctl.operations.admit_provider_lifecycle",
+        return_value=lifecycle,
+    ):
+        return instantiate_run_manifest(
+            profile=None,
+            release_path=packaged.release,
+            dataset_receipt=selected_dataset["corpus_path"],
+            seed=seed,
+            out=out,
+            repo_root=case["source"],
+            apply=apply,
+            sealed_evaluation_release_sha256=(
+                sealed_evaluation_release_sha256
+            ),
+            estimated_instance_hours=estimated_instance_hours,
+            dataset_verifier=(
+                case["verifier"]
+                if dataset_verifier is None
+                else dataset_verifier
+            ),
+            authority_root=out.parent / "authority",
+            runtime_lock_path=out.parent / "runtime-lock.json",
+            runtime_evidence_path=out.parent / "runtime-evidence.json",
+            runtime_sbom_path=out.parent / "runtime-sbom.json",
+            objective_controls_amendment_path=(
+                Path(case["source"])
+                / "configs"
+                / "objective-controls-amendment-v3.yaml"
+            ),
+            selection_store=object(),
+            account_id=lifecycle.binding.account_id,
+            instance_id=lifecycle.binding.instance_id,
+            boot_id=lifecycle.binding.boot_id,
+            expected_selection_version_id=(
+                lifecycle.binding.provider_selection_version_id
+            ),
+            identity_verifier=object(),
+            qualification_approval_verifier=object(),
+            trusted_qualification_public_key_sha256=(
+                lifecycle.binding.qualification_approval_public_key_sha256
+            ),
+        )
 
 
 def test_real_v3_release_instantiates_exact_seed_zero_and_nine_manifests(
@@ -324,18 +371,12 @@ def test_v3_instantiates_through_unmodified_default_corpus_verifier(
         tmp_path / "default-verified-corpus"
     )
 
-    result = instantiate_run_manifest(
-        profile=v3_case["profile"],
-        release_path=packaged.release,
-        dataset_receipt=dataset["corpus_path"],
+    result = _instantiate(
+        v3_case,
         seed=0,
         out=tmp_path / "default-verifier.json",
-        repo_root=v3_case["source"],
-        apply=False,
-        sealed_evaluation_release_sha256=(
-            SEALED_EVALUATION_RELEASE_SHA256
-        ),
-        estimated_instance_hours=ESTIMATED_INSTANCE_HOURS,
+        dataset=dataset,
+        dataset_verifier=False,
     )
 
     assert result["manifest"]["dataset_receipt_sha256"] == _sha256(
@@ -382,6 +423,25 @@ def test_v3_load_reload_binding_and_no_replace_preserve_every_identity(
         _instantiate(v3_case, seed=0, out=out, apply=True)
     assert caught.value.code == "RUN_MANIFEST_EXISTS"
     assert out.read_bytes() == original
+
+
+def test_v3_release_rejects_cross_selection_and_runtime_binding(
+    v3_case,
+    tmp_path,
+):
+    out = tmp_path / "selected-run.json"
+    _instantiate(v3_case, seed=0, out=out, apply=True)
+    manifest = load_run_manifest(out, repo_root=v3_case["source"])
+    release = load_release(v3_case["packaged"].release)
+
+    for mutated in (
+        replace(manifest, provider_selection_sha256="f" * 64),
+        replace(manifest, provider_selection_version_id="other-version"),
+        replace(manifest, runtime_sbom_sha256="e" * 64),
+        replace(manifest, objective_controls_contract_sha256="d" * 64),
+    ):
+        with pytest.raises(MsctlError, match="release|selection|lifecycle"):
+            bind_release(release, mutated)
 
 
 def test_v3_missing_sealed_evaluation_hash_blocks_publication(v3_case, tmp_path):
@@ -448,6 +508,11 @@ def test_v3_cli_requires_and_forwards_instantiation_inputs(
         "_load_task4_dataset_verifier",
         v3_case["verifier"],
     )
+    monkeypatch.setattr(
+        operations,
+        "admit_provider_lifecycle",
+        lambda **kwargs: provider_lifecycle(v3_case["profile"]),
+    )
     packaged = v3_case["packaged"]
     dataset = v3_case["dataset"]
     common = [
@@ -474,6 +539,20 @@ def test_v3_cli_requires_and_forwards_instantiation_inputs(
     assert set(caught.value.details["missing"]) == {
         "--estimated-instance-hours",
         "--sealed-evaluation-release-sha256",
+        "--authority-root",
+        "--runtime-lock",
+        "--runtime-evidence",
+        "--runtime-sbom",
+        "--objective-controls-amendment",
+        "--selection-version-id",
+        "--selection-bucket",
+        "--selection-region",
+        "--selection-staging-root",
+        "--account-id",
+        "--instance-id",
+        "--boot-id",
+        "--approval-public-key",
+        "--approval-public-key-sha256",
     }
     assert not (tmp_path / "cli-runs.json").exists()
 
@@ -487,8 +566,44 @@ def test_v3_cli_requires_and_forwards_instantiation_inputs(
     with pytest.raises(MsctlError) as caught:
         dispatch(missing_hours)
     assert caught.value.code == "CLI_USAGE"
-    assert caught.value.details["missing"] == ["--estimated-instance-hours"]
+    assert "--estimated-instance-hours" in caught.value.details["missing"]
 
+    public_key = tmp_path / "approval-public-key.pem"
+    public_key.write_text("fixture-public-key\n", encoding="ascii")
+    public_key.chmod(0o600)
+    authority_arguments = [
+        "--authority-root",
+        str(tmp_path / "authority"),
+        "--runtime-lock",
+        str(tmp_path / "runtime-lock.json"),
+        "--runtime-evidence",
+        str(tmp_path / "runtime-evidence.json"),
+        "--runtime-sbom",
+        str(tmp_path / "runtime-sbom.json"),
+        "--objective-controls-amendment",
+        str(
+            Path(v3_case["source"])
+            / "configs/objective-controls-amendment-v3.yaml"
+        ),
+        "--selection-version-id",
+        "selection-version-1",
+        "--selection-bucket",
+        "memorysplit-selection",
+        "--selection-region",
+        "us-east-1",
+        "--selection-staging-root",
+        str(tmp_path / "selection-staging"),
+        "--account-id",
+        "123456789012",
+        "--instance-id",
+        "i-0123456789abcdef0",
+        "--boot-id",
+        "12345678-1234-4abc-8def-1234567890ab",
+        "--approval-public-key",
+        str(public_key),
+        "--approval-public-key-sha256",
+        "8" * 64,
+    ]
     supplied = build_parser().parse_args(
         [
             *common,
@@ -496,6 +611,7 @@ def test_v3_cli_requires_and_forwards_instantiation_inputs(
             SEALED_EVALUATION_RELEASE_SHA256,
             "--estimated-instance-hours",
             str(ESTIMATED_INSTANCE_HOURS),
+            *authority_arguments,
         ]
     )
     dry_run, result = dispatch(supplied)

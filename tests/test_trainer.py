@@ -16,6 +16,9 @@ import train.safeio as safeio
 import train.trainer as trainer_module
 from train.model import GPT, GPTConfig
 from train.trainer import Trainer, cosine_lr
+from cluster.aws.gpu_profile import load_aws_gpu_profile
+from msctl.aws_lifecycle import lifecycle_operational_metadata
+from tests.provider_lifecycle_fixtures import provider_lifecycle
 
 
 def write_corpus(tmp_path, n=40192, mask_frac=0.1, seed=0):
@@ -81,6 +84,91 @@ def tiny_cfg(tmp_path, bp, mp, *, out_name="out", max_steps=2):
         }
     )
     return cfg
+
+
+def _operational_metadata() -> dict[str, object]:
+    root = Path(__file__).resolve().parents[1]
+    lifecycle = provider_lifecycle(
+        load_aws_gpu_profile(
+            root / "cluster/profiles/aws-p5.48xlarge-v3.json"
+        )
+    )
+    return lifecycle_operational_metadata(
+        lifecycle.binding,
+        run_id="memorysplit-v3-360m-s0-dense",
+        arm="dense",
+        config_sha256="b" * 64,
+        dataset_receipt_sha256="c" * 64,
+        dataset_build_id="d" * 64,
+        ordered_stream_sha256="e" * 64,
+        source_commit="f" * 40,
+        source_tree="0" * 40,
+    )
+
+
+def test_production_model_snapshot_is_self_authenticating_and_legacy_is_explicit(
+    tmp_path,
+):
+    bp, mp = write_corpus(tmp_path, n=256)
+    selected_cfg = tiny_cfg(tmp_path, bp, mp, out_name="selected")
+    selected_cfg["seed"] = 0
+    selected_cfg["operational_metadata"] = _operational_metadata()
+    selected = Trainer(selected_cfg)
+    selected.step = 1
+    selected.save_snapshot()
+    selected.save_ckpt()
+    selected.close()
+    snapshot_path = tmp_path / "selected" / "snapshots" / "step0000001.pt"
+    payload = snapshot_path.read_bytes()
+
+    parsed = trainer_module.parse_model_snapshot_bytes(
+        payload,
+        expected_operational_metadata=selected_cfg["operational_metadata"],
+    )
+
+    assert parsed["run_id"] == "memorysplit-v3-360m-s0-dense"
+    assert parsed["arm"] == "dense"
+    assert parsed["config_sha256"] == "b" * 64
+    assert parsed["provider_selection_sha256"] == "2" * 64
+    assert parsed["runtime_sbom_sha256"] == "9" * 64
+    assert parsed["objective_controls_contract_sha256"] == "a" * 64
+    assert parsed["config_fingerprint"] == selected.config_fingerprint
+    checkpoint_metadata = json.loads(
+        (tmp_path / "selected" / "ckpt.meta.json").read_text(
+            encoding="ascii"
+        )
+    )
+    assert all(
+        checkpoint_metadata[field] == value
+        for field, value in selected_cfg["operational_metadata"].items()
+    )
+
+    mutated = copy.deepcopy(parsed)
+    mutated["provider_selection_sha256"] = "1" * 64
+    buffer = trainer_module.io.BytesIO()
+    torch.save(mutated, buffer)
+    with pytest.raises(ValueError, match="operational|selection|snapshot"):
+        trainer_module.parse_model_snapshot_bytes(
+            buffer.getvalue(),
+            expected_operational_metadata=selected_cfg[
+                "operational_metadata"
+            ],
+        )
+
+    legacy_cfg = tiny_cfg(tmp_path, bp, mp, out_name="legacy")
+    legacy = Trainer(legacy_cfg)
+    legacy.step = 1
+    legacy.save_snapshot()
+    legacy.close()
+    legacy_payload = (
+        tmp_path / "legacy" / "snapshots" / "step0000001.pt"
+    ).read_bytes()
+    with pytest.raises(ValueError, match="legacy|operational"):
+        trainer_module.parse_model_snapshot_bytes(legacy_payload)
+    assert trainer_module.parse_model_snapshot_bytes(
+        legacy_payload,
+        allow_legacy=True,
+    )["step"] == 1
 
 
 def test_run_train_capabilities_json_is_strict_and_does_not_require_config():

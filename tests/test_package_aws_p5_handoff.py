@@ -10,6 +10,7 @@ import subprocess
 import sys
 import uuid
 import zipfile
+import inspect
 from pathlib import Path, PurePosixPath
 
 import pytest
@@ -61,6 +62,35 @@ CONFIG_KEYS = {
     "ckpt_minutes",
 }
 SNAPSHOT_STEPS = [1_358, 3_396, 6_791, 10_187, 13_582]
+PROVIDER_BRIDGE_MEMBERS = {
+    "cluster/aws/gpu_profile.py",
+    "cluster/aws/qualification.py",
+    "cluster/aws/qualification_worker.py",
+    "cluster/profiles/aws-p5.48xlarge-v3.json",
+    "cluster/profiles/aws-p6-b300.48xlarge-v3.json",
+    "configs/aws-hardware-amendment-v3.json",
+    "configs/objective-controls-amendment-v3.yaml",
+    "configs/29m-v3/manifest.json",
+    "configs/29m-v3/full_corpus_dense.yaml",
+    "configs/29m-v3/full_corpus_split90.yaml",
+    "configs/29m-v3/no_arc_conceptarc_dense.yaml",
+    "configs/29m-v3/no_arc_conceptarc_split90.yaml",
+    "configs/29m-v3/no_refinement_dense.yaml",
+    "configs/29m-v3/no_refinement_split90.yaml",
+    "configs/29m-v3/full_corpus_random_fact90.yaml",
+    "configs/29m-v3/full_corpus_matched_nonfactual_mask.yaml",
+    "containers/aws-gpu/Dockerfile",
+    "containers/aws-gpu/Dockerfile.dockerignore",
+    "containers/aws-gpu/build_image.py",
+    "containers/aws-gpu/host-candidate.json",
+    "containers/aws-gpu/inspect_container.py",
+    "containers/aws-gpu/requirements.in",
+    "containers/aws-gpu/requirements.lock",
+    "containers/aws-gpu/runtime_lock.py",
+    "msctl/aws_hardware.py",
+    "msctl/aws_lifecycle.py",
+    "msctl/objective_controls_v3.py",
+}
 
 
 def _load_module():
@@ -72,6 +102,155 @@ def _load_module():
     sys.modules[name] = module
     spec.loader.exec_module(module)
     return module
+
+
+def test_provider_lifecycle_package_closure_is_explicit_and_fail_closed():
+    module = _load_module()
+
+    assert PROVIDER_BRIDGE_MEMBERS <= module.REQUIRED_MEMBERS
+    assert all(
+        module._classification(path) == "included"
+        for path in PROVIDER_BRIDGE_MEMBERS
+    )
+    assert module._classification("containers/aws-gpu/unreviewed.txt") == "unknown"
+    assert module._classification("configs/29m-v3/unreviewed.yaml") == "unknown"
+
+
+def test_authenticated_package_metadata_comes_only_from_fixed_authority(
+    tmp_path,
+    monkeypatch,
+):
+    from cluster.aws.gpu_profile import load_aws_gpu_profile
+    from tests.provider_lifecycle_fixtures import provider_lifecycle
+
+    module = _load_module()
+    source = _minimal_repo(tmp_path)
+    lifecycle = provider_lifecycle(
+        load_aws_gpu_profile(
+            source / "cluster/profiles/aws-p5.48xlarge-v3.json"
+        )
+    )
+    calls = []
+
+    def admit(**kwargs):
+        calls.append(kwargs)
+        return lifecycle
+
+    monkeypatch.setattr(
+        module,
+        "admit_provider_lifecycle",
+        admit,
+        raising=False,
+    )
+    result = module.build_authenticated_handoff(
+        source_root=source,
+        out_dir=tmp_path / "selected-out",
+        apply=True,
+        authority_root=tmp_path / "authority",
+        runtime_lock_path=tmp_path / "runtime-lock.json",
+        runtime_evidence_path=tmp_path / "runtime-evidence.json",
+        runtime_sbom_path=tmp_path / "runtime-sbom.json",
+        objective_controls_amendment_path=(
+            source / "configs/objective-controls-amendment-v3.yaml"
+        ),
+        store=object(),
+        account_id=lifecycle.binding.account_id,
+        instance_id=lifecycle.binding.instance_id,
+        boot_id=lifecycle.binding.boot_id,
+        seed=0,
+        expected_selection_version_id=(
+            lifecycle.binding.provider_selection_version_id
+        ),
+        identity_verifier=object(),
+        approval_verifier=object(),
+        trusted_public_key_sha256=(
+            lifecycle.binding.qualification_approval_public_key_sha256
+        ),
+    )
+    second = module.build_authenticated_handoff(
+        source_root=source,
+        out_dir=tmp_path / "selected-out-2",
+        apply=True,
+        authority_root=tmp_path / "authority",
+        runtime_lock_path=tmp_path / "runtime-lock.json",
+        runtime_evidence_path=tmp_path / "runtime-evidence.json",
+        runtime_sbom_path=tmp_path / "runtime-sbom.json",
+        objective_controls_amendment_path=(
+            source / "configs/objective-controls-amendment-v3.yaml"
+        ),
+        store=object(),
+        account_id=lifecycle.binding.account_id,
+        instance_id=lifecycle.binding.instance_id,
+        boot_id=lifecycle.binding.boot_id,
+        seed=0,
+        expected_selection_version_id=(
+            lifecycle.binding.provider_selection_version_id
+        ),
+        identity_verifier=object(),
+        approval_verifier=object(),
+        trusted_public_key_sha256=(
+            lifecycle.binding.qualification_approval_public_key_sha256
+        ),
+    )
+    assert result.archive.read_bytes() == second.archive.read_bytes()
+    assert result.release.read_bytes() == second.release.read_bytes()
+
+    release = json.loads(result.release.read_text(encoding="ascii"))
+    assert all(
+        release[field] == value
+        for field, value in lifecycle.binding.to_dict().items()
+    )
+    assert release["provider"] == lifecycle.binding.provider
+    assert release["profile"]["path"] == (
+        "cluster/profiles/aws-p5.48xlarge-v3.json"
+    )
+    with zipfile.ZipFile(result.archive) as archive:
+        metadata = json.loads(archive.read("RELEASE-METADATA.json"))
+    assert all(
+        metadata[field] == value
+        for field, value in lifecycle.binding.to_dict().items()
+    )
+    assert len(calls) == 2
+    assert calls[0]["authority_root"] == tmp_path / "authority"
+    from msctl.contracts import load_release
+
+    parsed_release = load_release(result.release)
+    assert parsed_release.provider == lifecycle.binding.provider
+    assert parsed_release.value["provider_selection_sha256"] == (
+        lifecycle.binding.provider_selection_sha256
+    )
+    from cluster.aws.p5.bootstrap import verify_bootstrap_artifacts
+
+    dataset = tmp_path / "dataset-receipt.json"
+    _write(
+        dataset,
+        _canonical_json(
+            {
+            "build_id": "b" * 64,
+            "ordered_stream_sha256": "c" * 64,
+            }
+        ),
+    )
+    artifacts = verify_bootstrap_artifacts(
+        release_archive=result.archive,
+        release_sha256=_sha256_path(result.archive),
+        release_receipt=result.release,
+        release_receipt_sha256=_sha256_path(result.release),
+        dataset_receipt=dataset,
+        dataset_receipt_sha256=_sha256_path(dataset),
+        cohort_assignment=source / "configs/cohort-assignment-v3.json",
+        cohort_assignment_sha256=_sha256_path(
+            source / "configs/cohort-assignment-v3.json"
+        ),
+        code_commit=_git(source, "rev-parse", "HEAD"),
+    )
+    assert artifacts.profile_sha256 == lifecycle.binding.profile_sha256
+    parameters = set(
+        inspect.signature(module.build_authenticated_handoff).parameters
+    )
+    assert "binding" not in parameters
+    assert "profile" not in parameters
+    assert "provider" not in parameters
 
 
 def _git(root: Path, *arguments: str) -> str:
@@ -412,6 +591,9 @@ def _minimal_repo(
                 sort_keys=False,
                 allow_unicode=False,
             )
+    for relative in sorted(PROVIDER_BRIDGE_MEMBERS):
+        if relative not in files:
+            files[relative] = (REPO_ROOT / relative).read_bytes()
     for relative, data in files.items():
         _write(
             root / relative,

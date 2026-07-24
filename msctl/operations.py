@@ -12,6 +12,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from .approval import verify_approval
+from .aws_lifecycle import admit_provider_lifecycle
 from .aws_contracts import (
     COHORT_ASSIGNMENT_PATH as AWS_COHORT_ASSIGNMENT_PATH,
     COHORT_ID as AWS_COHORT_ID,
@@ -254,7 +255,7 @@ def _publish_manifest_no_replace(path: Path | str, value: object) -> None:
 
 def instantiate_run_manifest(
     *,
-    profile: object,
+    profile: object | None,
     release_path: Path | str,
     dataset_receipt: Path | str,
     seed: int,
@@ -265,12 +266,93 @@ def instantiate_run_manifest(
     estimated_instance_hours: object = None,
     cohort_loader: Callable[[Path | str], object] | None = None,
     dataset_verifier: Callable[..., object] | None = None,
+    authority_root: Path | str | None = None,
+    runtime_lock_path: Path | str | None = None,
+    runtime_evidence_path: Path | str | None = None,
+    runtime_sbom_path: Path | str | None = None,
+    objective_controls_amendment_path: Path | str | None = None,
+    selection_store: object | None = None,
+    account_id: str | None = None,
+    instance_id: str | None = None,
+    boot_id: str | None = None,
+    expected_selection_version_id: str | None = None,
+    identity_verifier: object | None = None,
+    qualification_approval_verifier: object | None = None,
+    trusted_qualification_public_key_sha256: str | None = None,
 ) -> dict[str, object]:
+    authority_inputs = {
+        "authority_root": authority_root,
+        "runtime_lock_path": runtime_lock_path,
+        "runtime_evidence_path": runtime_evidence_path,
+        "runtime_sbom_path": runtime_sbom_path,
+        "objective_controls_amendment_path": (
+            objective_controls_amendment_path
+        ),
+        "selection_store": selection_store,
+        "account_id": account_id,
+        "instance_id": instance_id,
+        "boot_id": boot_id,
+        "expected_selection_version_id": expected_selection_version_id,
+        "identity_verifier": identity_verifier,
+        "qualification_approval_verifier": (
+            qualification_approval_verifier
+        ),
+        "trusted_qualification_public_key_sha256": (
+            trusted_qualification_public_key_sha256
+        ),
+    }
+    selected_v3 = any(value is not None for value in authority_inputs.values())
+    lifecycle = None
+    if selected_v3:
+        missing = sorted(
+            name for name, value in authority_inputs.items() if value is None
+        )
+        if missing:
+            raise MsctlError(
+                "RUN_MANIFEST_INVALID",
+                "v3 provider lifecycle authority inputs are incomplete",
+                details={"missing": missing},
+            )
+        lifecycle = admit_provider_lifecycle(
+            authority_root=authority_root,
+            repo_root=repo_root,
+            runtime_lock_path=runtime_lock_path,
+            runtime_evidence_path=runtime_evidence_path,
+            runtime_sbom_path=runtime_sbom_path,
+            objective_controls_amendment_path=(
+                objective_controls_amendment_path
+            ),
+            store=selection_store,
+            account_id=account_id,
+            instance_id=instance_id,
+            boot_id=boot_id,
+            seed=seed,
+            expected_selection_version_id=expected_selection_version_id,
+            identity_verifier=identity_verifier,
+            approval_verifier=qualification_approval_verifier,
+            trusted_public_key_sha256=(
+                trusted_qualification_public_key_sha256
+            ),
+        )
+        profile = lifecycle.profile
     provider = getattr(profile, "provider", None)
     aws_v3 = (
-        provider == AWS_P5_PROFILE
-        and getattr(profile, "profile_id", None) == _AWS_V3_PROFILE_ID
+        lifecycle is not None
+        and getattr(profile, "profile_id", None)
+        in {
+            _AWS_V3_PROFILE_ID,
+            "aws-p6-b300.48xlarge-v3",
+        }
     )
+    if (
+        lifecycle is None
+        and getattr(profile, "profile_id", None)
+        in {_AWS_V3_PROFILE_ID, "aws-p6-b300.48xlarge-v3"}
+    ):
+        raise MsctlError(
+            "RUN_MANIFEST_INVALID",
+            "v3 AWS instantiation requires authenticated provider authority",
+        )
     if aws_v3 and (
         type(getattr(profile, "assigned_seeds", None)) is not tuple
         or getattr(profile, "assigned_seeds") != tuple(AWS_SEEDS)
@@ -427,10 +509,21 @@ def instantiate_run_manifest(
         )
     dataset_pointer_sha256: str | None = None
     if aws_v3:
+        selected_profile_path = {
+            "aws-p5.48xlarge-v3": AWS_PROFILE_PATH,
+            "aws-p6-b300.48xlarge-v3": (
+                "cluster/profiles/aws-p6-b300.48xlarge-v3.json"
+            ),
+        }.get(getattr(profile, "profile_id", None))
+        if selected_profile_path is None:
+            raise MsctlError(
+                "PROFILE_RELEASE_MISMATCH",
+                "authenticated provider profile is unsupported",
+            )
         verified_profile_sha256 = verify_release_member(
             release,
-            member_path=AWS_PROFILE_PATH,
-            local_path=root / AWS_PROFILE_PATH,
+            member_path=selected_profile_path,
+            local_path=root / selected_profile_path,
             label="AWS v3 profile",
         )
         dataset_pointer_sha256 = verify_release_member(
@@ -468,7 +561,9 @@ def instantiate_run_manifest(
             "v3 cohort identity differs from the AWS manifest contract",
         )
 
-    provider_configs = cohort.configs_for_provider(provider)
+    provider_configs = cohort.configs_for_provider(
+        AWS_P5_PROFILE if aws_v3 else provider
+    )
     selected = tuple(config for config in provider_configs if config.seed == seed)
     if (
         len(selected) != 2
@@ -512,7 +607,7 @@ def instantiate_run_manifest(
     dataset_verification = None
     dataset_build_id: str | None = None
     ordered_stream_sha256: str | None = None
-    if provider == AWS_P5_PROFILE:
+    if aws_v3 or provider == AWS_P5_PROFILE:
         ordered_sha256 = receipt_value.get("ordered_stream_sha256")
         verifier = dataset_verifier or _load_task4_dataset_verifier
         try:
@@ -570,11 +665,10 @@ def instantiate_run_manifest(
         assert ordered_stream_sha256 is not None
         assert sealed_evaluation_hash is not None
         assert release.source_tree is not None
+        assert lifecycle is not None
         manifest = {
+            **lifecycle.binding.to_dict(),
             "schema_version": 3,
-            "provider": AWS_P5_PROFILE,
-            "cohort_id": AWS_COHORT_ID,
-            "seed": seed,
             "release_sha256": release.archive_sha256,
             "release_receipt_sha256": release.receipt_sha256,
             "profile_sha256": profile_sha256,

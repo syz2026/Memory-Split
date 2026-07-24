@@ -13,6 +13,10 @@ from collections.abc import Sequence
 from contextlib import contextmanager
 from pathlib import Path
 
+from .aws_lifecycle import (
+    LIFECYCLE_BINDING_FIELDS,
+    ProviderLifecycleBinding,
+)
 from .errors import MsctlError
 from .fsutil import (
     atomic_write_at,
@@ -134,6 +138,14 @@ AWS_V3_RESUME_STATE_KEYS = AWS_V3_RUN_STATE_KEYS | {
     "checkpoint_objects",
     "prior_command_ids",
 }
+AWS_SELECTED_RUN_STATE_KEYS = (
+    AWS_V3_RUN_STATE_KEYS | set(LIFECYCLE_BINDING_FIELDS)
+)
+AWS_SELECTED_RESUME_STATE_KEYS = AWS_SELECTED_RUN_STATE_KEYS | {
+    "checkpoint_receipt",
+    "checkpoint_objects",
+    "prior_command_ids",
+}
 RESUME_STATE_KEYS = RUN_STATE_KEYS | {
     "checkpoint_receipt_sha256",
     "prior_job_ids",
@@ -225,6 +237,10 @@ RESOURCE_KEYS = {
 }
 STATUS_RE = re.compile(r"^[A-Z][A-Z0-9_]*$")
 _AWS_PROVIDER = "aws-p5.48xlarge"
+_AWS_SELECTED_PROVIDERS = {
+    "aws-p5.48xlarge",
+    "aws-p6-b300.48xlarge",
+}
 _AWS_PAIR_FILE_RE = re.compile(r"^aws-([0-9a-f]{64})\.json$")
 _AWS_V3_IDENTITY_FILE_RE = re.compile(
     r"^aws-([0-9a-f]{64})\.v3-identity$"
@@ -358,7 +374,7 @@ def _validate_common(value: dict[str, object], *, operation: str) -> None:
 
 
 def _validate_run_state(value: dict[str, object], run_id: str) -> None:
-    if value.get("provider") == _AWS_PROVIDER:
+    if value.get("provider") in _AWS_SELECTED_PROVIDERS:
         _validate_aws_run_state(value, run_id)
         return
     operation = value.get("operation")
@@ -395,7 +411,7 @@ def _validate_run_state(value: dict[str, object], run_id: str) -> None:
 
 
 def _validate_aws_run_state(value: dict[str, object], run_id: str) -> None:
-    if value.get("schema_version") == 2:
+    if value.get("schema_version") in {2, 3}:
         _validate_aws_v3_run_state(value, run_id)
         return
     operation = value.get("operation")
@@ -488,10 +504,19 @@ def _validate_aws_v3_run_state(
     run_id: str,
 ) -> None:
     operation = value.get("operation")
+    selected_lifecycle = "provider_selection_sha256" in value
     keys = (
-        AWS_V3_RESUME_STATE_KEYS
-        if operation == "resume"
-        else AWS_V3_RUN_STATE_KEYS
+        (
+            AWS_SELECTED_RESUME_STATE_KEYS
+            if operation == "resume"
+            else AWS_SELECTED_RUN_STATE_KEYS
+        )
+        if selected_lifecycle
+        else (
+            AWS_V3_RESUME_STATE_KEYS
+            if operation == "resume"
+            else AWS_V3_RUN_STATE_KEYS
+        )
     )
     require_exact_keys(value, keys, label="AWS v3 run state")
     if (
@@ -503,9 +528,68 @@ def _validate_aws_v3_run_state(
         or value["arm"] not in {"dense", "split90"}
         or type(value["seed"]) is not int
         or value["seed"] not in range(10)
-        or value["provider"] != _AWS_PROVIDER
+        or value["provider"]
+        not in (
+            _AWS_SELECTED_PROVIDERS
+            if selected_lifecycle
+            else {_AWS_PROVIDER}
+        )
     ):
         raise MsctlError("STATE_CORRUPT", "AWS v3 run identity is invalid")
+    if selected_lifecycle:
+        try:
+            ProviderLifecycleBinding(
+                cohort_id=value["cohort_id"],
+                provider=value["provider"],
+                profile_id=value["profile_id"],
+                profile_sha256=value["profile_sha256"],
+                hardware_amendment_sha256=value[
+                    "hardware_amendment_sha256"
+                ],
+                provider_selection_sha256=value[
+                    "provider_selection_sha256"
+                ],
+                provider_selection_version_id=value[
+                    "provider_selection_version_id"
+                ],
+                runtime_lock_sha256=value["runtime_lock_sha256"],
+                runtime_sbom_sha256=value["runtime_sbom_sha256"],
+                qualification_evidence_sha256=value[
+                    "qualification_evidence_sha256"
+                ],
+                qualification_environment_receipt_sha256=value[
+                    "qualification_environment_receipt_sha256"
+                ],
+                qualification_canary_receipt_sha256=value[
+                    "qualification_canary_receipt_sha256"
+                ],
+                qualification_approval_receipt_sha256=value[
+                    "qualification_approval_receipt_sha256"
+                ],
+                qualification_approval_public_key_sha256=value[
+                    "qualification_approval_public_key_sha256"
+                ],
+                objective_controls_contract_sha256=value[
+                    "objective_controls_contract_sha256"
+                ],
+                account_id=value["account_id"],
+                instance_id=value["instance_id"],
+                boot_id=value["boot_id"],
+                region=value["region"],
+                availability_zone=value["availability_zone"],
+                purchase_model=value["purchase_model"],
+                seed=value["seed"],
+                arms=(
+                    tuple(value["arms"])
+                    if isinstance(value["arms"], list)
+                    else value["arms"]
+                ),
+            )
+        except (TypeError, ValueError) as error:
+            raise MsctlError(
+                "STATE_CORRUPT",
+                "AWS selected lifecycle binding is invalid",
+            ) from error
     for field in (
         "release_sha256",
         "release_receipt_sha256",
@@ -927,7 +1011,7 @@ class StateStore:
     @staticmethod
     def _is_aws_v3_run(value: dict[str, object]) -> bool:
         return (
-            value.get("provider") == _AWS_PROVIDER
+            value.get("provider") in _AWS_SELECTED_PROVIDERS
             and value.get("schema_version") == 2
         )
 
@@ -1328,7 +1412,7 @@ class StateStore:
         )
         if (
             value["schema_version"] != 1
-            or value["provider"] != _AWS_PROVIDER
+            or value["provider"] not in _AWS_SELECTED_PROVIDERS
             or value["run_manifest_sha256"] != manifest_sha256
         ):
             raise MsctlError(
@@ -1376,9 +1460,19 @@ class StateStore:
         manifest_sha256: str,
         states: Sequence[dict[str, object]],
     ) -> dict[str, object]:
+        providers = {
+            state.get("provider") for state in states
+        }
+        if len(providers) != 1 or next(iter(providers)) not in (
+            _AWS_SELECTED_PROVIDERS
+        ):
+            raise MsctlError(
+                "STATE_CORRUPT",
+                "AWS v3 identity states use different providers",
+            )
         value = {
             "schema_version": 1,
-            "provider": _AWS_PROVIDER,
+            "provider": next(iter(providers)),
             "run_manifest_sha256": manifest_sha256,
             "runs": sorted(
                 (
@@ -1646,7 +1740,7 @@ class StateStore:
                 "AWS pair intent schema version is invalid",
             )
         if (
-            value["provider"] != _AWS_PROVIDER
+            value["provider"] not in _AWS_SELECTED_PROVIDERS
             or value["run_manifest_sha256"] != manifest_sha256
         ):
             raise MsctlError("STATE_CORRUPT", "AWS pair intent identity is invalid")

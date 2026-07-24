@@ -23,6 +23,10 @@ from msctl.aws_contracts import (
     PROVIDER,
     SEEDS,
 )
+from msctl.aws_lifecycle import (
+    AuthenticatedProviderLifecycle,
+    admit_provider_lifecycle,
+)
 from msctl.jsonutil import canonical_json
 
 
@@ -95,7 +99,7 @@ def _relative_inside(path: Path, root: Path, *, label: str) -> str:
         raise LaunchManifestError(f"{label} is outside scratch") from error
 
 
-def build_launcher_manifest(
+def _build_launcher_manifest(
     *,
     out: Path,
     scratch_root: Path,
@@ -112,6 +116,7 @@ def build_launcher_manifest(
     bootstrap_receipt: Path,
     corpus_receipt: Path,
     runs: Sequence[dict[str, object]],
+    lifecycle: AuthenticatedProviderLifecycle | None = None,
 ) -> dict[str, object]:
     """Resolve dynamic receipt hashes into Task3/5's closed manifest schema."""
 
@@ -233,21 +238,41 @@ def build_launcher_manifest(
         },
         "code_commit": code_commit,
         "cohort_assignment_sha256": cohort_assignment_sha256,
-        "cohort_id": COHORT_ID,
         "corpus_receipt": {
             "build_id": build_id,
             "ordered_stream_sha256": ordered_sha256,
             "path": corpus_relative,
             "sha256": corpus_hash,
         },
-        "profile_sha256": profile_sha256,
-        "provider": PROVIDER,
         "release_members_sha256": release_members_sha256,
         "release_sha256": release_sha256,
         "runs": launch_runs,
-        "schema_version": 2 if source_tree is not None else 1,
-        "seed": seed,
     }
+    if lifecycle is None:
+        manifest.update(
+            {
+                "cohort_id": COHORT_ID,
+                "profile_sha256": profile_sha256,
+                "provider": PROVIDER,
+                "schema_version": 2 if source_tree is not None else 1,
+                "seed": seed,
+            }
+        )
+    else:
+        if (
+            not isinstance(lifecycle, AuthenticatedProviderLifecycle)
+            or lifecycle.binding.seed != seed
+            or lifecycle.binding.profile_sha256 != profile_sha256
+        ):
+            raise LaunchManifestError(
+                "authenticated provider lifecycle differs from launcher seed/profile"
+            )
+        manifest.update(
+            {
+                **lifecycle.binding.to_dict(),
+                "schema_version": 3,
+            }
+        )
     if source_tree is not None:
         manifest.update(
             {
@@ -278,6 +303,118 @@ def build_launcher_manifest(
     finally:
         os.close(descriptor)
     return manifest
+
+
+def build_launcher_manifest(
+    *,
+    out: Path,
+    scratch_root: Path,
+    seed: int,
+    profile_sha256: str,
+    release_sha256: str,
+    release_members_sha256: str,
+    release_receipt_sha256: str | None = None,
+    environment_receipt_sha256: str | None = None,
+    run_manifest_sha256: str | None = None,
+    cohort_assignment_sha256: str,
+    code_commit: str,
+    source_tree: str | None = None,
+    bootstrap_receipt: Path,
+    corpus_receipt: Path,
+    runs: Sequence[dict[str, object]],
+) -> dict[str, object]:
+    """Build the explicit legacy-compatible P5 launcher manifest."""
+
+    return _build_launcher_manifest(
+        out=out,
+        scratch_root=scratch_root,
+        seed=seed,
+        profile_sha256=profile_sha256,
+        release_sha256=release_sha256,
+        release_members_sha256=release_members_sha256,
+        release_receipt_sha256=release_receipt_sha256,
+        environment_receipt_sha256=environment_receipt_sha256,
+        run_manifest_sha256=run_manifest_sha256,
+        cohort_assignment_sha256=cohort_assignment_sha256,
+        code_commit=code_commit,
+        source_tree=source_tree,
+        bootstrap_receipt=bootstrap_receipt,
+        corpus_receipt=corpus_receipt,
+        runs=runs,
+    )
+
+
+def build_authenticated_launcher_manifest(
+    *,
+    out: Path,
+    scratch_root: Path,
+    seed: int,
+    release_sha256: str,
+    release_members_sha256: str,
+    release_receipt_sha256: str,
+    run_manifest_sha256: str,
+    cohort_assignment_sha256: str,
+    code_commit: str,
+    source_tree: str,
+    bootstrap_receipt: Path,
+    corpus_receipt: Path,
+    runs: Sequence[dict[str, object]],
+    authority_root: Path | str,
+    repo_root: Path | str,
+    runtime_lock_path: Path | str,
+    runtime_evidence_path: Path | str,
+    runtime_sbom_path: Path | str,
+    objective_controls_amendment_path: Path | str,
+    store: object,
+    account_id: str,
+    instance_id: str,
+    boot_id: str,
+    expected_selection_version_id: str,
+    identity_verifier: object,
+    approval_verifier: object,
+    trusted_public_key_sha256: str,
+) -> dict[str, object]:
+    """Build a selected-provider manifest after exact authority re-entry."""
+
+    lifecycle = admit_provider_lifecycle(
+        authority_root=authority_root,
+        repo_root=repo_root,
+        runtime_lock_path=runtime_lock_path,
+        runtime_evidence_path=runtime_evidence_path,
+        runtime_sbom_path=runtime_sbom_path,
+        objective_controls_amendment_path=(
+            objective_controls_amendment_path
+        ),
+        store=store,
+        account_id=account_id,
+        instance_id=instance_id,
+        boot_id=boot_id,
+        seed=seed,
+        expected_selection_version_id=expected_selection_version_id,
+        identity_verifier=identity_verifier,
+        approval_verifier=approval_verifier,
+        trusted_public_key_sha256=trusted_public_key_sha256,
+    )
+    return _build_launcher_manifest(
+        out=out,
+        scratch_root=scratch_root,
+        seed=seed,
+        profile_sha256=lifecycle.binding.profile_sha256,
+        release_sha256=release_sha256,
+        release_members_sha256=release_members_sha256,
+        release_receipt_sha256=release_receipt_sha256,
+        environment_receipt_sha256=(
+            lifecycle.binding.qualification_environment_receipt_sha256
+        ),
+        run_manifest_sha256=run_manifest_sha256,
+        cohort_assignment_sha256=cohort_assignment_sha256,
+        code_commit=code_commit,
+        source_tree=source_tree,
+        bootstrap_receipt=bootstrap_receipt,
+        corpus_receipt=corpus_receipt,
+        runs=runs,
+        lifecycle=lifecycle,
+    )
 
 
 def _run_binding(value: str) -> dict[str, object]:

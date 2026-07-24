@@ -30,6 +30,10 @@ from cluster.aws.p5.checkpoint_mirror import (
 )
 from msctl import aws_resume_launch as aws_resume_launch_module
 from msctl.aws_contracts import checkpoint_object_key, checkpoint_receipt_key
+from msctl.aws_lifecycle import (
+    ProviderLifecycleBinding,
+    lifecycle_operational_metadata,
+)
 from msctl.contracts import (
     parse_paired_checkpoint_receipt_v3,
     verify_checkpoint_receipt,
@@ -50,6 +54,52 @@ def _canonical_json(value: object) -> bytes:
     ).encode("ascii")
 
 
+CHECKPOINT_LIFECYCLE = ProviderLifecycleBinding(
+    cohort_id="memorysplit-confirmatory-v3-360m-n10-aws",
+    provider="aws-p5.48xlarge",
+    profile_id="aws-p5.48xlarge-v3",
+    profile_sha256="1" * 64,
+    hardware_amendment_sha256="6" * 64,
+    provider_selection_sha256="7" * 64,
+    provider_selection_version_id="selection-version-1",
+    runtime_lock_sha256="8" * 64,
+    runtime_sbom_sha256="9" * 64,
+    qualification_evidence_sha256="0" * 64,
+    qualification_environment_receipt_sha256="2" * 64,
+    qualification_canary_receipt_sha256="3" * 64,
+    qualification_approval_receipt_sha256="4" * 64,
+    qualification_approval_public_key_sha256="5" * 64,
+    objective_controls_contract_sha256="a" * 64,
+    account_id="123456789012",
+    instance_id="i-0123456789abcdef0",
+    boot_id="11111111-2222-4333-8444-555555555555",
+    region="us-east-1",
+    availability_zone="us-east-1d",
+    purchase_model="on_demand",
+    seed=0,
+    arms=("dense", "split90"),
+)
+
+
+def _operational_metadata(
+    arm: str,
+    *,
+    seed: int = 0,
+) -> dict[str, object]:
+    binding = replace(CHECKPOINT_LIFECYCLE, seed=seed)
+    return lifecycle_operational_metadata(
+        binding,
+        run_id=f"memorysplit-v3-360m-s{seed}-{arm}",
+        arm=arm,
+        config_sha256=("b" if arm == "dense" else "c") * 64,
+        dataset_receipt_sha256="d" * 64,
+        dataset_build_id="b" * 64,
+        ordered_stream_sha256="e" * 64,
+        source_commit="9" * 40,
+        source_tree="a" * 40,
+    )
+
+
 def _write_metadata(
     checkpoint: Path,
     *,
@@ -61,6 +111,8 @@ def _write_metadata(
     ordered_stream_sha256: str = "e" * 64,
     request_token: str | None = "a" * 32,
     include_request_token: bool = True,
+    include_operational_metadata: bool = True,
+    operational_metadata: dict[str, object] | None = None,
 ) -> dict[str, object]:
     installed = checkpoint.stat(follow_symlinks=False)
     value = {
@@ -91,6 +143,17 @@ def _write_metadata(
     }
     if include_request_token:
         value["request_token"] = request_token
+    if include_operational_metadata:
+        arm = (
+            "split90"
+            if sidecar_name == "split90_target_weights"
+            else "dense"
+        )
+        value.update(
+            _operational_metadata(arm)
+            if operational_metadata is None
+            else operational_metadata
+        )
     checkpoint.with_name("ckpt.meta.json").write_bytes(_canonical_json(value))
     return value
 
@@ -138,6 +201,7 @@ def test_legacy_trainer_metadata_without_request_token_remains_readable(
         checkpoint,
         step=18,
         include_request_token=False,
+        include_operational_metadata=False,
     )
 
     actual = read_trainer_checkpoint_metadata(checkpoint)
@@ -289,8 +353,40 @@ def _request(tmp_path: Path) -> CheckpointMirrorRequest:
         deadline_at="2026-07-23T12:20:00Z",
         instance_id="i-0123456789abcdef0",
         boot_id="11111111-2222-4333-8444-555555555555",
+        account_id=CHECKPOINT_LIFECYCLE.account_id,
+        region=CHECKPOINT_LIFECYCLE.region,
+        availability_zone=CHECKPOINT_LIFECYCLE.availability_zone,
+        purchase_model=CHECKPOINT_LIFECYCLE.purchase_model,
+        provider=CHECKPOINT_LIFECYCLE.provider,
+        profile_id=CHECKPOINT_LIFECYCLE.profile_id,
         profile_sha256="1" * 64,
+        hardware_amendment_sha256=(
+            CHECKPOINT_LIFECYCLE.hardware_amendment_sha256
+        ),
+        provider_selection_sha256=(
+            CHECKPOINT_LIFECYCLE.provider_selection_sha256
+        ),
+        provider_selection_version_id=(
+            CHECKPOINT_LIFECYCLE.provider_selection_version_id
+        ),
+        runtime_lock_sha256=CHECKPOINT_LIFECYCLE.runtime_lock_sha256,
+        runtime_sbom_sha256=CHECKPOINT_LIFECYCLE.runtime_sbom_sha256,
+        qualification_evidence_sha256=(
+            CHECKPOINT_LIFECYCLE.qualification_evidence_sha256
+        ),
         environment_receipt_sha256="2" * 64,
+        qualification_canary_receipt_sha256=(
+            CHECKPOINT_LIFECYCLE.qualification_canary_receipt_sha256
+        ),
+        qualification_approval_receipt_sha256=(
+            CHECKPOINT_LIFECYCLE.qualification_approval_receipt_sha256
+        ),
+        qualification_approval_public_key_sha256=(
+            CHECKPOINT_LIFECYCLE.qualification_approval_public_key_sha256
+        ),
+        objective_controls_contract_sha256=(
+            CHECKPOINT_LIFECYCLE.objective_controls_contract_sha256
+        ),
         release_sha256="3" * 64,
         release_receipt_sha256="4" * 64,
         run_manifest_sha256="5" * 64,
@@ -307,12 +403,46 @@ def _request(tmp_path: Path) -> CheckpointMirrorRequest:
         },
         config_sha256={"dense": "b" * 64, "split90": "c" * 64},
         run_ids={
-            "dense": "memorysplit-v3-360m-dense-s0",
-            "split90": "memorysplit-v3-360m-split90-s0",
+            "dense": "memorysplit-v3-360m-s0-dense",
+            "split90": "memorysplit-v3-360m-s0-split90",
         },
         s3_root="s3://memorysplit-test/prefix",
         runtime_uid=os.geteuid(),
         runtime_gid=os.getegid(),
+    )
+
+
+def _bind_manifest_lifecycle(manifest, request: CheckpointMirrorRequest):
+    return replace(
+        manifest,
+        **{
+            field: (
+                tuple(value)
+                if field == "arms" and isinstance(value, list)
+                else value
+            )
+            for field, value in request._lifecycle.to_dict().items()
+        },
+    )
+
+
+def _legacy_request(tmp_path: Path) -> CheckpointMirrorRequest:
+    return replace(
+        _request(tmp_path),
+        account_id=None,
+        region=None,
+        availability_zone=None,
+        purchase_model=None,
+        hardware_amendment_sha256=None,
+        provider_selection_sha256=None,
+        provider_selection_version_id=None,
+        runtime_lock_sha256=None,
+        runtime_sbom_sha256=None,
+        qualification_evidence_sha256=None,
+        qualification_canary_receipt_sha256=None,
+        qualification_approval_receipt_sha256=None,
+        qualification_approval_public_key_sha256=None,
+        objective_controls_contract_sha256=None,
     )
 
 
@@ -360,6 +490,17 @@ def test_distinct_fresh_arm_steps_publish_one_atomic_pair_receipt(
         row["data"]["global_cursor"]
         for row in published.value["checkpoints"]
     ] == [5 * 524_288, 7 * 524_288]
+    assert published.value["provider"] == CHECKPOINT_LIFECYCLE.provider
+    assert published.value["profile_id"] == CHECKPOINT_LIFECYCLE.profile_id
+    assert published.value["provider_selection_version_id"] == (
+        CHECKPOINT_LIFECYCLE.provider_selection_version_id
+    )
+    assert published.value["runtime_sbom_sha256"] == (
+        CHECKPOINT_LIFECYCLE.runtime_sbom_sha256
+    )
+    assert published.value["objective_controls_contract_sha256"] == (
+        CHECKPOINT_LIFECYCLE.objective_controls_contract_sha256
+    )
 
 
 def test_both_arms_require_fresh_post_signal_generations(tmp_path: Path) -> None:
@@ -811,11 +952,8 @@ def test_v3_receipt_verifier_binds_every_manifest_provenance(
         source_tree=request.source_tree,
     )
     manifest = SimpleNamespace(
+        **request._lifecycle.to_dict(),
         schema_version=3,
-        provider="aws-p5.48xlarge",
-        cohort_id="memorysplit-confirmatory-v3-360m-n10-aws",
-        seed=0,
-        profile_sha256=request.profile_sha256,
         release_sha256=request.release_sha256,
         release_receipt_sha256=request.release_receipt_sha256,
         dataset_receipt_sha256=request.dataset_receipt_sha256,
@@ -846,6 +984,20 @@ def test_v3_receipt_verifier_binds_every_manifest_provenance(
         )
         is receipt
     )
+    with pytest.raises(Exception, match="provenance|selection|lifecycle"):
+        verify_aws_checkpoint_receipt_v3(
+            receipt,
+            release=release,
+            manifest=SimpleNamespace(
+                **{
+                    **vars(manifest),
+                    "provider_selection_sha256": "f" * 64,
+                }
+            ),
+            environment_receipt_sha256=request.environment_receipt_sha256,
+            instance_id=request.instance_id,
+            boot_id=request.boot_id,
+        )
     with pytest.raises(Exception, match="provenance|environment"):
         verify_aws_checkpoint_receipt_v3(
             receipt,
@@ -1239,11 +1391,8 @@ def test_controller_fetches_exact_receipt_and_heads_both_versions_first(
     runner = ReceiptRunner()
     backend = _backend(tmp_path / "backend", case, runner=runner)
     manifest = SimpleNamespace(
+        **request._lifecycle.to_dict(),
         schema_version=3,
-        provider="aws-p5.48xlarge",
-        cohort_id="memorysplit-confirmatory-v3-360m-n10-aws",
-        seed=0,
-        profile_sha256=request.profile_sha256,
         release_sha256=request.release_sha256,
         release_receipt_sha256=request.release_receipt_sha256,
         dataset_receipt_sha256=request.dataset_receipt_sha256,
@@ -1319,7 +1468,7 @@ def test_v3_resume_dry_run_consumes_the_versioned_pair(
     producer.mkdir()
     environment_sha256 = "e" * 64
     request = replace(
-        _request(producer),
+        _legacy_request(producer),
         profile_sha256=manifest.profile_sha256,
         environment_receipt_sha256=environment_sha256,
         release_sha256=manifest.release_sha256,
@@ -1350,6 +1499,7 @@ def test_v3_resume_dry_run_consumes_the_versioned_pair(
             receipt_sha256=request.dataset_receipt_sha256,
             build_id=request.dataset_build_id,
             ordered_stream_sha256=request.ordered_stream_sha256,
+            include_operational_metadata=False,
         )
 
     published = publish_paired_checkpoint(
@@ -1445,7 +1595,7 @@ def test_v3_resume_apply_exact_replay_is_idempotent_and_version_pinned(
     producer.mkdir()
     environment_sha256 = "e" * 64
     request = replace(
-        _request(producer),
+        _legacy_request(producer),
         profile_sha256=manifest.profile_sha256,
         environment_receipt_sha256=environment_sha256,
         release_sha256=manifest.release_sha256,
@@ -1476,6 +1626,7 @@ def test_v3_resume_apply_exact_replay_is_idempotent_and_version_pinned(
             receipt_sha256=request.dataset_receipt_sha256,
             build_id=request.dataset_build_id,
             ordered_stream_sha256=request.ordered_stream_sha256,
+            include_operational_metadata=False,
         )
 
     published = publish_paired_checkpoint(
@@ -2360,6 +2511,7 @@ def test_receipt_seed_nine_passes_and_seed_ten_fails(tmp_path: Path) -> None:
             checkpoint,
             step=12,
             sidecar_name=f"{arm}_target_weights",
+                operational_metadata=_operational_metadata(arm, seed=9),
         )
 
     published = publish_paired_checkpoint(

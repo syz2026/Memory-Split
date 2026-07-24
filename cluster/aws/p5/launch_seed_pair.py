@@ -35,6 +35,11 @@ from cluster.aws.p5.interruption_checkpoint import (
     S3ObjectStore,
     handle_interruption,
 )
+from cluster.aws.gpu_profile import read_secure_regular_file
+from cluster.aws.qualification import (
+    CohortSelectionAuthority,
+    _parse_selected_bootstrap_receipt_bytes,
+)
 from cluster.aws.p5.checkpoint_mirror import (
     CheckpointMirrorRequest,
     CheckpointMirrorScheduler,
@@ -67,6 +72,14 @@ from msctl.aws_contracts import (
     PROVIDER,
     SEEDS,
     SNAPSHOT_STEPS,
+    validate_gpu_product_names,
+)
+from msctl.aws_lifecycle import (
+    LIFECYCLE_BINDING_FIELDS,
+    AuthenticatedProviderLifecycle,
+    ProviderLifecycleBinding,
+    admit_provider_lifecycle,
+    lifecycle_operational_metadata,
 )
 from train.safeio import (
     CHECKPOINT_REQUEST_ARM_ENV,
@@ -104,6 +117,10 @@ _MANIFEST_V2_FIELDS = _MANIFEST_FIELDS | {
     "release_receipt_sha256",
     "run_manifest_sha256",
     "source_tree",
+}
+_MANIFEST_V3_FIELDS = _MANIFEST_V2_FIELDS | {
+    *LIFECYCLE_BINDING_FIELDS,
+    "profile_id",
 }
 _RUN_FIELDS = frozenset(
     {
@@ -237,6 +254,7 @@ class LaunchPlan:
     container_image: str
     runtime_uid: int
     runtime_gid: int
+    lifecycle_binding: ProviderLifecycleBinding | None = None
 
 
 @dataclass(frozen=True)
@@ -356,6 +374,10 @@ def _validate_release_root(
     profile_sha256: str,
     cohort_sha256: str,
     code_commit: str,
+    provider: str = PROVIDER,
+    profile_id: str = "aws-p5.48xlarge-v3",
+    profile_path: str = PROFILE_MEMBER_PATH,
+    lifecycle_binding: ProviderLifecycleBinding | None = None,
 ) -> tuple[VerifiedFile, ...]:
     from msctl.contracts import (
         same_typed_value,
@@ -437,23 +459,27 @@ def _validate_release_root(
 
     metadata_bytes = metadata_path.read_bytes()
     metadata = _load_json(metadata_path, label="release metadata")
+    metadata_fields = {
+        "schema_version",
+        "package_format_version",
+        "provider",
+        "source",
+        "seed_assignment",
+        "cohort_assignment",
+        "profile",
+        "environment",
+        "dataset_pointer",
+        "config_sha256",
+        "members",
+    }
+    if lifecycle_binding is not None:
+        metadata_fields |= {
+            *LIFECYCLE_BINDING_FIELDS,
+            "profile_id",
+        }
     _exact_fields(
         metadata,
-        frozenset(
-            {
-                "schema_version",
-                "package_format_version",
-                "provider",
-                "source",
-                "seed_assignment",
-                "cohort_assignment",
-                "profile",
-                "environment",
-                "dataset_pointer",
-                "config_sha256",
-                "members",
-            }
-        ),
+        frozenset(metadata_fields),
         label="release metadata",
     )
     source = metadata["source"]
@@ -470,7 +496,7 @@ def _validate_release_root(
         or metadata.get("schema_version") != 1
         or type(metadata.get("package_format_version")) is not int
         or metadata.get("package_format_version") != PACKAGE_FORMAT_VERSION
-        or metadata.get("provider") != PROVIDER
+        or metadata.get("provider") != provider
         or source["commit"] != code_commit
         or source["dirty"] is not False
         or not isinstance(source["tree"], str)
@@ -480,12 +506,22 @@ def _validate_release_root(
             {
                 "arms": list(ARMS),
                 "cohort_id": COHORT_ID,
-                "provider": PROVIDER,
+                "provider": provider,
                 "seeds": list(SEEDS),
             },
         )
     ):
         raise LaunchError("release metadata identity does not match")
+    if lifecycle_binding is not None and (
+        metadata.get("profile_id") != profile_id
+        or any(
+            metadata.get(field) != value
+            for field, value in lifecycle_binding.to_dict().items()
+        )
+    ):
+        raise LaunchError(
+            "release metadata differs from selected provider authority"
+        )
     rows = metadata.get("members")
     if not isinstance(rows, list):
         raise LaunchError("release metadata member list is missing")
@@ -560,7 +596,7 @@ def _validate_release_root(
     )
     _profile_path, metadata_profile_sha256 = metadata_binding(
         "profile",
-        PROFILE_MEMBER_PATH,
+        profile_path,
     )
     _pointer_path, metadata_pointer_sha256 = metadata_binding(
         "dataset_pointer",
@@ -1036,7 +1072,7 @@ def _arm_by_name(runs: object) -> dict[str, dict[str, object]]:
     return result
 
 
-def load_launch_plan(
+def _load_launch_plan(
     *,
     seed: int,
     manifest_path: Path | str,
@@ -1055,15 +1091,39 @@ def load_launch_plan(
     | None = None,
     enforce_profile_scratch: bool = True,
     allow_existing_outputs: bool = False,
+    _authenticated_lifecycle: AuthenticatedProviderLifecycle | None = None,
+    _runtime_lock_data: bytes | None = None,
+    _runtime_sbom_data: bytes | None = None,
 ) -> LaunchPlan:
     """Validate all trust roots and return an immutable paired launch plan."""
 
-    profile = load_aws_p5_profile(profile_path)
-    if (
-        profile.profile_id != "aws-p5.48xlarge-v3"
+    profile = (
+        _authenticated_lifecycle.profile
+        if _authenticated_lifecycle is not None
+        else load_aws_p5_profile(profile_path)
+    )
+    if _authenticated_lifecycle is None:
+        if (
+            profile.profile_id != "aws-p5.48xlarge-v3"
+            or profile.assigned_seeds != SEEDS
+        ):
+            raise LaunchError("launch requires the exact v3 AWS P5 profile")
+    elif (
+        not isinstance(
+            _authenticated_lifecycle,
+            AuthenticatedProviderLifecycle,
+        )
+        or _authenticated_lifecycle.binding.seed != seed
+        or profile.profile_id
+        not in {
+            "aws-p5.48xlarge-v3",
+            "aws-p6-b300.48xlarge-v3",
+        }
         or profile.assigned_seeds != SEEDS
     ):
-        raise LaunchError("launch requires the exact v3 AWS P5 profile")
+        raise LaunchError(
+            "launch selected-provider authority is invalid"
+        )
     try:
         runtime = validate_runtime_environment(profile, environment)
     except ValueError as error:
@@ -1075,8 +1135,14 @@ def load_launch_plan(
         if observed_instance_type is None
         else observed_instance_type
     )
-    if actual_instance_type != "p5.48xlarge":
-        raise LaunchError("launch requires an actual p5.48xlarge instance")
+    if actual_instance_type != profile.instance_type:
+        raise LaunchError(
+            (
+                "launch requires an actual p5.48xlarge instance"
+                if _authenticated_lifecycle is None
+                else "launch instance type differs from selected profile"
+            )
+        )
     actual_instance_id = (
         _default_instance_id()
         if observed_instance_id is None
@@ -1106,10 +1172,20 @@ def load_launch_plan(
         if gpu_names is None
         else tuple(gpu_names)
     )
-    if len(actual_gpu_names) != 8:
-        raise LaunchError("launch requires exactly eight H100 devices")
-    if any(_H100_RE.fullmatch(name) is None for name in actual_gpu_names):
-        raise LaunchError("launch requires eight NVIDIA H100 80GB devices")
+    try:
+        validate_gpu_product_names(
+            profile.profile_id,
+            actual_gpu_names,
+            expected_count=profile.allocated_gpus,
+        )
+    except ValueError as error:
+        raise LaunchError(
+            (
+                "launch requires exactly eight approved H100 devices"
+                if _authenticated_lifecycle is None
+                else "launch GPU devices differ from selected profile"
+            )
+        ) from error
 
     repo = Path(repo_root).resolve(strict=True)
     scratch = Path(scratch_root).resolve(strict=True)
@@ -1127,19 +1203,26 @@ def load_launch_plan(
     manifest_digest = _hash_regular(manifest_file, label="run manifest")
     manifest = _load_json(manifest_file, label="run manifest")
     manifest_schema = manifest.get("schema_version")
-    if type(manifest_schema) is not int or manifest_schema not in {1, 2}:
-        raise LaunchError("manifest schema version must be exact integer 1 or 2")
+    if (
+        type(manifest_schema) is not int
+        or manifest_schema not in {1, 2, 3}
+    ):
+        raise LaunchError(
+            "manifest schema version must be exact integer 1, 2, or 3"
+        )
     _exact_fields(
         manifest,
         (
-            _MANIFEST_V2_FIELDS
-            if manifest_schema == 2
+            _MANIFEST_V3_FIELDS
+            if manifest_schema == 3
+            else _MANIFEST_V2_FIELDS
+            if manifest_schema in {2, 3}
             else _MANIFEST_FIELDS
         ),
         label="run manifest",
     )
-    if manifest["provider"] != PROVIDER:
-        raise LaunchError("run manifest provider must be aws-p5.48xlarge")
+    if manifest["provider"] != profile.provider:
+        raise LaunchError("run manifest provider differs from selected profile")
     if manifest["cohort_id"] != COHORT_ID:
         raise LaunchError("run manifest cohort ID does not match")
     if type(manifest["seed"]) is not int or manifest["seed"] != seed:
@@ -1149,6 +1232,33 @@ def load_launch_plan(
     )
     if profile_sha256 != profile.sha256:
         raise LaunchError("manifest profile SHA-256 does not match")
+    lifecycle_binding = (
+        _authenticated_lifecycle.binding
+        if _authenticated_lifecycle is not None
+        else None
+    )
+    selected_profile_path = {
+        "aws-p5.48xlarge-v3": PROFILE_MEMBER_PATH,
+        "aws-p6-b300.48xlarge-v3": (
+            "cluster/profiles/aws-p6-b300.48xlarge-v3.json"
+        ),
+    }.get(profile.profile_id)
+    if selected_profile_path is None:
+        raise LaunchError("selected launch profile path is unsupported")
+    if manifest_schema == 3 and (
+        lifecycle_binding is None
+        or any(
+            manifest.get(field) != value
+            for field, value in lifecycle_binding.to_dict().items()
+        )
+    ):
+        raise LaunchError(
+            "run manifest differs from authenticated provider lifecycle"
+        )
+    if manifest_schema != 3 and lifecycle_binding is not None:
+        raise LaunchError(
+            "authenticated provider launch requires schema-3 manifest"
+        )
     release_sha256 = _sha256(
         manifest["release_sha256"], label="manifest release"
     )
@@ -1194,7 +1304,7 @@ def load_launch_plan(
     run_manifest_sha256 = None
     release_receipt_sha256 = None
     environment_receipt_sha256 = None
-    if manifest_schema == 2:
+    if manifest_schema in {2, 3}:
         source_tree = _commit(manifest["source_tree"])
         run_manifest_sha256 = _sha256(
             manifest["run_manifest_sha256"],
@@ -1254,23 +1364,70 @@ def load_launch_plan(
     bootstrap_path = _inside_existing(
         scratch, bootstrap_relative, label="bootstrap receipt"
     )
-    bootstrap_file, bootstrap_receipt = _validate_bootstrap_receipt(
-        bootstrap_path,
-        expected_sha256=_sha256(
-            bootstrap_binding["sha256"], label="manifest bootstrap receipt"
-        ),
-        profile=profile,
-        runtime=runtime,
-        release_sha256=release_sha256,
-        release_members_sha256=release_members_sha256,
-        cohort_sha256=cohort_sha256,
-        corpus_sha256=corpus_sha256,
-        corpus_build_id=corpus_build_id,
-        corpus_ordered_stream_sha256=ordered_sha256,
-        code_commit=code_commit,
-        observed_instance_id=actual_instance_id,
-        observed_boot_id=actual_boot_id,
+    expected_bootstrap_sha256 = _sha256(
+        bootstrap_binding["sha256"],
+        label="manifest bootstrap receipt",
     )
+    bootstrap_candidate = _load_json(
+        bootstrap_path,
+        label="bootstrap receipt",
+    )
+    if lifecycle_binding is not None:
+        if bootstrap_candidate.get("receipt_type") != (
+            "memorysplit-aws-gpu-bootstrap-v1"
+        ):
+            raise LaunchError(
+                "selected launch requires the selection-bound bootstrap receipt"
+            )
+        if _runtime_lock_data is None or _runtime_sbom_data is None:
+            raise LaunchError(
+                "selected bootstrap validation requires runtime lock/SBOM bytes"
+            )
+        bootstrap_data = bootstrap_path.read_bytes()
+        if hashlib.sha256(bootstrap_data).hexdigest() != (
+            expected_bootstrap_sha256
+        ):
+            raise LaunchError("selected bootstrap receipt hash differs")
+        authority = CohortSelectionAuthority(
+            profile=profile,
+            seed=seed,
+            arms=("dense", "split90"),
+            bindings=_authenticated_lifecycle.arm_bindings,
+        )
+        try:
+            bootstrap_receipt = _parse_selected_bootstrap_receipt_bytes(
+                bootstrap_data,
+                selection_authority=authority,
+                runtime_lock_data=_runtime_lock_data,
+                runtime_sbom_data=_runtime_sbom_data,
+                environment_receipt_sha256=str(
+                    manifest["environment_receipt_sha256"]
+                ),
+            )
+        except (TypeError, ValueError) as error:
+            raise LaunchError(
+                "selected bootstrap receipt authority is invalid"
+            ) from error
+        bootstrap_file = VerifiedFile(
+            path=bootstrap_path,
+            sha256=expected_bootstrap_sha256,
+        )
+    else:
+        bootstrap_file, bootstrap_receipt = _validate_bootstrap_receipt(
+            bootstrap_path,
+            expected_sha256=expected_bootstrap_sha256,
+            profile=profile,
+            runtime=runtime,
+            release_sha256=release_sha256,
+            release_members_sha256=release_members_sha256,
+            cohort_sha256=cohort_sha256,
+            corpus_sha256=corpus_sha256,
+            corpus_build_id=corpus_build_id,
+            corpus_ordered_stream_sha256=ordered_sha256,
+            code_commit=code_commit,
+            observed_instance_id=actual_instance_id,
+            observed_boot_id=actual_boot_id,
+        )
     verified_files.append(bootstrap_file)
     verified_files.extend(
         _validate_release_root(
@@ -1281,6 +1438,10 @@ def load_launch_plan(
             profile_sha256=profile_sha256,
             cohort_sha256=cohort_sha256,
             code_commit=code_commit,
+            provider=profile.provider,
+            profile_id=profile.profile_id,
+            profile_path=selected_profile_path,
+            lifecycle_binding=lifecycle_binding,
         )
     )
 
@@ -1361,7 +1522,7 @@ def load_launch_plan(
         )
         request_token_path = (
             checkpoint_path.with_name(CHECKPOINT_REQUEST_TOKEN_FILENAME)
-            if manifest_schema == 2
+            if manifest_schema in {2, 3}
             else None
         )
         pid_path = _inside_output(
@@ -1381,6 +1542,20 @@ def load_launch_plan(
         runtime_config = dict(config)
         runtime_config["train_corpus"] = "/dataset"
         runtime_config["out_dir"] = "/output/run"
+        if lifecycle_binding is not None:
+            runtime_config["operational_metadata"] = (
+                lifecycle_operational_metadata(
+                    lifecycle_binding,
+                    run_id=str(config["run_id"]),
+                    arm=arm,
+                    config_sha256=config_digest,
+                    dataset_receipt_sha256=corpus_sha256,
+                    dataset_build_id=corpus_build_id,
+                    ordered_stream_sha256=ordered_sha256,
+                    source_commit=code_commit,
+                    source_tree=str(source_tree),
+                )
+            )
         runtime_config_bytes = (
             json.dumps(
                 runtime_config,
@@ -1428,8 +1603,12 @@ def load_launch_plan(
             / f"{arm}.cid"
         )
         container_image = str(bootstrap_receipt["container_image"])
-        runtime_uid = int(bootstrap_receipt["runtime_uid"])
-        runtime_gid = int(bootstrap_receipt["runtime_gid"])
+        runtime_uid = int(
+            bootstrap_receipt.get("runtime_uid", runtime.uid)
+        )
+        runtime_gid = int(
+            bootstrap_receipt.get("runtime_gid", runtime.gid)
+        )
         mount_values = {
             "release": str(repo),
             "dataset": str(scratch / "dataset"),
@@ -1452,7 +1631,42 @@ def load_launch_plan(
                 "--env",
                 f"{CHECKPOINT_REQUEST_ARM_ENV}={arm}",
             )
-            if manifest_schema == 2
+            if manifest_schema in {2, 3}
+            else ()
+        )
+        selected_environment = (
+            (
+                "--env",
+                f"MS_PROVIDER={lifecycle_binding.provider}",
+                "--env",
+                f"MS_PROFILE_ID={lifecycle_binding.profile_id}",
+                "--env",
+                (
+                    "MS_PROVIDER_SELECTION_SHA256="
+                    f"{lifecycle_binding.provider_selection_sha256}"
+                ),
+                "--env",
+                (
+                    "MS_PROVIDER_SELECTION_VERSION_ID="
+                    f"{lifecycle_binding.provider_selection_version_id}"
+                ),
+                "--env",
+                (
+                    "MS_RUNTIME_LOCK_SHA256="
+                    f"{lifecycle_binding.runtime_lock_sha256}"
+                ),
+                "--env",
+                (
+                    "MS_RUNTIME_SBOM_SHA256="
+                    f"{lifecycle_binding.runtime_sbom_sha256}"
+                ),
+                "--env",
+                (
+                    "MS_OBJECTIVE_CONTROLS_SHA256="
+                    f"{lifecycle_binding.objective_controls_contract_sha256}"
+                ),
+            )
+            if lifecycle_binding is not None
             else ()
         )
         container_argv = (
@@ -1501,6 +1715,7 @@ def load_launch_plan(
             "--env",
             "MS_RANK_ZERO_PID_FILE=/output/rank-zero.pid",
             *request_token_environment,
+            *selected_environment,
             "--env",
             "OMP_NUM_THREADS=1",
             "--env",
@@ -1578,8 +1793,143 @@ def load_launch_plan(
         instance_id=actual_instance_id,
         boot_id=actual_boot_id,
         container_image=str(bootstrap_receipt["container_image"]),
-        runtime_uid=int(bootstrap_receipt["runtime_uid"]),
-        runtime_gid=int(bootstrap_receipt["runtime_gid"]),
+        runtime_uid=int(
+            bootstrap_receipt.get("runtime_uid", runtime.uid)
+        ),
+        runtime_gid=int(
+            bootstrap_receipt.get("runtime_gid", runtime.gid)
+        ),
+        lifecycle_binding=lifecycle_binding,
+    )
+
+
+def load_launch_plan(
+    *,
+    seed: int,
+    manifest_path: Path | str,
+    profile_path: Path | str,
+    repo_root: Path | str,
+    scratch_root: Path | str,
+    environment: Mapping[str, str],
+    observed_instance_type: str | None = None,
+    observed_instance_id: str | None = None,
+    observed_boot_id: str | None = None,
+    gpu_names: Sequence[str] | None = None,
+    port_available: Callable[[int], bool] = _default_port_available,
+    semantic_corpus_verifier: Callable[
+        [Path], Mapping[str, object]
+    ]
+    | None = None,
+    enforce_profile_scratch: bool = True,
+    allow_existing_outputs: bool = False,
+) -> LaunchPlan:
+    """Load the explicit legacy-compatible P5 launch plan."""
+
+    return _load_launch_plan(
+        seed=seed,
+        manifest_path=manifest_path,
+        profile_path=profile_path,
+        repo_root=repo_root,
+        scratch_root=scratch_root,
+        environment=environment,
+        observed_instance_type=observed_instance_type,
+        observed_instance_id=observed_instance_id,
+        observed_boot_id=observed_boot_id,
+        gpu_names=gpu_names,
+        port_available=port_available,
+        semantic_corpus_verifier=semantic_corpus_verifier,
+        enforce_profile_scratch=enforce_profile_scratch,
+        allow_existing_outputs=allow_existing_outputs,
+    )
+
+
+def load_authenticated_launch_plan(
+    *,
+    seed: int,
+    manifest_path: Path | str,
+    repo_root: Path | str,
+    scratch_root: Path | str,
+    environment: Mapping[str, str],
+    authority_root: Path | str,
+    runtime_lock_path: Path | str,
+    runtime_evidence_path: Path | str,
+    runtime_sbom_path: Path | str,
+    objective_controls_amendment_path: Path | str,
+    store: object,
+    account_id: str,
+    instance_id: str,
+    boot_id: str,
+    expected_selection_version_id: str,
+    identity_verifier: object,
+    approval_verifier: object,
+    trusted_public_key_sha256: str,
+    observed_instance_type: str | None = None,
+    observed_instance_id: str | None = None,
+    observed_boot_id: str | None = None,
+    gpu_names: Sequence[str] | None = None,
+    port_available: Callable[[int], bool] = _default_port_available,
+    semantic_corpus_verifier: Callable[
+        [Path], Mapping[str, object]
+    ]
+    | None = None,
+    enforce_profile_scratch: bool = True,
+    allow_existing_outputs: bool = False,
+) -> LaunchPlan:
+    """Load a selected P5/P6 plan after both arm scopes authenticate."""
+
+    lifecycle = admit_provider_lifecycle(
+        authority_root=authority_root,
+        repo_root=repo_root,
+        runtime_lock_path=runtime_lock_path,
+        runtime_evidence_path=runtime_evidence_path,
+        runtime_sbom_path=runtime_sbom_path,
+        objective_controls_amendment_path=(
+            objective_controls_amendment_path
+        ),
+        store=store,
+        account_id=account_id,
+        instance_id=instance_id,
+        boot_id=boot_id,
+        seed=seed,
+        expected_selection_version_id=expected_selection_version_id,
+        identity_verifier=identity_verifier,
+        approval_verifier=approval_verifier,
+        trusted_public_key_sha256=trusted_public_key_sha256,
+    )
+    profile_relative = {
+        "aws-p5.48xlarge-v3": PROFILE_MEMBER_PATH,
+        "aws-p6-b300.48xlarge-v3": (
+            "cluster/profiles/aws-p6-b300.48xlarge-v3.json"
+        ),
+    }[lifecycle.profile.profile_id]
+    runtime_lock_data = read_secure_regular_file(
+        runtime_lock_path,
+        label="selected launcher runtime lock",
+        max_bytes=1024 * 1024,
+    )
+    runtime_sbom_data = read_secure_regular_file(
+        runtime_sbom_path,
+        label="selected launcher runtime SBOM",
+        max_bytes=512 * 1024 * 1024,
+    )
+    return _load_launch_plan(
+        seed=seed,
+        manifest_path=manifest_path,
+        profile_path=Path(repo_root) / profile_relative,
+        repo_root=repo_root,
+        scratch_root=scratch_root,
+        environment=environment,
+        observed_instance_type=observed_instance_type,
+        observed_instance_id=observed_instance_id,
+        observed_boot_id=observed_boot_id,
+        gpu_names=gpu_names,
+        port_available=port_available,
+        semantic_corpus_verifier=semantic_corpus_verifier,
+        enforce_profile_scratch=enforce_profile_scratch,
+        allow_existing_outputs=allow_existing_outputs,
+        _authenticated_lifecycle=lifecycle,
+        _runtime_lock_data=runtime_lock_data,
+        _runtime_sbom_data=runtime_sbom_data,
     )
 
 
@@ -2617,6 +2967,7 @@ def _production_checkpoint_scheduler(
     scheduler: CheckpointMirrorScheduler
 
     def request(reason: str) -> CheckpointMirrorRequest:
+        lifecycle = plan.lifecycle_binding
         requested = wall_origin + timedelta(
             seconds=scheduler.fresh_at - monotonic_origin
         )
@@ -2629,9 +2980,65 @@ def _production_checkpoint_scheduler(
             deadline_at=deadline.strftime("%Y-%m-%dT%H:%M:%SZ"),
             instance_id=plan.instance_id,
             boot_id=plan.boot_id,
+            account_id=(lifecycle.account_id if lifecycle else None),
+            region=(lifecycle.region if lifecycle else None),
+            availability_zone=(
+                lifecycle.availability_zone if lifecycle else None
+            ),
+            purchase_model=(
+                lifecycle.purchase_model if lifecycle else None
+            ),
+            provider=plan.profile.provider,
+            profile_id=plan.profile.profile_id,
             profile_sha256=plan.profile.sha256,
+            hardware_amendment_sha256=(
+                lifecycle.hardware_amendment_sha256
+                if lifecycle
+                else None
+            ),
+            provider_selection_sha256=(
+                lifecycle.provider_selection_sha256
+                if lifecycle
+                else None
+            ),
+            provider_selection_version_id=(
+                lifecycle.provider_selection_version_id
+                if lifecycle
+                else None
+            ),
+            runtime_lock_sha256=(
+                lifecycle.runtime_lock_sha256 if lifecycle else None
+            ),
+            runtime_sbom_sha256=(
+                lifecycle.runtime_sbom_sha256 if lifecycle else None
+            ),
+            qualification_evidence_sha256=(
+                lifecycle.qualification_evidence_sha256
+                if lifecycle
+                else None
+            ),
             environment_receipt_sha256=(
                 plan.environment_receipt_sha256
+            ),
+            qualification_canary_receipt_sha256=(
+                lifecycle.qualification_canary_receipt_sha256
+                if lifecycle
+                else None
+            ),
+            qualification_approval_receipt_sha256=(
+                lifecycle.qualification_approval_receipt_sha256
+                if lifecycle
+                else None
+            ),
+            qualification_approval_public_key_sha256=(
+                lifecycle.qualification_approval_public_key_sha256
+                if lifecycle
+                else None
+            ),
+            objective_controls_contract_sha256=(
+                lifecycle.objective_controls_contract_sha256
+                if lifecycle
+                else None
             ),
             release_sha256=plan.release_sha256,
             release_receipt_sha256=plan.release_receipt_sha256,

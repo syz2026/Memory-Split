@@ -12,6 +12,11 @@ from pathlib import Path
 from cluster.aws.p5.profile import load_aws_p5_profile
 
 from .aws_p5 import build_aws_backend
+from .aws_hardware import (
+    AwsCliVersionedSelectionStore,
+    OpenSslQualificationApprovalVerifier,
+    verify_aws_instance_identity_pkcs7,
+)
 from .cleanup import apply_cleanup, make_cleanup_plan
 from .collect import collect_evidence
 from .contracts import load_release
@@ -137,6 +142,20 @@ def build_parser() -> JsonArgumentParser:
     instantiate.add_argument("--dataset-receipt", required=True)
     instantiate.add_argument("--sealed-evaluation-release-sha256")
     instantiate.add_argument("--estimated-instance-hours", type=float)
+    instantiate.add_argument("--authority-root")
+    instantiate.add_argument("--runtime-lock")
+    instantiate.add_argument("--runtime-evidence")
+    instantiate.add_argument("--runtime-sbom")
+    instantiate.add_argument("--objective-controls-amendment")
+    instantiate.add_argument("--selection-version-id")
+    instantiate.add_argument("--selection-bucket")
+    instantiate.add_argument("--selection-region")
+    instantiate.add_argument("--selection-staging-root")
+    instantiate.add_argument("--account-id")
+    instantiate.add_argument("--instance-id")
+    instantiate.add_argument("--boot-id")
+    instantiate.add_argument("--approval-public-key")
+    instantiate.add_argument("--approval-public-key-sha256")
     instantiate.add_argument("--seed", required=True, type=int)
     instantiate.add_argument("--out", required=True)
     instantiate.add_argument("--apply", action="store_true")
@@ -243,10 +262,10 @@ def _require_cli_values(args: argparse.Namespace, *names: str) -> None:
 
 def _load_cli_profile(path: Path | str) -> object:
     value = require_object(load_json(path, label="profile"), label="profile")
-    if (
-        value.get("provider") == AWS_P5_PROFILE
-        and value.get("profile_id") == "aws-p5.48xlarge-v3"
-    ):
+    if value.get("profile_id") in {
+        "aws-p5.48xlarge-v3",
+        "aws-p6-b300.48xlarge-v3",
+    }:
         try:
             return load_aws_p5_profile(path)
         except (OSError, TypeError, ValueError) as error:
@@ -312,7 +331,11 @@ def dispatch(
     profile = (profile_loader or default_profile_loader)(args.profile)
     environment = dict(os.environ if environ is None else environ)
     provider = getattr(profile, "provider", None)
-    if provider not in {SUPPORTED_PROFILE, AWS_P5_PROFILE}:
+    if provider not in {
+        SUPPORTED_PROFILE,
+        AWS_P5_PROFILE,
+        "aws-p6-b300.48xlarge",
+    }:
         raise MsctlError(
             "PROVIDER_UNSUPPORTED",
             "profile provider is not supported",
@@ -327,18 +350,70 @@ def dispatch(
             "P5 qualification canary requires the exact v3 AWS profile",
         )
     if command == "runs instantiate":
-        if (
-            provider == AWS_P5_PROFILE
-            and getattr(profile, "profile_id", None)
-            == "aws-p5.48xlarge-v3"
-        ):
+        selected_profile = getattr(profile, "profile_id", None) in {
+            "aws-p5.48xlarge-v3",
+            "aws-p6-b300.48xlarge-v3",
+        }
+        selected_inputs: dict[str, object] = {}
+        if selected_profile:
             _require_cli_values(
                 args,
                 "sealed_evaluation_release_sha256",
                 "estimated_instance_hours",
+                "authority_root",
+                "runtime_lock",
+                "runtime_evidence",
+                "runtime_sbom",
+                "objective_controls_amendment",
+                "selection_version_id",
+                "selection_bucket",
+                "selection_region",
+                "selection_staging_root",
+                "account_id",
+                "instance_id",
+                "boot_id",
+                "approval_public_key",
+                "approval_public_key_sha256",
             )
+            command_environment = {
+                name: environment[name]
+                for name in ("HOME", "LANG", "LC_ALL", "PATH")
+                if name in environment
+            }
+            command_environment["AWS_REGION"] = args.selection_region
+            selection_store = AwsCliVersionedSelectionStore(
+                bucket=args.selection_bucket,
+                region=args.selection_region,
+                environment=command_environment,
+                staging_root=args.selection_staging_root,
+            )
+            approval_verifier = OpenSslQualificationApprovalVerifier(
+                public_key_path=args.approval_public_key,
+                environment=command_environment,
+            )
+            selected_inputs = {
+                "authority_root": args.authority_root,
+                "runtime_lock_path": args.runtime_lock,
+                "runtime_evidence_path": args.runtime_evidence,
+                "runtime_sbom_path": args.runtime_sbom,
+                "objective_controls_amendment_path": (
+                    args.objective_controls_amendment
+                ),
+                "selection_store": selection_store,
+                "account_id": args.account_id,
+                "instance_id": args.instance_id,
+                "boot_id": args.boot_id,
+                "expected_selection_version_id": (
+                    args.selection_version_id
+                ),
+                "identity_verifier": verify_aws_instance_identity_pkcs7,
+                "qualification_approval_verifier": approval_verifier,
+                "trusted_qualification_public_key_sha256": (
+                    args.approval_public_key_sha256
+                ),
+            }
         return not args.apply, instantiate_run_manifest(
-            profile=profile,
+            profile=None if selected_profile else profile,
             release_path=args.release,
             dataset_receipt=args.dataset_receipt,
             seed=args.seed,
@@ -350,6 +425,7 @@ def dispatch(
             ),
             estimated_instance_hours=args.estimated_instance_hours,
             cohort_loader=cohort_loader,
+            **selected_inputs,
         )
     if provider == AWS_P5_PROFILE:
         if (

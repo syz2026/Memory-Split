@@ -27,7 +27,10 @@ from cluster.aws.p5.interruption_checkpoint import (
     ImdsV2Client,
     S3ObjectStore,
 )
-from cluster.aws.gpu_profile import read_secure_regular_file
+from cluster.aws.gpu_profile import (
+    parse_aws_gpu_profile_bytes,
+    read_secure_regular_file,
+)
 from cluster.aws.p5.profile import (
     AwsP5Profile,
     AwsP5Runtime,
@@ -49,6 +52,10 @@ from msctl.aws_contracts import (
     PROFILE_PATH,
     PROVIDER,
     SEEDS,
+)
+from msctl.aws_lifecycle import (
+    LIFECYCLE_BINDING_FIELDS,
+    ProviderLifecycleBinding,
 )
 
 
@@ -849,21 +856,40 @@ def _verify_release_archive(
             metadata_bytes,
             label="release metadata",
         )
+        selected_lifecycle = (
+            release_value is not None
+            and "provider_selection_sha256" in release_value
+        )
+        selected_provider = (
+            release_value["provider"] if release_value is not None else PROVIDER
+        )
+        selected_profile_path = (
+            release_value["profile"]["path"]
+            if selected_lifecycle
+            and isinstance(release_value.get("profile"), dict)
+            else PROFILE_PATH
+        )
+        metadata_fields = {
+            "schema_version",
+            "package_format_version",
+            "provider",
+            "source",
+            "seed_assignment",
+            "cohort_assignment",
+            "profile",
+            "environment",
+            "dataset_pointer",
+            "config_sha256",
+            "members",
+        }
+        if selected_lifecycle:
+            metadata_fields |= {
+                *LIFECYCLE_BINDING_FIELDS,
+                "profile_id",
+            }
         _exact_fields(
             metadata,
-            {
-                "schema_version",
-                "package_format_version",
-                "provider",
-                "source",
-                "seed_assignment",
-                "cohort_assignment",
-                "profile",
-                "environment",
-                "dataset_pointer",
-                "config_sha256",
-                "members",
-            },
+            metadata_fields,
             label="release metadata",
         )
         metadata_source = metadata["source"]
@@ -880,7 +906,7 @@ def _verify_release_archive(
             or metadata.get("schema_version") != 1
             or type(metadata.get("package_format_version")) is not int
             or metadata.get("package_format_version") != PACKAGE_FORMAT_VERSION
-            or metadata.get("provider") != PROVIDER
+            or metadata.get("provider") != selected_provider
             or metadata_source["commit"] != code_commit
             or metadata_source["dirty"] is not False
             or metadata_source["tree"] != code_tree
@@ -891,12 +917,22 @@ def _verify_release_archive(
                 {
                     "arms": list(ARMS),
                     "cohort_id": COHORT_ID,
-                    "provider": PROVIDER,
+                    "provider": selected_provider,
                     "seeds": list(SEEDS),
                 },
             )
         ):
             raise BootstrapError("release metadata identity does not match")
+        if selected_lifecycle and any(
+            not same_typed_value(
+                metadata.get(field),
+                release_value.get(field),
+            )
+            for field in (*LIFECYCLE_BINDING_FIELDS, "profile_id")
+        ):
+            raise BootstrapError(
+                "release lifecycle metadata differs from receipt"
+            )
         rows = metadata.get("members")
         if not isinstance(rows, list):
             raise BootstrapError("release metadata members must be a list")
@@ -953,7 +989,7 @@ def _verify_release_archive(
         profile_sha256 = _binding(
             metadata["profile"],
             label="release profile",
-            expected_path=PROFILE_PATH,
+            expected_path=selected_profile_path,
         )
         dataset_pointer_sha256 = _binding(
             metadata["dataset_pointer"],
@@ -962,7 +998,7 @@ def _verify_release_archive(
         )
         for path, digest, label in (
             (COHORT_ASSIGNMENT_PATH, cohort_sha256, "cohort assignment"),
-            (PROFILE_PATH, profile_sha256, "profile"),
+            (selected_profile_path, profile_sha256, "profile"),
             (DATASET_POINTER_PATH, dataset_pointer_sha256, "dataset pointer"),
         ):
             if member_sha256.get(path) != digest:
@@ -1031,10 +1067,28 @@ def _verify_release_archive(
                 "v3 cohort assignment must contain AWS-only seeds 0 through 9"
             )
         profile = _strict_json_object(
-            regular[PROFILE_PATH][1],
+            regular[selected_profile_path][1],
             label="v3 profile",
         )
-        if (
+        if selected_lifecycle:
+            try:
+                selected_profile = parse_aws_gpu_profile_bytes(
+                    regular[selected_profile_path][1]
+                )
+            except (TypeError, ValueError) as error:
+                raise BootstrapError(
+                    "release selected profile identity is invalid"
+                ) from error
+            if (
+                selected_profile.provider != selected_provider
+                or selected_profile.profile_id != metadata["profile_id"]
+                or selected_profile.sha256 != profile_sha256
+                or selected_profile.assigned_seeds != tuple(SEEDS)
+            ):
+                raise BootstrapError(
+                    "release selected profile differs from lifecycle"
+                )
+        elif (
             type(profile.get("schema_version")) is not int
             or profile.get("schema_version") != 1
             or profile.get("profile_id") != "aws-p5.48xlarge-v3"
@@ -1067,7 +1121,14 @@ def _verify_release_archive(
                 "seed_assignment",
                 "source",
                 "package_format_version",
+                *LIFECYCLE_BINDING_FIELDS,
+                "profile_id",
             ):
+                if not selected_lifecycle and field in {
+                    *LIFECYCLE_BINDING_FIELDS,
+                    "profile_id",
+                }:
+                    continue
                 if not same_typed_value(
                     release_value.get(field),
                     metadata[field],
@@ -1162,26 +1223,33 @@ def verify_bootstrap_artifacts(
     )
     if not isinstance(code_commit, str) or _COMMIT_RE.fullmatch(code_commit) is None:
         raise BootstrapError("code commit must be 40 lowercase hex characters")
+    selected_lifecycle = "provider_selection_sha256" in release_value
+    release_fields = {
+        "schema_version",
+        "package_format_version",
+        "release_id",
+        "provider",
+        "archive",
+        "source",
+        "members_sha256",
+        "seed_assignment",
+        "cohort_assignment",
+        "profile",
+        "environment",
+        "dataset_pointer",
+        "cohort_assignment_sha256",
+        "profile_sha256",
+        "dataset_pointer_sha256",
+        "config_sha256",
+    }
+    if selected_lifecycle:
+        release_fields |= {
+            *LIFECYCLE_BINDING_FIELDS,
+            "profile_id",
+        }
     _exact_fields(
         release_value,
-        {
-            "schema_version",
-            "package_format_version",
-            "release_id",
-            "provider",
-            "archive",
-            "source",
-            "members_sha256",
-            "seed_assignment",
-            "cohort_assignment",
-            "profile",
-            "environment",
-            "dataset_pointer",
-            "cohort_assignment_sha256",
-            "profile_sha256",
-            "dataset_pointer_sha256",
-            "config_sha256",
-        },
+        release_fields,
         label="release receipt",
     )
     if (
@@ -1189,7 +1257,12 @@ def verify_bootstrap_artifacts(
         or release_value["schema_version"] != 1
         or type(release_value["package_format_version"]) is not int
         or release_value["package_format_version"] != PACKAGE_FORMAT_VERSION
-        or release_value["provider"] != PROVIDER
+        or release_value["provider"]
+        not in (
+            {"aws-p5.48xlarge", "aws-p6-b300.48xlarge"}
+            if selected_lifecycle
+            else {PROVIDER}
+        )
         or not isinstance(release_value["release_id"], str)
         or re.fullmatch(
             r"[a-z0-9][a-z0-9._-]{0,126}[a-z0-9]",
@@ -1198,6 +1271,55 @@ def verify_bootstrap_artifacts(
         is None
     ):
         raise BootstrapError("release receipt package format identity is invalid")
+    if selected_lifecycle:
+        try:
+            lifecycle = ProviderLifecycleBinding(
+                cohort_id=release_value["cohort_id"],
+                provider=release_value["provider"],
+                profile_id=release_value["profile_id"],
+                profile_sha256=release_value["profile_sha256"],
+                hardware_amendment_sha256=release_value[
+                    "hardware_amendment_sha256"
+                ],
+                provider_selection_sha256=release_value[
+                    "provider_selection_sha256"
+                ],
+                provider_selection_version_id=release_value[
+                    "provider_selection_version_id"
+                ],
+                runtime_lock_sha256=release_value["runtime_lock_sha256"],
+                runtime_sbom_sha256=release_value["runtime_sbom_sha256"],
+                qualification_evidence_sha256=release_value[
+                    "qualification_evidence_sha256"
+                ],
+                qualification_environment_receipt_sha256=release_value[
+                    "qualification_environment_receipt_sha256"
+                ],
+                qualification_canary_receipt_sha256=release_value[
+                    "qualification_canary_receipt_sha256"
+                ],
+                qualification_approval_receipt_sha256=release_value[
+                    "qualification_approval_receipt_sha256"
+                ],
+                qualification_approval_public_key_sha256=release_value[
+                    "qualification_approval_public_key_sha256"
+                ],
+                objective_controls_contract_sha256=release_value[
+                    "objective_controls_contract_sha256"
+                ],
+                account_id=release_value["account_id"],
+                instance_id=release_value["instance_id"],
+                boot_id=release_value["boot_id"],
+                region=release_value["region"],
+                availability_zone=release_value["availability_zone"],
+                purchase_model=release_value["purchase_model"],
+                seed=release_value["seed"],
+                arms=tuple(release_value["arms"]),
+            )
+        except (TypeError, ValueError) as error:
+            raise BootstrapError(
+                "release provider lifecycle binding is invalid"
+            ) from error
     source = release_value["source"]
     if not isinstance(source, dict):
         raise BootstrapError("release source must be an object")
@@ -1248,7 +1370,7 @@ def verify_bootstrap_artifacts(
         {
             "arms": list(ARMS),
             "cohort_id": COHORT_ID,
-            "provider": PROVIDER,
+            "provider": release_value["provider"],
             "seeds": list(SEEDS),
         },
     ):
@@ -1260,10 +1382,20 @@ def verify_bootstrap_artifacts(
         label="release cohort assignment",
         expected_path=COHORT_ASSIGNMENT_PATH,
     )
+    profile_path = (
+        {
+            "aws-p5.48xlarge-v3": PROFILE_PATH,
+            "aws-p6-b300.48xlarge-v3": (
+                "cluster/profiles/aws-p6-b300.48xlarge-v3.json"
+            ),
+        }[release_value["profile_id"]]
+        if selected_lifecycle
+        else PROFILE_PATH
+    )
     profile_sha256 = _binding(
         release_value["profile"],
         label="release profile",
-        expected_path=PROFILE_PATH,
+        expected_path=profile_path,
     )
     dataset_pointer_sha256 = _binding(
         release_value["dataset_pointer"],

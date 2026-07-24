@@ -28,6 +28,12 @@ from train.safeio import (
     cleanup_checkpoint_request_token_path,
     publish_checkpoint_request_token,
 )
+from msctl.aws_lifecycle import (
+    OPERATIONAL_METADATA_FIELDS,
+    ProviderLifecycleBinding,
+    lifecycle_operational_metadata,
+    validate_lifecycle_operational_metadata,
+)
 
 
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
@@ -58,6 +64,7 @@ _LEGACY_METADATA_FIELDS = {
     "world_size",
 }
 _METADATA_FIELDS = _LEGACY_METADATA_FIELDS | {"request_token"}
+_SELECTED_METADATA_FIELDS = _METADATA_FIELDS | OPERATIONAL_METADATA_FIELDS
 _DATA_FIELDS = {
     "build_id",
     "global_cursor",
@@ -87,6 +94,7 @@ class TrainerCheckpointMetadata:
     data: dict[str, object]
     installed: dict[str, int]
     request_token: str | None
+    operational_metadata: dict[str, object] | None
 
 
 @dataclass(frozen=True)
@@ -639,8 +647,24 @@ class CheckpointMirrorRequest:
     deadline_at: str
     instance_id: str
     boot_id: str
+    account_id: str | None
+    region: str | None
+    availability_zone: str | None
+    purchase_model: str | None
+    provider: str
+    profile_id: str
     profile_sha256: str
+    hardware_amendment_sha256: str | None
+    provider_selection_sha256: str | None
+    provider_selection_version_id: str | None
+    runtime_lock_sha256: str | None
+    runtime_sbom_sha256: str | None
+    qualification_evidence_sha256: str | None
     environment_receipt_sha256: str
+    qualification_canary_receipt_sha256: str | None
+    qualification_approval_receipt_sha256: str | None
+    qualification_approval_public_key_sha256: str | None
+    objective_controls_contract_sha256: str | None
     release_sha256: str
     release_receipt_sha256: str
     run_manifest_sha256: str
@@ -679,6 +703,81 @@ class CheckpointMirrorRequest:
             or not self.boot_id
         ):
             raise ValueError("checkpoint instance and boot identities are required")
+        selected_lifecycle = self.provider_selection_sha256 is not None
+        try:
+            lifecycle = (ProviderLifecycleBinding(
+                cohort_id="memorysplit-confirmatory-v3-360m-n10-aws",
+                provider=self.provider,
+                profile_id=self.profile_id,
+                profile_sha256=self.profile_sha256,
+                hardware_amendment_sha256=(
+                    self.hardware_amendment_sha256
+                ),
+                provider_selection_sha256=(
+                    self.provider_selection_sha256
+                ),
+                provider_selection_version_id=(
+                    self.provider_selection_version_id
+                ),
+                runtime_lock_sha256=self.runtime_lock_sha256,
+                runtime_sbom_sha256=self.runtime_sbom_sha256,
+                qualification_evidence_sha256=(
+                    self.qualification_evidence_sha256
+                ),
+                qualification_environment_receipt_sha256=(
+                    self.environment_receipt_sha256
+                ),
+                qualification_canary_receipt_sha256=(
+                    self.qualification_canary_receipt_sha256
+                ),
+                qualification_approval_receipt_sha256=(
+                    self.qualification_approval_receipt_sha256
+                ),
+                qualification_approval_public_key_sha256=(
+                    self.qualification_approval_public_key_sha256
+                ),
+                objective_controls_contract_sha256=(
+                    self.objective_controls_contract_sha256
+                ),
+                account_id=self.account_id,
+                instance_id=self.instance_id,
+                boot_id=self.boot_id,
+                region=self.region,
+                availability_zone=self.availability_zone,
+                purchase_model=self.purchase_model,
+                seed=self.seed,
+                arms=("dense", "split90"),
+            ) if selected_lifecycle else None)
+        except (TypeError, ValueError) as error:
+            raise ValueError(
+                "checkpoint provider lifecycle binding is invalid"
+            ) from error
+        if not selected_lifecycle and (
+            self.provider != "aws-p5.48xlarge"
+            or self.profile_id != "aws-p5.48xlarge-v3"
+            or any(
+                value is not None
+                for value in (
+                    self.hardware_amendment_sha256,
+                    self.provider_selection_version_id,
+                    self.runtime_lock_sha256,
+                    self.runtime_sbom_sha256,
+                    self.qualification_evidence_sha256,
+                    self.qualification_canary_receipt_sha256,
+                    self.qualification_approval_receipt_sha256,
+                    self.qualification_approval_public_key_sha256,
+                    self.objective_controls_contract_sha256,
+                    self.account_id,
+                    self.region,
+                    self.availability_zone,
+                    self.purchase_model,
+                )
+            )
+        ):
+            raise ValueError(
+                "legacy checkpoint request cannot carry partial provider authority"
+            )
+        object.__setattr__(self, "_lifecycle", lifecycle)
         for label, digest in (
             ("profile", self.profile_sha256),
             ("environment receipt", self.environment_receipt_sha256),
@@ -763,6 +862,23 @@ class _StagedCheckpoint:
     sha256: str
     bytes: int
     metadata: TrainerCheckpointMetadata
+
+
+def _request_operational_metadata(
+    request: CheckpointMirrorRequest,
+    arm: str,
+) -> dict[str, object]:
+    return lifecycle_operational_metadata(
+        request._lifecycle,
+        run_id=request.run_ids[arm],
+        arm=arm,
+        config_sha256=request.config_sha256[arm],
+        dataset_receipt_sha256=request.dataset_receipt_sha256,
+        dataset_build_id=request.dataset_build_id,
+        ordered_stream_sha256=request.ordered_stream_sha256,
+        source_commit=request.source_commit,
+        source_tree=request.source_tree,
+    )
 
 
 def _strict_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
@@ -880,7 +996,12 @@ def _read_trainer_checkpoint_generation(
         raise ValueError("trainer checkpoint metadata is not canonical JSON") from error
     if (
         not isinstance(value, dict)
-        or set(value) not in (_METADATA_FIELDS, _LEGACY_METADATA_FIELDS)
+        or set(value)
+        not in (
+            _SELECTED_METADATA_FIELDS,
+            _METADATA_FIELDS,
+            _LEGACY_METADATA_FIELDS,
+        )
         or (
             json.dumps(
                 value,
@@ -897,6 +1018,14 @@ def _read_trainer_checkpoint_generation(
     data = value["data"]
     installed = value["installed"]
     request_token = value.get("request_token")
+    operational_metadata = (
+        {
+            field: value[field]
+            for field in OPERATIONAL_METADATA_FIELDS
+        }
+        if set(value) == _SELECTED_METADATA_FIELDS
+        else None
+    )
     if (
         type(value["schema_version"]) is not int
         or value["schema_version"] != 1
@@ -951,6 +1080,8 @@ def _read_trainer_checkpoint_generation(
         )
     ):
         raise ValueError("trainer checkpoint metadata values are invalid")
+    if operational_metadata is not None:
+        validate_lifecycle_operational_metadata(operational_metadata)
     try:
         checkpoint_stat = _stat_regular(
             checkpoint,
@@ -971,6 +1102,7 @@ def _read_trainer_checkpoint_generation(
             data=dict(data),
             installed=dict(installed),
             request_token=request_token,
+            operational_metadata=operational_metadata,
         ),
         (
             metadata_stat.st_dev,
@@ -1066,6 +1198,15 @@ def _stage_generation(
             or data["ordered_stream_sha256"] != request.ordered_stream_sha256
             or data["global_cursor"] != metadata.step * 524_288
             or data["sidecar_name"] != _SIDECARS[arm]
+            or (
+                request._lifecycle is not None
+                and metadata.operational_metadata
+                != _request_operational_metadata(request, arm)
+            )
+            or (
+                request._lifecycle is None
+                and metadata.operational_metadata is not None
+            )
         ):
             raise ValueError(f"{arm} trainer checkpoint metadata is incompatible")
         flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
@@ -1176,7 +1317,7 @@ def _checkpoint_metadata(
     # by a later request must be recoverable through exact HEAD. The
     # per-attempt request_id lives only in the paired receipt.
     data = staged.metadata.data
-    return {
+    metadata = {
         "arm": staged.arm,
         "checkpoint-version": str(staged.metadata.checkpoint_version),
         "config-fingerprint": staged.metadata.config_fingerprint,
@@ -1192,6 +1333,41 @@ def _checkpoint_metadata(
         "step": str(staged.metadata.step),
         "world-size": str(staged.metadata.world_size),
     }
+    if request._lifecycle is not None:
+        metadata.update(
+            {
+                "provider": request.provider,
+                "profile-id": request.profile_id,
+                "profile-sha256": request.profile_sha256,
+                "hardware-amendment-sha256": (
+                    request.hardware_amendment_sha256
+                ),
+                "provider-selection-sha256": (
+                    request.provider_selection_sha256
+                ),
+                "provider-selection-version-id": (
+                    request.provider_selection_version_id
+                ),
+                "runtime-lock-sha256": request.runtime_lock_sha256,
+                "runtime-sbom-sha256": request.runtime_sbom_sha256,
+                "qualification-evidence-sha256": (
+                    request.qualification_evidence_sha256
+                ),
+                "qualification-environment-sha256": (
+                    request.environment_receipt_sha256
+                ),
+                "qualification-canary-sha256": (
+                    request.qualification_canary_receipt_sha256
+                ),
+                "qualification-approval-sha256": (
+                    request.qualification_approval_receipt_sha256
+                ),
+                "objective-controls-sha256": (
+                    request.objective_controls_contract_sha256
+                ),
+            }
+        )
+    return metadata
 
 
 def _publish_exact(
@@ -1379,6 +1555,11 @@ def publish_paired_checkpoint(
         ):
             raise ValueError("staged checkpoint is outside freshness window")
         receipt = {
+            **(
+                request._lifecycle.to_dict()
+                if request._lifecycle is not None
+                else {}
+            ),
             "boot_id": request.boot_id,
             "checkpoints": rows,
             "cohort_id": "memorysplit-confirmatory-v3-360m-n10-aws",
@@ -1394,7 +1575,7 @@ def publish_paired_checkpoint(
             "instance_id": request.instance_id,
             "ordered_stream_sha256": request.ordered_stream_sha256,
             "profile_sha256": request.profile_sha256,
-            "provider": "aws-p5.48xlarge",
+            "provider": request.provider,
             "reason": request.reason,
             "receipt_type": "memorysplit-aws-paired-checkpoint-v3",
             "release_receipt_sha256": request.release_receipt_sha256,

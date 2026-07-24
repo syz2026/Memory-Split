@@ -29,8 +29,17 @@ from cluster.aws.p5.canary import (
     parse_qualification_receipt_bytes,
     qualification_roundtrip_blob,
 )
+from cluster.aws.gpu_profile import (
+    validate_runtime_environment as validate_selected_runtime_environment,
+)
 
 from .approval import verify_scope_approval
+from .aws_lifecycle import (
+    AuthenticatedProviderLifecycle,
+    LIFECYCLE_BINDING_FIELDS,
+    ProviderLifecycleBinding,
+    admit_provider_lifecycle,
+)
 from .aws_argv import (
     ARGV_DOCUMENT_CONTENT,
     ARGV_DOCUMENT_NAME,
@@ -422,8 +431,22 @@ class AwsP5Backend:
         environ: Mapping[str, str] | None = None,
         sleep: Callable[[float], None] = time.sleep,
         monotonic: Callable[[], float] = time.monotonic,
+        _authenticated_lifecycle: AuthenticatedProviderLifecycle | None = None,
+        _lifecycle_authority_kwargs: Mapping[str, object] | None = None,
     ) -> None:
-        _validate_profile(profile)
+        if _authenticated_lifecycle is None:
+            _validate_profile(profile)
+        elif (
+            not isinstance(
+                _authenticated_lifecycle,
+                AuthenticatedProviderLifecycle,
+            )
+            or _authenticated_lifecycle.profile != profile
+        ):
+            raise MsctlError(
+                "PROFILE_INVALID",
+                "authenticated provider lifecycle differs from profile",
+            )
         _validate_runtime(runtime)
         if (
             not isinstance(instance_profile_arn, str)
@@ -435,6 +458,16 @@ class AwsP5Backend:
             )
         self.profile = profile
         self.runtime = runtime
+        self.lifecycle_binding = (
+            _authenticated_lifecycle.binding
+            if _authenticated_lifecycle is not None
+            else None
+        )
+        self._lifecycle_authority_kwargs = (
+            dict(_lifecycle_authority_kwargs)
+            if _lifecycle_authority_kwargs is not None
+            else None
+        )
         self.instance_profile_arn = instance_profile_arn
         self.state_root = Path(state_root)
         self.runner = runner or SubprocessAwsJsonRunner()
@@ -486,6 +519,91 @@ class AwsP5Backend:
             self.controller_home = configured_home
         else:
             self.controller_home = "/tmp"
+
+    @classmethod
+    def from_authenticated_selection(
+        cls,
+        *,
+        authority_root: Path | str,
+        repo_root: Path | str,
+        runtime_lock_path: Path | str,
+        runtime_evidence_path: Path | str,
+        runtime_sbom_path: Path | str,
+        objective_controls_amendment_path: Path | str,
+        selection_store: object,
+        account_id: str,
+        instance_id: str,
+        boot_id: str,
+        seed: int,
+        expected_selection_version_id: str,
+        selection_identity_verifier: object,
+        qualification_approval_verifier: object,
+        trusted_qualification_public_key_sha256: str,
+        runtime_environment: Mapping[str, str],
+        instance_profile_arn: str,
+        state_root: Path | str,
+        runner: AwsJsonRunner | None = None,
+        scope_approval_verifier: Callable[..., object] = verify_scope_approval,
+        corpus_verifier: Callable[..., object] | None = None,
+        sleep: Callable[[float], None] = time.sleep,
+        monotonic: Callable[[], float] = time.monotonic,
+    ) -> "AwsP5Backend":
+        """Construct a selected-provider controller from fixed authority."""
+
+        authority_kwargs = {
+            "authority_root": authority_root,
+            "repo_root": repo_root,
+            "runtime_lock_path": runtime_lock_path,
+            "runtime_evidence_path": runtime_evidence_path,
+            "runtime_sbom_path": runtime_sbom_path,
+            "objective_controls_amendment_path": (
+                objective_controls_amendment_path
+            ),
+            "store": selection_store,
+            "account_id": account_id,
+            "instance_id": instance_id,
+            "boot_id": boot_id,
+            "expected_selection_version_id": (
+                expected_selection_version_id
+            ),
+            "identity_verifier": selection_identity_verifier,
+            "approval_verifier": qualification_approval_verifier,
+            "trusted_public_key_sha256": (
+                trusted_qualification_public_key_sha256
+            ),
+        }
+        lifecycle = admit_provider_lifecycle(
+            **authority_kwargs,
+            seed=seed,
+        )
+        try:
+            runtime = validate_selected_runtime_environment(
+                lifecycle.profile,
+                runtime_environment,
+            )
+        except ValueError as error:
+            raise MsctlError(
+                "AWS_RUNTIME_INVALID",
+                "selected provider runtime environment is invalid",
+            ) from error
+        return cls(
+            profile=lifecycle.profile,
+            runtime=runtime,
+            instance_profile_arn=instance_profile_arn,
+            state_root=state_root,
+            runner=runner,
+            approval_verifier=scope_approval_verifier,
+            corpus_verifier=corpus_verifier,
+            identity_verifier=selection_identity_verifier,
+            environ=runtime_environment,
+            sleep=sleep,
+            monotonic=monotonic,
+            _authenticated_lifecycle=lifecycle,
+            _lifecycle_authority_kwargs={
+                **authority_kwargs,
+                "seed": seed,
+            },
+        )
 
     def _aws_argv(
         self,
@@ -546,19 +664,73 @@ class AwsP5Backend:
                 "AWS caller identity fields must be non-empty strings",
             )
         return {
-            "provider": AWS_P5_PROFILE,
+            "provider": self.profile.provider,
             "region": self.runtime.region,
             **output,
         }
 
+    def _require_provider_lifecycle(self, manifest: object) -> None:
+        selected = getattr(
+            manifest,
+            "provider_selection_sha256",
+            None,
+        ) is not None
+        if not selected:
+            if self.lifecycle_binding is not None:
+                raise MsctlError(
+                    "RUN_MANIFEST_INVALID",
+                    "authenticated controller requires a selected manifest",
+                )
+            return
+        if self._lifecycle_authority_kwargs is None:
+            raise MsctlError(
+                "RUN_MANIFEST_INVALID",
+                "selected manifest requires fixed provider authority paths",
+            )
+        lifecycle = admit_provider_lifecycle(
+            **{
+                **self._lifecycle_authority_kwargs,
+                "seed": manifest.seed,
+            }
+        )
+        expected = lifecycle.binding.to_dict()
+        if (
+            lifecycle.profile != self.profile
+            or self.lifecycle_binding != lifecycle.binding
+            or any(
+                (
+                    tuple(getattr(manifest, field, ()))
+                    if field == "arms"
+                    and isinstance(
+                        getattr(manifest, field, None),
+                        (list, tuple),
+                    )
+                    else getattr(manifest, field, None)
+                )
+                != (
+                    tuple(value)
+                    if field == "arms"
+                    and isinstance(value, (list, tuple))
+                    else value
+                )
+                for field, value in expected.items()
+            )
+        ):
+            raise MsctlError(
+                "RUN_MANIFEST_INVALID",
+                "selected manifest differs from authenticated provider authority",
+            )
+
     def _validate_manifest(self, manifest: object) -> None:
+        self._require_provider_lifecycle(manifest)
         runs = getattr(manifest, "runs", ())
         is_v3_profile = (
-            getattr(self.profile, "profile_id", None) == _V3_PROFILE_ID
+            getattr(self.profile, "profile_id", None)
+            in {_V3_PROFILE_ID, "aws-p6-b300.48xlarge-v3"}
         )
         expected_schema = 3 if is_v3_profile else 2
         if (
-            getattr(manifest, "provider", None) != AWS_P5_PROFILE
+            getattr(manifest, "provider", None) != self.profile.provider
             or getattr(manifest, "seed", None)
             not in getattr(self.profile, "assigned_seeds", ())
             or len(runs) != 2
@@ -603,6 +775,24 @@ class AwsP5Backend:
                 "sha256",
             )
         )
+        if is_v3_profile and getattr(
+            manifest,
+            "provider_selection_sha256",
+            None,
+        ) is not None:
+            hash_fields = (
+                *hash_fields,
+                "hardware_amendment_sha256",
+                "provider_selection_sha256",
+                "runtime_lock_sha256",
+                "runtime_sbom_sha256",
+                "qualification_evidence_sha256",
+                "qualification_environment_receipt_sha256",
+                "qualification_canary_receipt_sha256",
+                "qualification_approval_receipt_sha256",
+                "qualification_approval_public_key_sha256",
+                "objective_controls_contract_sha256",
+            )
         for field in hash_fields:
             try:
                 require_sha256(
@@ -621,6 +811,32 @@ class AwsP5Backend:
             != "memorysplit-confirmatory-v3-360m-n10-aws"
             or not isinstance(getattr(manifest, "source_tree", None), str)
             or _COMMIT_RE.fullmatch(manifest.source_tree) is None
+            or getattr(manifest, "profile_id", None)
+            != getattr(self.profile, "profile_id", None)
+            or (
+                getattr(
+                    manifest,
+                    "provider_selection_sha256",
+                    None,
+                )
+                is not None
+                and (
+                    not isinstance(
+                        getattr(
+                            manifest,
+                            "provider_selection_version_id",
+                            None,
+                        ),
+                        str,
+                    )
+                    or getattr(
+                        manifest,
+                        "provider_selection_version_id",
+                        None,
+                    )
+                    in {"", "null"}
+                )
+            )
         ):
             raise MsctlError(
                 "RUN_MANIFEST_INVALID",
@@ -641,7 +857,7 @@ class AwsP5Backend:
     def _validate_release(self, release: object, manifest: object) -> None:
         is_v3 = getattr(manifest, "schema_version", None) == 3
         if (
-            getattr(release, "provider", None) != AWS_P5_PROFILE
+            getattr(release, "provider", None) != self.profile.provider
             or getattr(release, "archive_sha256", None)
             != manifest.release_sha256
             or getattr(release, "source_commit", None)
@@ -1215,10 +1431,62 @@ class AwsP5Backend:
                 "--apply",
             ]
         steps.append({"name": "paired-launch", "argv": launcher_argv})
+        selected_lifecycle = (
+            is_v3
+            and getattr(
+                manifest,
+                "provider_selection_sha256",
+                None,
+            )
+            is not None
+        )
+        lifecycle_fields = (
+            {
+                field: (
+                    list(manifest.arms)
+                    if field == "arms"
+                    else getattr(manifest, field)
+                )
+                for field in LIFECYCLE_BINDING_FIELDS
+            }
+            if selected_lifecycle
+            else {}
+        )
+        selected_environment = (
+            {
+                "MS_HARDWARE_AMENDMENT_SHA256": (
+                    manifest.hardware_amendment_sha256
+                ),
+                "MS_OBJECTIVE_CONTROLS_SHA256": (
+                    manifest.objective_controls_contract_sha256
+                ),
+                "MS_PROFILE_ID": manifest.profile_id,
+                "MS_PROFILE_SHA256": manifest.profile_sha256,
+                "MS_PROVIDER": manifest.provider,
+                "MS_PROVIDER_SELECTION_SHA256": (
+                    manifest.provider_selection_sha256
+                ),
+                "MS_PROVIDER_SELECTION_VERSION_ID": (
+                    manifest.provider_selection_version_id
+                ),
+                "MS_QUALIFICATION_EVIDENCE_SHA256": (
+                    manifest.qualification_evidence_sha256
+                ),
+                "MS_RUNTIME_LOCK_SHA256": manifest.runtime_lock_sha256,
+                "MS_RUNTIME_SBOM_SHA256": manifest.runtime_sbom_sha256,
+            }
+            if selected_lifecycle
+            else {}
+        )
         return {
-            "schema_version": 2 if is_v3 else 1,
+            **lifecycle_fields,
+            "schema_version": 3 if selected_lifecycle else 2 if is_v3 else 1,
             "operation": operation,
-            "provider": AWS_P5_PROFILE,
+            "provider": getattr(
+                manifest,
+                "provider",
+                self.profile.provider,
+            ),
             "seed": manifest.seed,
             "release_sha256": release.archive_sha256,
             "run_manifest_sha256": manifest.sha256,
@@ -1233,6 +1501,7 @@ class AwsP5Backend:
                 "MS_RUNTIME_GID": str(getattr(self.runtime, "gid", 1000)),
                 "MS_RUNTIME_UID": str(getattr(self.runtime, "uid", 1000)),
                 "MS_S3_ROOT": self.runtime.s3_root,
+                **selected_environment,
             },
             "checkpoint_receipt": checkpoint_binding,
             "steps": steps,
@@ -1566,7 +1835,11 @@ class AwsP5Backend:
             getattr(manifest, "dataset_sha256", None),
         )
         return {
-            "provider": AWS_P5_PROFILE,
+            "provider": getattr(
+                manifest,
+                "provider",
+                self.profile.provider,
+            ),
             "seed": manifest.seed,
             "cohort_sha256": manifest.cohort_assignment_sha256,
             "release_sha256": manifest.release_sha256,
@@ -1822,10 +2095,10 @@ class AwsP5Backend:
             if (
                 not isinstance(row["instance_id"], str)
                 or _INSTANCE_ID_RE.fullmatch(row["instance_id"]) is None
-                or row["instance_type"] != INSTANCE_TYPE
+                or row["instance_type"] != self.profile.instance_type
                 or row["state"] not in _ACTIVE_INSTANCE_STATES
                 or row["instance_profile_arn"] != self.instance_profile_arn
-                or row["provider"] != AWS_P5_PROFILE
+                or row["provider"] != self.profile.provider
                 or row["seed"] != manifest.seed
                 or row["cohort_sha256"]
                 != manifest.cohort_assignment_sha256
@@ -2004,9 +2277,32 @@ class AwsP5Backend:
         instance_id = state.get("instance_id")
         command_id = state.get("command_id")
         is_v3 = getattr(manifest, "schema_version", None) == 3
+        selected_lifecycle = (
+            is_v3
+            and getattr(
+                manifest,
+                "provider_selection_sha256",
+                None,
+            )
+            is not None
+        )
+        lifecycle_matches = (
+            all(
+                state.get(field)
+                == (
+                    list(manifest.arms)
+                    if field == "arms"
+                    else getattr(manifest, field)
+                )
+                for field in LIFECYCLE_BINDING_FIELDS
+            )
+            if selected_lifecycle
+            else True
+        )
         provenance_matches = (
             (
-                state.get("schema_version") == 2
+                state.get("schema_version")
+                == 2
                 and state.get("release_receipt_sha256")
                 == manifest.release_receipt_sha256
                 and state.get("dataset_pointer_sha256")
@@ -2020,6 +2316,7 @@ class AwsP5Backend:
                 and state.get("preregistration_sha256")
                 == manifest.preregistration_sha256
                 and state.get("source_tree") == manifest.source_tree
+                and lifecycle_matches
             )
             if is_v3
             else (
@@ -2031,7 +2328,7 @@ class AwsP5Backend:
         )
         return (
             run is not None
-            and state.get("provider") == AWS_P5_PROFILE
+            and state.get("provider") == manifest.provider
             and state.get("seed") == manifest.seed
             and state.get("arm") == run.arm
             and state.get("config_sha256") == run.config_sha256
@@ -2041,7 +2338,12 @@ class AwsP5Backend:
             and state.get("cohort_assignment_sha256")
             == manifest.cohort_assignment_sha256
             and state.get("source_commit") == manifest.source_commit
-            and state.get("profile_sha256") == self.profile.sha256
+            and state.get("profile_sha256")
+            == (
+                manifest.profile_sha256
+                if is_v3
+                else self.profile.sha256
+            )
             and state.get("runtime_sha256") == self._runtime_sha256()
             and state.get("ami_id") == self.runtime.ami_id
             and state.get("container_digest") == self.runtime.container_digest
@@ -2096,7 +2398,11 @@ class AwsP5Backend:
                 terminate_at=terminate_at,
             )
         return {
-            "provider": AWS_P5_PROFILE,
+            "provider": getattr(
+                manifest,
+                "provider",
+                self.profile.provider,
+            ),
             "seed": manifest.seed,
             "release_sha256": manifest.release_sha256,
             "run_manifest_sha256": manifest.sha256,
@@ -2754,7 +3060,7 @@ class AwsP5Backend:
         )
         if not apply:
             return {
-                "provider": AWS_P5_PROFILE,
+                "provider": manifest.provider,
                 "s3_uri": f"s3://{bucket}/{key}",
                 "commands": [argv],
                 "verified": False,
@@ -4139,7 +4445,7 @@ class AwsP5Backend:
         )
         if not apply:
             return {
-                "provider": AWS_P5_PROFILE,
+                "provider": manifest.provider,
                 "s3_uri": f"s3://{bucket}/{key}",
                 "out": str(destination),
                 "commands": [argv],
@@ -4187,12 +4493,36 @@ class AwsP5Backend:
         now = _timestamp()
         is_v3 = getattr(manifest, "schema_version", None) == 3
         if is_v3:
+            selected_lifecycle = (
+                getattr(
+                    manifest,
+                    "provider_selection_sha256",
+                    None,
+                )
+                is not None
+            )
             state = {
+                **(
+                    {
+                        field: (
+                            list(manifest.arms)
+                            if field == "arms"
+                            else getattr(manifest, field)
+                        )
+                        for field in LIFECYCLE_BINDING_FIELDS
+                    }
+                    if selected_lifecycle
+                    else {}
+                ),
                 "schema_version": 2,
                 "run_id": run.run_id,
                 "arm": run.arm,
                 "seed": run.seed,
-                "provider": AWS_P5_PROFILE,
+                "provider": getattr(
+                    manifest,
+                    "provider",
+                    self.profile.provider,
+                ),
                 "release_sha256": manifest.release_sha256,
                 "release_receipt_sha256": (
                     manifest.release_receipt_sha256
@@ -4327,7 +4657,7 @@ class AwsP5Backend:
             for state in supplied
         ]
         if (
-            getattr(manifest, "provider", None) != AWS_P5_PROFILE
+            getattr(manifest, "provider", None) != self.profile.provider
             or len(manifest_runs) != 2
             or any(not isinstance(run_id, str) for run_id in manifest_run_ids)
             or len(set(manifest_run_ids)) != 2
@@ -4383,7 +4713,11 @@ class AwsP5Backend:
             "schema_version": (
                 2 if getattr(manifest, "schema_version", None) == 3 else 1
             ),
-            "provider": AWS_P5_PROFILE,
+            "provider": getattr(
+                manifest,
+                "provider",
+                self.profile.provider,
+            ),
             "run_manifest_sha256": manifest.sha256,
             "operation_id": next(iter(operation_ids)),
             "states": ordered_states,
@@ -4743,7 +5077,9 @@ class AwsP5Backend:
                     "dataset_pointer_sha256",
                     "dataset_verification_sha256",
                     "environment_receipt_sha256",
+                    *LIFECYCLE_BINDING_FIELDS,
                 )
+                if field in core
             }
         )
         self._verify_approval(
@@ -4825,7 +5161,7 @@ class AwsP5Backend:
                     if recovered is None:
                         if started or terminal:
                             return {
-                                "provider": AWS_P5_PROFILE,
+                                "provider": manifest.provider,
                                 "seed": manifest.seed,
                                 "instance_id": instance_id,
                                 "operation_id": next(iter(operation_ids)),
@@ -4850,7 +5186,7 @@ class AwsP5Backend:
                         {"command_id": command_id, "status": status},
                     )
                     return {
-                        "provider": AWS_P5_PROFILE,
+                        "provider": manifest.provider,
                         "seed": manifest.seed,
                         "instance_id": instance_id,
                         "command_id": command_id,
@@ -4873,7 +5209,7 @@ class AwsP5Backend:
                     {"status": status},
                 )
                 return {
-                    "provider": AWS_P5_PROFILE,
+                    "provider": manifest.provider,
                     "seed": manifest.seed,
                     "instance_id": instance_id,
                     "command_id": command_id,
@@ -4951,7 +5287,7 @@ class AwsP5Backend:
                 {"command_id": command_id, "status": "Pending"},
             )
             return {
-                "provider": AWS_P5_PROFILE,
+                "provider": manifest.provider,
                 "seed": manifest.seed,
                 "instance_id": instance_id,
                 "command_id": command_id,
@@ -4969,7 +5305,6 @@ class AwsP5Backend:
         # Checkpoint object metadata is content addressed and carries no
         # request_id: an identical checkpoint published under an earlier
         # request remains recoverable and verifiable by exact HEAD.
-        del receipt
         return {
             "arm": checkpoint.arm,
             "checkpoint-version": str(checkpoint.checkpoint_version),
@@ -4980,6 +5315,35 @@ class AwsP5Backend:
             "global-cursor": str(checkpoint.data.global_cursor),
             "ordered-stream-sha256": (
                 checkpoint.data.ordered_stream_sha256
+            ),
+            "provider": receipt.provider,
+            "profile-id": receipt.profile_id,
+            "profile-sha256": receipt.profile_sha256,
+            "hardware-amendment-sha256": (
+                receipt.hardware_amendment_sha256
+            ),
+            "provider-selection-sha256": (
+                receipt.provider_selection_sha256
+            ),
+            "provider-selection-version-id": (
+                receipt.provider_selection_version_id
+            ),
+            "runtime-lock-sha256": receipt.runtime_lock_sha256,
+            "runtime-sbom-sha256": receipt.runtime_sbom_sha256,
+            "qualification-evidence-sha256": (
+                receipt.qualification_evidence_sha256
+            ),
+            "qualification-environment-sha256": (
+                receipt.environment_receipt_sha256
+            ),
+            "qualification-canary-sha256": (
+                receipt.qualification_canary_receipt_sha256
+            ),
+            "qualification-approval-sha256": (
+                receipt.qualification_approval_receipt_sha256
+            ),
+            "objective-controls-sha256": (
+                receipt.objective_controls_contract_sha256
             ),
             "run-id": checkpoint.run_id,
             "seed": str(checkpoint.seed),
@@ -5407,7 +5771,9 @@ class AwsP5Backend:
                         "dataset_pointer_sha256",
                         "dataset_verification_sha256",
                         "environment_receipt_sha256",
+                        *LIFECYCLE_BINDING_FIELDS,
                     )
+                    if field in operation_intent
                 }
             )
             self._verify_approval(
@@ -5497,7 +5863,7 @@ class AwsP5Backend:
                     if recovered is None:
                         if started or terminal:
                             return {
-                                "provider": AWS_P5_PROFILE,
+                                "provider": manifest.provider,
                                 "seed": manifest.seed,
                                 "instance_id": instance_id,
                                 "operation_id": operation_intent[
@@ -5524,7 +5890,7 @@ class AwsP5Backend:
                         {"command_id": command_id, "status": status},
                     )
                     return {
-                        "provider": AWS_P5_PROFILE,
+                        "provider": manifest.provider,
                         "seed": manifest.seed,
                         "instance_id": instance_id,
                         "command_id": command_id,
@@ -5547,7 +5913,7 @@ class AwsP5Backend:
                     {"status": status},
                 )
                 return {
-                    "provider": AWS_P5_PROFILE,
+                    "provider": manifest.provider,
                     "seed": manifest.seed,
                     "instance_id": instance_id,
                     "command_id": command_id,
@@ -5659,7 +6025,7 @@ class AwsP5Backend:
                 {"command_id": command_id, "status": "Pending"},
             )
             return {
-                "provider": AWS_P5_PROFILE,
+                "provider": manifest.provider,
                 "seed": manifest.seed,
                 "instance_id": instance_id,
                 "command_id": command_id,
@@ -6002,7 +6368,9 @@ class AwsP5Backend:
                         "dataset_pointer_sha256",
                         "dataset_verification_sha256",
                         "environment_receipt_sha256",
+                        *LIFECYCLE_BINDING_FIELDS,
                     )
+                    if field in operation_intent
                 }
             )
             self._verify_approval(

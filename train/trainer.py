@@ -27,6 +27,10 @@ from pathlib import Path
 import numpy as np
 import torch
 
+from msctl.aws_lifecycle import (
+    OPERATIONAL_METADATA_FIELDS,
+    validate_lifecycle_operational_metadata,
+)
 from train.data import (
     PackedShards,
     rank_sequence_counts,
@@ -78,12 +82,15 @@ _LOG_REQUIRED_FIELDS = {
     "tokens_per_step",
 }
 _LOG_OPTIONAL_FIELDS = {"loss_masked_values"}
-_SNAPSHOT_FIELDS = {
+_LEGACY_SNAPSHOT_FIELDS = {
     "data_provenance",
     "model",
     "model_cfg",
     "step",
     "world_size",
+}
+_SNAPSHOT_FIELDS = _LEGACY_SNAPSHOT_FIELDS | OPERATIONAL_METADATA_FIELDS | {
+    "config_fingerprint",
 }
 _SNAPSHOT_NAME = re.compile(r"^step([0-9]{7})\.pt$")
 _QUARANTINED_SNAPSHOT_NAME = re.compile(
@@ -366,6 +373,7 @@ _DATA_LOCATION_KEYS = {
     "train_masks",
     "train_weight_shards",
     "train_weights",
+    "operational_metadata",
 }
 
 
@@ -392,6 +400,63 @@ def resume_config_fingerprint(cfg: dict, model_cfg: GPTConfig) -> str:
     return hashlib.sha256(payload).hexdigest()
 
 
+def parse_model_snapshot_bytes(
+    payload: bytes,
+    *,
+    expected_operational_metadata: dict[str, object] | None = None,
+    allow_legacy: bool = False,
+) -> dict[str, object]:
+    """Parse strict production snapshot bytes with explicit legacy opt-in."""
+
+    if not isinstance(payload, bytes) or not payload:
+        raise ValueError("model snapshot bytes are missing")
+    if type(allow_legacy) is not bool:
+        raise ValueError("allow_legacy must be boolean")
+    try:
+        state = torch.load(
+            io.BytesIO(payload),
+            map_location="cpu",
+            weights_only=False,
+        )
+    except BaseException as error:
+        raise ValueError("model snapshot bytes are malformed") from error
+    if not isinstance(state, dict):
+        raise ValueError("model snapshot must contain one mapping")
+    fields = set(state)
+    if fields == _LEGACY_SNAPSHOT_FIELDS:
+        if not allow_legacy:
+            raise ValueError(
+                "legacy model snapshot requires explicit legacy admission"
+            )
+    elif fields == _SNAPSHOT_FIELDS:
+        fingerprint = state["config_fingerprint"]
+        if (
+            not isinstance(fingerprint, str)
+            or re.fullmatch(r"[0-9a-f]{64}", fingerprint) is None
+        ):
+            raise ValueError("model snapshot config fingerprint is invalid")
+        operational = {
+            field: state[field] for field in OPERATIONAL_METADATA_FIELDS
+        }
+        validate_lifecycle_operational_metadata(
+            operational,
+            expected=expected_operational_metadata,
+        )
+    else:
+        raise ValueError("model snapshot fields are foreign")
+    if (
+        type(state["step"]) is not int
+        or state["step"] < 0
+        or type(state["world_size"]) is not int
+        or state["world_size"] <= 0
+        or not isinstance(state["model"], dict)
+        or not isinstance(state["model_cfg"], dict)
+        or not isinstance(state["data_provenance"], dict)
+    ):
+        raise ValueError("model snapshot values are invalid")
+    return state
+
+
 class Trainer:
     def __init__(
         self,
@@ -413,6 +478,21 @@ class Trainer:
             raise ValueError("resume_sha256 requires resume_path")
         self.cfg = copy.deepcopy(cfg)
         cfg = self.cfg
+        raw_operational_metadata = cfg.get("operational_metadata")
+        self.operational_metadata = (
+            validate_lifecycle_operational_metadata(
+                raw_operational_metadata
+            )
+            if raw_operational_metadata is not None
+            else None
+        )
+        if (
+            self.operational_metadata is not None
+            and cfg.get("seed") != self.operational_metadata["seed"]
+        ):
+            raise ValueError(
+                "operational metadata seed differs from training config"
+            )
         self._checkpoint_request_generation = 0
         self._checkpoint_request_consumed = 0
         self._previous_sigusr1_handler = None
@@ -1189,15 +1269,13 @@ class Trainer:
         name: str,
     ) -> None:
         try:
-            state = torch.load(
-                io.BytesIO(payload),
-                map_location=self.device,
-                weights_only=False,
+            state = parse_model_snapshot_bytes(
+                payload,
+                expected_operational_metadata=self.operational_metadata,
+                allow_legacy=self.operational_metadata is None,
             )
-        except BaseException as error:
+        except ValueError as error:
             raise ValueError(f"resume snapshot is malformed: {name}") from error
-        if type(state) is not dict or set(state) != _SNAPSHOT_FIELDS:
-            raise ValueError(f"resume snapshot fields are foreign: {name}")
         if (
             type(state["step"]) is not int
             or state["step"] != expected_step
@@ -1612,6 +1690,8 @@ class Trainer:
                 "step": self.step,
                 "world_size": self.world_size,
             }
+            if self.operational_metadata is not None:
+                metadata.update(self.operational_metadata)
             metadata_bytes = (
                 json.dumps(
                     metadata,
@@ -1715,6 +1795,9 @@ class Trainer:
                 "world_size": self.world_size,
                 "data_provenance": self.data.provenance,
             }
+            if self.operational_metadata is not None:
+                state.update(self.operational_metadata)
+                state["config_fingerprint"] = self.config_fingerprint
             self._output.snapshots.write_atomic(
                 f"step{self.step:07d}.pt",
                 lambda handle: torch.save(state, handle),

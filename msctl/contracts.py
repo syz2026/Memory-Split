@@ -31,6 +31,7 @@ from .aws_contracts import (
 from .cohort import load_cohort_assignment as load_cohort_assignment
 from .errors import MsctlError
 from .fsutil import hash_fd, open_directory, open_regular_at, read_fd
+from .aws_lifecycle import LIFECYCLE_BINDING_FIELDS, ProviderLifecycleBinding
 from .jsonutil import (
     COMMIT_RE,
     RUN_ID_RE,
@@ -101,11 +102,30 @@ class RunManifest:
 class RunManifestV3:
     schema_version: int
     provider: str
+    profile_id: str
     cohort_id: str
     seed: int
     release_sha256: str
     release_receipt_sha256: str
     profile_sha256: str
+    hardware_amendment_sha256: str | None
+    provider_selection_sha256: str | None
+    provider_selection_version_id: str | None
+    runtime_lock_sha256: str | None
+    runtime_sbom_sha256: str | None
+    qualification_evidence_sha256: str | None
+    qualification_environment_receipt_sha256: str | None
+    qualification_canary_receipt_sha256: str | None
+    qualification_approval_receipt_sha256: str | None
+    qualification_approval_public_key_sha256: str | None
+    objective_controls_contract_sha256: str | None
+    account_id: str | None
+    instance_id: str | None
+    boot_id: str | None
+    region: str | None
+    availability_zone: str | None
+    purchase_model: str | None
+    arms: tuple[str, str]
     dataset_pointer_sha256: str
     dataset_receipt_sha256: str
     dataset_build_id: str
@@ -182,6 +202,7 @@ class AwsPairedCheckpointReceiptV3:
     schema_version: int
     receipt_type: str
     provider: str
+    profile_id: str
     cohort_id: str
     seed: int
     reason: str
@@ -189,7 +210,23 @@ class AwsPairedCheckpointReceiptV3:
     instance_id: str
     boot_id: str
     profile_sha256: str
+    hardware_amendment_sha256: str | None
+    provider_selection_sha256: str | None
+    provider_selection_version_id: str | None
+    runtime_lock_sha256: str | None
+    runtime_sbom_sha256: str | None
+    qualification_evidence_sha256: str | None
     environment_receipt_sha256: str
+    qualification_environment_receipt_sha256: str | None
+    qualification_canary_receipt_sha256: str | None
+    qualification_approval_receipt_sha256: str | None
+    qualification_approval_public_key_sha256: str | None
+    objective_controls_contract_sha256: str | None
+    account_id: str | None
+    region: str | None
+    availability_zone: str | None
+    purchase_model: str | None
+    arms: tuple[str, str]
     release_sha256: str
     release_receipt_sha256: str
     run_manifest_sha256: str
@@ -571,11 +608,15 @@ def _verify_release_internals(
     )
     aws_package_version = (
         release_value.get("package_format_version")
-        if release_value["provider"] == AWS_P5_PROFILE
+        if release_value["provider"]
+        in {"aws-p5.48xlarge", "aws-p6-b300.48xlarge"}
         and "package_format_version" in metadata
         else None
     )
     aws_package = aws_package_version is not None
+    selected_lifecycle = (
+        aws_package and "provider_selection_sha256" in release_value
+    )
     if aws_package:
         metadata_fields = {
             "schema_version",
@@ -590,6 +631,11 @@ def _verify_release_internals(
             "config_sha256",
             "members",
         }
+        if selected_lifecycle:
+            metadata_fields |= {
+                *LIFECYCLE_BINDING_FIELDS,
+                "profile_id",
+            }
     elif release_value["provider"] == AWS_P5_PROFILE:
         metadata_fields = {
             "schema_version",
@@ -752,11 +798,24 @@ def _verify_release_internals(
         "cluster/profiles/illumina-usfc-prd.json"
         if release_value["provider"] == SUPPORTED_PROFILE
         else (
-            AWS_PROFILE_PATH
+            portable_relative(
+                profile_binding["path"],
+                label="selected AWS profile path",
+            )
+            if selected_lifecycle
+            else AWS_PROFILE_PATH
             if aws_package_version == AWS_PACKAGE_FORMAT_VERSION
             else "cluster/profiles/aws-p5.48xlarge.json"
         )
     )
+    if selected_lifecycle and profile_member_path not in {
+        AWS_PROFILE_PATH,
+        "cluster/profiles/aws-p6-b300.48xlarge-v3.json",
+    }:
+        raise _release_error(
+            "RELEASE_INTERNAL_INVALID",
+            "selected AWS profile path is unsupported",
+        )
     profile_member = members.get(profile_member_path)
     if profile_member is None or profile_member["sha256"] != profile_hash:
         raise _release_error(
@@ -966,8 +1025,12 @@ def load_release(path: Path | str) -> Release:
     release_path = Path(os.path.abspath(os.fspath(path)))
     value = require_object(load_json(release_path, label="release"), label="release")
     aws_package = (
-        value.get("provider") == AWS_P5_PROFILE
+        value.get("provider")
+        in {"aws-p5.48xlarge", "aws-p6-b300.48xlarge"}
         and "package_format_version" in value
+    )
+    selected_lifecycle = (
+        aws_package and "provider_selection_sha256" in value
     )
     package_format_version: int | None = None
     if aws_package:
@@ -999,6 +1062,11 @@ def load_release(path: Path | str) -> Release:
             "dataset_pointer_sha256",
             "config_sha256",
         }
+        if selected_lifecycle:
+            release_fields |= {
+                *LIFECYCLE_BINDING_FIELDS,
+                "profile_id",
+            }
     require_exact_keys(
         value,
         release_fields,
@@ -1014,7 +1082,15 @@ def load_release(path: Path | str) -> Release:
             "RELEASE_INVALID",
             "release schema version is unsupported",
         ) from error
-    if value["provider"] not in {SUPPORTED_PROFILE, AWS_P5_PROFILE}:
+    if value["provider"] not in {
+        SUPPORTED_PROFILE,
+        AWS_P5_PROFILE,
+        *(
+            {"aws-p6-b300.48xlarge"}
+            if selected_lifecycle
+            else set()
+        ),
+    }:
         raise MsctlError(
             "RELEASE_INVALID",
             "release provider is unsupported",
@@ -1110,6 +1186,68 @@ def load_release(path: Path | str) -> Release:
         archive_data,
         release_value=value,
     )
+    if selected_lifecycle:
+        try:
+            lifecycle = ProviderLifecycleBinding(
+                cohort_id=value["cohort_id"],
+                provider=value["provider"],
+                profile_id=value["profile_id"],
+                profile_sha256=value["profile_sha256"],
+                hardware_amendment_sha256=value[
+                    "hardware_amendment_sha256"
+                ],
+                provider_selection_sha256=value[
+                    "provider_selection_sha256"
+                ],
+                provider_selection_version_id=value[
+                    "provider_selection_version_id"
+                ],
+                runtime_lock_sha256=value["runtime_lock_sha256"],
+                runtime_sbom_sha256=value["runtime_sbom_sha256"],
+                qualification_evidence_sha256=value[
+                    "qualification_evidence_sha256"
+                ],
+                qualification_environment_receipt_sha256=value[
+                    "qualification_environment_receipt_sha256"
+                ],
+                qualification_canary_receipt_sha256=value[
+                    "qualification_canary_receipt_sha256"
+                ],
+                qualification_approval_receipt_sha256=value[
+                    "qualification_approval_receipt_sha256"
+                ],
+                qualification_approval_public_key_sha256=value[
+                    "qualification_approval_public_key_sha256"
+                ],
+                objective_controls_contract_sha256=value[
+                    "objective_controls_contract_sha256"
+                ],
+                account_id=value["account_id"],
+                instance_id=value["instance_id"],
+                boot_id=value["boot_id"],
+                region=value["region"],
+                availability_zone=value["availability_zone"],
+                purchase_model=value["purchase_model"],
+                seed=value["seed"],
+                arms=(
+                    tuple(value["arms"])
+                    if isinstance(value["arms"], list)
+                    else value["arms"]
+                ),
+            )
+        except (TypeError, ValueError) as error:
+            raise MsctlError(
+                "RELEASE_INVALID",
+                "release provider lifecycle binding is invalid",
+            ) from error
+        if any(
+            not same_typed_value(metadata.get(field), expected)
+            for field, expected in lifecycle.to_dict().items()
+        ) or metadata.get("profile_id") != lifecycle.profile_id:
+            raise _release_error(
+                "RELEASE_INTERNAL_INVALID",
+                "release lifecycle fields differ from internal metadata",
+            )
     if aws_package:
         profile_hash = require_sha256(
             value["profile_sha256"],
@@ -1216,6 +1354,9 @@ def load_run_manifest(
             "RUN_MANIFEST_INVALID",
             "run manifest provider or schema is unsupported",
         )
+    selected_lifecycle = (
+        schema_version == 3 and "provider_selection_sha256" in value
+    )
     root_fields = {
         "schema_version",
         "provider",
@@ -1232,13 +1373,14 @@ def load_run_manifest(
         }
     elif schema_version == 3:
         root_fields = {
+            *(
+                LIFECYCLE_BINDING_FIELDS
+                if selected_lifecycle
+                else ("provider", "cohort_id", "seed", "profile_sha256")
+            ),
             "schema_version",
-            "provider",
-            "cohort_id",
-            "seed",
             "release_sha256",
             "release_receipt_sha256",
-            "profile_sha256",
             "dataset_pointer_sha256",
             "dataset_receipt_sha256",
             "dataset_build_id",
@@ -1254,13 +1396,24 @@ def load_run_manifest(
     provider = value["provider"]
     if (
         not isinstance(provider, str)
-        or provider not in {SUPPORTED_PROFILE, AWS_P5_PROFILE}
         or (schema_version == 1 and provider != SUPPORTED_PROFILE)
+        or (
+            schema_version == 2
+            and provider not in {SUPPORTED_PROFILE, AWS_P5_PROFILE}
+        )
         or (
             schema_version == 3
             and (
-                provider != AWS_P5_PROFILE
-                or value["cohort_id"] != AWS_COHORT_ID
+                value["cohort_id"] != AWS_COHORT_ID
+                or provider
+                not in (
+                    {
+                        "aws-p5.48xlarge",
+                        "aws-p6-b300.48xlarge",
+                    }
+                    if selected_lifecycle
+                    else {"aws-p5.48xlarge"}
+                )
             )
         )
     ):
@@ -1426,9 +1579,69 @@ def load_run_manifest(
                 "RUN_MANIFEST_INVALID",
                 "run manifest source tree is invalid",
             )
+        try:
+            lifecycle = (ProviderLifecycleBinding(
+                cohort_id=value["cohort_id"],
+                provider=value["provider"],
+                profile_id=value["profile_id"],
+                profile_sha256=value["profile_sha256"],
+                hardware_amendment_sha256=value[
+                    "hardware_amendment_sha256"
+                ],
+                provider_selection_sha256=value[
+                    "provider_selection_sha256"
+                ],
+                provider_selection_version_id=value[
+                    "provider_selection_version_id"
+                ],
+                runtime_lock_sha256=value["runtime_lock_sha256"],
+                runtime_sbom_sha256=value["runtime_sbom_sha256"],
+                qualification_evidence_sha256=value[
+                    "qualification_evidence_sha256"
+                ],
+                qualification_environment_receipt_sha256=value[
+                    "qualification_environment_receipt_sha256"
+                ],
+                qualification_canary_receipt_sha256=value[
+                    "qualification_canary_receipt_sha256"
+                ],
+                qualification_approval_receipt_sha256=value[
+                    "qualification_approval_receipt_sha256"
+                ],
+                qualification_approval_public_key_sha256=value[
+                    "qualification_approval_public_key_sha256"
+                ],
+                objective_controls_contract_sha256=value[
+                    "objective_controls_contract_sha256"
+                ],
+                account_id=value["account_id"],
+                instance_id=value["instance_id"],
+                boot_id=value["boot_id"],
+                region=value["region"],
+                availability_zone=value["availability_zone"],
+                purchase_model=value["purchase_model"],
+                seed=value["seed"],
+                arms=(
+                    tuple(value["arms"])
+                    if isinstance(value["arms"], list)
+                    else value["arms"]
+                ),
+            ) if selected_lifecycle else None)
+        except (TypeError, ValueError) as error:
+            raise MsctlError(
+                "RUN_MANIFEST_INVALID",
+                "run manifest provider lifecycle binding is invalid",
+            ) from error
         return RunManifestV3(
             schema_version=3,
-            provider=AWS_P5_PROFILE,
+            provider=(
+                lifecycle.provider if lifecycle is not None else value["provider"]
+            ),
+            profile_id=(
+                lifecycle.profile_id
+                if lifecycle is not None
+                else "aws-p5.48xlarge-v3"
+            ),
             cohort_id=AWS_COHORT_ID,
             seed=manifest_seed,
             release_sha256=require_sha256(
@@ -1442,6 +1655,80 @@ def load_run_manifest(
             profile_sha256=require_sha256(
                 value["profile_sha256"],
                 label="run manifest.profile_sha256",
+            ),
+            hardware_amendment_sha256=(
+                lifecycle.hardware_amendment_sha256
+                if lifecycle is not None
+                else None
+            ),
+            provider_selection_sha256=(
+                lifecycle.provider_selection_sha256
+                if lifecycle is not None
+                else None
+            ),
+            provider_selection_version_id=(
+                lifecycle.provider_selection_version_id
+                if lifecycle is not None
+                else None
+            ),
+            runtime_lock_sha256=(
+                lifecycle.runtime_lock_sha256
+                if lifecycle is not None
+                else None
+            ),
+            runtime_sbom_sha256=(
+                lifecycle.runtime_sbom_sha256
+                if lifecycle is not None
+                else None
+            ),
+            qualification_evidence_sha256=(
+                lifecycle.qualification_evidence_sha256
+                if lifecycle is not None
+                else None
+            ),
+            qualification_environment_receipt_sha256=(
+                lifecycle.qualification_environment_receipt_sha256
+                if lifecycle is not None
+                else None
+            ),
+            qualification_canary_receipt_sha256=(
+                lifecycle.qualification_canary_receipt_sha256
+                if lifecycle is not None
+                else None
+            ),
+            qualification_approval_receipt_sha256=(
+                lifecycle.qualification_approval_receipt_sha256
+                if lifecycle is not None
+                else None
+            ),
+            qualification_approval_public_key_sha256=(
+                lifecycle.qualification_approval_public_key_sha256
+                if lifecycle is not None
+                else None
+            ),
+            objective_controls_contract_sha256=(
+                lifecycle.objective_controls_contract_sha256
+                if lifecycle is not None
+                else None
+            ),
+            account_id=(lifecycle.account_id if lifecycle is not None else None),
+            instance_id=(
+                lifecycle.instance_id if lifecycle is not None else None
+            ),
+            boot_id=(lifecycle.boot_id if lifecycle is not None else None),
+            region=(lifecycle.region if lifecycle is not None else None),
+            availability_zone=(
+                lifecycle.availability_zone
+                if lifecycle is not None
+                else None
+            ),
+            purchase_model=(
+                lifecycle.purchase_model if lifecycle is not None else None
+            ),
+            arms=(
+                lifecycle.arms
+                if lifecycle is not None
+                else tuple(AWS_ARMS)
             ),
             dataset_pointer_sha256=require_sha256(
                 value["dataset_pointer_sha256"],
@@ -1523,13 +1810,31 @@ def bind_release(
         assignment = release.value.get("seed_assignment")
         expected_assignment = {
             "cohort_id": AWS_COHORT_ID,
-            "provider": AWS_P5_PROFILE,
+            "provider": manifest.provider,
             "seeds": list(AWS_SEEDS),
             "arms": ["dense", "split90"],
         }
+        selected_manifest = manifest.provider_selection_sha256 is not None
+        lifecycle_matches = (
+            all(
+                same_typed_value(
+                    release.value.get(field),
+                    (
+                        list(manifest.arms)
+                        if field == "arms"
+                        else getattr(manifest, field)
+                    ),
+                )
+                for field in LIFECYCLE_BINDING_FIELDS
+                if field != "seed"
+            )
+            and release.value.get("profile_id") == manifest.profile_id
+            if selected_manifest
+            else True
+        )
         mismatch = (
             release.package_format_version != AWS_PACKAGE_FORMAT_VERSION
-            or release.provider != AWS_P5_PROFILE
+            or release.provider != manifest.provider
             or release.archive_sha256 != manifest.release_sha256
             or release.receipt_sha256 != manifest.release_receipt_sha256
             or release.value.get("profile_sha256")
@@ -1543,6 +1848,7 @@ def bind_release(
             != manifest.preregistration_sha256
             or release.source_commit != manifest.source_commit
             or release.source_tree != manifest.source_tree
+            or not lifecycle_matches
             or not same_typed_value(assignment, expected_assignment)
             or not isinstance(config_hashes, dict)
             or any(
@@ -2001,6 +2307,7 @@ def parse_paired_checkpoint_receipt_v3(
             "paired checkpoint receipt URI is invalid"
         )
     object_root = receipt_uri[: -len(receipt_suffix)]
+    selected_lifecycle = "provider_selection_sha256" in value
     top_fields = {
         "boot_id",
         "checkpoints",
@@ -2025,6 +2332,8 @@ def parse_paired_checkpoint_receipt_v3(
         "source_commit",
         "source_tree",
     }
+    if selected_lifecycle:
+        top_fields |= set(LIFECYCLE_BINDING_FIELDS)
     require_exact_keys(
         value,
         top_fields,
@@ -2036,7 +2345,12 @@ def parse_paired_checkpoint_receipt_v3(
         or value["schema_version"] != 3
         or value["receipt_type"]
         != "memorysplit-aws-paired-checkpoint-v3"
-        or value["provider"] != AWS_P5_PROFILE
+        or value["provider"]
+        not in (
+            {"aws-p5.48xlarge", "aws-p6-b300.48xlarge"}
+            if selected_lifecycle
+            else {"aws-p5.48xlarge"}
+        )
         or value["cohort_id"] != AWS_COHORT_ID
         or type(seed) is not int
         or seed not in AWS_SEEDS
@@ -2056,6 +2370,58 @@ def parse_paired_checkpoint_receipt_v3(
         raise _checkpoint_v3_error(
             "paired checkpoint receipt identity is invalid"
         )
+    try:
+        lifecycle = (ProviderLifecycleBinding(
+            cohort_id=value["cohort_id"],
+            provider=value["provider"],
+            profile_id=value["profile_id"],
+            profile_sha256=value["profile_sha256"],
+            hardware_amendment_sha256=value[
+                "hardware_amendment_sha256"
+            ],
+            provider_selection_sha256=value[
+                "provider_selection_sha256"
+            ],
+            provider_selection_version_id=value[
+                "provider_selection_version_id"
+            ],
+            runtime_lock_sha256=value["runtime_lock_sha256"],
+            runtime_sbom_sha256=value["runtime_sbom_sha256"],
+            qualification_evidence_sha256=value[
+                "qualification_evidence_sha256"
+            ],
+            qualification_environment_receipt_sha256=value[
+                "qualification_environment_receipt_sha256"
+            ],
+            qualification_canary_receipt_sha256=value[
+                "qualification_canary_receipt_sha256"
+            ],
+            qualification_approval_receipt_sha256=value[
+                "qualification_approval_receipt_sha256"
+            ],
+            qualification_approval_public_key_sha256=value[
+                "qualification_approval_public_key_sha256"
+            ],
+            objective_controls_contract_sha256=value[
+                "objective_controls_contract_sha256"
+            ],
+            account_id=value["account_id"],
+            instance_id=value["instance_id"],
+            boot_id=value["boot_id"],
+            region=value["region"],
+            availability_zone=value["availability_zone"],
+            purchase_model=value["purchase_model"],
+            seed=value["seed"],
+            arms=(
+                tuple(value["arms"])
+                if isinstance(value["arms"], list)
+                else value["arms"]
+            ),
+        ) if selected_lifecycle else None)
+    except (TypeError, ValueError) as error:
+        raise _checkpoint_v3_error(
+            "paired checkpoint provider lifecycle binding is invalid"
+        ) from error
     hashes: dict[str, str] = {}
     for field in (
         "profile_sha256",
@@ -2276,7 +2642,14 @@ def parse_paired_checkpoint_receipt_v3(
     return AwsPairedCheckpointReceiptV3(
         schema_version=3,
         receipt_type="memorysplit-aws-paired-checkpoint-v3",
-        provider=AWS_P5_PROFILE,
+        provider=(
+            lifecycle.provider if lifecycle is not None else value["provider"]
+        ),
+        profile_id=(
+            lifecycle.profile_id
+            if lifecycle is not None
+            else "aws-p5.48xlarge-v3"
+        ),
         cohort_id=AWS_COHORT_ID,
         seed=seed,
         reason=value["reason"],
@@ -2284,9 +2657,75 @@ def parse_paired_checkpoint_receipt_v3(
         instance_id=value["instance_id"],
         boot_id=value["boot_id"],
         profile_sha256=hashes["profile_sha256"],
+        hardware_amendment_sha256=(
+            lifecycle.hardware_amendment_sha256
+            if lifecycle is not None
+            else None
+        ),
+        provider_selection_sha256=(
+            lifecycle.provider_selection_sha256
+            if lifecycle is not None
+            else None
+        ),
+        provider_selection_version_id=(
+            lifecycle.provider_selection_version_id
+            if lifecycle is not None
+            else None
+        ),
+        runtime_lock_sha256=(
+            lifecycle.runtime_lock_sha256
+            if lifecycle is not None
+            else None
+        ),
+        runtime_sbom_sha256=(
+            lifecycle.runtime_sbom_sha256
+            if lifecycle is not None
+            else None
+        ),
+        qualification_evidence_sha256=(
+            lifecycle.qualification_evidence_sha256
+            if lifecycle is not None
+            else None
+        ),
         environment_receipt_sha256=hashes[
             "environment_receipt_sha256"
         ],
+        qualification_environment_receipt_sha256=(
+            lifecycle.qualification_environment_receipt_sha256
+            if lifecycle is not None
+            else None
+        ),
+        qualification_canary_receipt_sha256=(
+            lifecycle.qualification_canary_receipt_sha256
+            if lifecycle is not None
+            else None
+        ),
+        qualification_approval_receipt_sha256=(
+            lifecycle.qualification_approval_receipt_sha256
+            if lifecycle is not None
+            else None
+        ),
+        qualification_approval_public_key_sha256=(
+            lifecycle.qualification_approval_public_key_sha256
+            if lifecycle is not None
+            else None
+        ),
+        objective_controls_contract_sha256=(
+            lifecycle.objective_controls_contract_sha256
+            if lifecycle is not None
+            else None
+        ),
+        account_id=(lifecycle.account_id if lifecycle is not None else None),
+        region=(lifecycle.region if lifecycle is not None else None),
+        availability_zone=(
+            lifecycle.availability_zone if lifecycle is not None else None
+        ),
+        purchase_model=(
+            lifecycle.purchase_model if lifecycle is not None else None
+        ),
+        arms=(
+            lifecycle.arms if lifecycle is not None else tuple(AWS_ARMS)
+        ),
         release_sha256=hashes["release_sha256"],
         release_receipt_sha256=hashes["release_receipt_sha256"],
         run_manifest_sha256=hashes["run_manifest_sha256"],
@@ -2331,6 +2770,19 @@ def verify_aws_checkpoint_receipt_v3(
     if (
         not isinstance(receipt, AwsPairedCheckpointReceiptV3)
         or getattr(manifest, "schema_version", None) != 3
+        or (
+            receipt.provider_selection_sha256 is not None
+            and any(
+                getattr(receipt, field)
+                != (
+                    tuple(getattr(manifest, field))
+                    if field == "arms"
+                    and isinstance(getattr(manifest, field, None), list)
+                    else getattr(manifest, field, None)
+                )
+                for field in LIFECYCLE_BINDING_FIELDS
+            )
+        )
         or receipt.provider != getattr(manifest, "provider", None)
         or receipt.cohort_id != getattr(manifest, "cohort_id", None)
         or receipt.seed != getattr(manifest, "seed", None)
