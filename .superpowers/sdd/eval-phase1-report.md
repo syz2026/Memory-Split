@@ -106,3 +106,80 @@ three focused test modules. `git diff --check` passed.
   One large patch write failed with `No space left on device`; it left no
   partial production edit, and all subsequent edits, tests, compilation, diff
   checks, and the implementation commit completed successfully.
+
+## Review-fix addendum
+
+- Review-fix status: `DONE_WITH_CONCERNS`.
+- Review-fix commit:
+  `b20ca76bbad4261562c85e4437a83cd5fac981b3`.
+
+### Findings resolved
+
+1. Exact v3 inference now carries `Fraction` identities from rate numerators
+   and denominators through paired metric deltas, right-step AULC, bootstrap
+   values, strict practical-equivalence comparisons, and the exhaustive
+   sign-flip statistic. Binary floats are rejected by authoritative v3
+   boundary and exact-test APIs; serialized floats remain convenience values.
+2. `BootstrapEstimate` now rejects non-finite effects/replicates, booleans and
+   non-integer metadata, impossible count hierarchies, length mismatches, and
+   estimates or bounds inconsistent with their exact inputs.
+3. `StudyLockV3` now rejects checkpoint-hash or versioned-object aliases across
+   slots. Each snapshot also binds a content-addressed paired-checkpoint
+   receipt hash, object key, and version ID; both arms at one seed/step must
+   share that receipt, and receipt evidence cannot be reused across steps.
+4. Snapshot and receipt version IDs are treated as opaque candidates and must
+   be 1–1,024 printable non-whitespace characters other than literal `null`.
+   The contract deliberately does not claim cryptographic reality until later
+   versioned HEAD and receipt replay.
+5. The v3 outcome binder now authenticates the unchanged v2 item identity,
+   v3 checkpoint identity, canonical S3 object identity, evidence references,
+   and membership in the exact lock snapshot.
+6. Public v3 records and locks now use `StudyArm.DENSE`/`StudyArm.SPLIT90`;
+   legacy v2 `Arm.DENSE`/`Arm.SPLIT`/`Arm.RANDOM` values remain unchanged.
+
+### Review RED evidence
+
+```text
+exact inference/bootstrap group
+7 failed, 9 passed in 0.64s
+- Fraction inputs were rejected.
+- the exact paired-delta API was absent.
+- bootstrap metadata/effects were insufficiently validated.
+
+StudyArm/cross-record binder group
+20 failed in 1.52s
+- split90 was rejected by the legacy Arm enum.
+- the package had no StudyArm.
+- the binder did not accept item or lock-snapshot identities.
+
+lock provenance/version group
+22 failed, 4 passed in 0.46s
+- checkpoint receipt evidence fields were absent.
+- malformed version IDs reached only the old field-set rejection.
+- a same-object alias across optimizer steps was accepted.
+```
+
+### Review GREEN evidence
+
+```text
+exact inference/bootstrap group
+16 passed in 12.92s
+
+StudyArm/cross-record binder file
+20 passed in 0.25s
+
+lock provenance/version group
+26 passed in 0.53s
+
+all focused v3 tests
+59 passed in 6.25s
+
+bounded v2 confirmatory + aws_contracts regressions
+156 passed in 60.59s
+```
+
+`python -m py_compile` passed for all five changed production modules and all
+three focused test modules. `git diff --check` passed. The review fixes touched
+only the original five confirmatory modules and three focused v3 test files;
+no sealing, aggregation, lifecycle, provider-selection, configuration,
+corpus-generation, IaC, packaging, or runbook file was added or changed.
