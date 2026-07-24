@@ -305,6 +305,72 @@ def _journal(fixture, states: list[dict[str, object]]) -> dict[str, object]:
     }
 
 
+def _schema_one_state(
+    fixture,
+    state: dict[str, object],
+    *,
+    manifest_sha256: str | None = None,
+) -> dict[str, object]:
+    return {
+        "schema_version": 1,
+        "run_id": state["run_id"],
+        "arm": state["arm"],
+        "seed": 1,
+        "provider": "aws-p5.48xlarge",
+        "release_sha256": state["release_sha256"],
+        "run_manifest_sha256": (
+            manifest_sha256 or fixture.manifest.sha256
+        ),
+        "config_sha256": state["config_sha256"],
+        "dataset_sha256": "1" * 64,
+        "dataset_pointer_sha256": state["dataset_pointer_sha256"],
+        "dataset_verification_sha256": state[
+            "dataset_verification_sha256"
+        ],
+        "environment_receipt_sha256": state[
+            "environment_receipt_sha256"
+        ],
+        "cohort_assignment_sha256": state["cohort_assignment_sha256"],
+        "study_lock_sha256": "2" * 64,
+        "source_commit": state["source_commit"],
+        "profile_sha256": state["profile_sha256"],
+        "runtime_sha256": state["runtime_sha256"],
+        "ami_id": state["ami_id"],
+        "container_digest": state["container_digest"],
+        "instance_id": state["instance_id"],
+        "terminate_at": state["terminate_at"],
+        "operation_id": state["operation_id"],
+        "intent_sha256": state["intent_sha256"],
+        "intent_uri": state["intent_uri"],
+        "command_id": state["command_id"],
+        "operation": "submit",
+        "status": state["status"],
+        "attempt": state["attempt"],
+        "send_attempted": state["send_attempted"],
+        "created_at": state["created_at"],
+        "updated_at": state["updated_at"],
+    }
+
+
+def _schema_one_journal(fixture) -> dict[str, object]:
+    states = [
+        _schema_one_state(fixture, state) for state in fixture.states
+    ]
+    return {
+        "schema_version": 1,
+        "provider": "aws-p5.48xlarge",
+        "run_manifest_sha256": fixture.manifest.sha256,
+        "operation_id": states[0]["operation_id"],
+        "states": states,
+    }
+
+
+def _write_raw_json(path: Path, value: object) -> None:
+    from msctl.jsonutil import canonical_json
+
+    path.write_bytes(canonical_json(value) + b"\n")
+
+
 def _transition_to_resume(fixture) -> list[dict[str, object]]:
     proposed = copy.deepcopy(fixture.states)
     checkpoint_objects = [
@@ -685,6 +751,51 @@ def test_v3_initial_pair_failure_removes_every_new_generation_file(
     assert not list((tmp_path / "target" / "intents").glob("*.json"))
 
 
+def test_v3_initial_pair_failure_can_retry_same_durable_identity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import msctl.fsutil as fsutil
+    import msctl.state as state_module
+    from msctl.state import StateStore
+
+    fixture = _v3_pair(tmp_path / "source")
+    store = StateStore(tmp_path / "target")
+    calls = 0
+    original_write = fsutil.atomic_write_at
+
+    def fail_second_install(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise OSError("injected initial transaction failure")
+        return original_write(*args, **kwargs)
+
+    monkeypatch.setattr(state_module, "atomic_write_at", fail_second_install)
+    with store.locked(), pytest.raises(Exception):
+        fixture.backend._write_paired_states(
+            store,
+            fixture.manifest,
+            copy.deepcopy(fixture.states),
+        )
+
+    monkeypatch.setattr(state_module, "atomic_write_at", original_write)
+    with store.locked():
+        fixture.backend._write_paired_states(
+            store,
+            fixture.manifest,
+            copy.deepcopy(fixture.states),
+        )
+        journal = store.read_aws_pair(fixture.manifest.sha256)
+        runs = {
+            run.run_id: store.read_run(run.run_id)
+            for run in fixture.manifest.runs
+        }
+
+    assert journal is not None
+    assert {state["run_id"]: state for state in journal["states"]} == runs
+
+
 def test_v3_failed_rollback_poison_is_observed_before_lifecycle_use(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -808,6 +919,215 @@ def test_v3_unmarked_mixed_generation_blocks_direct_run_write(
     assert _generation_bytes(fixture) == before
 
 
+@pytest.mark.parametrize("arm", ["dense", "split90"])
+def test_v3_run_write_rejects_schema_one_downgrade_with_forged_manifest(
+    tmp_path: Path,
+    arm: str,
+) -> None:
+    fixture = _v3_pair(tmp_path)
+    before = _generation_bytes(fixture)
+    run = next(run for run in fixture.manifest.runs if run.arm == arm)
+    current = next(state for state in fixture.states if state["arm"] == arm)
+    downgraded = _schema_one_state(
+        fixture,
+        current,
+        manifest_sha256="f" * 64,
+    )
+
+    with fixture.store.locked(), pytest.raises(
+        Exception,
+        match="transaction|journal|state|poison",
+    ):
+        fixture.store.write_run(run.run_id, downgraded)
+
+    assert _generation_bytes(fixture) == before
+
+
+@pytest.mark.parametrize("arm", ["dense", "split90"])
+def test_v3_missing_run_cannot_be_recreated_as_schema_one(
+    tmp_path: Path,
+    arm: str,
+) -> None:
+    fixture = _v3_pair(tmp_path)
+    run = next(run for run in fixture.manifest.runs if run.arm == arm)
+    current = next(state for state in fixture.states if state["arm"] == arm)
+    run_path = fixture.state_root / "runs" / f"{run.run_id}.json"
+    run_path.unlink()
+    downgraded = _schema_one_state(fixture, current)
+
+    with fixture.store.locked(), pytest.raises(
+        Exception,
+        match="transaction|journal|state|missing",
+    ):
+        fixture.store.write_run(run.run_id, downgraded)
+
+    assert not run_path.exists()
+
+
+@pytest.mark.parametrize("arm", ["dense", "split90"])
+def test_v3_raw_run_downgrade_blocks_all_authority_reads_after_reopen(
+    tmp_path: Path,
+    arm: str,
+) -> None:
+    from msctl.state import StateStore
+
+    fixture = _v3_pair(tmp_path)
+    current = next(state for state in fixture.states if state["arm"] == arm)
+    attacked = fixture.state_root / "runs" / f"{current['run_id']}.json"
+    _write_raw_json(attacked, _schema_one_state(fixture, current))
+
+    for store in (fixture.store, StateStore(fixture.state_root)):
+        with store.locked():
+            for run in fixture.manifest.runs:
+                with pytest.raises(
+                    Exception,
+                    match="generation|journal|state|schema",
+                ):
+                    store.read_run(run.run_id)
+            with pytest.raises(
+                Exception,
+                match="generation|journal|state|schema",
+            ):
+                store.read_aws_pair(fixture.manifest.sha256)
+
+
+@pytest.mark.parametrize("arm", ["dense", "split90"])
+def test_v3_marker_write_failure_cannot_hide_raw_schema_downgrade(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    arm: str,
+) -> None:
+    from msctl.state import StateStore
+
+    fixture = _induce_unmarked_mixed_generation(tmp_path, monkeypatch)
+    current = next(state for state in fixture.states if state["arm"] == arm)
+    attacked = fixture.state_root / "runs" / f"{current['run_id']}.json"
+    _write_raw_json(attacked, _schema_one_state(fixture, current))
+
+    reopened = StateStore(fixture.state_root)
+    with reopened.locked():
+        for run in fixture.manifest.runs:
+            with pytest.raises(
+                Exception,
+                match="generation|journal|state|schema",
+            ):
+                reopened.read_run(run.run_id)
+        with pytest.raises(
+            Exception,
+            match="generation|journal|state|schema",
+        ):
+            reopened.read_aws_pair(fixture.manifest.sha256)
+
+
+def test_v3_journal_write_rejects_schema_one_downgrade(
+    tmp_path: Path,
+) -> None:
+    fixture = _v3_pair(tmp_path)
+    before = _generation_bytes(fixture)
+
+    with fixture.store.locked(), pytest.raises(
+        Exception,
+        match="transaction|identity|journal|state",
+    ):
+        fixture.store.write_aws_pair(
+            fixture.manifest.sha256,
+            _schema_one_journal(fixture),
+        )
+
+    assert _generation_bytes(fixture) == before
+
+
+@pytest.mark.parametrize("replace_runs", [False, True])
+def test_v3_raw_journal_downgrade_never_returns_authority(
+    tmp_path: Path,
+    replace_runs: bool,
+) -> None:
+    from msctl.state import StateStore
+
+    fixture = _v3_pair(tmp_path)
+    journal_path = _generation_paths(fixture)[0]
+    _write_raw_json(journal_path, _schema_one_journal(fixture))
+    if replace_runs:
+        for state in fixture.states:
+            _write_raw_json(
+                fixture.state_root
+                / "runs"
+                / f"{state['run_id']}.json",
+                _schema_one_state(fixture, state),
+            )
+
+    for store in (fixture.store, StateStore(fixture.state_root)):
+        with store.locked():
+            with pytest.raises(
+                Exception,
+                match="identity|journal|generation|state|schema",
+            ):
+                store.read_aws_pair(fixture.manifest.sha256)
+            for run in fixture.manifest.runs:
+                with pytest.raises(
+                    Exception,
+                    match="identity|journal|generation|state|schema",
+                ):
+                    store.read_run(run.run_id)
+
+
+def test_v3_missing_journal_cannot_be_recreated_as_schema_one(
+    tmp_path: Path,
+) -> None:
+    fixture = _v3_pair(tmp_path)
+    journal_path = _generation_paths(fixture)[0]
+    journal_path.unlink()
+    before_runs = {
+        path: path.read_bytes() for path in _generation_paths(fixture)[1:]
+    }
+
+    with fixture.store.locked(), pytest.raises(
+        Exception,
+        match="transaction|identity|journal|state",
+    ):
+        fixture.store.write_aws_pair(
+            fixture.manifest.sha256,
+            _schema_one_journal(fixture),
+        )
+
+    assert not journal_path.exists()
+    assert {
+        path: path.read_bytes() for path in _generation_paths(fixture)[1:]
+    } == before_runs
+
+
+def test_v3_marker_write_failure_cannot_hide_full_raw_downgrade(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from msctl.state import StateStore
+
+    fixture = _induce_unmarked_mixed_generation(tmp_path, monkeypatch)
+    _write_raw_json(
+        _generation_paths(fixture)[0],
+        _schema_one_journal(fixture),
+    )
+    for state in fixture.states:
+        _write_raw_json(
+            fixture.state_root / "runs" / f"{state['run_id']}.json",
+            _schema_one_state(fixture, state),
+        )
+
+    reopened = StateStore(fixture.state_root)
+    with reopened.locked():
+        with pytest.raises(
+            Exception,
+            match="identity|journal|generation|state|schema",
+        ):
+            reopened.read_aws_pair(fixture.manifest.sha256)
+        for run in fixture.manifest.runs:
+            with pytest.raises(
+                Exception,
+                match="identity|journal|generation|state|schema",
+            ):
+                reopened.read_run(run.run_id)
+
+
 def test_v3_valid_generation_rejects_all_standalone_writes(
     tmp_path: Path,
 ) -> None:
@@ -854,7 +1174,10 @@ def test_v3_poison_marker_gates_every_state_entrypoint(tmp_path: Path) -> None:
                 == "STATE_ROLLBACK_FAILED"
             )
             with pytest.raises(Exception) as write_error:
-                fixture.store.write_run(run.run_id, copy.deepcopy(state))
+                fixture.store.write_run(
+                    run.run_id,
+                    _schema_one_state(fixture, state),
+                )
             assert (
                 getattr(write_error.value, "code", None)
                 == "STATE_ROLLBACK_FAILED"
@@ -862,6 +1185,15 @@ def test_v3_poison_marker_gates_every_state_entrypoint(tmp_path: Path) -> None:
         with pytest.raises(Exception) as pair_error:
             fixture.store.read_aws_pair(fixture.manifest.sha256)
         assert getattr(pair_error.value, "code", None) == "STATE_ROLLBACK_FAILED"
+        with pytest.raises(Exception) as pair_write_error:
+            fixture.store.write_aws_pair(
+                fixture.manifest.sha256,
+                _schema_one_journal(fixture),
+            )
+        assert (
+            getattr(pair_write_error.value, "code", None)
+            == "STATE_ROLLBACK_FAILED"
+        )
         with pytest.raises(Exception) as transaction_error:
             fixture.store.write_aws_pair_transaction(
                 fixture.manifest.sha256,

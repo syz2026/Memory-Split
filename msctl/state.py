@@ -185,6 +185,13 @@ AWS_PAIR_INTENT_KEYS = {
     "operation_id",
     "states",
 }
+AWS_V3_IDENTITY_KEYS = {
+    "schema_version",
+    "provider",
+    "run_manifest_sha256",
+    "runs",
+}
+AWS_V3_IDENTITY_RUN_KEYS = {"run_id", "arm"}
 INTENT_KEYS = {
     "schema_version",
     "submission_key",
@@ -216,6 +223,10 @@ RESOURCE_KEYS = {
 }
 STATUS_RE = re.compile(r"^[A-Z][A-Z0-9_]*$")
 _AWS_PROVIDER = "aws-p5.48xlarge"
+_AWS_PAIR_FILE_RE = re.compile(r"^aws-([0-9a-f]{64})\.json$")
+_AWS_V3_IDENTITY_FILE_RE = re.compile(
+    r"^aws-([0-9a-f]{64})\.v3-identity$"
+)
 _AWS_INSTANCE_RE = re.compile(r"^i-[0-9a-f]{8,17}$")
 _AWS_COMMAND_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9-]{7,127}$")
 _AWS_AMI_RE = re.compile(r"^ami-[0-9a-f]{8,17}$")
@@ -918,7 +929,112 @@ class StateStore:
             and value.get("schema_version") == 2
         )
 
+    def _discover_aws_pair_membership(
+        self,
+        run_id: str,
+    ) -> tuple[str, dict[str, object]] | None:
+        _, _, _, intents_fd = self._require_locked()
+        identity_membership = self._discover_aws_v3_identity_membership(
+            run_id,
+        )
+        if identity_membership is not None:
+            manifest_sha256, identity = identity_membership
+            journal = self._load_aws_pair_unchecked(manifest_sha256)
+            if journal is None:
+                raise MsctlError(
+                    "STATE_INCOMPLETE",
+                    "AWS v3 identity is missing its pair journal",
+                    details={"manifest_sha256": manifest_sha256},
+                )
+            if journal.get("schema_version") != 2:
+                raise MsctlError(
+                    "STATE_CORRUPT",
+                    "AWS v3 pair journal was downgraded",
+                    details={"manifest_sha256": manifest_sha256},
+                )
+            if self._aws_v3_identity_value(
+                manifest_sha256,
+                journal["states"],
+            ) != identity:
+                raise MsctlError(
+                    "STATE_CORRUPT",
+                    "AWS v3 pair journal changed its durable run identity",
+                    details={"manifest_sha256": manifest_sha256},
+                )
+            return manifest_sha256, journal
+        matches: list[tuple[str, dict[str, object]]] = []
+        for name in os.listdir(intents_fd):
+            match = _AWS_PAIR_FILE_RE.fullmatch(name)
+            if match is None:
+                continue
+            manifest_sha256 = match.group(1)
+            try:
+                raw = load_json_at(
+                    intents_fd,
+                    name,
+                    label="AWS pair membership journal",
+                )
+                journal = require_object(
+                    raw,
+                    label="AWS pair membership journal",
+                )
+                self._validate_aws_pair(journal, manifest_sha256)
+            except MsctlError as error:
+                raise MsctlError(
+                    "STATE_CORRUPT",
+                    "AWS pair membership journal is unreadable",
+                    details={"manifest_sha256": manifest_sha256},
+                ) from error
+            if any(
+                state.get("run_id") == run_id
+                for state in journal["states"]
+            ):
+                self._require_aws_pair_not_failed(
+                    intents_fd,
+                    manifest_sha256,
+                )
+                if journal.get("schema_version") == 2:
+                    self._write_aws_v3_identity(
+                        manifest_sha256,
+                        journal["states"],
+                    )
+                else:
+                    v3_runs = self._find_aws_v3_runs(manifest_sha256)
+                    if v3_runs:
+                        if len(v3_runs) == 2:
+                            self._write_aws_v3_identity(
+                                manifest_sha256,
+                                list(v3_runs.values()),
+                            )
+                        raise MsctlError(
+                            "STATE_CORRUPT",
+                            "AWS v3 pair journal was downgraded",
+                            details={"manifest_sha256": manifest_sha256},
+                        )
+                matches.append((manifest_sha256, journal))
+        if len(matches) > 1:
+            raise MsctlError(
+                "STATE_CORRUPT",
+                "run ID belongs to multiple AWS pair journals",
+                details={"run_id": run_id},
+            )
+        return matches[0] if matches else None
+
     def read_run(self, run_id: str) -> dict[str, object] | None:
+        membership = self._discover_aws_pair_membership(run_id)
+        if membership is not None and membership[1].get("schema_version") == 2:
+            manifest_sha256, journal = membership
+            _journal, generation = self._load_aws_v3_generation(
+                manifest_sha256,
+                journal=journal,
+            )
+            if run_id not in generation:
+                raise MsctlError(
+                    "STATE_CORRUPT",
+                    "AWS v3 pair journal has the wrong run membership",
+                    details={"run_id": run_id},
+                )
+            return generation[run_id]
         value = self._load_run_unchecked(run_id)
         if value is None or not self._is_aws_v3_run(value):
             return value
@@ -936,6 +1052,36 @@ class StateStore:
 
     def write_run(self, run_id: str, value: dict[str, object]) -> None:
         _, runs_fd, _, intents_fd = self._require_locked()
+        membership = self._discover_aws_pair_membership(run_id)
+        existing = self._load_run_unchecked(run_id)
+        if membership is not None and membership[1].get("schema_version") == 2:
+            manifest_sha256, journal = membership
+            self._load_aws_v3_generation(
+                manifest_sha256,
+                journal=journal,
+            )
+            raise MsctlError(
+                "STATE_TRANSACTION_REQUIRED",
+                "AWS v3 run state writes require the paired transaction",
+                details={"run_id": run_id},
+            )
+        if existing is not None and self._is_aws_v3_run(existing):
+            manifest_sha256 = str(existing["run_manifest_sha256"])
+            self._require_aws_pair_not_failed(
+                intents_fd,
+                manifest_sha256,
+            )
+            journal = self._load_aws_pair_unchecked(manifest_sha256)
+            if journal is not None:
+                self._load_aws_v3_generation(
+                    manifest_sha256,
+                    journal=journal,
+                )
+            raise MsctlError(
+                "STATE_TRANSACTION_REQUIRED",
+                "AWS v3 run state writes require the paired transaction",
+                details={"run_id": run_id},
+            )
         try:
             _validate_run_state(value, run_id)
         except MsctlError as error:
@@ -1164,6 +1310,210 @@ class StateStore:
             os.close(descriptor)
         os.fsync(intents_fd)
 
+    def _aws_v3_identity_name(self, manifest_sha256: str) -> str:
+        self._aws_pair_name(manifest_sha256)
+        return f"aws-{manifest_sha256}.v3-identity"
+
+    def _validate_aws_v3_identity(
+        self,
+        value: dict[str, object],
+        manifest_sha256: str,
+    ) -> None:
+        require_exact_keys(
+            value,
+            AWS_V3_IDENTITY_KEYS,
+            label="AWS v3 state identity",
+        )
+        if (
+            value["schema_version"] != 1
+            or value["provider"] != _AWS_PROVIDER
+            or value["run_manifest_sha256"] != manifest_sha256
+        ):
+            raise MsctlError(
+                "STATE_CORRUPT",
+                "AWS v3 state identity binding is invalid",
+            )
+        runs = value["runs"]
+        if not isinstance(runs, list) or len(runs) != 2:
+            raise MsctlError(
+                "STATE_CORRUPT",
+                "AWS v3 state identity run set is incomplete",
+            )
+        run_ids: set[str] = set()
+        arms: set[str] = set()
+        for raw in runs:
+            run = require_object(raw, label="AWS v3 state identity run")
+            require_exact_keys(
+                run,
+                AWS_V3_IDENTITY_RUN_KEYS,
+                label="AWS v3 state identity run",
+            )
+            run_id = run["run_id"]
+            arm = run["arm"]
+            if (
+                not isinstance(run_id, str)
+                or RUN_ID_RE.fullmatch(run_id) is None
+                or run_id in run_ids
+                or arm not in {"dense", "split90"}
+                or arm in arms
+            ):
+                raise MsctlError(
+                    "STATE_CORRUPT",
+                    "AWS v3 state identity run binding is invalid",
+                )
+            run_ids.add(run_id)
+            arms.add(str(arm))
+        if arms != {"dense", "split90"}:
+            raise MsctlError(
+                "STATE_CORRUPT",
+                "AWS v3 state identity must bind both arms",
+            )
+
+    def _aws_v3_identity_value(
+        self,
+        manifest_sha256: str,
+        states: Sequence[dict[str, object]],
+    ) -> dict[str, object]:
+        value = {
+            "schema_version": 1,
+            "provider": _AWS_PROVIDER,
+            "run_manifest_sha256": manifest_sha256,
+            "runs": sorted(
+                (
+                    {
+                        "run_id": state.get("run_id"),
+                        "arm": state.get("arm"),
+                    }
+                    for state in states
+                ),
+                key=lambda row: str(row["run_id"]),
+            ),
+        }
+        self._validate_aws_v3_identity(value, manifest_sha256)
+        return value
+
+    def _load_aws_v3_identity(
+        self,
+        manifest_sha256: str,
+    ) -> dict[str, object] | None:
+        _, _, _, intents_fd = self._require_locked()
+        name = self._aws_v3_identity_name(manifest_sha256)
+        try:
+            raw = load_json_at(
+                intents_fd,
+                name,
+                label="AWS v3 state identity",
+            )
+        except MsctlError as error:
+            if error.code == "FILE_NOT_FOUND":
+                return None
+            raise MsctlError(
+                "STATE_CORRUPT",
+                "AWS v3 state identity is unreadable",
+                details={"manifest_sha256": manifest_sha256},
+            ) from error
+        value = require_object(raw, label="AWS v3 state identity")
+        self._validate_aws_v3_identity(value, manifest_sha256)
+        return value
+
+    def _write_aws_v3_identity(
+        self,
+        manifest_sha256: str,
+        states: Sequence[dict[str, object]],
+    ) -> dict[str, object]:
+        _, _, _, intents_fd = self._require_locked()
+        desired = self._aws_v3_identity_value(
+            manifest_sha256,
+            states,
+        )
+        existing = self._load_aws_v3_identity(manifest_sha256)
+        if existing is not None:
+            if existing != desired:
+                raise MsctlError(
+                    "STATE_CORRUPT",
+                    "AWS v3 state identity conflicts with its run set",
+                )
+            return existing
+        name = self._aws_v3_identity_name(manifest_sha256)
+        flags = (
+            os.O_WRONLY
+            | os.O_CREAT
+            | os.O_EXCL
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_CLOEXEC", 0)
+        )
+        try:
+            descriptor = os.open(name, flags, 0o600, dir_fd=intents_fd)
+        except FileExistsError:
+            existing = self._load_aws_v3_identity(manifest_sha256)
+            if existing != desired:
+                raise MsctlError(
+                    "STATE_CORRUPT",
+                    "AWS v3 state identity changed during publication",
+                )
+            return desired
+        try:
+            data = canonical_json(desired) + b"\n"
+            view = memoryview(data)
+            while view:
+                written = os.write(descriptor, view)
+                view = view[written:]
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+        os.fsync(intents_fd)
+        return desired
+
+    def _find_aws_v3_runs(
+        self,
+        manifest_sha256: str,
+    ) -> dict[str, dict[str, object]]:
+        _, runs_fd, _, _ = self._require_locked()
+        matches: dict[str, dict[str, object]] = {}
+        for name in os.listdir(runs_fd):
+            if not name.endswith(".json"):
+                continue
+            run_id = name.removesuffix(".json")
+            if RUN_ID_RE.fullmatch(run_id) is None:
+                continue
+            state = self._load_run_unchecked(run_id)
+            if (
+                state is not None
+                and self._is_aws_v3_run(state)
+                and state.get("run_manifest_sha256") == manifest_sha256
+            ):
+                matches[run_id] = state
+        return matches
+
+    def _discover_aws_v3_identity_membership(
+        self,
+        run_id: str,
+    ) -> tuple[str, dict[str, object]] | None:
+        _, _, _, intents_fd = self._require_locked()
+        matches: list[tuple[str, dict[str, object]]] = []
+        for name in os.listdir(intents_fd):
+            match = _AWS_V3_IDENTITY_FILE_RE.fullmatch(name)
+            if match is None:
+                continue
+            manifest_sha256 = match.group(1)
+            identity = self._load_aws_v3_identity(manifest_sha256)
+            assert identity is not None
+            if any(
+                row.get("run_id") == run_id for row in identity["runs"]
+            ):
+                self._require_aws_pair_not_failed(
+                    intents_fd,
+                    manifest_sha256,
+                )
+                matches.append((manifest_sha256, identity))
+        if len(matches) > 1:
+            raise MsctlError(
+                "STATE_CORRUPT",
+                "run ID belongs to multiple AWS v3 identities",
+                details={"run_id": run_id},
+            )
+        return matches[0] if matches else None
+
     def _validate_aws_pair(
         self,
         value: dict[str, object],
@@ -1270,6 +1620,10 @@ class StateStore:
                 "AWS v3 run state has the wrong pair journal version",
                 details={"manifest_sha256": manifest_sha256},
             )
+        self._write_aws_v3_identity(
+            manifest_sha256,
+            current_journal["states"],
+        )
         expected = {
             str(state["run_id"]): state
             for state in current_journal["states"]
@@ -1296,11 +1650,39 @@ class StateStore:
         self,
         manifest_sha256: str,
     ) -> dict[str, object] | None:
+        identity = self._load_aws_v3_identity(manifest_sha256)
         value = self._load_aws_pair_unchecked(manifest_sha256)
         if value is not None and value.get("schema_version") == 2:
             self._load_aws_v3_generation(
                 manifest_sha256,
                 journal=value,
+            )
+            return value
+        if identity is not None:
+            raise MsctlError(
+                "STATE_CORRUPT",
+                (
+                    "AWS v3 pair journal is missing"
+                    if value is None
+                    else "AWS v3 pair journal was downgraded"
+                ),
+                details={"manifest_sha256": manifest_sha256},
+            )
+        v3_runs = self._find_aws_v3_runs(manifest_sha256)
+        if v3_runs:
+            if len(v3_runs) == 2:
+                self._write_aws_v3_identity(
+                    manifest_sha256,
+                    list(v3_runs.values()),
+                )
+            raise MsctlError(
+                "STATE_CORRUPT",
+                (
+                    "AWS v3 pair journal is missing"
+                    if value is None
+                    else "AWS v3 pair journal was downgraded"
+                ),
+                details={"manifest_sha256": manifest_sha256},
             )
         return value
 
@@ -1311,6 +1693,32 @@ class StateStore:
     ) -> None:
         _, _, _, intents_fd = self._require_locked()
         self._require_aws_pair_not_failed(intents_fd, manifest_sha256)
+        identity = self._load_aws_v3_identity(manifest_sha256)
+        existing = self._load_aws_pair_unchecked(manifest_sha256)
+        v3_runs = self._find_aws_v3_runs(manifest_sha256)
+        if existing is not None and existing.get("schema_version") == 2:
+            self._write_aws_v3_identity(
+                manifest_sha256,
+                existing["states"],
+            )
+        if (
+            identity is not None
+            or (
+                existing is not None
+                and existing.get("schema_version") == 2
+            )
+            or bool(v3_runs)
+        ):
+            if identity is None and len(v3_runs) == 2:
+                self._write_aws_v3_identity(
+                    manifest_sha256,
+                    list(v3_runs.values()),
+                )
+            raise MsctlError(
+                "STATE_TRANSACTION_REQUIRED",
+                "AWS v3 pair journal writes require the paired transaction",
+                details={"manifest_sha256": manifest_sha256},
+            )
         self._validate_aws_pair(value, manifest_sha256)
         if value.get("schema_version") == 2:
             raise MsctlError(
@@ -1527,6 +1935,11 @@ class StateStore:
         _, runs_fd, _, intents_fd = self._require_locked()
         self._require_aws_pair_not_failed(intents_fd, manifest_sha256)
         self._validate_aws_pair(value, manifest_sha256)
+        if value.get("schema_version") != 2:
+            raise MsctlError(
+                "STATE_CORRUPT",
+                "AWS paired transaction requires a v3 journal",
+            )
         state_by_id: dict[str, dict[str, object]] = {}
         for state in states:
             run_id = state.get("run_id")
@@ -1553,9 +1966,10 @@ class StateStore:
                 "AWS pair transaction journal and run states differ",
             )
 
-        current_journal = self.read_aws_pair(manifest_sha256)
+        current_journal = self._load_aws_pair_unchecked(manifest_sha256)
         current_runs = {
-            run_id: self.read_run(run_id) for run_id in sorted(state_by_id)
+            run_id: self._load_run_unchecked(run_id)
+            for run_id in sorted(state_by_id)
         }
         if current_journal is None:
             if any(state is not None for state in current_runs.values()):
@@ -1564,6 +1978,12 @@ class StateStore:
                     "AWS pair transaction lacks its existing journal",
                 )
         else:
+            if current_journal.get("schema_version") != 2:
+                raise MsctlError(
+                    "STATE_CORRUPT",
+                    "AWS v3 pair journal was downgraded",
+                    details={"manifest_sha256": manifest_sha256},
+                )
             current_by_id = {
                 str(state["run_id"]): state
                 for state in current_journal["states"]
@@ -1615,6 +2035,10 @@ class StateStore:
                 )
             )
 
+        self._write_aws_v3_identity(
+            manifest_sha256,
+            value["states"],
+        )
         snapshots = [
             self._read_state_bytes(directory_fd, name, label=label)
             for directory_fd, name, _data, label in targets
