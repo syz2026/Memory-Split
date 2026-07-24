@@ -741,3 +741,132 @@ Both static checks were silent with exit code zero.
 The unrelated pre-existing full-suite failures recorded earlier remain outside
 this task's ownership. All requested focused, source-lock, compilation, and
 diff gates are green.
+
+## Two-name exchange state-machine closure
+
+Status: `DONE_WITH_CONCERNS`
+
+Implementation commit:
+`c5bbbb87c63191130b01549dc1df90e2e996c05d` —
+`fix: close Wikidata two-name quarantine race`.
+
+### Remaining race addressed
+
+1. Exchange quarantine now classifies the retained candidate and retained
+   marker independently at both the final and quarantine names after every
+   exchange. The state is four fixed booleans; no path-only observation is
+   promoted to authority.
+2. The reviewer sequence that swaps the exact candidate and exact marker before
+   the production exchange is distinguishable as `candidate at final, marker at
+   marker`. That state receives one descriptor-bound retry. The expected result
+   is then `candidate at quarantine, marker at final`; only the exact empty
+   marker is removed.
+3. Repeating the restored-original state exhausts that marker's retry and
+   allocates a freshly name-bound retained marker. The exact old marker is
+   removed when still reachable, its descriptor is closed exhaustively, and
+   the fresh marker becomes the bounded state machine's active authority.
+4. A lost original marker while the candidate remains known at the final name
+   takes the same fresh-marker transition. The state machine cannot return or
+   raise from a classification that still binds the failed candidate to final.
+5. A candidate already at quarantine with a non-marker final entry preserves
+   that entry. Rollback remains restricted to the one-sided wrong-source state:
+   marker at final, candidate at neither name, and marker absent from its own
+   name.
+6. Every terminal path fsyncs the namespace, reclassifies all four retained
+   descriptor/name relations, and proceeds only when the candidate is no
+   longer at final. Continuous hostile interference can delay completion, but
+   state and descriptor usage remain bounded.
+
+### State-machine TDD evidence
+
+The exact pre-swap and repeated-state exhaustion tests were added before
+production changes.
+
+Direct RED selection:
+
+```bash
+python -m pytest -q tests/test_reasoning_v2_wikidata_source.py \
+  -k 'two_name_preswap or repeated_original_state'
+```
+
+Exact RED result:
+
+```text
+FF                                                                       [100%]
+2 failed, 73 deselected in 0.65s
+```
+
+The first failure showed that the failed candidate remained at the final inode
+after the adversary's exact two-name pre-swap. The second showed that no fresh
+marker was allocated after the repeated restored-original state.
+
+The same selection after implementation:
+
+```text
+..                                                                       [100%]
+2 passed, 73 deselected in 0.48s
+```
+
+### Final verification
+
+```bash
+python -m pytest -q tests/test_reasoning_v2_wikidata_source.py
+```
+
+```text
+........................................................................ [ 96%]
+...                                                                      [100%]
+75 passed in 2.92s
+```
+
+```bash
+python -m pytest -q \
+  tests/test_reasoning_v2_source_lock.py \
+  tests/test_current_sources.py
+```
+
+```text
+........................................................................ [ 64%]
+.......................................                                  [100%]
+111 passed in 16.95s
+```
+
+The regression command used unrestricted local filesystem execution only
+because its fixtures create temporary Git repositories. No network or AWS
+access was enabled or used.
+
+```bash
+python -m py_compile \
+  corpusgen/reasoning_v2/wikidata_source.py \
+  tests/test_reasoning_v2_wikidata_source.py
+git diff --check
+```
+
+Both static checks were silent with exit code zero.
+
+### Bounded-memory and self-review
+
+- The state machine retains four booleans, one small retry counter, the active
+  marker authority, and at most one retired descriptor during marker rotation.
+  It does not retain corpus records or add any corpus-sized read.
+- Every retry rebinds the candidate and active marker immediately before the
+  atomic exchange. Every exchange is followed by a four-location
+  descriptor-based classification.
+- The new pre-swap test proves the failed candidate leaves final and remains
+  under a quarantine name. The exhaustion test forces the original state twice,
+  proves a second marker is allocated, proves the old marker is retired, and
+  proves exactly one quarantine entry remains with the candidate inode.
+- All prior marker-substitution, final-substitution, fsync-failure,
+  same-inode-ABA, close-exhaustion, bounded external-sort, and deterministic
+  byte tests remain green.
+- Task 1/Task 2 public interfaces and schema/format v1 are unchanged.
+- The implementation commit contains exactly the two authorized Wikidata
+  code/test files. This appendix is the only report change. No amend, push,
+  source mutation, AWS operation, network operation, or other worktree edit
+  occurred.
+
+### Concern
+
+The unrelated pre-existing full-suite failures recorded earlier remain outside
+this task's ownership. All requested focused, source-lock, compilation, and
+diff gates are green.
