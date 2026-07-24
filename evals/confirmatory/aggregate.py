@@ -22,7 +22,6 @@ from evals.confirmatory.contracts import (
 from evals.confirmatory.study_lock import (
     EXPECTED_STUDY_SLOTS_V3,
     ProviderSelectionBinding,
-    SeedLifecycleBinding,
     StudyLockV3,
     StudySnapshotBinding,
     _git_sha1,
