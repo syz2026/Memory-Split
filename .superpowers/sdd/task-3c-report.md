@@ -829,3 +829,116 @@ carried into `9e76a88` as described in the concurrency note.
   product failure.
 - No live paid AWS, versioned S3, P5, NCCL, Docker, or IMDS operation was
   performed; boundaries remain covered by injected stores and runners.
+
+## Signal-acknowledged request-token remediation from `ed6c8d8`
+
+Status: complete for the remaining baseline-to-signal race.
+
+Implementation commit:
+
+- `9b7d52a` — `fix: require signal-acknowledged checkpoint tokens`
+
+No receipt field, receipt timing, checkpoint payload, scientific config,
+optimizer schedule, or legacy write path changed.
+
+### Root cause and fix
+
+Descriptor-pinned baselines proved that metadata and checkpoint bytes belonged
+to one generation, but did not prove that a later generation acknowledged the
+active SIGUSR1. Both baselines were captured before either signal, so a normal
+checkpoint published in that interval could satisfy the old generation-only
+test.
+
+The production path now uses the existing 32-lowercase-hex `request_id` as a
+one-use checkpoint request token:
+
+1. The reviewed launcher binds a distinct host token path to each arm's
+   checkpoint sibling and passes the exact container path and arm through
+   fixed Docker environment entries. The production request carries those
+   paths plus the attested runtime UID/GID; resume uses the same scheduler.
+2. Before either signal, the mirror exclusively and durably publishes strict
+   canonical per-arm token files. Existing files are never overwritten.
+3. The signal handler remains a generation-counter increment only. At the
+   safe service boundary, rank zero atomically claims and validates the token
+   only when servicing a SIGUSR1 generation, then passes its request ID to
+   `save_ckpt`.
+4. Adjacent trainer metadata always includes `request_token` (`null` for
+   periodic/final/local saves). The reader accepts old metadata without the
+   field as read-only compatibility and maps it to `None`.
+5. Production staging waits past unrelated generations and accepts only
+   metadata whose token equals the active request ID. Missing, stale,
+   cross-request, and unacknowledged metadata therefore time out without a
+   pair receipt.
+6. Token publication/claim/cleanup uses no-follow directory walks, canonical
+   payloads, exact owner/mode/link checks, exclusive publication, identity-
+   checked quarantine/restore, and directory fsync. Failed signals, staging
+   failures, timeout, and fork cancellation remove only the exact request's
+   pending files.
+
+### RED evidence
+
+All production slices began with focused failing tests:
+
+```text
+Secure token format/publication/consume tests:
+  6 failed — checkpoint token APIs did not exist.
+
+Trainer capability/metadata/service tests:
+  5 failed — capability and metadata lacked the token, missing tokens did
+  not fail closed, and SIGUSR1 saves did not consume/bind a token.
+
+Launcher propagation:
+  request.runtime_uid was absent; the token capability was rejected as
+  unknown evidence instead of being enforced.
+
+Mirror race/cleanup:
+  unrelated gap generation: dense acknowledgment hook was never reached;
+  cross-request metadata: DID NOT RAISE TimeoutError;
+  failed signal: both observations saw no published token files.
+```
+
+The deterministic gap regression installs valid Dense metadata after
+baselines but immediately before the Dense signal callback. It then installs
+the acknowledged generation only from the staging wait hook. The old code
+published step 2 without reaching that hook; the fixed code waits and
+publishes acknowledged Dense step 4 with Split90 step 3.
+
+### GREEN evidence
+
+Focused cycles:
+
+```text
+Secure token contract and adversarial file checks:      6 passed
+Trainer token capability/metadata/service checks:       6 passed
+Launcher path/environment/capability checks:            3 passed
+Mirror gap/cross-request/failed-signal checks:           3 passed
+Mirror compatibility and cancellation focus:            5 passed
+Final combined remediation selection:                   14 passed
+Resume periodic scheduler plus real token paths:         2 passed
+```
+
+### Final disk-bounded verification
+
+Every pytest command used `PYTHONDONTWRITEBYTECODE=1`,
+`-p no:cacheprovider`, and a dedicated `/tmp/ms3c-token-*` basetemp:
+
+```text
+tests/test_aws_checkpoint_mirror.py                         69 passed
+tests/test_aws_p5_launcher.py                               147 passed
+tests/test_trainer.py tests/test_ddp_trainer.py              99 passed
+tests/test_msctl.py                                         157 passed
+tests/test_run_manifest_v3.py tests/test_package_aws_p5_handoff.py
+                                                             172 passed
+tests/test_aws_argv.py                                       19 passed
+```
+
+Non-overlapping required-group aggregate: **663 passed**.
+
+Changed-file `python -m py_compile`, staged and unstaged `git diff --check`,
+and the final 14-test focused rerun passed.
+
+### Token-remediation concerns
+
+- No live paid AWS, versioned S3 bucket, P5, Docker, NCCL, or IMDS operation
+  was performed. Filesystem, process, object-store, launcher, resume, and
+  package boundaries are covered by deterministic injected tests.
