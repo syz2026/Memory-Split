@@ -802,6 +802,8 @@ def _qualification_verification_kwargs() -> dict[str, object]:
 
 def _qualification_evidence_value(
     profile_id: str = "aws-p6-b300.48xlarge-v3",
+    *,
+    identity_mode: str = "minimal",
 ) -> tuple[dict[str, object], bytes]:
     lock_data = _canonical_json(
         _runtime_lock_value(profile_id)
@@ -811,13 +813,30 @@ def _qualification_evidence_value(
     identity = {
         "accountId": "123456789012",
         "architecture": "x86_64",
-        "availabilityZone": "us-east-1d" if is_p6 else "us-east-1c",
         "imageId": lock["ami_id"],
         "instanceId": "i-0123456789abcdef0",
-        "instanceType": "p6-b300.48xlarge" if is_p6 else "p5.48xlarge",
         "privateIp": "10.1.2.3",
         "region": "us-east-1",
     }
+    availability_zone = "us-east-1d" if is_p6 else "us-east-1c"
+    if identity_mode == "full":
+        identity.update(
+            {
+                "availabilityZone": availability_zone,
+                "billingProducts": ["bp-6ba54002"],
+                "devpayProductCodes": None,
+                "instanceType": (
+                    "p6-b300.48xlarge" if is_p6 else "p5.48xlarge"
+                ),
+                "kernelId": None,
+                "marketplaceProductCodes": [],
+                "pendingTime": "2026-07-24T06:00:00Z",
+                "ramdiskId": None,
+                "version": "2017-09-30",
+            }
+        )
+    elif identity_mode != "minimal":  # pragma: no cover - helper guard
+        raise AssertionError(identity_mode)
     environment = {
         "account_id": identity["accountId"],
         "ami_id": identity["imageId"],
@@ -901,6 +920,7 @@ def _qualification_evidence_value(
             _canonical_json(environment["runtime_facts"])
         ).hexdigest(),
         "container_image_digest": environment["container_image_digest"],
+        "availability_zone": availability_zone,
         "environment_receipt_sha256": hashlib.sha256(
             environment_data
         ).hexdigest(),
@@ -922,11 +942,79 @@ def _qualification_evidence_value(
     }
     return {
         "approval": approval,
+        "availability_zone": availability_zone,
         "canary_receipt": canary,
         "environment_receipt": environment,
         "receipt_type": "memorysplit-aws-qualified-runtime-v2",
         "schema_version": 2,
     }, lock_data
+
+
+@pytest.mark.parametrize("identity_mode", ["minimal", "full"])
+def test_qualification_accepts_realistic_aws_identity_documents(identity_mode):
+    from msctl.aws_hardware import (
+        parse_authenticated_qualification_evidence_bytes,
+    )
+
+    value, lock_data = _qualification_evidence_value(
+        identity_mode=identity_mode
+    )
+    evidence = parse_authenticated_qualification_evidence_bytes(
+        _canonical_json(value),
+        profile_data=P6_PROFILE.read_bytes(),
+        runtime_lock_data=lock_data,
+        **_qualification_verification_kwargs(),
+    )
+
+    assert evidence.availability_zone == "us-east-1d"
+    identity = value["environment_receipt"][
+        "aws_instance_identity_document"
+    ]
+    if identity_mode == "minimal":
+        assert set(identity) == {
+            "accountId",
+            "architecture",
+            "imageId",
+            "instanceId",
+            "privateIp",
+            "region",
+        }
+    else:
+        assert "billingProducts" in identity
+        assert "version" in identity
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("unknownField", "forbidden"),
+        ("billingProducts", "not-a-list"),
+        ("kernelId", 42),
+        ("instanceType", "p5.48xlarge"),
+    ],
+)
+def test_qualification_rejects_unknown_or_invalid_optional_identity(
+    field,
+    value,
+):
+    from msctl.aws_hardware import (
+        parse_authenticated_qualification_evidence_bytes,
+    )
+
+    evidence, lock_data = _qualification_evidence_value(
+        identity_mode="full"
+    )
+    evidence["environment_receipt"]["aws_instance_identity_document"][
+        field
+    ] = value
+
+    with pytest.raises(ValueError, match="identity"):
+        parse_authenticated_qualification_evidence_bytes(
+            _canonical_json(evidence),
+            profile_data=P6_PROFILE.read_bytes(),
+            runtime_lock_data=lock_data,
+            **_qualification_verification_kwargs(),
+        )
 
 
 def test_qualification_evidence_requires_identity_and_approval_verification():
@@ -1420,11 +1508,18 @@ class _MemorySelectionStore:
         corrupt_head: str | None = None,
         history_versions: tuple[str, ...] = (),
         delete_markers: tuple[str, ...] = (),
+        post_put_versions: tuple[str, ...] = (),
+        post_put_delete_markers: tuple[str, ...] = (),
+        fail_at: str | None = None,
     ) -> None:
         self.lost_put = lost_put
         self.corrupt_head = corrupt_head
         self.history_versions = list(history_versions)
         self.delete_markers = list(delete_markers)
+        self.post_put_versions = list(post_put_versions)
+        self.post_put_delete_markers = list(post_put_delete_markers)
+        self.fail_at = fail_at
+        self.list_count = 0
         self.objects: dict[str, tuple[bytes, str]] = {}
         self.list_calls: list[str] = []
         self.put_calls: list[dict[str, object]] = []
@@ -1435,6 +1530,10 @@ class _MemorySelectionStore:
         from msctl.aws_hardware import VersionedSelectionHistory
 
         self.list_calls.append(key)
+        self.list_count += 1
+        if self.fail_at == f"list-{self.list_count}":
+            self.fail_at = None
+            raise TimeoutError("synthetic list timeout")
         return VersionedSelectionHistory(
             key=key,
             versions=tuple(self.history_versions),
@@ -1463,6 +1562,11 @@ class _MemorySelectionStore:
         version_id = "version-1"
         self.objects[key] = (data, version_id)
         self.history_versions.append(version_id)
+        self.history_versions.extend(self.post_put_versions)
+        self.delete_markers.extend(self.post_put_delete_markers)
+        if self.fail_at == "put-after-write":
+            self.fail_at = None
+            raise TimeoutError("synthetic lost PUT response")
         if self.lost_put:
             return None
         return VersionedSelectionObject(
@@ -1476,6 +1580,9 @@ class _MemorySelectionStore:
         from msctl.aws_hardware import VersionedSelectionObject
 
         self.head_calls.append({"key": key, "version_id": version_id})
+        if self.fail_at == "head":
+            self.fail_at = None
+            raise TimeoutError("synthetic HEAD timeout")
         stored = self.objects.get(key)
         if stored is None:
             return None
@@ -1670,6 +1777,325 @@ def test_selection_publication_blocks_any_fixed_key_history(
     assert not (
         tmp_path / "authority" / PROVIDER_SELECTION_LOCAL_PATH
     ).exists()
+
+
+@pytest.mark.parametrize(
+    ("post_put_versions", "post_put_delete_markers"),
+    [(("concurrent-version",), ()), ((), ("concurrent-delete",))],
+    ids=["concurrent-version", "concurrent-delete-marker"],
+)
+def test_selection_publication_rechecks_singleton_history_after_put(
+    tmp_path,
+    post_put_versions,
+    post_put_delete_markers,
+):
+    from msctl.aws_hardware import publish_provider_selection
+
+    selection_data, runtime_lock, runtime_evidence = _write_authority_inputs(
+        tmp_path
+    )
+    store = _MemorySelectionStore(
+        post_put_versions=post_put_versions,
+        post_put_delete_markers=post_put_delete_markers,
+    )
+
+    with pytest.raises(ValueError, match="history|version|delete"):
+        publish_provider_selection(
+            authority_root=tmp_path / "authority",
+            repo_root=ROOT,
+            runtime_lock_path=runtime_lock,
+            runtime_evidence_path=runtime_evidence,
+            selection_data=selection_data,
+            store=store,
+            **_qualification_verification_kwargs(),
+        )
+    assert store.list_calls == [SELECTION_S3_KEY, SELECTION_S3_KEY]
+
+
+@pytest.mark.parametrize("race", ["version", "delete-marker"])
+def test_replay_and_admission_recheck_singleton_history(tmp_path, race):
+    from msctl.aws_hardware import (
+        admit_provider_selection,
+        load_versioned_provider_selection_authority,
+        publish_provider_selection,
+    )
+
+    selection_data, runtime_lock, runtime_evidence = _write_authority_inputs(
+        tmp_path
+    )
+    authority_root = tmp_path / "authority-history"
+    store = _MemorySelectionStore()
+    published = publish_provider_selection(
+        authority_root=authority_root,
+        repo_root=ROOT,
+        runtime_lock_path=runtime_lock,
+        runtime_evidence_path=runtime_evidence,
+        selection_data=selection_data,
+        store=store,
+        **_qualification_verification_kwargs(),
+    )
+    if race == "version":
+        store.history_versions.append("concurrent-version")
+    else:
+        store.delete_markers.append("concurrent-delete")
+
+    with pytest.raises(ValueError, match="history|version|delete"):
+        load_versioned_provider_selection_authority(
+            authority_root=authority_root,
+            repo_root=ROOT,
+            runtime_lock_path=runtime_lock,
+            runtime_evidence_path=runtime_evidence,
+            store=store,
+            **_qualification_verification_kwargs(),
+        )
+    with pytest.raises(ValueError, match="history|version|delete"):
+        admit_provider_selection(
+            authority_root=authority_root,
+            repo_root=ROOT,
+            runtime_lock_path=runtime_lock,
+            runtime_evidence_path=runtime_evidence,
+            store=store,
+            account_id=published.selection.account_id,
+            instance_id=published.selection.qualification_instance_id,
+            boot_id=published.selection.qualification_boot_id,
+            seed=0,
+            arm="dense",
+            expected_selection_version_id=published.remote.version_id,
+            **_qualification_verification_kwargs(),
+        )
+
+
+def test_pending_intent_is_durable_before_any_remote_mutation(tmp_path):
+    from msctl.aws_hardware import (
+        PROVIDER_SELECTION_PENDING_ARCHIVE_LOCAL_PATH,
+        PROVIDER_SELECTION_PENDING_LOCAL_PATH,
+        publish_provider_selection,
+    )
+
+    selection_data, runtime_lock, runtime_evidence = _write_authority_inputs(
+        tmp_path
+    )
+    authority_root = tmp_path / "authority-pending"
+    store = _MemorySelectionStore(fail_at="list-1")
+
+    with pytest.raises(ValueError, match="uncertain|publication|timeout"):
+        publish_provider_selection(
+            authority_root=authority_root,
+            repo_root=ROOT,
+            runtime_lock_path=runtime_lock,
+            runtime_evidence_path=runtime_evidence,
+            selection_data=selection_data,
+            store=store,
+            **_qualification_verification_kwargs(),
+        )
+    pending = authority_root / PROVIDER_SELECTION_PENDING_LOCAL_PATH
+    assert json.loads(pending.read_bytes()) == {
+        "expected_bytes": len(selection_data),
+        "s3_key": SELECTION_S3_KEY,
+        "schema_version": 1,
+        "selection_sha256": hashlib.sha256(selection_data).hexdigest(),
+    }
+    assert store.put_calls == []
+
+    published = publish_provider_selection(
+        authority_root=authority_root,
+        repo_root=ROOT,
+        runtime_lock_path=runtime_lock,
+        runtime_evidence_path=runtime_evidence,
+        selection_data=selection_data,
+        store=store,
+        **_qualification_verification_kwargs(),
+    )
+    assert published.publication_state == "published"
+    assert not pending.exists()
+    assert (
+        authority_root / PROVIDER_SELECTION_PENDING_ARCHIVE_LOCAL_PATH
+    ).is_file()
+
+
+@pytest.mark.parametrize(
+    "fail_at",
+    ["put-after-write", "head", "list-2"],
+)
+def test_retry_recovers_single_exact_remote_version_after_timeout(
+    tmp_path,
+    fail_at,
+):
+    from msctl.aws_hardware import (
+        PROVIDER_SELECTION_PENDING_LOCAL_PATH,
+        publish_provider_selection,
+    )
+
+    selection_data, runtime_lock, runtime_evidence = _write_authority_inputs(
+        tmp_path
+    )
+    authority_root = tmp_path / f"authority-{fail_at}"
+    store = _MemorySelectionStore(fail_at=fail_at)
+
+    with pytest.raises(ValueError, match="uncertain|publication|timeout"):
+        publish_provider_selection(
+            authority_root=authority_root,
+            repo_root=ROOT,
+            runtime_lock_path=runtime_lock,
+            runtime_evidence_path=runtime_evidence,
+            selection_data=selection_data,
+            store=store,
+            **_qualification_verification_kwargs(),
+        )
+    assert (
+        authority_root / PROVIDER_SELECTION_PENDING_LOCAL_PATH
+    ).is_file()
+
+    recovered = publish_provider_selection(
+        authority_root=authority_root,
+        repo_root=ROOT,
+        runtime_lock_path=runtime_lock,
+        runtime_evidence_path=runtime_evidence,
+        selection_data=selection_data,
+        store=store,
+        **_qualification_verification_kwargs(),
+    )
+    assert recovered.publication_state == "recovered"
+    assert recovered.remote.version_id == "version-1"
+    assert len(store.put_calls) == 1
+    assert store.get_calls[-1] == {
+        "key": SELECTION_S3_KEY,
+        "version_id": "version-1",
+    }
+
+
+@pytest.mark.parametrize(
+    "boundary",
+    [
+        "local-selection",
+        "version-binding",
+        "pending-archive",
+        "pending-archive-midway",
+    ],
+)
+def test_retry_recovers_after_each_local_commit_boundary(
+    tmp_path,
+    monkeypatch,
+    boundary,
+):
+    import msctl.aws_hardware as hardware
+
+    selection_data, runtime_lock, runtime_evidence = _write_authority_inputs(
+        tmp_path
+    )
+    authority_root = tmp_path / f"authority-{boundary}"
+    store = _MemorySelectionStore()
+    target_name = {
+        "local-selection": "_publish_local_selection",
+        "version-binding": "_publish_version_binding",
+        "pending-archive": "_archive_pending_selection",
+        "pending-archive-midway": "_archive_pending_selection",
+    }[boundary]
+    original = getattr(hardware, target_name, None)
+    failed = False
+
+    def fail_once(*args, **kwargs):
+        nonlocal failed
+        if not failed:
+            failed = True
+            if boundary == "pending-archive-midway":
+                pending = Path(authority_root) / (
+                    hardware.PROVIDER_SELECTION_PENDING_LOCAL_PATH
+                )
+                archive = Path(authority_root) / (
+                    hardware.PROVIDER_SELECTION_PENDING_ARCHIVE_LOCAL_PATH
+                )
+                pending.rename(archive)
+            raise TimeoutError(f"synthetic crash at {boundary}")
+        assert original is not None
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(hardware, target_name, fail_once, raising=False)
+
+    with pytest.raises(ValueError, match="uncertain|publication|crash"):
+        hardware.publish_provider_selection(
+            authority_root=authority_root,
+            repo_root=ROOT,
+            runtime_lock_path=runtime_lock,
+            runtime_evidence_path=runtime_evidence,
+            selection_data=selection_data,
+            store=store,
+            **_qualification_verification_kwargs(),
+        )
+    recovered = hardware.publish_provider_selection(
+        authority_root=authority_root,
+        repo_root=ROOT,
+        runtime_lock_path=runtime_lock,
+        runtime_evidence_path=runtime_evidence,
+        selection_data=selection_data,
+        store=store,
+        **_qualification_verification_kwargs(),
+    )
+
+    assert recovered.publication_state == "recovered"
+    assert len(store.put_calls) == 1
+
+
+@pytest.mark.parametrize("conflict", ["multiple-versions", "delete-marker"])
+def test_pending_recovery_rejects_conflicting_history(tmp_path, conflict):
+    from msctl.aws_hardware import publish_provider_selection
+
+    selection_data, runtime_lock, runtime_evidence = _write_authority_inputs(
+        tmp_path
+    )
+    authority_root = tmp_path / f"authority-{conflict}"
+    store = _MemorySelectionStore(fail_at="list-1")
+    with pytest.raises(ValueError):
+        publish_provider_selection(
+            authority_root=authority_root,
+            repo_root=ROOT,
+            runtime_lock_path=runtime_lock,
+            runtime_evidence_path=runtime_evidence,
+            selection_data=selection_data,
+            store=store,
+            **_qualification_verification_kwargs(),
+        )
+    if conflict == "multiple-versions":
+        store.history_versions.extend(["version-a", "version-b"])
+    else:
+        store.delete_markers.append("delete-a")
+
+    with pytest.raises(ValueError, match="history|version|delete|conflict"):
+        publish_provider_selection(
+            authority_root=authority_root,
+            repo_root=ROOT,
+            runtime_lock_path=runtime_lock,
+            runtime_evidence_path=runtime_evidence,
+            selection_data=selection_data,
+            store=store,
+            **_qualification_verification_kwargs(),
+        )
+    assert store.put_calls == []
+
+
+def test_preexisting_single_version_never_becomes_retry_recoverable(tmp_path):
+    from msctl.aws_hardware import publish_provider_selection
+
+    selection_data, runtime_lock, runtime_evidence = _write_authority_inputs(
+        tmp_path
+    )
+    authority_root = tmp_path / "authority-preexisting"
+    store = _MemorySelectionStore(history_versions=("preexisting",))
+    store.objects[SELECTION_S3_KEY] = (selection_data, "preexisting")
+
+    for _attempt in range(2):
+        with pytest.raises(ValueError, match="history|conflict|version"):
+            publish_provider_selection(
+                authority_root=authority_root,
+                repo_root=ROOT,
+                runtime_lock_path=runtime_lock,
+                runtime_evidence_path=runtime_evidence,
+                selection_data=selection_data,
+                store=store,
+                **_qualification_verification_kwargs(),
+            )
+    assert store.put_calls == []
+    assert store.get_calls == []
 
 
 def test_published_version_is_persisted_and_required_for_exact_replay(tmp_path):
@@ -2266,7 +2692,37 @@ def test_authority_cli_is_dry_run_by_default_and_apply_is_explicit(tmp_path):
     assert applied["selection_sha256"] == hashlib.sha256(
         paths["selection"].read_bytes()
     ).hexdigest()
-    assert store.list_calls == [SELECTION_S3_KEY]
+    assert store.list_calls == [SELECTION_S3_KEY, SELECTION_S3_KEY]
+
+
+def test_cli_apply_timeout_reports_uncertain_then_retry_reports_recovered(
+    tmp_path,
+    capsysbinary,
+):
+    from msctl.aws_hardware import main, run_hardware_authority_cli
+
+    paths = _write_cli_authority_inputs(tmp_path)
+    store = _MemorySelectionStore(fail_at="put-after-write")
+    exit_code = main(
+        _publish_cli_argv(paths, apply=True),
+        store=store,
+        **_qualification_verification_kwargs(),
+    )
+    report = json.loads(capsysbinary.readouterr().out)
+
+    assert exit_code == 2
+    assert report["ok"] is False
+    assert report["dry_run"] is False
+    assert report["publication_state"] == "uncertain"
+
+    dry_run, recovered = run_hardware_authority_cli(
+        _publish_cli_argv(paths, apply=True),
+        store=store,
+        **_qualification_verification_kwargs(),
+    )
+    assert dry_run is False
+    assert recovered["publication_state"] == "recovered"
+    assert len(store.put_calls) == 1
 
 
 def test_exact_admission_returns_only_authenticated_selection_binding(tmp_path):

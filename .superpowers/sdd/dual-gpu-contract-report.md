@@ -282,3 +282,88 @@ frozen scientific/profile/amendment diff assertions
 
 No live AWS command or paid-capacity mutation was performed. AWS behavior was
 exercised only through injected runners and in-memory versioned stores.
+
+## Final production-edge remediation (2026-07-24)
+
+### AWS identity document compatibility
+
+- Qualification now requires exactly the existing attestation contract's six
+  mandatory identity fields: account ID, architecture, image ID, instance ID,
+  private IP, and region, with their exact types and value constraints.
+- Only the existing AWS-documented optional allowlist is accepted:
+  availability zone, billing products, DevPay product codes, instance type,
+  kernel ID, marketplace product codes, pending time, ramdisk ID, and document
+  version. Optional list/null/string forms match the existing attestation
+  rules; unknown fields fail closed.
+- Availability zone remains selection-authoritative without becoming a
+  mandatory instance-document field: it is separately approval-signed and, if
+  the optional AWS identity value is present, the two must match.
+- Tests cover realistic minimal and full AWS documents plus unknown fields,
+  invalid optional types, and wrong optional instance type.
+
+### Closed history races
+
+- Publication lists versions/delete markers before PUT, persists the
+  remote-mutation marker only after confirming empty history, uses
+  `If-None-Match: *`, HEADs the exact version, then lists again and requires
+  history to be exactly that singleton with no delete marker.
+- Lost-PUT recovery additionally GETs the exact version and byte-compares it.
+  A prior singleton that existed before the mutation marker can never become
+  recoverable merely by retrying.
+- Every versioned replay, admission, and resume re-lists history before and
+  after exact-version GET and requires the persisted version to remain the sole
+  version with no delete marker.
+- Concurrent extra versions and delete markers before, during, or after PUT
+  fail publication/admission.
+
+### Crash-safe pending intent and CLI state
+
+- Before any remote operation, the authority installs a no-replace pending
+  intent binding fixed key, selection SHA-256, and expected byte count.
+- A separate no-replace remote-mutation marker is installed only after empty
+  history is observed and before PUT. Retry recovery therefore cannot authorize
+  a pre-existing version.
+- With an existing exact pending/mutation intent, one singleton remote version
+  is recoverable only after exact HEAD and GET checksum/length/version/content
+  verification. Multiple versions, delete markers, or different bytes fail.
+- Local selection and version binding are installed before pending and
+  mutation intents are atomically quarantined. Recovery covers failure before
+  remote list, lost PUT response, HEAD timeout, post-PUT history timeout,
+  local-selection install, version-binding install, and both sides of pending
+  quarantine.
+- CLI `--apply` errors now always report `dry_run:false` and an explicit
+  publication state. Post-mutation failures report `uncertain`; successful
+  retries report `recovered`. Dry-run remains mutation-free and reports
+  `planned`.
+
+### Final RED/GREEN evidence
+
+- Identity compatibility: RED had six minimal/full/optional-schema failures;
+  GREEN passed all six.
+- History races: RED had four accepted concurrent version/delete cases; GREEN
+  passed post-PUT singleton and replay/admission re-list enforcement.
+- Pending recovery: RED had ten missing pending/crash/CLI-state failures plus a
+  pre-existing-singleton retry escape and mid-quarantine crash; GREEN passed
+  all recovery and conflict cases.
+
+### Final verification
+
+```text
+tests/test_aws_hardware.py tests/test_aws_p5_profile.py
+tests/test_cohort_assignment_v3.py
+=> 227 passed
+
+tests/test_aws_contract_roundtrip.py tests/test_run_manifest_v3.py
+tests/test_aws_environment_receipt.py tests/test_aws_canary.py
+tests/test_aws_p5_launcher.py
+=> 347 passed
+
+python -m py_compile cluster/aws/gpu_profile.py cluster/aws/p5/profile.py
+  msctl/aws_hardware.py tests/test_aws_hardware.py
+git diff --check
+frozen profile/amendment/preregistration/cohort diff assertions
+=> passed
+```
+
+No frozen profile, amendment, preregistration, or cohort bytes changed. No live
+AWS command or paid-capacity mutation was performed.

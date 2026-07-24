@@ -48,6 +48,21 @@ PROVIDER_SELECTION_S3_KEY = (
 PROVIDER_SELECTION_VERSION_LOCAL_PATH = (
     "memorysplit-confirmatory-v3-360m-n10-aws/provider-selection-version.json"
 )
+PROVIDER_SELECTION_PENDING_LOCAL_PATH = (
+    "memorysplit-confirmatory-v3-360m-n10-aws/provider-selection-pending.json"
+)
+PROVIDER_SELECTION_PENDING_ARCHIVE_LOCAL_PATH = (
+    "memorysplit-confirmatory-v3-360m-n10-aws/"
+    "provider-selection-pending-completed.json"
+)
+PROVIDER_SELECTION_MUTATION_LOCAL_PATH = (
+    "memorysplit-confirmatory-v3-360m-n10-aws/"
+    "provider-selection-remote-mutation.json"
+)
+PROVIDER_SELECTION_MUTATION_ARCHIVE_LOCAL_PATH = (
+    "memorysplit-confirmatory-v3-360m-n10-aws/"
+    "provider-selection-remote-mutation-completed.json"
+)
 AWS_HARDWARE_AMENDMENT_SHA256 = (
     "d4cf13b587c751d27756ad7881e538facb7ea79305a098990a568a7b28b6fb14"
 )
@@ -132,6 +147,29 @@ _CANARY_PHASE_ORDER = (
     "resume",
     "throughput_4x4",
     "s3_roundtrip",
+)
+_IDENTITY_REQUIRED_FIELDS = frozenset(
+    {
+        "accountId",
+        "architecture",
+        "imageId",
+        "instanceId",
+        "privateIp",
+        "region",
+    }
+)
+_IDENTITY_OPTIONAL_FIELDS = frozenset(
+    {
+        "availabilityZone",
+        "billingProducts",
+        "devpayProductCodes",
+        "instanceType",
+        "kernelId",
+        "marketplaceProductCodes",
+        "pendingTime",
+        "ramdiskId",
+        "version",
+    }
 )
 _CANARY_RECEIPT_FIELDS = frozenset(
     {
@@ -296,6 +334,7 @@ class PublishedProviderSelection:
     local_path: Path
     remote: VersionedSelectionObject
     version_path: Path
+    publication_state: str
 
 
 @dataclass(frozen=True)
@@ -372,6 +411,12 @@ class QualificationApprovalVerifier(Protocol):
         algorithm: str,
         public_key_sha256: str,
     ) -> bool: ...
+
+
+class SelectionPublicationError(ValueError):
+    def __init__(self, message: str, *, publication_state: str) -> None:
+        super().__init__(message)
+        self.publication_state = publication_state
 
 
 def verify_aws_instance_identity_pkcs7(
@@ -1556,6 +1601,7 @@ def parse_authenticated_qualification_evidence_bytes(
         fields=frozenset(
             {
                 "approval",
+                "availability_zone",
                 "canary_receipt",
                 "environment_receipt",
                 "receipt_type",
@@ -1607,28 +1653,64 @@ def parse_authenticated_qualification_evidence_bytes(
     identity = environment["aws_instance_identity_document"]
     if not isinstance(identity, dict):
         raise ValueError("qualification instance identity must be an object")
-    required_identity = {
-        "accountId",
-        "architecture",
-        "availabilityZone",
-        "imageId",
-        "instanceId",
-        "instanceType",
-        "privateIp",
-        "region",
-    }
+    identity_fields = set(identity)
     if (
-        set(identity) != required_identity
-        or not all(isinstance(identity[field], str) for field in required_identity)
+        not _IDENTITY_REQUIRED_FIELDS <= identity_fields
+        or not identity_fields
+        <= _IDENTITY_REQUIRED_FIELDS | _IDENTITY_OPTIONAL_FIELDS
+        or not all(
+            isinstance(identity[field], str)
+            for field in _IDENTITY_REQUIRED_FIELDS
+        )
         or _ACCOUNT_RE.fullmatch(identity["accountId"]) is None
         or _INSTANCE_RE.fullmatch(identity["instanceId"]) is None
         or _REGION_RE.fullmatch(identity["region"]) is None
-        or _AVAILABILITY_ZONE_RE.fullmatch(identity["availabilityZone"]) is None
         or identity["architecture"] != profile.architecture
-        or identity["instanceType"] != profile.instance_type
         or identity["imageId"] != runtime_lock.ami_id
     ):
         raise ValueError("qualification instance identity is invalid")
+    selected_availability_zone = root["availability_zone"]
+    if (
+        not isinstance(selected_availability_zone, str)
+        or (
+            zone_match := _AVAILABILITY_ZONE_RE.fullmatch(
+                selected_availability_zone
+            )
+        )
+        is None
+        or zone_match.group("region") != identity["region"]
+        or (
+            profile.allowed_availability_zones
+            and selected_availability_zone
+            not in profile.allowed_availability_zones
+        )
+    ):
+        raise ValueError("qualification selected availability zone is invalid")
+    if "availabilityZone" in identity and (
+        not isinstance(identity["availabilityZone"], str)
+        or identity["availabilityZone"] != selected_availability_zone
+    ):
+        raise ValueError("qualification identity availability zone differs")
+    if "instanceType" in identity and (
+        not isinstance(identity["instanceType"], str)
+        or identity["instanceType"] != profile.instance_type
+    ):
+        raise ValueError("qualification identity instance type differs")
+    for field in (
+        "billingProducts",
+        "devpayProductCodes",
+        "marketplaceProductCodes",
+    ):
+        if field in identity and identity[field] is not None and (
+            not isinstance(identity[field], list)
+            or any(not isinstance(item, str) for item in identity[field])
+        ):
+            raise ValueError(f"qualification identity {field} is invalid")
+    for field in ("kernelId", "pendingTime", "ramdiskId", "version"):
+        if field in identity and identity[field] is not None and (
+            not isinstance(identity[field], str) or not identity[field]
+        ):
+            raise ValueError(f"qualification identity {field} is invalid")
     try:
         address = ipaddress.ip_address(identity["privateIp"])
     except ValueError as error:
@@ -1640,7 +1722,7 @@ def parse_authenticated_qualification_evidence_bytes(
     region = environment["region"]
     ami_id = environment["ami_id"]
     boot_id = environment["boot_id"]
-    availability_zone = identity["availabilityZone"]
+    availability_zone = selected_availability_zone
     if (
         account_id != identity["accountId"]
         or instance_id != identity["instanceId"]
@@ -1648,10 +1730,6 @@ def parse_authenticated_qualification_evidence_bytes(
         or ami_id != identity["imageId"]
         or _BOOT_RE.fullmatch(str(boot_id)) is None
         or region not in profile.allowed_regions
-        or (
-            profile.allowed_availability_zones
-            and availability_zone not in profile.allowed_availability_zones
-        )
     ):
         raise ValueError("qualification environment identity duplicates differ")
     pkcs7 = _canonical_base64(
@@ -1763,6 +1841,7 @@ def parse_authenticated_qualification_evidence_bytes(
     expected_scope = {
         "account_id": account_id,
         "ami_id": ami_id,
+        "availability_zone": availability_zone,
         "boot_id": boot_id,
         "canary_receipt_sha256": canary_sha256,
         "container_facts_sha256": container_facts_sha256,
@@ -2124,6 +2203,257 @@ def _preflight_local_selection(
         )
 
 
+def _matching_durable_selection_binding(
+    *,
+    authority_root: Path | str,
+    data: bytes,
+) -> bool:
+    root = Path(authority_root)
+    try:
+        local_data = _regular_bytes(
+            root.joinpath(*PROVIDER_SELECTION_LOCAL_PATH.split("/")),
+            label="provider selection authority",
+            private=True,
+        )
+        version_data = _regular_bytes(
+            root.joinpath(*PROVIDER_SELECTION_VERSION_LOCAL_PATH.split("/")),
+            label="provider selection version authority",
+            private=True,
+        )
+    except ValueError as error:
+        cause = error.__cause__
+        if isinstance(cause, FileNotFoundError) or (
+            isinstance(cause, MsctlError) and cause.code == "FILE_NOT_FOUND"
+        ):
+            return False
+        raise
+    if local_data != data:
+        raise SelectionPublicationError(
+            "durable local selection conflicts with pending candidate",
+            publication_state="conflict",
+        )
+    value = _json_object(version_data, label="provider selection version")
+    if (
+        version_data != _canonical_json(value)
+        or set(value)
+        != {"schema_version", "selection_sha256", "s3_key", "version_id"}
+        or type(value["schema_version"]) is not int
+        or value["schema_version"] != 1
+        or value["selection_sha256"] != hashlib.sha256(data).hexdigest()
+        or value["s3_key"] != PROVIDER_SELECTION_S3_KEY
+        or not isinstance(value["version_id"], str)
+        or value["version_id"] in {"", "null"}
+    ):
+        raise SelectionPublicationError(
+            "durable selection version binding is invalid",
+            publication_state="conflict",
+        )
+    return True
+
+
+def _pending_selection_data(data: bytes) -> bytes:
+    return _canonical_json(
+        {
+            "expected_bytes": len(data),
+            "s3_key": PROVIDER_SELECTION_S3_KEY,
+            "schema_version": 1,
+            "selection_sha256": hashlib.sha256(data).hexdigest(),
+        }
+    )
+
+
+def _publish_pending_selection(
+    *,
+    authority_root: Path | str,
+    data: bytes,
+) -> tuple[Path, bool]:
+    pending_data = _pending_selection_data(data)
+    destination = Path(authority_root).joinpath(
+        *PROVIDER_SELECTION_PENDING_LOCAL_PATH.split("/")
+    )
+    existed = False
+    try:
+        _write_selection_noreplace(destination, pending_data)
+    except FileExistsError as error:
+        existed = True
+        existing = _regular_bytes(
+            destination,
+            label="provider selection pending intent",
+            private=True,
+        )
+        if existing != pending_data:
+            raise SelectionPublicationError(
+                "pending provider selection conflicts with candidate bytes",
+                publication_state="conflict",
+            ) from error
+    installed = _regular_bytes(
+        destination,
+        label="provider selection pending intent",
+        private=True,
+    )
+    if installed != pending_data:
+        raise SelectionPublicationError(
+            "pending provider selection differs after publication",
+            publication_state="uncertain",
+        )
+    return destination, existed
+
+
+def _remote_mutation_marker_path(authority_root: Path | str) -> Path:
+    return Path(authority_root).joinpath(
+        *PROVIDER_SELECTION_MUTATION_LOCAL_PATH.split("/")
+    )
+
+
+def _remote_mutation_marker_exists(
+    *,
+    authority_root: Path | str,
+    data: bytes,
+) -> bool:
+    try:
+        existing = _regular_bytes(
+            _remote_mutation_marker_path(authority_root),
+            label="provider selection remote-mutation marker",
+            private=True,
+        )
+    except ValueError as error:
+        cause = error.__cause__
+        if isinstance(cause, FileNotFoundError) or (
+            isinstance(cause, MsctlError) and cause.code == "FILE_NOT_FOUND"
+        ):
+            return False
+        raise
+    if existing != _pending_selection_data(data):
+        raise SelectionPublicationError(
+            "provider selection remote-mutation marker conflicts",
+            publication_state="conflict",
+        )
+    return True
+
+
+def _publish_remote_mutation_marker(
+    *,
+    authority_root: Path | str,
+    data: bytes,
+) -> Path:
+    marker_data = _pending_selection_data(data)
+    destination = _remote_mutation_marker_path(authority_root)
+    try:
+        _write_selection_noreplace(destination, marker_data)
+    except FileExistsError as error:
+        existing = _regular_bytes(
+            destination,
+            label="provider selection remote-mutation marker",
+            private=True,
+        )
+        if existing != marker_data:
+            raise SelectionPublicationError(
+                "provider selection remote-mutation marker conflicts",
+                publication_state="conflict",
+            ) from error
+    return destination
+
+
+def _archive_pending_selection(
+    *,
+    authority_root: Path | str,
+    data: bytes,
+) -> Path:
+    pending_data = _pending_selection_data(data)
+    pending = Path(authority_root).joinpath(
+        *PROVIDER_SELECTION_PENDING_LOCAL_PATH.split("/")
+    )
+    archive = Path(authority_root).joinpath(
+        *PROVIDER_SELECTION_PENDING_ARCHIVE_LOCAL_PATH.split("/")
+    )
+    marker = _remote_mutation_marker_path(authority_root)
+    marker_archive = Path(authority_root).joinpath(
+        *PROVIDER_SELECTION_MUTATION_ARCHIVE_LOCAL_PATH.split("/")
+    )
+    parent_fd = open_directory(
+        pending.parent,
+        label="provider selection authority parent",
+    )
+    try:
+        try:
+            rename_noreplace_at(
+                parent_fd,
+                pending.name,
+                parent_fd,
+                archive.name,
+            )
+            os.fsync(parent_fd)
+        except FileExistsError:
+            archived = _regular_bytes(
+                archive,
+                label="provider selection pending archive",
+                private=True,
+            )
+            current = _regular_bytes(
+                pending,
+                label="provider selection pending intent",
+                private=True,
+            )
+            if archived != pending_data or current != pending_data:
+                raise SelectionPublicationError(
+                    "provider selection pending archive conflicts",
+                    publication_state="conflict",
+                )
+            os.unlink(pending.name, dir_fd=parent_fd)
+            os.fsync(parent_fd)
+        try:
+            rename_noreplace_at(
+                parent_fd,
+                marker.name,
+                parent_fd,
+                marker_archive.name,
+            )
+            os.fsync(parent_fd)
+        except FileExistsError:
+            archived_marker = _regular_bytes(
+                marker_archive,
+                label="provider selection remote-mutation archive",
+                private=True,
+            )
+            current_marker = _regular_bytes(
+                marker,
+                label="provider selection remote-mutation marker",
+                private=True,
+            )
+            if (
+                archived_marker != pending_data
+                or current_marker != pending_data
+            ):
+                raise SelectionPublicationError(
+                    "provider selection remote-mutation archive conflicts",
+                    publication_state="conflict",
+                )
+            os.unlink(marker.name, dir_fd=parent_fd)
+            os.fsync(parent_fd)
+    finally:
+        os.close(parent_fd)
+    archived = _regular_bytes(
+        archive,
+        label="provider selection pending archive",
+        private=True,
+    )
+    if archived != pending_data:
+        raise SelectionPublicationError(
+            "provider selection pending archive is not durable",
+            publication_state="uncertain",
+        )
+    if _regular_bytes(
+        marker_archive,
+        label="provider selection remote-mutation archive",
+        private=True,
+    ) != pending_data:
+        raise SelectionPublicationError(
+            "provider selection remote-mutation archive is not durable",
+            publication_state="uncertain",
+        )
+    return archive
+
+
 def _verified_remote_object(
     value: object,
     *,
@@ -2152,21 +2482,65 @@ def _verified_remote_object(
 
 def _publish_remote_selection(
     *,
+    authority_root: Path | str,
     data: bytes,
     store: VersionedProviderSelectionStore,
-) -> VersionedSelectionObject:
+    allow_recovery: bool,
+) -> tuple[VersionedSelectionObject, str]:
     digest = hashlib.sha256(data).hexdigest()
     history = store.list_versions(key=PROVIDER_SELECTION_S3_KEY)
     if (
         not isinstance(history, VersionedSelectionHistory)
         or history.key != PROVIDER_SELECTION_S3_KEY
     ):
-        raise ValueError("fixed-key selection version history is invalid")
-    if history.versions or history.delete_markers:
-        raise ValueError(
-            "fixed-key selection history conflicts with new publication; "
-            "prior versions or delete markers are forbidden"
+        raise SelectionPublicationError(
+            "fixed-key selection version history is invalid",
+            publication_state="uncertain",
         )
+    if history.versions or history.delete_markers:
+        if (
+            not allow_recovery
+            or len(history.versions) != 1
+            or history.delete_markers
+        ):
+            raise SelectionPublicationError(
+                "fixed-key selection history conflicts with publication; "
+                "multiple versions or delete markers are forbidden",
+                publication_state="conflict",
+            )
+        version_id = history.versions[0]
+        head = store.head(
+            key=PROVIDER_SELECTION_S3_KEY,
+            version_id=version_id,
+        )
+        remote = _verified_remote_object(
+            head,
+            expected_sha256=digest,
+            expected_bytes=len(data),
+            expected_version=version_id,
+        )
+        fetched = store.get_exact(
+            key=PROVIDER_SELECTION_S3_KEY,
+            version_id=version_id,
+        )
+        if (
+            not isinstance(fetched, VersionedSelectionRead)
+            or fetched.data != data
+            or fetched.object != remote
+        ):
+            raise SelectionPublicationError(
+                "pending selection recovery GET differs from candidate bytes",
+                publication_state="conflict",
+            )
+        _require_singleton_selection_history(
+            store=store,
+            version_id=version_id,
+        )
+        return remote, "recovered"
+    _publish_remote_mutation_marker(
+        authority_root=authority_root,
+        data=data,
+    )
     put = store.put_if_none_match(
         key=PROVIDER_SELECTION_S3_KEY,
         data=data,
@@ -2188,7 +2562,7 @@ def _publish_remote_selection(
         version_id=head_version,
     )
     try:
-        return _verified_remote_object(
+        remote = _verified_remote_object(
             head,
             expected_sha256=digest,
             expected_bytes=len(data),
@@ -2198,6 +2572,49 @@ def _publish_remote_selection(
         raise ValueError(
             "remote fixed-key provider selection conflicts or failed exact HEAD"
         ) from error
+    _require_singleton_selection_history(
+        store=store,
+        version_id=remote.version_id,
+    )
+    state = "published"
+    if put is None:
+        fetched = store.get_exact(
+            key=PROVIDER_SELECTION_S3_KEY,
+            version_id=remote.version_id,
+        )
+        if (
+            not isinstance(fetched, VersionedSelectionRead)
+            or fetched.data != data
+            or fetched.object != remote
+        ):
+            raise SelectionPublicationError(
+                "lost PUT response cannot recover exact selection bytes",
+                publication_state="uncertain",
+            )
+        _require_singleton_selection_history(
+            store=store,
+            version_id=remote.version_id,
+        )
+        state = "recovered"
+    return remote, state
+
+
+def _require_singleton_selection_history(
+    *,
+    store: VersionedProviderSelectionStore,
+    version_id: str,
+) -> None:
+    history = store.list_versions(key=PROVIDER_SELECTION_S3_KEY)
+    if (
+        not isinstance(history, VersionedSelectionHistory)
+        or history.key != PROVIDER_SELECTION_S3_KEY
+        or history.versions != (version_id,)
+        or history.delete_markers
+    ):
+        raise ValueError(
+            "fixed-key selection history must contain exactly the selected "
+            "version and no delete marker"
+        )
 
 
 def _publish_version_binding(
@@ -2260,21 +2677,52 @@ def publish_provider_selection(
         authority_root=authority_root,
         data=selection_data,
     )
-    remote = _publish_remote_selection(data=selection_data, store=store)
-    local_path = _publish_local_selection(
+    durable_binding_exists = _matching_durable_selection_binding(
         authority_root=authority_root,
         data=selection_data,
     )
-    version_path = _publish_version_binding(
+    _pending_path, pending_existed = _publish_pending_selection(
         authority_root=authority_root,
-        selection=selection,
-        remote=remote,
+        data=selection_data,
     )
+    mutation_started = _remote_mutation_marker_exists(
+        authority_root=authority_root,
+        data=selection_data,
+    )
+    try:
+        remote, publication_state = _publish_remote_selection(
+            authority_root=authority_root,
+            data=selection_data,
+            store=store,
+            allow_recovery=mutation_started
+            and (pending_existed or durable_binding_exists),
+        )
+        local_path = _publish_local_selection(
+            authority_root=authority_root,
+            data=selection_data,
+        )
+        version_path = _publish_version_binding(
+            authority_root=authority_root,
+            selection=selection,
+            remote=remote,
+        )
+        _archive_pending_selection(
+            authority_root=authority_root,
+            data=selection_data,
+        )
+    except SelectionPublicationError:
+        raise
+    except Exception as error:
+        raise SelectionPublicationError(
+            f"provider selection publication is uncertain: {error}",
+            publication_state="uncertain",
+        ) from error
     return PublishedProviderSelection(
         selection=selection,
         local_path=local_path,
         remote=remote,
         version_path=version_path,
+        publication_state=publication_state,
     )
 
 
@@ -2357,6 +2805,10 @@ def load_versioned_provider_selection_authority(
         or selection_sha256 != hashlib.sha256(local_data).hexdigest()
     ):
         raise ValueError("provider selection version identity is invalid")
+    _require_singleton_selection_history(
+        store=store,
+        version_id=version["version_id"],
+    )
     fetched = store.get_exact(
         key=PROVIDER_SELECTION_S3_KEY,
         version_id=version["version_id"],
@@ -2370,6 +2822,10 @@ def load_versioned_provider_selection_authority(
         or fetched.object.version_id != version["version_id"]
     ):
         raise ValueError("provider selection exact-version GET replay failed")
+    _require_singleton_selection_history(
+        store=store,
+        version_id=version["version_id"],
+    )
     return _load_verified_selection_from_paths(
         fetched.data,
         repo_root=repo_root,
@@ -2604,6 +3060,7 @@ def run_hardware_authority_cli(
     result: dict[str, object] = {
         "operation": "publish-provider-selection",
         "apply": bool(arguments.apply),
+        "publication_state": "planned",
         "cohort_id": verified.cohort_id,
         "profile_id": verified.profile.profile_id,
         "selection_sha256": verified.sha256,
@@ -2638,14 +3095,34 @@ def run_hardware_authority_cli(
     )
     return False, {
         **result,
+        "publication_state": published.publication_state,
         "selection_version_id": published.remote.version_id,
         "version_path": str(published.version_path),
     }
 
 
-def main(argv: Sequence[str] | None = None) -> int:
+def main(
+    argv: Sequence[str] | None = None,
+    *,
+    store: VersionedProviderSelectionStore | None = None,
+    identity_verifier: Callable[
+        [Mapping[str, object], str, str], bool
+    ] = verify_aws_instance_identity_pkcs7,
+    approval_verifier: QualificationApprovalVerifier | None = None,
+    trusted_public_key_sha256: str | None = None,
+    environ: Mapping[str, str] | None = None,
+) -> int:
+    effective_argv = list(sys.argv[1:] if argv is None else argv)
+    apply_requested = "--apply" in effective_argv
     try:
-        dry_run, result = run_hardware_authority_cli(argv)
+        dry_run, result = run_hardware_authority_cli(
+            effective_argv,
+            store=store,
+            identity_verifier=identity_verifier,
+            approval_verifier=approval_verifier,
+            trusted_public_key_sha256=trusted_public_key_sha256,
+            environ=environ,
+        )
         report = {
             "schema_version": 1,
             "ok": True,
@@ -2654,10 +3131,16 @@ def main(argv: Sequence[str] | None = None) -> int:
         }
         exit_code = 0
     except (OSError, TypeError, ValueError) as error:
+        publication_state = getattr(
+            error,
+            "publication_state",
+            "uncertain" if apply_requested else "not-started",
+        )
         report = {
             "schema_version": 1,
             "ok": False,
-            "dry_run": True,
+            "dry_run": not apply_requested,
+            "publication_state": publication_state,
             "error": str(error),
         }
         exit_code = 2
@@ -2682,10 +3165,15 @@ __all__ = [
     "OpenSslQualificationApprovalVerifier",
     "PREREGISTRATION_PATH",
     "PROVIDER_SELECTION_LOCAL_PATH",
+    "PROVIDER_SELECTION_MUTATION_ARCHIVE_LOCAL_PATH",
+    "PROVIDER_SELECTION_MUTATION_LOCAL_PATH",
+    "PROVIDER_SELECTION_PENDING_ARCHIVE_LOCAL_PATH",
+    "PROVIDER_SELECTION_PENDING_LOCAL_PATH",
     "PROVIDER_SELECTION_S3_KEY",
     "PROVIDER_SELECTION_VERSION_LOCAL_PATH",
     "PublishedProviderSelection",
     "QualificationApprovalVerifier",
+    "SelectionPublicationError",
     "VersionedProviderSelectionStore",
     "VersionedSelectionHistory",
     "VersionedSelectionObject",
