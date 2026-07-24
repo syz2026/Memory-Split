@@ -541,6 +541,140 @@ class _Time:
         return self.tick
 
 
+def test_aws_cli_object_store_parses_complete_formatted_put_and_get_json(
+    tmp_path,
+):
+    import base64
+
+    module = _load_module()
+    payload = b"formatted AWS CLI JSON\n"
+    digest = hashlib.sha256(payload).hexdigest()
+    checksum = base64.b64encode(bytes.fromhex(digest)).decode("ascii")
+
+    class Reader:
+        def __init__(self):
+            self.calls = []
+
+        def run(self, spec):
+            self.calls.append(spec)
+            if spec.name == "s3-roundtrip-put":
+                value = {
+                    "checksum": checksum,
+                    "version_id": "formatted-version-1",
+                }
+            elif spec.name == "s3-roundtrip-get":
+                destination = Path(spec.argv[spec.argv.index("--checksum-mode") + 2])
+                destination.write_bytes(payload)
+                value = {
+                    "checksum": checksum,
+                    "version_id": "formatted-version-1",
+                }
+            else:
+                raise AssertionError(spec.name)
+            return module.CommandResult(
+                0,
+                json.dumps(value, indent=4, sort_keys=True) + "\n",
+                "",
+            )
+
+    reader = Reader()
+    store = module.AwsCliObjectStore(
+        reader=reader,
+        region="us-east-1",
+        scratch_root=tmp_path,
+    )
+
+    written = store.put(
+        "s3://memorysplit-prod/canary/blob.json",
+        payload,
+        sha256=digest,
+    )
+    downloaded = store.get(
+        "s3://memorysplit-prod/canary/blob.json",
+        version_id=written.version_id,
+    )
+
+    assert written == module.ObjectWrite(
+        checksum_sha256=digest,
+        byte_count=len(payload),
+        version_id="formatted-version-1",
+    )
+    assert downloaded == module.ObjectRead(
+        payload=payload,
+        checksum_sha256=digest,
+        version_id="formatted-version-1",
+    )
+    assert [spec.name for spec in reader.calls] == [
+        "s3-roundtrip-put",
+        "s3-roundtrip-get",
+    ]
+
+
+def test_aws_cli_object_store_rejects_trailing_json_value(tmp_path):
+    module = _load_module()
+    payload = b"strict AWS JSON\n"
+    digest = hashlib.sha256(payload).hexdigest()
+
+    class Reader:
+        def run(self, spec):
+            return module.CommandResult(
+                0,
+                '{"checksum":"unused","version_id":"v1"}\n{}\n',
+                "",
+            )
+
+    store = module.AwsCliObjectStore(
+        reader=Reader(),
+        region="us-east-1",
+        scratch_root=tmp_path,
+    )
+
+    with pytest.raises(module.CanaryError, match="JSON|S3 put-object"):
+        store.put(
+            "s3://memorysplit-prod/canary/blob.json",
+            payload,
+            sha256=digest,
+        )
+
+
+@pytest.mark.parametrize("version_id", [None, "", "null"])
+def test_aws_cli_object_store_rejects_missing_or_null_version(
+    tmp_path,
+    version_id,
+):
+    import base64
+
+    module = _load_module()
+    payload = b"versioned AWS object\n"
+    digest = hashlib.sha256(payload).hexdigest()
+    checksum = base64.b64encode(bytes.fromhex(digest)).decode("ascii")
+
+    class Reader:
+        def run(self, spec):
+            return module.CommandResult(
+                0,
+                json.dumps(
+                    {"checksum": checksum, "version_id": version_id},
+                    indent=2,
+                )
+                + "\n",
+                "",
+            )
+
+    store = module.AwsCliObjectStore(
+        reader=Reader(),
+        region="us-east-1",
+        scratch_root=tmp_path,
+    )
+
+    with pytest.raises(module.CanaryError, match="version"):
+        store.put(
+            "s3://memorysplit-prod/canary/blob.json",
+            payload,
+            sha256=digest,
+        )
+
+
 def _execute(case, module, *, commands=None, store=None, apply=True):
     plan = case["plan"]
     return module.execute_canary(
@@ -777,6 +911,47 @@ def test_hardware_rejects_current_boot_drift_without_receipt(tmp_path):
 
 
 @pytest.mark.parametrize(
+    ("mutate_after", "forbidden_next"),
+    [
+        ("hardware-boot-id", "functional-dense-train"),
+        ("functional-split90-inspect", "resume-dense-train"),
+        ("resume-split90-inspect", "throughput-pair"),
+    ],
+)
+def test_config_drift_fails_before_each_execution_boundary(
+    tmp_path,
+    mutate_after,
+    forbidden_next,
+):
+    module = _load_module()
+    case = _case(tmp_path, module)
+    config = (
+        case["release_root"] / "configs" / "360m-v3" / "dense-s0.yaml"
+    )
+
+    class MutatingCommands(_Commands):
+        def run(self, spec):
+            result = super().run(spec)
+            if spec.name == mutate_after:
+                config.write_bytes(config.read_bytes() + b"# review drift\n")
+            return result
+
+        def run_pair(self, specs):
+            if forbidden_next == "throughput-pair":
+                pytest.fail("throughput pair must not start after config drift")
+            return super().run_pair(specs)
+
+    commands = MutatingCommands(module, case["plan"])
+    with pytest.raises(module.CanaryError, match="config|changed|hash"):
+        _execute(case, module, commands=commands)
+
+    assert not case["output"].exists()
+    if forbidden_next != "throughput-pair":
+        assert forbidden_next not in [spec.name for spec in commands.calls]
+    assert commands.pairs == []
+
+
+@pytest.mark.parametrize(
     "mutation",
     [
         "put-hash",
@@ -796,6 +971,126 @@ def test_s3_roundtrip_requires_checksum_bytes_and_version(tmp_path, mutation):
         _execute(case, module, store=store)
 
     assert not case["output"].exists()
+
+
+def _real_pair_spec(module, *, name, script, cwd, timeout):
+    return module.CommandSpec(
+        name=name,
+        argv=(sys.executable, "-c", script),
+        environment={"PYTHONUNBUFFERED": "1"},
+        cwd=cwd,
+        timeout_seconds=timeout,
+    )
+
+
+def test_real_pair_runner_spawns_both_processes_before_polling(tmp_path):
+    module = _load_module()
+    dense_started = tmp_path / "dense.started"
+    split_started = tmp_path / "split.started"
+
+    def script(own, peer):
+        return (
+            "from pathlib import Path; import sys,time;"
+            f"own=Path({str(own)!r});peer=Path({str(peer)!r});"
+            "own.write_text('started');"
+            "deadline=time.monotonic()+2.0;"
+            "\nwhile not peer.exists() and time.monotonic()<deadline:"
+            "\n time.sleep(0.01)"
+            "\nsys.exit(0 if peer.exists() else 41)"
+        )
+
+    specs = (
+        _real_pair_spec(
+            module,
+            name="throughput-dense-train",
+            script=script(dense_started, split_started),
+            cwd=tmp_path,
+            timeout=3.0,
+        ),
+        _real_pair_spec(
+            module,
+            name="throughput-split90-train",
+            script=script(split_started, dense_started),
+            cwd=tmp_path,
+            timeout=3.0,
+        ),
+    )
+
+    results = module.SubprocessCommandReader().run_pair(specs)
+
+    assert dense_started.is_file()
+    assert split_started.is_file()
+    assert {name: result.returncode for name, result in results.items()} == {
+        "throughput-dense-train": 0,
+        "throughput-split90-train": 0,
+    }
+
+
+@pytest.mark.parametrize("mode", ["failure", "timeout"])
+def test_real_pair_runner_terminates_peers_on_failure_and_timeout(
+    tmp_path,
+    mode,
+):
+    module = _load_module()
+    dense_started = tmp_path / "dense.started"
+    split_started = tmp_path / "split.started"
+    dense_terminated = tmp_path / "dense.terminated"
+    split_terminated = tmp_path / "split.terminated"
+
+    def waiting_script(started, terminated):
+        return (
+            "from pathlib import Path; import signal,time;"
+            f"started=Path({str(started)!r});"
+            f"terminated=Path({str(terminated)!r});"
+            "started.write_text('started');"
+            "\ndef stop(signum,frame):"
+            "\n terminated.write_text(str(signum));raise SystemExit(0)"
+            "\nsignal.signal(signal.SIGTERM,stop)"
+            "\nwhile True: time.sleep(0.02)"
+        )
+
+    if mode == "failure":
+        dense_script = (
+            "from pathlib import Path; import sys,time;"
+            f"own=Path({str(dense_started)!r});"
+            f"peer=Path({str(split_started)!r});"
+            "own.write_text('started');"
+            "\nwhile not peer.exists(): time.sleep(0.01)"
+            "\ntime.sleep(0.2);sys.exit(23)"
+        )
+        split_script = waiting_script(split_started, split_terminated)
+        timeout = 3.0
+    else:
+        dense_script = waiting_script(dense_started, dense_terminated)
+        split_script = waiting_script(split_started, split_terminated)
+        timeout = 0.4
+    specs = (
+        _real_pair_spec(
+            module,
+            name="throughput-dense-train",
+            script=dense_script,
+            cwd=tmp_path,
+            timeout=timeout,
+        ),
+        _real_pair_spec(
+            module,
+            name="throughput-split90-train",
+            script=split_script,
+            cwd=tmp_path,
+            timeout=timeout,
+        ),
+    )
+
+    results = module.SubprocessCommandReader().run_pair(specs)
+
+    assert dense_started.is_file()
+    assert split_started.is_file()
+    if mode == "failure":
+        assert results["throughput-dense-train"].returncode == 23
+        assert split_terminated.is_file()
+    else:
+        assert dense_terminated.is_file()
+        assert split_terminated.is_file()
 
 
 def test_receipt_is_owner_only_atomic_no_replace_and_failed_rerun_preserves_it(
@@ -1013,6 +1308,45 @@ def test_controller_dry_run_is_local_content_addressed_and_argv_only(tmp_path):
         )
     ).hexdigest()
     assert not case["output"].exists()
+
+
+def test_controller_normalizes_remote_paths_independent_of_ssm_cwd(
+    tmp_path,
+    monkeypatch,
+):
+    module = _load_module()
+    case = _case(tmp_path, module)
+    backend = _backend(tmp_path, case, runner=_NoAwsCalls())
+    monkeypatch.chdir(tmp_path)
+
+    planned = backend.canary_run(
+        release_root=case["release_root"].relative_to(tmp_path),
+        release_receipt=case["release_receipt"].relative_to(tmp_path),
+        run_manifest=case["manifest_path"].relative_to(tmp_path),
+        dataset_receipt=case["dataset_receipt"].relative_to(tmp_path),
+        environment_receipt=case["environment"].relative_to(tmp_path),
+        runtime_lock=case["runtime_lock"].relative_to(tmp_path),
+        instance_id=INSTANCE_ID,
+        boot_id=BOOT_ID,
+        output=case["output"].relative_to(tmp_path),
+        apply=False,
+    )
+
+    argv = planned["remote_canary_argv"]
+    for flag in (
+        "--release-root",
+        "--release-receipt",
+        "--manifest",
+        "--dataset-receipt",
+        "--environment-receipt",
+        "--runtime-lock",
+        "--scratch-root",
+        "--output",
+    ):
+        value = argv[argv.index(flag) + 1]
+        assert Path(value).is_absolute()
+        assert ".." not in Path(value).parts
+    assert planned["operation_intent"]["steps"][0]["argv"] == argv
 
 
 class _ApplyRunner:
@@ -1348,6 +1682,84 @@ def test_remote_wrapper_accepts_only_the_exact_canary_operation_boundary(
         aws_argv._validate_intent(
             mutated_payload,
             expected_sha256=hashlib.sha256(mutated_payload).hexdigest(),
+        )
+
+
+@pytest.mark.parametrize(
+    "bypass",
+    [
+        ["--operational-steps", "100"],
+        ["--operational-steps=100"],
+        ["--operational-step", "100"],
+        ["--operational-step=100"],
+        ["--operational-s=100"],
+        ["--oper=100"],
+        ["--o", "100"],
+    ],
+)
+def test_remote_wrapper_rejects_operational_step_option_bypass(
+    tmp_path,
+    bypass,
+):
+    from msctl import aws_argv
+
+    module = _load_module()
+    case = _case(tmp_path, module)
+    intent = _canary_controller_call(
+        _backend(tmp_path, case),
+        case,
+        apply=False,
+    )["operation_intent"]
+    intent["operation"] = "evaluate"
+    intent["seed"] = 1
+    intent["terminate_at"] = (
+        datetime.now(UTC) + timedelta(hours=1)
+    ).isoformat().replace("+00:00", "Z")
+    intent["steps"] = [
+        {
+            "name": "evaluate-probe",
+            "argv": [
+                "/usr/bin/python3",
+                "/release/scripts/run_train.py",
+            ],
+        }
+    ]
+
+    def bind(value):
+        identity = {
+            key: item
+            for key, item in value.items()
+            if key
+            not in {
+                "operation_id",
+                "ssm_document",
+                "started_receipt_uri",
+                "terminal_receipt_uri",
+            }
+        }
+        value["operation_id"] = hashlib.sha256(
+            module._canonical(identity, newline=False)
+        ).hexdigest()
+        receipt_root = (
+            f"{value['environment']['MS_S3_ROOT']}/operations/"
+            f"{value['operation_id']}/receipts"
+        )
+        value["started_receipt_uri"] = f"{receipt_root}/started.json"
+        value["terminal_receipt_uri"] = f"{receipt_root}/terminal.json"
+        return module._canonical(value, newline=False)
+
+    baseline = bind(intent)
+    assert aws_argv._validate_intent(
+        baseline,
+        expected_sha256=hashlib.sha256(baseline).hexdigest(),
+    ) == intent
+
+    intent["steps"][0]["argv"].extend(bypass)
+    payload = bind(intent)
+    with pytest.raises(aws_argv.RemoteIntentError, match="operational"):
+        aws_argv._validate_intent(
+            payload,
+            expected_sha256=hashlib.sha256(payload).hexdigest(),
         )
 
 

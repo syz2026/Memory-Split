@@ -42,7 +42,7 @@ class _StoreOperationalSteps(argparse.Action):
 
 
 def main(argv: list[str] | None = None) -> None:
-    ap = argparse.ArgumentParser()
+    ap = argparse.ArgumentParser(allow_abbrev=False)
     mode = ap.add_mutually_exclusive_group(required=True)
     mode.add_argument("--config")
     mode.add_argument("--capabilities-json", action="store_true")

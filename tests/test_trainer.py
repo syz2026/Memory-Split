@@ -264,6 +264,11 @@ def test_run_train_emits_canonical_operational_metrics_without_config_mutation(
         ["--operational-steps", "01"],
         ["--operational-steps", str(sys.maxsize + 1)],
         ["--operational-steps", "1", "--operational-steps", "2"],
+        ["--operational-step", "1"],
+        ["--operational-step=1"],
+        ["--operational-s", "1"],
+        ["--oper=1"],
+        ["--o", "1"],
     ],
 )
 def test_run_train_operational_steps_cli_fails_closed_before_config_read(

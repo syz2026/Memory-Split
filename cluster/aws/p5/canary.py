@@ -632,8 +632,19 @@ def load_canary_plan(
         raise CanaryError("selected instance ID is invalid")
     if not isinstance(boot_id, str) or _BOOT_RE.fullmatch(boot_id) is None:
         raise CanaryError("selected boot ID is invalid")
+    release_receipt_file = Path(
+        os.path.abspath(os.fspath(release_receipt_path))
+    )
+    run_manifest_file = Path(os.path.abspath(os.fspath(run_manifest_path)))
+    dataset_receipt_file = Path(
+        os.path.abspath(os.fspath(dataset_receipt_path))
+    )
+    environment_receipt_file = Path(
+        os.path.abspath(os.fspath(environment_receipt_path))
+    )
+    runtime_lock_file = Path(os.path.abspath(os.fspath(runtime_lock_path)))
     release_root_path = Path(release_root).resolve(strict=True)
-    release, release_bytes = _load_release(release_receipt_path)
+    release, release_bytes = _load_release(release_receipt_file)
     members = _verify_release_root(release_root_path, release)
     profile_path = release_root_path / PROFILE_PATH
     try:
@@ -651,12 +662,12 @@ def load_canary_plan(
 
     try:
         runtime_bytes = read_regular_input(
-            runtime_lock_path,
+            runtime_lock_file,
             label="runtime lock",
             maximum_bytes=1024 * 1024,
         )
         environment_bytes = read_regular_input(
-            environment_receipt_path,
+            environment_receipt_file,
             label="environment receipt",
             maximum_bytes=1024 * 1024,
         )
@@ -685,7 +696,7 @@ def load_canary_plan(
         raise CanaryError("environment identity does not match runtime lock")
 
     manifest, manifest_bytes, runs = _load_manifest(
-        run_manifest_path,
+        run_manifest_file,
         release_root=release_root_path,
     )
     release_receipt_sha256 = hashlib.sha256(release_bytes).hexdigest()
@@ -710,7 +721,7 @@ def load_canary_plan(
         raise CanaryError("release, manifest, and runtime identities differ")
 
     dataset_value, dataset_bytes = _read_canonical_object(
-        dataset_receipt_path,
+        dataset_receipt_file,
         label="dataset receipt",
         maximum_bytes=256 * 1024 * 1024,
     )
@@ -725,7 +736,7 @@ def load_canary_plan(
     verifier = dataset_verifier or verify_canonical_corpus
     try:
         evidence = verifier(
-            Path(dataset_receipt_path),
+            dataset_receipt_file,
             expected_sha256=dataset_sha256,
             expected_ordered_sha256=str(manifest["ordered_stream_sha256"]),
         )
@@ -785,11 +796,11 @@ def load_canary_plan(
     ).hexdigest()
     return CanaryPlan(
         release_root=release_root_path,
-        release_receipt_path=Path(release_receipt_path).absolute(),
-        run_manifest_path=Path(run_manifest_path).absolute(),
-        dataset_receipt_path=Path(dataset_receipt_path).absolute(),
-        environment_receipt_path=Path(environment_receipt_path).absolute(),
-        runtime_lock_path=Path(runtime_lock_path).absolute(),
+        release_receipt_path=release_receipt_file,
+        run_manifest_path=run_manifest_file,
+        dataset_receipt_path=dataset_receipt_file,
+        environment_receipt_path=environment_receipt_file,
+        runtime_lock_path=runtime_lock_file,
         scratch_root=scratch,
         output_path=output,
         s3_root=s3_root.rstrip("/"),
@@ -1232,6 +1243,31 @@ def _parse_one_json_line(
     return parsed[0]
 
 
+def _parse_complete_json_object(
+    stdout: str,
+    *,
+    label: str,
+    fields: set[str],
+) -> dict[str, object]:
+    try:
+        value = json.loads(
+            stdout,
+            object_pairs_hook=_strict_object,
+            parse_constant=lambda constant: (_ for _ in ()).throw(
+                CanaryError(f"{label} contains non-finite {constant}")
+            ),
+        )
+    except CanaryError:
+        raise
+    except json.JSONDecodeError as error:
+        raise CanaryError(
+            f"{label} did not emit one complete JSON object"
+        ) from error
+    if type(value) is not dict or set(value) != fields:
+        raise CanaryError(f"{label} JSON fields do not match the contract")
+    return value
+
+
 def _hardware_phase(
     plan: CanaryPlan,
     reader: CommandReader,
@@ -1361,6 +1397,17 @@ def _read_loss(path: Path, *, expected_step: int) -> float:
     return float(loss)
 
 
+def _revalidate_execution_config(plan: CanaryPlan, arm: str) -> None:
+    config_path = plan.release_root / plan.config_paths[arm]
+    if _regular_sha256(
+        config_path,
+        label=f"{arm} execution config",
+    ) != plan.config_sha256[arm]:
+        raise CanaryError(
+            f"{arm} config changed before the execution boundary"
+        )
+
+
 def _checkpoint_evidence(
     plan: CanaryPlan,
     reader: CommandReader,
@@ -1458,6 +1505,7 @@ def _functional_or_resume_phase(
         work_root = Path(train_spec.host_work_root)
         if phase == "functional":
             work_root.mkdir(parents=True, mode=0o700, exist_ok=False)
+        _revalidate_execution_config(plan, arm)
         _checked(reader, train_spec)
         by_arm[arm] = _checkpoint_evidence(
             plan,
@@ -1560,6 +1608,7 @@ def compute_throughput(
 
 
 def _throughput_phase(
+    plan: CanaryPlan,
     reader: CommandReader,
     specs: Sequence[CommandSpec],
 ) -> dict[str, object]:
@@ -1569,6 +1618,8 @@ def _throughput_phase(
             mode=0o700,
             exist_ok=False,
         )
+    for arm in ARMS:
+        _revalidate_execution_config(plan, arm)
     try:
         results = reader.run_pair(specs)
     except Exception as error:
@@ -2010,7 +2061,7 @@ def execute_canary(
                 prior=values["functional"],
             )
         elif phase == "throughput_4x4":
-            value = _throughput_phase(command_reader, specs[phase])
+            value = _throughput_phase(plan, command_reader, specs[phase])
         else:
             value = _s3_phase(plan, object_store)
         seconds = time_reader.monotonic() - phase_started
@@ -2247,17 +2298,22 @@ class AwsCliObjectStore:
                 timeout_seconds=120.0,
             ),
         )
-        value = _parse_one_json_line(
+        value = _parse_complete_json_object(
             result.stdout,
             label="S3 put-object",
             fields={"checksum", "version_id"},
         )
-        if value["checksum"] != checksum:
-            raise CanaryError("S3 put-object checksum differs")
+        returned_version = value["version_id"]
+        if (
+            value["checksum"] != checksum
+            or not isinstance(returned_version, str)
+            or returned_version in {"", "null"}
+        ):
+            raise CanaryError("S3 put-object checksum or version differs")
         return ObjectWrite(
             checksum_sha256=sha256,
             byte_count=len(payload),
-            version_id=str(value["version_id"]),
+            version_id=returned_version,
         )
 
     def get(self, uri: str, *, version_id: str) -> ObjectRead:
@@ -2293,7 +2349,7 @@ class AwsCliObjectStore:
                 timeout_seconds=120.0,
             ),
         )
-        value = _parse_one_json_line(
+        value = _parse_complete_json_object(
             result.stdout,
             label="S3 get-object",
             fields={"checksum", "version_id"},
@@ -2301,12 +2357,18 @@ class AwsCliObjectStore:
         payload = destination.read_bytes()
         digest = hashlib.sha256(payload).hexdigest()
         expected_checksum = base64.b64encode(bytes.fromhex(digest)).decode("ascii")
-        if value["checksum"] != expected_checksum:
-            raise CanaryError("S3 get-object checksum differs")
+        returned_version = value["version_id"]
+        if (
+            value["checksum"] != expected_checksum
+            or not isinstance(returned_version, str)
+            or returned_version != version_id
+            or returned_version in {"", "null"}
+        ):
+            raise CanaryError("S3 get-object checksum or version differs")
         return ObjectRead(
             payload=payload,
             checksum_sha256=digest,
-            version_id=str(value["version_id"]),
+            version_id=returned_version,
         )
 
 

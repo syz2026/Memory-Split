@@ -182,6 +182,17 @@ def _decode_object(payload: bytes, *, label: str) -> dict[str, object]:
     return value
 
 
+def _is_operational_steps_option(value: object) -> bool:
+    if not isinstance(value, str):
+        return False
+    option = value.split("=", 1)[0]
+    return (
+        len(option) >= 3
+        and option.startswith("--")
+        and "--operational-steps".startswith(option)
+    )
+
+
 def _sha256(value: object, *, label: str) -> str:
     if not isinstance(value, str) or _SHA256_RE.fullmatch(value) is None:
         raise RemoteIntentError(f"{label} must be lowercase SHA-256")
@@ -428,18 +439,13 @@ def _validate_intent(
             or not str(steps[0]["argv"][1]).endswith(
                 "/cluster/aws/p5/canary.py"
             )
-            or any(
-                item == "--operational-steps"
-                or item.startswith("--operational-steps=")
-                for item in steps[0]["argv"]
-            )
+            or any(_is_operational_steps_option(item) for item in steps[0]["argv"])
         ):
             raise RemoteIntentError(
                 "canary operation must execute only the qualification harness"
             )
     elif any(
-        item == "--operational-steps"
-        or item.startswith("--operational-steps=")
+        _is_operational_steps_option(item)
         for step in steps
         for item in step["argv"]
     ):

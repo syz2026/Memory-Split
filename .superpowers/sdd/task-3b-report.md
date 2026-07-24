@@ -162,6 +162,65 @@ Additional verification:
 - The controller intentionally enables only qualification. Production
   submit/resume/evaluate and checkpoint/state lifecycle remain disabled for v3.
 
+## Blocking review follow-up
+
+All Critical and Important Task 3B review findings were closed:
+
+1. `AwsCliObjectStore` now parses the complete AWS CLI stdout as exactly one
+   closed JSON object, including realistic indented multi-line output. Duplicate,
+   trailing, non-finite, missing/null-version, checksum, and version drift fail
+   closed for both put and get.
+2. `scripts/run_train.py` disables argparse abbreviation. The remote argv
+   contract rejects the exact operational option, `=` form, and every argparse
+   prefix from `--o` through `--operational-step`, outside the closed canary
+   operation.
+3. Dense and Split90 config bytes are rehashed from a pinned regular-file read
+   immediately before every functional, resume, and throughput execution
+   boundary. Any post-plan mutation fails before the next training process or
+   pair starts, so receipt config hashes bind the bytes admitted for execution.
+4. Every remote canary path is normalized to an absolute path during plan
+   admission and the SSM argv is rendered only from those normalized plan
+   paths. Relative caller inputs no longer make execution depend on SSM cwd.
+5. Controlled tests now exercise the real subprocess pair runner. They prove
+   both children spawn before polling and prove process-group termination on
+   peer failure and timeout.
+
+Exact review RED evidence:
+
+```text
+review canary slice: 10 failed, 6 passed, 29 deselected in 1.71s
+trainer abbreviation slice: 5 failed, 8 passed in 11.03s
+strict AWS version slice: 3 failed in 0.14s
+```
+
+The failures directly reproduced multi-line JSON rejection, stale config
+acceptance at all three phase boundaries, relative SSM argv, abbreviated
+operational-option bypasses, argparse config access after abbreviation, and
+missing/null S3 version acceptance.
+
+Exact review GREEN evidence:
+
+```text
+review canary slice: 16 passed, 29 deselected in 1.56s
+trainer abbreviation slice: 13 passed in 10.75s
+strict AWS version slice: 3 passed in 0.12s
+real subprocess pair runner: 3 passed, 42 deselected in 1.05s
+focused canary/trainer/argv suites: 146 passed in 25.10s
+```
+
+Final post-review binding command:
+
+```text
+667 passed, 22 warnings in 183.40s
+```
+
+The 22 warnings remain the pre-existing `os.fork()` deprecation warning in
+`interruption_checkpoint.py`. Final changed-file `py_compile`,
+`git diff --check`, and forbidden-scope diff checks passed.
+
+No live paid AWS/P5 run was performed. External hardware and cloud
+qualification remains explicitly deferred to the later execution task.
+
 Report path:
 
 `/Users/stephenzhang/Documents/MemorySplit/.worktrees/memorysplit-v3-aws-n10/.superpowers/sdd/task-3b-report.md`
