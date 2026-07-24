@@ -3,13 +3,16 @@
 from __future__ import annotations
 
 import hashlib
+import heapq
 import json
 import os
 import re
+import secrets
 import stat
 import struct
 import tarfile
 import unicodedata
+import weakref
 import zlib
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
@@ -20,9 +23,12 @@ from typing import Any, BinaryIO, cast
 
 from corpusgen.parallel.canonical import canonical_json_bytes
 from corpusgen.parallel.safeio import (
+    atomic_rename_noreplace,
     entry_lstat,
+    fsync_directory,
     list_entries,
     open_directory_at,
+    open_directory_path,
     open_parent_directory,
     open_regular_file_at,
 )
@@ -104,6 +110,71 @@ _PAX_SIZE_KEYWORDS = frozenset(
     {b"size", b"GNU.sparse.size", b"GNU.sparse.realsize"}
 )
 _PAX_RECORD_RE = re.compile(rb"(\d+) ([^=]+)=")
+_UINT64_MAX = (1 << 64) - 1
+_ALIAS_RELATION_BIT = 1 << 63
+_ALIAS_NUMERIC_MAX = _ALIAS_RELATION_BIT - 1
+_SOURCE_LINE_LIMIT = 64 * 1024 * 1024
+_SORT_CHUNK_BYTES = 8 * 1024 * 1024
+_SORT_CHUNK_RECORDS = 65_536
+_SORT_MERGE_FAN_IN = 32
+_SORT_RECORD_LIMIT = 128 * 1024 * 1024
+_CONTROL_FILE_LIMIT = 16 * 1024 * 1024
+_SORT_HEADER = struct.Struct(">IQ")
+_UINT64 = struct.Struct(">Q")
+_ALIAS_INDEX_RECORD = struct.Struct(">QQQ")
+_EDGE_SORT_KEY = struct.Struct(">QQQBQ")
+_WRITE_FLAGS = (
+    os.O_WRONLY
+    | os.O_CREAT
+    | os.O_EXCL
+    | getattr(os, "O_CLOEXEC", 0)
+    | getattr(os, "O_NOFOLLOW", 0)
+)
+_VIEW_ROOT_ENTRIES = ("indexes", "members", "receipt.json", "streams")
+_TRAINING_SOURCE_ROWS = (
+    (
+        "inductive_train",
+        "wikidata5m_inductive_train.txt",
+        "wikidata5m_inductive.tar.gz",
+        0,
+        True,
+    ),
+    (
+        "transductive_train",
+        "wikidata5m_transductive_train.txt",
+        "wikidata5m_transductive.tar.gz",
+        1,
+        True,
+    ),
+    (
+        "inductive_test",
+        "wikidata5m_inductive_test.txt",
+        "wikidata5m_inductive.tar.gz",
+        2,
+        False,
+    ),
+    (
+        "inductive_valid",
+        "wikidata5m_inductive_valid.txt",
+        "wikidata5m_inductive.tar.gz",
+        3,
+        False,
+    ),
+    (
+        "transductive_test",
+        "wikidata5m_transductive_test.txt",
+        "wikidata5m_transductive.tar.gz",
+        4,
+        False,
+    ),
+    (
+        "transductive_valid",
+        "wikidata5m_transductive_valid.txt",
+        "wikidata5m_transductive.tar.gz",
+        5,
+        False,
+    ),
+)
 
 
 def _byte_key(value: str) -> bytes:
@@ -233,6 +304,43 @@ class ArtifactRecord:
 
 
 @dataclass(frozen=True)
+class IndexArtifactRecord(ArtifactRecord):
+    count: int
+    record_width: int
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        count = _validate_count(self.count, "index record count")
+        if type(self.record_width) is not int or self.record_width <= 0:
+            raise ValueError("index record width must be a positive integer")
+        if self.bytes != count * self.record_width:
+            raise ValueError("index byte count does not match count and width")
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            **super().as_dict(),
+            "count": self.count,
+            "record_width": self.record_width,
+        }
+
+    @classmethod
+    def from_dict(cls, value: object) -> "IndexArtifactRecord":
+        if (
+            not isinstance(value, dict)
+            or set(value)
+            != {"bytes", "count", "path", "record_width", "sha256"}
+        ):
+            raise ValueError("index artifact fields do not match the contract")
+        return cls(
+            path=value["path"],
+            bytes=value["bytes"],
+            sha256=value["sha256"],
+            count=value["count"],
+            record_width=value["record_width"],
+        )
+
+
+@dataclass(frozen=True)
 class V2TrainingTriple:
     training_split: str
     row: int
@@ -310,7 +418,7 @@ class WikidataDerivedViewReceipt:
     archives: tuple[ArtifactRecord, ...]
     members: tuple[ArtifactRecord, ...]
     streams: tuple[ArtifactRecord, ...]
-    indexes: tuple[ArtifactRecord, ...]
+    indexes: tuple[IndexArtifactRecord, ...]
     training_rows: int
     alias_rows: int
     distinct_edges: int
@@ -329,7 +437,12 @@ class WikidataDerivedViewReceipt:
         _require_exact_paths(self.archives, ARCHIVE_PATHS, "archive inventory")
         _require_exact_paths(self.members, MEMBER_PATHS, "member inventory")
         _require_exact_paths(self.streams, STREAM_PATHS, "stream inventory")
-        _require_exact_paths(self.indexes, INDEX_PATHS, "index inventory")
+        _require_exact_paths(
+            self.indexes,
+            INDEX_PATHS,
+            "index inventory",
+            IndexArtifactRecord,
+        )
         training_rows = _validate_count(self.training_rows, "training rows")
         alias_rows = _validate_count(self.alias_rows, "alias rows")
         distinct_edges = _validate_count(self.distinct_edges, "distinct edges")
@@ -361,13 +474,11 @@ class WikidataDerivedViewReceipt:
             "indexes/transductive-training-offsets.bin"
         ]
         if (
-            alias_index.bytes != alias_rows * 24
-            or alias_index.bytes % 24 != 0
-            or inductive_index.bytes % 8 != 0
-            or transductive_index.bytes % 8 != 0
-            or (inductive_index.bytes // 8)
-            + (transductive_index.bytes // 8)
-            != training_rows
+            alias_index.record_width != 24
+            or alias_index.count != alias_rows
+            or inductive_index.record_width != 8
+            or transductive_index.record_width != 8
+            or inductive_index.count + transductive_index.count != training_rows
         ):
             raise ValueError("receipt row and index totals are inconsistent")
 
@@ -399,8 +510,11 @@ class WikidataDerivedViewReceipt:
             raw_inventory = value[name]
             if not isinstance(raw_inventory, list):
                 raise ValueError(f"Wikidata receipt {name} must be a JSON list")
+            record_type = (
+                IndexArtifactRecord if name == "indexes" else ArtifactRecord
+            )
             inventories[name] = tuple(
-                ArtifactRecord.from_dict(record) for record in raw_inventory
+                record_type.from_dict(record) for record in raw_inventory
             )
         return cls(
             format=value["format"],
@@ -439,10 +553,57 @@ class WikidataDerivedViewReceipt:
 
 
 @dataclass(frozen=True)
+class _VerifiedViewAuthority:
+    root_identity: tuple[int, int, int, int, int, int, int | None, int | None]
+    directory_identities: Mapping[
+        str,
+        tuple[int, int, int, int, int, int, int | None, int | None],
+    ]
+    file_identities: Mapping[
+        str,
+        tuple[int, int, int, int, int, int, int | None, int | None],
+    ]
+
+
+@dataclass(frozen=True)
 class WikidataDerivedView:
     root: Path
     receipt_sha256: str
     receipt: WikidataDerivedViewReceipt
+
+
+_VERIFIED_VIEW_AUTHORITIES: dict[
+    int,
+    tuple[
+        weakref.ReferenceType[WikidataDerivedView],
+        _VerifiedViewAuthority,
+    ],
+] = {}
+
+
+def _register_verified_view(
+    view: WikidataDerivedView,
+    authority: _VerifiedViewAuthority,
+) -> WikidataDerivedView:
+    identity = id(view)
+
+    def discard(reference: weakref.ReferenceType[WikidataDerivedView]) -> None:
+        current = _VERIFIED_VIEW_AUTHORITIES.get(identity)
+        if current is not None and current[0] is reference:
+            _VERIFIED_VIEW_AUTHORITIES.pop(identity, None)
+
+    reference = weakref.ref(view, discard)
+    _VERIFIED_VIEW_AUTHORITIES[identity] = (reference, authority)
+    return view
+
+
+def _registered_view_authority(
+    view: WikidataDerivedView,
+) -> _VerifiedViewAuthority:
+    current = _VERIFIED_VIEW_AUTHORITIES.get(id(view))
+    if current is None or current[0]() is not view:
+        raise ValueError("a verified Wikidata derived view is required")
+    return current[1]
 
 
 def parse_wikidata_derived_view_receipt(
@@ -505,6 +666,8 @@ def _read_descriptor(
     _require_owned_mode(before, directory=False, description=description)
     if _file_identity(before) != expected_identity:
         raise ValueError(f"{description} identity drift")
+    if before.st_size > _CONTROL_FILE_LIMIT:
+        raise ValueError(f"{description} exceeds the bounded control-file limit")
     os.lseek(descriptor, 0, os.SEEK_SET)
     chunks = []
     byte_count = 0
@@ -609,7 +772,6 @@ def _open_bound_file(
 @dataclass(frozen=True)
 class VerifiedArchiveSet:
     source_lock_sha256: str
-    generator_commit: str
     archives: tuple[ArtifactRecord, ...]
     members: tuple[ArtifactRecord, ...]
     _archive_descriptors: Mapping[str, int] = field(
@@ -828,6 +990,11 @@ def _validate_archive_envelope(descriptor: int, archive_path: str) -> None:
                 )
             block_span = (header.size + _TAR_BLOCK_SIZE - 1) // _TAR_BLOCK_SIZE
             if header.type in _PAX_HEADER_TYPES:
+                if header.size > _SOURCE_LINE_LIMIT:
+                    raise ValueError(
+                        f"archive PAX header exceeds the bounded limit: "
+                        f"{archive_path}"
+                    )
                 if block_span == 0:
                     _reject_pax_size_override(b"", archive_path)
                 else:
@@ -843,7 +1010,24 @@ def _validate_archive_envelope(descriptor: int, archive_path: str) -> None:
             compressed = os.read(duplicate, _READ_CHUNK_SIZE)
             if not compressed:
                 break
-            consume(decompressor.decompress(compressed))
+            remaining = compressed
+            while remaining and not decompressor.eof:
+                previous_size = len(remaining)
+                output = decompressor.decompress(
+                    remaining,
+                    _READ_CHUNK_SIZE,
+                )
+                remaining = decompressor.unconsumed_tail
+                consume(output)
+                if (
+                    not output
+                    and len(remaining) == previous_size
+                    and not decompressor.eof
+                ):
+                    raise ValueError(
+                        f"archive gzip stream made no progress: "
+                        f"{archive_path}"
+                    )
         if not decompressor.eof:
             raise ValueError(f"archive gzip stream is truncated: {archive_path}")
         consume(decompressor.flush())
@@ -1154,7 +1338,6 @@ def _open_verified_archives(
 
         empty_verified = VerifiedArchiveSet(
             source_lock_sha256=lock_sha256,
-            generator_commit=lock.generator_commit,
             archives=(),
             members=(),
             _archive_descriptors=MappingProxyType(archive_fds),
@@ -1217,7 +1400,6 @@ def _open_verified_archives(
             raise ValueError("decoded archive member inventory drift")
         verified = VerifiedArchiveSet(
             source_lock_sha256=lock_sha256,
-            generator_commit=lock.generator_commit,
             archives=tuple(archive_records),
             members=ordered_members,
             _archive_descriptors=MappingProxyType(archive_fds),
@@ -1244,3 +1426,2153 @@ def _open_verified_archives(
             os.close(lock_fd)
         if lock_parent_fd >= 0:
             os.close(lock_parent_fd)
+
+
+def _require_derived_mode(
+    metadata: os.stat_result,
+    *,
+    directory: bool,
+    description: str,
+) -> None:
+    _require_owned_mode(
+        metadata,
+        directory=directory,
+        description=description,
+    )
+    expected_mode = 0o700 if directory else 0o600
+    if stat.S_IMODE(metadata.st_mode) != expected_mode:
+        raise ValueError(f"{description} mode drift")
+
+
+def _write_all(descriptor: int, payload: bytes) -> None:
+    view = memoryview(payload)
+    while view:
+        written = os.write(descriptor, view)
+        if written <= 0:
+            raise OSError("short write")
+        view = view[written:]
+
+
+class _ArtifactWriter:
+    def __init__(
+        self,
+        directory_fd: int,
+        name: str,
+        relative_path: str,
+    ) -> None:
+        self.relative_path = _safe_relative_path(
+            relative_path,
+            "derived artifact path",
+        )
+        self.descriptor = os.open(
+            name,
+            _WRITE_FLAGS,
+            0o600,
+            dir_fd=directory_fd,
+        )
+        self.byte_count = 0
+        self.digest = hashlib.sha256()
+        self.closed = False
+        _require_derived_mode(
+            os.fstat(self.descriptor),
+            directory=False,
+            description=f"derived artifact {relative_path}",
+        )
+
+    def write(self, payload: bytes) -> None:
+        if self.closed:
+            raise ValueError("derived artifact writer is closed")
+        if not isinstance(payload, bytes):
+            raise TypeError("derived artifact payload must be bytes")
+        _write_all(self.descriptor, payload)
+        self.byte_count += len(payload)
+        self.digest.update(payload)
+
+    def finish(self) -> ArtifactRecord:
+        if self.closed:
+            raise ValueError("derived artifact writer is closed")
+        os.fsync(self.descriptor)
+        os.close(self.descriptor)
+        self.descriptor = -1
+        self.closed = True
+        return ArtifactRecord(
+            path=self.relative_path,
+            bytes=self.byte_count,
+            sha256=self.digest.hexdigest(),
+        )
+
+    def finish_index(
+        self,
+        *,
+        count: int,
+        record_width: int,
+    ) -> IndexArtifactRecord:
+        artifact = self.finish()
+        return IndexArtifactRecord(
+            path=artifact.path,
+            bytes=artifact.bytes,
+            sha256=artifact.sha256,
+            count=count,
+            record_width=record_width,
+        )
+
+    def abort(self) -> None:
+        if not self.closed:
+            os.close(self.descriptor)
+            self.descriptor = -1
+            self.closed = True
+
+
+def _read_exact(descriptor: int, size: int, description: str) -> bytes:
+    if size < 0 or size > _SORT_RECORD_LIMIT:
+        raise ValueError(f"{description} size is outside the bounded contract")
+    chunks: list[bytes] = []
+    remaining = size
+    while remaining:
+        chunk = os.read(descriptor, min(remaining, _READ_CHUNK_SIZE))
+        if not chunk:
+            raise ValueError(f"{description} is truncated")
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    return b"".join(chunks)
+
+
+def _write_sort_record(
+    descriptor: int,
+    key: bytes,
+    payload: bytes,
+) -> None:
+    if (
+        not isinstance(key, bytes)
+        or not isinstance(payload, bytes)
+        or len(key) > 0xFFFFFFFF
+        or len(key) + len(payload) > _SORT_RECORD_LIMIT
+    ):
+        raise ValueError("external-sort record exceeds the bounded contract")
+    _write_all(descriptor, _SORT_HEADER.pack(len(key), len(payload)))
+    _write_all(descriptor, key)
+    _write_all(descriptor, payload)
+
+
+def _read_sort_record(descriptor: int) -> tuple[bytes, bytes] | None:
+    first = os.read(descriptor, _SORT_HEADER.size)
+    if not first:
+        return None
+    header = bytearray(first)
+    while len(header) < _SORT_HEADER.size:
+        chunk = os.read(descriptor, _SORT_HEADER.size - len(header))
+        if not chunk:
+            raise ValueError("external-sort run has a truncated header")
+        header.extend(chunk)
+    key_size, payload_size = _SORT_HEADER.unpack(header)
+    if key_size + payload_size > _SORT_RECORD_LIMIT:
+        raise ValueError("external-sort run record exceeds the bounded contract")
+    return (
+        _read_exact(descriptor, key_size, "external-sort key"),
+        _read_exact(descriptor, payload_size, "external-sort payload"),
+    )
+
+
+@contextmanager
+def _open_sorted_run(
+    work_fd: int,
+    name: str | None,
+) -> Iterator[Iterator[tuple[bytes, bytes]]]:
+    if name is None:
+        yield iter(())
+        return
+    descriptor, metadata = open_regular_file_at(work_fd, name)
+    _require_derived_mode(
+        metadata,
+        directory=False,
+        description="external-sort run",
+    )
+
+    def records() -> Iterator[tuple[bytes, bytes]]:
+        previous: bytes | None = None
+        while True:
+            record = _read_sort_record(descriptor)
+            if record is None:
+                return
+            key, payload = record
+            if previous is not None and key < previous:
+                raise ValueError("external-sort run ordering drift")
+            previous = key
+            yield key, payload
+
+    try:
+        yield records()
+    finally:
+        os.close(descriptor)
+        os.unlink(name, dir_fd=work_fd)
+
+
+class _ExternalSorter:
+    """Bounded in-memory runs with deterministic external merge reduction."""
+
+    def __init__(self, work_fd: int, prefix: str) -> None:
+        if re.fullmatch(r"[a-z0-9-]+", prefix) is None:
+            raise ValueError("external-sort prefix is unsafe")
+        self.work_fd = work_fd
+        self.prefix = prefix
+        self.chunk: list[tuple[bytes, bytes]] = []
+        self.chunk_bytes = 0
+        self.pending_runs: dict[int, str] = {}
+        self.run_counters: dict[int, int] = {}
+        self.finished = False
+
+    def add(self, key: bytes, payload: bytes = b"") -> None:
+        if self.finished:
+            raise ValueError("external sorter is already finalized")
+        record_size = _SORT_HEADER.size + len(key) + len(payload)
+        if record_size > _SORT_RECORD_LIMIT:
+            raise ValueError("external-sort input record is too large")
+        if self.chunk and (
+            self.chunk_bytes + record_size > _SORT_CHUNK_BYTES
+            or len(self.chunk) >= _SORT_CHUNK_RECORDS
+        ):
+            self._flush()
+        self.chunk.append((key, payload))
+        self.chunk_bytes += record_size
+
+    def _new_run_name(self, level: int) -> str:
+        run_number = self.run_counters.get(level, 0)
+        self.run_counters[level] = run_number + 1
+        return f"{self.prefix}-l{level:04d}-r{run_number:08d}.bin"
+
+    def _store_run(self, level: int, name: str) -> None:
+        while level in self.pending_runs:
+            older = self.pending_runs.pop(level)
+            output_name = self._new_run_name(level + 1)
+            self._merge_batch([older, name], output_name)
+            name = output_name
+            level += 1
+            if level > 64:
+                raise ValueError("external-sort run count exceeds uint64")
+        self.pending_runs[level] = name
+
+    def _flush(self) -> None:
+        if not self.chunk:
+            return
+        self.chunk.sort(key=lambda record: record[0])
+        name = self._new_run_name(0)
+        descriptor = os.open(
+            name,
+            _WRITE_FLAGS,
+            0o600,
+            dir_fd=self.work_fd,
+        )
+        try:
+            for key, payload in self.chunk:
+                _write_sort_record(descriptor, key, payload)
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+        self.chunk.clear()
+        self.chunk_bytes = 0
+        self._store_run(0, name)
+
+    def _merge_batch(
+        self,
+        names: list[str],
+        output_name: str,
+    ) -> None:
+        inputs: list[int] = []
+        output = -1
+        try:
+            for name in names:
+                descriptor, metadata = open_regular_file_at(
+                    self.work_fd,
+                    name,
+                )
+                _require_derived_mode(
+                    metadata,
+                    directory=False,
+                    description="external-sort merge input",
+                )
+                inputs.append(descriptor)
+            output = os.open(
+                output_name,
+                _WRITE_FLAGS,
+                0o600,
+                dir_fd=self.work_fd,
+            )
+            heap: list[tuple[bytes, int, bytes]] = []
+            for index, descriptor in enumerate(inputs):
+                record = _read_sort_record(descriptor)
+                if record is not None:
+                    key, payload = record
+                    heapq.heappush(heap, (key, index, payload))
+            previous: bytes | None = None
+            while heap:
+                key, index, payload = heapq.heappop(heap)
+                if previous is not None and key < previous:
+                    raise ValueError("external-sort merge ordering drift")
+                previous = key
+                _write_sort_record(output, key, payload)
+                record = _read_sort_record(inputs[index])
+                if record is not None:
+                    next_key, next_payload = record
+                    heapq.heappush(
+                        heap,
+                        (next_key, index, next_payload),
+                    )
+            os.fsync(output)
+        finally:
+            if output >= 0:
+                os.close(output)
+            for descriptor in inputs:
+                os.close(descriptor)
+        for name in names:
+            os.unlink(name, dir_fd=self.work_fd)
+
+    def finish(self) -> str | None:
+        if self.finished:
+            raise ValueError("external sorter is already finalized")
+        self.finished = True
+        self._flush()
+        names = [
+            self.pending_runs[level]
+            for level in sorted(self.pending_runs, reverse=True)
+        ]
+        level = 65
+        while len(names) > 1:
+            merged: list[str] = []
+            for start in range(0, len(names), _SORT_MERGE_FAN_IN):
+                batch = names[start : start + _SORT_MERGE_FAN_IN]
+                if len(batch) == 1:
+                    merged.append(batch[0])
+                else:
+                    output_name = self._new_run_name(level)
+                    self._merge_batch(batch, output_name)
+                    merged.append(output_name)
+            names = merged
+            level += 1
+        return names[0] if names else None
+
+
+def _iter_descriptor_lines(
+    descriptor: int,
+    description: str,
+) -> Iterator[tuple[int, bytes]]:
+    os.lseek(descriptor, 0, os.SEEK_SET)
+    pending = bytearray()
+    offset = 0
+    while True:
+        chunk = os.read(descriptor, _READ_CHUNK_SIZE)
+        if chunk:
+            pending.extend(chunk)
+        while True:
+            newline = pending.find(b"\n")
+            if newline < 0:
+                break
+            line = bytes(pending[: newline + 1])
+            del pending[: newline + 1]
+            if len(line) > _SOURCE_LINE_LIMIT:
+                raise ValueError(f"{description} row exceeds the bounded limit")
+            yield offset, line
+            offset += len(line)
+        if len(pending) > _SOURCE_LINE_LIMIT:
+            raise ValueError(f"{description} row exceeds the bounded limit")
+        if not chunk:
+            break
+    if pending:
+        yield offset, bytes(pending)
+
+
+def _source_row_bytes(line: bytes) -> bytes:
+    row = line[:-1] if line.endswith(b"\n") else line
+    if row.endswith(b"\r"):
+        row = row[:-1]
+    return row
+
+
+def _numeric_identifier(
+    value: bytes,
+    prefix: bytes,
+    description: str,
+    *,
+    maximum: int = _UINT64_MAX,
+) -> int:
+    if (
+        len(value) < 2
+        or value[:1] != prefix
+        or not value[1:].isdigit()
+        or (len(value) > 2 and value[1:2] == b"0")
+    ):
+        raise ValueError(f"{description} is not a canonical identifier")
+    number = int(value[1:])
+    if number > maximum:
+        raise ValueError(f"{description} exceeds the unsigned index range")
+    return number
+
+
+def _alias_key(prefix: bytes, number: int) -> int:
+    if number > _ALIAS_NUMERIC_MAX:
+        raise ValueError("alias canonical ID exceeds the kind/id key range")
+    return number | (_ALIAS_RELATION_BIT if prefix == b"P" else 0)
+
+
+def _canonical_id_for_alias_key(key: int) -> str:
+    prefix = "P" if key & _ALIAS_RELATION_BIT else "Q"
+    return f"{prefix}{key & _ALIAS_NUMERIC_MAX}"
+
+
+def _canonical_json_string(value: str) -> bytes:
+    return json.dumps(
+        value,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+
+
+def _materialize_member_files(
+    verified: VerifiedArchiveSet,
+    members_fd: int,
+) -> tuple[ArtifactRecord, ...]:
+    expected = {record.path: record for record in verified.members}
+    records: list[ArtifactRecord] = []
+    for archive_path in ARCHIVE_PATHS:
+        duplicate = os.dup(verified._archive_descriptors[archive_path])
+        os.lseek(duplicate, 0, os.SEEK_SET)
+        try:
+            with os.fdopen(duplicate, "rb") as handle:
+                duplicate = -1
+                with tarfile.open(
+                    fileobj=cast(BinaryIO, handle),
+                    mode="r:*",
+                ) as archive:
+                    for member in archive:
+                        name = _safe_relative_path(
+                            member.name,
+                            "archive member path",
+                        )
+                        if (
+                            not member.isreg()
+                            or name not in ARCHIVE_MEMBERS[archive_path]
+                        ):
+                            raise ValueError(
+                                f"archive member changed during materialization: "
+                                f"{archive_path}:{name}"
+                            )
+                        try:
+                            stream = archive.extractfile(member)
+                        except (KeyError, OSError, tarfile.TarError) as error:
+                            raise ValueError(
+                                f"archive member payload is truncated: "
+                                f"{archive_path}:{name}"
+                            ) from error
+                        if stream is None:
+                            raise ValueError(
+                                f"archive member payload is unreadable: "
+                                f"{archive_path}:{name}"
+                            )
+                        writer = _ArtifactWriter(
+                            members_fd,
+                            name,
+                            f"members/{name}",
+                        )
+                        try:
+                            copied = 0
+                            while True:
+                                chunk = stream.read(_READ_CHUNK_SIZE)
+                                if not chunk:
+                                    break
+                                copied += len(chunk)
+                                writer.write(chunk)
+                            if stream.read(1) or copied != member.size:
+                                raise ValueError(
+                                    f"archive member size/EOF mismatch: "
+                                    f"{archive_path}:{name}"
+                                )
+                            artifact = writer.finish()
+                        except BaseException:
+                            writer.abort()
+                            raise
+                        finally:
+                            stream.close()
+                        locked = expected.get(artifact.path)
+                        if locked is None or artifact != locked:
+                            raise ValueError(
+                                f"decoded member drift: {archive_path}:{name}"
+                            )
+                        records.append(artifact)
+        except (EOFError, OSError, tarfile.TarError) as error:
+            raise ValueError(
+                f"archive changed during member materialization: {archive_path}"
+            ) from error
+        finally:
+            if duplicate >= 0:
+                os.close(duplicate)
+    ordered = tuple(sorted(records, key=lambda record: _byte_key(record.path)))
+    if ordered != verified.members:
+        raise ValueError("materialized member inventory drift")
+    fsync_directory(members_fd)
+    return ordered
+
+
+def _open_member_file(members_fd: int, member_name: str) -> int:
+    descriptor, metadata = open_regular_file_at(members_fd, member_name)
+    try:
+        _require_derived_mode(
+            metadata,
+            directory=False,
+            description=f"decoded member {member_name}",
+        )
+        return descriptor
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def _iter_member_triples(
+    members_fd: int,
+    member_name: str,
+) -> Iterator[tuple[int, int, int, int]]:
+    descriptor = _open_member_file(members_fd, member_name)
+    try:
+        source_row = 0
+        for _offset, line in _iter_descriptor_lines(
+            descriptor,
+            f"Wikidata member {member_name}",
+        ):
+            source_row += 1
+            fields = _source_row_bytes(line).split(b"\t")
+            if len(fields) != 3:
+                raise ValueError(
+                    f"{member_name}:{source_row}: "
+                    "expected 3 tab-separated fields"
+                )
+            try:
+                subject = _numeric_identifier(
+                    fields[0],
+                    b"Q",
+                    "triple subject",
+                )
+                relation = _numeric_identifier(
+                    fields[1],
+                    b"P",
+                    "triple relation",
+                )
+                object_id = _numeric_identifier(
+                    fields[2],
+                    b"Q",
+                    "triple object",
+                )
+            except ValueError as error:
+                raise ValueError(
+                    f"{member_name}:{source_row}: {error}"
+                ) from error
+            yield source_row, subject, relation, object_id
+    finally:
+        os.close(descriptor)
+
+
+def _training_stream_line(
+    training_split: str,
+    row: int,
+    subject: int,
+    relation: int,
+    object_id: int,
+) -> bytes:
+    return (
+        f"{training_split}\t{row}\tQ{subject}\tP{relation}\tQ{object_id}\n"
+    ).encode("ascii")
+
+
+def _build_training_artifacts(
+    members_fd: int,
+    streams_fd: int,
+    indexes_fd: int,
+    work_fd: int,
+) -> tuple[
+    ArtifactRecord,
+    ArtifactRecord,
+    tuple[IndexArtifactRecord, IndexArtifactRecord],
+    int,
+    int,
+]:
+    training_writer = _ArtifactWriter(
+        streams_fd,
+        "training.tsv",
+        "streams/training.tsv",
+    )
+    distinct_writer = _ArtifactWriter(
+        streams_fd,
+        "distinct-edges.tsv",
+        "streams/distinct-edges.tsv",
+    )
+    index_writers = {
+        "inductive_train": _ArtifactWriter(
+            indexes_fd,
+            "inductive-training-offsets.bin",
+            "indexes/inductive-training-offsets.bin",
+        ),
+        "transductive_train": _ArtifactWriter(
+            indexes_fd,
+            "transductive-training-offsets.bin",
+            "indexes/transductive-training-offsets.bin",
+        ),
+    }
+    counts = {split: 0 for split in TRAINING_SPLITS}
+    edge_sorter = _ExternalSorter(work_fd, "training-edges")
+    try:
+        for (
+            source_name,
+            member_name,
+            _archive_path,
+            source_rank,
+            is_training,
+        ) in _TRAINING_SOURCE_ROWS:
+            for row, subject, relation, object_id in _iter_member_triples(
+                members_fd,
+                member_name,
+            ):
+                if is_training:
+                    training_split = source_name
+                    if training_split not in counts:
+                        raise ValueError("training source mapping drift")
+                    offset = training_writer.byte_count
+                    index_writers[training_split].write(_UINT64.pack(offset))
+                    training_writer.write(
+                        _training_stream_line(
+                            training_split,
+                            row,
+                            subject,
+                            relation,
+                            object_id,
+                        )
+                    )
+                    counts[training_split] += 1
+                edge_sorter.add(
+                    _EDGE_SORT_KEY.pack(
+                        subject,
+                        relation,
+                        object_id,
+                        source_rank,
+                        row,
+                    )
+                )
+
+        distinct_count = 0
+        edge_run = edge_sorter.finish()
+        with _open_sorted_run(work_fd, edge_run) as edge_records:
+            current_edge: bytes | None = None
+            first_training: tuple[int, int] | None = None
+            has_sealed = False
+
+            def finish_edge() -> None:
+                nonlocal distinct_count
+                if current_edge is None:
+                    return
+                if first_training is not None and has_sealed:
+                    subject, relation, object_id = struct.unpack(
+                        ">QQQ",
+                        current_edge,
+                    )
+                    raise ValueError(
+                        "training/sealed overlap for "
+                        f"Q{subject}/P{relation}/Q{object_id}"
+                    )
+                if first_training is None:
+                    return
+                source_rank, row = first_training
+                training_split = TRAINING_SPLITS[source_rank]
+                subject, relation, object_id = struct.unpack(
+                    ">QQQ",
+                    current_edge,
+                )
+                distinct_writer.write(
+                    _training_stream_line(
+                        training_split,
+                        row,
+                        subject,
+                        relation,
+                        object_id,
+                    )
+                )
+                distinct_count += 1
+
+            for key, payload in edge_records:
+                if payload or len(key) != _EDGE_SORT_KEY.size:
+                    raise ValueError("training edge external-sort drift")
+                subject, relation, object_id, source_rank, row = (
+                    _EDGE_SORT_KEY.unpack(key)
+                )
+                edge = key[:24]
+                if current_edge != edge:
+                    finish_edge()
+                    current_edge = edge
+                    first_training = None
+                    has_sealed = False
+                if source_rank < len(TRAINING_SPLITS):
+                    if first_training is None:
+                        first_training = (source_rank, row)
+                else:
+                    has_sealed = True
+            finish_edge()
+
+        training_artifact = training_writer.finish()
+        distinct_artifact = distinct_writer.finish()
+        index_artifacts = tuple(
+            index_writers[split].finish_index(
+                count=counts[split],
+                record_width=_UINT64.size,
+            )
+            for split in TRAINING_SPLITS
+        )
+    except BaseException:
+        training_writer.abort()
+        distinct_writer.abort()
+        for writer in index_writers.values():
+            writer.abort()
+        raise
+    fsync_directory(streams_fd)
+    fsync_directory(indexes_fd)
+    return (
+        training_artifact,
+        distinct_artifact,
+        cast(
+            tuple[IndexArtifactRecord, IndexArtifactRecord],
+            index_artifacts,
+        ),
+        sum(counts.values()),
+        distinct_count,
+    )
+
+
+def _iter_alias_member_rows(
+    members_fd: int,
+    member_name: str,
+    prefix: bytes,
+) -> Iterator[tuple[int, int, tuple[tuple[int, bytes, bytes], ...]]]:
+    descriptor = _open_member_file(members_fd, member_name)
+    try:
+        source_row = 0
+        for _offset, line in _iter_descriptor_lines(
+            descriptor,
+            f"Wikidata alias member {member_name}",
+        ):
+            source_row += 1
+            fields = _source_row_bytes(line).split(b"\t")
+            if len(fields) < 2:
+                raise ValueError(
+                    f"{member_name}:{source_row}: "
+                    "expected a canonical ID and at least one alias"
+                )
+            try:
+                numeric_id = _numeric_identifier(
+                    fields[0],
+                    prefix,
+                    "alias canonical ID",
+                    maximum=_ALIAS_NUMERIC_MAX,
+                )
+            except ValueError as error:
+                raise ValueError(
+                    f"{member_name}:{source_row}: {error}"
+                ) from error
+            aliases: list[tuple[int, bytes, bytes]] = []
+            for position, raw in enumerate(fields[1:]):
+                try:
+                    text = raw.decode("utf-8")
+                except UnicodeDecodeError as error:
+                    raise ValueError(
+                        f"{member_name}:{source_row}: alias is not UTF-8"
+                    ) from error
+                if "\x00" in text:
+                    raise ValueError(
+                        f"{member_name}:{source_row}: alias contains NUL"
+                    )
+                display = " ".join(
+                    unicodedata.normalize("NFKC", text).split()
+                )
+                if not display:
+                    continue
+                normalized = " ".join(
+                    unicodedata.normalize("NFKC", display).split()
+                ).casefold()
+                normalized_bytes = normalized.encode("utf-8")
+                display_bytes = display.encode("utf-8")
+                if (
+                    len(normalized_bytes) + len(display_bytes)
+                    > _SORT_RECORD_LIMIT
+                ):
+                    raise ValueError(
+                        f"{member_name}:{source_row}: alias is too large"
+                    )
+                aliases.append(
+                    (position, normalized_bytes, display_bytes)
+                )
+            yield source_row, _alias_key(prefix, numeric_id), tuple(aliases)
+    finally:
+        os.close(descriptor)
+
+
+def _build_alias_artifacts(
+    members_fd: int,
+    streams_fd: int,
+    indexes_fd: int,
+    work_fd: int,
+) -> tuple[ArtifactRecord, IndexArtifactRecord, int]:
+    canonical_sorter = _ExternalSorter(work_fd, "alias-canonical")
+    occurrence_sorter = _ExternalSorter(work_fd, "alias-occurrence")
+    for member_name, prefix in (
+        ("wikidata5m_entity.txt", b"Q"),
+        ("wikidata5m_relation.txt", b"P"),
+    ):
+        for _row, canonical_key, aliases in _iter_alias_member_rows(
+            members_fd,
+            member_name,
+            prefix,
+        ):
+            canonical_sorter.add(_UINT64.pack(canonical_key))
+            for position, normalized, display in aliases:
+                occurrence_sorter.add(
+                    normalized
+                    + b"\0"
+                    + struct.pack(">QQ", canonical_key, position),
+                    display,
+                )
+
+    survivor_sorter = _ExternalSorter(work_fd, "alias-survivor")
+    occurrence_run = occurrence_sorter.finish()
+    with _open_sorted_run(work_fd, occurrence_run) as occurrences:
+        current_normalized: bytes | None = None
+        current_owner: int | None = None
+        first_key = b""
+        first_display = b""
+        ambiguous = False
+
+        def finish_normalized() -> None:
+            if current_normalized is not None and not ambiguous:
+                survivor_sorter.add(first_key, first_display)
+
+        for key, display in occurrences:
+            separator = key.find(b"\0")
+            if separator < 0 or len(key) - separator - 1 != 16:
+                raise ValueError("alias occurrence external-sort drift")
+            normalized = key[:separator]
+            canonical_key, _position = struct.unpack(
+                ">QQ",
+                key[separator + 1 :],
+            )
+            if normalized != current_normalized:
+                finish_normalized()
+                current_normalized = normalized
+                current_owner = canonical_key
+                first_key = key[separator + 1 :]
+                first_display = display
+                ambiguous = False
+            elif canonical_key != current_owner:
+                ambiguous = True
+        finish_normalized()
+
+    canonical_run = canonical_sorter.finish()
+    survivor_run = survivor_sorter.finish()
+    alias_writer = _ArtifactWriter(
+        streams_fd,
+        "aliases.tsv",
+        "streams/aliases.tsv",
+    )
+    index_writer = _ArtifactWriter(
+        indexes_fd,
+        "aliases.bin",
+        "indexes/aliases.bin",
+    )
+    alias_count = 0
+    try:
+        with (
+            _open_sorted_run(work_fd, canonical_run) as canonicals,
+            _open_sorted_run(work_fd, survivor_run) as survivors,
+        ):
+            survivor = next(survivors, None)
+            previous_canonical: int | None = None
+            for key, payload in canonicals:
+                if payload or len(key) != _UINT64.size:
+                    raise ValueError("alias canonical external-sort drift")
+                canonical_key = _UINT64.unpack(key)[0]
+                if (
+                    previous_canonical is not None
+                    and canonical_key <= previous_canonical
+                ):
+                    raise ValueError(
+                        "duplicate alias canonical ID in source members"
+                    )
+                previous_canonical = canonical_key
+                if (
+                    survivor is not None
+                    and _UINT64.unpack(survivor[0][:8])[0] < canonical_key
+                ):
+                    raise ValueError("alias survivor has no canonical owner")
+
+                canonical_id = _canonical_id_for_alias_key(canonical_key)
+                row_offset = alias_writer.byte_count
+                alias_writer.write(
+                    canonical_id.encode("ascii")
+                    + b'\t{"aliases":['
+                )
+                first = True
+                display: str | None = None
+                previous_position: int | None = None
+                while survivor is not None:
+                    survivor_key, display_bytes = survivor
+                    if len(survivor_key) != 16:
+                        raise ValueError("alias survivor index drift")
+                    owner, position = struct.unpack(">QQ", survivor_key)
+                    if owner != canonical_key:
+                        break
+                    if (
+                        previous_position is not None
+                        and position <= previous_position
+                    ):
+                        raise ValueError("alias survivor ordering drift")
+                    previous_position = position
+                    try:
+                        alias = display_bytes.decode("utf-8")
+                    except UnicodeDecodeError as error:
+                        raise ValueError(
+                            "alias survivor is not UTF-8"
+                        ) from error
+                    V2AliasRecord(
+                        canonical_id=canonical_id,
+                        kind=(
+                            "relation"
+                            if canonical_key & _ALIAS_RELATION_BIT
+                            else "entity"
+                        ),
+                        display=alias,
+                        aliases=(alias,),
+                    )
+                    if not first:
+                        alias_writer.write(b",")
+                    alias_writer.write(_canonical_json_string(alias))
+                    if display is None:
+                        display = alias
+                    first = False
+                    survivor = next(survivors, None)
+                if display is None:
+                    display = canonical_id
+                alias_writer.write(
+                    b'],"display":'
+                    + _canonical_json_string(display)
+                    + b"}\n"
+                )
+                row_length = alias_writer.byte_count - row_offset
+                index_writer.write(
+                    _ALIAS_INDEX_RECORD.pack(
+                        canonical_key,
+                        row_offset,
+                        row_length,
+                    )
+                )
+                alias_count += 1
+            if survivor is not None:
+                raise ValueError("alias survivor has no canonical owner")
+        alias_artifact = alias_writer.finish()
+        index_artifact = index_writer.finish_index(
+            count=alias_count,
+            record_width=_ALIAS_INDEX_RECORD.size,
+        )
+    except BaseException:
+        alias_writer.abort()
+        index_writer.abort()
+        raise
+    fsync_directory(streams_fd)
+    fsync_directory(indexes_fd)
+    return alias_artifact, index_artifact, alias_count
+
+
+def _derived_row(line: bytes, description: str) -> bytes:
+    if not line.endswith(b"\n") or line.endswith(b"\r\n"):
+        raise ValueError(f"{description} is not a canonical newline row")
+    return line[:-1]
+
+
+def _positive_decimal(value: bytes, description: str) -> int:
+    if (
+        not value
+        or not value.isdigit()
+        or value == b"0"
+        or (len(value) > 1 and value[:1] == b"0")
+    ):
+        raise ValueError(f"{description} must be a canonical positive integer")
+    return int(value)
+
+
+def _parse_training_stream_row(
+    line: bytes,
+    description: str,
+) -> V2TrainingTriple:
+    fields = _derived_row(line, description).split(b"\t")
+    if len(fields) != 5:
+        raise ValueError(f"{description} must have five tab-separated fields")
+    try:
+        training_split = fields[0].decode("ascii")
+    except UnicodeDecodeError as error:
+        raise ValueError(f"{description} split is not ASCII") from error
+    if training_split not in TRAINING_SPLITS:
+        raise ValueError(f"{description} split is not canonical")
+    row = _positive_decimal(fields[1], f"{description} row")
+    subject = _numeric_identifier(
+        fields[2],
+        b"Q",
+        f"{description} subject",
+    )
+    relation_number = _numeric_identifier(
+        fields[3],
+        b"P",
+        f"{description} relation",
+    )
+    object_id = _numeric_identifier(
+        fields[4],
+        b"Q",
+        f"{description} object",
+    )
+    archive_path = (
+        "wikidata5m_inductive.tar.gz"
+        if training_split == "inductive_train"
+        else "wikidata5m_transductive.tar.gz"
+    )
+    return V2TrainingTriple(
+        training_split=training_split,
+        row=row,
+        subject=subject,
+        relation=f"P{relation_number}",
+        object=object_id,
+        member=f"wikidata5m_{training_split}.txt",
+        archive_path=archive_path,
+    )
+
+
+def _parse_alias_stream_row(
+    line: bytes,
+    description: str,
+) -> V2AliasRecord:
+    row = _derived_row(line, description)
+    try:
+        canonical_bytes, payload = row.split(b"\t", 1)
+    except ValueError as error:
+        raise ValueError(
+            f"{description} must have two tab-separated fields"
+        ) from error
+    if canonical_bytes[:1] not in {b"Q", b"P"}:
+        raise ValueError(f"{description} canonical ID prefix is invalid")
+    prefix = canonical_bytes[:1]
+    number = _numeric_identifier(
+        canonical_bytes,
+        prefix,
+        f"{description} canonical ID",
+        maximum=_ALIAS_NUMERIC_MAX,
+    )
+    canonical_id = f"{prefix.decode('ascii')}{number}"
+    value = _strict_json_bytes(payload, f"{description} alias payload")
+    if (
+        not isinstance(value, dict)
+        or set(value) != {"aliases", "display"}
+        or type(value["display"]) is not str
+        or not isinstance(value["aliases"], list)
+        or not all(type(alias) is str for alias in value["aliases"])
+    ):
+        raise ValueError(f"{description} alias payload schema drift")
+    if canonical_json_bytes(value) != payload + b"\n":
+        raise ValueError(f"{description} alias payload is not canonical JSON")
+    return V2AliasRecord(
+        canonical_id=canonical_id,
+        kind="entity" if prefix == b"Q" else "relation",
+        display=value["display"],
+        aliases=tuple(value["aliases"]),
+    )
+
+
+def _pread_exact(
+    descriptor: int,
+    size: int,
+    offset: int,
+    description: str,
+) -> bytes:
+    if size < 0 or size > _SOURCE_LINE_LIMIT or offset < 0:
+        raise ValueError(f"{description} bounds are invalid")
+    chunks: list[bytes] = []
+    remaining = size
+    position = offset
+    while remaining:
+        chunk = os.pread(
+            descriptor,
+            min(remaining, _READ_CHUNK_SIZE),
+            position,
+        )
+        if not chunk:
+            raise ValueError(f"{description} is truncated")
+        chunks.append(chunk)
+        remaining -= len(chunk)
+        position += len(chunk)
+    return b"".join(chunks)
+
+
+def _verify_training_logical_files(
+    file_fds: Mapping[str, int],
+    receipt: WikidataDerivedViewReceipt,
+) -> None:
+    stream_fd = file_fds["streams/training.tsv"]
+    index_records = {
+        record.path: record for record in receipt.indexes
+    }
+    index_fds = {
+        "inductive_train": file_fds[
+            "indexes/inductive-training-offsets.bin"
+        ],
+        "transductive_train": file_fds[
+            "indexes/transductive-training-offsets.bin"
+        ],
+    }
+    index_artifacts = {
+        "inductive_train": index_records[
+            "indexes/inductive-training-offsets.bin"
+        ],
+        "transductive_train": index_records[
+            "indexes/transductive-training-offsets.bin"
+        ],
+    }
+    counts = {split: 0 for split in TRAINING_SPLITS}
+    current_rank = 0
+    total = 0
+    for offset, line in _iter_descriptor_lines(
+        stream_fd,
+        "training stream",
+    ):
+        triple = _parse_training_stream_row(
+            line,
+            f"training stream row {total + 1}",
+        )
+        rank = TRAINING_SPLITS.index(triple.training_split)
+        if rank < current_rank:
+            raise ValueError("training stream split ordering drift")
+        current_rank = rank
+        counts[triple.training_split] += 1
+        if triple.row != counts[triple.training_split]:
+            raise ValueError("training stream row ordering drift")
+        if line != _training_stream_line(
+            triple.training_split,
+            triple.row,
+            triple.subject,
+            int(triple.relation[1:]),
+            triple.object,
+        ):
+            raise ValueError("training stream canonical row drift")
+        index_offset = _pread_exact(
+            index_fds[triple.training_split],
+            _UINT64.size,
+            (counts[triple.training_split] - 1) * _UINT64.size,
+            "training offset index record",
+        )
+        if _UINT64.unpack(index_offset)[0] != offset:
+            raise ValueError("training offset index does not match stream")
+        total += 1
+    if total != receipt.training_rows:
+        raise ValueError("training stream row count drift")
+    for split in TRAINING_SPLITS:
+        if counts[split] != index_artifacts[split].count:
+            raise ValueError("training index record count drift")
+
+
+def _verify_distinct_logical_file(
+    descriptor: int,
+    receipt: WikidataDerivedViewReceipt,
+) -> None:
+    previous: tuple[int, int, int] | None = None
+    count = 0
+    for _offset, line in _iter_descriptor_lines(
+        descriptor,
+        "distinct-edge stream",
+    ):
+        triple = _parse_training_stream_row(
+            line,
+            f"distinct-edge stream row {count + 1}",
+        )
+        edge = (
+            triple.subject,
+            int(triple.relation[1:]),
+            triple.object,
+        )
+        if previous is not None and edge <= previous:
+            raise ValueError("distinct-edge stream ordering drift")
+        previous = edge
+        if line != _training_stream_line(
+            triple.training_split,
+            triple.row,
+            triple.subject,
+            edge[1],
+            triple.object,
+        ):
+            raise ValueError("distinct-edge stream canonical row drift")
+        count += 1
+    if count != receipt.distinct_edges:
+        raise ValueError("distinct-edge stream row count drift")
+
+
+def _verify_alias_logical_files(
+    file_fds: Mapping[str, int],
+    receipt: WikidataDerivedViewReceipt,
+) -> None:
+    stream_fd = file_fds["streams/aliases.tsv"]
+    index_fd = file_fds["indexes/aliases.bin"]
+    previous_key: int | None = None
+    count = 0
+    for offset, line in _iter_descriptor_lines(
+        stream_fd,
+        "alias stream",
+    ):
+        alias = _parse_alias_stream_row(
+            line,
+            f"alias stream row {count + 1}",
+        )
+        prefix = alias.canonical_id[:1].encode("ascii")
+        numeric_id = int(alias.canonical_id[1:])
+        key = _alias_key(prefix, numeric_id)
+        if previous_key is not None and key <= previous_key:
+            raise ValueError("alias stream ordering drift")
+        previous_key = key
+        normalized: set[str] = set()
+        for value in alias.aliases:
+            key_value = " ".join(
+                unicodedata.normalize("NFKC", value).split()
+            ).casefold()
+            if not key_value or key_value in normalized:
+                raise ValueError("alias stream contains duplicate aliases")
+            normalized.add(key_value)
+        expected_display = (
+            alias.aliases[0] if alias.aliases else alias.canonical_id
+        )
+        if alias.display != expected_display:
+            raise ValueError("alias stream display selection drift")
+        index_payload = _pread_exact(
+            index_fd,
+            _ALIAS_INDEX_RECORD.size,
+            count * _ALIAS_INDEX_RECORD.size,
+            "alias index record",
+        )
+        indexed_key, indexed_offset, indexed_length = (
+            _ALIAS_INDEX_RECORD.unpack(index_payload)
+        )
+        if (
+            indexed_key != key
+            or indexed_offset != offset
+            or indexed_length != len(line)
+        ):
+            raise ValueError("alias index does not match stream")
+        count += 1
+    if count != receipt.alias_rows:
+        raise ValueError("alias stream row count drift")
+
+
+def _verify_logical_files(
+    file_fds: Mapping[str, int],
+    receipt: WikidataDerivedViewReceipt,
+) -> None:
+    _verify_training_logical_files(file_fds, receipt)
+    _verify_alias_logical_files(file_fds, receipt)
+    _verify_distinct_logical_file(
+        file_fds["streams/distinct-edges.tsv"],
+        receipt,
+    )
+
+
+def _verify_derived_tree(
+    verified_source: VerifiedArchiveSet,
+    view_root: Path,
+    *,
+    expected_generator_commit: str,
+    require_namespace: bool,
+) -> WikidataDerivedView:
+    expected_commit = _validate_commit(
+        expected_generator_commit,
+        "expected generator commit",
+    )
+    root_path = Path(view_root)
+    root_parent_fd = -1
+    root_fd = -1
+    directory_fds: dict[str, int] = {}
+    file_fds: dict[str, int] = {}
+    directory_identities: dict[
+        str,
+        tuple[int, int, int, int, int, int, int | None, int | None],
+    ] = {}
+    file_identities: dict[
+        str,
+        tuple[int, int, int, int, int, int, int | None, int | None],
+    ] = {}
+    try:
+        root_parent_fd, root_name = open_parent_directory(root_path)
+        _require_derived_mode(
+            os.fstat(root_parent_fd),
+            directory=True,
+            description="derived-view parent",
+        )
+        root_fd, root_identity = _open_bound_directory(
+            root_parent_fd,
+            root_name,
+            "derived-view root",
+        )
+        _require_derived_mode(
+            os.fstat(root_fd),
+            directory=True,
+            description="derived-view root",
+        )
+        if list_entries(root_fd) != _VIEW_ROOT_ENTRIES:
+            raise ValueError("derived-view root inventory drift")
+
+        receipt_fd, receipt_identity = _open_bound_file(
+            root_fd,
+            "receipt.json",
+            "derived-view receipt",
+        )
+        file_fds["receipt.json"] = receipt_fd
+        _require_derived_mode(
+            os.fstat(receipt_fd),
+            directory=False,
+            description="derived-view receipt",
+        )
+        receipt_payload = _read_descriptor(
+            receipt_fd,
+            expected_identity=receipt_identity,
+            description="derived-view receipt",
+        )
+        receipt_sha256 = hashlib.sha256(receipt_payload).hexdigest()
+        receipt = WikidataDerivedViewReceipt.from_bytes(
+            receipt_payload,
+            expected_generator_commit=expected_commit,
+        )
+        if require_namespace:
+            if root_path.parent.name != "wikidata":
+                raise ValueError("derived-view namespace parent drift")
+            if root_name != receipt_sha256:
+                raise ValueError("derived-view content-address namespace drift")
+        if receipt.source_lock_sha256 != verified_source.source_lock_sha256:
+            raise ValueError("derived-view source-lock binding drift")
+        if receipt.archives != verified_source.archives:
+            raise ValueError("derived-view archive binding drift")
+        if receipt.members != verified_source.members:
+            raise ValueError("derived-view member binding drift")
+        file_identities["receipt.json"] = receipt_identity
+
+        inventory = {
+            "members": tuple(
+                PurePosixPath(record.path).name for record in receipt.members
+            ),
+            "streams": tuple(
+                PurePosixPath(record.path).name for record in receipt.streams
+            ),
+            "indexes": tuple(
+                PurePosixPath(record.path).name for record in receipt.indexes
+            ),
+        }
+        for directory_name in ("members", "streams", "indexes"):
+            descriptor, identity = _open_bound_directory(
+                root_fd,
+                directory_name,
+                f"derived-view {directory_name} directory",
+            )
+            directory_fds[directory_name] = descriptor
+            directory_identities[directory_name] = identity
+            _require_derived_mode(
+                os.fstat(descriptor),
+                directory=True,
+                description=f"derived-view {directory_name} directory",
+            )
+            expected_names = tuple(sorted(inventory[directory_name]))
+            if list_entries(descriptor) != expected_names:
+                raise ValueError(
+                    f"derived-view {directory_name} inventory drift"
+                )
+
+        records = {
+            record.path: record
+            for record in (
+                *receipt.members,
+                *receipt.streams,
+                *receipt.indexes,
+            )
+        }
+        for relative_path in sorted(records, key=_byte_key):
+            record = records[relative_path]
+            directory_name, name = relative_path.split("/", 1)
+            descriptor, identity = _open_bound_file(
+                directory_fds[directory_name],
+                name,
+                f"derived artifact {relative_path}",
+            )
+            file_fds[relative_path] = descriptor
+            file_identities[relative_path] = identity
+            _require_derived_mode(
+                os.fstat(descriptor),
+                directory=False,
+                description=f"derived artifact {relative_path}",
+            )
+            byte_count, sha256 = _digest_descriptor(
+                descriptor,
+                expected_identity=identity,
+                description=f"derived artifact {relative_path}",
+            )
+            if byte_count != record.bytes or sha256 != record.sha256:
+                raise ValueError(
+                    f"derived artifact digest drift: {relative_path}"
+                )
+
+        _verify_logical_files(file_fds, receipt)
+
+        for relative_path, descriptor in file_fds.items():
+            parent_fd = (
+                root_fd
+                if relative_path == "receipt.json"
+                else directory_fds[relative_path.split("/", 1)[0]]
+            )
+            name = (
+                relative_path
+                if relative_path == "receipt.json"
+                else relative_path.split("/", 1)[1]
+            )
+            _check_named_file(
+                parent_fd,
+                name,
+                descriptor,
+                file_identities[relative_path],
+                f"derived artifact {relative_path}",
+            )
+        for directory_name, descriptor in directory_fds.items():
+            _check_named_directory(
+                root_fd,
+                directory_name,
+                descriptor,
+                directory_identities[directory_name],
+                f"derived-view {directory_name} directory",
+            )
+        _check_named_directory(
+            root_parent_fd,
+            root_name,
+            root_fd,
+            root_identity,
+            "derived-view root",
+        )
+        if list_entries(root_fd) != _VIEW_ROOT_ENTRIES:
+            raise ValueError("derived-view root inventory drift")
+
+        authority = _VerifiedViewAuthority(
+            root_identity=root_identity,
+            directory_identities=MappingProxyType(
+                dict(directory_identities)
+            ),
+            file_identities=MappingProxyType(dict(file_identities)),
+        )
+        return _register_verified_view(
+            WikidataDerivedView(
+                root=root_path,
+                receipt_sha256=receipt_sha256,
+                receipt=receipt,
+            ),
+            authority,
+        )
+    except OSError as error:
+        raise ValueError("derived-view authority is missing or unsafe") from error
+    finally:
+        for descriptor in file_fds.values():
+            os.close(descriptor)
+        for descriptor in directory_fds.values():
+            os.close(descriptor)
+        if root_fd >= 0:
+            os.close(root_fd)
+        if root_parent_fd >= 0:
+            os.close(root_parent_fd)
+
+
+@contextmanager
+def _open_authorized_view_files(
+    view: WikidataDerivedView,
+    relative_paths: tuple[str, ...],
+) -> Iterator[Mapping[str, int]]:
+    if not isinstance(view, WikidataDerivedView):
+        raise ValueError("a verified Wikidata derived view is required")
+    authority = _registered_view_authority(view)
+    if (
+        _validate_sha256(view.receipt_sha256, "view receipt sha256")
+        != view.receipt_sha256
+        or view.root.name != view.receipt_sha256
+        or view.root.parent.name != "wikidata"
+    ):
+        raise ValueError("verified view namespace identity drift")
+    root_parent_fd = -1
+    root_fd = -1
+    receipt_fd = -1
+    directory_fds: dict[str, int] = {}
+    selected_fds: dict[str, int] = {}
+    try:
+        root_parent_fd, root_name = open_parent_directory(view.root)
+        _require_derived_mode(
+            os.fstat(root_parent_fd),
+            directory=True,
+            description="verified-view parent",
+        )
+        root_fd, root_identity = _open_bound_directory(
+            root_parent_fd,
+            root_name,
+            "verified-view root",
+        )
+        _require_derived_mode(
+            os.fstat(root_fd),
+            directory=True,
+            description="verified-view root",
+        )
+        if (
+            root_identity != authority.root_identity
+            or list_entries(root_fd) != _VIEW_ROOT_ENTRIES
+        ):
+            raise ValueError("verified view root identity drift")
+
+        receipt_fd, receipt_identity = _open_bound_file(
+            root_fd,
+            "receipt.json",
+            "verified-view receipt",
+        )
+        if receipt_identity != authority.file_identities["receipt.json"]:
+            raise ValueError("verified view receipt identity drift")
+        payload = _read_descriptor(
+            receipt_fd,
+            expected_identity=receipt_identity,
+            description="verified-view receipt",
+        )
+        if hashlib.sha256(payload).hexdigest() != view.receipt_sha256:
+            raise ValueError("verified view receipt digest drift")
+        receipt = WikidataDerivedViewReceipt.from_bytes(
+            payload,
+            expected_generator_commit=view.receipt.generator_commit,
+        )
+        if receipt != view.receipt:
+            raise ValueError("verified view receipt object drift")
+
+        expected_names = {
+            "members": tuple(
+                PurePosixPath(record.path).name
+                for record in receipt.members
+            ),
+            "streams": tuple(
+                PurePosixPath(record.path).name
+                for record in receipt.streams
+            ),
+            "indexes": tuple(
+                PurePosixPath(record.path).name
+                for record in receipt.indexes
+            ),
+        }
+        for directory_name in ("members", "streams", "indexes"):
+            descriptor, identity = _open_bound_directory(
+                root_fd,
+                directory_name,
+                f"verified-view {directory_name} directory",
+            )
+            if (
+                identity
+                != authority.directory_identities[directory_name]
+                or list_entries(descriptor)
+                != tuple(sorted(expected_names[directory_name]))
+            ):
+                os.close(descriptor)
+                raise ValueError(
+                    f"verified view {directory_name} identity drift"
+                )
+            directory_fds[directory_name] = descriptor
+
+        records = {
+            record.path: record
+            for record in (
+                *receipt.members,
+                *receipt.streams,
+                *receipt.indexes,
+            )
+        }
+        requested = set(relative_paths)
+        if len(requested) != len(relative_paths) or not requested <= set(records):
+            raise ValueError("verified view file request is invalid")
+        for relative_path, record in records.items():
+            directory_name, name = relative_path.split("/", 1)
+            named = entry_lstat(directory_fds[directory_name], name)
+            _require_derived_mode(
+                named,
+                directory=False,
+                description=f"verified-view artifact {relative_path}",
+            )
+            if (
+                relative_path not in authority.file_identities
+                or _file_identity(named)
+                != authority.file_identities[relative_path]
+                or named.st_size != record.bytes
+            ):
+                raise ValueError(
+                    f"verified view artifact identity drift: {relative_path}"
+                )
+            if relative_path not in requested:
+                continue
+            descriptor, identity = _open_bound_file(
+                directory_fds[directory_name],
+                name,
+                f"verified-view artifact {relative_path}",
+            )
+            if (
+                identity != authority.file_identities[relative_path]
+                or os.fstat(descriptor).st_size != record.bytes
+            ):
+                os.close(descriptor)
+                raise ValueError(
+                    f"verified view artifact identity drift: {relative_path}"
+                )
+            selected_fds[relative_path] = descriptor
+        yield MappingProxyType(selected_fds)
+
+        for relative_path, descriptor in selected_fds.items():
+            directory_name, name = relative_path.split("/", 1)
+            _check_named_file(
+                directory_fds[directory_name],
+                name,
+                descriptor,
+                authority.file_identities[relative_path],
+                f"verified-view artifact {relative_path}",
+            )
+        _check_named_file(
+            root_fd,
+            "receipt.json",
+            receipt_fd,
+            authority.file_identities["receipt.json"],
+            "verified-view receipt",
+        )
+        _check_named_directory(
+            root_parent_fd,
+            root_name,
+            root_fd,
+            authority.root_identity,
+            "verified-view root",
+        )
+    except OSError as error:
+        raise ValueError("verified view authority is missing or unsafe") from error
+    finally:
+        for descriptor in selected_fds.values():
+            os.close(descriptor)
+        for descriptor in directory_fds.values():
+            os.close(descriptor)
+        if receipt_fd >= 0:
+            os.close(receipt_fd)
+        if root_fd >= 0:
+            os.close(root_fd)
+        if root_parent_fd >= 0:
+            os.close(root_parent_fd)
+
+
+def verify_wikidata_derived_view(
+    source_lock_path: Path,
+    source_root: Path,
+    view_root: Path,
+    *,
+    expected_generator_commit: str,
+) -> WikidataDerivedView:
+    with _open_verified_archives(
+        Path(source_lock_path),
+        Path(source_root),
+    ) as verified:
+        return _verify_derived_tree(
+            verified,
+            Path(view_root),
+            expected_generator_commit=expected_generator_commit,
+            require_namespace=True,
+        )
+
+
+def iter_v2_training_triples(
+    view: WikidataDerivedView,
+) -> Iterator[V2TrainingTriple]:
+    with _open_authorized_view_files(
+        view,
+        ("streams/training.tsv",),
+    ) as files:
+        counts = {split: 0 for split in TRAINING_SPLITS}
+        current_rank = 0
+        total = 0
+        for _offset, line in _iter_descriptor_lines(
+            files["streams/training.tsv"],
+            "training stream",
+        ):
+            triple = _parse_training_stream_row(
+                line,
+                f"training stream row {total + 1}",
+            )
+            rank = TRAINING_SPLITS.index(triple.training_split)
+            counts[triple.training_split] += 1
+            if (
+                rank < current_rank
+                or triple.row != counts[triple.training_split]
+            ):
+                raise ValueError("training stream ordering drift")
+            current_rank = rank
+            total += 1
+            yield triple
+        if total != view.receipt.training_rows:
+            raise ValueError("training stream row count drift")
+
+
+def iter_v2_aliases(
+    view: WikidataDerivedView,
+) -> Iterator[V2AliasRecord]:
+    with _open_authorized_view_files(
+        view,
+        ("streams/aliases.tsv",),
+    ) as files:
+        previous_key: int | None = None
+        count = 0
+        for _offset, line in _iter_descriptor_lines(
+            files["streams/aliases.tsv"],
+            "alias stream",
+        ):
+            alias = _parse_alias_stream_row(
+                line,
+                f"alias stream row {count + 1}",
+            )
+            key = _alias_key(
+                alias.canonical_id[:1].encode("ascii"),
+                int(alias.canonical_id[1:]),
+            )
+            if previous_key is not None and key <= previous_key:
+                raise ValueError("alias stream ordering drift")
+            previous_key = key
+            count += 1
+            yield alias
+        if count != view.receipt.alias_rows:
+            raise ValueError("alias stream row count drift")
+
+
+def iter_distinct_training_edges(
+    view: WikidataDerivedView,
+) -> Iterator[V2TrainingTriple]:
+    with _open_authorized_view_files(
+        view,
+        ("streams/distinct-edges.tsv",),
+    ) as files:
+        previous: tuple[int, int, int] | None = None
+        count = 0
+        for _offset, line in _iter_descriptor_lines(
+            files["streams/distinct-edges.tsv"],
+            "distinct-edge stream",
+        ):
+            triple = _parse_training_stream_row(
+                line,
+                f"distinct-edge stream row {count + 1}",
+            )
+            edge = (
+                triple.subject,
+                int(triple.relation[1:]),
+                triple.object,
+            )
+            if previous is not None and edge <= previous:
+                raise ValueError("distinct-edge stream ordering drift")
+            previous = edge
+            count += 1
+            yield triple
+        if count != view.receipt.distinct_edges:
+            raise ValueError("distinct-edge stream row count drift")
+
+
+def lookup_training_triple(
+    view: WikidataDerivedView,
+    training_split: str,
+    row: int,
+) -> V2TrainingTriple:
+    if training_split not in TRAINING_SPLITS:
+        raise ValueError("training split is not in the frozen contract")
+    if type(row) is not int or row <= 0:
+        raise ValueError("training row must be a positive integer")
+    index_paths = {
+        "inductive_train": "indexes/inductive-training-offsets.bin",
+        "transductive_train": "indexes/transductive-training-offsets.bin",
+    }
+    paths = (
+        "streams/training.tsv",
+        index_paths["inductive_train"],
+        index_paths["transductive_train"],
+    )
+    with _open_authorized_view_files(view, paths) as files:
+        index_by_path = {
+            record.path: record for record in view.receipt.indexes
+        }
+        selected_path = index_paths[training_split]
+        selected_index = index_by_path[selected_path]
+        if row > selected_index.count:
+            raise IndexError("training row is outside the indexed split")
+        index_fd = files[selected_path]
+        offset = _UINT64.unpack(
+            _pread_exact(
+                index_fd,
+                _UINT64.size,
+                (row - 1) * _UINT64.size,
+                "training offset index record",
+            )
+        )[0]
+        if row < selected_index.count:
+            next_offset = _UINT64.unpack(
+                _pread_exact(
+                    index_fd,
+                    _UINT64.size,
+                    row * _UINT64.size,
+                    "next training offset index record",
+                )
+            )[0]
+        elif training_split == "inductive_train":
+            transductive = index_by_path[index_paths["transductive_train"]]
+            if transductive.count:
+                next_offset = _UINT64.unpack(
+                    _pread_exact(
+                        files[index_paths["transductive_train"]],
+                        _UINT64.size,
+                        0,
+                        "first transductive offset index record",
+                    )
+                )[0]
+            else:
+                next_offset = os.fstat(
+                    files["streams/training.tsv"]
+                ).st_size
+        else:
+            next_offset = os.fstat(files["streams/training.tsv"]).st_size
+        stream_size = os.fstat(files["streams/training.tsv"]).st_size
+        if (
+            offset >= next_offset
+            or next_offset > stream_size
+            or next_offset - offset > _SOURCE_LINE_LIMIT
+        ):
+            raise ValueError("training offset index bounds drift")
+        line = _pread_exact(
+            files["streams/training.tsv"],
+            next_offset - offset,
+            offset,
+            "indexed training row",
+        )
+        triple = _parse_training_stream_row(line, "indexed training row")
+        if triple.training_split != training_split or triple.row != row:
+            raise ValueError("indexed training key does not match stream row")
+        return triple
+
+
+def lookup_alias(
+    view: WikidataDerivedView,
+    canonical_id: str,
+) -> V2AliasRecord | None:
+    if type(canonical_id) is not str:
+        raise TypeError("alias canonical ID must be a string")
+    try:
+        encoded = canonical_id.encode("ascii")
+    except UnicodeEncodeError as error:
+        raise ValueError("alias canonical ID is not canonical") from error
+    if encoded[:1] not in {b"Q", b"P"}:
+        raise ValueError("alias canonical ID is not canonical")
+    number = _numeric_identifier(
+        encoded,
+        encoded[:1],
+        "alias canonical ID",
+        maximum=_ALIAS_NUMERIC_MAX,
+    )
+    target = _alias_key(encoded[:1], number)
+    with _open_authorized_view_files(
+        view,
+        ("streams/aliases.tsv", "indexes/aliases.bin"),
+    ) as files:
+        index = next(
+            record
+            for record in view.receipt.indexes
+            if record.path == "indexes/aliases.bin"
+        )
+        low = 0
+        high = index.count
+        index_fd = files["indexes/aliases.bin"]
+        while low < high:
+            middle = (low + high) // 2
+            payload = _pread_exact(
+                index_fd,
+                _ALIAS_INDEX_RECORD.size,
+                middle * _ALIAS_INDEX_RECORD.size,
+                "alias index record",
+            )
+            key, offset, length = _ALIAS_INDEX_RECORD.unpack(payload)
+            if key < target:
+                low = middle + 1
+            elif key > target:
+                high = middle
+            else:
+                stream_size = os.fstat(
+                    files["streams/aliases.tsv"]
+                ).st_size
+                if (
+                    length <= 0
+                    or length > _SOURCE_LINE_LIMIT
+                    or offset > stream_size
+                    or length > stream_size - offset
+                ):
+                    raise ValueError("alias index bounds drift")
+                line = _pread_exact(
+                    files["streams/aliases.tsv"],
+                    length,
+                    offset,
+                    "indexed alias row",
+                )
+                alias = _parse_alias_stream_row(line, "indexed alias row")
+                if alias.canonical_id != canonical_id:
+                    raise ValueError(
+                        "indexed alias key does not match stream row"
+                    )
+                return alias
+        return None
+
+
+def _create_private_directory(parent_fd: int, name: str) -> int:
+    os.mkdir(name, mode=0o700, dir_fd=parent_fd)
+    fsync_directory(parent_fd)
+    descriptor, created = open_directory_at(parent_fd, name)
+    if created:
+        os.close(descriptor)
+        raise ValueError("private directory creation identity drift")
+    _require_derived_mode(
+        os.fstat(descriptor),
+        directory=True,
+        description=f"private derived directory {name}",
+    )
+    return descriptor
+
+
+def _allocate_build_directory(
+    wikidata_fd: int,
+    source_lock_sha256: str,
+    generator_commit: str,
+) -> tuple[str, int]:
+    prefix = (
+        f".build-{source_lock_sha256[:16]}-{generator_commit[:16]}-"
+    )
+    for _attempt in range(32):
+        name = prefix + secrets.token_hex(8)
+        try:
+            descriptor = _create_private_directory(wikidata_fd, name)
+        except FileExistsError:
+            continue
+        return name, descriptor
+    raise FileExistsError("could not allocate a private derived-view sibling")
+
+
+def _remove_private_directory(parent_fd: int, name: str) -> None:
+    try:
+        descriptor, _created = open_directory_at(parent_fd, name)
+    except FileNotFoundError:
+        return
+    try:
+        _require_derived_mode(
+            os.fstat(descriptor),
+            directory=True,
+            description=f"owned private directory {name}",
+        )
+        for child_name in list_entries(descriptor):
+            metadata = entry_lstat(descriptor, child_name)
+            if stat.S_ISDIR(metadata.st_mode):
+                _remove_private_directory(descriptor, child_name)
+            elif stat.S_ISREG(metadata.st_mode):
+                _require_derived_mode(
+                    metadata,
+                    directory=False,
+                    description=f"owned private file {child_name}",
+                )
+                os.unlink(child_name, dir_fd=descriptor)
+            else:
+                raise ValueError(
+                    f"owned private entry is unsafe: {child_name}"
+                )
+        fsync_directory(descriptor)
+    finally:
+        os.close(descriptor)
+    os.rmdir(name, dir_fd=parent_fd)
+    fsync_directory(parent_fd)
+
+
+def build_wikidata_derived_view(
+    source_lock_path: Path,
+    source_root: Path,
+    output_root: Path,
+    *,
+    expected_generator_commit: str,
+) -> WikidataDerivedView:
+    generator_commit = _validate_commit(
+        expected_generator_commit,
+        "expected generator commit",
+    )
+    output_fd = -1
+    wikidata_fd = -1
+    build_fd = -1
+    members_fd = -1
+    streams_fd = -1
+    indexes_fd = -1
+    work_fd = -1
+    build_name = ""
+    build_path: Path | None = None
+    output_path = Path(output_root)
+    try:
+        output_fd = open_directory_path(
+            output_path,
+            create=True,
+            mode=0o700,
+        )
+        _require_owned_mode(
+            os.fstat(output_fd),
+            directory=True,
+            description="derived-view output root",
+        )
+        wikidata_fd, _created = open_directory_at(
+            output_fd,
+            "wikidata",
+            create=True,
+            mode=0o700,
+        )
+        _require_derived_mode(
+            os.fstat(wikidata_fd),
+            directory=True,
+            description="Wikidata derived-view namespace",
+        )
+
+        with _open_verified_archives(
+            Path(source_lock_path),
+            Path(source_root),
+        ) as verified:
+            build_name, build_fd = _allocate_build_directory(
+                wikidata_fd,
+                verified.source_lock_sha256,
+                generator_commit,
+            )
+            build_path = output_path / "wikidata" / build_name
+            members_fd = _create_private_directory(build_fd, "members")
+            streams_fd = _create_private_directory(build_fd, "streams")
+            indexes_fd = _create_private_directory(build_fd, "indexes")
+            work_fd = _create_private_directory(build_fd, ".work")
+
+            members = _materialize_member_files(verified, members_fd)
+            (
+                training_stream,
+                distinct_stream,
+                training_indexes,
+                training_rows,
+                distinct_edges,
+            ) = _build_training_artifacts(
+                members_fd,
+                streams_fd,
+                indexes_fd,
+                work_fd,
+            )
+            alias_stream, alias_index, alias_rows = (
+                _build_alias_artifacts(
+                    members_fd,
+                    streams_fd,
+                    indexes_fd,
+                    work_fd,
+                )
+            )
+            if list_entries(work_fd):
+                raise ValueError("external-sort temporary inventory drift")
+            os.close(work_fd)
+            work_fd = -1
+            os.rmdir(".work", dir_fd=build_fd)
+            fsync_directory(build_fd)
+
+            receipt = WikidataDerivedViewReceipt(
+                format=RECEIPT_FORMAT,
+                schema_version=RECEIPT_SCHEMA_VERSION,
+                source_lock_sha256=verified.source_lock_sha256,
+                generator_commit=generator_commit,
+                archives=verified.archives,
+                members=members,
+                streams=tuple(
+                    sorted(
+                        (
+                            training_stream,
+                            alias_stream,
+                            distinct_stream,
+                        ),
+                        key=lambda record: _byte_key(record.path),
+                    )
+                ),
+                indexes=tuple(
+                    sorted(
+                        (
+                            alias_index,
+                            *training_indexes,
+                        ),
+                        key=lambda record: _byte_key(record.path),
+                    )
+                ),
+                training_rows=training_rows,
+                alias_rows=alias_rows,
+                distinct_edges=distinct_edges,
+                overlap_audit_passed=True,
+            )
+            receipt_payload = receipt.to_bytes()
+            receipt_sha256 = hashlib.sha256(receipt_payload).hexdigest()
+            receipt_writer = _ArtifactWriter(
+                build_fd,
+                "receipt.json",
+                "receipt.json",
+            )
+            try:
+                receipt_writer.write(receipt_payload)
+                receipt_writer.finish()
+            except BaseException:
+                receipt_writer.abort()
+                raise
+
+            fsync_directory(members_fd)
+            fsync_directory(streams_fd)
+            fsync_directory(indexes_fd)
+            fsync_directory(build_fd)
+            _verify_derived_tree(
+                verified,
+                build_path,
+                expected_generator_commit=generator_commit,
+                require_namespace=False,
+            )
+
+        try:
+            atomic_rename_noreplace(
+                wikidata_fd,
+                build_name,
+                wikidata_fd,
+                receipt_sha256,
+            )
+        except FileExistsError:
+            winner = _verify_derived_tree(
+                verified,
+                output_path / "wikidata" / receipt_sha256,
+                expected_generator_commit=generator_commit,
+                require_namespace=True,
+            )
+            return winner
+        fsync_directory(wikidata_fd)
+        return _verify_derived_tree(
+            verified,
+            output_path / "wikidata" / receipt_sha256,
+            expected_generator_commit=generator_commit,
+            require_namespace=True,
+        )
+    except OSError as error:
+        raise ValueError(
+            "Wikidata derived-view publication is missing or unsafe"
+        ) from error
+    finally:
+        if build_name and wikidata_fd >= 0:
+            _remove_private_directory(wikidata_fd, build_name)
+        for descriptor in (
+            work_fd,
+            indexes_fd,
+            streams_fd,
+            members_fd,
+            build_fd,
+            wikidata_fd,
+            output_fd,
+        ):
+            if descriptor >= 0:
+                os.close(descriptor)

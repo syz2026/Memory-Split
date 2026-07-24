@@ -337,6 +337,19 @@ def _artifact(path: str, *, size: int = 0) -> dict[str, object]:
     }
 
 
+def _index_artifact(
+    path: str,
+    *,
+    count: int = 0,
+    record_width: int,
+) -> dict[str, object]:
+    return {
+        **_artifact(path, size=count * record_width),
+        "count": count,
+        "record_width": record_width,
+    }
+
+
 def _valid_receipt_dict() -> dict[str, object]:
     members = sorted(
         (
@@ -353,9 +366,15 @@ def _valid_receipt_dict() -> dict[str, object]:
         "format": RECEIPT_FORMAT,
         "generator_commit": EXPECTED_GENERATOR_COMMIT,
         "indexes": [
-            _artifact("indexes/aliases.bin"),
-            _artifact("indexes/inductive-training-offsets.bin"),
-            _artifact("indexes/transductive-training-offsets.bin"),
+            _index_artifact("indexes/aliases.bin", record_width=24),
+            _index_artifact(
+                "indexes/inductive-training-offsets.bin",
+                record_width=8,
+            ),
+            _index_artifact(
+                "indexes/transductive-training-offsets.bin",
+                record_width=8,
+            ),
         ],
         "members": [_artifact(path) for path in members],
         "overlap_audit_passed": True,
@@ -379,6 +398,9 @@ def test_receipt_parser_rejects_open_missing_and_noncanonical_fields():
         ArtifactRecord(path=path, bytes=0, sha256=EMPTY_SHA256)
         for path in ARCHIVE_PATHS
     )
+    assert tuple(
+        (record.count, record.record_width) for record in receipt.indexes
+    ) == ((0, 24), (0, 8), (0, 8))
 
     malformed: list[bytes] = []
     unknown = copy.deepcopy(valid)
@@ -390,6 +412,12 @@ def test_receipt_parser_rejects_open_missing_and_noncanonical_fields():
     open_artifact = copy.deepcopy(valid)
     open_artifact["archives"][0]["future_field"] = "open"
     malformed.append(canonical_json_bytes(open_artifact))
+    open_index = copy.deepcopy(valid)
+    open_index["indexes"][0]["future_field"] = "open"
+    malformed.append(canonical_json_bytes(open_index))
+    missing_index_count = copy.deepcopy(valid)
+    missing_index_count["indexes"][0].pop("count")
+    malformed.append(canonical_json_bytes(missing_index_count))
     boolean_count = copy.deepcopy(valid)
     boolean_count["training_rows"] = False
     malformed.append(canonical_json_bytes(boolean_count))
@@ -431,6 +459,7 @@ def test_receipt_parser_rejects_nonempty_training_with_zero_distinct_edges():
     invalid["training_rows"] = 1
     invalid["streams"][2]["bytes"] = 1
     invalid["indexes"][1]["bytes"] = 8
+    invalid["indexes"][1]["count"] = 1
 
     with pytest.raises(ValueError, match="training.*distinct edge"):
         WikidataDerivedViewReceipt.from_bytes(canonical_json_bytes(invalid))
@@ -799,3 +828,365 @@ def test_archive_authority_leaves_source_root_byte_identical(
         assert len(verified.archives) == 3
         assert len(verified.members) == 8
     assert _source_snapshot(archive_authority.source_root) == before
+
+
+def _authority_from_entries(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    fixture_source_lock: FixtureSourceLock,
+    entries: dict[str, list[_TarEntry]],
+) -> _AuthorityFixture:
+    return _install_archive_authority(
+        tmp_path,
+        monkeypatch,
+        fixture_source_lock,
+        {
+            name: _tar_bytes(archive_entries)
+            for name, archive_entries in entries.items()
+        },
+    )
+
+
+def _replace_member(
+    entries: dict[str, list[_TarEntry]],
+    archive_name: str,
+    member_name: str,
+    payload: bytes,
+) -> None:
+    archive_entries = entries[archive_name]
+    index = next(
+        position
+        for position, entry in enumerate(archive_entries)
+        if entry.name == member_name
+    )
+    archive_entries[index] = replace(archive_entries[index], payload=payload)
+
+
+def _build_view(authority: _AuthorityFixture, output_root: Path):
+    return wikidata_source_module.build_wikidata_derived_view(
+        authority.source_lock_path,
+        authority.source_root,
+        output_root,
+        expected_generator_commit=EXPECTED_GENERATOR_COMMIT,
+    )
+
+
+def _view_payloads(view) -> dict[str, bytes]:
+    return {
+        path: (view.root / path).read_bytes()
+        for path in (
+            "receipt.json",
+            "streams/training.tsv",
+            "streams/aliases.tsv",
+            "streams/distinct-edges.tsv",
+            "indexes/inductive-training-offsets.bin",
+            "indexes/transductive-training-offsets.bin",
+            "indexes/aliases.bin",
+        )
+    }
+
+
+def _alias_stream_row(
+    canonical_id: str,
+    display: str,
+    aliases: list[str],
+) -> bytes:
+    return (
+        canonical_id.encode("utf-8")
+        + b"\t"
+        + canonical_json_bytes({"aliases": aliases, "display": display})
+    )
+
+
+def test_repeated_builds_produce_identical_receipt_streams_and_indexes(
+    archive_authority: _AuthorityFixture,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    source_before = _source_snapshot(archive_authority.source_root)
+
+    first = _build_view(archive_authority, tmp_path / "derived-a")
+    monkeypatch.setattr(wikidata_source_module, "_SORT_CHUNK_BYTES", 64)
+    monkeypatch.setattr(wikidata_source_module, "_SORT_CHUNK_RECORDS", 1)
+    monkeypatch.setattr(wikidata_source_module, "_SORT_MERGE_FAN_IN", 2)
+    second = _build_view(archive_authority, tmp_path / "derived-b")
+
+    assert first.receipt_sha256 == second.receipt_sha256
+    assert first.root == (
+        tmp_path / "derived-a" / "wikidata" / first.receipt_sha256
+    )
+    assert second.root == (
+        tmp_path / "derived-b" / "wikidata" / second.receipt_sha256
+    )
+    assert _view_payloads(first) == _view_payloads(second)
+    assert tuple(
+        (record.path, record.count, record.record_width)
+        for record in first.receipt.indexes
+    ) == (
+        ("indexes/aliases.bin", 2, 24),
+        ("indexes/inductive-training-offsets.bin", 1, 8),
+        ("indexes/transductive-training-offsets.bin", 1, 8),
+    )
+    assert _source_snapshot(archive_authority.source_root) == source_before
+
+
+def test_training_and_alias_order_matches_frozen_contract(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    fixture_source_lock: FixtureSourceLock,
+):
+    entries = _base_archive_entries()
+    _replace_member(
+        entries,
+        "wikidata5m_alias.tar.gz",
+        "wikidata5m_entity.txt",
+        (
+            b"Q10\tTen\n"
+            b"Q2\t  Second   Entity \tAlias Two\n"
+        ),
+    )
+    _replace_member(
+        entries,
+        "wikidata5m_alias.tar.gz",
+        "wikidata5m_relation.txt",
+        b"P10\tRelation Ten\nP2\tRelation Two\n",
+    )
+    _replace_member(
+        entries,
+        "wikidata5m_inductive.tar.gz",
+        "wikidata5m_inductive_train.txt",
+        b"Q10\tP2\tQ3\nQ2\tP10\tQ1\n",
+    )
+    _replace_member(
+        entries,
+        "wikidata5m_transductive.tar.gz",
+        "wikidata5m_transductive_train.txt",
+        b"Q1\tP1\tQ4\n",
+    )
+    authority = _authority_from_entries(
+        tmp_path,
+        monkeypatch,
+        fixture_source_lock,
+        entries,
+    )
+
+    view = _build_view(authority, tmp_path / "derived")
+
+    assert (view.root / "streams/training.tsv").read_bytes() == (
+        b"inductive_train\t1\tQ10\tP2\tQ3\n"
+        b"inductive_train\t2\tQ2\tP10\tQ1\n"
+        b"transductive_train\t1\tQ1\tP1\tQ4\n"
+    )
+    assert (view.root / "streams/aliases.tsv").read_bytes() == b"".join(
+        (
+            _alias_stream_row(
+                "Q2",
+                "Second Entity",
+                ["Second Entity", "Alias Two"],
+            ),
+            _alias_stream_row("Q10", "Ten", ["Ten"]),
+            _alias_stream_row("P2", "Relation Two", ["Relation Two"]),
+            _alias_stream_row("P10", "Relation Ten", ["Relation Ten"]),
+        )
+    )
+    assert (view.root / "streams/distinct-edges.tsv").read_bytes() == (
+        b"transductive_train\t1\tQ1\tP1\tQ4\n"
+        b"inductive_train\t2\tQ2\tP10\tQ1\n"
+        b"inductive_train\t1\tQ10\tP2\tQ3\n"
+    )
+    assert [
+        (
+            record.training_split,
+            record.row,
+            record.subject,
+            record.relation,
+            record.object,
+        )
+        for record in wikidata_source_module.iter_v2_training_triples(view)
+    ] == [
+        ("inductive_train", 1, 10, "P2", 3),
+        ("inductive_train", 2, 2, "P10", 1),
+        ("transductive_train", 1, 1, "P1", 4),
+    ]
+    assert [
+        (record.canonical_id, record.kind, record.display, record.aliases)
+        for record in wikidata_source_module.iter_v2_aliases(view)
+    ] == [
+        ("Q2", "entity", "Second Entity", ("Second Entity", "Alias Two")),
+        ("Q10", "entity", "Ten", ("Ten",)),
+        ("P2", "relation", "Relation Two", ("Relation Two",)),
+        ("P10", "relation", "Relation Ten", ("Relation Ten",)),
+    ]
+
+
+def test_alias_ambiguity_is_removed_globally(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    fixture_source_lock: FixtureSourceLock,
+):
+    entries = _base_archive_entries()
+    _replace_member(
+        entries,
+        "wikidata5m_alias.tar.gz",
+        "wikidata5m_entity.txt",
+        (
+            "Q1\t Shared \tUnique One\t unique   one \tＳＯＬＯ\n"
+            "Q2\tshared\tUnique Two\n"
+            "Q3\tshared\n"
+        ).encode("utf-8"),
+    )
+    _replace_member(
+        entries,
+        "wikidata5m_alias.tar.gz",
+        "wikidata5m_relation.txt",
+        b"P1\tSHARED\trelation-only\n",
+    )
+    authority = _authority_from_entries(
+        tmp_path,
+        monkeypatch,
+        fixture_source_lock,
+        entries,
+    )
+
+    view = _build_view(authority, tmp_path / "derived")
+
+    assert [
+        (record.canonical_id, record.display, record.aliases)
+        for record in wikidata_source_module.iter_v2_aliases(view)
+    ] == [
+        ("Q1", "Unique One", ("Unique One", "SOLO")),
+        ("Q2", "Unique Two", ("Unique Two",)),
+        ("Q3", "Q3", ()),
+        ("P1", "relation-only", ("relation-only",)),
+    ]
+
+
+def test_indexed_lookup_matches_streaming_without_archive_rescan(
+    archive_authority: _AuthorityFixture,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    view = _build_view(archive_authority, tmp_path / "derived")
+    triples = list(wikidata_source_module.iter_v2_training_triples(view))
+    aliases = {
+        record.canonical_id: record
+        for record in wikidata_source_module.iter_v2_aliases(view)
+    }
+
+    def reject_archive_rescan(*_args, **_kwargs):
+        raise AssertionError("lookup reopened a source archive")
+
+    monkeypatch.setattr(
+        wikidata_source_module,
+        "_open_verified_archives",
+        reject_archive_rescan,
+    )
+
+    for triple in triples:
+        assert wikidata_source_module.lookup_training_triple(
+            view,
+            triple.training_split,
+            triple.row,
+        ) == triple
+    for canonical_id, alias in aliases.items():
+        assert (
+            wikidata_source_module.lookup_alias(view, canonical_id)
+            == alias
+        )
+    assert wikidata_source_module.lookup_alias(view, "Q999999") is None
+
+    caller_constructed = wikidata_source_module.WikidataDerivedView(
+        root=view.root,
+        receipt_sha256=view.receipt_sha256,
+        receipt=view.receipt,
+    )
+    with pytest.raises(ValueError, match="verified"):
+        wikidata_source_module.lookup_alias(caller_constructed, "Q1")
+
+
+@pytest.mark.parametrize("attack", ["overlap", "malformed"])
+def test_train_sealed_overlap_and_malformed_rows_fail_before_publish(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    fixture_source_lock: FixtureSourceLock,
+    attack: str,
+):
+    entries = _base_archive_entries()
+    if attack == "overlap":
+        _replace_member(
+            entries,
+            "wikidata5m_inductive.tar.gz",
+            "wikidata5m_inductive_test.txt",
+            b"Q1\tP1\tQ2\n",
+        )
+    else:
+        _replace_member(
+            entries,
+            "wikidata5m_inductive.tar.gz",
+            "wikidata5m_inductive_train.txt",
+            b"Q1\tP1\n",
+        )
+    authority = _authority_from_entries(
+        tmp_path,
+        monkeypatch,
+        fixture_source_lock,
+        entries,
+    )
+    output_root = tmp_path / "derived"
+
+    with pytest.raises(ValueError, match="overlap|tab-separated"):
+        _build_view(authority, output_root)
+
+    wikidata_root = output_root / "wikidata"
+    assert not wikidata_root.exists() or not tuple(wikidata_root.iterdir())
+
+
+def test_no_replace_publication_reuses_only_a_fully_verified_winner(
+    archive_authority: _AuthorityFixture,
+    tmp_path: Path,
+):
+    output_root = tmp_path / "derived"
+    first = _build_view(archive_authority, output_root)
+    first_identity = first.root.stat().st_ino
+
+    reused = _build_view(archive_authority, output_root)
+
+    assert reused.root == first.root
+    assert reused.root.stat().st_ino == first_identity
+    assert tuple(path.name for path in (output_root / "wikidata").iterdir()) == (
+        first.receipt_sha256,
+    )
+
+    index_path = first.root / "indexes/aliases.bin"
+    attacked = bytearray(index_path.read_bytes())
+    attacked[-1] ^= 1
+    index_path.write_bytes(attacked)
+    with pytest.raises(ValueError, match="drift|digest|index"):
+        _build_view(archive_authority, output_root)
+
+
+@pytest.mark.parametrize(
+    "relative_path",
+    ["streams/training.tsv", "indexes/aliases.bin"],
+)
+def test_stream_or_index_drift_fails_verification(
+    archive_authority: _AuthorityFixture,
+    tmp_path: Path,
+    relative_path: str,
+):
+    view = _build_view(
+        archive_authority,
+        tmp_path / relative_path.split("/", 1)[0],
+    )
+    attacked_path = view.root / relative_path
+    attacked = bytearray(attacked_path.read_bytes())
+    attacked[len(attacked) // 2] ^= 1
+    attacked_path.write_bytes(attacked)
+
+    with pytest.raises(ValueError, match="drift|digest|canonical|index"):
+        wikidata_source_module.verify_wikidata_derived_view(
+            archive_authority.source_lock_path,
+            archive_authority.source_root,
+            view.root,
+            expected_generator_commit=EXPECTED_GENERATOR_COMMIT,
+        )
