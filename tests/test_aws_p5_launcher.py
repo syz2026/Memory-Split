@@ -753,6 +753,27 @@ def test_launcher_rejects_unassigned_seed(tmp_path, seed):
         _load_fixture_plan(fixture, seed=seed)
 
 
+def test_legacy_launcher_omits_checkpoint_request_token_environment(
+    tmp_path,
+):
+    plan = _load_fixture_plan(_launcher_fixture(tmp_path))
+
+    assert plan.run_manifest_sha256 is None
+    for launch in plan.arms:
+        assert launch.request_token_path is None
+        env_values = {
+            launch.argv[index + 1]
+            for index, value in enumerate(launch.argv[:-1])
+            if value == "--env"
+        }
+        assert not any(
+            value.startswith("MS_CHECKPOINT_REQUEST_TOKEN_FILE=")
+            or value.startswith("MS_CHECKPOINT_REQUEST_ARM=")
+            for value in env_values
+        )
+        assert "MS_RANK_ZERO_PID_FILE=/output/rank-zero.pid" in env_values
+
+
 def test_launcher_rejects_partial_pair(tmp_path):
     fixture = _launcher_fixture(tmp_path)
     manifest = deepcopy(fixture["manifest"])

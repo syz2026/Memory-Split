@@ -202,7 +202,7 @@ class ArmLaunch:
     scientific_config_sha256: str
     out_dir: Path
     checkpoint_path: Path
-    request_token_path: Path
+    request_token_path: Path | None
     rank_zero_pid_file: Path
     cidfile_path: Path
     container_name: str
@@ -1359,8 +1359,10 @@ def load_launch_plan(
         checkpoint_path = _inside_output(
             scratch, checkpoint_relative, label=f"{arm} checkpoint"
         )
-        request_token_path = checkpoint_path.with_name(
-            CHECKPOINT_REQUEST_TOKEN_FILENAME
+        request_token_path = (
+            checkpoint_path.with_name(CHECKPOINT_REQUEST_TOKEN_FILENAME)
+            if manifest_schema == 2
+            else None
         )
         pid_path = _inside_output(
             scratch, pid_relative, label=f"{arm} rank-zero PID file"
@@ -1440,6 +1442,19 @@ def load_launch_plan(
         ):
             raise LaunchError("container bind-mount path contains unsafe characters")
         child_environment = {"PATH": "/usr/bin:/bin"}
+        request_token_environment = (
+            (
+                "--env",
+                (
+                    f"{CHECKPOINT_REQUEST_TOKEN_FILE_ENV}="
+                    f"/output/run/{CHECKPOINT_REQUEST_TOKEN_FILENAME}"
+                ),
+                "--env",
+                f"{CHECKPOINT_REQUEST_ARM_ENV}={arm}",
+            )
+            if manifest_schema == 2
+            else ()
+        )
         container_argv = (
             "docker",
             "run",
@@ -1485,13 +1500,7 @@ def load_launch_plan(
             f"MS_DATA_LOADER_WORKERS={workers}",
             "--env",
             "MS_RANK_ZERO_PID_FILE=/output/rank-zero.pid",
-            "--env",
-            (
-                f"{CHECKPOINT_REQUEST_TOKEN_FILE_ENV}="
-                f"/output/run/{CHECKPOINT_REQUEST_TOKEN_FILENAME}"
-            ),
-            "--env",
-            f"{CHECKPOINT_REQUEST_ARM_ENV}={arm}",
+            *request_token_environment,
             "--env",
             "OMP_NUM_THREADS=1",
             "--env",
@@ -2583,6 +2592,12 @@ def _production_checkpoint_scheduler(
         or plan.source_tree is None
     ):
         raise LaunchError("v3 checkpoint mirror context is incomplete")
+    launches = {launch.arm: launch for launch in plan.arms}
+    if any(launches[arm].request_token_path is None for arm in _ARMS):
+        raise LaunchError("v3 checkpoint request token paths are incomplete")
+    request_token_paths = {
+        arm: launches[arm].request_token_path for arm in _ARMS
+    }
     staging_root = plan.scratch_root / "staging" / "checkpoint-mirror"
     aws_home = plan.scratch_root / "staging" / "checkpoint-aws-home"
     aws_home.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -2606,7 +2621,6 @@ def _production_checkpoint_scheduler(
             seconds=scheduler.fresh_at - monotonic_origin
         )
         deadline = requested + timedelta(seconds=1200)
-        launches = {launch.arm: launch for launch in plan.arms}
         return CheckpointMirrorRequest(
             seed=plan.seed,
             reason=reason,
@@ -2631,9 +2645,7 @@ def _production_checkpoint_scheduler(
             checkpoint_paths={
                 arm: launches[arm].checkpoint_path for arm in _ARMS
             },
-            request_token_paths={
-                arm: launches[arm].request_token_path for arm in _ARMS
-            },
+            request_token_paths=request_token_paths,
             config_sha256={
                 arm: launches[arm].config_sha256 for arm in _ARMS
             },

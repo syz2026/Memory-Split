@@ -1050,6 +1050,8 @@ def test_sigusr1_handler_only_requests_checkpoint_until_safe_boundary(
     cfg = tiny_cfg(tmp_path, bp, mp)
     pid_path = tmp_path / "rank-zero.pid"
     installed = {}
+    monkeypatch.delenv("MS_CHECKPOINT_REQUEST_TOKEN_FILE", raising=False)
+    monkeypatch.delenv("MS_CHECKPOINT_REQUEST_ARM", raising=False)
     monkeypatch.setenv("MS_RANK_ZERO_PID_FILE", str(pid_path))
     monkeypatch.setattr(signal, "getsignal", lambda signum: f"previous-{signum}")
 
@@ -1065,6 +1067,11 @@ def test_sigusr1_handler_only_requests_checkpoint_until_safe_boundary(
 
     assert trainer._service_checkpoint_request() is True
     assert torch.load(trainer.ckpt_path, weights_only=False)["step"] == 0
+    metadata = json.loads(
+        (trainer.out_dir / "ckpt.meta.json").read_text(encoding="ascii")
+    )
+    assert metadata["request_token"] is None
+    assert trainer.checkpoint_request_token_path is None
     trainer.close()
 
 

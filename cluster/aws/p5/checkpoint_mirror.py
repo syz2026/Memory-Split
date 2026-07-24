@@ -437,11 +437,17 @@ class ForkedCheckpointMirrorAttempt:
                 return
             self._chunks.append(chunk)
 
+    def _run_cancel_cleanup(self) -> None:
+        cleanup = self._cancel_cleanup
+        self._cancel_cleanup = None
+        if cleanup is not None:
+            cleanup()
+
     def poll(self) -> tuple[bool, PublishedCheckpointPair | None]:
         if self._pid is None:
             raise RuntimeError("checkpoint mirror attempt was already consumed")
         self._drain_pipe()
-        waited, _status = os.waitpid(self._pid, os.WNOHANG)
+        waited, status = os.waitpid(self._pid, os.WNOHANG)
         if waited == 0:
             return False, None
         self._drain_pipe()
@@ -449,18 +455,21 @@ class ForkedCheckpointMirrorAttempt:
         os.close(self._read_fd)
         self._read_fd = None
         self._pid = None
-        self._cancel_cleanup = None
+        if not os.WIFEXITED(status) or os.WEXITSTATUS(status) != 0:
+            self._run_cancel_cleanup()
+            return True, None
         try:
             ok, value = pickle.loads(b"".join(self._chunks))
         except Exception:
+            self._run_cancel_cleanup()
             return True, None
-        if not ok or not isinstance(value, PublishedCheckpointPair):
+        if ok is not True or not isinstance(value, PublishedCheckpointPair):
+            self._run_cancel_cleanup()
             return True, None
+        self._cancel_cleanup = None
         return True, value
 
     def cancel(self) -> None:
-        cleanup = self._cancel_cleanup
-        self._cancel_cleanup = None
         try:
             if self._pid is not None:
                 try:
@@ -476,8 +485,7 @@ class ForkedCheckpointMirrorAttempt:
                 os.close(self._read_fd)
                 self._read_fd = None
         finally:
-            if cleanup is not None:
-                cleanup()
+            self._run_cancel_cleanup()
 
 
 class CheckpointMirrorScheduler:
