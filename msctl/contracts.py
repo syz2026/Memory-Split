@@ -407,6 +407,20 @@ def _verify_release_internals(
     )
     aws_provider = release_value["provider"] in AWS_GPU_PROFILES
     aws_package = aws_provider and "package_format_version" in metadata
+    aws_gpu_v3_provider = release_value["provider"] in {
+        AWS_P5_V3_PROFILE,
+        AWS_P6_B300_V3_PROFILE,
+    }
+    aws_gpu_v3_package = (
+        aws_gpu_v3_provider
+        and aws_package
+        and metadata.get("package_format_version") == "aws-gpu-v3"
+    )
+    if aws_gpu_v3_provider and not aws_gpu_v3_package:
+        raise _release_error(
+            "RELEASE_INTERNAL_INVALID",
+            "AWS GPU v3 release package format is unsupported",
+        )
     if aws_package:
         metadata_fields = {
             "schema_version",
@@ -421,6 +435,14 @@ def _verify_release_internals(
             "config_sha256",
             "members",
         }
+        if aws_gpu_v3_package:
+            metadata_fields |= {
+                "selected_profile_id",
+                "preregistration",
+                "hardware_amendment",
+                "container_base_lock",
+                "contract_locks",
+            }
     elif aws_provider:
         metadata_fields = {
             "schema_version",
@@ -563,11 +585,20 @@ def _verify_release_internals(
             "internal profile hash is not bound to its member",
         )
     if aws_package:
+        package_format_version = metadata["package_format_version"]
         if (
-            not isinstance(metadata["package_format_version"], str)
-            or not metadata["package_format_version"]
-            or metadata["package_format_version"]
-            != release_value["package_format_version"]
+            package_format_version != release_value["package_format_version"]
+            or (
+                aws_gpu_v3_provider
+                and package_format_version != "aws-gpu-v3"
+            )
+            or (
+                release_value["provider"] == AWS_P5_PROFILE
+                and (
+                    type(package_format_version) is not int
+                    or package_format_version != 1
+                )
+            )
         ):
             raise _release_error(
                 "RELEASE_INTERNAL_INVALID",
@@ -613,6 +644,119 @@ def _verify_release_internals(
                     "RELEASE_INTERNAL_INVALID",
                     "AWS config hash is not bound to a release member",
                 )
+        if aws_gpu_v3_package:
+            if metadata["selected_profile_id"] != release_value["provider"]:
+                raise _release_error(
+                    "RELEASE_INTERNAL_INVALID",
+                    "AWS GPU v3 selected profile identity is invalid",
+                )
+            for label in ("preregistration", "hardware_amendment"):
+                binding = require_object(
+                    metadata[label],
+                    label=f"RELEASE-METADATA.json.{label}",
+                )
+                require_exact_keys(
+                    binding,
+                    {"path", "sha256"},
+                    label=f"RELEASE-METADATA.json.{label}",
+                )
+                relative = portable_relative(
+                    binding["path"],
+                    label=f"RELEASE-METADATA.json.{label}.path",
+                )
+                digest = require_sha256(
+                    binding["sha256"],
+                    label=f"RELEASE-METADATA.json.{label}.sha256",
+                )
+                if relative not in members or members[relative]["sha256"] != digest:
+                    raise _release_error(
+                        "RELEASE_INTERNAL_INVALID",
+                        f"AWS GPU v3 {label} is not bound to a release member",
+                    )
+            container_lock = require_object(
+                metadata["container_base_lock"],
+                label="RELEASE-METADATA.json.container_base_lock",
+            )
+            require_exact_keys(
+                container_lock,
+                {"path", "sha256", "base_image", "base_digest"},
+                label="RELEASE-METADATA.json.container_base_lock",
+            )
+            container_path = portable_relative(
+                container_lock["path"],
+                label="AWS GPU v3 container base lock path",
+            )
+            container_digest = require_sha256(
+                container_lock["sha256"],
+                label="AWS GPU v3 container base lock SHA-256",
+            )
+            if (
+                container_path not in members
+                or members[container_path]["sha256"] != container_digest
+                or not isinstance(container_lock["base_image"], str)
+                or not container_lock["base_image"]
+                or not isinstance(container_lock["base_digest"], str)
+                or not container_lock["base_image"].endswith(
+                    "@" + container_lock["base_digest"]
+                )
+            ):
+                raise _release_error(
+                    "RELEASE_INTERNAL_INVALID",
+                    "AWS GPU v3 container base lock is not immutable and bound",
+                )
+            contract_locks = require_object(
+                metadata["contract_locks"],
+                label="RELEASE-METADATA.json.contract_locks",
+            )
+            require_exact_keys(
+                contract_locks,
+                {"provider_selection", "fleet", "lifecycle", "canary", "container"},
+                label="RELEASE-METADATA.json.contract_locks",
+            )
+            for lock_name, raw_lock in contract_locks.items():
+                lock = require_object(
+                    raw_lock,
+                    label=f"AWS GPU v3 {lock_name} contract lock",
+                )
+                require_exact_keys(
+                    lock,
+                    {"members", "sha256"},
+                    label=f"AWS GPU v3 {lock_name} contract lock",
+                )
+                inventory = require_object(
+                    lock["members"],
+                    label=f"AWS GPU v3 {lock_name} lock members",
+                )
+                if not inventory:
+                    raise _release_error(
+                        "RELEASE_INTERNAL_INVALID",
+                        "AWS GPU v3 contract lock inventory is empty",
+                    )
+                for raw_path, raw_digest in inventory.items():
+                    relative = portable_relative(
+                        raw_path,
+                        label=f"AWS GPU v3 {lock_name} lock path",
+                    )
+                    digest = require_sha256(
+                        raw_digest,
+                        label=f"AWS GPU v3 {lock_name} lock member SHA-256",
+                    )
+                    if (
+                        relative not in members
+                        or members[relative]["sha256"] != digest
+                    ):
+                        raise _release_error(
+                            "RELEASE_INTERNAL_INVALID",
+                            "AWS GPU v3 contract lock is not bound to its members",
+                        )
+                if require_sha256(
+                    lock["sha256"],
+                    label=f"AWS GPU v3 {lock_name} aggregate SHA-256",
+                ) != canonical_sha256(inventory):
+                    raise _release_error(
+                        "RELEASE_INTERNAL_INVALID",
+                        "AWS GPU v3 contract lock aggregate is invalid",
+                    )
     else:
         environment_hashes = require_object(
             metadata["environment_hashes"],
@@ -680,10 +824,36 @@ def _verify_release_internals(
 def load_release(path: Path | str) -> Release:
     release_path = Path(os.path.abspath(os.fspath(path)))
     value = require_object(load_json(release_path, label="release"), label="release")
+    aws_gpu_v3_provider = value.get("provider") in {
+        AWS_P5_V3_PROFILE,
+        AWS_P6_B300_V3_PROFILE,
+    }
     aws_package = (
         value.get("provider") in AWS_GPU_PROFILES
         and "package_format_version" in value
     )
+    aws_gpu_v3_package = (
+        aws_gpu_v3_provider
+        and aws_package
+        and value.get("package_format_version") == "aws-gpu-v3"
+    )
+    if aws_gpu_v3_provider and not aws_gpu_v3_package:
+        raise MsctlError(
+            "RELEASE_INVALID",
+            "AWS GPU v3 release package format is unsupported",
+        )
+    if (
+        value.get("provider") == AWS_P5_PROFILE
+        and aws_package
+        and (
+            type(value.get("package_format_version")) is not int
+            or value.get("package_format_version") != 1
+        )
+    ):
+        raise MsctlError(
+            "RELEASE_INVALID",
+            "AWS P5 v2 release package format is unsupported",
+        )
     release_fields = {
         "schema_version",
         "release_id",
@@ -705,6 +875,17 @@ def load_release(path: Path | str) -> Release:
             "dataset_pointer_sha256",
             "config_sha256",
         }
+        if aws_gpu_v3_package:
+            release_fields |= {
+                "selected_profile_id",
+                "preregistration",
+                "hardware_amendment",
+                "container_base_lock",
+                "preregistration_sha256",
+                "hardware_amendment_sha256",
+                "container_base_lock_sha256",
+                "contract_locks",
+            }
     require_exact_keys(
         value,
         release_fields,
@@ -832,6 +1013,24 @@ def load_release(path: Path | str) -> Release:
             raise _release_error(
                 "RELEASE_INTERNAL_INVALID",
                 "AWS release receipt does not bind internal package metadata",
+            )
+        if aws_gpu_v3_package and (
+            value["selected_profile_id"] != value["provider"]
+            or value["selected_profile_id"] != metadata["selected_profile_id"]
+            or value["preregistration"] != metadata["preregistration"]
+            or value["hardware_amendment"] != metadata["hardware_amendment"]
+            or value["container_base_lock"] != metadata["container_base_lock"]
+            or value["contract_locks"] != metadata["contract_locks"]
+            or value["preregistration_sha256"]
+            != metadata["preregistration"]["sha256"]
+            or value["hardware_amendment_sha256"]
+            != metadata["hardware_amendment"]["sha256"]
+            or value["container_base_lock_sha256"]
+            != metadata["container_base_lock"]["sha256"]
+        ):
+            raise _release_error(
+                "RELEASE_INTERNAL_INVALID",
+                "AWS GPU v3 receipt does not bind its closed contracts",
             )
     return Release(
         release_id=release_id,

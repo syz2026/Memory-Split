@@ -1,0 +1,165 @@
+{
+  "$id": "https://memorysplit.invalid/schemas/aws-gpu-provider-selection-v3.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "oneOf": [
+    {
+      "properties": {
+        "gpu_model": {
+          "const": "NVIDIA H100 80GB"
+        },
+        "instance_type": {
+          "const": "p5.48xlarge"
+        },
+        "provider": {
+          "const": "aws-p5.48xlarge-v3"
+        },
+        "selected_profile_id": {
+          "const": "aws-p5.48xlarge-v3"
+        }
+      },
+      "required": [
+        "selected_profile_id",
+        "provider",
+        "instance_type",
+        "gpu_model"
+      ]
+    },
+    {
+      "properties": {
+        "gpu_model": {
+          "const": "NVIDIA B300"
+        },
+        "instance_type": {
+          "const": "p6-b300.48xlarge"
+        },
+        "provider": {
+          "const": "aws-p6-b300.48xlarge-v3"
+        },
+        "selected_profile_id": {
+          "const": "aws-p6-b300.48xlarge-v3"
+        }
+      },
+      "required": [
+        "selected_profile_id",
+        "provider",
+        "instance_type",
+        "gpu_model"
+      ]
+    }
+  ],
+  "properties": {
+    "amendment_sha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "type": "string"
+    },
+    "ami_id": {
+      "pattern": "^ami-[0-9a-f]{8,17}$",
+      "type": "string"
+    },
+    "cohort_assignment_sha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "type": "string"
+    },
+    "cohort_id": {
+      "const": "memorysplit-confirmatory-v3-360m-n10-aws"
+    },
+    "container_digest": {
+      "pattern": "^sha256:[0-9a-f]{64}$",
+      "type": "string"
+    },
+    "container_image": {
+      "pattern": "^[^\\s@]+@sha256:[0-9a-f]{64}$",
+      "type": "string"
+    },
+    "gpu_model": {
+      "enum": [
+        "NVIDIA H100 80GB",
+        "NVIDIA B300"
+      ]
+    },
+    "instance_type": {
+      "enum": [
+        "p5.48xlarge",
+        "p6-b300.48xlarge"
+      ]
+    },
+    "mixed_profiles": {
+      "const": false
+    },
+    "preregistration_sha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "type": "string"
+    },
+    "profile_sha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "type": "string"
+    },
+    "protected_outcomes_inspected": {
+      "const": false
+    },
+    "provider": {
+      "enum": [
+        "aws-p5.48xlarge-v3",
+        "aws-p6-b300.48xlarge-v3"
+      ]
+    },
+    "receipt_type": {
+      "const": "memorysplit-aws-provider-selection-v3"
+    },
+    "region": {
+      "pattern": "^[a-z]{2}(?:-[a-z0-9]+)+-[0-9]+$",
+      "type": "string"
+    },
+    "schema_version": {
+      "const": 3
+    },
+    "seeds": {
+      "const": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9
+      ]
+    },
+    "selected_at": {
+      "format": "date-time",
+      "type": "string"
+    },
+    "selected_profile_id": {
+      "enum": [
+        "aws-p5.48xlarge-v3",
+        "aws-p6-b300.48xlarge-v3"
+      ]
+    }
+  },
+  "required": [
+    "schema_version",
+    "receipt_type",
+    "amendment_sha256",
+    "preregistration_sha256",
+    "cohort_assignment_sha256",
+    "cohort_id",
+    "selected_profile_id",
+    "provider",
+    "profile_sha256",
+    "instance_type",
+    "gpu_model",
+    "region",
+    "ami_id",
+    "container_image",
+    "container_digest",
+    "seeds",
+    "mixed_profiles",
+    "protected_outcomes_inspected",
+    "selected_at"
+  ],
+  "title": "MemorySplit AWS GPU provider selection v3",
+  "type": "object"
+}

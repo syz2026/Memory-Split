@@ -783,6 +783,25 @@ def _verify_release_archive(
         assignment_providers = {provider}
         if v3_provider:
             assignment_providers.add(AWS_P5_V3_PROFILE_ID)
+        source = metadata.get("source") if isinstance(metadata, dict) else None
+        valid_source = (
+            isinstance(source, dict)
+            and source.get("commit") == code_commit
+            and source.get("dirty") is False
+            and (
+                (
+                    set(source) == {"commit", "dirty", "tree"}
+                    and isinstance(source.get("tree"), str)
+                    and re.fullmatch(
+                        r"(?:[0-9a-f]{40}|[0-9a-f]{64})",
+                        source["tree"],
+                    )
+                    is not None
+                )
+                if v3_provider
+                else set(source) == {"commit", "dirty"}
+            )
+        )
         valid_assignment = (
             isinstance(assignment, dict)
             and set(assignment) == {"arms", "cohort_id", "provider", "seeds"}
@@ -796,10 +815,14 @@ def _verify_release_archive(
             not isinstance(metadata, dict)
             or _canonical_pretty(metadata) != metadata_bytes
             or metadata.get("schema_version") != 1
-            or metadata.get("package_format_version") != 1
+            or metadata.get("package_format_version")
+            != ("aws-gpu-v3" if v3_provider else 1)
             or metadata.get("provider") != provider
-            or metadata.get("source")
-            != {"commit": code_commit, "dirty": False}
+            or (
+                v3_provider
+                and metadata.get("selected_profile_id") != provider
+            )
+            or not valid_source
             or not valid_assignment
         ):
             raise BootstrapError("release metadata identity does not match")
@@ -922,15 +945,30 @@ def verify_bootstrap_artifacts(
         bound_archive = release_value["archive"]["sha256"]
         bound_commit = release_value["source"]["commit"]
         bound_cohort = release_value["cohort_assignment_sha256"]
-        bound_dataset = release_value["dataset_receipt_sha256"]
         bound_members = release_value["members_sha256"]
+    except (KeyError, TypeError) as error:
+        raise BootstrapError("release receipt is missing artifact bindings") from error
+    v3_package = release_value.get("package_format_version") == "aws-gpu-v3"
+    try:
+        if v3_package:
+            bound_dataset_pointer = _required_sha256(
+                release_value["dataset_pointer_sha256"],
+                label="release receipt dataset pointer",
+            )
+            bound_dataset = None
+        else:
+            bound_dataset = _required_sha256(
+                release_value["dataset_receipt_sha256"],
+                label="release receipt dataset",
+            )
+            bound_dataset_pointer = None
     except (KeyError, TypeError) as error:
         raise BootstrapError("release receipt is missing artifact bindings") from error
     if (
         bound_archive != release_digest
         or bound_commit != code_commit
         or bound_cohort != cohort_digest
-        or bound_dataset != corpus_digest
+        or (bound_dataset is not None and bound_dataset != corpus_digest)
     ):
         raise BootstrapError("release receipt artifact bindings do not match")
     release_members = _verify_release_archive(
@@ -951,6 +989,14 @@ def verify_bootstrap_artifacts(
             else (1, 2, 3, 4)
         ),
     )
+    if bound_dataset_pointer is not None and not any(
+        member.path == "DATASET-POINTER-AWS.json"
+        and member.sha256 == bound_dataset_pointer
+        for member in release_members
+    ):
+        raise BootstrapError(
+            "release receipt dataset pointer binding does not match"
+        )
     return BootstrapArtifacts(
         release_sha256=release_digest,
         release_receipt_sha256=release_receipt_digest,
