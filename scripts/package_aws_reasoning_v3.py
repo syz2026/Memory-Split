@@ -29,7 +29,6 @@ from scripts.package_135m_slurm_cohort import (
     _read_source,
     _sha,
     _write_zip,
-    source_revision,
 )
 
 ARCHIVE_NAME = "memorysplit-135m-reasoning-v3-aws.zip"
@@ -85,6 +84,32 @@ _SECRET_NAMES = (
 )
 
 
+def _source_revision(source_root: Path, *, require_clean: bool) -> str:
+    revision = _git(source_root, "rev-parse", "--verify", "HEAD").strip()
+    if len(revision) != 40:
+        raise ValueError("source revision is not a full commit id")
+    if not require_clean:
+        return revision
+    changed = _git(
+        source_root,
+        "status",
+        "--porcelain",
+        "--untracked-files=all",
+    ).splitlines()
+    disallowed = [
+        line
+        for line in changed
+        if not line.startswith("?? corpus-build/")
+        and not line.startswith("?? artifacts/aws-reasoning-v3/")
+    ]
+    if disallowed:
+        raise ValueError(
+            "production AWS releases require clean tracked sources; "
+            f"dirty={disallowed}"
+        )
+    return revision
+
+
 def source_paths(source_root: Path) -> list[str]:
     tracked = set(_git(source_root, "ls-files").splitlines())
     selected = {
@@ -138,7 +163,7 @@ def build_package(
     require_clean: bool = True,
 ) -> Path:
     source = Path(source_root)
-    revision = source_revision(source, require_clean=require_clean)
+    revision = _source_revision(source, require_clean=require_clean)
     destination = Path(output)
     if destination.suffix != ".zip":
         destination = destination / ARCHIVE_NAME
