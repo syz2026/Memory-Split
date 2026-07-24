@@ -2272,3 +2272,443 @@ def test_quarantine_exchange_race_restores_substituted_winner(
         expected_generator_commit=EXPECTED_GENERATOR_COMMIT,
     )
     assert verified.root == winner
+
+
+def test_marker_is_bound_before_final_verification_and_publish_is_immediate(
+    archive_authority: _AuthorityFixture,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    output_root = tmp_path / "derived"
+    verified_snapshot: dict[str, tuple[int, int, int]] | None = None
+    checked_publish = False
+    original_verify = wikidata_source_module._verify_sealed_private_build
+    original_rename = wikidata_source_module.atomic_rename_noreplace
+
+    def namespace_snapshot() -> dict[str, tuple[int, int, int]]:
+        namespace = output_root / "wikidata"
+        return {
+            path.name: (
+                path.lstat().st_dev,
+                path.lstat().st_ino,
+                path.lstat().st_mode,
+            )
+            for path in namespace.iterdir()
+        }
+
+    def verify_with_marker(
+        authority,
+        *,
+        root_name,
+        expected_root_identity,
+    ):
+        nonlocal verified_snapshot
+        result = original_verify(
+            authority,
+            root_name=root_name,
+            expected_root_identity=expected_root_identity,
+        )
+        if root_name.startswith(".build-"):
+            markers = tuple(
+                path
+                for path in (output_root / "wikidata").iterdir()
+                if path.name.startswith(".quarantine-")
+            )
+            assert len(markers) == 1
+            assert not tuple(markers[0].iterdir())
+            assert markers[0].stat().st_mode & 0o777 == 0o700
+            verified_snapshot = namespace_snapshot()
+        return result
+
+    def publish_without_mutation(
+        source_directory_fd,
+        source_name,
+        destination_directory_fd,
+        destination_name,
+    ):
+        nonlocal checked_publish
+        if source_name.startswith(".build-"):
+            assert verified_snapshot is not None
+            assert namespace_snapshot() == verified_snapshot
+            checked_publish = True
+        return original_rename(
+            source_directory_fd,
+            source_name,
+            destination_directory_fd,
+            destination_name,
+        )
+
+    monkeypatch.setattr(
+        wikidata_source_module,
+        "_verify_sealed_private_build",
+        verify_with_marker,
+    )
+    monkeypatch.setattr(
+        wikidata_source_module,
+        "atomic_rename_noreplace",
+        publish_without_mutation,
+    )
+
+    _build_view(archive_authority, output_root)
+
+    assert checked_publish
+
+
+def test_marker_substitution_keeps_failed_candidate_quarantined(
+    archive_authority: _AuthorityFixture,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    output_root = tmp_path / "derived"
+    candidate_inode: int | None = None
+    substitute_inode: int | None = None
+    marker_inode: int | None = None
+    quarantine_name: str | None = None
+    substituted = False
+
+    def substitute_marker(phase, authority, receipt_sha256):
+        nonlocal candidate_inode, substitute_inode, marker_inode
+        nonlocal quarantine_name, substituted
+        namespace = output_root / "wikidata"
+        if phase == "before_postpublish_verify":
+            candidate_inode = (namespace / receipt_sha256).stat().st_ino
+            assert candidate_inode == authority.identity[1]
+            raise RuntimeError("forced failed candidate")
+        if phase != "before_quarantine_exchange" or substituted:
+            return
+        substituted = True
+        markers = tuple(
+            path
+            for path in namespace.iterdir()
+            if path.name.startswith(".quarantine-")
+        )
+        assert len(markers) == 1
+        marker = markers[0]
+        quarantine_name = marker.name
+        marker_inode = marker.stat().st_ino
+        displaced_marker = namespace / "retained-marker-displaced"
+        marker.rename(displaced_marker)
+        marker.mkdir(mode=0o700)
+        substitute_inode = marker.stat().st_ino
+
+    monkeypatch.setattr(
+        wikidata_source_module,
+        "_derived_view_build_hook",
+        substitute_marker,
+    )
+
+    with pytest.raises(RuntimeError, match="forced failed candidate"):
+        _build_view(archive_authority, output_root)
+
+    assert substituted
+    assert quarantine_name is not None
+    namespace = output_root / "wikidata"
+    final_names = tuple(
+        path
+        for path in namespace.iterdir()
+        if len(path.name) == 64
+    )
+    assert len(final_names) == 1
+    assert final_names[0].stat().st_ino == substitute_inode
+    quarantined = namespace / quarantine_name
+    assert quarantined.is_dir()
+    assert quarantined.stat().st_ino == candidate_inode
+    assert final_names[0].stat().st_ino != candidate_inode
+    displaced_marker = namespace / "retained-marker-displaced"
+    assert displaced_marker.stat().st_ino == marker_inode
+
+
+def test_sort_run_open_validation_close_failure_preserves_identity_error(
+    archive_authority: _AuthorityFixture,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    output_root = tmp_path / "derived"
+    opened: list[int] = []
+    opened_identities: dict[int, tuple[int, int]] = {}
+    attacked = False
+    close_failed = False
+    direct_close_seen = False
+    original_open = wikidata_source_module.open_regular_file_at
+    real_close = os.close
+
+    def record_open(directory_fd, name):
+        descriptor, metadata = original_open(directory_fd, name)
+        if attacked and "-l" in name and name.endswith(".bin"):
+            opened.append(descriptor)
+            opened_identities[descriptor] = (
+                metadata.st_dev,
+                metadata.st_ino,
+            )
+        return descriptor, metadata
+
+    def substitute_run(phase, work_fd, run):
+        nonlocal attacked
+        if phase != "before_open" or attacked:
+            return
+        attacked = True
+        os.rename(
+            run.name,
+            f"{run.name}.displaced",
+            src_dir_fd=work_fd,
+            dst_dir_fd=work_fd,
+        )
+        replacement = os.open(
+            run.name,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+            0o600,
+            dir_fd=work_fd,
+        )
+        os.write(replacement, b"replacement")
+        os.close(replacement)
+
+    def injected_close(descriptor):
+        nonlocal close_failed
+        closes_target = False
+        if descriptor in opened_identities:
+            try:
+                metadata = os.fstat(descriptor)
+            except OSError:
+                pass
+            else:
+                closes_target = (
+                    metadata.st_dev,
+                    metadata.st_ino,
+                ) == opened_identities[descriptor]
+        real_close(descriptor)
+        if closes_target and not close_failed:
+            close_failed = True
+            raise OSError("injected sort-open close failure")
+
+    def observe_direct_close(descriptor):
+        nonlocal direct_close_seen
+        if descriptor in opened_identities:
+            try:
+                metadata = os.fstat(descriptor)
+            except OSError:
+                pass
+            else:
+                if (
+                    metadata.st_dev,
+                    metadata.st_ino,
+                ) == opened_identities[descriptor]:
+                    direct_close_seen = True
+        real_close(descriptor)
+
+    monkeypatch.setattr(
+        wikidata_source_module,
+        "open_regular_file_at",
+        record_open,
+    )
+    monkeypatch.setattr(
+        wikidata_source_module,
+        "_external_sort_hook",
+        substitute_run,
+    )
+    monkeypatch.setattr(
+        wikidata_source_module,
+        "_close_descriptor",
+        injected_close,
+    )
+    monkeypatch.setattr(
+        wikidata_source_module.os,
+        "close",
+        observe_direct_close,
+    )
+    monkeypatch.setattr(wikidata_source_module, "_SORT_CHUNK_RECORDS", 1)
+
+    with pytest.raises(ValueError, match="identity drift") as raised:
+        _build_view(archive_authority, output_root)
+
+    assert "sort-open close failure" not in str(raised.value)
+    assert attacked
+    assert not direct_close_seen
+    assert close_failed
+    assert opened
+    for descriptor in opened:
+        with pytest.raises(OSError):
+            os.fstat(descriptor)
+
+
+def test_archive_envelope_duplicate_close_preserves_body_error(
+    archive_authority: _AuthorityFixture,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    source = (
+        archive_authority.source_root
+        / "wikidata5m"
+        / wikidata_source_module.ARCHIVE_PATHS[0]
+    )
+    source_fd = os.open(source, os.O_RDONLY)
+    duplicate_fd = -1
+    close_failed = False
+    real_dup = os.dup
+    real_read = os.read
+    real_close = os.close
+
+    def record_duplicate(descriptor):
+        nonlocal duplicate_fd
+        duplicate = real_dup(descriptor)
+        if descriptor == source_fd:
+            duplicate_fd = duplicate
+        return duplicate
+
+    def fail_duplicate_read(descriptor, size):
+        if descriptor == duplicate_fd:
+            raise RuntimeError("envelope body failure")
+        return real_read(descriptor, size)
+
+    def injected_close(descriptor):
+        nonlocal close_failed
+        real_close(descriptor)
+        if descriptor == duplicate_fd and not close_failed:
+            close_failed = True
+            raise OSError("injected envelope close failure")
+
+    monkeypatch.setattr(wikidata_source_module.os, "dup", record_duplicate)
+    monkeypatch.setattr(wikidata_source_module.os, "read", fail_duplicate_read)
+    monkeypatch.setattr(
+        wikidata_source_module,
+        "_close_descriptor",
+        injected_close,
+    )
+
+    try:
+        with pytest.raises(RuntimeError, match="envelope body failure") as raised:
+            wikidata_source_module._validate_archive_envelope(
+                source_fd,
+                wikidata_source_module.ARCHIVE_PATHS[0],
+            )
+    finally:
+        real_close(source_fd)
+
+    assert "envelope close failure" not in str(raised.value)
+    assert close_failed
+    with pytest.raises(OSError):
+        os.fstat(duplicate_fd)
+
+
+def test_archive_parser_fdopen_close_preserves_body_error(
+    archive_authority: _AuthorityFixture,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    archive_path = wikidata_source_module.ARCHIVE_PATHS[0]
+    source = archive_authority.source_root / "wikidata5m" / archive_path
+    source_fd = os.open(source, os.O_RDONLY)
+    armed = False
+    duplicate_fd = -1
+    close_failed = False
+    real_validate = wikidata_source_module._validate_archive_envelope
+    real_dup = os.dup
+    real_close = os.close
+
+    def validate_then_arm(descriptor, path):
+        nonlocal armed
+        real_validate(descriptor, path)
+        armed = True
+
+    def record_duplicate(descriptor):
+        nonlocal duplicate_fd
+        duplicate = real_dup(descriptor)
+        if armed and descriptor == source_fd:
+            duplicate_fd = duplicate
+        return duplicate
+
+    def fail_tar_open(*_args, **_kwargs):
+        if armed:
+            raise RuntimeError("parser body failure")
+        raise AssertionError("parser tar hook armed too late")
+
+    def injected_close(descriptor):
+        nonlocal close_failed
+        real_close(descriptor)
+        if descriptor == duplicate_fd and not close_failed:
+            close_failed = True
+            raise OSError("injected parser close failure")
+
+    monkeypatch.setattr(
+        wikidata_source_module,
+        "_validate_archive_envelope",
+        validate_then_arm,
+    )
+    monkeypatch.setattr(wikidata_source_module.os, "dup", record_duplicate)
+    monkeypatch.setattr(
+        wikidata_source_module.tarfile,
+        "open",
+        fail_tar_open,
+    )
+    monkeypatch.setattr(
+        wikidata_source_module,
+        "_close_descriptor",
+        injected_close,
+    )
+
+    try:
+        with pytest.raises(RuntimeError, match="parser body failure") as raised:
+            wikidata_source_module._parse_archive_descriptor(
+                source_fd,
+                archive_path,
+                {},
+            )
+    finally:
+        real_close(source_fd)
+
+    assert "parser close failure" not in str(raised.value)
+    assert close_failed
+    with pytest.raises(OSError):
+        os.fstat(duplicate_fd)
+
+
+def test_archive_materialization_fdopen_close_preserves_body_error(
+    archive_authority: _AuthorityFixture,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    tar_calls = 0
+    duplicates: list[int] = []
+    target_fd = -1
+    close_failed = False
+    original_tar_open = wikidata_source_module.tarfile.open
+    real_dup = os.dup
+    real_close = os.close
+
+    def record_duplicate(descriptor):
+        duplicate = real_dup(descriptor)
+        duplicates.append(duplicate)
+        return duplicate
+
+    def fail_materialization_open(*args, **kwargs):
+        nonlocal tar_calls, target_fd
+        tar_calls += 1
+        if tar_calls > len(wikidata_source_module.ARCHIVE_PATHS):
+            target_fd = duplicates[-1]
+            raise RuntimeError("materialization body failure")
+        return original_tar_open(*args, **kwargs)
+
+    def injected_close(descriptor):
+        nonlocal close_failed
+        real_close(descriptor)
+        if descriptor == target_fd and not close_failed:
+            close_failed = True
+            raise OSError("injected materialization close failure")
+
+    monkeypatch.setattr(wikidata_source_module.os, "dup", record_duplicate)
+    monkeypatch.setattr(
+        wikidata_source_module.tarfile,
+        "open",
+        fail_materialization_open,
+    )
+    monkeypatch.setattr(
+        wikidata_source_module,
+        "_close_descriptor",
+        injected_close,
+    )
+
+    with pytest.raises(RuntimeError, match="materialization body failure") as raised:
+        _build_view(archive_authority, tmp_path / "derived")
+
+    assert "materialization close failure" not in str(raised.value)
+    assert close_failed
+    assert target_fd >= 0
+    with pytest.raises(OSError):
+        os.fstat(target_fd)

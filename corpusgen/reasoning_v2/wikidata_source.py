@@ -972,9 +972,10 @@ def _reject_pax_size_override(records: bytes, archive_path: str) -> None:
         )
 
 
-def _validate_archive_envelope(descriptor: int, archive_path: str) -> None:
-    duplicate = os.dup(descriptor)
-    os.lseek(duplicate, 0, os.SEEK_SET)
+def _validate_archive_envelope_duplicate(
+    duplicate: int,
+    archive_path: str,
+) -> None:
     decompressor = zlib.decompressobj(zlib.MAX_WBITS | 16)
     buffered = bytearray()
     pax_records = bytearray()
@@ -1090,8 +1091,6 @@ def _validate_archive_envelope(descriptor: int, archive_path: str) -> None:
             )
     except zlib.error as error:
         raise ValueError(f"archive gzip stream is malformed: {archive_path}") from error
-    finally:
-        os.close(duplicate)
 
     if buffered:
         raise ValueError(
@@ -1109,58 +1108,62 @@ def _validate_archive_envelope(descriptor: int, archive_path: str) -> None:
         )
 
 
+def _validate_archive_envelope(descriptor: int, archive_path: str) -> None:
+    with _open_archive_duplicate_descriptor(
+        descriptor,
+        f"Wikidata archive envelope {archive_path}",
+    ) as duplicate:
+        _validate_archive_envelope_duplicate(duplicate, archive_path)
+
+
 def _parse_archive_descriptor(
     descriptor: int,
     archive_path: str,
     planned: dict[str, str],
 ) -> tuple[ArtifactRecord, ...]:
     _validate_archive_envelope(descriptor, archive_path)
-    duplicate = os.dup(descriptor)
-    os.lseek(duplicate, 0, os.SEEK_SET)
     records: list[ArtifactRecord] = []
     seen: set[str] = set()
-    try:
-        with os.fdopen(duplicate, "rb") as handle:
-            duplicate = -1
-            try:
-                with tarfile.open(
-                    fileobj=cast(BinaryIO, handle),
-                    mode="r:*",
-                ) as archive:
-                    for member in archive:
-                        name = _safe_relative_path(
-                            member.name,
-                            "archive member path",
+    with _open_archive_duplicate_file(
+        descriptor,
+        f"Wikidata archive parser {archive_path}",
+    ) as handle:
+        try:
+            with tarfile.open(
+                fileobj=cast(BinaryIO, handle),
+                mode="r:*",
+            ) as archive:
+                for member in archive:
+                    name = _safe_relative_path(
+                        member.name,
+                        "archive member path",
+                    )
+                    kind = "directory" if member.isdir() else "file"
+                    _register_archive_output(planned, name, kind)
+                    if (
+                        member.sparse is not None
+                        or member.type == tarfile.GNUTYPE_SPARSE
+                    ):
+                        raise ValueError(
+                            f"unsafe sparse archive member: {name!r}"
                         )
-                        kind = "directory" if member.isdir() else "file"
-                        _register_archive_output(planned, name, kind)
-                        if (
-                            member.sparse is not None
-                            or member.type == tarfile.GNUTYPE_SPARSE
-                        ):
-                            raise ValueError(
-                                f"unsafe sparse archive member: {name!r}"
-                            )
-                        if not member.isreg():
-                            raise ValueError(
-                                f"unsafe archive member type: {name!r}"
-                            )
-                        if name not in ARCHIVE_MEMBERS[archive_path]:
-                            raise ValueError(
-                                f"undeclared archive member: "
-                                f"{archive_path}:{name}"
-                            )
-                        seen.add(name)
-                        records.append(
-                            _read_member_payload(archive, member, archive_path)
+                    if not member.isreg():
+                        raise ValueError(
+                            f"unsafe archive member type: {name!r}"
                         )
-            except (EOFError, OSError, tarfile.TarError) as error:
-                raise ValueError(
-                    f"archive is truncated or malformed: {archive_path}"
-                ) from error
-    finally:
-        if duplicate >= 0:
-            os.close(duplicate)
+                    if name not in ARCHIVE_MEMBERS[archive_path]:
+                        raise ValueError(
+                            f"undeclared archive member: "
+                            f"{archive_path}:{name}"
+                        )
+                    seen.add(name)
+                    records.append(
+                        _read_member_payload(archive, member, archive_path)
+                    )
+        except (EOFError, OSError, tarfile.TarError) as error:
+            raise ValueError(
+                f"archive is truncated or malformed: {archive_path}"
+            ) from error
     if seen != set(ARCHIVE_MEMBERS[archive_path]):
         missing = sorted(set(ARCHIVE_MEMBERS[archive_path]) - seen, key=_byte_key)
         raise ValueError(
@@ -1762,6 +1765,67 @@ def _close_descriptors_exhaustively(
     return close_error
 
 
+@contextmanager
+def _open_archive_duplicate_descriptor(
+    descriptor: int,
+    description: str,
+) -> Iterator[int]:
+    duplicate = -1
+    primary_error: BaseException | None = None
+    try:
+        duplicate = os.dup(descriptor)
+        os.lseek(duplicate, 0, os.SEEK_SET)
+        yield duplicate
+    except BaseException as error:
+        primary_error = error
+        raise
+    finally:
+        close_error = _close_descriptors_exhaustively((duplicate,))
+        if close_error is not None:
+            if primary_error is None:
+                raise close_error
+            primary_error.add_note(
+                f"{description} descriptor close also failed: "
+                f"{close_error!r}"
+            )
+
+
+@contextmanager
+def _open_archive_duplicate_file(
+    descriptor: int,
+    description: str,
+) -> Iterator[BinaryIO]:
+    with _open_archive_duplicate_descriptor(
+        descriptor,
+        description,
+    ) as duplicate:
+        handle: BinaryIO | None = None
+        primary_error: BaseException | None = None
+        try:
+            handle = cast(
+                BinaryIO,
+                os.fdopen(duplicate, "rb", closefd=False),
+            )
+            yield handle
+        except BaseException as error:
+            primary_error = error
+            raise
+        finally:
+            handle_error: BaseException | None = None
+            if handle is not None:
+                try:
+                    handle.close()
+                except BaseException as error:
+                    handle_error = error
+            if handle_error is not None:
+                if primary_error is None:
+                    raise handle_error
+                primary_error.add_note(
+                    f"{description} file handle close also failed: "
+                    f"{handle_error!r}"
+                )
+
+
 def _digest_private_descriptor(
     descriptor: int,
     *,
@@ -2226,9 +2290,13 @@ def _open_sort_run_descriptor(work_fd: int, run: _SortRun) -> int:
             rewind=True,
         )
         return descriptor
-    except BaseException:
-        if descriptor >= 0:
-            os.close(descriptor)
+    except BaseException as error:
+        close_error = _close_descriptors_exhaustively((descriptor,))
+        if close_error is not None:
+            error.add_note(
+                f"external-sort run reopen close also failed: "
+                f"{close_error!r}"
+            )
         raise
 
 
@@ -2657,11 +2725,11 @@ def _materialize_member_files(
     expected = {record.path: record for record in verified.members}
     records: list[ArtifactRecord] = []
     for archive_path in ARCHIVE_PATHS:
-        duplicate = os.dup(verified._archive_descriptors[archive_path])
-        os.lseek(duplicate, 0, os.SEEK_SET)
         try:
-            with os.fdopen(duplicate, "rb") as handle:
-                duplicate = -1
+            with _open_archive_duplicate_file(
+                verified._archive_descriptors[archive_path],
+                f"Wikidata archive materialization {archive_path}",
+            ) as handle:
                 with tarfile.open(
                     fileobj=cast(BinaryIO, handle),
                     mode="r:*",
@@ -2726,9 +2794,6 @@ def _materialize_member_files(
             raise ValueError(
                 f"archive changed during member materialization: {archive_path}"
             ) from error
-        finally:
-            if duplicate >= 0:
-                os.close(duplicate)
     ordered = tuple(sorted(records, key=lambda record: _byte_key(record.path)))
     if ordered != verified.members:
         raise ValueError("materialized member inventory drift")
@@ -4626,30 +4691,97 @@ def _rollback_quarantine_exchange(
     authority: _PrivateBuildAuthority,
     published_name: str,
     marker: _QuarantineMarker,
-    swapped_entry_identity: _CreationIdentity,
 ) -> None:
-    _atomic_exchange_directories(
-        authority.namespace_fd,
-        published_name,
-        marker.name,
-    )
-    marker.entry_name = marker.name
-    _check_named_derived_directory(
-        marker.namespace_fd,
-        marker.name,
-        marker.descriptor,
-        marker.identity,
-        "quarantine marker after exchange rollback",
-    )
-    restored = entry_lstat(authority.namespace_fd, published_name)
-    _require_derived_mode(
-        restored,
-        directory=True,
-        description="restored concurrent winner",
-    )
-    if _creation_identity(restored) != swapped_entry_identity:
-        raise ValueError("quarantine exchange rollback identity drift")
-    fsync_directory(authority.namespace_fd)
+    wrong_source_fd = -1
+    primary_error: BaseException | None = None
+    try:
+        wrong_source_before = entry_lstat(
+            authority.namespace_fd,
+            marker.name,
+        )
+        _require_derived_mode(
+            wrong_source_before,
+            directory=True,
+            description="exchanged non-candidate source",
+        )
+        wrong_source_fd, _created = open_directory_at(
+            authority.namespace_fd,
+            marker.name,
+        )
+        wrong_source_opened = os.fstat(wrong_source_fd)
+        _require_derived_mode(
+            wrong_source_opened,
+            directory=True,
+            description="exchanged non-candidate source",
+        )
+        wrong_source_identity = _creation_identity(wrong_source_opened)
+        if (
+            _creation_identity(wrong_source_before)
+            != wrong_source_identity
+        ):
+            raise ValueError(
+                "exchanged non-candidate source identity drift"
+            )
+        _check_named_derived_directory(
+            authority.namespace_fd,
+            marker.name,
+            wrong_source_fd,
+            wrong_source_identity,
+            "exchanged non-candidate source before rollback",
+        )
+        _atomic_exchange_directories(
+            authority.namespace_fd,
+            published_name,
+            marker.name,
+        )
+        marker.entry_name = marker.name
+        _check_named_derived_directory(
+            marker.namespace_fd,
+            marker.name,
+            marker.descriptor,
+            marker.identity,
+            "quarantine marker after exchange rollback",
+        )
+        _check_named_derived_directory(
+            authority.namespace_fd,
+            published_name,
+            wrong_source_fd,
+            wrong_source_identity,
+            "restored concurrent winner",
+        )
+        fsync_directory(authority.namespace_fd)
+    except BaseException as error:
+        primary_error = error
+        raise
+    finally:
+        close_error = _close_descriptors_exhaustively((wrong_source_fd,))
+        if close_error is not None:
+            if primary_error is None:
+                raise close_error
+            primary_error.add_note(
+                f"quarantine rollback descriptor close also failed: "
+                f"{close_error!r}"
+            )
+
+
+def _named_derived_directory_matches(
+    parent_fd: int,
+    name: str,
+    descriptor: int,
+    identity: _CreationIdentity,
+    description: str,
+) -> bool:
+    try:
+        _check_named_derived_directory(
+            parent_fd,
+            name,
+            descriptor,
+            identity,
+            description,
+        )
+    except (OSError, ValueError):
+        return False
+    return True
 
 
 def _exchange_quarantine_published_candidate(
@@ -4657,69 +4789,74 @@ def _exchange_quarantine_published_candidate(
     published_name: str,
     marker: _QuarantineMarker,
 ) -> str:
+    _check_named_derived_directory(
+        authority.namespace_fd,
+        published_name,
+        authority.descriptor,
+        authority.identity,
+        "published candidate before quarantine exchange",
+    )
+    _check_named_derived_directory(
+        marker.namespace_fd,
+        marker.name,
+        marker.descriptor,
+        marker.identity,
+        "quarantine marker before exchange",
+    )
     _derived_view_build_hook(
         "before_quarantine_exchange",
         authority,
         published_name,
     )
-    before_exchange = entry_lstat(
-        authority.namespace_fd,
-        published_name,
-    )
-    _require_derived_mode(
-        before_exchange,
-        directory=True,
-        description="entry before quarantine exchange",
-    )
-    swapped_entry_identity = _creation_identity(before_exchange)
     _atomic_exchange_directories(
         authority.namespace_fd,
         published_name,
         marker.name,
     )
-    marker.entry_name = published_name
-    try:
-        swapped_metadata = entry_lstat(
-            authority.namespace_fd,
-            marker.name,
-        )
-        _require_derived_mode(
-            swapped_metadata,
-            directory=True,
-            description="entry moved into quarantine",
-        )
-        swapped_entry_identity = _creation_identity(swapped_metadata)
-        _check_named_derived_directory(
-            authority.namespace_fd,
-            marker.name,
-            authority.descriptor,
-            authority.identity,
-            "published candidate after quarantine exchange",
-        )
-        _check_named_derived_directory(
-            authority.namespace_fd,
-            published_name,
-            marker.descriptor,
-            marker.identity,
-            "quarantine marker at final name",
-        )
-        _remove_quarantine_marker(marker, sync_parent=True)
+    candidate_moved = _named_derived_directory_matches(
+        authority.namespace_fd,
+        marker.name,
+        authority.descriptor,
+        authority.identity,
+        "published candidate after quarantine exchange",
+    )
+    marker_at_final = _named_derived_directory_matches(
+        authority.namespace_fd,
+        published_name,
+        marker.descriptor,
+        marker.identity,
+        "quarantine marker at final name",
+    )
+    marker.entry_name = published_name if marker_at_final else None
+
+    if candidate_moved:
+        if marker_at_final:
+            _remove_quarantine_marker(marker, sync_parent=True)
+        else:
+            fsync_directory(authority.namespace_fd)
         return marker.name
-    except BaseException as exchange_error:
-        if marker.entry_name is not None:
-            try:
-                _rollback_quarantine_exchange(
-                    authority,
-                    published_name,
-                    marker,
-                    swapped_entry_identity,
-                )
-            except BaseException as rollback_error:
-                exchange_error.add_note(
-                    f"quarantine exchange rollback also failed: "
-                    f"{rollback_error!r}"
-                )
-        raise
+
+    if marker_at_final:
+        try:
+            _rollback_quarantine_exchange(
+                authority,
+                published_name,
+                marker,
+            )
+        except BaseException as rollback_error:
+            rollback_failure = ValueError(
+                "quarantine exchange rollback failed"
+            )
+            rollback_failure.add_note(
+                f"conditional rollback also failed: {rollback_error!r}"
+            )
+            raise rollback_failure from rollback_error
+        raise ValueError(
+            "published candidate did not move during quarantine exchange"
+        )
+
+    fsync_directory(authority.namespace_fd)
+    raise ValueError("quarantine exchange identities are indeterminate")
 
 
 def _cleanup_private_build(authority: _PrivateBuildAuthority) -> None:
@@ -5075,6 +5212,17 @@ def build_wikidata_derived_view(
             authority,
             receipt_sha256,
         )
+        quarantine_marker = _allocate_quarantine_marker(
+            wikidata_fd,
+            receipt_sha256,
+        )
+        _check_named_derived_directory(
+            wikidata_fd,
+            quarantine_marker.name,
+            quarantine_marker.descriptor,
+            quarantine_marker.identity,
+            "quarantine marker before final candidate verification",
+        )
         _verify_sealed_private_build(
             authority,
             root_name=build_name,
@@ -5082,10 +5230,6 @@ def build_wikidata_derived_view(
                 _PrivateFileIdentity,
                 authority.sealed_root_identity,
             ),
-        )
-        quarantine_marker = _allocate_quarantine_marker(
-            wikidata_fd,
-            receipt_sha256,
         )
         try:
             atomic_rename_noreplace(
