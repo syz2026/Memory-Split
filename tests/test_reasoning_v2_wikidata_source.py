@@ -1183,25 +1183,41 @@ def test_no_replace_publication_reuses_only_a_fully_verified_winner(
     output_root = tmp_path / "derived"
     first = _build_view(archive_authority, output_root)
     first_identity = first.root.stat().st_ino
+    namespace = output_root / "wikidata"
+    marker_prefix = f".wikidata-marker-{first.receipt_sha256}-"
+    initial_markers = tuple(
+        path
+        for path in namespace.iterdir()
+        if path.name.startswith(marker_prefix)
+    )
+    assert len(initial_markers) == 1
+    marker_name = initial_markers[0].name
+    marker_identity = initial_markers[0].stat().st_ino
+    assert not tuple(initial_markers[0].iterdir())
 
-    reused = _build_view(archive_authority, output_root)
+    reused = first
+    for _attempt in range(4):
+        reused = _build_view(archive_authority, output_root)
 
     assert reused.root == first.root
     assert reused.root.stat().st_ino == first_identity
-    namespace_entries = tuple((output_root / "wikidata").iterdir())
+    namespace_entries = tuple(namespace.iterdir())
     assert tuple(
         path.name
         for path in namespace_entries
-        if not path.name.startswith(".orphan-marker-")
+        if not path.name.startswith(marker_prefix)
     ) == (
         first.receipt_sha256,
     )
     retained_markers = tuple(
         path
         for path in namespace_entries
-        if path.name.startswith(".orphan-marker-")
+        if path.name.startswith(marker_prefix)
     )
-    assert len(retained_markers) == 2
+    assert len(retained_markers) == 1
+    assert retained_markers[0].name == marker_name
+    assert retained_markers[0].stat().st_ino == marker_identity
+    assert not tuple(retained_markers[0].iterdir())
     assert all(path.stat().st_mode & 0o777 == 0o700 for path in retained_markers)
 
     index_path = first.root / "indexes/aliases.bin"
@@ -1210,6 +1226,53 @@ def test_no_replace_publication_reuses_only_a_fully_verified_winner(
     index_path.write_bytes(attacked)
     with pytest.raises(ValueError, match="drift|digest|index"):
         _build_view(archive_authority, output_root)
+
+
+def test_reusable_marker_slot_rejects_same_inode_aba(
+    archive_authority: _AuthorityFixture,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    output_root = tmp_path / "derived"
+    first = _build_view(archive_authority, output_root)
+    namespace = output_root / "wikidata"
+    marker_prefix = f".wikidata-marker-{first.receipt_sha256}-"
+    initial_marker = next(
+        path
+        for path in namespace.iterdir()
+        if path.name.startswith(marker_prefix)
+    )
+    marker_inode = initial_marker.stat().st_ino
+    attacked = False
+    original_list = wikidata_source_module.list_entries
+
+    def mutate_and_restore_marker(descriptor):
+        nonlocal attacked
+        entries = original_list(descriptor)
+        if not attacked and os.fstat(descriptor).st_ino == marker_inode:
+            attacked = True
+            os.mkdir(".marker-aba", mode=0o700, dir_fd=descriptor)
+            os.rmdir(".marker-aba", dir_fd=descriptor)
+        return entries
+
+    monkeypatch.setattr(
+        wikidata_source_module,
+        "list_entries",
+        mutate_and_restore_marker,
+    )
+
+    reused = _build_view(archive_authority, output_root)
+
+    assert attacked
+    assert reused.root == first.root
+    markers = tuple(
+        path
+        for path in namespace.iterdir()
+        if path.name.startswith(marker_prefix)
+    )
+    assert len(markers) == 2
+    assert all(not tuple(path.iterdir()) for path in markers)
+    assert initial_marker.stat().st_ino == marker_inode
 
 
 @pytest.mark.parametrize(
@@ -1800,10 +1863,10 @@ def test_postpublish_drift_quarantines_exact_root_and_vacates_final_name(
     quarantines = tuple(
         path
         for path in namespace.iterdir()
-        if path.name.startswith(".quarantine-")
+        if path.name.startswith(f".wikidata-marker-{final_name}-")
+        and path.stat().st_ino == published_inode
     )
     assert len(quarantines) == 1
-    assert quarantines[0].stat().st_ino == published_inode
     assert quarantines[0].stat().st_mode & 0o777 == 0o700
 
 
@@ -1844,11 +1907,13 @@ def test_postpublish_root_swap_preserves_concurrent_winner(
     winner = output_root / "wikidata" / final_name
     assert winner.is_dir()
     assert winner.stat().st_ino == winner_inode
-    assert not tuple(
+    retained_markers = tuple(
         path
         for path in winner.parent.iterdir()
-        if path.name.startswith(".quarantine-")
+        if path.name.startswith(f".wikidata-marker-{final_name}-")
     )
+    assert len(retained_markers) == 1
+    assert not tuple(retained_markers[0].iterdir())
     verified = wikidata_source_module.verify_wikidata_derived_view(
         archive_authority.source_lock_path,
         archive_authority.source_root,
@@ -2211,10 +2276,10 @@ def test_postrename_fsync_failure_exchange_quarantines_and_vacates_final(
     quarantines = tuple(
         path
         for path in namespace.iterdir()
-        if path.name.startswith(".quarantine-")
+        if path.name.startswith(f".wikidata-marker-{final_name}-")
+        and path.stat().st_ino == published_inode
     )
     assert len(quarantines) == 1
-    assert quarantines[0].stat().st_ino == published_inode
     assert quarantines[0].stat().st_mode & 0o777 == 0o700
 
 
@@ -2241,7 +2306,10 @@ def test_quarantine_exchange_race_restores_substituted_winner(
         markers = tuple(
             path
             for path in namespace.iterdir()
-            if path.name.startswith(".quarantine-")
+            if path.name.startswith(
+                f".wikidata-marker-{receipt_sha256}-"
+            )
+            and not tuple(path.iterdir())
         )
         assert len(markers) == 1
         assert not tuple(markers[0].iterdir())
@@ -2271,15 +2339,10 @@ def test_quarantine_exchange_race_restores_substituted_winner(
     retained_markers = tuple(
         path
         for path in namespace.iterdir()
-        if path.name.startswith(".orphan-marker-")
+        if path.name.startswith(f".wikidata-marker-{final_name}-")
         and path.stat().st_ino == marker_inode
     )
     assert len(retained_markers) == 1
-    assert not tuple(
-        path
-        for path in namespace.iterdir()
-        if path.name.startswith(".quarantine-")
-    )
     verified = wikidata_source_module.verify_wikidata_derived_view(
         archive_authority.source_lock_path,
         archive_authority.source_root,
@@ -2327,7 +2390,7 @@ def test_marker_is_bound_before_final_verification_and_publish_is_immediate(
             markers = tuple(
                 path
                 for path in (output_root / "wikidata").iterdir()
-                if path.name.startswith(".quarantine-")
+                if path.name.startswith(".wikidata-marker-")
             )
             assert len(markers) == 1
             assert not tuple(markers[0].iterdir())
@@ -2395,7 +2458,9 @@ def test_marker_substitution_keeps_failed_candidate_quarantined(
         markers = tuple(
             path
             for path in namespace.iterdir()
-            if path.name.startswith(".quarantine-")
+            if path.name.startswith(
+                f".wikidata-marker-{receipt_sha256}-"
+            )
         )
         assert len(markers) == 1
         marker = markers[0]
@@ -2754,7 +2819,10 @@ def test_two_name_preswap_retries_until_candidate_is_quarantined(
         markers = tuple(
             path
             for path in namespace.iterdir()
-            if path.name.startswith(".quarantine-")
+            if path.name.startswith(
+                f".wikidata-marker-{receipt_sha256}-"
+            )
+            and not tuple(path.iterdir())
         )
         assert len(markers) == 1
         marker_inode = markers[0].stat().st_ino
@@ -2783,14 +2851,14 @@ def test_two_name_preswap_retries_until_candidate_is_quarantined(
     quarantined_candidates = tuple(
         path
         for path in namespace.iterdir()
-        if path.name.startswith(".quarantine-")
+        if path.name.startswith(f".wikidata-marker-{final_name}-")
         and path.stat().st_ino == candidate_inode
     )
     assert len(quarantined_candidates) == 1
     retained_markers = tuple(
         path
         for path in namespace.iterdir()
-        if path.name.startswith(".orphan-marker-")
+        if path.name.startswith(f".wikidata-marker-{final_name}-")
         and path.stat().st_ino == marker_inode
     )
     assert len(retained_markers) == 1
@@ -2810,11 +2878,11 @@ def test_repeated_original_state_exhaustion_refreshes_marker(
     original_allocate = wikidata_source_module._allocate_quarantine_marker
     original_exchange = wikidata_source_module._atomic_exchange_directories
 
-    def record_marker(namespace_fd, published_name, orphan_budget=None):
+    def record_marker(namespace_fd, published_name, pool=None):
         marker = original_allocate(
             namespace_fd,
             published_name,
-            orphan_budget,
+            pool,
         )
         allocated_markers.append(marker.name)
         return marker
@@ -2864,10 +2932,10 @@ def test_repeated_original_state_exhaustion_refreshes_marker(
     quarantines = tuple(
         path
         for path in namespace.iterdir()
-        if path.name.startswith(".quarantine-")
+        if path.name.startswith(f".wikidata-marker-{final_name}-")
+        and path.stat().st_ino == candidate_inode
     )
     assert len(quarantines) == 1
-    assert quarantines[0].stat().st_ino == candidate_inode
 
 
 def test_repeated_fresh_marker_bind_failures_keep_resources_bounded(
@@ -2910,11 +2978,11 @@ def test_repeated_fresh_marker_bind_failures_keep_resources_bounded(
             == identity
         )
 
-    def record_allocation(namespace_fd, published_name, orphan_budget=None):
+    def record_allocation(namespace_fd, published_name, pool=None):
         marker = original_allocate(
             namespace_fd,
             published_name,
-            orphan_budget,
+            pool,
         )
         allocation_records.append((marker.descriptor, marker.identity))
         return marker
@@ -2966,7 +3034,7 @@ def test_repeated_fresh_marker_bind_failures_keep_resources_bounded(
                 for descriptor, identity in allocation_records
             )
             named_markers = sum(
-                path.name.startswith(".quarantine-")
+                path.name.startswith(".wikidata-marker-")
                 for path in namespace.iterdir()
             )
             observations.append((open_markers, named_markers))
@@ -2988,8 +3056,7 @@ def test_repeated_fresh_marker_bind_failures_keep_resources_bounded(
         nonlocal marker_rmdir_seen
         marker_name = os.fsdecode(name)
         if (
-            marker_name.startswith(".quarantine-")
-            or marker_name.startswith(".orphan-marker-")
+            marker_name.startswith(".wikidata-marker-")
             or marker_name == final_name
         ):
             marker_rmdir_seen = True
@@ -3034,7 +3101,7 @@ def test_repeated_fresh_marker_bind_failures_keep_resources_bounded(
 
     assert fresh_bind_succeeded
     assert fresh_checks == bind_failures + 1
-    assert observations == [(1, 1)] * bind_failures
+    assert observations == [(1, count) for count in range(2, 6)]
     assert close_failure_injected
     notes = getattr(raised.value, "__notes__", ())
     assert any(
@@ -3057,19 +3124,20 @@ def test_repeated_fresh_marker_bind_failures_keep_resources_bounded(
     quarantines = tuple(
         path
         for path in namespace.iterdir()
-        if path.name.startswith(".quarantine-")
+        if path.name.startswith(f".wikidata-marker-{final_name}-")
+        and path.stat().st_ino == candidate_inode
     )
     assert len(quarantines) == 1
-    assert quarantines[0].stat().st_ino == candidate_inode
-    orphans = tuple(
+    pooled_entries = tuple(
         path
         for path in namespace.iterdir()
-        if path.name.startswith(".orphan-marker-")
+        if path.name.startswith(f".wikidata-marker-{final_name}-")
     )
-    assert 1 <= len(orphans) <= 8
+    assert len(pooled_entries) == 7
+    assert sum(not tuple(path.iterdir()) for path in pooled_entries) == 6
 
 
-def test_quarantine_allocation_failures_share_orphan_budget(
+def test_quarantine_allocation_failures_consume_marker_pool(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ):
@@ -3079,7 +3147,11 @@ def test_quarantine_allocation_failures_share_orphan_budget(
         namespace,
         os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
     )
-    budget = wikidata_source_module._QuarantineOrphanBudget()
+    published_name = "a" * 64
+    pool = wikidata_source_module._QuarantineMarkerPool(
+        namespace_fd=namespace_fd,
+        published_name=published_name,
+    )
     created: list[
         tuple[int, wikidata_source_module._CreationIdentity]
     ] = []
@@ -3098,7 +3170,7 @@ def test_quarantine_allocation_failures_share_orphan_budget(
 
     def record_marker_create(parent_fd, name):
         descriptor, identity = original_create(parent_fd, name)
-        if name.startswith(".quarantine-"):
+        if name.startswith(f".wikidata-marker-{published_name}-"):
             created.append((descriptor, identity))
         return descriptor, identity
 
@@ -3126,43 +3198,37 @@ def test_quarantine_allocation_failures_share_orphan_budget(
     )
 
     try:
-        for _attempt in range(12):
-            with pytest.raises(
-                ValueError,
-                match="allocation validation failure|orphan budget exhausted",
-            ):
-                wikidata_source_module._allocate_quarantine_marker(
-                    namespace_fd,
-                    "a" * 64,
-                    budget,
-                )
-            assert not any(
-                marker_is_open(descriptor, identity)
-                for descriptor, identity in created
+        with pytest.raises(ValueError, match="marker pool allocation exhausted"):
+            wikidata_source_module._allocate_quarantine_marker(
+                namespace_fd,
+                published_name,
+                pool,
             )
-            assert len(
-                tuple(
-                    path
-                    for path in namespace.iterdir()
-                    if path.name.startswith(".orphan-marker-")
-                )
-            ) <= 7
-            assert not tuple(
-                path
-                for path in namespace.iterdir()
-                if path.name.startswith(".quarantine-")
+        assert not any(
+            marker_is_open(descriptor, identity)
+            for descriptor, identity in created
+        )
+        pooled_entries = tuple(
+            path
+            for path in namespace.iterdir()
+            if path.name.startswith(
+                f".wikidata-marker-{published_name}-"
             )
+        )
+        assert len(pooled_entries) == 8
+        assert all(not tuple(path.iterdir()) for path in pooled_entries)
+
+        with pytest.raises(ValueError, match="marker pool allocation exhausted"):
+            wikidata_source_module._allocate_quarantine_marker(
+                namespace_fd,
+                published_name,
+                pool,
+            )
+        assert len(tuple(namespace.iterdir())) == 8
     finally:
         os.close(namespace_fd)
 
-    assert len(created) == 7
-    assert len(
-        tuple(
-            path
-            for path in namespace.iterdir()
-            if path.name.startswith(".orphan-marker-")
-        )
-    ) == 7
+    assert len(created) == 8
 
 
 def test_marker_detach_restores_substitute_without_rmdir(
@@ -3194,11 +3260,11 @@ def test_marker_detach_restores_substitute_without_rmdir(
             return False
         return wikidata_source_module._creation_identity(metadata) == identity
 
-    def record_allocation(namespace_fd, published_name, orphan_budget=None):
+    def record_allocation(namespace_fd, published_name, pool=None):
         marker = original_allocate(
             namespace_fd,
             published_name,
-            orphan_budget,
+            pool,
         )
         allocation_records.append((marker.descriptor, marker.identity))
         return marker
@@ -3224,7 +3290,9 @@ def test_marker_detach_restores_substitute_without_rmdir(
             not raced
             and final_name is not None
             and source_name == final_name
-            and destination_name.startswith(".orphan-marker-")
+            and destination_name.startswith(
+                f".wikidata-marker-{final_name}-"
+            )
         ):
             raced = True
             namespace = output_root / "wikidata"
@@ -3245,8 +3313,7 @@ def test_marker_detach_restores_substitute_without_rmdir(
         nonlocal marker_rmdir_seen
         marker_name = os.fsdecode(name)
         if (
-            marker_name.startswith(".quarantine-")
-            or marker_name.startswith(".orphan-marker-")
+            marker_name.startswith(".wikidata-marker-")
             or marker_name == final_name
         ):
             marker_rmdir_seen = True
@@ -3293,7 +3360,7 @@ def test_marker_detach_restores_substitute_without_rmdir(
     quarantined_candidates = tuple(
         path
         for path in namespace.iterdir()
-        if path.name.startswith(".quarantine-")
+        if path.name.startswith(f".wikidata-marker-{final_name}-")
         and path.stat().st_ino == candidate_inode
     )
     assert len(quarantined_candidates) == 1
@@ -3301,10 +3368,164 @@ def test_marker_detach_restores_substitute_without_rmdir(
         tuple(
             path
             for path in namespace.iterdir()
-            if path.name.startswith(".orphan-marker-")
+            if path.name.startswith(f".wikidata-marker-{final_name}-")
         )
     ) <= 8
     assert not any(
         marker_is_open(descriptor, identity)
         for descriptor, identity in allocation_records
+    )
+
+
+def test_lost_marker_attempts_exhaust_deterministic_pool(
+    tmp_path: Path,
+):
+    namespace = tmp_path / "wikidata"
+    namespace.mkdir(mode=0o700)
+    namespace_fd = os.open(
+        namespace,
+        os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+    )
+    published_name = "b" * 64
+    pool = None
+    opened: list[
+        tuple[int, wikidata_source_module._CreationIdentity]
+    ] = []
+
+    try:
+        for slot in range(8):
+            marker = wikidata_source_module._allocate_quarantine_marker(
+                namespace_fd,
+                published_name,
+                pool,
+            )
+            pool = marker.pool
+            opened.append((marker.descriptor, marker.identity))
+            os.rename(
+                marker.name,
+                f"lost-marker-{slot}",
+                src_dir_fd=namespace_fd,
+                dst_dir_fd=namespace_fd,
+            )
+            close_error = (
+                wikidata_source_module._close_descriptors_exhaustively(
+                    (marker.descriptor,)
+                )
+            )
+            assert close_error is None
+
+        with pytest.raises(ValueError, match="marker pool.*exhausted"):
+            wikidata_source_module._allocate_quarantine_marker(
+                namespace_fd,
+                published_name,
+                pool,
+            )
+    finally:
+        os.close(namespace_fd)
+
+    assert len(tuple(namespace.iterdir())) == 8
+    assert not tuple(
+        path
+        for path in namespace.iterdir()
+        if path.name.startswith(f".wikidata-marker-{published_name}-")
+    )
+    for descriptor, identity in opened:
+        try:
+            metadata = os.fstat(descriptor)
+        except OSError:
+            continue
+        assert wikidata_source_module._creation_identity(metadata) != identity
+
+
+def test_seven_failed_candidates_block_eighth_before_publication(
+    archive_authority: _AuthorityFixture,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    output_root = tmp_path / "derived"
+    published_name: str | None = None
+    postpublication_failures = 0
+    allocated: list[
+        tuple[int, wikidata_source_module._CreationIdentity]
+    ] = []
+    original_allocate = wikidata_source_module._allocate_quarantine_marker
+
+    def marker_is_open(
+        descriptor: int,
+        identity: wikidata_source_module._CreationIdentity,
+    ) -> bool:
+        try:
+            metadata = os.fstat(descriptor)
+        except OSError:
+            return False
+        return wikidata_source_module._creation_identity(metadata) == identity
+
+    def record_allocation(*args, **kwargs):
+        marker = original_allocate(*args, **kwargs)
+        allocated.append((marker.descriptor, marker.identity))
+        return marker
+
+    def fail_after_publish(phase, _authority, receipt_sha256):
+        nonlocal published_name, postpublication_failures
+        if phase != "before_postpublish_verify":
+            return
+        published_name = receipt_sha256
+        postpublication_failures += 1
+        raise RuntimeError("forced pooled quarantine failure")
+
+    monkeypatch.setattr(
+        wikidata_source_module,
+        "_allocate_quarantine_marker",
+        record_allocation,
+    )
+    monkeypatch.setattr(
+        wikidata_source_module,
+        "_derived_view_build_hook",
+        fail_after_publish,
+    )
+
+    for failure_count in range(1, 8):
+        with pytest.raises(
+            RuntimeError,
+            match="forced pooled quarantine failure",
+        ):
+            _build_view(archive_authority, output_root)
+        assert published_name is not None
+        namespace = output_root / "wikidata"
+        final = namespace / published_name
+        assert not final.exists()
+        slots = tuple(
+            path
+            for path in namespace.iterdir()
+            if path.name.startswith(
+                f".wikidata-marker-{published_name}-"
+            )
+        )
+        assert len(slots) == failure_count + 1
+        assert sum(bool(tuple(path.iterdir())) for path in slots) == failure_count
+        assert sum(not tuple(path.iterdir()) for path in slots) == 1
+        assert not any(
+            marker_is_open(descriptor, identity)
+            for descriptor, identity in allocated
+        )
+
+    with pytest.raises(ValueError, match="marker pool.*capacity|exhausted"):
+        _build_view(archive_authority, output_root)
+
+    assert postpublication_failures == 7
+    assert published_name is not None
+    namespace = output_root / "wikidata"
+    final = namespace / published_name
+    assert not final.exists()
+    slots = tuple(
+        path
+        for path in namespace.iterdir()
+        if path.name.startswith(f".wikidata-marker-{published_name}-")
+    )
+    assert len(slots) == 8
+    assert sum(bool(tuple(path.iterdir())) for path in slots) == 7
+    assert sum(not tuple(path.iterdir()) for path in slots) == 1
+    assert not any(
+        marker_is_open(descriptor, identity)
+        for descriptor, identity in allocated
     )

@@ -4629,14 +4629,16 @@ def _verify_sealed_private_build(
 
 
 _QUARANTINE_SAME_STATE_RETRIES = 1
-_QUARANTINE_DETACH_ATTEMPTS = 4
-_QUARANTINE_ORPHAN_LIMIT = 8
-_QUARANTINE_ORPHAN_PREFIX = ".orphan-marker-"
+_MARKER_POOL_SIZE = 8
+_MARKER_POOL_PREFIX = ".wikidata-marker-"
 
 
 @dataclass
-class _QuarantineOrphanBudget:
-    retained: int = 0
+class _QuarantineMarkerPool:
+    namespace_fd: int
+    published_name: str
+    attempted_slots: set[int] = field(default_factory=set)
+    reserved_detach_slot: int | None = None
 
 
 @dataclass
@@ -4646,9 +4648,8 @@ class _QuarantineMarker:
     descriptor: int
     identity: _CreationIdentity
     entry_name: str | None
-    orphan_budget: _QuarantineOrphanBudget = field(
-        default_factory=_QuarantineOrphanBudget
-    )
+    pool: _QuarantineMarkerPool
+    slot_index: int
 
 
 @dataclass(frozen=True)
@@ -4659,76 +4660,192 @@ class _QuarantineExchangeState:
     marker_at_marker: bool
 
 
-def _allocate_quarantine_marker(
-    namespace_fd: int,
-    published_name: str,
-    orphan_budget: _QuarantineOrphanBudget | None = None,
+def _marker_pool_slot_name(
+    pool: _QuarantineMarkerPool,
+    slot_index: int,
+) -> str:
+    if not 0 <= slot_index < _MARKER_POOL_SIZE:
+        raise ValueError("Wikidata marker pool slot is invalid")
+    return f"{_MARKER_POOL_PREFIX}{pool.published_name}-{slot_index}"
+
+
+def _open_marker_pool_slot(
+    pool: _QuarantineMarkerPool,
+    slot_index: int,
 ) -> _QuarantineMarker:
-    if (
-        orphan_budget is not None
-        and orphan_budget.retained >= _QUARANTINE_ORPHAN_LIMIT - 1
-    ):
-        raise ValueError("quarantine marker orphan budget exhausted")
-    prefix = f".quarantine-{published_name[:16]}-"
-    for _attempt in range(32):
-        name = prefix + secrets.token_hex(8)
+    name = _marker_pool_slot_name(pool, slot_index)
+    descriptor = -1
+    primary_error: BaseException | None = None
+    try:
+        named_before_identity: _PrivateFileIdentity | None = None
         try:
             descriptor, identity = _create_private_directory(
-                namespace_fd,
+                pool.namespace_fd,
                 name,
             )
         except FileExistsError:
-            continue
-        marker = _QuarantineMarker(
-            namespace_fd=namespace_fd,
+            named_before = entry_lstat(pool.namespace_fd, name)
+            _require_derived_mode(
+                named_before,
+                directory=True,
+                description="reusable Wikidata marker pool slot",
+            )
+            named_before_identity = _private_file_identity(named_before)
+            descriptor, _created = open_directory_at(
+                pool.namespace_fd,
+                name,
+            )
+            opened = os.fstat(descriptor)
+            _require_derived_mode(
+                opened,
+                directory=True,
+                description="reusable Wikidata marker pool slot",
+            )
+            identity = _creation_identity(opened)
+            if (
+                _creation_identity(named_before) != identity
+                or named_before_identity != _private_file_identity(opened)
+            ):
+                raise ValueError(
+                    "reusable Wikidata marker pool slot identity drift"
+                )
+
+        expected_shape = _private_file_identity(os.fstat(descriptor))
+        for description in (
+            "Wikidata marker pool slot",
+            "empty Wikidata marker pool slot",
+        ):
+            _check_named_derived_directory(
+                pool.namespace_fd,
+                name,
+                descriptor,
+                identity,
+                description,
+            )
+            if list_entries(descriptor):
+                raise ValueError("Wikidata marker pool slot is not empty")
+            opened_after = os.fstat(descriptor)
+            named_after = entry_lstat(pool.namespace_fd, name)
+            _require_derived_mode(
+                opened_after,
+                directory=True,
+                description=description,
+            )
+            _require_derived_mode(
+                named_after,
+                directory=True,
+                description=description,
+            )
+            if (
+                _private_file_identity(opened_after) != expected_shape
+                or _private_file_identity(named_after) != expected_shape
+            ):
+                raise ValueError(
+                    "Wikidata marker pool slot shape identity drift"
+                )
+        return _QuarantineMarker(
+            namespace_fd=pool.namespace_fd,
             name=name,
             descriptor=descriptor,
             identity=identity,
             entry_name=name,
-            orphan_budget=(
-                orphan_budget
-                if orphan_budget is not None
-                else _QuarantineOrphanBudget()
+            pool=pool,
+            slot_index=slot_index,
+        )
+    except BaseException as error:
+        primary_error = error
+        raise
+    finally:
+        if primary_error is not None:
+            close_error = _close_descriptors_exhaustively((descriptor,))
+            if close_error is not None:
+                primary_error.add_note(
+                    "marker pool slot descriptor close also failed: "
+                    f"{close_error!r}"
+                )
+
+
+def _allocate_quarantine_marker(
+    namespace_fd: int,
+    published_name: str,
+    pool: _QuarantineMarkerPool | None = None,
+) -> _QuarantineMarker:
+    if pool is None:
+        pool = _QuarantineMarkerPool(
+            namespace_fd=namespace_fd,
+            published_name=_validate_sha256(
+                published_name,
+                "published receipt sha256",
             ),
         )
+    elif (
+        pool.namespace_fd != namespace_fd
+        or pool.published_name != published_name
+    ):
+        raise ValueError("Wikidata marker pool authority mismatch")
+
+    attempt_errors: list[BaseException] = []
+    for slot_index in range(_MARKER_POOL_SIZE):
+        if slot_index in pool.attempted_slots:
+            continue
+        pool.attempted_slots.add(slot_index)
         try:
-            if list_entries(descriptor):
-                raise ValueError("quarantine marker is not empty")
-        except BaseException as error:
-            cleanup_error = _release_owned_quarantine_marker(
-                marker,
-                detach_entry=True,
-            )
-            if cleanup_error is not None:
-                error.add_note(
-                    f"quarantine allocation cleanup also failed: "
-                    f"{cleanup_error!r}"
-                )
-            raise
-        return marker
-    raise FileExistsError("could not allocate quarantine marker")
+            return _open_marker_pool_slot(pool, slot_index)
+        except (OSError, ValueError) as error:
+            attempt_errors.append(error)
+
+    exhausted = ValueError("Wikidata marker pool allocation exhausted")
+    for error in attempt_errors:
+        exhausted.add_note(f"marker pool slot attempt failed: {error!r}")
+    raise exhausted
+
+
+def _reserve_quarantine_detach_slot(
+    marker: _QuarantineMarker,
+) -> str:
+    pool = marker.pool
+    pool.reserved_detach_slot = None
+    for slot_index in range(_MARKER_POOL_SIZE):
+        if slot_index in pool.attempted_slots:
+            continue
+        name = _marker_pool_slot_name(pool, slot_index)
+        try:
+            entry_lstat(pool.namespace_fd, name)
+        except FileNotFoundError:
+            pool.reserved_detach_slot = slot_index
+            return name
+        except OSError:
+            continue
+    raise ValueError("Wikidata marker pool detach capacity exhausted")
 
 
 def _detach_quarantine_marker(
     marker: _QuarantineMarker,
-    *,
-    reserve_final_orphan: bool,
 ) -> str | None:
     if marker.entry_name is None:
         return None
-    orphan_ceiling = _QUARANTINE_ORPHAN_LIMIT - int(
-        reserve_final_orphan
-    )
-    if marker.orphan_budget.retained >= orphan_ceiling:
-        return None
-
     source_name = marker.entry_name
-    inode_token = f"{marker.identity[1]:x}"
-    for _attempt in range(_QUARANTINE_DETACH_ATTEMPTS):
-        orphan_name = (
-            f"{_QUARANTINE_ORPHAN_PREFIX}{inode_token}-"
-            f"{secrets.token_hex(8)}"
+    pool = marker.pool
+    slot_order = tuple(
+        dict.fromkeys(
+            (
+                *(
+                    (pool.reserved_detach_slot,)
+                    if pool.reserved_detach_slot is not None
+                    else ()
+                ),
+                *range(_MARKER_POOL_SIZE),
+            )
         )
+    )
+    for slot_index in slot_order:
+        if (
+            slot_index == marker.slot_index
+            or slot_index in pool.attempted_slots
+        ):
+            continue
+        pool.attempted_slots.add(slot_index)
+        orphan_name = _marker_pool_slot_name(pool, slot_index)
         try:
             atomic_rename_noreplace(
                 marker.namespace_fd,
@@ -4746,8 +4863,8 @@ def _detach_quarantine_marker(
             marker.identity,
             "detached quarantine marker",
         ):
-            marker.entry_name = None
-            marker.orphan_budget.retained += 1
+            marker.entry_name = orphan_name
+            pool.reserved_detach_slot = None
             fsync_directory(marker.namespace_fd)
             _check_named_derived_directory(
                 marker.namespace_fd,
@@ -4825,31 +4942,13 @@ def _detach_quarantine_marker(
                     "detached substitute descriptor close also failed: "
                     f"{close_error!r}"
                 )
-    return None
+    raise ValueError("Wikidata marker pool detach exhausted")
 
 
 def _release_owned_quarantine_marker(
     marker: _QuarantineMarker,
-    *,
-    detach_entry: bool,
 ) -> BaseException | None:
-    cleanup_error: BaseException | None = None
-    if detach_entry:
-        try:
-            _detach_quarantine_marker(
-                marker,
-                reserve_final_orphan=True,
-            )
-        except BaseException as error:
-            cleanup_error = error
-    close_error = _close_descriptors_exhaustively((marker.descriptor,))
-    if close_error is not None:
-        cleanup_error = _append_secondary_error(
-            cleanup_error,
-            close_error,
-            "quarantine marker descriptor close failure",
-        )
-    return cleanup_error
+    return _close_descriptors_exhaustively((marker.descriptor,))
 
 
 def _rollback_quarantine_exchange(
@@ -5004,11 +5103,6 @@ def _refresh_quarantine_marker(
     published_name: str,
     state: _QuarantineExchangeState,
 ) -> BaseException | None:
-    if (
-        marker.orphan_budget.retained
-        >= _QUARANTINE_ORPHAN_LIMIT - 1
-    ):
-        raise ValueError("quarantine marker orphan budget exhausted")
     fresh: _QuarantineMarker | None = None
     ownership_transferred = False
     primary_error: BaseException | None = None
@@ -5016,7 +5110,7 @@ def _refresh_quarantine_marker(
         fresh = _allocate_quarantine_marker(
             marker.namespace_fd,
             published_name,
-            marker.orphan_budget,
+            marker.pool,
         )
         _check_named_derived_directory(
             fresh.namespace_fd,
@@ -5025,33 +5119,31 @@ def _refresh_quarantine_marker(
             fresh.identity,
             "fresh quarantine marker",
         )
+        _reserve_quarantine_detach_slot(fresh)
         retired = _QuarantineMarker(
             namespace_fd=marker.namespace_fd,
             name=marker.name,
             descriptor=marker.descriptor,
             identity=marker.identity,
             entry_name=marker.name if state.marker_at_marker else None,
-            orphan_budget=marker.orphan_budget,
+            pool=marker.pool,
+            slot_index=marker.slot_index,
         )
         marker.namespace_fd = fresh.namespace_fd
         marker.name = fresh.name
         marker.descriptor = fresh.descriptor
         marker.identity = fresh.identity
         marker.entry_name = fresh.entry_name
+        marker.pool = fresh.pool
+        marker.slot_index = fresh.slot_index
         ownership_transferred = True
-        return _release_owned_quarantine_marker(
-            retired,
-            detach_entry=retired.entry_name is not None,
-        )
+        return _release_owned_quarantine_marker(retired)
     except BaseException as error:
         primary_error = error
         raise
     finally:
         if fresh is not None and not ownership_transferred:
-            cleanup_error = _release_owned_quarantine_marker(
-                fresh,
-                detach_entry=True,
-            )
+            cleanup_error = _release_owned_quarantine_marker(fresh)
             if cleanup_error is not None:
                 if primary_error is None:
                     raise cleanup_error
@@ -5180,10 +5272,7 @@ def _exchange_quarantine_published_candidate(
         if state.candidate_at_marker and state.marker_at_final:
             marker.entry_name = published_name
             try:
-                _detach_quarantine_marker(
-                    marker,
-                    reserve_final_orphan=False,
-                )
+                _detach_quarantine_marker(marker)
             except BaseException as error:
                 if secondary_error is None:
                     secondary_error = error
@@ -5583,6 +5672,7 @@ def build_wikidata_derived_view(
             quarantine_marker.identity,
             "quarantine marker before final candidate verification",
         )
+        _reserve_quarantine_detach_slot(quarantine_marker)
         _verify_sealed_private_build(
             authority,
             root_name=build_name,
@@ -5591,6 +5681,7 @@ def build_wikidata_derived_view(
                 authority.sealed_root_identity,
             ),
         )
+        _reserve_quarantine_detach_slot(quarantine_marker)
         try:
             atomic_rename_noreplace(
                 wikidata_fd,
@@ -5648,10 +5739,6 @@ def build_wikidata_derived_view(
                 root_name=receipt_sha256,
                 expected_root_identity=postrename_root_identity,
             )
-            _detach_quarantine_marker(
-                quarantine_marker,
-                reserve_final_orphan=False,
-            )
             published = True
             return winner
         except BaseException as error:
@@ -5688,21 +5775,6 @@ def build_wikidata_derived_view(
                 _cleanup_private_build(authority)
             except BaseException as error:
                 secondary_error = error
-        if (
-            quarantine_marker is not None
-            and quarantine_marker.entry_name is not None
-        ):
-            try:
-                _detach_quarantine_marker(
-                    quarantine_marker,
-                    reserve_final_orphan=False,
-                )
-            except BaseException as error:
-                secondary_error = _append_secondary_error(
-                    secondary_error,
-                    error,
-                    "quarantine marker cleanup failure",
-                )
         close_error = _close_descriptors_exhaustively(
             (
                 work_fd,
