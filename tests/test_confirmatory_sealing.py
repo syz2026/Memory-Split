@@ -61,6 +61,17 @@ def _publish_fixture(tmp_path: Path):
     return source, preregistration, output_root, published
 
 
+def _quarantine_directories(output_root: Path) -> list[Path]:
+    return sorted(
+        (
+            path
+            for path in output_root.iterdir()
+            if path.name.startswith(".sealed-release-quarantine-")
+        ),
+        key=lambda path: path.name,
+    )
+
+
 def _rewrite_jsonl(path: Path, records: list[dict[str, object]]) -> None:
     path.write_bytes(b"".join(canonical_json_bytes(record) for record in records))
 
@@ -372,7 +383,7 @@ def test_apply_rejects_conflicting_output_without_touching_it(tmp_path):
     assert sorted(path.name for path in output_root.iterdir()) == [plan.release_id]
 
 
-def test_apply_removes_private_staging_after_mid_write_failure(
+def test_failed_stage_is_preserved_as_quarantine_without_pathname_deletion(
     tmp_path,
     monkeypatch,
 ):
@@ -383,6 +394,9 @@ def test_apply_removes_private_staging_after_mid_write_failure(
     original = sealing._write_file_at
     calls = 0
 
+    def forbid_pathname_deletion(*_args, **_kwargs):
+        raise AssertionError("authority path must never unlink or rmdir")
+
     def fail_third_write(*args, **kwargs):
         nonlocal calls
         calls += 1
@@ -391,6 +405,8 @@ def test_apply_removes_private_staging_after_mid_write_failure(
         return original(*args, **kwargs)
 
     monkeypatch.setattr(sealing, "_write_file_at", fail_third_write)
+    monkeypatch.setattr(sealing.os, "unlink", forbid_pathname_deletion)
+    monkeypatch.setattr(sealing.os, "rmdir", forbid_pathname_deletion)
     with pytest.raises(OSError, match="injected staged write failure"):
         seal_release(
             source_dir=source,
@@ -399,7 +415,19 @@ def test_apply_removes_private_staging_after_mid_write_failure(
             apply=True,
         )
 
-    assert list(output_root.iterdir()) == []
+    quarantines = _quarantine_directories(output_root)
+    assert len(quarantines) == 1
+    assert {path.name for path in quarantines[0].iterdir()} == {
+        "items.jsonl",
+        "stores.jsonl",
+    }
+    with pytest.raises(SealingError, match="quarantine|blocker"):
+        seal_release(
+            source_dir=source,
+            preregistration_path=preregistration,
+            output_root=output_root,
+            apply=True,
+        )
 
 
 def test_apply_detects_source_toctou_before_publication(tmp_path, monkeypatch):
@@ -423,7 +451,51 @@ def test_apply_detects_source_toctou_before_publication(tmp_path, monkeypatch):
             apply=True,
         )
 
-    assert list(output_root.iterdir()) == []
+    quarantines = _quarantine_directories(output_root)
+    assert len(quarantines) == 1
+    assert {path.name for path in quarantines[0].iterdir()} == {
+        "items.jsonl",
+        "stores.jsonl",
+        "sealed-gold.jsonl",
+        "sealed-release.json",
+    }
+
+
+def test_failed_install_verification_is_preserved_as_quarantine(
+    tmp_path,
+    monkeypatch,
+):
+    source, preregistration = _write_source(tmp_path)
+    output_root = tmp_path / "releases"
+    output_root.mkdir(mode=0o700)
+    output_root.chmod(0o700)
+
+    def fail_install(*_args, **_kwargs):
+        raise SealingError("injected installed release verification failure")
+
+    def forbid_pathname_deletion(*_args, **_kwargs):
+        raise AssertionError("authority path must never unlink or rmdir")
+
+    monkeypatch.setattr(sealing, "_verify_staged_release", fail_install)
+    monkeypatch.setattr(sealing.os, "unlink", forbid_pathname_deletion)
+    monkeypatch.setattr(sealing.os, "rmdir", forbid_pathname_deletion)
+
+    with pytest.raises(SealingError, match="installed release verification"):
+        seal_release(
+            source_dir=source,
+            preregistration_path=preregistration,
+            output_root=output_root,
+            apply=True,
+        )
+
+    quarantines = _quarantine_directories(output_root)
+    assert len(quarantines) == 1
+    assert {path.name for path in quarantines[0].iterdir()} == {
+        "items.jsonl",
+        "stores.jsonl",
+        "sealed-gold.jsonl",
+        "sealed-release.json",
+    }
 
 
 def test_publish_boundary_rejects_release_directory_swapped_before_return(
@@ -444,7 +516,7 @@ def test_publish_boundary_rejects_release_directory_swapped_before_return(
     sentinel = plan.release_dir / "replacement-sentinel"
 
     def swap_release(event, **_context):
-        if event != "publish_before_final_return":
+        if event != "publish_before_final_binding":
             return
         plan.release_dir.rename(displaced)
         plan.release_dir.mkdir(mode=0o700)
@@ -463,10 +535,14 @@ def test_publish_boundary_rejects_release_directory_swapped_before_return(
 
     assert sentinel.read_text(encoding="utf-8") == "replacement"
     assert not displaced.exists()
+    quarantines = _quarantine_directories(output_root)
+    assert len(quarantines) == 1
+    assert quarantines[0].joinpath("sealed-release.json").is_file()
 
 
-def test_quarantine_cleanup_recursively_deletes_only_the_pinned_directory(
+def test_quarantine_preserves_exact_pinned_directory_without_deletion(
     tmp_path,
+    monkeypatch,
 ):
     parent = tmp_path / "cleanup-parent"
     parent.mkdir(mode=0o700)
@@ -481,8 +557,14 @@ def test_quarantine_cleanup_recursively_deletes_only_the_pinned_directory(
     nested.joinpath("child").write_bytes(b"child")
     parent_fd = os.open(parent, sealing._directory_flags())
     owned_fd = os.open("owned", sealing._directory_flags(), dir_fd=parent_fd)
+
+    def forbid_pathname_deletion(*_args, **_kwargs):
+        raise AssertionError("authority path must never unlink or rmdir")
+
+    monkeypatch.setattr(sealing.os, "unlink", forbid_pathname_deletion)
+    monkeypatch.setattr(sealing.os, "rmdir", forbid_pathname_deletion)
     try:
-        sealing._quarantine_and_delete_directory(
+        quarantine_name = sealing._quarantine_preserve_directory(
             parent_fd,
             "owned",
             owned_fd,
@@ -492,10 +574,13 @@ def test_quarantine_cleanup_recursively_deletes_only_the_pinned_directory(
         os.close(owned_fd)
         os.close(parent_fd)
 
-    assert list(parent.iterdir()) == []
+    assert not owned.exists()
+    quarantine = parent / quarantine_name
+    assert quarantine.joinpath("payload").read_bytes() == b"payload"
+    assert quarantine.joinpath("nested", "child").read_bytes() == b"child"
 
 
-def test_quarantine_cleanup_restores_replacement_directory_on_identity_mismatch(
+def test_quarantine_restores_replacement_directory_on_identity_mismatch(
     tmp_path,
     monkeypatch,
 ):
@@ -511,7 +596,7 @@ def test_quarantine_cleanup_restores_replacement_directory_on_identity_mismatch(
 
     def replace_quarantine(event, **context):
         if (
-            event != "cleanup_after_directory_quarantine"
+            event != "quarantine_after_rename"
             or context["source_name"] != "owned"
         ):
             return
@@ -537,7 +622,7 @@ def test_quarantine_cleanup_restores_replacement_directory_on_identity_mismatch(
     monkeypatch.setattr(sealing, "_run_mutation_hook", replace_quarantine)
     try:
         with pytest.raises(SealingError, match="quarantine|identity|restore"):
-            sealing._quarantine_and_delete_directory(
+            sealing._quarantine_preserve_directory(
                 parent_fd,
                 "owned",
                 owned_fd,
@@ -554,58 +639,8 @@ def test_quarantine_cleanup_restores_replacement_directory_on_identity_mismatch(
     )
 
 
-def test_quarantine_cleanup_restores_replacement_member_on_identity_mismatch(
-    tmp_path,
-    monkeypatch,
-):
-    parent = tmp_path / "cleanup-parent"
-    parent.mkdir(mode=0o700)
-    parent.chmod(0o700)
-    owned = parent / "owned"
-    owned.mkdir(mode=0o700)
-    owned.chmod(0o700)
-    owned.joinpath("payload").write_bytes(b"exact-owned")
-    parent_fd = os.open(parent, sealing._directory_flags())
-    owned_fd = os.open("owned", sealing._directory_flags(), dir_fd=parent_fd)
-
-    def replace_member(event, **context):
-        if (
-            event != "cleanup_after_member_quarantine"
-            or context["source_name"] != "payload"
-        ):
-            return
-        directory_fd = context["parent_fd"]
-        quarantine_name = context["quarantine_name"]
-        os.rename(
-            quarantine_name,
-            "displaced-exact-member",
-            src_dir_fd=directory_fd,
-            dst_dir_fd=directory_fd,
-        )
-        _write_file_at(directory_fd, quarantine_name, b"replacement")
-
-    monkeypatch.setattr(sealing, "_run_mutation_hook", replace_member)
-    try:
-        with pytest.raises(SealingError, match="quarantine|identity|restore"):
-            sealing._quarantine_and_delete_directory(
-                parent_fd,
-                "owned",
-                owned_fd,
-                label="test owned directory",
-            )
-    finally:
-        os.close(owned_fd)
-        os.close(parent_fd)
-
-    assert parent.joinpath("owned", "payload").read_bytes() == b"replacement"
-    assert (
-        parent.joinpath("owned", "displaced-exact-member").read_bytes()
-        == b"exact-owned"
-    )
-
-
 @pytest.mark.parametrize("mutation", ["insert", "remove", "replace"])
-def test_quarantine_cleanup_detects_membership_mutation_after_rename(
+def test_quarantine_detects_membership_mutation_after_rename(
     tmp_path,
     monkeypatch,
     mutation,
@@ -622,7 +657,7 @@ def test_quarantine_cleanup_detects_membership_mutation_after_rename(
 
     def mutate_membership(event, **context):
         if (
-            event != "cleanup_after_directory_quarantine"
+            event != "quarantine_after_rename"
             or context["source_name"] != "owned"
         ):
             return
@@ -651,7 +686,7 @@ def test_quarantine_cleanup_detects_membership_mutation_after_rename(
             SealingError,
             match="changed|membership|identity|replaced",
         ):
-            sealing._quarantine_and_delete_directory(
+            sealing._quarantine_preserve_directory(
                 parent_fd,
                 "owned",
                 owned_fd,
@@ -673,7 +708,7 @@ def test_quarantine_cleanup_detects_membership_mutation_after_rename(
         assert parent.joinpath("displaced-payload").read_bytes() == b"exact-owned"
 
 
-def test_cleanup_failure_still_closes_all_staged_descriptors(
+def test_quarantine_failure_still_closes_all_staged_descriptors(
     tmp_path,
     monkeypatch,
 ):
@@ -685,11 +720,11 @@ def test_cleanup_failure_still_closes_all_staged_descriptors(
     original_close = sealing._close_staged
 
     def mutate_published_membership(event, **context):
-        if event == "publish_before_final_return":
+        if event == "publish_before_final_binding":
             os.mkdir("unexpected", 0o700, dir_fd=context["release_fd"])
 
-    def fail_cleanup(*_args, **_kwargs):
-        raise SealingError("injected safe cleanup failure")
+    def fail_quarantine(*_args, **_kwargs):
+        raise SealingError("injected safe quarantine failure")
 
     def record_close(staged):
         nonlocal closed
@@ -701,10 +736,14 @@ def test_cleanup_failure_still_closes_all_staged_descriptors(
         "_run_mutation_hook",
         mutate_published_membership,
     )
-    monkeypatch.setattr(sealing, "_cleanup_staged_directory", fail_cleanup)
+    monkeypatch.setattr(
+        sealing,
+        "_quarantine_staged_directory",
+        fail_quarantine,
+    )
     monkeypatch.setattr(sealing, "_close_staged", record_close)
 
-    with pytest.raises(SealingError, match="cleanup failure"):
+    with pytest.raises(SealingError, match="quarantine failure"):
         seal_release(
             source_dir=source,
             preregistration_path=preregistration,
@@ -734,7 +773,7 @@ def test_publish_boundary_detects_concurrent_membership_mutation(
     replacement_bytes = source.joinpath("items.jsonl").read_bytes()
 
     def mutate_membership(event, **_context):
-        if event != "publish_before_final_return":
+        if event != "publish_before_final_binding":
             return
         if mutation == "insert":
             plan.release_dir.joinpath("unexpected").write_text(
@@ -763,6 +802,22 @@ def test_publish_boundary_detects_concurrent_membership_mutation(
             output_root=output_root,
             apply=True,
         )
+
+    quarantines = _quarantine_directories(output_root)
+    assert len(quarantines) == 1
+    if mutation == "insert":
+        assert quarantines[0].joinpath("unexpected").read_text() == "inserted"
+    elif mutation == "remove":
+        assert output_root.joinpath(
+            "removed-published-stores.jsonl"
+        ).is_file()
+    else:
+        assert quarantines[0].joinpath("items.jsonl").read_bytes() == (
+            replacement_bytes
+        )
+        assert output_root.joinpath(
+            "displaced-published-items.jsonl"
+        ).read_bytes() == replacement_bytes
 
 
 @pytest.mark.parametrize("attack", ["symlink", "hardlink", "unsafe_mode"])
@@ -848,6 +903,8 @@ def test_explicit_verification_replays_every_record_and_external_commitment(
 
     assert verified.release_dir == published.release_dir
     assert verified.release_sha256 == published.release_sha256
+    assert verified.authoritative_commitment == published.release_sha256
+    assert verified.path_authority == "informational_reopen_and_verify"
     assert verified.manifest_bytes == published.manifest_bytes
     assert verified.item_count == published.item_count
     assert verified.pair_count == published.pair_count
@@ -961,7 +1018,7 @@ def test_read_boundary_rejects_release_directory_swapped_before_return(
     sentinel = published.release_dir / "replacement-sentinel"
 
     def swap_release(event, **_context):
-        if event != f"{operation_name}_before_final_return":
+        if event != f"{operation_name}_before_final_binding":
             return
         published.release_dir.rename(displaced)
         published.release_dir.mkdir(mode=0o700)
@@ -996,7 +1053,7 @@ def test_read_boundary_detects_concurrent_membership_mutation(
     replacement_bytes = published.release_dir.joinpath("items.jsonl").read_bytes()
 
     def mutate_membership(event, **_context):
-        if event != f"{operation_name}_before_final_return":
+        if event != f"{operation_name}_before_final_binding":
             return
         if mutation == "insert":
             published.release_dir.joinpath("unexpected").write_text(
@@ -1120,6 +1177,7 @@ def test_cli_dry_run_publish_and_verify_each_emit_one_json_result(
     assert published["ok"] is True
     assert published["mode"] == "publish"
     assert published["published"] is True
+    assert published["path_authority"] == "informational_reopen_and_verify"
     assert Path(published["release_dir"]).is_dir()
 
     assert (

@@ -44,6 +44,7 @@ ITEMS_NAME = "items.jsonl"
 STORES_NAME = "stores.jsonl"
 SEALED_GOLD_NAME = "sealed-gold.jsonl"
 RELEASE_ID_PREFIX = "memorysplit-confirmatory-sealed-v3-"
+PATH_AUTHORITY = "informational_reopen_and_verify"
 
 _SOURCE_NAMES = (ITEMS_NAME, STORES_NAME, SEALED_GOLD_NAME)
 _RELEASE_NAMES = (
@@ -108,6 +109,11 @@ class SealedReleaseResult:
     world_count: int
     store_count: int
     published: bool
+    path_authority: str = PATH_AUTHORITY
+
+    @property
+    def authoritative_commitment(self) -> str:
+        return self.release_sha256
 
 
 @dataclass(frozen=True)
@@ -120,6 +126,11 @@ class VerifiedSealedRelease:
     world_count: int
     store_count: int
     sealed_gold_sha256: str
+    path_authority: str = PATH_AUTHORITY
+
+    @property
+    def authoritative_commitment(self) -> str:
+        return self.release_sha256
 
 
 @dataclass(frozen=True)
@@ -131,6 +142,11 @@ class ModelVisiblePreflightResult:
     world_count: int
     store_count: int
     sealed_gold_sha256: str
+    path_authority: str = PATH_AUTHORITY
+
+    @property
+    def authoritative_commitment(self) -> str:
+        return self.release_sha256
 
 
 @dataclass(frozen=True)
@@ -1016,7 +1032,7 @@ def _make_staging(
         except BaseException:
             if descriptor is not None:
                 try:
-                    _quarantine_and_delete_directory(
+                    _quarantine_preserve_directory(
                         output_fd,
                         name,
                         descriptor,
@@ -1029,7 +1045,8 @@ def _make_staging(
 
 
 def _private_quarantine_name(kind: str) -> str:
-    return f".cleanup-{secrets.token_hex(16)}.{kind}"
+    del kind
+    return f".sealed-release-quarantine-{secrets.token_hex(16)}"
 
 
 def _restore_quarantined_entry(
@@ -1109,7 +1126,7 @@ def _rename_exact_to_quarantine(
             )
         except SealingError as exc:
             raise SealingError(
-                f"{label} quarantine pathname disappeared; refusing deletion"
+                f"{label} quarantine pathname disappeared; refusing authority"
             ) from exc
         descriptor_identity = _owned_node_identity(
             os.fstat(descriptor),
@@ -1148,275 +1165,6 @@ def _rename_exact_to_quarantine(
     raise SealingError(f"{label} could not allocate a private quarantine name")
 
 
-def _open_owned_entry(
-    parent_fd: int,
-    name: str,
-    label: str,
-) -> tuple[int, _NodeIdentity]:
-    try:
-        descriptor = os.open(name, _file_flags(), dir_fd=parent_fd)
-    except OSError as exc:
-        raise SealingError(f"{label} cannot be descriptor-pinned") from exc
-    try:
-        identity = _owned_node_identity(os.fstat(descriptor), label)
-        _assert_named_node(
-            parent_fd,
-            name,
-            descriptor,
-            identity,
-            label,
-        )
-        return descriptor, identity
-    except BaseException:
-        os.close(descriptor)
-        raise
-
-
-def _delete_exact_regular_file(
-    parent_fd: int,
-    source_name: str,
-    descriptor: int,
-    expected: _NodeIdentity,
-    label: str,
-) -> None:
-    quarantine_name = _rename_exact_to_quarantine(
-        parent_fd,
-        source_name,
-        descriptor,
-        expected,
-        label,
-        hook_event="cleanup_after_member_quarantine",
-    )
-    _assert_named_node(
-        parent_fd,
-        quarantine_name,
-        descriptor,
-        expected,
-        label,
-    )
-    os.unlink(quarantine_name, dir_fd=parent_fd)
-    after = _raw_node_identity(os.fstat(descriptor))
-    expected_after = replace(expected, links=expected.links - 1)
-    if after != expected_after:
-        raise SealingError(
-            f"{label} descriptor identity did not reflect exact unlink"
-        )
-
-
-def _restore_exact_directory(
-    parent_fd: int,
-    quarantine_name: str,
-    source_name: str,
-    descriptor: int,
-    label: str,
-) -> None:
-    expected = _owned_node_identity(os.fstat(descriptor), label)
-    _assert_named_node(
-        parent_fd,
-        quarantine_name,
-        descriptor,
-        expected,
-        label,
-    )
-    try:
-        _rename_noreplace_at(
-            parent_fd,
-            quarantine_name,
-            source_name,
-        )
-    except SealingError as exc:
-        raise SealingError(
-            f"{label} failed safely but quarantine could not be restored"
-        ) from exc
-    _assert_named_node(
-        parent_fd,
-        source_name,
-        descriptor,
-        expected,
-        label,
-    )
-    os.fsync(parent_fd)
-
-
-def _delete_exact_empty_directory(
-    parent_fd: int,
-    quarantine_name: str,
-    descriptor: int,
-    label: str,
-) -> None:
-    _capture_directory_snapshot(
-        descriptor,
-        label,
-        expected_names=(),
-        exact_mode=0o700,
-    )
-    expected = _owned_node_identity(os.fstat(descriptor), label)
-    final_name = _rename_exact_to_quarantine(
-        parent_fd,
-        quarantine_name,
-        descriptor,
-        expected,
-        label,
-        hook_event="cleanup_after_empty_directory_quarantine",
-    )
-    final_snapshot = _capture_directory_snapshot(
-        descriptor,
-        label,
-        expected_names=(),
-        exact_mode=0o700,
-    )
-    _assert_named_node(
-        parent_fd,
-        final_name,
-        descriptor,
-        expected,
-        label,
-    )
-    _assert_directory_snapshot(descriptor, final_snapshot, label)
-    os.rmdir(final_name, dir_fd=parent_fd)
-    try:
-        os.stat(final_name, dir_fd=parent_fd, follow_symlinks=False)
-    except FileNotFoundError:
-        pass
-    else:
-        raise SealingError(f"{label} exact directory removal was not final")
-    os.fsync(parent_fd)
-
-
-def _assert_expected_files(
-    directory_fd: int,
-    expected_files: Mapping[str, _NodeIdentity],
-    label: str,
-) -> None:
-    snapshot = _capture_directory_snapshot(
-        directory_fd,
-        label,
-        expected_names=tuple(expected_files),
-        exact_mode=0o700,
-    )
-    for name, expected in expected_files.items():
-        descriptor, observed = _open_owned_entry(
-            directory_fd,
-            name,
-            f"{label} member {name}",
-        )
-        try:
-            if observed != expected:
-                raise SealingError(
-                    f"{label} entries changed or were replaced before cleanup"
-                )
-        finally:
-            os.close(descriptor)
-    _assert_directory_snapshot(directory_fd, snapshot, label)
-
-
-def _delete_directory_contents_exact(
-    directory_fd: int,
-    label: str,
-) -> None:
-    initial = _capture_directory_snapshot(
-        directory_fd,
-        label,
-        exact_mode=0o700,
-    )
-    entries: list[tuple[str, int, _NodeIdentity]] = []
-    try:
-        for name in initial.names:
-            descriptor, identity = _open_owned_entry(
-                directory_fd,
-                name,
-                f"{label} member {name}",
-            )
-            entries.append((name, descriptor, identity))
-        _assert_directory_snapshot(directory_fd, initial, label)
-        remaining = list(initial.names)
-        for name, descriptor, identity in entries:
-            _capture_directory_snapshot(
-                directory_fd,
-                label,
-                expected_names=tuple(remaining),
-                exact_mode=0o700,
-            )
-            _assert_named_node(
-                directory_fd,
-                name,
-                descriptor,
-                identity,
-                f"{label} member {name}",
-            )
-            if identity.file_type == stat.S_IFDIR:
-                _quarantine_and_delete_directory(
-                    directory_fd,
-                    name,
-                    descriptor,
-                    label=f"{label} member {name}",
-                )
-            else:
-                _delete_exact_regular_file(
-                    directory_fd,
-                    name,
-                    descriptor,
-                    identity,
-                    f"{label} member {name}",
-                )
-            remaining.remove(name)
-            _capture_directory_snapshot(
-                directory_fd,
-                label,
-                expected_names=tuple(remaining),
-                exact_mode=0o700,
-            )
-    finally:
-        for _name, descriptor, _identity in reversed(entries):
-            try:
-                os.close(descriptor)
-            except OSError:
-                pass
-
-
-def _quarantine_and_delete_directory(
-    parent_fd: int,
-    source_name: str,
-    directory_fd: int,
-    *,
-    label: str,
-    expected_files: Mapping[str, _NodeIdentity] | None = None,
-) -> None:
-    expected = _owned_node_identity(os.fstat(directory_fd), label)
-    if expected.file_type != stat.S_IFDIR:
-        raise SealingError(f"{label} must be a directory")
-    quarantine_name = _rename_exact_to_quarantine(
-        parent_fd,
-        source_name,
-        directory_fd,
-        expected,
-        label,
-        hook_event="cleanup_after_directory_quarantine",
-    )
-    try:
-        if expected_files is not None:
-            _assert_expected_files(directory_fd, expected_files, label)
-        _delete_directory_contents_exact(directory_fd, label)
-        _delete_exact_empty_directory(
-            parent_fd,
-            quarantine_name,
-            directory_fd,
-            label,
-        )
-    except BaseException:
-        try:
-            _restore_exact_directory(
-                parent_fd,
-                quarantine_name,
-                source_name,
-                directory_fd,
-                label,
-            )
-        except SealingError:
-            pass
-        raise
-
-
 def _find_pinned_directory_name(
     parent_fd: int,
     directory_fd: int,
@@ -1425,51 +1173,118 @@ def _find_pinned_directory_name(
     try:
         names = tuple(sorted(os.listdir(parent_fd)))
     except OSError as exc:
-        raise SealingError("cleanup parent cannot be enumerated safely") from exc
+        raise SealingError("quarantine parent cannot be enumerated safely") from exc
     matches = []
     for name in names:
         try:
             observed = _named_node_identity(
                 parent_fd,
                 name,
-                "cleanup candidate",
+                "quarantine candidate",
             )
         except SealingError:
             continue
         if observed == expected:
             matches.append(name)
     if len(matches) > 1:
-        raise SealingError("pinned cleanup directory has multiple pathnames")
+        raise SealingError("pinned quarantine directory has multiple pathnames")
     return matches[0] if matches else None
 
 
-def _cleanup_staged_directory(
+def _quarantine_preserve_directory(
+    parent_fd: int,
+    source_name: str,
+    directory_fd: int,
+    *,
+    label: str,
+) -> str:
+    expected = _owned_node_identity(os.fstat(directory_fd), label)
+    if expected.file_type != stat.S_IFDIR:
+        raise SealingError(f"{label} must be a directory")
+    if source_name.startswith(".sealed-release-quarantine-"):
+        _assert_named_node(
+            parent_fd,
+            source_name,
+            directory_fd,
+            expected,
+            label,
+        )
+        snapshot = _capture_directory_snapshot(
+            directory_fd,
+            label,
+            exact_mode=0o700,
+        )
+        os.fsync(directory_fd)
+        os.fsync(parent_fd)
+        _assert_named_node(
+            parent_fd,
+            source_name,
+            directory_fd,
+            expected,
+            label,
+        )
+        _assert_directory_snapshot(directory_fd, snapshot, label)
+        return source_name
+    quarantine_name = _rename_exact_to_quarantine(
+        parent_fd,
+        source_name,
+        directory_fd,
+        expected,
+        label,
+        hook_event="quarantine_after_rename",
+    )
+    snapshot = _capture_directory_snapshot(
+        directory_fd,
+        label,
+        exact_mode=0o700,
+    )
+    os.fsync(directory_fd)
+    os.fsync(parent_fd)
+    _assert_named_node(
+        parent_fd,
+        quarantine_name,
+        directory_fd,
+        expected,
+        label,
+    )
+    _assert_directory_snapshot(directory_fd, snapshot, label)
+    return quarantine_name
+
+
+def _quarantine_staged_directory(
     output_fd: int,
     staged: _StagedRelease,
-    *,
-    strict_files: bool,
-) -> None:
+) -> str | None:
     source_name = _find_pinned_directory_name(output_fd, staged.descriptor)
     if source_name is None:
-        return
-    expected_files = (
-        {
-            pinned.name: _owned_node_identity(
-                os.fstat(pinned.descriptor),
-                f"staged {pinned.name}",
-            )
-            for pinned in staged.files
-        }
-        if strict_files
-        else None
-    )
-    _quarantine_and_delete_directory(
+        return None
+    return _quarantine_preserve_directory(
         output_fd,
         source_name,
         staged.descriptor,
-        label="pinned staged release cleanup",
-        expected_files=expected_files,
+        label="pinned failed release quarantine",
     )
+
+
+def _reject_quarantine_blockers(output_fd: int) -> None:
+    try:
+        names = tuple(sorted(os.listdir(output_fd)))
+    except OSError as exc:
+        raise SealingError(
+            "release output quarantine blockers cannot be enumerated"
+        ) from exc
+    blockers = tuple(
+        name
+        for name in names
+        if name.startswith(".sealed-release-quarantine-")
+        or name.endswith(".staging")
+    )
+    if blockers:
+        raise SealingError(
+            "release output contains quarantine blockers requiring explicit "
+            f"offline cleanup: {list(blockers)}",
+            code="QUARANTINE_BLOCKER",
+        )
 
 
 def _stage_release(
@@ -1520,7 +1335,7 @@ def _stage_release(
             except OSError:
                 pass
         try:
-            _quarantine_and_delete_directory(
+            _quarantine_preserve_directory(
                 output_fd,
                 staging_name,
                 staging_fd,
@@ -1667,10 +1482,9 @@ def _quarantine_installed(
     staged: _StagedRelease,
 ) -> None:
     del release_id
-    _cleanup_staged_directory(
+    _quarantine_staged_directory(
         output_fd,
         staged,
-        strict_files=True,
     )
 
 
@@ -1952,22 +1766,41 @@ def _open_release_manifest(
         raise
 
 
-def _assert_opened_release(opened: _OpenedRelease) -> None:
+def _assert_final_directory_binding(
+    *,
+    parent_path: Path,
+    parent_fd: int,
+    directory_name: str,
+    directory_fd: int,
+    snapshot: _DirectorySnapshot,
+    label: str,
+) -> None:
     _assert_directory_path(
-        opened.parent_path,
-        opened.parent_fd,
-        "sealed release parent",
+        parent_path,
+        parent_fd,
+        f"{label} parent",
     )
     _assert_directory_entry(
-        opened.parent_fd,
-        opened.path.name,
-        opened.descriptor,
-        "sealed release directory",
+        parent_fd,
+        directory_name,
+        directory_fd,
+        label,
     )
     _assert_directory_snapshot(
-        opened.descriptor,
-        opened.snapshot,
-        "sealed release directory",
+        directory_fd,
+        snapshot,
+        label,
+    )
+
+
+def _assert_opened_release(opened: _OpenedRelease) -> None:
+    _assert_final_directory_binding(
+        parent_path=opened.parent_path,
+        parent_fd=opened.parent_fd,
+        directory_name=opened.path.name,
+        directory_fd=opened.descriptor,
+        snapshot=opened.snapshot,
+        label="sealed release directory",
     )
 
 
@@ -2027,12 +1860,6 @@ def preflight_model_visible_release(
             store_count=visible.store_count,
             sealed_gold_sha256=sealed_gold["sha256"],
         )
-        _run_mutation_hook(
-            "preflight_before_final_return",
-            release_fd=opened.descriptor,
-            parent_fd=opened.parent_fd,
-            release_name=opened.path.name,
-        )
         for pinned in files:
             _assert_pinned_file(pinned, pinned.name)
         if (
@@ -2042,7 +1869,30 @@ def preflight_model_visible_release(
             raise SealingError(
                 "sealed-gold metadata changed during model-visible preflight"
             )
-        _assert_opened_release(opened)
+        final_snapshot = _capture_directory_snapshot(
+            opened.descriptor,
+            "sealed release directory",
+            expected_names=_RELEASE_NAMES,
+            exact_mode=0o700,
+        )
+        if final_snapshot != opened.snapshot:
+            raise SealingError(
+                "sealed release directory changed during model-visible preflight"
+            )
+        _run_mutation_hook(
+            "preflight_before_final_binding",
+            release_fd=opened.descriptor,
+            parent_fd=opened.parent_fd,
+            release_name=opened.path.name,
+        )
+        _assert_final_directory_binding(
+            parent_path=opened.parent_path,
+            parent_fd=opened.parent_fd,
+            directory_name=opened.path.name,
+            directory_fd=opened.descriptor,
+            snapshot=final_snapshot,
+            label="sealed release directory",
+        )
         return result
     finally:
         _close_release_files(opened, files)
@@ -2088,15 +1938,32 @@ def verify_release(
             store_count=validated.store_count,
             sealed_gold_sha256=sealed_gold["sha256"],
         )
+        for pinned in files:
+            _assert_pinned_file(pinned, pinned.name)
+        final_snapshot = _capture_directory_snapshot(
+            opened.descriptor,
+            "sealed release directory",
+            expected_names=_RELEASE_NAMES,
+            exact_mode=0o700,
+        )
+        if final_snapshot != opened.snapshot:
+            raise SealingError(
+                "sealed release directory changed during full verification"
+            )
         _run_mutation_hook(
-            "verify_before_final_return",
+            "verify_before_final_binding",
             release_fd=opened.descriptor,
             parent_fd=opened.parent_fd,
             release_name=opened.path.name,
         )
-        for pinned in files:
-            _assert_pinned_file(pinned, pinned.name)
-        _assert_opened_release(opened)
+        _assert_final_directory_binding(
+            parent_path=opened.parent_path,
+            parent_fd=opened.parent_fd,
+            directory_name=opened.path.name,
+            directory_fd=opened.descriptor,
+            snapshot=final_snapshot,
+            label="sealed release directory",
+        )
         return result
     finally:
         _close_release_files(opened, files)
@@ -2190,6 +2057,7 @@ def seal_release(
         published = False
         try:
             _lock_output(output_fd)
+            _reject_quarantine_blockers(output_fd)
             _reject_existing_release(output_fd, release_id)
             staged = _stage_release(
                 output_fd,
@@ -2210,13 +2078,6 @@ def seal_release(
                 release_id=release_id,
                 staged=staged,
             )
-            final_result = replace(result, published=True)
-            _run_mutation_hook(
-                "publish_before_final_return",
-                release_fd=staged.descriptor,
-                parent_fd=output_fd,
-                release_name=release_id,
-            )
             for pinned in staged.files:
                 _assert_staged_file(pinned)
             for pinned in inputs:
@@ -2231,17 +2092,30 @@ def seal_release(
                 source_snapshot,
                 "source directory",
             )
-            _assert_directory_path(output_path, output_fd, "output root")
-            _assert_directory_entry(
-                output_fd,
-                release_id,
+            final_snapshot = _capture_directory_snapshot(
                 staged.descriptor,
                 "installed sealed release",
+                expected_names=_RELEASE_NAMES,
+                exact_mode=0o700,
             )
-            _assert_directory_snapshot(
-                staged.descriptor,
-                installed_snapshot,
-                "installed sealed release",
+            if final_snapshot != installed_snapshot:
+                raise SealingError(
+                    "installed sealed release changed during final validation"
+                )
+            final_result = replace(result, published=True)
+            _run_mutation_hook(
+                "publish_before_final_binding",
+                release_fd=staged.descriptor,
+                parent_fd=output_fd,
+                release_name=release_id,
+            )
+            _assert_final_directory_binding(
+                parent_path=output_path,
+                parent_fd=output_fd,
+                directory_name=release_id,
+                directory_fd=staged.descriptor,
+                snapshot=final_snapshot,
+                label="installed sealed release",
             )
             published = True
             return final_result
@@ -2249,10 +2123,9 @@ def seal_release(
             if staged is not None:
                 try:
                     if not published:
-                        _cleanup_staged_directory(
+                        _quarantine_staged_directory(
                             output_fd,
                             staged,
-                            strict_files=True,
                         )
                 finally:
                     _close_staged(staged)

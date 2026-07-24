@@ -78,6 +78,7 @@ def _build_payload(
         "release_id": result.release_id,
         "release_dir": str(result.release_dir),
         "release_sha256": result.release_sha256,
+        "path_authority": result.path_authority,
         "manifest": str(result.release_dir / SEALED_RELEASE_MANIFEST),
         "counts": _counts(result),
     }
@@ -92,6 +93,7 @@ def _verify_payload(result: VerifiedSealedRelease) -> dict[str, Any]:
         "verified": True,
         "release_dir": str(result.release_dir),
         "release_sha256": result.release_sha256,
+        "path_authority": result.path_authority,
         "sealed_gold_sha256": result.sealed_gold_sha256,
         "counts": _counts(result),
     }
