@@ -22,6 +22,7 @@ ARNs.
 
 ### Read-only EC2, quota, and price discovery
 
+- `sts:GetCallerIdentity`
 - `ec2:DescribeImages`
 - `ec2:DescribeInstances`
 - `ec2:DescribeInstanceAttribute`

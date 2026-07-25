@@ -117,6 +117,8 @@ def build_parser() -> JsonArgumentParser:
         help_text="install reviewed control bytes through stock AWS SSM",
     )
     control_install.add_argument("--instance-id", required=True)
+    control_install.add_argument("--bundle", required=True)
+    control_install.add_argument("--bundle-sha256", required=True)
     control_install.add_argument("--apply", action="store_true")
 
     canary = _leaf(commands, "canary", help_text="AWS GPU qualification canary")

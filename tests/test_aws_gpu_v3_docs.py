@@ -1,8 +1,14 @@
 from __future__ import annotations
 
+import json
 import re
 import subprocess
 from pathlib import Path
+
+import pytest
+
+from msctl.cli import build_parser, main
+from msctl.errors import MsctlError
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -39,6 +45,9 @@ def test_operator_docs_cover_closed_profiles_and_complete_lifecycle() -> None:
         "environment",
         "export ms_aws_ami_id",
         "export ms_container_image",
+        "export ms_s3_root",
+        "export ms_s3_kms_key_id",
+        "export ms_aws_instance_profile_arn",
         "bootstrap",
         "control install",
         "aws-runshellscript",
@@ -63,6 +72,14 @@ def test_operator_docs_cover_closed_profiles_and_complete_lifecycle() -> None:
         "ms_s3_kms_key_id",
         "o_nofollow",
         "--if-none-match '*'",
+        "credential_process",
+        "aws_shared_credentials_file=/dev/null",
+        "aws_ec2_metadata_disabled=true",
+        "load_operator_credential_process",
+        "validate_aws_gpu_launch_request.py",
+        "capacityreservation.capacityreservationid",
+        "checksum-mode enabled",
+        "lexicographic id order",
     ):
         assert required in lowered
 
@@ -82,6 +99,27 @@ def test_operator_docs_cover_closed_profiles_and_complete_lifecycle() -> None:
     assert "aws s3 sync /mnt/memorysplit/runs" not in lowered
     assert "--start-date-range replace_with_earliest_start" in lowered
     assert "--end-date-range replace_with_latest_end" in lowered
+    assert '["result"]["bundle_sha256"]' in text
+    assert '["result"]["command_id"]' in text
+    assert '["result"]["intent"]["qualification_receipt_uri"]' in text
+    assert '["request_sha256"]' in text
+    assert "--bundle-sha256 \"$CONTROL_BUNDLE_SHA256\"" in text
+    assert "docker login" in text
+    assert "docker pull" in text
+    assert text.index("docker login") < text.index("docker pull")
+    assert text.count("docker login") >= 2
+    image_apply = text.index('  --apply > "$IMAGE_RESULT"')
+    assert text.index("docker login") < image_apply
+    assert image_apply < text.index("docker logout", image_apply)
+    instance_login = text.index("/usr/bin/docker login")
+    instance_pull = text.index("/usr/bin/docker pull")
+    assert text.index("aws ecr batch-get-image") < instance_login < instance_pull
+    assert instance_pull < text.index("/usr/bin/docker image inspect")
+    assert (
+        "${MS_S3_ROOT}/dataset/${relative}" in text
+        and "/mnt/memorysplit/dataset/receipt.json" in text
+    )
+    assert '--container-image "$MS_CONTAINER_IMAGE"' in text
     for static_key_name in (
         "AWS_ACCESS_KEY_ID",
         "AWS_SECRET_ACCESS_KEY",
@@ -89,6 +127,212 @@ def test_operator_docs_cover_closed_profiles_and_complete_lifecycle() -> None:
     ):
         assert static_key_name not in text
     assert ":latest" not in text
+
+
+def test_operator_commands_use_python3_and_documented_cli_shapes_parse(
+    tmp_path,
+    capsys,
+) -> None:
+    runbook = RUNBOOK.read_text(encoding="utf-8")
+    start = START.read_text(encoding="utf-8")
+    bash = "\n".join(
+        re.findall(r"```bash\n(.*?)\n```", runbook + start, flags=re.DOTALL)
+    )
+    assert re.search(r"(?<![/\w])python(?:\s|$)", bash) is None
+
+    bundle = tmp_path / "control-bundle.tar"
+    install = build_parser().parse_args(
+        [
+            "--profile",
+            "cluster/profiles/aws-p5.48xlarge-v3.json",
+            "control",
+            "install",
+            "--instance-id",
+            "i-0123456789abcdef0",
+            "--bundle",
+            str(bundle),
+            "--bundle-sha256",
+            "a" * 64,
+        ]
+    )
+    assert install.bundle == str(bundle)
+    assert install.bundle_sha256 == "a" * 64
+    with pytest.raises(MsctlError):
+        build_parser().parse_args(
+            [
+                "control",
+                "install",
+                "--instance-id",
+                "i-0123456789abcdef0",
+            ]
+        )
+
+    assert (
+        main(
+            [
+                "--profile",
+                str(
+                    REPO_ROOT
+                    / "cluster"
+                    / "profiles"
+                    / "aws-p5.48xlarge-v3.json"
+                ),
+                "--repo-root",
+                str(REPO_ROOT),
+                "control",
+                "bundle",
+                "--out",
+                str(bundle),
+            ]
+        )
+        == 0
+    )
+    report = json.loads(capsys.readouterr().out)
+    assert report["command"] == "control bundle"
+    assert report["dry_run"] is True
+    assert re.fullmatch(r"[0-9a-f]{64}", report["result"]["bundle_sha256"])
+    assert not bundle.exists()
+
+
+def test_documented_bootstrap_paths_and_capacity_response_shapes_match_parsers(
+    tmp_path,
+) -> None:
+    from cluster.aws.p5.bootstrap import (
+        BootstrapEvidence,
+        _parser as bootstrap_parser,
+        render_bootstrap_commands,
+    )
+    from cluster.aws.p5.profile import (
+        load_aws_gpu_profile,
+        validate_runtime_environment,
+    )
+    from scripts.validate_aws_gpu_launch_request import (
+        extract_capacity_reservation_id,
+    )
+
+    arguments = bootstrap_parser().parse_args(
+        [
+            "--profile",
+            "/opt/memorysplit/control/hash/cluster/profiles/"
+            "aws-p6-b300.48xlarge-v3.json",
+            "--container-image",
+            "123456789012.dkr.ecr.us-east-1.amazonaws.com/repo@sha256:"
+            + "a" * 64,
+            "--release-archive",
+            "/mnt/memorysplit/staging/releases/archive/release.zip",
+            "--release-sha256",
+            "a" * 64,
+            "--release-receipt",
+            "/mnt/memorysplit/staging/releases/archive/RELEASE.json",
+            "--release-receipt-sha256",
+            "b" * 64,
+            "--dataset-receipt",
+            "/mnt/memorysplit/dataset/receipt.json",
+            "--dataset-receipt-sha256",
+            "c" * 64,
+            "--cohort-assignment",
+            "/mnt/memorysplit/staging/releases/archive/"
+            "cohort-assignment-v3.json",
+            "--cohort-assignment-sha256",
+            "d" * 64,
+            "--code-commit",
+            "e" * 40,
+            "--owner-uid",
+            "10001",
+            "--owner-gid",
+            "10001",
+            "--aws-private-home",
+            "/run/memorysplit-aws",
+        ]
+    )
+    assert arguments.dataset_receipt == Path(
+        "/mnt/memorysplit/dataset/receipt.json"
+    )
+    assert arguments.release_archive == Path(
+        "/mnt/memorysplit/staging/releases/archive/release.zip"
+    )
+
+    profile = load_aws_gpu_profile(
+        REPO_ROOT
+        / "cluster"
+        / "profiles"
+        / "aws-p6-b300.48xlarge-v3.json"
+    )
+    runtime = validate_runtime_environment(
+        profile,
+        {
+            "AWS_REGION": "us-east-1",
+            "MS_AWS_AMI_ID": "ami-0123456789abcdef0",
+            "MS_CONTAINER_DIGEST": "sha256:" + "a" * 64,
+            "MS_CONTAINER_IMAGE": (
+                "123456789012.dkr.ecr.us-east-1.amazonaws.com/repo@sha256:"
+                + "a" * 64
+            ),
+            "MS_RUNTIME_UID": "10001",
+            "MS_RUNTIME_GID": "10001",
+            "MS_S3_ROOT": "s3://memorysplit-prod/cohort-v3",
+            "MS_S3_KMS_KEY_ID": (
+                "arn:aws:kms:us-east-1:123456789012:"
+                "key/12345678-1234-4234-9234-123456789abc"
+            ),
+        },
+    )
+    evidence = BootstrapEvidence(
+        instance_id="i-0123456789abcdef0",
+        instance_type=profile.instance_type,
+        ami_id=runtime.ami_id,
+        boot_id="12345678-1234-4234-9234-123456789abc",
+        account_id="123456789012",
+        identity_document={},
+        identity_pkcs7="fixture",
+        role_name="memorysplit-v3",
+        role_arn="arn:aws:iam::123456789012:role/memorysplit-v3",
+        gpu_names=("NVIDIA B300",) * 8,
+        fabric_manager_active=True,
+        instance_store_devices=tuple(
+            f"/dev/nvme{index}n1" for index in range(8)
+        ),
+        container_image=runtime.container_image,
+    )
+    commands = render_bootstrap_commands(
+        profile,
+        runtime,
+        evidence,
+        owner_uid=runtime.uid,
+        owner_gid=runtime.gid,
+    )
+    syncs = [
+        command
+        for command in commands
+        if command[:3] == ["aws", "s3", "sync"]
+    ]
+    assert [command[3:5] for command in syncs] == [
+        [
+            "s3://memorysplit-prod/cohort-v3/releases",
+            "/mnt/memorysplit/staging/releases",
+        ],
+        [
+            "s3://memorysplit-prod/cohort-v3/dataset",
+            "/mnt/memorysplit/dataset",
+        ],
+    ]
+    runbook = RUNBOOK.read_text(encoding="utf-8")
+    assert "${MS_S3_ROOT}/releases/${RELEASE_SHA256}" in runbook
+    assert "${MS_S3_ROOT}/dataset/${relative}" in runbook
+    assert "extract_capacity_reservation_id" in runbook
+    assert "extract_run_instance_ids" in runbook
+
+    purchase = {
+        "CapacityReservation": {
+            "CapacityReservationId": "cr-0123456789abcdef0"
+        }
+    }
+    purchase_path = tmp_path / "capacity-block-purchase.json"
+    purchase_path.write_text(json.dumps(purchase), encoding="utf-8")
+    assert (
+        extract_capacity_reservation_id(purchase_path)
+        == "cr-0123456789abcdef0"
+    )
 
 
 def test_paid_and_mutating_runbook_steps_are_reviewed_before_apply() -> None:
@@ -165,6 +409,7 @@ def test_access_request_is_temporary_least_privilege_and_complete() -> None:
     lowered = _squash(text)
 
     for action in (
+        "sts:GetCallerIdentity",
         "ec2:DescribeImages",
         "ec2:DescribeInstances",
         "ec2:DescribeInstanceAttribute",

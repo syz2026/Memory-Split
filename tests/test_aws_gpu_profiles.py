@@ -179,6 +179,154 @@ def _runtime_environment() -> dict[str, str]:
     }
 
 
+def _credential_process_environment(
+    tmp_path: Path,
+    *,
+    region: str = "us-east-1",
+) -> dict[str, str]:
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    helper = tmp_path / "federated-credentials"
+    helper.write_text(
+        "#!/bin/sh\n"
+        "# Reviewed test helper; production emits AWS credential_process JSON.\n"
+        "exit 1\n",
+        encoding="ascii",
+    )
+    helper.chmod(0o700)
+    profile = "memorysplit-v3-operator"
+    config = tmp_path / "aws-config"
+    config.write_text(
+        f"[profile {profile}]\n"
+        f"credential_process = {helper}\n"
+        f"region = {region}\n"
+        "output = json\n",
+        encoding="utf-8",
+    )
+    return {
+        "MSCTL_AWS_CONFIG_FILE": str(config),
+        "MSCTL_AWS_CONFIG_SHA256": hashlib.sha256(
+            config.read_bytes()
+        ).hexdigest(),
+        "MSCTL_AWS_CREDENTIAL_PROCESS_SHA256": hashlib.sha256(
+            helper.read_bytes()
+        ).hexdigest(),
+        "MSCTL_AWS_PROFILE": profile,
+    }
+
+
+def test_backend_uses_only_hash_reviewed_credential_process_federation(tmp_path):
+    profile = load_aws_gpu_profile(P5_V3)
+    environment = {
+        **_runtime_environment(),
+        **_credential_process_environment(tmp_path),
+    }
+    runner = _Runner(
+        {
+            "account": "123456789012",
+            "arn": (
+                "arn:aws:sts::123456789012:"
+                "assumed-role/memorysplit-v3-operator/reviewed"
+            ),
+            "user_id": "role-id:reviewed",
+        }
+    )
+
+    backend = build_aws_backend(
+        profile=profile,
+        state_root=tmp_path / "state",
+        environ=environment,
+        runner=runner,
+    )
+    backend.auth_check()
+
+    argv = runner.calls[0][0]
+    assert argv[:2] == ["env", "-i"]
+    assert f"AWS_CONFIG_FILE={environment['MSCTL_AWS_CONFIG_FILE']}" in argv
+    assert f"AWS_PROFILE={environment['MSCTL_AWS_PROFILE']}" in argv
+    assert "AWS_SHARED_CREDENTIALS_FILE=/dev/null" in argv
+    assert "AWS_EC2_METADATA_DISABLED=true" in argv
+    assert not any(item.startswith("AWS_ACCESS_KEY_ID=") for item in argv)
+    assert not any(item.startswith("AWS_SESSION_TOKEN=") for item in argv)
+
+
+def test_default_backend_requires_reviewed_operator_federation(tmp_path):
+    profile = load_aws_gpu_profile(P5_V3)
+
+    with pytest.raises(MsctlError) as missing:
+        build_aws_backend(
+            profile=profile,
+            state_root=tmp_path / "state",
+            environ=_runtime_environment(),
+        )
+
+    assert missing.value.code == "AWS_CREDENTIAL_PROCESS_REQUIRED"
+
+
+def test_operator_federation_rejects_unreviewed_config_shape_or_helper(
+    tmp_path,
+):
+    profile = load_aws_gpu_profile(P5_V3)
+    credentials = _credential_process_environment(tmp_path)
+    config = Path(credentials["MSCTL_AWS_CONFIG_FILE"])
+    config.write_text(
+        config.read_text(encoding="utf-8") + "source_profile = fallback\n",
+        encoding="utf-8",
+    )
+    credentials["MSCTL_AWS_CONFIG_SHA256"] = hashlib.sha256(
+        config.read_bytes()
+    ).hexdigest()
+
+    with pytest.raises(MsctlError) as fallback:
+        build_aws_backend(
+            profile=profile,
+            state_root=tmp_path / "state",
+            environ={**_runtime_environment(), **credentials},
+            runner=_Runner(),
+        )
+    assert fallback.value.code == "AWS_CREDENTIAL_PROCESS_INVALID"
+
+    credentials = _credential_process_environment(tmp_path / "second")
+    config = Path(credentials["MSCTL_AWS_CONFIG_FILE"])
+    config.write_text(
+        config.read_text(encoding="utf-8").replace(
+            "\nregion =",
+            " --unreviewed-argument\nregion =",
+        ),
+        encoding="utf-8",
+    )
+    credentials["MSCTL_AWS_CONFIG_SHA256"] = hashlib.sha256(
+        config.read_bytes()
+    ).hexdigest()
+    with pytest.raises(MsctlError, match="exactly one absolute executable"):
+        build_aws_backend(
+            profile=profile,
+            state_root=tmp_path / "state-2",
+            environ={**_runtime_environment(), **credentials},
+            runner=_Runner(),
+        )
+
+    credentials = _credential_process_environment(tmp_path / "third")
+    config = Path(credentials["MSCTL_AWS_CONFIG_FILE"])
+    config.chmod(0o666)
+    with pytest.raises(MsctlError, match="safe reviewed regular file"):
+        build_aws_backend(
+            profile=profile,
+            state_root=tmp_path / "state-3",
+            environ={**_runtime_environment(), **credentials},
+            runner=_Runner(),
+        )
+
+    credentials = _credential_process_environment(tmp_path / "fourth")
+    credentials["MSCTL_AWS_CREDENTIAL_PROCESS_SHA256"] = "0" * 64
+    with pytest.raises(MsctlError, match="executable SHA-256"):
+        build_aws_backend(
+            profile=profile,
+            state_root=tmp_path / "state-4",
+            environ={**_runtime_environment(), **credentials},
+            runner=_Runner(),
+        )
+
+
 def test_p6_backend_constructs_and_runs_only_read_only_auth_capacity(tmp_path):
     profile = load_aws_gpu_profile(P6_V3)
     runner = _Runner(

@@ -1053,6 +1053,7 @@ def test_v3_profiles_support_full_dry_run_lifecycle(
     )
     from msctl.aws_p5 import AwsP5Backend, V3LifecycleContext
     from msctl.aws_readiness import LaunchReadiness
+    from msctl.aws_control_bundle import write_control_bundle
     from msctl.aws_sealed_evaluation import (
         SealedEvaluationFixture,
         SealedEvaluationRelease,
@@ -1187,8 +1188,12 @@ def test_v3_profiles_support_full_dry_run_lifecycle(
         "dataset_verification_sha256": "6" * 64,
         "environment_receipt_sha256": "7" * 64,
     }
+    reviewed_bundle = tmp_path / "control-bundle.tar"
+    write_control_bundle(reviewed_bundle, backend.control_bundle)
     control_install = backend.control_install(
         instance_id=instance_id,
+        bundle_path=reviewed_bundle,
+        bundle_sha256=backend.control_bundle.sha256,
         apply=False,
     )
     assert control_install["ssm_document"] == "AWS-RunShellScript"
@@ -1533,6 +1538,71 @@ def test_v3_profiles_support_full_dry_run_lifecycle(
     )
 
 
+def test_control_install_binds_reviewed_file_hash_and_running_source(tmp_path):
+    from msctl.aws_control_bundle import (
+        CONTROL_BUNDLE_MEMBERS,
+        build_control_bundle_bytes,
+        write_control_bundle,
+    )
+    from msctl.aws_p5 import AwsP5Backend
+
+    profile, _amendment, selection = _selection(P5)
+    runner_calls = []
+    backend = AwsP5Backend(
+        profile=profile,
+        runtime=SimpleNamespace(
+            region=selection.region,
+            s3_root="s3://memorysplit-prod/cohort-v3",
+            kms_key_id=(
+                "arn:aws:kms:us-east-1:123456789012:"
+                "key/12345678-1234-4234-8234-123456789012"
+            ),
+            ami_id=selection.ami_id,
+            container_image=selection.container_image,
+            container_digest=selection.container_digest,
+        ),
+        instance_profile_arn=(
+            "arn:aws:iam::123456789012:instance-profile/memorysplit-v3"
+        ),
+        state_root=tmp_path / "state",
+        runner=SimpleNamespace(
+            run_json=lambda *args, **kwargs: runner_calls.append((args, kwargs))
+        ),
+    )
+    reviewed = tmp_path / "reviewed-control.tar"
+    write_control_bundle(reviewed, backend.control_bundle)
+
+    with pytest.raises(Exception) as wrong_hash:
+        backend.control_install(
+            instance_id="i-0123456789abcdef0",
+            bundle_path=reviewed,
+            bundle_sha256="0" * 64,
+            apply=False,
+        )
+    assert getattr(wrong_hash.value, "code", None) == "CONTROL_BUNDLE_INVALID"
+
+    alternate_root = tmp_path / "alternate-source"
+    for relative in CONTROL_BUNDLE_MEMBERS:
+        destination = alternate_root / relative
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_bytes((ROOT / relative).read_bytes())
+    changed = alternate_root / "msctl" / "errors.py"
+    changed.write_bytes(changed.read_bytes() + b"\n")
+    alternate = build_control_bundle_bytes(alternate_root)
+    alternate_path = tmp_path / "alternate-control.tar"
+    write_control_bundle(alternate_path, alternate)
+
+    with pytest.raises(Exception) as wrong_source:
+        backend.control_install(
+            instance_id="i-0123456789abcdef0",
+            bundle_path=alternate_path,
+            bundle_sha256=alternate.sha256,
+            apply=False,
+        )
+    assert getattr(wrong_source.value, "code", None) == "CONTROL_BUNDLE_INVALID"
+    assert runner_calls == []
+
+
 def test_control_install_apply_waits_for_verified_ssm_success(tmp_path, monkeypatch):
     import base64
 
@@ -1620,9 +1690,15 @@ def test_control_install_apply_waits_for_verified_ssm_success(tmp_path, monkeypa
     )
     backend_ref.append(backend)
     monkeypatch.setattr(aws_p5.time, "sleep", lambda _seconds: None)
+    reviewed_bundle = tmp_path / "control-bundle.tar"
+    from msctl.aws_control_bundle import write_control_bundle
+
+    write_control_bundle(reviewed_bundle, backend.control_bundle)
 
     result = backend.control_install(
         instance_id="i-0123456789abcdef0",
+        bundle_path=reviewed_bundle,
+        bundle_sha256=backend.control_bundle.sha256,
         apply=True,
     )
 

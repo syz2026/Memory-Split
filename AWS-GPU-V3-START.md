@@ -19,11 +19,11 @@ Set one of the two literal paths above:
 
 ```bash
 set -euo pipefail
-PROFILE=cluster/profiles/aws-p6-b300.48xlarge-v3.json
+export PROFILE=cluster/profiles/aws-p6-b300.48xlarge-v3.json
 OUT_ROOT=../memorysplit-releases/aws-gpu-v3
 
 # DRY RUN: validates the clean Git snapshot and writes nothing.
-python scripts/package_aws_gpu_handoff.py \
+python3 scripts/package_aws_gpu_handoff.py \
   --profile "$PROFILE" \
   --out-dir "$OUT_ROOT"
 ```
@@ -33,7 +33,7 @@ Review the one-object JSON report, especially `provider`, `release_id`, and
 
 ```bash
 # APPLY only after the dry-run report is approved.
-python scripts/package_aws_gpu_handoff.py \
+python3 scripts/package_aws_gpu_handoff.py \
   --profile "$PROFILE" \
   --out-dir "$OUT_ROOT" \
   --apply
@@ -43,7 +43,7 @@ Verify the published `RELEASE-AWS-GPU-V3.json` before upload or extraction:
 
 ```bash
 RELEASE="$OUT_ROOT/<reviewed-release-id>/RELEASE-AWS-GPU-V3.json"
-python scripts/verify_aws_gpu_v3_release.py \
+python3 scripts/verify_aws_gpu_v3_release.py \
   --profile "$PROFILE" \
   --release "$RELEASE" \
   --source-root .

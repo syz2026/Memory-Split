@@ -2,13 +2,15 @@
 
 from __future__ import annotations
 
-import importlib
 import base64
+import configparser
 import hashlib
+import importlib
 import json
 import os
 import re
 import secrets
+import shlex
 import shutil
 import stat
 import subprocess
@@ -35,8 +37,10 @@ from evals.confirmatory.sealing import (
 from . import aws_identity
 from .approval import verify_scope_approval
 from .aws_control_bundle import (
+    ControlBundle,
     build_control_bundle_bytes,
     render_control_install_command,
+    verify_control_bundle,
 )
 from .aws_fleet import (
     FleetManifestBinding,
@@ -193,6 +197,16 @@ _SAFE_PATH = "/usr/local/bin:/usr/bin:/bin"
 _MAX_PAID_RUNTIME = timedelta(minutes=1440)
 _AWS_PRIVATE_HOME = "/var/lib/memorysplit/aws-private-home"
 _AWS_DSA_CERTIFICATES = AWS_INSTANCE_IDENTITY_CERTIFICATES
+_OPERATOR_CREDENTIAL_VARIABLES = frozenset(
+    {
+        "MSCTL_AWS_CONFIG_FILE",
+        "MSCTL_AWS_CONFIG_SHA256",
+        "MSCTL_AWS_CREDENTIAL_PROCESS_SHA256",
+        "MSCTL_AWS_PROFILE",
+    }
+)
+_MAX_AWS_CONFIG_BYTES = 64 * 1024
+_MAX_CREDENTIAL_PROCESS_BYTES = 64 * 1024 * 1024
 
 
 @dataclass(frozen=True)
@@ -210,6 +224,205 @@ class V3LifecycleContext:
     @property
     def instance_id(self) -> str:
         return self.fleet_binding.instance_id
+
+
+@dataclass(frozen=True)
+class OperatorCredentialProcess:
+    """One reviewed AWS CLI credential_process configuration."""
+
+    config_file: Path
+    config_sha256: str
+    profile: str
+    executable: Path
+    executable_sha256: str
+
+    def environment(self) -> tuple[str, ...]:
+        return (
+            f"AWS_CONFIG_FILE={self.config_file}",
+            f"AWS_PROFILE={self.profile}",
+            "AWS_SHARED_CREDENTIALS_FILE=/dev/null",
+            "AWS_EC2_METADATA_DISABLED=true",
+            "AWS_SDK_LOAD_CONFIG=1",
+        )
+
+
+def _reviewed_regular_bytes(
+    path: Path,
+    *,
+    label: str,
+    max_bytes: int | None = None,
+    executable: bool = False,
+) -> bytes:
+    descriptor: int | None = None
+    try:
+        if not path.is_absolute():
+            raise MsctlError(
+                "AWS_CREDENTIAL_PROCESS_INVALID",
+                f"{label} is not one safe reviewed regular file",
+            )
+        descriptor = os.open(
+            path,
+            os.O_RDONLY
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_CLOEXEC", 0),
+        )
+        before = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or before.st_nlink != 1
+            or before.st_uid not in {0, os.geteuid()}
+            or before.st_mode & 0o022
+            or before.st_size <= 0
+            or (max_bytes is not None and before.st_size > max_bytes)
+            or (executable and (before.st_mode & 0o111) == 0)
+        ):
+            raise MsctlError(
+                "AWS_CREDENTIAL_PROCESS_INVALID",
+                f"{label} is not one safe reviewed regular file",
+            )
+        chunks: list[bytes] = []
+        remaining = before.st_size
+        while remaining:
+            chunk = os.read(descriptor, min(remaining, 64 * 1024))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        payload = b"".join(chunks)
+        after = os.fstat(descriptor)
+    except OSError as error:
+        raise MsctlError(
+            "AWS_CREDENTIAL_PROCESS_INVALID",
+            f"{label} cannot be read safely",
+        ) from error
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+    if (
+        before.st_dev,
+        before.st_ino,
+        before.st_size,
+        before.st_mtime_ns,
+        before.st_ctime_ns,
+    ) != (
+        after.st_dev,
+        after.st_ino,
+        after.st_size,
+        after.st_mtime_ns,
+        after.st_ctime_ns,
+    ) or len(payload) != after.st_size:
+        raise MsctlError(
+            "AWS_CREDENTIAL_PROCESS_INVALID",
+            f"{label} changed while being read",
+        )
+    return payload
+
+
+def load_operator_credential_process(
+    environment: Mapping[str, str],
+    *,
+    region: str,
+) -> OperatorCredentialProcess:
+    """Load a hash-pinned credential_process-only AWS CLI configuration."""
+
+    missing = sorted(
+        name
+        for name in _OPERATOR_CREDENTIAL_VARIABLES
+        if not isinstance(environment.get(name), str) or not environment[name]
+    )
+    if missing:
+        raise MsctlError(
+            "AWS_CREDENTIAL_PROCESS_REQUIRED",
+            "AWS CLI access requires one explicit reviewed credential_process",
+            details={"missing": missing},
+        )
+    config_path = Path(environment["MSCTL_AWS_CONFIG_FILE"])
+    config_digest = environment["MSCTL_AWS_CONFIG_SHA256"]
+    executable_digest = environment[
+        "MSCTL_AWS_CREDENTIAL_PROCESS_SHA256"
+    ]
+    profile = environment["MSCTL_AWS_PROFILE"]
+    if (
+        _SHA256_RE.fullmatch(config_digest) is None
+        or _SHA256_RE.fullmatch(executable_digest) is None
+        or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}", profile) is None
+    ):
+        raise MsctlError(
+            "AWS_CREDENTIAL_PROCESS_INVALID",
+            "credential process hashes or profile name are invalid",
+        )
+    config_payload = _reviewed_regular_bytes(
+        config_path,
+        label="AWS credential_process config",
+        max_bytes=_MAX_AWS_CONFIG_BYTES,
+    )
+    if hashlib.sha256(config_payload).hexdigest() != config_digest:
+        raise MsctlError(
+            "AWS_CREDENTIAL_PROCESS_INVALID",
+            "AWS credential_process config SHA-256 does not match review",
+        )
+    parser = configparser.ConfigParser(
+        interpolation=None,
+        strict=True,
+        delimiters=("=",),
+    )
+    try:
+        parser.read_string(config_payload.decode("utf-8"))
+    except (UnicodeDecodeError, configparser.Error) as error:
+        raise MsctlError(
+            "AWS_CREDENTIAL_PROCESS_INVALID",
+            "AWS credential_process config is not strict UTF-8 INI",
+        ) from error
+    section_name = f"profile {profile}"
+    if (
+        parser.defaults()
+        or parser.sections() != [section_name]
+        or set(parser[section_name])
+        != {"credential_process", "output", "region"}
+        or parser[section_name]["region"] != region
+        or parser[section_name]["output"] != "json"
+    ):
+        raise MsctlError(
+            "AWS_CREDENTIAL_PROCESS_INVALID",
+            "AWS config must contain only the reviewed credential_process profile",
+        )
+    command = parser[section_name]["credential_process"]
+    try:
+        process_argv = shlex.split(command, posix=True)
+    except ValueError as error:
+        raise MsctlError(
+            "AWS_CREDENTIAL_PROCESS_INVALID",
+            "credential_process command cannot be parsed",
+        ) from error
+    if (
+        len(process_argv) != 1
+        or not process_argv[0]
+        or any(c in process_argv[0] for c in "\x00\n\r")
+        or not Path(process_argv[0]).is_absolute()
+    ):
+        raise MsctlError(
+            "AWS_CREDENTIAL_PROCESS_INVALID",
+            "credential_process must be exactly one absolute executable",
+        )
+    executable = Path(process_argv[0])
+    executable_payload = _reviewed_regular_bytes(
+        executable,
+        label="AWS credential_process executable",
+        max_bytes=_MAX_CREDENTIAL_PROCESS_BYTES,
+        executable=True,
+    )
+    if hashlib.sha256(executable_payload).hexdigest() != executable_digest:
+        raise MsctlError(
+            "AWS_CREDENTIAL_PROCESS_INVALID",
+            "AWS credential_process executable SHA-256 does not match review",
+        )
+    return OperatorCredentialProcess(
+        config_file=config_path,
+        config_sha256=config_digest,
+        profile=profile,
+        executable=executable,
+        executable_sha256=executable_digest,
+    )
 
 
 def _manifest_schema(manifest: object) -> int | None:
@@ -525,6 +738,7 @@ class AwsP5Backend:
             bool,
         ] = _verify_instance_identity_pkcs7,
         environ: Mapping[str, str] | None = None,
+        operator_credentials: OperatorCredentialProcess | None = None,
     ) -> None:
         _validate_profile(profile)
         _validate_runtime(runtime)
@@ -545,6 +759,7 @@ class AwsP5Backend:
         self.corpus_verifier = corpus_verifier
         self.identity_verifier = identity_verifier
         self.environ = dict(os.environ if environ is None else environ)
+        self.operator_credentials = operator_credentials
         self.control_bundle = build_control_bundle_bytes(
             Path(__file__).resolve().parents[1]
         )
@@ -556,12 +771,18 @@ class AwsP5Backend:
         *arguments: str,
         query: str,
     ) -> list[str]:
+        credential_environment = (
+            list(self.operator_credentials.environment())
+            if self.operator_credentials is not None
+            else []
+        )
         return [
             "env",
             "-i",
             f"AWS_REGION={self.runtime.region}",
             "HOME=/tmp",
             f"PATH={_SAFE_PATH}",
+            *credential_environment,
             "aws",
             "--no-cli-pager",
             "--region",
@@ -1881,10 +2102,13 @@ class AwsP5Backend:
             "version_id": row["version_id"],
         }
 
-    def _publish_control_bundle(self) -> dict[str, object]:
+    def _publish_control_bundle(
+        self,
+        bundle: ControlBundle | None = None,
+    ) -> dict[str, object]:
         """Publish and independently verify the content-addressed bootstrap."""
 
-        bundle = self.control_bundle
+        bundle = bundle or self.control_bundle
         if (
             hashlib.sha256(bundle.payload).hexdigest() != bundle.sha256
             or len(bundle.payload) != bundle.bytes
@@ -2032,7 +2256,12 @@ class AwsP5Backend:
             "version_id": row["version_id"],
         }
 
-    def _control_install_plan(self, instance_id: str) -> dict[str, object]:
+    def _control_install_plan(
+        self,
+        instance_id: str,
+        *,
+        bundle: ControlBundle,
+    ) -> dict[str, object]:
         if (
             getattr(self.profile, "profile_id", None) not in _V3_PROFILES
             or _INSTANCE_ID_RE.fullmatch(instance_id) is None
@@ -2042,7 +2271,6 @@ class AwsP5Backend:
                 "CONTROL_INSTALL_INVALID",
                 "control install requires one explicit v3 instance and KMS key",
             )
-        bundle = self.control_bundle
         bucket, key = self._s3_location(f"control/{bundle.sha256}.tar")
         uri = f"s3://{bucket}/{key}"
         local_path = (
@@ -2137,15 +2365,32 @@ class AwsP5Backend:
         self,
         *,
         instance_id: str,
+        bundle_path: Path | str,
+        bundle_sha256: str,
         apply: bool,
     ) -> dict[str, object]:
         """Install reviewed control bytes before any custom SSM document use."""
 
-        plan = self._control_install_plan(instance_id)
+        bundle = verify_control_bundle(
+            bundle_path,
+            expected_sha256=bundle_sha256,
+        )
+        if (
+            bundle.sha256 != self.control_bundle.sha256
+            or bundle.payload != self.control_bundle.payload
+        ):
+            raise MsctlError(
+                "CONTROL_BUNDLE_INVALID",
+                "reviewed control bundle differs from the running msctl source",
+            )
+        plan = {
+            **self._control_install_plan(instance_id, bundle=bundle),
+            "reviewed_control_bundle": str(Path(bundle_path).resolve()),
+        }
         if not apply:
             return plan
         self._require_ssm_online(instance_id)
-        published = self._publish_control_bundle()
+        published = self._publish_control_bundle(bundle)
         output = _aws_output_object(
             self._run(plan["commands"][2], operation="install control bundle"),
             {"command"},
@@ -8728,6 +8973,8 @@ class AwsP5Backend:
             apply = bool(getattr(args, "apply", False))
             return not apply, self.control_install(
                 instance_id=str(args.instance_id),
+                bundle_path=args.bundle,
+                bundle_sha256=args.bundle_sha256,
                 apply=apply,
             )
         if command == "canary plan":
@@ -9034,6 +9281,14 @@ def build_aws_backend(
     approval_verifier: Callable[..., object] = verify_scope_approval,
 ) -> AwsP5Backend:
     environment = dict(os.environ if environ is None else environ)
+    supplied_credential_variables = (
+        set(environment) & _OPERATOR_CREDENTIAL_VARIABLES
+    )
+    runtime_environment = {
+        name: value
+        for name, value in environment.items()
+        if name not in _OPERATOR_CREDENTIAL_VARIABLES
+    }
     module_name = "cluster.aws.p5.profile"
     try:
         module = importlib.import_module(module_name)
@@ -9055,7 +9310,7 @@ def build_aws_backend(
             details={"adapter": module_name},
         )
     try:
-        runtime = validator(profile, environment)
+        runtime = validator(profile, runtime_environment)
     except MsctlError:
         raise
     except (TypeError, ValueError) as error:
@@ -9069,6 +9324,12 @@ def build_aws_backend(
             "AWS_RUNTIME_INVALID",
             "MS_AWS_INSTANCE_PROFILE_ARN is required",
         )
+    operator_credentials = None
+    if runner is None or supplied_credential_variables:
+        operator_credentials = load_operator_credential_process(
+            environment,
+            region=runtime.region,
+        )
     return AwsP5Backend(
         profile=profile,
         runtime=runtime,
@@ -9077,6 +9338,7 @@ def build_aws_backend(
         runner=runner,
         approval_verifier=approval_verifier,
         environ=environment,
+        operator_credentials=operator_credentials,
     )
 
 

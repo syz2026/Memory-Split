@@ -210,6 +210,7 @@ _STATIC_REQUIRED_MEMBERS = frozenset(
         "scripts/package_aws_gpu_handoff.py",
         "scripts/package_aws_p5_handoff.py",
         "scripts/run_train.py",
+        "scripts/validate_aws_gpu_launch_request.py",
         "scripts/verify_aws_gpu_v3_release.py",
         "sources/Wikidata-CC0-1.0.txt",
         "sources/current-dataset-licenses.json",
@@ -247,6 +248,7 @@ CONTRACT_GROUPS = {
         "evals/confirmatory/sealing.py",
         "msctl/operations.py",
         "msctl/state.py",
+        "scripts/validate_aws_gpu_launch_request.py",
     ),
     "canary": (
         "cluster/aws/p5/canary.py",
