@@ -805,6 +805,88 @@ git commit -m "feat: add immutable v2 source freeze"
 
 ---
 
+### Task 3W: Build the verified indexed Wikidata derived view
+
+**Files:**
+- Create: `corpusgen/reasoning_v2/wikidata_source.py`
+- Create: `tests/test_reasoning_v2_wikidata_source.py`
+
+**Interfaces:**
+- Consumes:
+  canonical source-lock bytes,
+  verified source root,
+  a derived-output root outside the source tree, and
+  the expected generator commit.
+- Produces:
+  `WikidataDerivedViewReceipt`,
+  `WikidataDerivedView`,
+  `build_wikidata_derived_view(...)`,
+  `verify_wikidata_derived_view(...)`,
+  `iter_v2_training_triples(...)`,
+  `iter_v2_aliases(...)`,
+  `iter_distinct_training_edges(...)`,
+  `lookup_training_triple(view, training_split, row)`, and
+  `lookup_alias(view, canonical_id)`.
+
+- [ ] **Step 1: RED — test source binding, canonical streams, and indexes**
+
+Build tiny deterministic versions of all three real tar archives. Stage them
+through `SourceLock`, build the derived view outside the source root, and test:
+
+- exact archive/member role enforcement and rejection of unsafe tar members;
+- byte-identical receipts and logical streams across independent builds;
+- source-lock, archive, receipt, stream, index, and namespace tamper rejection;
+- training/sealed overlap rejection;
+- canonical training, alias, and distinct-edge ordering;
+- indexed training-row and alias lookup equivalence with the logical streams;
+- no-replace publication and verified winner reuse; and
+- source-root byte identity before and after build and verification.
+
+- [ ] **Step 2: Verify RED**
+
+Run:
+
+```bash
+python -m pytest -q \
+  tests/test_reasoning_v2_wikidata_source.py \
+  tests/test_reasoning_v2_source_lock.py \
+  tests/test_current_sources.py
+```
+
+Expected: the new derived-view tests fail because no authority boundary or
+indexed lookup implementation exists.
+
+- [ ] **Step 3: GREEN — publish a closed content-addressed view**
+
+Authenticate the exact staged archives through retained regular-file
+descriptors, decode only declared members, and write canonical `training.tsv`,
+`aliases.tsv`, and `distinct-edges.tsv` streams plus fixed-width indexes. The
+closed receipt binds source-lock SHA-256, generator commit, the three archive
+identities, decoded members, overlap audit, all stream/index commitments,
+counts, and the exact derived-file inventory. Publish only by no-replace rename
+to `<output-root>/wikidata/<receipt-sha256>` and completely verify any existing
+winner before reuse.
+
+The derived view is compiler output, never an expansion of the immutable
+source root. Public iteration and lookup accept only a verified
+`WikidataDerivedView`; a caller-constructed data object or path-only receipt
+does not authorize reads.
+
+- [ ] **Step 4: Verify GREEN**
+
+Run the three-file command from Step 2. Expected: all pass, indexed and logical
+reads agree, and fixed Wikidata source identities remain unchanged.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add corpusgen/reasoning_v2/wikidata_source.py \
+  tests/test_reasoning_v2_wikidata_source.py
+git commit -m "feat: add verified Wikidata derived view"
+```
+
+---
+
 ### Task 3: Build the canonical external-memory eight-lane catalog
 
 **Files:**
@@ -815,7 +897,9 @@ git commit -m "feat: add immutable v2 source freeze"
 - Consumes:
   `BuildGeometry`,
   `SourceLock`,
-  verified source root, and
+  verified source root,
+  a `WikidataGraphCatalogSource` constructed from the verified Task 3W view,
+  and
   `Mapping[LaneId, LaneCatalogSource]`.
 - Produces:
   `SemanticFactRow`,
@@ -824,6 +908,7 @@ git commit -m "feat: add immutable v2 source freeze"
   `CatalogLaneIndex`,
   `InputCatalog`,
   `LaneCatalogSource`,
+  `WikidataGraphCatalogSource`,
   `LaneQuotaShortfall`,
   `catalog_record_id(draft: CatalogDraft, target_count: int) -> str`, and
   `build_input_catalog(geometry: BuildGeometry, source_lock: SourceLock, source_root: Path, lane_sources: Mapping[LaneId, LaneCatalogSource], output_root: Path) -> InputCatalog`.
@@ -980,6 +1065,7 @@ class InputCatalog:
     records_path: Path
     index_path: Path
     source_lock_sha256: str
+    wikidata_view_sha256: str
     sha256: str
     record_count: int
     target_count: int
@@ -1015,8 +1101,13 @@ raise `LaneQuotaShortfall` if a finite iterator ends. Hash the canonical draft
 core plus `target_count` for `record_id`; do not include global ordinal in the
 ID. Write `catalog.jsonl` in lane order and lane-local source-key order, then
 write `catalog-index.json` with source-lock hash, per-lane ordinal ranges,
-counts, target sums, overall record count, target count, and the SHA-256 of
-`catalog.jsonl`. Read every source iterator through verified manifest paths;
+counts, target sums, overall record count, target count, the SHA-256 of
+`catalog.jsonl`, and the exact Task 3W `wikidata_view_sha256`.
+`WikidataGraphCatalogSource` accepts only the verified derived view and emits
+closed locators containing archive path, decoded member, literal
+`split="train"`, separate `training_split`, one-based row, canonical training
+edge key, and the same view receipt commitment. Read every other source
+iterator through verified manifest paths;
 reject path names containing evaluation, validation, test, sealed, or holdout
 unless the source lock explicitly marks the file as training.
 
@@ -1259,8 +1350,9 @@ git commit -m "feat: add v2 semantic sidecar routing"
   verified source root,
   `RouteIndex`,
   `get_tok()`,
-  `iter_training_triples()`,
-  `iter_aliases()`,
+  verified Task 3W `WikidataDerivedView`,
+  `lookup_training_triple()`,
+  `lookup_alias()`,
   `iter_worlds()`, and
   `iter_graph_records()`.
 - Produces:
@@ -1301,7 +1393,11 @@ FineMath consumes `finemath-4plus` before cross-deduplicated
 `finemath-3plus`; Wikidata graph emits every training triple before a
 `graph-revisit`; synthetic graph reproduces the exact catalog seed and frozen
 `WorldConfig`. Reject source hash drift, non-NFC text, a non-finite payload,
-duplicate record ID, oversized core, and target-count drift.
+duplicate record ID, oversized core, and target-count drift. For Wikidata,
+flow real tiny archives through Task 3W and the production catalog, forbid
+legacy iterators and archive/full-stream rescans during record rendering, and
+prove that drift in the alias archive or either training archive is rejected
+at both render boundaries.
 
 - [ ] **Step 2: Verify RED**
 
@@ -1364,6 +1460,14 @@ deduplication. Graph renderers insert only indexed
 `<|graph_noop|><|graph_step|>` schema tokens before EOT when the semantic core
 is shorter than the requested length. Call `derive_sidecar_weights()` after
 fitting and require no leaks.
+
+`WikidataGraphRenderer(source_root, wikidata_view)` requires the verified Task
+3W view, checks the catalog's view/locator commitments, and obtains each record
+only through `lookup_training_triple()` and `lookup_alias()`. It never imports
+legacy Wikidata iterators or scans an archive or complete logical stream per
+record. Construction authenticates and pins all three locked archives;
+rendering reverifies the complete pinned set before and after tokenization and
+sidecar construction, including the alias and non-selected training archives.
 
 - [ ] **Step 4: Verify GREEN**
 
@@ -1969,6 +2073,7 @@ git commit -m "feat: assemble exact v2 corpus shards"
 - Consumes:
   `CandidateDataset`,
   source lock bytes,
+  canonical Task 3W Wikidata derived-view receipt bytes,
   route/dose artifacts,
   proof/leak manifests,
   32 `TaskReceipt` values, and
@@ -2004,6 +2109,10 @@ def test_inner_receipt_binds_every_production_commitment(release_candidate):
     )
     bindings = receipt.production_bindings
     assert bindings.source_lock_sha256 == release_candidate.source_lock_sha256
+    assert (
+        bindings.wikidata_view_receipt_sha256
+        == release_candidate.wikidata_view_receipt_sha256
+    )
     assert bindings.route_manifest_sha256 == release_candidate.route_sha256
     assert bindings.proof_manifest_sha256 == release_candidate.proof_sha256
     assert len(bindings.task_receipt_sha256s) == 32
@@ -2131,6 +2240,7 @@ class ProductionBindings:
     dataset_id: str
     source_git_commit: str
     source_lock_sha256: str
+    wikidata_view_receipt_sha256: str
     renderer_versions: tuple[tuple[LaneId, str], ...]
     catalog_sha256: str
     metadata_sha256: str
@@ -2150,6 +2260,7 @@ Keep all existing base v2 fields and append only the
 `production_bindings` object for production receipts. Inventory
 `catalog.jsonl`, `metadata.jsonl`, `schedule.jsonl`, `assignments.jsonl`,
 32 token shards, both 32-shard sidecar sets, `manifests/source-lock.json`,
+`manifests/wikidata-view-receipt.json`,
 `manifests/route-manifest.jsonl`, `manifests/dose-report.json`,
 `manifests/semantic-spans.jsonl`, `manifests/semantic-leaks.json`, and
 `proofs/proof-manifest.jsonl`.
@@ -2198,6 +2309,10 @@ class OuterMaterializationReceipt:
     source_git_commit: str
     source_lock_path: Literal["source-lock.json"]
     source_lock_sha256: str
+    wikidata_view_receipt_path: Literal[
+        "dataset/manifests/wikidata-view-receipt.json"
+    ]
+    wikidata_view_receipt_sha256: str
     inner_receipt_path: Literal["dataset/corpus-receipt.json"]
     inner_receipt_sha256: str
     build_id: str
@@ -2217,7 +2332,11 @@ Require `semantic_verification_rate == 1.0`,
 `structural_train_evaluation_overlap == 0.0`, both exact dose fractions at
 least `9/10`, zero leaks, complete graph coverage, a passing FarmShare
 candidate-verification hash, and matching second-build commitments before
-constructing the full outer receipt. `graph_coverage` has exact keys
+constructing the full outer receipt. Hash the inventoried canonical Wikidata
+view receipt and require it to equal both the catalog's
+`wikidata_view_sha256` and `ProductionBindings.wikidata_view_receipt_sha256`;
+the outer receipt binds that same hash and its fixed release-relative path.
+`graph_coverage` has exact keys
 `training_edges`, `covered_training_edges`, `complete_once`, and
 `revisit_started_after_complete`; `route_dose` has exact rational fact/burden
 fractions and pass booleans; `semantic_leakage` has `leak_count=0` and the

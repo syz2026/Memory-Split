@@ -141,6 +141,38 @@ licensed, downloaded, and hashed, the full build remains blocked.
 Teacher-generated chain-of-thought contributes zero targets in this build.
 This satisfies the frozen maximum while avoiding an unfrozen teacher model.
 
+### 5.1 Wikidata derived-view authority
+
+After source staging verifies the three locked Wikidata archives, and before
+the production catalog consumes any Wikidata row, the producer builds and
+verifies a deterministic content-addressed derived view outside the immutable
+source root. The authority flow is:
+
+```text
+SourceLock + staged Wikidata archives
+  -> verified decoding and canonical logical streams
+  -> fixed-width training and alias indexes
+  -> closed WikidataDerivedViewReceipt
+  -> verified WikidataGraphCatalogSource
+  -> indexed Wikidata renderer lookups
+```
+
+The view receipt binds the source-lock SHA-256, generator commit, all three
+archive identities, decoded-member inventory, logical-stream commitments,
+index commitments, row counts, and exact derived-file inventory. Its SHA-256
+is the view's content address. Building the view neither expands nor mutates
+the staged source tree, and does not alter any frozen source identity.
+
+The catalog index records the exact `wikidata_view_sha256`, and every Wikidata
+catalog locator repeats that commitment together with its archive, member,
+outer `split="train"`, separate training split, one-based row, and canonical
+edge key. Publication inventories the canonical view receipt at
+`dataset/manifests/wikidata-view-receipt.json`; production bindings and the
+outer materialization receipt both bind its SHA-256, while the outer receipt
+also binds that relative path. Verification rejects any disagreement among
+the source lock, view receipt, catalog commitment, inner production bindings,
+and outer receipt.
+
 ## 6. Compiler architecture
 
 The implementation replaces `UnsupportedProductionRenderer` with a strict
@@ -168,7 +200,9 @@ order, and Python hash randomization.
 
 - FineWeb-Edu and FineMath render locked text records.
 - Wikidata graph renders the complete frozen training graph once before any
-  deterministic revisit permitted by the schedule.
+  deterministic revisit permitted by the schedule, using indexed training-row
+  and alias lookups from the verified derived view rather than archive or
+  logical-stream rescans.
 - Synthetic graph uses frozen generator code and explicit seeds.
 - Synthetic multihop and Wikidata path lanes emit canonical solver-verified
   proofs.
@@ -231,6 +265,7 @@ The inner receipt binds:
 - token ordered-stream and Merkle commitments;
 - Dense and Split90 sidecar shard inventories and stream commitments;
 - source-lock SHA-256;
+- Wikidata derived-view receipt SHA-256;
 - route-manifest SHA-256;
 - proof-manifest SHA-256; and
 - build ID.
@@ -239,6 +274,7 @@ The outer receipt binds:
 
 - dataset ID `memorysplit-v2-20x-reasoning-max-cohort`;
 - source Git commit and source-lock hash;
+- Wikidata derived-view receipt path and SHA-256;
 - inner receipt path and SHA-256;
 - exact lane quotas and realized counts;
 - graph coverage;
