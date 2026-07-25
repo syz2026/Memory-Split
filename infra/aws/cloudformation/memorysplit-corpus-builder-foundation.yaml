@@ -8,6 +8,66 @@ Parameters:
   BuilderAmiId:
     Type: AWS::EC2::Image::Id
     Description: Immutable Amazon Linux 2023 AMI ID approved for the builder.
+  BuilderUserDataGzipBase64Part1:
+    Type: String
+    AllowedPattern: '^H4sI[A-Za-z0-9+/]*={0,2}$'
+    ConstraintDescription: Must start one deterministic gzip base64 payload.
+    Description: >-
+      First ordered chunk of the Task 6 deterministic gzip/base64 user data;
+      split at 4096-character boundaries.
+    MaxLength: 4096
+    MinLength: 8
+    NoEcho: true
+  BuilderUserDataGzipBase64Part2:
+    Type: String
+    AllowedPattern: '^[A-Za-z0-9+/]*={0,2}$'
+    ConstraintDescription: Must continue the deterministic gzip base64 payload.
+    Default: ""
+    Description: >-
+      Next ordered chunk of the Task 6 deterministic gzip/base64 user data;
+      leave empty after the final chunk.
+    MaxLength: 4096
+    NoEcho: true
+  BuilderUserDataGzipBase64Part3:
+    Type: String
+    AllowedPattern: '^[A-Za-z0-9+/]*={0,2}$'
+    ConstraintDescription: Must continue the deterministic gzip base64 payload.
+    Default: ""
+    Description: >-
+      Next ordered chunk of the Task 6 deterministic gzip/base64 user data;
+      leave empty after the final chunk.
+    MaxLength: 4096
+    NoEcho: true
+  BuilderUserDataGzipBase64Part4:
+    Type: String
+    AllowedPattern: '^[A-Za-z0-9+/]*={0,2}$'
+    ConstraintDescription: Must continue the deterministic gzip base64 payload.
+    Default: ""
+    Description: >-
+      Next ordered chunk of the Task 6 deterministic gzip/base64 user data;
+      leave empty after the final chunk.
+    MaxLength: 4096
+    NoEcho: true
+  BuilderUserDataGzipBase64Part5:
+    Type: String
+    AllowedPattern: '^[A-Za-z0-9+/]*={0,2}$'
+    ConstraintDescription: Must continue the deterministic gzip base64 payload.
+    Default: ""
+    Description: >-
+      Next ordered chunk of the Task 6 deterministic gzip/base64 user data;
+      leave empty after the final chunk.
+    MaxLength: 4096
+    NoEcho: true
+  BuilderUserDataGzipBase64Part6:
+    Type: String
+    AllowedPattern: '^[A-Za-z0-9+/]*={0,2}$'
+    ConstraintDescription: Must continue the deterministic gzip base64 payload.
+    Default: ""
+    Description: >-
+      Next ordered chunk of the Task 6 deterministic gzip/base64 user data;
+      leave empty after the final chunk.
+    MaxLength: 1368
+    NoEcho: true
   BuilderAvailabilityZone:
     Type: AWS::EC2::AvailabilityZone::Name
     Description: Selected us-east-1 Availability Zone for the corpus builder.
@@ -282,7 +342,9 @@ Resources:
             Principal: "*"
             Action: s3:PutObject
             Resource:
-              Fn::Sub: ${ArtifactBucket.Arn}/v2/builds/*
+              - Fn::Sub: ${ArtifactBucket.Arn}/v2/builds/*
+              - Fn::Sub: ${ArtifactBucket.Arn}/v2/packages/*
+              - Fn::Sub: ${ArtifactBucket.Arn}/v2/sources/*
             Condition:
               "Null":
                 s3:x-amz-server-side-encryption: "false"
@@ -293,7 +355,9 @@ Resources:
             Principal: "*"
             Action: s3:PutObject
             Resource:
-              Fn::Sub: ${ArtifactBucket.Arn}/v2/builds/*
+              - Fn::Sub: ${ArtifactBucket.Arn}/v2/builds/*
+              - Fn::Sub: ${ArtifactBucket.Arn}/v2/packages/*
+              - Fn::Sub: ${ArtifactBucket.Arn}/v2/sources/*
             Condition:
               "Null":
                 s3:x-amz-server-side-encryption-aws-kms-key-id: "false"
@@ -371,13 +435,31 @@ Resources:
                 Effect: Allow
                 Action:
                   - kms:Decrypt
-                  - kms:DescribeKey
                   - kms:Encrypt
                   - kms:GenerateDataKey
                 Resource:
                   Fn::GetAtt:
                     - DataKey
                     - Arn
+                Condition:
+                  StringEquals:
+                    "kms:EncryptionContext:aws:s3:arn":
+                      Fn::GetAtt:
+                        - ArtifactBucket
+                        - Arn
+                    "kms:ViaService":
+                      Fn::Sub: s3.${AWS::Region}.amazonaws.com
+              - Sid: DescribeDataKey
+                Effect: Allow
+                Action: kms:DescribeKey
+                Resource:
+                  Fn::GetAtt:
+                    - DataKey
+                    - Arn
+                Condition:
+                  StringEquals:
+                    "kms:ViaService":
+                      Fn::Sub: s3.${AWS::Region}.amazonaws.com
               - Sid: WriteBuilderLogs
                 Effect: Allow
                 Action:
@@ -431,6 +513,7 @@ Resources:
                     ec2:IsLaunchTemplateResource: "true"
                   StringEquals:
                     aws:RequestTag/MemorySplitCorpusBuilder: "true"
+                    ec2:InstanceMarketType: on-demand
                     ec2:InstanceType: i4i.16xlarge
                     ec2:MetadataHttpTokens: required
               - Sid: TagApprovedLaunchResources
@@ -449,15 +532,6 @@ Resources:
                     aws:TagKeys:
                       - MemorySplitCorpusBuilder
                       - Name
-              - Sid: SetBuilderShutdownBehavior
-                Effect: Allow
-                Action: ec2:ModifyInstanceAttribute
-                Resource:
-                  Fn::Sub: >-
-                    arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:instance/*
-                Condition:
-                  StringEquals:
-                    ec2:ResourceTag/MemorySplitCorpusBuilder: "true"
               - Sid: TerminateTaggedBuilder
                 Effect: Allow
                 Action: ec2:TerminateInstances
@@ -503,10 +577,23 @@ Resources:
                 Effect: Allow
                 Action:
                   - kms:Decrypt
-                  - kms:DescribeKey
                   - kms:GenerateDataKeyWithoutPlaintext
                   - kms:ReEncryptFrom
                   - kms:ReEncryptTo
+                Resource:
+                  Fn::GetAtt:
+                    - DataKey
+                    - Arn
+                Condition:
+                  "ForAnyValue:StringEquals":
+                    kms:EncryptionContextKeys:
+                      - aws:ebs:id
+                  StringEquals:
+                    "kms:ViaService":
+                      Fn::Sub: ec2.${AWS::Region}.amazonaws.com
+              - Sid: DescribeDataKeyForEbs
+                Effect: Allow
+                Action: kms:DescribeKey
                 Resource:
                   Fn::GetAtt:
                     - DataKey
@@ -521,6 +608,26 @@ Resources:
                 Condition:
                   Bool:
                     kms:GrantIsForAWSResource: "true"
+                  StringEquals:
+                    "kms:ViaService":
+                      Fn::Sub: ec2.${AWS::Region}.amazonaws.com
+              - Sid: ListFailedBuildVersions
+                Effect: Allow
+                Action: s3:ListBucketVersions
+                Resource:
+                  Fn::GetAtt:
+                    - ArtifactBucket
+                    - Arn
+                Condition:
+                  StringLike:
+                    s3:prefix: v2/builds/*
+              - Sid: CleanupFailedBuildVersions
+                Effect: Allow
+                Action:
+                  - s3:BypassGovernanceRetention
+                  - s3:DeleteObjectVersion
+                Resource:
+                  Fn::Sub: ${ArtifactBucket.Arn}/v2/builds/*
               - Sid: IdentifyControllerSession
                 Effect: Allow
                 Action: sts:GetCallerIdentity
@@ -632,6 +739,15 @@ Resources:
             Tags:
               - Key: MemorySplitCorpusBuilder
                 Value: "true"
+        UserData:
+          Fn::Join:
+            - ""
+            - - Ref: BuilderUserDataGzipBase64Part1
+              - Ref: BuilderUserDataGzipBase64Part2
+              - Ref: BuilderUserDataGzipBase64Part3
+              - Ref: BuilderUserDataGzipBase64Part4
+              - Ref: BuilderUserDataGzipBase64Part5
+              - Ref: BuilderUserDataGzipBase64Part6
       TagSpecifications:
         - ResourceType: launch-template
           Tags:
