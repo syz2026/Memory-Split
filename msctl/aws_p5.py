@@ -3296,6 +3296,7 @@ class AwsP5Backend:
         context: V3LifecycleContext | None = None,
         expected_binding: Mapping[str, object] | None = None,
         allow_historical_binding: bool = False,
+        allowed_historical_bindings: Sequence[Mapping[str, object]] = (),
     ) -> dict[str, object]:
         root = _aws_output_object(
             output,
@@ -3352,7 +3353,15 @@ class AwsP5Backend:
             )
         observed = {field: row[field] for field in expected}
         if allow_historical_binding:
-            valid = all(value is None for value in observed.values())
+            historical = [dict(binding) for binding in allowed_historical_bindings]
+            if any(set(binding) != set(expected) for binding in historical):
+                raise MsctlError(
+                    "INSTANCE_BINDING_MISMATCH",
+                    "historical instance tag binding is incomplete",
+                )
+            valid = all(value is None for value in observed.values()) or any(
+                observed == binding for binding in historical
+            )
         elif require_bound:
             valid = observed == expected
         else:
@@ -3526,6 +3535,7 @@ class AwsP5Backend:
         operation: str,
         context: V3LifecycleContext | None = None,
         allow_historical_binding: bool = False,
+        allowed_historical_bindings: Sequence[Mapping[str, object]] = (),
     ) -> dict[str, object]:
         selected_argv = self._selected_instance_argv(instance_id, manifest)
         row = self._parse_selected_instance(
@@ -3539,6 +3549,7 @@ class AwsP5Backend:
             require_bound=True,
             context=context,
             allow_historical_binding=allow_historical_binding,
+            allowed_historical_bindings=allowed_historical_bindings,
         )
         attribute = self._aws_argv(
             "ec2",
@@ -3575,6 +3586,153 @@ class AwsP5Backend:
             )
         return row
 
+    def _validated_fleet_state_tag_binding(
+        self,
+        *,
+        store: StateStore,
+        manifest: object,
+        plan: FleetPlan,
+        binding: FleetManifestBinding,
+    ) -> dict[str, object] | None:
+        journal = store.read_aws_pair(binding.sha256)
+        if journal is None:
+            return None
+        states = journal.get("states")
+        expected_journal = {
+            "schema_version": 3,
+            "provider": self.profile.provider,
+            "instance_type": self.profile.instance_type,
+            "profile_sha256": self.profile.sha256,
+            "gres": _profile_gres(self.profile),
+            "run_manifest_sha256": binding.sha256,
+            "cohort_assignment_sha256": plan.cohort_assignment_sha256,
+            "preregistration_sha256": plan.preregistration_sha256,
+            "hardware_amendment_sha256": plan.hardware_amendment_sha256,
+            "provider_selection_sha256": plan.provider_selection_sha256,
+            "sealed_fixture_sha256": plan.sealed_fixture_sha256,
+            "fleet_plan_sha256": plan.sha256,
+            "fleet_wave": binding.wave,
+            "control_bundle_sha256": self.control_bundle.sha256,
+        }
+        if (
+            any(journal.get(field) != value for field, value in expected_journal.items())
+            or not isinstance(states, list)
+            or len(states) != 2
+            or {state.get("arm") for state in states if isinstance(state, dict)}
+            != {"dense", "split90"}
+            or any(
+                not isinstance(state, dict)
+                or state.get("instance_id") != binding.instance_id
+                or state.get("seed") != binding.seed
+                or state.get("release_sha256") != plan.release_sha256
+                or state.get("dataset_sha256") != plan.dataset_sha256
+                or state.get("source_commit") != plan.source_commit
+                or state.get("runtime_sha256") != self._runtime_sha256()
+                or state.get("ami_id") != self.runtime.ami_id
+                or state.get("container_digest") != self.runtime.container_digest
+                for state in states
+            )
+            or any(
+                len({state.get(field) for state in states}) != 1
+                for field in (
+                    "instance_id",
+                    "terminate_at",
+                    "operation",
+                    "operation_id",
+                    "intent_sha256",
+                    "intent_uri",
+                    "launch_readiness_sha256",
+                )
+            )
+        ):
+            raise MsctlError(
+                "FLEET_ADVANCE_INVALID",
+                "current fleet assignment state is incomplete or cross-plan",
+            )
+        bindings = [
+            self._fleet_state_tag_binding(manifest, state) for state in states
+        ]
+        if canonical_json(bindings[0]) != canonical_json(bindings[1]):
+            raise MsctlError(
+                "FLEET_ADVANCE_INVALID",
+                "current fleet assignment state has divergent tag bindings",
+            )
+        return bindings[0]
+
+    def _historical_evaluation_bindings(
+        self,
+        *,
+        manifest: object,
+        checkpoint_receipt_sha256: str,
+        context: V3LifecycleContext,
+        store: StateStore | None,
+    ) -> tuple[bool, tuple[dict[str, object], ...]]:
+        plan = context.fleet_plan
+        source = context.fleet_binding
+        later = sorted(
+            (
+                candidate
+                for candidate in plan.manifests
+                if candidate.instance_id == source.instance_id
+                and candidate.wave > source.wave
+            ),
+            key=lambda candidate: candidate.wave,
+        )
+        reached = source
+        missing_advance = False
+        first_advance = None
+        for candidate in later:
+            advance = load_fleet_advance(
+                self.state_root,
+                plan=plan,
+                to_binding=candidate,
+            )
+            if advance is None:
+                missing_advance = True
+                continue
+            if missing_advance or advance.from_binding != reached:
+                raise MsctlError(
+                    "FLEET_ADVANCE_INVALID",
+                    "historical evaluation requires one consecutive same-instance "
+                    "advance-receipt chain",
+                )
+            if first_advance is None:
+                first_advance = advance
+            reached = candidate
+        if first_advance is None:
+            return False, ()
+        if (
+            first_advance.from_binding != source
+            or first_advance.evidence.get("checkpoint_receipt_sha256")
+            != checkpoint_receipt_sha256
+        ):
+            raise MsctlError(
+                "FLEET_ADVANCE_REQUIRED",
+                "historical evaluation requires the source wave's matching "
+                "terminal checkpoint advance receipt",
+                details={
+                    "instance_id": source.instance_id,
+                    "seed": source.seed,
+                    "wave": source.wave,
+                },
+            )
+
+        def current_binding(locked: StateStore) -> dict[str, object] | None:
+            return self._validated_fleet_state_tag_binding(
+                store=locked,
+                manifest=manifest,
+                plan=plan,
+                binding=reached,
+            )
+
+        if store is None:
+            local_store = StateStore(self.state_root)
+            with local_store.locked():
+                current = current_binding(local_store)
+        else:
+            current = current_binding(store)
+        return True, (() if current is None else (current,))
+
     def _validate_evaluation_instance_binding(
         self,
         manifest: object,
@@ -3583,6 +3741,7 @@ class AwsP5Backend:
         terminate_at: str,
         checkpoint_receipt_sha256: str,
         context: V3LifecycleContext | None,
+        store: StateStore | None = None,
     ) -> dict[str, object]:
         validated = self._validate_v3_context(manifest, context)
         if validated is None:
@@ -3593,50 +3752,20 @@ class AwsP5Backend:
                 operation="evaluation",
                 context=context,
             )
-        binding = validated.fleet_binding
-        successors = [
-            candidate
-            for candidate in validated.fleet_plan.manifests
-            if candidate.instance_id == binding.instance_id
-            and candidate.wave == binding.wave + 1
-        ]
-        if len(successors) > 1:
-            raise MsctlError(
-                "FLEET_PLAN_INVALID",
-                "fleet plan has duplicate same-instance successors",
-            )
-        advance = (
-            load_fleet_advance(
-                self.state_root,
-                plan=validated.fleet_plan,
-                to_binding=successors[0],
-            )
-            if successors
-            else None
+        historical, allowed_bindings = self._historical_evaluation_bindings(
+            manifest=manifest,
+            checkpoint_receipt_sha256=checkpoint_receipt_sha256,
+            context=validated,
+            store=store,
         )
-        if successors and (
-            advance is None
-            or advance.from_binding != binding
-            or advance.evidence.get("checkpoint_receipt_sha256")
-            != checkpoint_receipt_sha256
-        ):
-            raise MsctlError(
-                "FLEET_ADVANCE_REQUIRED",
-                "evaluation after training-tag removal requires the matching "
-                "closed training-wave advance receipt",
-                details={
-                    "instance_id": binding.instance_id,
-                    "seed": binding.seed,
-                    "wave": binding.wave,
-                },
-            )
         return self._validate_selected_instance_binding(
             manifest,
             instance_id=instance_id,
             terminate_at=terminate_at,
             operation="evaluation",
             context=context,
-            allow_historical_binding=advance is not None,
+            allow_historical_binding=historical,
+            allowed_historical_bindings=allowed_bindings,
         )
 
     def _parse_instances(
@@ -6858,6 +6987,7 @@ class AwsP5Backend:
                 "from_seed": from_binding.seed,
                 "to_seed": to_binding.seed,
                 "fleet_plan_sha256": plan.sha256,
+                "release_sha256": plan.release_sha256,
                 "advance_receipt_sha256": existing.sha256,
                 "advance_receipt": str(existing.path),
                 "advanced": 0,
@@ -6994,6 +7124,7 @@ class AwsP5Backend:
             "from_seed": from_binding.seed,
             "to_seed": to_binding.seed,
             "fleet_plan_sha256": plan.sha256,
+            "release_sha256": plan.release_sha256,
             "resources": resources,
             "approval_resources": resources,
             "commands": [delete_argv],
@@ -8372,28 +8503,28 @@ class AwsP5Backend:
                 )
                 command_ids = {state.get("command_id") for state in present}
                 if command_ids == {None}:
+                    receipt_recovery = self._reconcile_receipted_pair(
+                        store=store,
+                        manifest=manifest,
+                        states=present,
+                        intent=operation_intent,
+                        context=context,
+                        operation_label="resume",
+                    )
+                    if receipt_recovery is not None:
+                        return {
+                            "provider": self.profile.provider,
+                            "seed": manifest.seed,
+                            "instance_id": instance_id,
+                            **receipt_recovery,
+                            "submitted": 0,
+                            "idempotent": True,
+                        }
                     recovered = self._find_operation_command(
                         operation_id=str(operation_intent["operation_id"]),
                         instance_id=instance_id,
                     )
                     if recovered is None:
-                        receipt_recovery = self._reconcile_receipted_pair(
-                            store=store,
-                            manifest=manifest,
-                            states=present,
-                            intent=operation_intent,
-                            context=context,
-                            operation_label="resume",
-                        )
-                        if receipt_recovery is not None:
-                            return {
-                                "provider": self.profile.provider,
-                                "seed": manifest.seed,
-                                "instance_id": instance_id,
-                                **receipt_recovery,
-                                "submitted": 0,
-                                "idempotent": True,
-                            }
                         raise MsctlError(
                             "SUBMISSION_UNCERTAIN",
                             "resume send was attempted without safe resend proof",
@@ -8451,27 +8582,74 @@ class AwsP5Backend:
             previous_commands = {
                 state.get("command_id") for state in present
             }
-            if None in previous_commands or len(previous_commands) != 1:
+            previous_command: str | None
+            if previous_commands == {None}:
+                previous_intent = self._state_operation_intent(present[0])
+                receipt_recovery = self._reconcile_receipted_pair(
+                    store=store,
+                    manifest=manifest,
+                    states=present,
+                    intent=previous_intent,
+                    context=context,
+                    operation_label="training",
+                )
+                if receipt_recovery is not None:
+                    previous_command = None
+                    previous_status = str(receipt_recovery["status"])
+                else:
+                    recovered = self._find_operation_command(
+                        operation_id=str(previous_intent["operation_id"]),
+                        instance_id=instance_id,
+                    )
+                    if recovered is None:
+                        raise MsctlError(
+                            "SUBMISSION_UNCERTAIN",
+                            "AWS resume requires a previous command or validated "
+                            "terminal receipt",
+                        )
+                    previous_command = str(recovered["command_id"])
+                    previous_status = self._command_status(
+                        instance_id,
+                        previous_command,
+                    )
+                    now = _timestamp()
+                    for state in present:
+                        state["command_id"] = previous_command
+                        state["status"] = previous_status
+                        state["updated_at"] = now
+                    self._write_paired_states(
+                        store,
+                        manifest,
+                        present,
+                        context,
+                    )
+            elif None in previous_commands or len(previous_commands) != 1:
                 raise MsctlError(
                     "SUBMISSION_UNCERTAIN",
                     "AWS resume requires one previous paired command",
                 )
-            previous_command = str(next(iter(previous_commands)))
-            previous_status = self._command_status(
-                instance_id,
-                previous_command,
-            )
+            else:
+                previous_command = str(next(iter(previous_commands)))
+                previous_status = self._command_status(
+                    instance_id,
+                    previous_command,
+                )
             if previous_status in _ACTIVE_COMMAND_STATES:
                 raise MsctlError(
                     "RUN_ALREADY_ACTIVE",
                     "refusing to resume an active AWS command",
                 )
-            if previous_status == "Success":
+            if previous_status in {"Success", "REMOTE_TERMINAL_SUCCESS"}:
                 raise MsctlError(
                     "RUN_ALREADY_COMPLETE",
                     "refusing to resume a successful AWS command",
                 )
-            if previous_status not in {"Failed", "Cancelled", "TimedOut"}:
+            if previous_status not in {
+                "Failed",
+                "Cancelled",
+                "TimedOut",
+                "REMOTE_TERMINAL_FAILED",
+            }:
                 raise MsctlError(
                     "RESUME_STATE_UNCERTAIN",
                     "SSM did not report an explicit resumable terminal state",
@@ -8491,7 +8669,8 @@ class AwsP5Backend:
             now = _timestamp()
             for state in present:
                 prior = list(state.get("prior_command_ids", []))
-                prior.append(previous_command)
+                if previous_command is not None:
+                    prior.append(previous_command)
                 state.update(
                     {
                         "command_id": None,
@@ -9315,6 +9494,7 @@ class AwsP5Backend:
                         label="evaluation checkpoint receipt",
                     ),
                     context=context,
+                    store=store,
                 )
             else:
                 self._validate_selected_instance_binding(
@@ -9327,21 +9507,61 @@ class AwsP5Backend:
             training_commands = {
                 state.get("command_id") for state in states
             }
-            if None in training_commands or len(training_commands) != 1:
+            if training_commands == {None}:
+                training_intent = self._state_operation_intent(states[0])
+                receipt_recovery = self._reconcile_receipted_pair(
+                    store=store,
+                    manifest=manifest,
+                    states=states,
+                    intent=training_intent,
+                    context=context,
+                    operation_label="training",
+                )
+                if receipt_recovery is not None:
+                    training_status = str(receipt_recovery["status"])
+                else:
+                    recovered = self._find_operation_command(
+                        operation_id=str(training_intent["operation_id"]),
+                        instance_id=instance_id,
+                    )
+                    if recovered is None:
+                        raise MsctlError(
+                            "SUBMISSION_UNCERTAIN",
+                            "AWS evaluation requires a training command or "
+                            "validated terminal receipt",
+                        )
+                    training_command = str(recovered["command_id"])
+                    training_status = self._command_status(
+                        instance_id,
+                        training_command,
+                    )
+                    now = _timestamp()
+                    for state in states:
+                        state["command_id"] = training_command
+                        state["status"] = training_status
+                        state["updated_at"] = now
+                    self._write_paired_states(
+                        store,
+                        manifest,
+                        states,
+                        context,
+                    )
+            elif None in training_commands or len(training_commands) != 1:
                 raise MsctlError(
                     "SUBMISSION_UNCERTAIN",
                     "AWS evaluation requires one paired training command",
                 )
-            training_status = self._command_status(
-                instance_id,
-                str(next(iter(training_commands))),
-            )
+            else:
+                training_status = self._command_status(
+                    instance_id,
+                    str(next(iter(training_commands))),
+                )
             if training_status in _ACTIVE_COMMAND_STATES:
                 raise MsctlError(
                     "RUN_ALREADY_ACTIVE",
                     "refusing to evaluate an active AWS training pair",
                 )
-            if training_status != "Success":
+            if training_status not in {"Success", "REMOTE_TERMINAL_SUCCESS"}:
                 raise MsctlError(
                     "RUN_NOT_COMPLETE",
                     "AWS evaluation requires successful paired training",
@@ -9402,28 +9622,26 @@ class AwsP5Backend:
                             "SUBMISSION_UNCERTAIN",
                             "evaluation intent was not durably marked as sent",
                         )
+                    receipt_recovery = self._reconcile_receipted_evaluation(
+                        store=store,
+                        manifest=manifest,
+                        state=existing,
+                        intent=operation_intent,
+                    )
+                    if receipt_recovery is not None:
+                        return {
+                            "provider": self.profile.provider,
+                            "seed": manifest.seed,
+                            "instance_id": instance_id,
+                            **receipt_recovery,
+                            "submitted": 0,
+                            "idempotent": True,
+                        }
                     recovered = self._find_operation_command(
                         operation_id=str(operation_intent["operation_id"]),
                         instance_id=instance_id,
                     )
                     if recovered is None:
-                        receipt_recovery = (
-                            self._reconcile_receipted_evaluation(
-                                store=store,
-                                manifest=manifest,
-                                state=existing,
-                                intent=operation_intent,
-                            )
-                        )
-                        if receipt_recovery is not None:
-                            return {
-                                "provider": self.profile.provider,
-                                "seed": manifest.seed,
-                                "instance_id": instance_id,
-                                **receipt_recovery,
-                                "submitted": 0,
-                                "idempotent": True,
-                            }
                         raise MsctlError(
                             "SUBMISSION_UNCERTAIN",
                             "evaluation send has no safe resend proof",

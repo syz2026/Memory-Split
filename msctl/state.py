@@ -469,7 +469,6 @@ def _validate_aws_run_state(value: dict[str, object], run_id: str) -> None:
         prior = value["prior_command_ids"]
         if (
             not isinstance(prior, list)
-            or not prior
             or any(
                 not isinstance(item, str)
                 or _AWS_COMMAND_RE.fullmatch(item) is None

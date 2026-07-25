@@ -53,7 +53,8 @@ mkdir -p \
   "$OPERATOR_ROOT/approvals" \
   "$OPERATOR_ROOT/collected" \
   "$OPERATOR_ROOT/manifests" \
-  "$OPERATOR_ROOT/receipts"
+  "$OPERATOR_ROOT/receipts" \
+  "$OPERATOR_ROOT/state"
 case "$(realpath "$OPERATOR_ROOT")/" in
   "$(realpath "$REPO_ROOT")/"*) echo "operator root is inside source tree" >&2; exit 2 ;;
 esac
@@ -80,6 +81,33 @@ export MSCTL_AWS_CONFIG_FILE="$FEDERATION_CONFIG"
 export MSCTL_AWS_PROFILE=memorysplit-v3-operator
 export MSCTL_AWS_CONFIG_SHA256=REPLACE_WITH_REVIEWED_CONFIG_SHA256
 export MSCTL_AWS_CREDENTIAL_PROCESS_SHA256=REPLACE_WITH_REVIEWED_HELPER_SHA256
+
+# Remove every ambient AWS credential source rejected by msctl. Keep the four
+# reviewed MSCTL_AWS_* credential-process bindings above and AWS_REGION below.
+PROHIBITED_AMBIENT_AWS_VARS=(
+  AWS_ACCESS_KEY_ID
+  AWS_CONFIG_FILE
+  AWS_CONTAINER_CREDENTIALS_FULL_URI
+  AWS_CONTAINER_CREDENTIALS_RELATIVE_URI
+  AWS_DEFAULT_PROFILE
+  AWS_EC2_METADATA_DISABLED
+  AWS_PROFILE
+  AWS_ROLE_ARN
+  AWS_ROLE_SESSION_NAME
+  AWS_SECRET_ACCESS_KEY
+  AWS_SECURITY_TOKEN
+  AWS_SESSION_TOKEN
+  AWS_SHARED_CREDENTIALS_FILE
+  AWS_WEB_IDENTITY_TOKEN_FILE
+)
+for name in "${PROHIBITED_AMBIENT_AWS_VARS[@]}"; do
+  unset "$name"
+done
+: "${MSCTL_AWS_CONFIG_FILE:?reviewed credential-process config is required}"
+: "${MSCTL_AWS_CONFIG_SHA256:?reviewed config hash is required}"
+: "${MSCTL_AWS_CREDENTIAL_PROCESS_SHA256:?reviewed helper hash is required}"
+: "${MSCTL_AWS_PROFILE:?reviewed credential-process profile is required}"
+
 test "$(sha256sum "$MSCTL_AWS_CONFIG_FILE" | awk '{print $1}')" = \
   "$MSCTL_AWS_CONFIG_SHA256"
 test "$(sha256sum "$FEDERATION_HELPER" | awk '{print $1}')" = \
@@ -512,32 +540,14 @@ The returned `CapacityReservation.CapacityReservationId` is the only
 reservation ID permitted in the launch request and provider-selection receipt;
 never copy an ID from discovery or another purchase. Launch one P6 into that
 exact block using a reviewed `launch-request.json`.
-The request must pin `p6-b300.48xlarge`, `AMI_ID`, private networking, no public
-IP, the dedicated instance profile, encrypted volumes, and the Capacity Block
-reservation identity. In particular, the reviewed JSON must contain these
-literal API fields; an ordinary reservation target without the market type is
-not a Capacity Block launch:
-
-```json
-{
-  "MinCount": 1,
-  "MaxCount": 1,
-  "InstanceType": "p6-b300.48xlarge",
-  "InstanceMarketOptions": {
-    "MarketType": "capacity-block"
-  },
-  "CapacityReservationSpecification": {
-    "CapacityReservationTarget": {
-      "CapacityReservationId": "REPLACE_WITH_EXACT_CAPACITY_RESERVATION_ID"
-    }
-  }
-}
-```
-
-The complete request must contain only the common closed fields enforced by
-`validate_aws_gpu_launch_request.py`, plus the two Capacity Block fields shown
-above. Set every expected identity explicitly and validate the whole request
-before either AWS call:
+The following is the complete closed construction template. It pins
+`p6-b300.48xlarge`, `AMI_ID`, one private interface with no public IP, the
+dedicated instance profile, one encrypted root volume, mandatory IMDSv2,
+instance and volume cohort tags, and both Capacity Block fields. An ordinary
+reservation target without `"MarketType": "capacity-block"` is not a Capacity
+Block launch. The constructor uses exclusive create; remove an obsolete
+operator-side file deliberately rather than replacing reviewed bytes in place.
+Validate the whole request before either AWS call:
 
 ```bash
 LAUNCH_REQUEST="$OPERATOR_ROOT/launch-request.json"
@@ -548,6 +558,78 @@ EBS_KMS_KEY_ID=arn:aws:kms:REPLACE_WITH_REGION:REPLACE_WITH_ACCOUNT:key/REPLACE_
 ROOT_DEVICE_NAME=/dev/sda1
 ROOT_VOLUME_GIB=500
 COHORT_ID=memorysplit-confirmatory-v3-360m-n10-aws
+
+python3 - "$LAUNCH_REQUEST" "$AMI_ID" \
+  "$MS_AWS_INSTANCE_PROFILE_ARN" "$PRIVATE_SUBNET_ID" \
+  "$SECURITY_GROUP_ID" "$EBS_KMS_KEY_ID" "$ROOT_DEVICE_NAME" \
+  "$ROOT_VOLUME_GIB" "$COHORT_ID" "$CAPACITY_RESERVATION_ID" <<'PY'
+import json
+import pathlib
+import sys
+
+(
+    out,
+    ami_id,
+    instance_profile_arn,
+    subnet_id,
+    security_group_id,
+    ebs_kms_key_id,
+    root_device_name,
+    root_volume_gib,
+    cohort_id,
+    capacity_reservation_id,
+) = sys.argv[1:]
+tags = [{"Key": "MemorySplitCohort", "Value": cohort_id}]
+request = {
+    "ImageId": ami_id,
+    "InstanceType": "p6-b300.48xlarge",
+    "MinCount": 1,
+    "MaxCount": 1,
+    "IamInstanceProfile": {"Arn": instance_profile_arn},
+    "NetworkInterfaces": [
+        {
+            "AssociatePublicIpAddress": False,
+            "DeleteOnTermination": True,
+            "DeviceIndex": 0,
+            "Groups": [security_group_id],
+            "SubnetId": subnet_id,
+        }
+    ],
+    "BlockDeviceMappings": [
+        {
+            "DeviceName": root_device_name,
+            "Ebs": {
+                "DeleteOnTermination": True,
+                "Encrypted": True,
+                "KmsKeyId": ebs_kms_key_id,
+                "VolumeSize": int(root_volume_gib),
+                "VolumeType": "gp3",
+            },
+        }
+    ],
+    "MetadataOptions": {
+        "HttpEndpoint": "enabled",
+        "HttpProtocolIpv6": "disabled",
+        "HttpPutResponseHopLimit": 1,
+        "HttpTokens": "required",
+        "InstanceMetadataTags": "disabled",
+    },
+    "TagSpecifications": [
+        {"ResourceType": "instance", "Tags": tags},
+        {"ResourceType": "volume", "Tags": tags},
+    ],
+    "InstanceMarketOptions": {"MarketType": "capacity-block"},
+    "CapacityReservationSpecification": {
+        "CapacityReservationTarget": {
+            "CapacityReservationId": capacity_reservation_id
+        }
+    },
+}
+with pathlib.Path(out).open("x", encoding="ascii") as destination:
+    destination.write(
+        json.dumps(request, sort_keys=True, separators=(",", ":")) + "\n"
+    )
+PY
 
 python3 scripts/validate_aws_gpu_launch_request.py \
   --request "$LAUNCH_REQUEST" \
@@ -606,6 +688,78 @@ EBS_KMS_KEY_ID=arn:aws:kms:REPLACE_WITH_REGION:REPLACE_WITH_ACCOUNT:key/REPLACE_
 ROOT_DEVICE_NAME=/dev/sda1
 ROOT_VOLUME_GIB=500
 COHORT_ID=memorysplit-confirmatory-v3-360m-n10-aws
+P5_INSTANCE_COUNT=4
+
+# Complete closed P5 construction: exact count 1-4, private network, dedicated
+# role, encrypted root, mandatory IMDSv2, and instance/volume cohort tags.
+python3 - "$LAUNCH_REQUEST" "$AMI_ID" \
+  "$MS_AWS_INSTANCE_PROFILE_ARN" "$PRIVATE_SUBNET_ID" \
+  "$SECURITY_GROUP_ID" "$EBS_KMS_KEY_ID" "$ROOT_DEVICE_NAME" \
+  "$ROOT_VOLUME_GIB" "$COHORT_ID" "$P5_INSTANCE_COUNT" <<'PY'
+import json
+import pathlib
+import sys
+
+(
+    out,
+    ami_id,
+    instance_profile_arn,
+    subnet_id,
+    security_group_id,
+    ebs_kms_key_id,
+    root_device_name,
+    root_volume_gib,
+    cohort_id,
+    count_text,
+) = sys.argv[1:]
+count = int(count_text)
+if not 1 <= count <= 4:
+    raise SystemExit("P5 instance count must be 1-4")
+tags = [{"Key": "MemorySplitCohort", "Value": cohort_id}]
+request = {
+    "ImageId": ami_id,
+    "InstanceType": "p5.48xlarge",
+    "MinCount": count,
+    "MaxCount": count,
+    "IamInstanceProfile": {"Arn": instance_profile_arn},
+    "NetworkInterfaces": [
+        {
+            "AssociatePublicIpAddress": False,
+            "DeleteOnTermination": True,
+            "DeviceIndex": 0,
+            "Groups": [security_group_id],
+            "SubnetId": subnet_id,
+        }
+    ],
+    "BlockDeviceMappings": [
+        {
+            "DeviceName": root_device_name,
+            "Ebs": {
+                "DeleteOnTermination": True,
+                "Encrypted": True,
+                "KmsKeyId": ebs_kms_key_id,
+                "VolumeSize": int(root_volume_gib),
+                "VolumeType": "gp3",
+            },
+        }
+    ],
+    "MetadataOptions": {
+        "HttpEndpoint": "enabled",
+        "HttpProtocolIpv6": "disabled",
+        "HttpPutResponseHopLimit": 1,
+        "HttpTokens": "required",
+        "InstanceMetadataTags": "disabled",
+    },
+    "TagSpecifications": [
+        {"ResourceType": "instance", "Tags": tags},
+        {"ResourceType": "volume", "Tags": tags},
+    ],
+}
+with pathlib.Path(out).open("x", encoding="ascii") as destination:
+    destination.write(
+        json.dumps(request, sort_keys=True, separators=(",", ":")) + "\n"
+    )
+PY
 
 # Closed local validation: count must be 1-4 and Capacity Block fields are
 # forbidden for the On-Demand profile.
@@ -1150,6 +1304,7 @@ CANARY_APPROVAL="$OPERATOR_ROOT/approvals/canary-${INSTANCE_ID}.json"
 # DRY RUN: verifies the release, provider selection, PKCS7 identity receipt,
 # explicit instance ID, and exact release-mounted phase argv.
 python3 -m msctl --profile "$PROFILE" --repo-root . \
+  --state-root "$OPERATOR_ROOT/state" \
   canary plan \
   --release "$RELEASE_RECEIPT" \
   --amendment configs/hardware-amendment-v3.json \
@@ -1161,6 +1316,7 @@ python3 -m msctl --profile "$PROFILE" --repo-root . \
 
 # APPLY writes the canonical plan once and refuses replacement.
 python3 -m msctl --profile "$PROFILE" --repo-root . \
+  --state-root "$OPERATOR_ROOT/state" \
   canary plan \
   --release "$RELEASE_RECEIPT" \
   --amendment configs/hardware-amendment-v3.json \
@@ -1172,14 +1328,28 @@ python3 -m msctl --profile "$PROFILE" --repo-root . \
 
 # DRY RUN: render the content-addressed SSM intent without AWS mutations.
 python3 -m msctl --profile "$PROFILE" --repo-root . \
+  --state-root "$OPERATOR_ROOT/state" \
   canary run \
   --canary-plan "$CANARY_PLAN" \
   --instance-id "$INSTANCE_ID" \
   > "$REVIEW_ROOT/canary-run-review-${INSTANCE_ID}.json"
 
-# APPLY only after reviewing and signing the exact approval_resources object,
-# instance, plan digest, and immutable argv from the dry run.
+# Sign the exact canary resources and orchestration-plan scope from the dry run.
+APPROVAL_KEY_ID=REPLACE_WITH_REVIEWER_KEY_ID
+APPROVAL_EXPIRES_AT=REPLACE_WITH_RFC3339_UTC_EXPIRY
+: "${MSCTL_APPROVAL_KEYS:?export the reviewer-controlled key map}"
+python3 scripts/sign_msctl_approval.py \
+  --dry-run-report "$REVIEW_ROOT/canary-run-review-${INSTANCE_ID}.json" \
+  --operation canary \
+  --key-id "$APPROVAL_KEY_ID" \
+  --expires-at "$APPROVAL_EXPIRES_AT" \
+  --out "$CANARY_APPROVAL" \
+  > "$REVIEW_ROOT/canary-approval-${INSTANCE_ID}.json"
+
+# APPLY only after reviewing the instance, plan digest, immutable argv, and
+# signer report.
 python3 -m msctl --profile "$PROFILE" --repo-root . \
+  --state-root "$OPERATOR_ROOT/state" \
   canary run \
   --canary-plan "$CANARY_PLAN" \
   --instance-id "$INSTANCE_ID" \
@@ -1462,54 +1632,13 @@ APPROVAL_KEY_ID=REPLACE_WITH_REVIEWER_KEY_ID
 APPROVAL_EXPIRES_AT=REPLACE_WITH_RFC3339_UTC_EXPIRY
 : "${MSCTL_APPROVAL_KEYS:?export the reviewer-controlled key map}"
 umask 077
-python3 - "$REVIEW_ROOT/submit-plan-seed-0.json" "$APPROVAL" \
-  "$APPROVAL_OPERATION" "$APPROVAL_KEY_ID" "$APPROVAL_EXPIRES_AT" <<'PY'
-import hashlib
-import hmac
-import json
-import os
-import sys
-
-from msctl.jsonutil import canonical_json
-
-plan_path, out_path, operation, key_id, expires_at = sys.argv[1:]
-with open(plan_path, "rb") as source:
-    report = json.load(source)
-resources = report["result"]["approval_resources"]
-if not isinstance(resources, dict) or resources.get("operation") != operation:
-    raise SystemExit("dry run lacks exact approval_resources")
-keys = json.loads(os.environ["MSCTL_APPROVAL_KEYS"])
-secret = keys[key_id].encode("utf-8")
-if len(secret) < 32:
-    raise SystemExit("approval key is too short")
-unsigned = {
-    "schema_version": 1,
-    "receipt_id": (
-        f"{operation}-{hashlib.sha256(canonical_json(resources)).hexdigest()}"
-    ),
-    "provider": resources["provider"],
-    "operation": operation,
-    "release_sha256": resources["release_sha256"],
-    "run_manifest_sha256": resources["run_manifest_sha256"],
-    "resources": resources,
-    "limits": {
-        "gpu_hours": resources["gpu_hours"],
-        "jobs": resources["jobs"],
-    },
-    "expires_at": expires_at,
-    "key_id": key_id,
-}
-receipt = {
-    **unsigned,
-    "signature": hmac.new(
-        secret,
-        canonical_json(unsigned),
-        hashlib.sha256,
-    ).hexdigest(),
-}
-with open(out_path, "xb") as destination:
-    destination.write(canonical_json(receipt) + b"\n")
-PY
+python3 scripts/sign_msctl_approval.py \
+  --dry-run-report "$REVIEW_ROOT/submit-plan-seed-0.json" \
+  --operation "$APPROVAL_OPERATION" \
+  --key-id "$APPROVAL_KEY_ID" \
+  --expires-at "$APPROVAL_EXPIRES_AT" \
+  --out "$APPROVAL" \
+  > "$REVIEW_ROOT/submit-approval-seed-0.json"
 
 # APPLY only after argv, ID, wave, ETA, cost, and deadline review.
 python3 -m msctl \
@@ -1529,12 +1658,14 @@ python3 -m msctl \
   --apply > "$REVIEW_ROOT/submit-result-seed-0.json"
 ```
 
-The signed `resources` value must exactly equal the dry run's
-`result.approval_resources`; `canonical_json` above defines its signed bytes.
-Do not reconstruct or edit it. Repeat the same reviewer-controlled signing flow
-for `resume`, `evaluate`, and every other apply after generating that command's
-fresh dry-run report. A changed checkpoint hash, deadline, instance, lifecycle
-receipt, sealed release, or study lock requires a new dry run and signature.
+The signer copies `result.approval_resources` without reconstruction and uses
+the operation's exact scope: run-manifest SHA-256 for lifecycle operations,
+orchestration-plan SHA-256 for canary, and fleet-plan SHA-256 for fleet
+advance. It binds the release SHA-256 at the approval envelope's top level.
+Repeat the same reviewer-controlled signing flow for `resume`, `evaluate`, and
+every apply after generating that command's fresh dry-run report. A changed
+checkpoint hash, deadline, instance, lifecycle receipt, sealed release, study
+lock, canary plan, or fleet transition requires a new dry run and signature.
 
 Poll with `status --cached` first, then the read-only authoritative status
 path. Verify both arms advance together. The trainer’s `ckpt_minutes: 30`
@@ -1559,6 +1690,30 @@ stabilized checkpoint pair; it has no terminal run bindings or checkpoint
 records and is valid for `resume`, never for training-wave advance or
 evaluation. Local NVMe is scratch; do not stop or terminate until the relevant
 paired receipt and all receipt-listed objects are durably verified.
+
+The complete cached and authoritative status invocations are:
+
+```bash
+STATUS_ARGS=(
+  --release "$RELEASE_RECEIPT"
+  --manifest "$MANIFEST"
+  --hardware-amendment configs/hardware-amendment-v3.json
+  --provider-selection "$SELECTION"
+  --fleet-plan "$FLEET_PLAN"
+)
+python3 -m msctl \
+  --profile "$PROFILE" \
+  --repo-root . \
+  --state-root "$OPERATOR_ROOT/state" \
+  status "${STATUS_ARGS[@]}" --cached \
+  > "$REVIEW_ROOT/status-cached-seed-${SEED}.json"
+python3 -m msctl \
+  --profile "$PROFILE" \
+  --repo-root . \
+  --state-root "$OPERATOR_ROOT/state" \
+  status "${STATUS_ARGS[@]}" \
+  > "$REVIEW_ROOT/status-authoritative-seed-${SEED}.json"
+```
 
 There is no prelaunch evaluator or checkpoint-hash binding. At terminal
 completion the publisher derives `model_id` and raw token count from the
@@ -1793,6 +1948,16 @@ python3 -m msctl \
   --checkpoint-receipt "$CHECKPOINT_RECEIPT" \
   --approval "$ADVANCE_APPROVAL" \
   > "$REVIEW_ROOT/fleet-advance-plan-seed-${CURRENT_SEED}-to-${NEXT_SEED}.json"
+
+# Sign the exact zero-GPU transition resources, top-level release SHA-256, and
+# fleet-plan scope emitted by the dry run.
+python3 scripts/sign_msctl_approval.py \
+  --dry-run-report "$REVIEW_ROOT/fleet-advance-plan-seed-${CURRENT_SEED}-to-${NEXT_SEED}.json" \
+  --operation fleet-advance \
+  --key-id "$APPROVAL_KEY_ID" \
+  --expires-at "$APPROVAL_EXPIRES_AT" \
+  --out "$ADVANCE_APPROVAL" \
+  > "$REVIEW_ROOT/fleet-advance-approval-seed-${CURRENT_SEED}-to-${NEXT_SEED}.json"
 
 # APPLY only with signed approval for these exact resources.
 python3 -m msctl \

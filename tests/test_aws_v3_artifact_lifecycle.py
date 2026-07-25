@@ -5,6 +5,7 @@ import hashlib
 import json
 import shutil
 from contextlib import nullcontext
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -86,11 +87,23 @@ class _MemoryAwsRunner:
     def __init__(self, objects: dict[str, bytes]) -> None:
         self.objects = objects
         self.calls: list[tuple[str, ...]] = []
+        self.selected_instances: dict[str, dict[str, object]] = {}
 
     def run_json(self, argv, *, operation):
         del operation
         exact = tuple(argv)
         self.calls.append(exact)
+        if "describe-instances" in exact:
+            instance_id = exact[exact.index("--instance-ids") + 1]
+            return {"instances": [dict(self.selected_instances[instance_id])]}
+        if "describe-instance-attribute" in exact:
+            instance_id = exact[exact.index("--instance-id") + 1]
+            return {
+                "attribute": {
+                    "instance_id": instance_id,
+                    "shutdown_behavior": "terminate",
+                }
+            }
         if "get-object" not in exact:
             pytest.fail(f"unexpected AWS operation: {exact}")
         bucket = exact[exact.index("--bucket") + 1]
@@ -517,6 +530,7 @@ def test_mocked_v3_terminal_evaluate_collect_advance_lifecycle(
     )
     assert advanced["from_seed"] == manifest.seed
     assert advanced["to_seed"] == target.seed
+    assert advanced["release_sha256"] == fleet_plan.release_sha256
     assert advanced["resources"]["checkpoint_receipt_sha256"] == (
         terminal.receipt_sha256
     )
@@ -574,6 +588,7 @@ def test_mocked_v3_terminal_evaluate_collect_advance_lifecycle(
 def test_mocked_all_v3_waves_finalize_then_evaluate_and_collect(
     tmp_path,
     instance_count,
+    monkeypatch,
 ):
     from evals.confirmatory.contracts import canonical_json_bytes
     from evals.confirmatory.fixtures import positive_fixture
@@ -828,7 +843,17 @@ def test_mocked_all_v3_waves_finalize_then_evaluate_and_collect(
         members_sha256="a" * 64,
         source_commit=first_manifest.source_commit,
     )
-    collected_seeds = []
+    terminate_at = (
+        datetime.now(UTC) + timedelta(hours=23)
+    ).isoformat(timespec="seconds").replace("+00:00", "Z")
+    evidence = {
+        "dataset_pointer_sha256": "5" * 64,
+        "dataset_verification_sha256": "6" * 64,
+        "environment_receipt_sha256": "7" * 64,
+    }
+    contexts: dict[int, V3LifecycleContext] = {}
+    checkpoints: dict[int, object] = {}
+    state_pairs: dict[int, list[dict[str, object]]] = {}
     for manifest_path in manifest_paths:
         manifest = load_run_manifest(manifest_path, repo_root=ROOT)
         binding = plan.binding_for_seed(manifest.seed)
@@ -847,17 +872,12 @@ def test_mocked_all_v3_waves_finalize_then_evaluate_and_collect(
             readiness=readiness,
             sealed_evaluation=finalized,
         )
-        terminate_at = "2097-12-31T23:00:00Z"
         submit_core = backend._training_operation_intent(
             operation="submit",
             release=release,
             manifest=manifest,
             terminate_at=terminate_at,
-            evidence={
-                "dataset_pointer_sha256": "5" * 64,
-                "dataset_verification_sha256": "6" * 64,
-                "environment_receipt_sha256": "7" * 64,
-            },
+            evidence=evidence,
             context=context,
         )
         submit_intent = backend._operation_envelope(
@@ -890,22 +910,82 @@ def test_mocked_all_v3_waves_finalize_then_evaluate_and_collect(
             state["command_id"] = f"training-command-{manifest.seed:08d}"
             state["status"] = "Success"
             state["send_attempted"] = True
-        from msctl.state import StateStore
+        contexts[manifest.seed] = context
+        checkpoints[manifest.seed] = checkpoint
+        state_pairs[manifest.seed] = persisted
 
-        store = StateStore(backend.state_root)
-        with store.locked():
-            backend._write_paired_states(store, manifest, persisted, context)
+    from msctl.state import StateStore
+
+    store = StateStore(backend.state_root)
+    with store.locked():
+        for manifest_path in manifest_paths:
+            manifest = load_run_manifest(manifest_path, repo_root=ROOT)
+            backend._write_paired_states(
+                store,
+                manifest,
+                state_pairs[manifest.seed],
+                contexts[manifest.seed],
+            )
+        for fleet_instance in plan.instances:
+            current_seed = fleet_instance.seeds[-1]
+            current = load_run_manifest(
+                manifest_paths[current_seed],
+                repo_root=ROOT,
+            )
+            current_tags = backend._fleet_state_tag_binding(
+                current,
+                state_pairs[current_seed][0],
+            )
+            runner.selected_instances[fleet_instance.instance_id] = {
+                **current_tags,
+                "instance_id": fleet_instance.instance_id,
+                "instance_type": profile.instance_type,
+                "state": "running",
+                "instance_profile_arn": backend.instance_profile_arn,
+                "ami_id": runtime.ami_id,
+            }
+
+    def publish_intent(intent):
+        digest = _digest(canonical_json(intent))
+        return {
+            "intent_sha256": digest,
+            "intent_uri": (
+                f"{runtime.s3_root}/operations/intents/sha256/{digest}.json"
+            ),
+            "version_id": "intent-version-1",
+        }
+
+    monkeypatch.setattr(backend, "approval_verifier", lambda **_: {})
+    monkeypatch.setattr(backend, "_command_status", lambda *_: "Success")
+    monkeypatch.setattr(backend, "_require_ssm_online", lambda *_: None)
+    monkeypatch.setattr(backend, "_ensure_argv_document", lambda: None)
+    monkeypatch.setattr(
+        backend,
+        "_publish_control_bundle",
+        lambda: {"version_id": "control-version-1"},
+    )
+    monkeypatch.setattr(backend, "_publish_operation_intent", publish_intent)
+    monkeypatch.setattr(
+        backend,
+        "_send_operation_intent",
+        lambda **values: (
+            f"evaluation-command-{int(values['intent']['seed']):08d}"
+        ),
+    )
+
+    collected_seeds = []
+    for manifest_path in manifest_paths:
+        manifest = load_run_manifest(manifest_path, repo_root=ROOT)
+        binding = plan.binding_for_seed(manifest.seed)
+        checkpoint = checkpoints[manifest.seed]
+        context = contexts[manifest.seed]
 
         evaluation_plan = backend.evaluate(
             release=release,
             manifest=manifest,
             approval_path=None,
             apply=False,
-            evidence={
-                "dataset_pointer_sha256": "5" * 64,
-                "dataset_verification_sha256": "6" * 64,
-                "environment_receipt_sha256": "7" * 64,
-            },
+            evidence=evidence,
             context=context,
             checkpoint_receipt=checkpoint,
         )
@@ -930,6 +1010,24 @@ def test_mocked_all_v3_waves_finalize_then_evaluate_and_collect(
             and "run-instances" not in step["argv"]
             for step in terminal_steps
         )
+        evaluation_apply = backend.evaluate(
+            release=release,
+            manifest=manifest,
+            approval_path=tmp_path / "approval.json",
+            apply=True,
+            evidence=evidence,
+            context=context,
+            checkpoint_receipt=checkpoint,
+        )
+        assert evaluation_apply == {
+            "provider": profile.provider,
+            "seed": manifest.seed,
+            "instance_id": binding.instance_id,
+            "command_id": f"evaluation-command-{manifest.seed:08d}",
+            "status": "Pending",
+            "submitted": 1,
+            "idempotent": False,
+        }
 
         evaluation_root = tmp_path / "evaluations" / f"seed-{manifest.seed}"
         for run in manifest.runs:
@@ -1005,12 +1103,13 @@ def test_evaluation_uses_historical_advance_after_training_tags_are_removed(
 
     profile, selection, manifest_paths = _manifests(tmp_path)
     instance_id = "i-0123456789abcdef0"
+    other_instance_id = "i-1123456789abcdef0"
     plan = validate_fleet_plan(
         create_fleet_plan(
             profile=profile,
             selection=selection,
             manifest_paths=manifest_paths,
-            instance_ids=[instance_id],
+            instance_ids=[instance_id, other_instance_id],
             repo_root=ROOT,
         ),
         profile=profile,
@@ -1038,7 +1137,7 @@ def test_evaluation_uses_historical_advance_after_training_tags_are_removed(
     runner = Runner()
     backend = _backend(profile, selection, tmp_path, runner)
     manifest = load_run_manifest(manifest_paths[0], repo_root=ROOT)
-    target = load_run_manifest(manifest_paths[1], repo_root=ROOT)
+    target = load_run_manifest(manifest_paths[2], repo_root=ROOT)
     source_binding, target_binding = fleet_transition_for_target(
         plan,
         instance_id=instance_id,
@@ -1058,32 +1157,33 @@ def test_evaluation_uses_historical_advance_after_training_tags_are_removed(
             advanced_at="2026-07-24T02:00:00Z",
         ),
     )
+    amendment = load_hardware_amendment(AMENDMENT)
+    readiness = LaunchReadiness(
+        profile_id=profile.profile_id,
+        sha256="8" * 64,
+        bindings={
+            "release_sha256": manifest.release_sha256,
+            "provider_selection_sha256": selection.sha256,
+            "hardware_amendment_sha256": manifest.hardware_amendment_sha256,
+            "sealed_fixture_sha256": manifest.sealed_fixture_sha256,
+            "environment_receipt_sha256": "7" * 64,
+        },
+        decision={"protected_launch_allowed": True},
+        path=None,
+        value={},
+    )
+    sealed_fixture = SealedEvaluationFixture(
+        root=tmp_path / "sealed-fixture",
+        sha256=manifest.sealed_fixture_sha256,
+        members={},
+    )
     context = V3LifecycleContext(
-        amendment=load_hardware_amendment(AMENDMENT),
+        amendment=amendment,
         selection=selection,
         fleet_plan=plan,
         fleet_binding=source_binding,
-        readiness=LaunchReadiness(
-            profile_id=profile.profile_id,
-            sha256="8" * 64,
-            bindings={
-                "release_sha256": manifest.release_sha256,
-                "provider_selection_sha256": selection.sha256,
-                "hardware_amendment_sha256": (
-                    manifest.hardware_amendment_sha256
-                ),
-                "sealed_fixture_sha256": manifest.sealed_fixture_sha256,
-                "environment_receipt_sha256": "7" * 64,
-            },
-            decision={"protected_launch_allowed": True},
-            path=None,
-            value={},
-        ),
-        sealed_fixture=SealedEvaluationFixture(
-            root=tmp_path / "sealed-fixture",
-            sha256=manifest.sealed_fixture_sha256,
-            members={},
-        ),
+        readiness=readiness,
+        sealed_fixture=sealed_fixture,
     )
     terminate_at = "2026-07-25T00:00:00Z"
     runner.row = {
@@ -1147,6 +1247,129 @@ def test_evaluation_uses_historical_advance_after_training_tags_are_removed(
         context=context,
     )
     assert validated["instance_id"] == instance_id
+
+    target_context = V3LifecycleContext(
+        amendment=amendment,
+        selection=selection,
+        fleet_plan=plan,
+        fleet_binding=target_binding,
+        readiness=readiness,
+        sealed_fixture=sealed_fixture,
+    )
+    release = SimpleNamespace(
+        provider=profile.provider,
+        archive_sha256=manifest.release_sha256,
+        receipt_sha256="9" * 64,
+        members_sha256="a" * 64,
+        source_commit=manifest.source_commit,
+    )
+    target_core = backend._training_operation_intent(
+        operation="submit",
+        release=release,
+        manifest=target,
+        terminate_at=terminate_at,
+        evidence={
+            "dataset_pointer_sha256": "5" * 64,
+            "dataset_verification_sha256": "6" * 64,
+            "environment_receipt_sha256": "7" * 64,
+        },
+        context=target_context,
+    )
+    target_intent = backend._operation_envelope(
+        target_core,
+        instance_id=instance_id,
+        terminate_at=terminate_at,
+    )
+    target_intent_sha256 = _digest(canonical_json(target_intent))
+    target_states = [
+        backend._new_aws_run_state(
+            run=run,
+            manifest=target,
+            operation="submit",
+            instance_id=instance_id,
+            terminate_at=terminate_at,
+            intent=target_intent,
+            published={
+                "intent_sha256": target_intent_sha256,
+                "intent_uri": (
+                    f"{backend.runtime.s3_root}/operations/intents/sha256/"
+                    f"{target_intent_sha256}.json"
+                ),
+            },
+            attempt=1,
+            context=target_context,
+        )
+        for run in target.runs
+    ]
+    from msctl.state import StateStore
+
+    store = StateStore(backend.state_root)
+    with store.locked():
+        backend._write_paired_states(
+            store,
+            target,
+            target_states,
+            target_context,
+        )
+    current_tags = backend._fleet_state_tag_binding(
+        target,
+        target_states[0],
+    )
+
+    def selected_with_tags(tags):
+        return {
+            **tags,
+            "instance_id": instance_id,
+            "instance_type": profile.instance_type,
+            "state": "running",
+            "instance_profile_arn": backend.instance_profile_arn,
+            "ami_id": selection.ami_id,
+        }
+
+    runner.row = selected_with_tags(current_tags)
+    current = backend._validate_evaluation_instance_binding(
+        manifest,
+        instance_id=instance_id,
+        terminate_at=terminate_at,
+        checkpoint_receipt_sha256="4" * 64,
+        context=context,
+    )
+    assert current["seed"] == target.seed
+
+    other = load_run_manifest(manifest_paths[1], repo_root=ROOT)
+    other_context = V3LifecycleContext(
+        amendment=amendment,
+        selection=selection,
+        fleet_plan=plan,
+        fleet_binding=plan.binding_for_seed(other.seed),
+        readiness=readiness,
+        sealed_fixture=sealed_fixture,
+    )
+    rejected_bindings = {
+        "earlier": backend._selected_binding(
+            manifest,
+            terminate_at=terminate_at,
+            context=context,
+        ),
+        "other-instance": backend._selected_binding(
+            other,
+            terminate_at=terminate_at,
+            context=other_context,
+        ),
+    }
+    for label, tags in rejected_bindings.items():
+        runner.row = selected_with_tags(tags)
+        with pytest.raises(Exception) as rejected:
+            backend._validate_evaluation_instance_binding(
+                manifest,
+                instance_id=instance_id,
+                terminate_at=terminate_at,
+                checkpoint_receipt_sha256="4" * 64,
+                context=context,
+            )
+        assert getattr(rejected.value, "code", None) == (
+            "INSTANCE_BINDING_MISMATCH"
+        ), label
 
 
 def test_multi_instance_wave_gate_requires_every_parallel_advance(tmp_path):

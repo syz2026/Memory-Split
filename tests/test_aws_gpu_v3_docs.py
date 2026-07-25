@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import re
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -120,12 +121,42 @@ def test_operator_docs_cover_closed_profiles_and_complete_lifecycle() -> None:
         and "/mnt/memorysplit/dataset/receipt.json" in text
     )
     assert '--container-image "$MS_CONTAINER_IMAGE"' in text
+    prohibited_block = text.split(
+        "PROHIBITED_AMBIENT_AWS_VARS=(",
+        1,
+    )[1].split("\n)", 1)[0]
+    prohibited_names = {
+        line.strip()
+        for line in prohibited_block.splitlines()
+        if line.strip()
+    }
+    assert prohibited_names == {
+        "AWS_ACCESS_KEY_ID",
+        "AWS_CONFIG_FILE",
+        "AWS_CONTAINER_CREDENTIALS_FULL_URI",
+        "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
+        "AWS_DEFAULT_PROFILE",
+        "AWS_EC2_METADATA_DISABLED",
+        "AWS_PROFILE",
+        "AWS_ROLE_ARN",
+        "AWS_ROLE_SESSION_NAME",
+        "AWS_SECRET_ACCESS_KEY",
+        "AWS_SECURITY_TOKEN",
+        "AWS_SESSION_TOKEN",
+        "AWS_SHARED_CREDENTIALS_FILE",
+        "AWS_WEB_IDENTITY_TOKEN_FILE",
+    }
     for static_key_name in (
         "AWS_ACCESS_KEY_ID",
         "AWS_SECRET_ACCESS_KEY",
         "AWS_SESSION_TOKEN",
     ):
-        assert static_key_name not in text
+        assert static_key_name in prohibited_block
+        assert f"export {static_key_name}" not in text
+    assert 'unset "$name"' in text
+    assert text.count("scripts/sign_msctl_approval.py") >= 3
+    assert text.count('--state-root "$OPERATOR_ROOT/state"') >= 8
+    assert 'status "${STATUS_ARGS[@]}" --cached' in text
     assert ":latest" not in text
 
 
@@ -333,6 +364,79 @@ def test_documented_bootstrap_paths_and_capacity_response_shapes_match_parsers(
         extract_capacity_reservation_id(purchase_path)
         == "cr-0123456789abcdef0"
     )
+
+
+@pytest.mark.parametrize(
+    ("profile_name", "instance_type", "count", "capacity_reservation_id"),
+    [
+        ("aws-p5.48xlarge-v3.json", "p5.48xlarge", 4, None),
+        (
+            "aws-p6-b300.48xlarge-v3.json",
+            "p6-b300.48xlarge",
+            1,
+            "cr-0123456789abcdef0",
+        ),
+    ],
+)
+def test_documented_launch_constructors_match_closed_validator(
+    tmp_path,
+    profile_name,
+    instance_type,
+    count,
+    capacity_reservation_id,
+) -> None:
+    from scripts.validate_aws_gpu_launch_request import validate_launch_request
+
+    runbook = RUNBOOK.read_text(encoding="utf-8")
+    python_blocks = [
+        fragment.split("\nPY", 1)[0]
+        for fragment in runbook.split("<<'PY'\n")[1:]
+    ]
+    constructor = next(
+        block
+        for block in python_blocks
+        if f'"InstanceType": "{instance_type}"' in block
+        and '"TagSpecifications"' in block
+    )
+    request = tmp_path / f"{instance_type}.json"
+    arguments = [
+        str(request),
+        "ami-0123456789abcdef0",
+        "arn:aws:iam::123456789012:instance-profile/memorysplit-gpu",
+        "subnet-0123456789abcdef0",
+        "sg-0123456789abcdef0",
+        (
+            "arn:aws:kms:us-east-1:123456789012:"
+            "key/12345678-1234-4234-9234-123456789abc"
+        ),
+        "/dev/sda1",
+        "500",
+        "memorysplit-confirmatory-v3-360m-n10-aws",
+        capacity_reservation_id or str(count),
+    ]
+    completed = subprocess.run(
+        [sys.executable, "-", *arguments],
+        input=constructor,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stderr
+    report = validate_launch_request(
+        request,
+        profile_path=REPO_ROOT / "cluster" / "profiles" / profile_name,
+        region="us-east-1",
+        ami_id=arguments[1],
+        instance_profile_arn=arguments[2],
+        subnet_id=arguments[3],
+        security_group_ids=[arguments[4]],
+        ebs_kms_key_id=arguments[5],
+        root_device_name=arguments[6],
+        root_volume_gib=int(arguments[7]),
+        cohort_id=arguments[8],
+        capacity_reservation_id=capacity_reservation_id,
+    )
+    assert report["count"] == count
 
 
 def test_paid_and_mutating_runbook_steps_are_reviewed_before_apply() -> None:
