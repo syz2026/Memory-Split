@@ -219,19 +219,26 @@ def _exact_package_revision(s3: object, package: S3ObjectVersion) -> str:
         ),
         label="exact package metadata response",
     )
-    metadata = _mapping(
-        response.get("Metadata"),
-        label="exact package metadata",
-    )
+    raw_metadata = response.get("Metadata")
+    if not isinstance(raw_metadata, Mapping):
+        raise ValueError(
+            'exact package object Metadata["revision"] is required '
+            "and must be immutable"
+        )
+    metadata = raw_metadata
     revision = metadata.get("revision")
     if (
         response.get("VersionId") != package.version_id
         or metadata.get("sha256") != package.sha256
-        or not isinstance(revision, str)
+    ):
+        raise ValueError("exact package object metadata authority drift")
+    if (
+        not isinstance(revision, str)
         or _OBJECT_ID_RE.fullmatch(revision) is None
     ):
         raise ValueError(
-            "exact package object does not bind its immutable revision"
+            'exact package object Metadata["revision"] is required '
+            "and must be immutable"
         )
     return revision
 
@@ -1066,9 +1073,14 @@ def _run_gate(
     return result
 
 
-def validate_local_request(request: PreflightRequest) -> None:
+def validate_local_request(
+    request: PreflightRequest,
+    *,
+    now: datetime,
+) -> None:
     """Validate every preflight authority that requires no AWS client."""
 
+    _validate_now(now)
     checks: list[str] = []
     _run_gate(
         checks,

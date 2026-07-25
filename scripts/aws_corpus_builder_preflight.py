@@ -112,23 +112,30 @@ def _write_all(descriptor: int, payload: bytes) -> None:
         written += count
 
 
-def _unlink_if_identity(
+def _unlink_owned_name(
     parent_descriptor: int,
     name: str,
     identity: tuple[int, int] | None,
 ) -> None:
-    if identity is None:
-        return
     try:
         named = os.stat(
             name,
             dir_fd=parent_descriptor,
             follow_symlinks=False,
         )
-        if (named.st_dev, named.st_ino) == identity:
-            os.unlink(name, dir_fd=parent_descriptor)
+    except FileNotFoundError:
+        return
     except OSError:
-        pass
+        named = None
+    if (
+        identity is not None
+        and named is not None
+        and (named.st_dev, named.st_ino) != identity
+    ):
+        raise PreflightError(
+            f"launch intent cleanup refused changed inode: {name}"
+        )
+    os.unlink(name, dir_fd=parent_descriptor)
 
 
 def _write_intent(path: Path, payload: bytes) -> None:
@@ -154,7 +161,8 @@ def _write_intent(path: Path, payload: bytes) -> None:
     descriptor = -1
     temporary_name: str | None = None
     temporary_identity: tuple[int, int] | None = None
-    published = False
+    temporary_exists = False
+    published_exists = False
     success = False
     try:
         parent_descriptor = os.open(output.parent, parent_flags)
@@ -178,6 +186,7 @@ def _write_intent(path: Path, payload: bytes) -> None:
             0o600,
             dir_fd=parent_descriptor,
         )
+        temporary_exists = True
         opened = os.fstat(descriptor)
         temporary_identity = (opened.st_dev, opened.st_ino)
         _write_all(descriptor, payload)
@@ -201,22 +210,20 @@ def _write_intent(path: Path, payload: bytes) -> None:
         descriptor = -1
         os.close(descriptor_to_close)
         try:
-            os.stat(
+            os.link(
+                temporary_name,
                 output.name,
-                dir_fd=parent_descriptor,
+                src_dir_fd=parent_descriptor,
+                dst_dir_fd=parent_descriptor,
                 follow_symlinks=False,
             )
-        except FileNotFoundError:
-            pass
-        else:
-            raise PreflightError("launch intent output already exists")
-        os.rename(
-            temporary_name,
-            output.name,
-            src_dir_fd=parent_descriptor,
-            dst_dir_fd=parent_descriptor,
-        )
-        published = True
+        except FileExistsError as error:
+            raise PreflightError(
+                "launch intent output already exists"
+            ) from error
+        published_exists = True
+        os.unlink(temporary_name, dir_fd=parent_descriptor)
+        temporary_exists = False
         final = os.stat(
             output.name,
             dir_fd=parent_descriptor,
@@ -236,24 +243,44 @@ def _write_intent(path: Path, payload: bytes) -> None:
     except OSError as error:
         raise PreflightError("cannot emit launch intent securely") from error
     finally:
+        primary_error = sys.exception()
+        cleanup_errors: list[tuple[str, BaseException]] = []
         if descriptor >= 0:
             try:
                 os.close(descriptor)
-            except OSError:
-                pass
+            except OSError as error:
+                cleanup_errors.append(("descriptor close", error))
         if parent_descriptor >= 0:
             if not success:
-                cleanup_name = output.name if published else temporary_name
-                if cleanup_name is not None:
-                    _unlink_if_identity(
-                        parent_descriptor,
-                        cleanup_name,
-                        temporary_identity,
-                    )
+                cleanup_targets = (
+                    (output.name, published_exists),
+                    (temporary_name, temporary_exists),
+                )
+                for cleanup_name, exists in cleanup_targets:
+                    if cleanup_name is None or not exists:
+                        continue
+                    try:
+                        _unlink_owned_name(
+                            parent_descriptor,
+                            cleanup_name,
+                            temporary_identity,
+                        )
+                    except BaseException as error:
+                        cleanup_errors.append(("unlink", error))
             try:
                 os.close(parent_descriptor)
-            except OSError:
-                pass
+            except OSError as error:
+                cleanup_errors.append(("parent close", error))
+        if cleanup_errors:
+            notes = [
+                f"launch intent cleanup {action} failed: {error}"
+                for action, error in cleanup_errors
+            ]
+            if primary_error is not None:
+                for note in notes:
+                    primary_error.add_note(note)
+            else:
+                raise PreflightError("; ".join(notes)) from cleanup_errors[0][1]
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -308,7 +335,7 @@ def main(
         ami_id=arguments.ami_id,
         ami_owner_id=arguments.ami_owner_id,
     )
-    validate_local_request(request)
+    validate_local_request(request, now=current_time)
     if aws is not None:
         if arguments.live:
             raise PreflightError(

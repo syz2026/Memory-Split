@@ -778,6 +778,19 @@ def test_preflight_rejects_manifest_forged_for_an_unrelated_revision(tmp_path):
     assert fake.ec2.run_instances_calls == []
 
 
+def test_missing_package_revision_names_required_s3_metadata_key(tmp_path):
+    fake = FakeAws()
+    fake.package_revision = ""
+
+    with pytest.raises(
+        PreflightError,
+        match=r'Metadata\["revision"\]',
+    ):
+        run_preflight(_request(tmp_path, fake), aws=fake.clients(), now=NOW)
+
+    assert fake.ec2.run_instances_calls == []
+
+
 def test_intent_uses_the_validated_stack_output_snapshot(tmp_path):
     fake = FakeAws()
     request = _request(tmp_path, fake)
@@ -1144,6 +1157,40 @@ def test_cli_explicit_live_opt_in_uses_only_the_patched_client_factory(
     assert intent_path.is_file()
 
 
+def test_cli_invalid_clock_fails_before_live_client_construction(
+    tmp_path,
+    monkeypatch,
+):
+    fake = FakeAws()
+    request = _request(tmp_path, fake)
+    arguments, intent_path, _paths = _cli_arguments(
+        tmp_path,
+        fake,
+        request,
+        live=True,
+    )
+    constructed = []
+
+    def fake_live_clients(**kwargs):
+        constructed.append(kwargs)
+        return fake.clients()
+
+    monkeypatch.setattr(
+        aws_corpus_builder_preflight,
+        "_live_clients",
+        fake_live_clients,
+    )
+
+    with pytest.raises(PreflightError, match="UTC"):
+        aws_corpus_builder_preflight.main(
+            arguments,
+            now=datetime(2026, 7, 25, 4, 0, 0),
+        )
+
+    assert constructed == []
+    assert not intent_path.exists()
+
+
 def test_atomic_intent_stays_unpublished_until_temporary_is_fsynced(
     tmp_path,
     monkeypatch,
@@ -1170,6 +1217,109 @@ def test_atomic_intent_stays_unpublished_until_temporary_is_fsynced(
     assert visible_during_fsync == [False]
     assert not intent_path.exists()
     assert list(tmp_path.iterdir()) == []
+
+
+def test_atomic_intent_publish_never_replaces_a_racing_destination(
+    tmp_path,
+    monkeypatch,
+):
+    intent_path = tmp_path / "launch-intent.json"
+    racing_payload = b'{"racing":"winner"}\n'
+    real_link = aws_corpus_builder_preflight.os.link
+
+    def race_before_link(source, destination, **kwargs):
+        intent_path.write_bytes(racing_payload)
+        return real_link(source, destination, **kwargs)
+
+    monkeypatch.setattr(
+        aws_corpus_builder_preflight.os,
+        "link",
+        race_before_link,
+    )
+
+    with pytest.raises(PreflightError, match="emit|exists"):
+        aws_corpus_builder_preflight._write_intent(
+            intent_path,
+            b'{"complete":true}\n',
+        )
+
+    assert intent_path.read_bytes() == racing_payload
+    assert list(tmp_path.iterdir()) == [intent_path]
+
+
+def test_initial_temporary_fstat_failure_still_cleans_created_file(
+    tmp_path,
+    monkeypatch,
+):
+    intent_path = tmp_path / "launch-intent.json"
+    real_fstat = aws_corpus_builder_preflight.os.fstat
+    calls = 0
+
+    def fail_first_fstat(descriptor):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise OSError("simulated initial fstat failure")
+        return real_fstat(descriptor)
+
+    monkeypatch.setattr(
+        aws_corpus_builder_preflight.os,
+        "fstat",
+        fail_first_fstat,
+    )
+
+    with pytest.raises(PreflightError, match="emit"):
+        aws_corpus_builder_preflight._write_intent(
+            intent_path,
+            b'{"complete":true}\n',
+        )
+
+    assert not intent_path.exists()
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_cleanup_unlink_failure_is_reported_without_hiding_primary_error(
+    tmp_path,
+    monkeypatch,
+):
+    intent_path = tmp_path / "launch-intent.json"
+    real_unlink = aws_corpus_builder_preflight.os.unlink
+
+    def fail_write(_descriptor, _payload):
+        raise PreflightError("simulated primary write failure")
+
+    def fail_unlink(*_args, **_kwargs):
+        raise PermissionError("simulated cleanup unlink failure")
+
+    monkeypatch.setattr(
+        aws_corpus_builder_preflight,
+        "_write_all",
+        fail_write,
+    )
+    monkeypatch.setattr(
+        aws_corpus_builder_preflight.os,
+        "unlink",
+        fail_unlink,
+    )
+
+    with pytest.raises(
+        PreflightError,
+        match="simulated primary write failure",
+    ) as caught:
+        aws_corpus_builder_preflight._write_intent(
+            intent_path,
+            b'{"complete":true}\n',
+        )
+
+    notes = getattr(caught.value, "__notes__", ())
+    assert any("cleanup unlink failed" in note for note in notes)
+    monkeypatch.setattr(
+        aws_corpus_builder_preflight.os,
+        "unlink",
+        real_unlink,
+    )
+    for leftover in tmp_path.iterdir():
+        leftover.unlink()
 
 
 def test_interrupted_write_leaves_no_intent_or_temporary_file(
