@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import gzip
 import os
 import subprocess
 from dataclasses import replace
@@ -70,6 +71,44 @@ def fixture_config() -> BootstrapConfig:
         launch_intent_sha256=_LAUNCH_INTENT_SHA256,
         workers=32,
     )
+
+
+def alternate_config() -> BootstrapConfig:
+    build_id = "f" * 64
+    config = fixture_config()
+    return replace(
+        config,
+        build_id=build_id,
+        package=replace(
+            config.package,
+            uri=(
+                f"s3://{CORPUS_BUCKET}/v2/builds/{build_id}/"
+                "bootstrap/other-package.tar.gz"
+            ),
+            version_id="other-package-version",
+            sha256="1" * 64,
+        ),
+        source_manifest=replace(
+            config.source_manifest,
+            uri=(
+                f"s3://{CORPUS_BUCKET}/v2/builds/{build_id}/"
+                "bootstrap/other-source-manifest.json"
+            ),
+            version_id="other-manifest-version",
+            sha256="2" * 64,
+        ),
+        profile_sha256="3" * 64,
+        launch_intent_sha256="4" * 64,
+        workers=64,
+    )
+
+
+def _builder_entrypoint_source(text: str) -> str:
+    marker = "<<'BUILDER_ENTRYPOINT'\n"
+    assert text.count(marker) == 1
+    source = text.split(marker, 1)[1].split("\nBUILDER_ENTRYPOINT", 1)[0]
+    compile(source, "memorysplit-corpus-builder", "exec")
+    return source
 
 
 def _write_stub(path: Path, body: str) -> None:
@@ -281,30 +320,128 @@ def test_watchdog_initiates_shutdown_before_timed_out_marker_upload(
     assert watchdog_calls[-1] == "shutdown -h now"
 
 
-def test_rendered_bootstrap_pins_every_input_authority_without_mutable_reads():
-    config = fixture_config()
-    text = render_bootstrap(config)
+def test_rendered_bootstrap_is_build_invariant_and_contains_no_build_values():
+    first_config = fixture_config()
+    second_config = alternate_config()
+    first = render_bootstrap(first_config)
+    second = render_bootstrap(second_config)
 
-    for expected in (
-        config.build_id,
-        config.package.uri,
-        config.package.version_id,
-        config.package.sha256,
-        str(config.package.bytes),
-        config.package.etag,
-        config.source_manifest.uri,
-        config.source_manifest.version_id,
-        config.source_manifest.sha256,
-        config.profile_sha256,
-        config.launch_intent_sha256,
-        config.kms_key_arn,
-    ):
-        assert expected in text
-    assert "download_exact_object" in text
-    assert "VersionId" in text
-    assert "aws s3 cp" not in text
-    assert "git clone" not in text
-    assert "git checkout" not in text
+    assert first == second
+    assert first == render_bootstrap()
+    for config in (first_config, second_config):
+        for forbidden in (
+            config.build_id,
+            config.package.uri,
+            config.package.version_id,
+            config.package.sha256,
+            config.source_manifest.uri,
+            config.source_manifest.version_id,
+            config.source_manifest.sha256,
+            config.profile_sha256,
+            config.launch_intent_sha256,
+            config.kms_key_arn,
+        ):
+            assert forbidden not in first
+    assert "/usr/local/bin/memorysplit-corpus-builder" in first
+    assert "--build-id" in first
+    assert "--package-uri" in first
+    assert "--source-manifest-uri" in first
+    assert "aws s3 cp" not in first
+    assert "git clone" not in first
+    assert "git checkout" not in first
+
+
+def test_invariant_bootstrap_gzip_fits_ec2_user_data_limit():
+    payload = gzip.compress(
+        render_bootstrap(fixture_config()).encode("utf-8"),
+        compresslevel=9,
+        mtime=0,
+    )
+
+    assert len(payload) <= 16_384
+
+
+def test_fixed_entrypoint_resolves_one_immutable_version_before_download():
+    source = _builder_entrypoint_source(render_bootstrap(fixture_config()))
+    namespace: dict[str, object] = {"__name__": "memorysplit_entrypoint_test"}
+    exec(compile(source, "memorysplit-corpus-builder", "exec"), namespace)
+    calls: list[list[str]] = []
+    sha256 = "a" * 64
+
+    def fake_aws(arguments: list[str]) -> dict[str, object]:
+        calls.append(arguments)
+        if arguments[0] == "list-object-versions":
+            return {
+                "DeleteMarkers": [],
+                "IsTruncated": False,
+                "Versions": [
+                    {
+                        "IsLatest": True,
+                        "Key": "v2/packages/package.tar.gz",
+                        "VersionId": "version-001",
+                    }
+                ],
+            }
+        assert arguments[0] == "head-object"
+        assert arguments[-2:] == ["--version-id", "version-001"]
+        return {
+            "ContentLength": 123,
+            "ETag": '"0123456789abcdef0123456789abcdef"',
+            "Metadata": {"sha256": sha256},
+            "SSEKMSKeyId": _KMS_ARN,
+            "ServerSideEncryption": "aws:kms",
+            "VersionId": "version-001",
+        }
+
+    resolve = namespace["_resolve_exact_object"]
+    assert callable(resolve)
+    authority = resolve(
+        f"s3://{CORPUS_BUCKET}/v2/packages/package.tar.gz",
+        sha256,
+        "v2/packages/",
+        fake_aws,
+    )
+
+    assert authority.version_id == "version-001"
+    assert authority.sha256 == sha256
+    assert [call[0] for call in calls] == [
+        "list-object-versions",
+        "head-object",
+    ]
+
+
+def test_fixed_entrypoint_rejects_ambiguous_object_version_history():
+    source = _builder_entrypoint_source(render_bootstrap(fixture_config()))
+    namespace: dict[str, object] = {"__name__": "memorysplit_entrypoint_test"}
+    exec(compile(source, "memorysplit-corpus-builder", "exec"), namespace)
+
+    def ambiguous_history(_arguments: list[str]) -> dict[str, object]:
+        return {
+            "DeleteMarkers": [],
+            "IsTruncated": False,
+            "Versions": [
+                {
+                    "Key": "v2/sources/manifest.json",
+                    "VersionId": "version-001",
+                },
+                {
+                    "Key": "v2/sources/manifest.json",
+                    "VersionId": "version-002",
+                },
+            ],
+        }
+
+    error = namespace["BuilderError"]
+    resolve = namespace["_resolve_exact_object"]
+    assert isinstance(error, type)
+    assert callable(resolve)
+    with pytest.raises(error):
+        resolve(
+            f"s3://{CORPUS_BUCKET}/v2/sources/manifest.json",
+            "b" * 64,
+            "v2/sources/",
+            ambiguous_history,
+        )
 
 
 def test_download_bootstrap_inputs_delegates_both_objects_to_task3_helper(
@@ -365,21 +502,27 @@ def test_download_bootstrap_inputs_delegates_both_objects_to_task3_helper(
 )
 def test_render_bootstrap_rejects_invalid_or_cross_authority_config(
     config: BootstrapConfig,
+    tmp_path: Path,
 ):
     with pytest.raises(ValueError):
-        render_bootstrap(config)
+        download_bootstrap_inputs(
+            object(),
+            config,
+            package_destination=tmp_path / "package.tar.gz",
+            source_manifest_destination=tmp_path / "manifest.json",
+        )
 
 
 def test_render_bootstrap_is_deterministic_cwd_independent_and_bash_syntax_valid(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ):
-    config = fixture_config()
-    first = render_bootstrap(config)
+    first = render_bootstrap(fixture_config())
     monkeypatch.chdir(tmp_path)
-    second = render_bootstrap(config)
+    second = render_bootstrap(alternate_config())
 
     assert first == second
+    assert first == render_bootstrap()
     assert first.startswith("#!/usr/bin/env bash\n")
     completed = subprocess.run(
         ["bash", "-n"],
