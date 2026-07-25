@@ -44,7 +44,10 @@ REQUIRED_FILES = (
 
 _REQUIRED_PACKAGE_PATHS = frozenset(
     {
+        "cluster/aws/corpus_builder/bootstrap.py",
+        "cluster/aws/corpus_builder/bootstrap.sh",
         "cluster/aws/corpus_builder/contracts.py",
+        "cluster/aws/corpus_builder/driver.py",
         "cluster/aws/corpus_builder/package.py",
         "cluster/aws/corpus_builder/s3.py",
         "cluster/profiles/aws-i4i.16xlarge-corpus-v1.json",
@@ -71,8 +74,15 @@ _REQUIRED_PACKAGE_PATHS = frozenset(
 )
 _REQUIRED_TEST_PATHS = frozenset(
     {
+        "tests/reasoning_v2_fixtures.py",
+        "tests/test_aws_corpus_builder_bootstrap.py",
         "tests/test_aws_corpus_builder_contracts.py",
+        "tests/test_aws_corpus_builder_driver.py",
+        "tests/test_aws_corpus_builder_foundation.py",
+        "tests/test_aws_corpus_builder_launch.py",
+        "tests/test_aws_corpus_builder_preflight.py",
         "tests/test_aws_corpus_builder_s3.py",
+        "tests/test_package_aws_corpus_builder.py",
         "tests/test_parallel_corpus.py",
         "tests/test_reasoning_v2_catalog.py",
         "tests/test_reasoning_v2_renderers.py",
@@ -103,11 +113,28 @@ _PRODUCTION_COMPLETION_SYMBOLS = {
 }
 _UNSUPPORTED_RENDERER_MARKER = b"Unsupported" b"ProductionRenderer"
 
-_REVIEWED_MEMBER_INVENTORY = frozenset(
+# Reasoning-v2 lane modules and the production adapter that binds them. These
+# land as one reviewable unit: a lane module is only shippable once
+# corpusgen/parallel/adapters.py exposes verified_reasoning_v2_inputs, because
+# _require_production_pipeline keeps the build closed until the placeholder
+# renderer is gone. Adding a lane module here without its adapter would ship an
+# unreachable module; adding the adapter without every lane module would let
+# build_input_catalog fail closed on the instance instead of at package time.
+# Expected members: corpusgen/reasoning_v2/catalog_generated.py,
+# catalog_relational.py, catalog_text.py, catalog_objective.py,
+# catalog_wikidata_paths.py, puzzle_source.py.
+_LANE_MEMBER_INVENTORY: frozenset[str] = frozenset()
+
+_REVIEWED_MEMBER_INVENTORY = _LANE_MEMBER_INVENTORY | frozenset(
     {
         "cluster/aws/corpus_builder/__init__.py",
+        "cluster/aws/corpus_builder/bootstrap.py",
+        "cluster/aws/corpus_builder/bootstrap.sh",
         "cluster/aws/corpus_builder/contracts.py",
+        "cluster/aws/corpus_builder/driver.py",
+        "cluster/aws/corpus_builder/launch.py",
         "cluster/aws/corpus_builder/package.py",
+        "cluster/aws/corpus_builder/preflight.py",
         "cluster/aws/corpus_builder/s3.py",
         "cluster/profiles/aws-i4i.16xlarge-corpus-v1.json",
         "cluster/profiles/aws-p5.48xlarge.json",
@@ -176,6 +203,8 @@ _REVIEWED_MEMBER_INVENTORY = frozenset(
         "scripts/analyze.py",
         "scripts/analyze_keyguess_policy.py",
         "scripts/analyze_relational.py",
+        "scripts/aws_corpus_builder_launch.py",
+        "scripts/aws_corpus_builder_preflight.py",
         "scripts/aws_corpus_cleanroom_verify.py",
         "scripts/build_corpus.py",
         "scripts/build_current_dataset.py",
