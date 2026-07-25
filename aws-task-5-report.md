@@ -447,19 +447,8 @@ Implementation commit:
 
 The Task 6 renderer is not present or importable in this foundation worktree,
 and copying the renderer here would duplicate runtime logic and violate the
-owned-file boundary. This follow-up therefore uses the review-approved small
-fixture approach.
-
-The committed test fixture is the SHA-256 of the ASCII bytes of the actual
-base64 user-data payload produced by Task 6's `fixture_config` at reviewed
-bootstrap commit `48835f7`:
-
-```text
-raw rendered bytes:  26,605
-gzip bytes:           6,878
-base64 characters:    9,172
-base64 SHA-256:        0381b939d78fb48b4ba6593ce3f5bc1472f22ed798f9cd79388f7030a40e80aa
-```
+owned-file boundary. The test therefore pins the independently reproduced
+authoritative digest as a small fixture.
 
 The foundation now requires `BootstrapUserDataSha256`, constrained to exactly
 64 lowercase hexadecimal characters with no default, and emits the same value
@@ -470,12 +459,11 @@ carried end to end by this stack.
 
 This is deliberately not represented as content validation inside
 CloudFormation: an authorized stack updater can still supply arbitrary chunks
-and their matching digest because CloudFormation cannot hash the concatenated
-parameter value. The separately assigned preflight change is the completing
-control: it will hash the deployed launch template's actual user data, compare
-that result with this stack output, freshly render the reviewed Task 6
-bootstrap from the approved launch inputs, and require all three values to
-match before authorizing a launch.
+and their matching decoded-gzip digest because CloudFormation cannot decode
+and hash the concatenated parameter value. Preflight is the completing control:
+it base64-decodes and hashes the deployed launch template's actual user data,
+compares that result with this stack output and the reviewed build-invariant
+bootstrap digest, and requires all values to match before authorizing a launch.
 
 ### Remaining guard non-vacuity
 
@@ -549,9 +537,9 @@ tests/test_aws_corpus_builder_foundation.py`, and `git diff --check` each exited
 
 ### Second-review self-review
 
-- The hash is explicitly defined over the concatenated base64 text, matching
+- The hash is explicitly defined over the base64-decoded gzip member, matching
   the downstream comparison contract; it is not ambiguously defined over the
-  decoded gzip bytes or rendered shell text.
+  base64 transport text or rendered shell text.
 - The fixture proves stack plumbing but does not pretend to replace the live
   preflight render-and-compare gate.
 - Both wildcard launch arrays now have required-match counts and executable
@@ -560,3 +548,84 @@ tests/test_aws_corpus_builder_foundation.py`, and `git diff --check` each exited
   not conflated with its strong object-integrity checks.
 - No deployment, change set, AWS API call, push, amend, or edit outside the
   owned files occurred. `PENDING-REVIEW-FINDINGS.md` remains untracked.
+
+## Integration alignment: canonical decoded-gzip digest
+
+Implementation commit:
+`34ae258b5a3168aa4908b4499ae0145d3e420ee1`.
+
+The integration review established one canonical definition for
+`BootstrapUserDataSha256`: SHA-256 of the bytes obtained after concatenating
+all base64 parts and base64-decoding that text. Those bytes are the
+deterministic gzip member that EC2 decodes as user data. The independently
+reproduced authoritative values are:
+
+```text
+rendered UTF-8: 36,486 bytes
+sha256:          7a551e1bc5bfc614c3ca699c8359b46143e4c10417a68be1f75b5b73edfdda37
+
+gzip member:     9,594 bytes
+sha256:          11f5fbfd7bee7a01e42956654020d21eeec7455305a2da3c8c7e9fb37a0b139f
+
+base64 text:    12,792 bytes
+sha256:          0e93ee325ff77776caf8e5e910e6a7b84850d901d5b596981ad3525fd5fff50d
+```
+
+The deploy-time part values are:
+
+```text
+BuilderUserDataGzipBase64Part1: 4,096 characters
+BuilderUserDataGzipBase64Part2: 4,096 characters
+BuilderUserDataGzipBase64Part3: 4,096 characters
+BuilderUserDataGzipBase64Part4:   504 characters
+BuilderUserDataGzipBase64Part5:     0 characters (empty)
+BuilderUserDataGzipBase64Part6:     0 characters (empty)
+```
+
+The four non-empty parts concatenate to 12,792 base64 characters. Their
+decoded gzip member is 9,594 bytes, which is 6,790 bytes below EC2's
+16,384-byte decoded user-data limit. Leaving parts 5 and 6 at their empty
+defaults is therefore intentional.
+
+The bootstrap payload is now build-invariant: build-specific authorities are
+obtained at runtime rather than rendered into user data. Consequently the
+decoded-gzip hash above is stable for this stack's lifetime and does not change
+from build to build. The rendered-text and base64-text hashes are useful
+cross-checks, but neither is the value supplied to
+`BootstrapUserDataSha256`.
+
+### Integration RED/GREEN and verification
+
+The semantic regression test was changed before the template and Guard rule:
+
+```text
+RED:   1 failed, 39 passed in 0.48s
+GREEN: 40 passed in 0.43s
+```
+
+The final real-Guard-backed focused suite and direct validation then passed:
+
+```text
+CFN_GUARD=.cfn-guard-tool/bin/cfn-guard \
+  python -m pytest -q tests/test_aws_corpus_builder_foundation.py
+40 passed in 2.45s
+
+cfn-guard 3.2.0 validate --rules <guard> --data <template>
+exit 0, no findings
+```
+
+`cfn-lint 1.53.2`, `python -m py_compile
+tests/test_aws_corpus_builder_foundation.py`, and `git diff --check` each exited
+0 with no findings. The temporary Guard binary was removed after validation.
+
+### Integration self-review
+
+- The parameter, output, test fixture, and Guard semantics all name the
+  base64-decoded gzip member, not its transport representation.
+- The pinned fixture is the authoritative gzip digest
+  `11f5fbfd7bee7a01e42956654020d21eeec7455305a2da3c8c7e9fb37a0b139f`.
+- The test freezes the six part lengths, confirms parts 5 and 6 are empty,
+  checks each part fits its CloudFormation parameter, and checks 9,594 bytes is
+  below the EC2 decoded user-data limit.
+- No deployment, change set, AWS API call, push, amend, or edit outside the
+  owned files occurred. Existing untracked review inputs remain untouched.
