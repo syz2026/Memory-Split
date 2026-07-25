@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import shutil
+import sys
 import zipfile
 from pathlib import Path
 from types import SimpleNamespace
@@ -12,6 +14,7 @@ import pytest
 import torch
 import yaml
 
+import cluster.aws.readiness as readiness
 import cluster.aws.reasoning_v3 as corpus
 from cluster.aws.readiness import inspect_aws_readiness
 from cluster.aws.reasoning_v3 import (
@@ -48,6 +51,14 @@ from train.model import GPT, GPTConfig
 ROOT = Path(__file__).resolve().parents[1]
 MANIFEST = ROOT / "cluster" / "aws" / "reasoning-v3-corpus-manifest.json"
 PROFILE = ROOT / "cluster" / "profiles" / "aws-p5-p6.example.json"
+B200_PROFILE = ROOT / "cluster" / "profiles" / "aws-p6-b200.48xlarge-135m-v1.json"
+INEXACT_HARDWARE = (
+    "NVIDIA H100 80GB HBM3",
+    "NVIDIA H200",
+    "NVIDIA B300",
+    "NVIDIA GB200 NVL72",
+    "not-a-B200 emulator",
+)
 
 
 def _sha(path: Path) -> str:
@@ -230,6 +241,13 @@ def test_s3_uri_parser_rejects_ambiguous_or_injectable_values(value):
     )
 
 
+@pytest.mark.skipif(
+    not sys.platform.startswith("linux"),
+    reason=(
+        "corpus publication deliberately fails closed without Linux renameat2 "
+        "RENAME_NOREPLACE; this gate is exercised on the EC2 execution target"
+    ),
+)
 def test_s3_stage_is_hash_gated_atomic_and_idempotent(tmp_path, monkeypatch):
     manifest, remote, _ = _tiny_transfer(tmp_path, monkeypatch)
     destination = tmp_path / "staged"
@@ -388,20 +406,48 @@ def test_s3_upload_rejects_wrong_existing_identity(tmp_path, monkeypatch):
         )
 
 
-def test_aws_profile_and_parallelcluster_template_scale_from_zero():
+def test_no_broad_gpu_regex_authorizes_protected_b200_work():
+    profile = load_profile(PROFILE)
+    admitted = [
+        name for name in INEXACT_HARDWARE if re.search(profile.gpu_name_regex, name)
+    ]
+    assert admitted, "the fixture must exercise the shipped substring regex"
+    exact_gate = getattr(readiness, "admit_b200_node", None)
+    assert exact_gate is not None, (
+        "protected B200 work is still authorized by the substring regex "
+        f"{profile.gpu_name_regex!r} in {PROFILE.name}, which admits inexact "
+        f"hardware {admitted}; cluster.aws.readiness exposes no exact B200 "
+        "admission gate"
+    )
+    shipped = readiness.load_hardware_profile(B200_PROFILE)
+    assert shipped.launch_ready is False
+    assert shipped.instance_type == "p6-b200.48xlarge"
+
+
+def test_aws_profile_and_parallelcluster_template_bind_the_exact_b200_node():
     profile = load_profile(PROFILE)
     assert profile.platform == "aws"
     assert profile.gpus_per_pair == 2
+    hardware = readiness.load_hardware_profile(B200_PROFILE)
     template = yaml.safe_load(
         (
             ROOT
             / "cluster/aws/parallelcluster/memorysplit-v3-p5.example.yaml"
         ).read_text()
     )
-    queue = template["Scheduling"]["SlurmQueues"][0]
+    assert template["Region"] == hardware.region
+    queues = template["Scheduling"]["SlurmQueues"]
+    resources = [
+        resource for queue in queues for resource in queue["ComputeResources"]
+    ]
+    assert {resource["InstanceType"] for resource in resources} == {
+        hardware.instance_type
+    }
+    assert all(resource["MinCount"] == 0 for resource in resources)
+    queue = queues[0]
     assert queue["Name"] == profile.partition
     assert queue["ComputeResources"][0]["MinCount"] == 0
-    assert queue["ComputeResources"][0]["MaxCount"] == 3
+    assert queue["ComputeResources"][0]["MaxCount"] == 2
     assert queue["ComputeResources"][0]["Efa"]["Enabled"] is False
     assert queue["Networking"]["PlacementGroup"]["Enabled"] is False
     assert template["HeadNode"]["Imds"]["Secured"] is True

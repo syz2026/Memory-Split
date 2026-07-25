@@ -2,16 +2,19 @@
 
 from __future__ import annotations
 
+import json
+from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import Any
 
 import yaml
 
-from cluster.aws.reasoning_v3 import verify_staged_corpus
+from cluster.aws.readiness import B200_PROFILE_PATH, HardwareAdmissionError
+from cluster.aws.reasoning_v3 import admit_reasoning_v3_site, verify_staged_corpus
 from cluster.corpus_contract import sha256_file
 from msctl.adapters.slurm import load_pair_manifest
 from msctl.manifest import canonical_json_bytes, write_json_no_replace
-from msctl.operations import _write_yaml_no_replace
+from msctl.operations import _write_yaml_no_replace, submit
 from msctl.profile import load_profile
 from msctl.reasoning_cohort import (
     ARMS,
@@ -29,6 +32,93 @@ from msctl.reasoning_cohort import (
     load_run_config,
     pair_id,
 )
+
+
+UNADMITTED_HARDWARE: dict[str, Any] = {
+    "admitted": False,
+    "authority_id": None,
+    "instance_type": None,
+    "note": (
+        "No exact hardware profile was asserted; this cohort instance may run "
+        "canaries only. Protected launches must pass B200 site admission."
+    ),
+    "profile_id": None,
+    "profile_sha256": None,
+}
+
+
+def load_site_evidence(path: Path | str) -> dict[str, Any]:
+    """Read one node/site evidence document without trusting its contents."""
+
+    source = Path(path)
+    if not source.is_file() or source.is_symlink() or source.stat().st_size > 1 << 20:
+        raise HardwareAdmissionError(
+            f"site evidence is missing, unsafe, or oversized: {source}"
+        )
+    try:
+        raw = json.loads(source.read_text(encoding="utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise HardwareAdmissionError("site evidence is not valid UTF-8 JSON") from error
+    if not isinstance(raw, dict):
+        raise HardwareAdmissionError(  # noqa: TRY004
+            "site evidence must be a JSON object"
+        )
+    return raw
+
+
+def admit_b200_site(
+    *,
+    site_evidence_path: Path | str,
+    hardware_profile_path: Path | str = B200_PROFILE_PATH,
+    asserted_authority: str | None = None,
+) -> dict[str, Any]:
+    """Admit one P6-B200 node for protected reasoning-v3 work."""
+
+    evidence = load_site_evidence(site_evidence_path)
+    if asserted_authority is None:
+        asserted_authority = evidence.get("authority_id")
+    return admit_reasoning_v3_site(
+        site_evidence=evidence,
+        asserted_authority=asserted_authority,
+        profile_path=hardware_profile_path,
+    )
+
+
+def authorize_protected_submission(
+    pair_manifests: Sequence[Path | str],
+    *,
+    profile_path: Path | str,
+    venv_root: Path | str,
+    preflight_path: Path | str,
+    site_evidence_path: Path | str,
+    hardware_profile_path: Path | str = B200_PROFILE_PATH,
+    apply: bool = False,
+    runner: Callable[[Sequence[str]], object] | None = None,
+) -> dict[str, Any]:
+    """Submit protected AWS work only behind exact B200 site admission.
+
+    Site admission runs first and raises before any job is planned, so an
+    unadmitted or merely regex-compatible node cannot reach ``sbatch``.
+    """
+
+    hardware = admit_b200_site(
+        site_evidence_path=site_evidence_path,
+        hardware_profile_path=hardware_profile_path,
+    )
+    kwargs: dict[str, Any] = {}
+    if runner is not None:
+        kwargs["runner"] = runner
+    report = submit(
+        pair_manifests,
+        profile_path=profile_path,
+        mode="protected",
+        venv_root=venv_root,
+        preflight_path=preflight_path,
+        apply=apply,
+        **kwargs,
+    )
+    report["hardware"] = hardware
+    return report
 
 
 def _runtime_paths(dataset_root: Path, values: list[str]) -> list[str]:
@@ -70,6 +160,8 @@ def instantiate_aws(
     out_root: Path | str,
     repository_root: Path | str,
     seeds: tuple[int, ...] = SEEDS,
+    hardware_profile_path: Path | str | None = None,
+    site_evidence_path: Path | str | None = None,
 ) -> dict[str, Any]:
     """Verify frozen bytes and write immutable pair manifests for selected seeds."""
 
@@ -80,6 +172,17 @@ def instantiate_aws(
         or any(isinstance(seed, bool) or seed not in SEEDS for seed in seeds)
     ):
         raise ValueError("AWS seeds must be a non-empty sorted unique v3 subset")
+    if (hardware_profile_path is None) != (site_evidence_path is None):
+        raise ValueError(
+            "exact hardware admission needs both hardware_profile_path and "
+            "site_evidence_path; a half-asserted hardware claim is rejected"
+        )
+    hardware = dict(UNADMITTED_HARDWARE)
+    if hardware_profile_path is not None and site_evidence_path is not None:
+        hardware = admit_b200_site(
+            site_evidence_path=site_evidence_path,
+            hardware_profile_path=hardware_profile_path,
+        )
     root = Path(repository_root).resolve()
     dataset = Path(dataset_root).resolve()
     runtime = Path(runtime_root).resolve()
@@ -127,6 +230,7 @@ def instantiate_aws(
             "receipt_sha256": evidence.virtual_receipt_sha256,
             "scientific_scope": SCIENTIFIC_SCOPE,
         },
+        "hardware": hardware,
         "operator": ROLE,
         "platform": ROLES[ROLE]["platform"],
         "provider": PROVIDER,
@@ -194,6 +298,7 @@ def instantiate_aws(
     return {
         "dataset_manifest_sha256": evidence.manifest_sha256,
         "dataset_receipt_sha256": evidence.virtual_receipt_sha256,
+        "hardware": hardware,
         "pair_manifests": pair_paths,
         "profile_sha256": profile.sha256,
         "role_manifest": role_manifest_path,

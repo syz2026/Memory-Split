@@ -14,6 +14,12 @@ from pathlib import Path, PurePosixPath
 from typing import Any
 from urllib.parse import urlsplit
 
+from cluster.aws.readiness import (
+    B200_PROFILE_PATH,
+    HardwareAdmissionError,
+    admit_protected_site,
+    load_hardware_profile,
+)
 from cluster.aws.safeio import atomic_rename_noreplace
 
 TRANSFER_FORMAT = "memorysplit-aws-corpus-transfer-v1"
@@ -448,6 +454,57 @@ def verify_staged_corpus(
         raw_target_tokens=RAW_TARGET_TOKENS,
         composite_stream_sha256=dict(EXPECTED_COMPOSITE_STREAM_SHA256),
     )
+
+
+def admit_reasoning_v3_site(
+    *,
+    site_evidence: object,
+    asserted_authority: object,
+    profile_path: Path | str = B200_PROFILE_PATH,
+    transfer_manifest_sha256: str | None = None,
+    virtual_receipt_sha256: str | None = None,
+) -> dict[str, Any]:
+    """Admit one exact B200 site and bind it to the frozen v3 corpus identity.
+
+    Hardware admission alone is not enough: the same node must also be pinned
+    to this corpus so P5, B300, or a differently seeded site can never supply
+    evidence for a reasoning-v3 cell.
+    """
+
+    profile = load_hardware_profile(profile_path)
+    if profile.dataset_contract_id != CONTRACT_ID:
+        raise HardwareAdmissionError(
+            f"hardware profile is bound to {profile.dataset_contract_id!r}, "
+            f"not the frozen corpus contract {CONTRACT_ID!r}"
+        )
+    expected_manifest = TRANSFER_MANIFEST_SHA256
+    expected_receipt = VIRTUAL_RECEIPT_SHA256
+    if transfer_manifest_sha256 is None:
+        transfer_manifest_sha256 = expected_manifest
+    if virtual_receipt_sha256 is None:
+        virtual_receipt_sha256 = expected_receipt
+    if transfer_manifest_sha256 != expected_manifest:
+        raise HardwareAdmissionError(
+            "site admission transfer manifest digest is not the frozen v3 manifest"
+        )
+    if virtual_receipt_sha256 != expected_receipt:
+        raise HardwareAdmissionError(
+            "site admission corpus receipt digest is not the frozen v3 receipt"
+        )
+    receipt = admit_protected_site(
+        profile=profile,
+        site_evidence=site_evidence,
+        asserted_authority=asserted_authority,
+    )
+    receipt.update(
+        {
+            "dataset_contract_id": CONTRACT_ID,
+            "raw_target_tokens": RAW_TARGET_TOKENS,
+            "transfer_manifest_sha256": transfer_manifest_sha256,
+            "virtual_receipt_sha256": virtual_receipt_sha256,
+        }
+    )
+    return receipt
 
 
 def verify_upload_sources(
