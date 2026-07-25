@@ -97,7 +97,6 @@ class PreflightRequest:
     stack_outputs: Mapping[str, str]
     ami_id: str
     ami_owner_id: str
-    expected_bootstrap_user_data_sha256: str
 
 
 @dataclass(frozen=True)
@@ -649,21 +648,13 @@ def _verify_launch_template(
     return template_id, version, data
 
 
-def _reviewed_bootstrap_hash(value: object) -> str:
-    if not isinstance(value, str) or _SHA256_RE.fullmatch(value) is None:
-        raise ValueError(
-            "reviewed expected SHA-256 must be 64 lowercase hexadecimal characters"
-        )
-    return value
-
-
 def _verify_bootstrap_user_data(
     outputs: Mapping[str, str],
     *,
     launch_data: Mapping[str, object],
-    expected_sha256: str,
+    profile: CorpusBuilderProfile,
 ) -> None:
-    expected = _reviewed_bootstrap_hash(expected_sha256)
+    expected = profile.bootstrap_user_data_sha256
     stack_sha256 = _stack_output(
         outputs,
         "BootstrapUserDataSha256",
@@ -671,7 +662,8 @@ def _verify_bootstrap_user_data(
     )
     if stack_sha256 != expected:
         raise ValueError(
-            "BootstrapUserDataSha256 does not match the reviewed expected SHA-256"
+            "BootstrapUserDataSha256 does not match "
+            "profile.bootstrap_user_data_sha256"
         )
     encoded = launch_data.get("UserData")
     if not isinstance(encoded, str) or not encoded:
@@ -686,10 +678,10 @@ def _verify_bootstrap_user_data(
     if not payload or base64.b64encode(payload) != encoded_bytes:
         raise ValueError("launch template UserData is not canonical base64")
     actual_sha256 = hashlib.sha256(payload).hexdigest()
-    if actual_sha256 != stack_sha256:
+    if actual_sha256 != expected:
         raise ValueError(
             "launch template UserData SHA-256 does not match "
-            "BootstrapUserDataSha256"
+            "profile.bootstrap_user_data_sha256"
         )
 
 
@@ -1151,13 +1143,6 @@ def validate_local_request(
             request.package,
         ),
     )
-    _run_gate(
-        checks,
-        PREFLIGHT_CHECKS[7],
-        lambda: _reviewed_bootstrap_hash(
-            request.expected_bootstrap_user_data_sha256
-        ),
-    )
 
 
 def _validate_now(now: datetime) -> None:
@@ -1244,7 +1229,7 @@ def run_preflight(
         lambda: _verify_bootstrap_user_data(
             stack_outputs,
             launch_data=launch_data,
-            expected_sha256=request.expected_bootstrap_user_data_sha256,
+            profile=profile,
         ),
     )
     security_group_id = _run_gate(

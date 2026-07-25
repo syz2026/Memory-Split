@@ -17,6 +17,7 @@ from cluster.aws.corpus_builder.contracts import (
     CORPUS_BUCKET,
     S3ObjectVersion,
     launch_intent_to_bytes,
+    load_corpus_builder_profile,
 )
 from cluster.aws.corpus_builder.package import (
     ARCHIVE_NAME,
@@ -66,7 +67,9 @@ BOOTSTRAP_USER_DATA = (
     b"set -euo pipefail\n"
     b"systemd-run --on-active=23h30m /sbin/shutdown -h now\n"
 )
-BOOTSTRAP_USER_DATA_SHA256 = hashlib.sha256(BOOTSTRAP_USER_DATA).hexdigest()
+PROVISIONAL_BOOTSTRAP_USER_DATA_SHA256 = (
+    "4a666e5a093da098a8066aadd4b4ed368dc4571a8cde54e525bf2e387db06861"
+)
 
 EXPECTED_CHECKS = (
     "profile-canonical-sha256",
@@ -136,7 +139,7 @@ def _stack_outputs() -> dict[str, str]:
         "ArtifactBucketName": CORPUS_BUCKET,
         "BuilderInstanceProfileArn": INSTANCE_PROFILE_ARN,
         "BuilderRoleArn": BUILDER_ROLE_ARN,
-        "BootstrapUserDataSha256": BOOTSTRAP_USER_DATA_SHA256,
+        "BootstrapUserDataSha256": PROVISIONAL_BOOTSTRAP_USER_DATA_SHA256,
         "ControllerRoleArn": (
             "arn:aws:iam::056956104102:role/memorysplit-corpus-controller"
         ),
@@ -640,19 +643,85 @@ def _request(tmp_path: Path, fake: FakeAws) -> PreflightRequest:
         stack_outputs=_stack_outputs(),
         ami_id=AMI_ID,
         ami_owner_id=AMI_OWNER_ID,
-        expected_bootstrap_user_data_sha256=BOOTSTRAP_USER_DATA_SHA256,
     )
 
 
-def test_request_carries_reviewed_bootstrap_user_data_hash(tmp_path):
+def test_request_cannot_override_profile_bootstrap_user_data_hash(tmp_path):
     fake = FakeAws()
 
-    request = replace(
-        _request(tmp_path, fake),
-        expected_bootstrap_user_data_sha256="f" * 64,
-    )
+    with pytest.raises(TypeError, match="unexpected keyword argument"):
+        replace(
+            _request(tmp_path, fake),
+            expected_bootstrap_user_data_sha256="f" * 64,
+        )
 
-    assert request.expected_bootstrap_user_data_sha256 == "f" * 64
+
+def test_profile_bootstrap_hash_is_loudly_provisional():
+    profile = load_corpus_builder_profile(PROFILE_PATH)
+
+    assert hashlib.sha256(BOOTSTRAP_USER_DATA).hexdigest() == (
+        PROVISIONAL_BOOTSTRAP_USER_DATA_SHA256
+    )
+    assert profile.bootstrap_user_data_sha256 == (
+        PROVISIONAL_BOOTSTRAP_USER_DATA_SHA256
+    ), "integration must replace the explicitly provisional bootstrap digest"
+
+
+@pytest.mark.parametrize(
+    ("profile_hash", "message"),
+    (
+        (None, r"missing=.*bootstrap_user_data_sha256"),
+        (
+            "not-a-sha256",
+            (
+                r"profile\.bootstrap_user_data_sha256 "
+                r"must be a lowercase SHA-256"
+            ),
+        ),
+    ),
+)
+def test_profile_missing_or_malformed_bootstrap_hash_fails_closed(
+    tmp_path,
+    profile_hash,
+    message,
+):
+    fake = FakeAws()
+    value = json.loads(PROFILE_PATH.read_text(encoding="utf-8"))
+    if profile_hash is None:
+        value.pop("bootstrap_user_data_sha256", None)
+    else:
+        value["bootstrap_user_data_sha256"] = profile_hash
+    profile_path = tmp_path / "profile.json"
+    profile_path.write_bytes(_canonical_json(value))
+    request = replace(_request(tmp_path, fake), profile_path=profile_path)
+
+    with pytest.raises(
+        PreflightError,
+        match=rf"profile-canonical-sha256.*{message}",
+    ):
+        run_preflight(request, aws=fake.clients(), now=NOW)
+
+    assert fake.calls == []
+
+
+def test_alternate_profile_cannot_override_pinned_bootstrap_hash(tmp_path):
+    fake = FakeAws()
+    value = json.loads(PROFILE_PATH.read_text(encoding="utf-8"))
+    value["bootstrap_user_data_sha256"] = "f" * 64
+    profile_path = tmp_path / "profile.json"
+    profile_path.write_bytes(_canonical_json(value))
+    request = replace(_request(tmp_path, fake), profile_path=profile_path)
+
+    with pytest.raises(
+        PreflightError,
+        match=(
+            "profile-canonical-sha256.*"
+            r"profile\.bootstrap_user_data_sha256 drift"
+        ),
+    ):
+        run_preflight(request, aws=fake.clients(), now=NOW)
+
+    assert fake.calls == []
 
 
 def test_preflight_emits_intent_only_after_every_read_only_gate_and_ec2_dry_run(
@@ -745,7 +814,7 @@ def test_bootstrap_user_data_mismatch_fails_before_intent_or_network_gate(
         PreflightError,
         match=(
             "bootstrap-user-data-sha256.*"
-            "UserData SHA-256.*BootstrapUserDataSha256"
+            r"UserData SHA-256.*profile\.bootstrap_user_data_sha256"
         ),
     ):
         run_preflight(_request(tmp_path, fake), aws=fake.clients(), now=NOW)
@@ -783,16 +852,19 @@ def test_bootstrap_user_data_gate_rejects_missing_or_malformed_stack_hash(
     assert fake.ec2.run_instances_calls == []
 
 
-def test_bootstrap_stack_hash_must_match_reviewed_expected_hash(tmp_path):
+def test_bootstrap_stack_hash_must_match_frozen_profile(tmp_path):
     fake = FakeAws()
-    request = replace(
-        _request(tmp_path, fake),
-        expected_bootstrap_user_data_sha256="f" * 64,
-    )
+    request = _request(tmp_path, fake)
+    outputs = dict(request.stack_outputs)
+    outputs["BootstrapUserDataSha256"] = "f" * 64
+    request = replace(request, stack_outputs=outputs)
 
     with pytest.raises(
         PreflightError,
-        match="bootstrap-user-data-sha256.*reviewed expected SHA-256",
+        match=(
+            "bootstrap-user-data-sha256.*"
+            r"BootstrapUserDataSha256.*profile\.bootstrap_user_data_sha256"
+        ),
     ):
         run_preflight(request, aws=fake.clients(), now=NOW)
 
@@ -1148,8 +1220,6 @@ def _cli_arguments(
         AMI_ID,
         "--ami-owner-id",
         AMI_OWNER_ID,
-        "--expected-bootstrap-user-data-sha256",
-        request.expected_bootstrap_user_data_sha256,
         "--intent",
         str(intent_path),
         "--profile",
@@ -1170,12 +1240,16 @@ def _cli_arguments(
     )
 
 
-def test_cli_requires_reviewed_bootstrap_user_data_hash(tmp_path):
+def test_cli_rejects_caller_bootstrap_hash_override(tmp_path):
     fake = FakeAws()
     request = _request(tmp_path, fake)
-    arguments, _intent_path, _paths = _cli_arguments(tmp_path, fake, request)
-    index = arguments.index("--expected-bootstrap-user-data-sha256")
-    del arguments[index : index + 2]
+    arguments, intent_path, _paths = _cli_arguments(tmp_path, fake, request)
+    arguments.extend(
+        [
+            "--expected-bootstrap-user-data-sha256",
+            "f" * 64,
+        ]
+    )
 
     with pytest.raises(SystemExit):
         aws_corpus_builder_preflight.main(
@@ -1184,37 +1258,6 @@ def test_cli_requires_reviewed_bootstrap_user_data_hash(tmp_path):
             now=NOW,
         )
 
-
-def test_cli_malformed_bootstrap_hash_fails_before_live_clients(
-    tmp_path,
-    monkeypatch,
-):
-    fake = FakeAws()
-    request = _request(tmp_path, fake)
-    arguments, intent_path, _paths = _cli_arguments(
-        tmp_path,
-        fake,
-        request,
-        live=True,
-    )
-    index = arguments.index("--expected-bootstrap-user-data-sha256")
-    arguments[index + 1] = "not-a-sha256"
-    constructed = []
-
-    def fake_live_clients(**kwargs):
-        constructed.append(kwargs)
-        return fake.clients()
-
-    monkeypatch.setattr(
-        aws_corpus_builder_preflight,
-        "_live_clients",
-        fake_live_clients,
-    )
-
-    with pytest.raises(PreflightError, match="reviewed expected SHA-256"):
-        aws_corpus_builder_preflight.main(arguments, now=NOW)
-
-    assert constructed == []
     assert not intent_path.exists()
 
 
@@ -1544,8 +1587,6 @@ def test_preflight_cli_writes_canonical_owner_only_intent_and_prints_hash(
             AMI_ID,
             "--ami-owner-id",
             AMI_OWNER_ID,
-            "--expected-bootstrap-user-data-sha256",
-            request.expected_bootstrap_user_data_sha256,
             "--intent",
             str(intent_path),
             "--profile",
@@ -1597,8 +1638,6 @@ def test_preflight_cli_never_creates_intent_when_a_gate_fails(
                 AMI_ID,
                 "--ami-owner-id",
                 AMI_OWNER_ID,
-                "--expected-bootstrap-user-data-sha256",
-                request.expected_bootstrap_user_data_sha256,
                 "--intent",
                 str(intent_path),
                 "--profile",
@@ -1649,8 +1688,6 @@ def test_preflight_cli_removes_partial_intent_when_fsync_fails(
                 AMI_ID,
                 "--ami-owner-id",
                 AMI_OWNER_ID,
-                "--expected-bootstrap-user-data-sha256",
-                request.expected_bootstrap_user_data_sha256,
                 "--intent",
                 str(intent_path),
                 "--profile",
