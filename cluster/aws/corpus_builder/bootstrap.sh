@@ -6,25 +6,75 @@ umask 077
 
 readonly CORPUS_BUCKET="memorysplit-corpus-056956104102-us-east-1"
 readonly CORPUS_REGION="us-east-1"
-readonly RAID_DEVICE="/dev/md/memorysplit"
-readonly SCRATCH_ROOT="/mnt/memorysplit-builder"
-readonly WORK_ROOT="/mnt/memorysplit-builder/work"
-readonly OUTPUT_ROOT="/mnt/memorysplit-builder/output"
-readonly CLEANROOM_ROOT="/mnt/memorysplit-builder/cleanroom"
-readonly BOOTSTRAP_RECEIPT="/mnt/memorysplit-builder/bootstrap-receipt.json"
-readonly LOG_PATH="/var/log/memorysplit-corpus-bootstrap.log"
-readonly RUNTIME_ROOT="/run/memorysplit-corpus-bootstrap"
-readonly WATCHDOG_ENV="/etc/memorysplit-corpus-watchdog.env"
-readonly WATCHDOG_PROGRAM="/usr/local/sbin/memorysplit-corpus-watchdog"
-readonly DRIVER_PATH="/opt/memorysplit/scripts/aws_corpus_builder_driver.py"
 readonly SAFE_PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 
+RAID_DEVICE=""
+SCRATCH_ROOT=""
+WORK_ROOT=""
+OUTPUT_ROOT=""
+CLEANROOM_ROOT=""
+BOOTSTRAP_RECEIPT=""
+LOG_PATH=""
+RUNTIME_ROOT=""
+WATCHDOG_ENV=""
+WATCHDOG_PROGRAM=""
+WATCHDOG_STATE_DIR=""
+SYSTEMD_UNIT_DIR=""
+DRIVER_PATH=""
+LSBLK_JSON=""
+NVME_RECORDS=""
+AWS_BIN=""
+SHUTDOWN_BIN=""
+TIMEOUT_BIN=""
+PYTHON_BIN=""
+SHA256_BIN=""
+AWK_BIN=""
+INSTALL_BIN=""
+SYNC_BIN=""
+SYSTEMCTL_BIN=""
 CURRENT_PHASE="initializing"
 SHUTDOWN_REQUESTED=0
+NVME_DEVICES=()
+NVME_SERIALS=()
 
 die() {
     printf 'bootstrap error [%s]: %s\n' "${CURRENT_PHASE}" "$*" >&2
     exit 1
+}
+
+configure_paths() {
+    local requested_root="${1:-/}"
+    [[ "${requested_root}" == /* ]] \
+        || die "bootstrap state root must be absolute"
+    [[ -d "${requested_root}" && ! -L "${requested_root}" ]] \
+        || die "bootstrap state root must be a real directory"
+    local prefix
+    if [[ "${requested_root}" == "/" ]]; then
+        prefix=""
+        RAID_DEVICE="/dev/md/memorysplit"
+        SCRATCH_ROOT="/mnt/memorysplit-builder"
+        WORK_ROOT="/mnt/memorysplit-builder/work"
+        OUTPUT_ROOT="/mnt/memorysplit-builder/output"
+        CLEANROOM_ROOT="/mnt/memorysplit-builder/cleanroom"
+        BOOTSTRAP_RECEIPT="/mnt/memorysplit-builder/bootstrap-receipt.json"
+    else
+        prefix="${requested_root%/}"
+        RAID_DEVICE="${prefix}/dev/md/memorysplit"
+        SCRATCH_ROOT="${prefix}/mnt/memorysplit-builder"
+        WORK_ROOT="${SCRATCH_ROOT}/work"
+        OUTPUT_ROOT="${SCRATCH_ROOT}/output"
+        CLEANROOM_ROOT="${SCRATCH_ROOT}/cleanroom"
+        BOOTSTRAP_RECEIPT="${SCRATCH_ROOT}/bootstrap-receipt.json"
+    fi
+    LOG_PATH="${prefix}/var/log/memorysplit-corpus-bootstrap.log"
+    RUNTIME_ROOT="${prefix}/run/memorysplit-corpus-bootstrap"
+    WATCHDOG_ENV="${prefix}/etc/memorysplit-corpus-watchdog.env"
+    WATCHDOG_PROGRAM="${prefix}/usr/local/sbin/memorysplit-corpus-watchdog"
+    WATCHDOG_STATE_DIR="${prefix}/var/lib/memorysplit-corpus-watchdog"
+    SYSTEMD_UNIT_DIR="${prefix}/etc/systemd/system"
+    DRIVER_PATH="${prefix}/opt/memorysplit/scripts/aws_corpus_builder_driver.py"
+    LSBLK_JSON="${RUNTIME_ROOT}/lsblk.json"
+    NVME_RECORDS="${RUNTIME_ROOT}/nvme-records.tsv"
 }
 
 require_command() {
@@ -44,7 +94,7 @@ upload_file() {
     local digest
     [[ -f "${path}" && ! -L "${path}" ]] || die "upload source is not a regular file"
     digest="$(sha256sum "${path}" | awk '{print $1}')"
-    /usr/bin/timeout 120s /usr/bin/aws s3api put-object \
+    "${TIMEOUT_BIN}" 120s "${AWS_BIN}" s3api put-object \
         --region "${CORPUS_REGION}" \
         --bucket "${CORPUS_BUCKET}" \
         --key "${key}" \
@@ -63,57 +113,77 @@ upload_phase_log() {
         "${LOG_PATH}"
 }
 
+request_shutdown() {
+    SHUTDOWN_REQUESTED=1
+    if [[ -n "${SHUTDOWN_BIN}" ]]; then
+        "${SHUTDOWN_BIN}" -h now >/dev/null 2>&1 || true
+    else
+        /usr/sbin/shutdown -h now >/dev/null 2>&1 || true
+    fi
+}
+
+emergency_exit() {
+    local status=$?
+    trap - EXIT
+    if (( status != 0 )); then
+        request_shutdown
+    fi
+    exit "${status}"
+}
+
 on_exit() {
     local status=$?
     trap - EXIT ERR
     set +e
     if (( status != 0 )); then
-        printf 'bootstrap failed in phase %s with status %d\n' \
-            "${CURRENT_PHASE}" "${status}" >>"${LOG_PATH}"
-        upload_phase_log "bootstrap-failed"
         if (( SHUTDOWN_REQUESTED == 0 )); then
-            SHUTDOWN_REQUESTED=1
-            /usr/sbin/shutdown -h now
+            request_shutdown
+        fi
+        if [[ -n "${LOG_PATH}" ]]; then
+            printf 'bootstrap failed in phase %s with status %d\n' \
+                "${CURRENT_PHASE}" "${status}" >>"${LOG_PATH}"
+        fi
+        if [[ -f "${LOG_PATH}" && ! -L "${LOG_PATH}" ]]; then
+            upload_phase_log "bootstrap-failed"
         fi
     fi
-    rm -rf -- "${RUNTIME_ROOT}"
+    if [[ -n "${RUNTIME_ROOT}" ]]; then
+        rm -rf -- "${RUNTIME_ROOT}"
+    fi
     exit "${status}"
 }
 
-trap on_exit EXIT
+initialize_runtime() {
+    CURRENT_PHASE="runtime-initialize"
+    for required in \
+        awk \
+        aws \
+        blkid \
+        findmnt \
+        install \
+        lsblk \
+        mdadm \
+        mkfs.xfs \
+        mount \
+        python3 \
+        sha256sum \
+        systemctl \
+        tar \
+        timeout \
+        udevadm \
+        wipefs; do
+        require_command "${required}"
+    done
 
-for required in \
-    awk \
-    blkid \
-    findmnt \
-    install \
-    lsblk \
-    mdadm \
-    mkfs.xfs \
-    mount \
-    python3 \
-    sha256sum \
-    systemctl \
-    tar \
-    timeout \
-    udevadm \
-    wipefs; do
-    require_command "${required}"
-done
-[[ -x /usr/bin/aws ]] || die "AWS CLI v2 is required at /usr/bin/aws"
-[[ -x /usr/sbin/shutdown ]] || die "shutdown is required at /usr/sbin/shutdown"
-
-[[ ! -e "${RUNTIME_ROOT}" && ! -L "${RUNTIME_ROOT}" ]] \
-    || die "bootstrap runtime path already exists"
-install -d -m 0700 "${RUNTIME_ROOT}"
-install -m 0600 /dev/null "${LOG_PATH}"
-exec >>"${LOG_PATH}" 2>&1
-printf 'starting MemorySplit corpus bootstrap for %s\n' "${MEMORYSPLIT_BUILD_ID}"
-
-readonly LSBLK_JSON="${RUNTIME_ROOT}/lsblk.json"
-readonly NVME_RECORDS="${RUNTIME_ROOT}/nvme-records.tsv"
-NVME_DEVICES=()
-NVME_SERIALS=()
+    [[ ! -e "${RUNTIME_ROOT}" && ! -L "${RUNTIME_ROOT}" ]] \
+        || die "bootstrap runtime path already exists"
+    "${INSTALL_BIN}" -d -m 0700 "${RUNTIME_ROOT}"
+    "${INSTALL_BIN}" -d -m 0755 "${LOG_PATH%/*}"
+    "${INSTALL_BIN}" -m 0600 /dev/null "${LOG_PATH}"
+    exec >>"${LOG_PATH}" 2>&1
+    printf 'starting MemorySplit corpus bootstrap for %s\n' \
+        "${MEMORYSPLIT_BUILD_ID}"
+}
 
 discover_instance_store_nvmes() {
     CURRENT_PHASE="nvme-discovery"
@@ -275,24 +345,81 @@ PY
 
 install_watchdog() {
     CURRENT_PHASE="watchdog-install"
+    SHUTDOWN_BIN="$(command -v shutdown || true)"
+    TIMEOUT_BIN="$(command -v timeout || true)"
+    AWS_BIN="$(command -v aws || true)"
+    PYTHON_BIN="$(command -v python3 || true)"
+    SHA256_BIN="$(command -v sha256sum || true)"
+    AWK_BIN="$(command -v awk || true)"
+    INSTALL_BIN="$(command -v install || true)"
+    SYNC_BIN="$(command -v sync || true)"
+    SYSTEMCTL_BIN="$(command -v systemctl || true)"
+    for resolved in \
+        "${SHUTDOWN_BIN}" \
+        "${TIMEOUT_BIN}" \
+        "${AWS_BIN}" \
+        "${PYTHON_BIN}" \
+        "${SHA256_BIN}" \
+        "${AWK_BIN}" \
+        "${INSTALL_BIN}" \
+        "${SYNC_BIN}" \
+        "${SYSTEMCTL_BIN}"; do
+        [[ -n "${resolved}" && -x "${resolved}" ]] \
+            || die "watchdog prerequisite is unavailable"
+    done
+
+    "${INSTALL_BIN}" -d -m 0755 \
+        "${SYSTEMD_UNIT_DIR}" \
+        "${WATCHDOG_ENV%/*}" \
+        "${WATCHDOG_PROGRAM%/*}"
+    "${INSTALL_BIN}" -d -m 0700 "${WATCHDOG_STATE_DIR}"
     {
         printf 'MEMORYSPLIT_BUILD_ID=%q\n' "${MEMORYSPLIT_BUILD_ID}"
         printf 'MEMORYSPLIT_KMS_KEY_ARN=%q\n' "${MEMORYSPLIT_KMS_KEY_ARN}"
         printf 'MEMORYSPLIT_LAUNCH_INTENT_SHA256=%q\n' \
             "${MEMORYSPLIT_LAUNCH_INTENT_SHA256}"
+        printf 'MEMORYSPLIT_SHUTDOWN_BIN=%q\n' "${SHUTDOWN_BIN}"
+        printf 'MEMORYSPLIT_TIMEOUT_BIN=%q\n' "${TIMEOUT_BIN}"
+        printf 'MEMORYSPLIT_AWS_BIN=%q\n' "${AWS_BIN}"
+        printf 'MEMORYSPLIT_PYTHON_BIN=%q\n' "${PYTHON_BIN}"
+        printf 'MEMORYSPLIT_SHA256_BIN=%q\n' "${SHA256_BIN}"
+        printf 'MEMORYSPLIT_AWK_BIN=%q\n' "${AWK_BIN}"
+        printf 'MEMORYSPLIT_SYNC_BIN=%q\n' "${SYNC_BIN}"
+        printf 'MEMORYSPLIT_TIMEOUT_MARKER=%q\n' \
+            "${WATCHDOG_STATE_DIR}/timeout.json"
     } >"${WATCHDOG_ENV}"
     chmod 0600 "${WATCHDOG_ENV}"
 
-    cat >"${WATCHDOG_PROGRAM}" <<'WATCHDOG'
+    {
+        cat <<'WATCHDOG_HEADER'
 #!/usr/bin/env bash
 set +e
 umask 077
-trap '/usr/sbin/shutdown -h now' EXIT
-source /etc/memorysplit-corpus-watchdog.env
-readonly marker="/var/lib/memorysplit-corpus-watchdog/timeout.json"
-install -d -m 0700 /var/lib/memorysplit-corpus-watchdog
-export MEMORYSPLIT_TIMEOUT_MARKER="${marker}"
-python3 <<'PY'
+WATCHDOG_HEADER
+        printf 'source %q || true\n' "${WATCHDOG_ENV}"
+        cat <<'WATCHDOG_BODY'
+: "${MEMORYSPLIT_SHUTDOWN_BIN:=/usr/sbin/shutdown}"
+: "${MEMORYSPLIT_TIMEOUT_BIN:=/usr/bin/timeout}"
+: "${MEMORYSPLIT_AWS_BIN:=/usr/bin/aws}"
+: "${MEMORYSPLIT_PYTHON_BIN:=/usr/bin/python3}"
+: "${MEMORYSPLIT_SHA256_BIN:=/usr/bin/sha256sum}"
+: "${MEMORYSPLIT_AWK_BIN:=/usr/bin/awk}"
+: "${MEMORYSPLIT_SYNC_BIN:=/usr/bin/sync}"
+: "${MEMORYSPLIT_TIMEOUT_MARKER:=/var/lib/memorysplit-corpus-watchdog/timeout.json}"
+
+terminate() {
+    if [[ -n "${MEMORYSPLIT_SHUTDOWN_BIN}" ]]; then
+        "${MEMORYSPLIT_SHUTDOWN_BIN}" -h now >/dev/null 2>&1 || true
+    else
+        /usr/sbin/shutdown -h now >/dev/null 2>&1 || true
+    fi
+}
+
+trap terminate EXIT
+terminate
+
+export MEMORYSPLIT_TIMEOUT_MARKER
+"${MEMORYSPLIT_PYTHON_BIN}" <<'PY'
 import datetime
 import json
 import os
@@ -311,37 +438,41 @@ with open(os.environ["MEMORYSPLIT_TIMEOUT_MARKER"], "w", encoding="utf-8") as st
     json.dump(value, stream, separators=(",", ":"), sort_keys=True)
     stream.write("\n")
 PY
-digest="$(sha256sum "${marker}" | awk '{print $1}')"
-/usr/bin/timeout 120s /usr/bin/aws s3api put-object \
+digest="$(
+    "${MEMORYSPLIT_SHA256_BIN}" "${MEMORYSPLIT_TIMEOUT_MARKER}" \
+        | "${MEMORYSPLIT_AWK_BIN}" '{print $1}'
+)"
+"${MEMORYSPLIT_TIMEOUT_BIN}" 5s "${MEMORYSPLIT_AWS_BIN}" s3api put-object \
     --region us-east-1 \
     --bucket memorysplit-corpus-056956104102-us-east-1 \
     --key "v2/builds/${MEMORYSPLIT_BUILD_ID}/operational/timeout.json" \
-    --body "${marker}" \
+    --body "${MEMORYSPLIT_TIMEOUT_MARKER}" \
     --server-side-encryption aws:kms \
     --ssekms-key-id "${MEMORYSPLIT_KMS_KEY_ARN}" \
     --metadata "sha256=${digest},build-id=${MEMORYSPLIT_BUILD_ID}" \
     --no-cli-pager \
     --output json >/dev/null 2>&1 || true
-/usr/bin/sync || true
-WATCHDOG
+"${MEMORYSPLIT_SYNC_BIN}" || true
+WATCHDOG_BODY
+    } >"${WATCHDOG_PROGRAM}"
     chmod 0700 "${WATCHDOG_PROGRAM}"
 
-    cat >/etc/systemd/system/memorysplit-corpus-watchdog.service <<'SERVICE'
+    cat >"${SYSTEMD_UNIT_DIR}/memorysplit-corpus-watchdog.service" <<SERVICE
 [Unit]
 Description=Terminate MemorySplit corpus builder before 24-hour ceiling
 
 [Service]
 Type=oneshot
-TimeoutStartSec=3min
-ExecStart=/usr/local/sbin/memorysplit-corpus-watchdog
+TimeoutStartSec=15s
+ExecStart=${WATCHDOG_PROGRAM}
 SERVICE
 
-    cat >/etc/systemd/system/memorysplit-corpus-watchdog.timer <<'TIMER'
+    cat >"${SYSTEMD_UNIT_DIR}/memorysplit-corpus-watchdog.timer" <<'TIMER'
 [Unit]
 Description=Terminate MemorySplit corpus builder before 24-hour ceiling
 
 [Timer]
-OnActiveSec=23h30m
+OnBootSec=23h30m
 Persistent=true
 AccuracySec=1s
 Unit=memorysplit-corpus-watchdog.service
@@ -350,11 +481,11 @@ Unit=memorysplit-corpus-watchdog.service
 WantedBy=timers.target
 TIMER
     chmod 0644 \
-        /etc/systemd/system/memorysplit-corpus-watchdog.service \
-        /etc/systemd/system/memorysplit-corpus-watchdog.timer
-    systemctl daemon-reload
-    systemctl enable --now memorysplit-corpus-watchdog.timer
-    systemctl is-active --quiet memorysplit-corpus-watchdog.timer \
+        "${SYSTEMD_UNIT_DIR}/memorysplit-corpus-watchdog.service" \
+        "${SYSTEMD_UNIT_DIR}/memorysplit-corpus-watchdog.timer"
+    "${SYSTEMCTL_BIN}" daemon-reload
+    "${SYSTEMCTL_BIN}" enable --now memorysplit-corpus-watchdog.timer
+    "${SYSTEMCTL_BIN}" is-active --quiet memorysplit-corpus-watchdog.timer \
         || die "termination watchdog timer did not start"
 }
 
@@ -365,7 +496,7 @@ seed_exact_package() {
     readonly SEED_CODE_ROOT="${RUNTIME_ROOT}/seed-code"
     response_path="${RUNTIME_ROOT}/seed-get-response.json"
     package_key="$(object_key_from_uri "${MEMORYSPLIT_PACKAGE_URI}")"
-    /usr/bin/timeout 900s /usr/bin/aws s3api get-object \
+    "${TIMEOUT_BIN}" 900s "${AWS_BIN}" s3api get-object \
         --region "${CORPUS_REGION}" \
         --bucket "${CORPUS_BUCKET}" \
         --key "${package_key}" \
@@ -526,32 +657,41 @@ run_driver() {
         /usr/bin/python3 "${DRIVER_PATH}"
 }
 
-discover_instance_store_nvmes
-build_scratch_array
-write_bootstrap_receipt
+main() {
+    configure_paths "${1:-/}"
+    SHUTDOWN_BIN="$(command -v shutdown || true)"
+    trap emergency_exit EXIT
+    install_watchdog
+    trap on_exit EXIT
+    initialize_runtime
+    discover_instance_store_nvmes
+    build_scratch_array
+    write_bootstrap_receipt
 
-install_watchdog
+    upload_file \
+        "v2/builds/${MEMORYSPLIT_BUILD_ID}/operational/bootstrap-receipt.json" \
+        "${BOOTSTRAP_RECEIPT}"
+    upload_phase_log "nvme-mounted"
+    upload_phase_log "watchdog-installed"
 
-upload_file \
-    "v2/builds/${MEMORYSPLIT_BUILD_ID}/operational/bootstrap-receipt.json" \
-    "${BOOTSTRAP_RECEIPT}"
-upload_phase_log "nvme-mounted"
-upload_phase_log "watchdog-installed"
+    seed_exact_package
+    upload_phase_log "bootstrap-seed-verified"
 
-seed_exact_package
-upload_phase_log "bootstrap-seed-verified"
+    download_and_verify_inputs
+    upload_phase_log "inputs-verified"
 
-download_and_verify_inputs
-upload_phase_log "inputs-verified"
+    install_verified_package
+    upload_phase_log "package-installed"
 
-install_verified_package
-upload_phase_log "package-installed"
+    run_driver
+    CURRENT_PHASE="driver-complete"
+    upload_phase_log "driver-complete"
 
-run_driver
-CURRENT_PHASE="driver-complete"
-upload_phase_log "driver-complete"
+    CURRENT_PHASE="normal-shutdown"
+    "${SYNC_BIN}"
+    request_shutdown
+}
 
-CURRENT_PHASE="normal-shutdown"
-sync
-SHUTDOWN_REQUESTED=1
-/usr/sbin/shutdown -h now
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    main "${1:-/}"
+fi
