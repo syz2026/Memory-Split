@@ -8,6 +8,7 @@ import json
 import os
 import shutil
 import tarfile
+import time
 from dataclasses import dataclass, replace
 from pathlib import Path
 
@@ -3906,6 +3907,136 @@ def test_persistent_emergency_occupation_reclassifies_and_names_cleanup_path(
             f"manual cleanup required at {cleanup_path}" in note
             for note in notes
         )
+
+
+def test_detach_failure_with_occupied_emergency_terminates_with_cleanup_path(
+    archive_authority: _AuthorityFixture,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    output_root = tmp_path / "derived"
+    final_name: str | None = None
+    manual_name: str | None = None
+    candidate_inode: int | None = None
+    emergency_inode: int | None = None
+    manual_attempts = 0
+    classifications = 0
+    timeout_guard_fired = False
+    deadline = time.monotonic() + 5.0
+    expected_iteration_limit = 16
+    original_rename = wikidata_source_module.atomic_rename_noreplace
+    original_classify = wikidata_source_module._classify_quarantine_exchange
+
+    def fail_after_publish(phase, authority, receipt_sha256):
+        nonlocal final_name, manual_name, candidate_inode, emergency_inode
+        if phase != "before_postpublish_verify":
+            return
+        final_name = receipt_sha256
+        manual_name = authority.name
+        namespace = output_root / "wikidata"
+        candidate_inode = (namespace / receipt_sha256).stat().st_ino
+        emergency = namespace / f".wikidata-marker-{receipt_sha256}-7"
+        emergency.mkdir(mode=0o700)
+        emergency_inode = emergency.stat().st_ino
+        raise RuntimeError("forced detach-and-emergency failure")
+
+    def fail_regular_marker_detach(_marker):
+        raise RuntimeError("injected regular marker detach failure")
+
+    def block_terminal_relocation(
+        source_directory_fd,
+        source_name,
+        destination_directory_fd,
+        destination_name,
+    ):
+        nonlocal manual_attempts
+        is_manual_fallback = (
+            final_name is not None
+            and manual_name is not None
+            and source_name == final_name
+            and destination_name == manual_name
+        )
+        if is_manual_fallback:
+            manual_attempts += 1
+            raise PermissionError("injected manual relocation failure")
+        return original_rename(
+            source_directory_fd,
+            source_name,
+            destination_directory_fd,
+            destination_name,
+        )
+
+    def timeout_guarded_classification(*args, **kwargs):
+        nonlocal classifications, timeout_guard_fired
+        classifications += 1
+        if (
+            classifications
+            > expected_iteration_limit * 2 + 4
+            or time.monotonic() >= deadline
+        ):
+            timeout_guard_fired = True
+            raise AssertionError("quarantine loop timeout guard fired")
+        return original_classify(*args, **kwargs)
+
+    monkeypatch.setattr(
+        wikidata_source_module,
+        "_derived_view_build_hook",
+        fail_after_publish,
+    )
+    monkeypatch.setattr(
+        wikidata_source_module,
+        "_detach_quarantine_marker",
+        fail_regular_marker_detach,
+    )
+    monkeypatch.setattr(
+        wikidata_source_module,
+        "atomic_rename_noreplace",
+        block_terminal_relocation,
+    )
+    monkeypatch.setattr(
+        wikidata_source_module,
+        "_classify_quarantine_exchange",
+        timeout_guarded_classification,
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match="forced detach-and-emergency failure",
+    ) as raised:
+        _build_view(archive_authority, output_root)
+
+    assert not timeout_guard_fired
+    assert time.monotonic() < deadline
+    assert (
+        wikidata_source_module._QUARANTINE_EXCHANGE_ATTEMPTS
+        == expected_iteration_limit
+    )
+    assert manual_attempts >= 1
+    assert final_name is not None
+    assert candidate_inode is not None
+    assert emergency_inode is not None
+    namespace = output_root / "wikidata"
+    final = namespace / final_name
+    emergency = namespace / f".wikidata-marker-{final_name}-7"
+    assert emergency.stat().st_ino == emergency_inode
+    candidate_paths = tuple(
+        path
+        for path in namespace.iterdir()
+        if path.stat().st_ino == candidate_inode
+    )
+    assert len(candidate_paths) == 1
+    cleanup_path = f"wikidata/{candidate_paths[0].name}"
+    error_text = "\n".join(
+        (str(raised.value), *getattr(raised.value, "__notes__", ()))
+    )
+    assert "injected regular marker detach failure" in error_text
+    assert "injected manual relocation failure" in error_text
+    assert f"manual cleanup required at {cleanup_path}" in error_text
+    if final.stat().st_ino == candidate_inode:
+        assert cleanup_path == f"wikidata/{final_name}"
+        assert "must not be trusted" in error_text
+    else:
+        assert "does not denote the retained failed candidate" in error_text
 
 
 @pytest.mark.parametrize(

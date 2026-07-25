@@ -4638,6 +4638,7 @@ def _verify_sealed_private_build(
 
 
 _QUARANTINE_SAME_STATE_RETRIES = 1
+_QUARANTINE_EXCHANGE_ATTEMPTS = 16
 _MARKER_POOL_SIZE = 8
 _MARKER_REGULAR_SLOT_COUNT = 7
 _MARKER_EMERGENCY_SLOT = 7
@@ -5600,6 +5601,80 @@ def _sync_and_classify_quarantine(
     return state
 
 
+def _quarantine_terminal_error(
+    authority: _PrivateBuildAuthority,
+    published_name: str,
+    marker: _QuarantineMarker,
+    *,
+    reason: str,
+    failures: tuple[tuple[str, BaseException], ...] = (),
+) -> ValueError:
+    recorded_failures = list(failures)
+    try:
+        fsync_directory(authority.namespace_fd)
+    except BaseException as error:
+        recorded_failures.append(("terminal namespace sync failure", error))
+
+    regular = _classify_quarantine_exchange(
+        authority,
+        published_name,
+        marker,
+    )
+    emergency_name = _marker_pool_slot_name(
+        marker.pool,
+        _MARKER_EMERGENCY_SLOT,
+    )
+    emergency = _classify_emergency_quarantine(
+        authority,
+        published_name,
+        emergency_name,
+    )
+
+    if regular.candidate_at_final or emergency.candidate_at_final:
+        cleanup_path = f"wikidata/{published_name}"
+        disposition = (
+            "retained failed candidate is still verified at "
+            f"{cleanup_path}; manual cleanup required at {cleanup_path}; "
+            "this path must not be trusted"
+        )
+    else:
+        cleanup_name: str | None = None
+        if emergency.candidate_at_emergency:
+            cleanup_name = emergency_name
+        elif emergency.candidate_at_manual:
+            cleanup_name = authority.name
+        elif regular.candidate_at_marker:
+            cleanup_name = marker.name
+
+        if cleanup_name is None:
+            disposition = (
+                "final content-addressed name was identity-reclassified and "
+                "does not denote the retained failed candidate; the retained "
+                "candidate cleanup path is unknown"
+            )
+        else:
+            cleanup_path = f"wikidata/{cleanup_name}"
+            disposition = (
+                f"retained failed candidate is verified at {cleanup_path}; "
+                f"manual cleanup required at {cleanup_path}; final "
+                "content-addressed name was identity-reclassified and does "
+                "not denote the retained failed candidate"
+            )
+
+    details = []
+    for label, failure in recorded_failures:
+        diagnostic = repr(failure)
+        notes = getattr(failure, "__notes__", ())
+        if notes:
+            diagnostic += "; notes: " + " | ".join(str(note) for note in notes)
+        details.append(f"{label}: {diagnostic}")
+
+    message = f"{reason}; {disposition}"
+    if details:
+        message += "; " + "; ".join(details)
+    return ValueError(message)
+
+
 def _exchange_quarantine_published_candidate(
     authority: _PrivateBuildAuthority,
     published_name: str,
@@ -5641,7 +5716,7 @@ def _exchange_quarantine_published_candidate(
     except BaseException as error:
         secondary_error = error
 
-    while True:
+    for _attempt in range(_QUARANTINE_EXCHANGE_ATTEMPTS):
         state = _classify_quarantine_exchange(
             authority,
             published_name,
@@ -5723,9 +5798,10 @@ def _exchange_quarantine_published_candidate(
             marker.entry_name = published_name
             try:
                 _detach_quarantine_marker(marker)
-            except BaseException as error:
+            except BaseException as detach_error:
+                prior_error = secondary_error
                 if secondary_error is None:
-                    secondary_error = error
+                    secondary_error = detach_error
                 try:
                     _check_named_derived_directory(
                         authority.namespace_fd,
@@ -5768,8 +5844,36 @@ def _exchange_quarantine_published_candidate(
                         marker.pool,
                     )
                 except BaseException as emergency_error:
-                    if secondary_error is None:
-                        secondary_error = emergency_error
+                    failures: list[tuple[str, BaseException]] = []
+                    if (
+                        prior_error is not None
+                        and prior_error is not detach_error
+                    ):
+                        failures.append(
+                            ("prior quarantine failure", prior_error)
+                        )
+                    failures.extend(
+                        (
+                            (
+                                "original marker detach failure",
+                                detach_error,
+                            ),
+                            (
+                                "emergency fallback failure",
+                                emergency_error,
+                            ),
+                        )
+                    )
+                    secondary_error = _quarantine_terminal_error(
+                        authority,
+                        published_name,
+                        marker,
+                        reason=(
+                            "regular marker detach and emergency fallback "
+                            "failed"
+                        ),
+                        failures=tuple(failures),
+                    )
                 continue
 
         one_sided_wrong_source = (
@@ -5798,8 +5902,33 @@ def _exchange_quarantine_published_candidate(
         if terminal.candidate_at_marker and terminal.marker_at_final:
             continue
         if secondary_error is not None:
-            raise secondary_error
+            raise _quarantine_terminal_error(
+                authority,
+                published_name,
+                marker,
+                reason="Wikidata quarantine failed",
+                failures=(("earlier quarantine failure", secondary_error),),
+            ) from secondary_error
         return marker.name
+
+    failures = (
+        (("earlier quarantine failure", secondary_error),)
+        if secondary_error is not None
+        else ()
+    )
+    exhausted = _quarantine_terminal_error(
+        authority,
+        published_name,
+        marker,
+        reason=(
+            "Wikidata quarantine iteration limit exhausted after "
+            f"{_QUARANTINE_EXCHANGE_ATTEMPTS} attempts"
+        ),
+        failures=failures,
+    )
+    if secondary_error is not None:
+        raise exhausted from secondary_error
+    raise exhausted
 
 
 def _cleanup_private_build(authority: _PrivateBuildAuthority) -> None:
