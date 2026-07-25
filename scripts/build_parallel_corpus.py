@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import sys
 from pathlib import Path
@@ -13,12 +14,13 @@ _ROOT = Path(__file__).resolve().parents[1]
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
+from cluster.aws.corpus_builder.driver import (  # noqa: E402
+    load_verified_production_inputs,
+)
 from corpusgen.parallel import (  # noqa: E402
     FixtureRenderer,
     IncompleteTaskResults,
-    InputCatalog,
     ParallelBuildConfig,
-    UnsupportedProductionRenderer,
     build_parallel_corpus,
     build_parallel_corpus_from_tasks,
     fixture_catalog,
@@ -29,6 +31,7 @@ from corpusgen.parallel import (  # noqa: E402
     render_task_result,
     verify_parallel_corpus,
 )
+from corpusgen.reasoning_v2.contracts import load_recipe  # noqa: E402
 
 
 def _print_receipt(receipt: dict) -> None:
@@ -57,18 +60,15 @@ def _nonnegative(value: str) -> int:
     return parsed
 
 
-def _lane_weights(values: list[str]) -> tuple[tuple[str, int], ...]:
-    weights = []
-    for value in values:
-        try:
-            lane, raw_weight = value.split("=", 1)
-            weight = int(raw_weight)
-        except ValueError as error:
-            raise ValueError("lane weights must use LANE=POSITIVE_INT") from error
-        if not lane or weight <= 0:
-            raise ValueError("lane weights must use LANE=POSITIVE_INT")
-        weights.append((lane, weight))
-    return tuple(weights)
+def _production_lane_weights() -> tuple[tuple[str, int], ...]:
+    recipe = load_recipe(_ROOT / "configs" / "reasoning-dataset-v2.json")
+    denominator = math.lcm(
+        *(share.denominator for _lane, share in recipe.lane_shares)
+    )
+    return tuple(
+        (lane, share.numerator * (denominator // share.denominator))
+        for lane, share in recipe.lane_shares
+    )
 
 
 def _config(args: argparse.Namespace, lane_weights) -> ParallelBuildConfig:
@@ -118,17 +118,17 @@ def _parser() -> argparse.ArgumentParser:
 
     production = commands.add_parser(
         "build-production",
-        help="exercise the explicit fail-closed production adapter boundary",
+        help="build from verified production source and derived authorities",
     )
-    _add_packing_options(production)
-    production.add_argument("--catalog", type=Path, required=True)
-    production.add_argument("--source", required=True)
-    production.add_argument(
-        "--lane-weight",
-        action="append",
-        required=True,
-        metavar="LANE=WEIGHT",
-    )
+    production.add_argument("--source-lock", type=Path, required=True)
+    production.add_argument("--source-root", type=Path, required=True)
+    production.add_argument("--derived-root", type=Path, required=True)
+    production.add_argument("--generator-commit", required=True)
+    production.add_argument("--output", type=Path, required=True)
+    production.add_argument("--update-tokens", type=_positive, required=True)
+    production.add_argument("--shards", type=_positive, required=True)
+    production.add_argument("--workers", type=_positive, required=True)
+    production.add_argument("--allow-fewer-shards", action="store_true")
 
     render_task = commands.add_parser(
         "render-fixture-task",
@@ -246,26 +246,14 @@ def main(argv: list[str] | None = None) -> int:
         catalog = fixture_catalog(args.records)
         renderer = FixtureRenderer()
         lane_weights = (("natural", 1), ("facts", 1), ("reasoning", 1))
-    elif args.command == "build-production":
-        catalog = InputCatalog.from_bytes(args.catalog.read_bytes())
-        renderer = UnsupportedProductionRenderer(args.source)
-        lane_weights = _lane_weights(args.lane_weight)
-    else:
-        raise AssertionError(f"unhandled command: {args.command}")
-    if (args.dense_target_weights is None) != (
-        args.split90_target_weights is None
-    ):
-        parser.error(
-            "--dense-target-weights and --split90-target-weights "
-            "must be supplied together"
-        )
-    receipt = build_parallel_corpus(
-        catalog,
-        renderer,
-        _config(args, lane_weights),
-        args.output,
-        workers=args.workers,
-        sidecar_paths=(
+        if (args.dense_target_weights is None) != (
+            args.split90_target_weights is None
+        ):
+            parser.error(
+                "--dense-target-weights and --split90-target-weights "
+                "must be supplied together"
+            )
+        sidecar_paths = (
             {
                 "dense_target_weights": args.dense_target_weights,
                 "split90_target_weights": args.split90_target_weights,
@@ -275,7 +263,27 @@ def main(argv: list[str] | None = None) -> int:
                 and args.split90_target_weights is not None
             )
             else None
-        ),
+        )
+    elif args.command == "build-production":
+        inputs = load_verified_production_inputs(
+            source_lock_path=args.source_lock,
+            source_root=args.source_root,
+            derived_root=args.derived_root,
+            expected_generator_commit=args.generator_commit,
+        )
+        catalog = inputs.catalog
+        renderer = inputs.renderer
+        lane_weights = _production_lane_weights()
+        sidecar_paths = dict(inputs.sidecars)
+    else:
+        raise AssertionError(f"unhandled command: {args.command}")
+    receipt = build_parallel_corpus(
+        catalog,
+        renderer,
+        _config(args, lane_weights),
+        args.output,
+        workers=args.workers,
+        sidecar_paths=sidecar_paths,
     )
     _print_receipt(receipt)
     return 0
