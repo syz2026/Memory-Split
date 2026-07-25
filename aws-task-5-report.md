@@ -259,3 +259,181 @@ executed here.
 
 Implementation commit:
 `c24123cbb56bd7dc56c01ae6cee514097abae6e8`.
+
+## Full code-review follow-up
+
+Implementation commit:
+`ba8d02ed84778538ca2a2e78f42c3a12a0773013`.
+
+### Critical 1: boot-anchored watchdog wiring
+
+Closed. `BuilderLaunchTemplate` now receives the Task 6 `render_bootstrap`
+payload as deterministic gzip encoded once as base64, without `Fn::Base64`.
+CloudFormation limits each String parameter to 4,096 characters, while the
+reviewed Task 6 fixture is 9,172 base64 characters and a 16,384-byte gzip
+payload can require 21,848 characters. The template therefore accepts six
+ordered chunks (five at 4,096 characters and one at 1,368) and joins them
+directly into `LaunchTemplateData.UserData`. The deployment integration must
+split the already-encoded value at those boundaries; it must not re-encode it.
+Changing any chunk creates a new launch-template version for Task 7/8 to
+preflight and launch by explicit numeric version.
+
+The launch template still fixes
+`InstanceInitiatedShutdownBehavior: terminate`. The frozen profile assertions
+now cover the 86,400-second compute ceiling, the 84,600-second (23h30m)
+boot-anchored watchdog/SSM timeout, `$5.491/hour`, and `$131.78` maximum compute
+cost.
+
+### Critical 2: controller launch authority
+
+Partially closed at the IAM layer, with the unsupported remainder documented
+rather than represented by fictitious condition keys.
+
+Applied controls:
+
+- `RunInstances` still requires the exact stack launch-template ARN and
+  `ec2:IsLaunchTemplateResource=true`, and now also requires
+  `ec2:InstanceMarketType=on-demand`.
+- The existing exact instance-type, IMDSv2, and request-tag conditions remain.
+- `ec2:ModifyInstanceAttribute` and `SetBuilderShutdownBehavior` were removed,
+  so the controller cannot change shutdown behavior or termination protection
+  after launch.
+
+AWS's *Actions, resources, and condition keys for Amazon EC2* reference lists
+`ec2:LaunchTemplate`, `ec2:IsLaunchTemplateResource`, and
+`ec2:InstanceMarketType`, but no condition keys for a launch-template version,
+`MinCount`, `MaxCount`, instance-initiated shutdown behavior, or termination
+protection. The `RunInstances` API reference exposes version and instance
+counts only as request fields. Consequently IAM cannot make a direct
+`RunInstances` grant enforce one instance, one numeric template version, or
+the shutdown scalar at launch.
+
+Task 8 remains the compensating trusted launch boundary: it verifies the exact
+numeric template version, calls `RunInstances` once with
+`MinCount=MaxCount=1`, a deterministic client token, no user-data or other
+launch overrides, and verifies/cleans up the returned instances. A principal
+that can assume the controller role can still bypass that client, so the
+cardinality/version/launch-time-shutdown portion of this Critical is **not
+fully closed by IAM**. Closing it independently of trusted client code would
+require a mediated launch service or another stateful authorization boundary,
+which is outside this foundation's approved resource inventory.
+
+### KMS and S3 hardening
+
+- Builder cryptographic calls require
+  `kms:ViaService=s3.${AWS::Region}.amazonaws.com` and the artifact-bucket
+  encryption context. The context is the bucket ARN because S3 Bucket Keys
+  are enabled.
+- Controller EBS cryptographic calls require
+  `kms:ViaService=ec2.${AWS::Region}.amazonaws.com` and the `aws:ebs:id`
+  encryption-context key. `CreateGrant` also requires the EC2 service path and
+  `kms:GrantIsForAWSResource=true`.
+- Controller `kms:DescribeKey` remains a direct, read-only call scoped to the
+  one key because Task 7 preflight uses it to verify live key metadata before
+  launch; it is not a cryptographic operation.
+- Both wrong-algorithm and wrong-key bucket-policy denies now cover
+  `v2/builds/*`, `v2/packages/*`, and `v2/sources/*`.
+
+### Governance-retention cleanup
+
+Failed, partial, and quarantined build output **can be physically deleted
+within the 365-day GOVERNANCE period**. Default retention applies to the
+`v2/builds/*` objects, so the controller now has:
+
+- `s3:ListBucketVersions` on the bucket, conditioned to `v2/builds/*`; and
+- `s3:DeleteObjectVersion` plus `s3:BypassGovernanceRetention`, scoped only to
+  `${ArtifactBucket.Arn}/v2/builds/*`.
+
+Cleanup must address the exact version ID and send
+`x-amz-bypass-governance-retention:true`; deleting without a version would
+only create a delete marker and would not remove billed locked bytes.
+Packages and sources are immutable inputs, not failure output, and remain
+outside this cleanup grant. As expected for governance mode, the controller
+can also bypass retention for a successful build version under the same
+prefix; this is an explicit operator trust boundary, not an automatic
+lifecycle path.
+
+### Guard non-vacuity and TDD evidence
+
+The guard now requires exactly one launch template, one required instance tag,
+one required volume tag, every expected IAM/endpoint/bucket policy SID, both
+trust-policy SIDs, one SSM shell step, one exact command, and all five exact
+SSM parameters. The old broad guard-text search was replaced by 13 template
+mutations covering missing/altered launch, user-data, tags, trust statements,
+policy SIDs, SSM command, step, and parameters.
+
+RED/GREEN evidence:
+
+```text
+Watchdog wiring RED:       2 failed, 19 passed
+Watchdog wiring GREEN:     21 passed
+IAM/KMS/S3 cleanup RED:    3 failed, 20 passed
+IAM/KMS/S3 cleanup GREEN:  23 passed
+Guard count RED:           1 failed, 36 passed
+Guard count GREEN:         37 passed
+```
+
+The first `cfn-lint` review run correctly rejected a single 21,848-character
+parameter with `E2001: 21848 is greater than the maximum of 4096`. Chunking
+regressions then produced `3 failed, 34 passed`; the six-part implementation
+returned the suite to `37 passed`.
+
+Cross-component review caught that applying `kms:ViaService` to controller
+`DescribeKey` would break Task 7's direct metadata check. Its focused RED was
+`1 failed, 36 deselected`; the final full suite covers the corrected split
+between direct metadata read and service-bound cryptographic use.
+
+Fresh final validation:
+
+```text
+CFN_GUARD=.cfn-guard-tool/bin/cfn-guard \
+  python -m pytest -q tests/test_aws_corpus_builder_foundation.py
+37 passed in 1.71s
+
+cfn-lint 1.53.2
+exit 0, no findings
+
+cfn-guard 3.2.0 validate --rules <guard> --data <template>
+exit 0, no findings
+
+python -m py_compile tests/test_aws_corpus_builder_foundation.py
+git diff HEAD^ HEAD --check
+git diff --check
+all exit 0, no findings
+```
+
+CloudFormation Guard still has no PyPI distribution, but this follow-up
+installed version 3.2.0 temporarily from crates.io. The real guard engine
+validated the final template and rejected all 13 mutations; the temporary
+binary was then removed.
+
+### Package approval and standing cost
+
+`PackageUri` remains caller-selected within `v2/packages/`; duplicating Task
+7's software gate in this static template would not add authority. Task 7
+first performs exact-version S3 verification, then binds the archive bytes and
+SHA-256 to the canonical package manifest, binds the manifest revision to
+metadata on that same immutable package object version, and requires the
+closed production module authority set. The emitted launch intent therefore
+authorizes the exact verified package object rather than any object that merely
+matches the SSM URI pattern.
+
+Deploying this stack starts standing non-compute charges. At the published
+us-east-1 price of `$0.01` per interface-endpoint ENI-hour, seven one-AZ
+interface endpoints are approximately `$51.10/month` at 730 hours. The
+retained customer-managed KMS key starts at `$1/month`, for an initial standing
+base of approximately **$52.10/month**, before endpoint data processing, KMS
+requests, S3 storage/requests, and CloudWatch Logs. Automatic rotation adds
+another `$1/month` after each of the first two rotations (capped after the
+second). The S3 gateway endpoint has no endpoint-hour charge.
+
+### Follow-up self-review
+
+- Only the owned template, guard, test, and report files changed; no AWS API,
+  deployment, or change-set operation occurred.
+- `PENDING-REVIEW-FINDINGS.md` remains untracked and untouched.
+- Critical 1 is closed. Critical 2's supported IAM controls are tightened, but
+  the absence of EC2 condition keys for count/version/launch-time shutdown is
+  an explicit remaining boundary, not silently widened policy.
+- Governance cleanup removes billed object versions rather than merely adding
+  delete markers, and is scoped away from package/source inputs.
