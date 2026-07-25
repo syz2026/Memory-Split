@@ -27,12 +27,15 @@ _TARGET_ACCOUNT_ID = "056956104102"
 _MAX_RUNTIME = timedelta(hours=24)
 _DESCRIBE_ATTEMPTS = 20
 _DESCRIBE_DELAY_SECONDS = 0.25
+_TERMINATE_ATTEMPTS = 3
+_TERMINATION_CONFIRM_ATTEMPTS = 20
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _INSTANCE_ID_RE = re.compile(r"^i-(?:[0-9a-f]{8}|[0-9a-f]{17})$")
 _INSTANCE_PROFILE_ACCOUNT_RE = re.compile(
     r"^arn:aws:iam::([0-9]{12}):instance-profile/"
 )
 _ACTIVE_INSTANCE_STATES = ("pending", "running", "stopping", "stopped")
+_TERMINATED_INSTANCE_STATES = {"shutting-down", "terminated"}
 
 _PRICE_FILTERS = (
     ("capacitystatus", "Used"),
@@ -395,23 +398,112 @@ def _run_instance_ids(response: object) -> tuple[list[str], int]:
     return identifiers, len(instances)
 
 
+def _termination_response_confirms(
+    response: object,
+    instance_ids: list[str],
+) -> bool:
+    try:
+        response = _mapping(response, label="TerminateInstances response")
+        rows = _list(
+            response.get("TerminatingInstances"),
+            label="terminating instances",
+        )
+        states: dict[str, str] = {}
+        for row_value in rows:
+            row = _mapping(row_value, label="terminating instance")
+            identifier = _instance_id(row.get("InstanceId"))
+            current_state = row.get("CurrentState")
+            state_name = (
+                current_state.get("Name")
+                if isinstance(current_state, Mapping)
+                else None
+            )
+            if (
+                identifier is None
+                or identifier in states
+                or not isinstance(state_name, str)
+                or state_name not in _TERMINATED_INSTANCE_STATES
+            ):
+                return False
+            states[identifier] = state_name
+    except LaunchError:
+        return False
+    return set(states) == set(instance_ids)
+
+
+def _termination_is_confirmed(
+    ec2: Ec2Client,
+    instance_ids: list[str],
+) -> bool:
+    for identifier in instance_ids:
+        try:
+            response = ec2.describe_instances(InstanceIds=[identifier])
+        except Exception as error:
+            if _not_found(error):
+                continue
+            return False
+        try:
+            response = _mapping(
+                response,
+                label="termination DescribeInstances response",
+            )
+            if response.get("NextToken") not in (None, ""):
+                return False
+            instances = _described_instances(response)
+        except LaunchError:
+            return False
+        if len(instances) != 1 or instances[0].get("InstanceId") != identifier:
+            return False
+        state = instances[0].get("State")
+        state_name = state.get("Name") if isinstance(state, Mapping) else None
+        if (
+            not isinstance(state_name, str)
+            or state_name not in _TERMINATED_INSTANCE_STATES
+        ):
+            return False
+    return True
+
+
 def _terminate_then_raise(
     ec2: Ec2Client,
     instance_ids: list[str],
     message: str,
     *,
+    sleep: Callable[[float], None],
     cause: Exception | None = None,
 ) -> None:
     identifiers = sorted(set(instance_ids))
     if not identifiers:
         raise LaunchError(message) from cause
-    try:
-        ec2.terminate_instances(InstanceIds=identifiers)
-    except Exception as termination_error:
-        raise LaunchError(
-            f"{message}; termination failed for {', '.join(identifiers)}"
-        ) from termination_error
-    raise LaunchError(message) from cause
+    cleanup_error: Exception | None = None
+    for attempt in range(_TERMINATE_ATTEMPTS):
+        try:
+            response = ec2.terminate_instances(InstanceIds=identifiers)
+        except Exception as error:
+            cleanup_error = error
+        else:
+            if _termination_response_confirms(response, identifiers):
+                break
+            cleanup_error = LaunchError(
+                "TerminateInstances response did not confirm shutdown"
+            )
+        if attempt + 1 < _TERMINATE_ATTEMPTS:
+            sleep(_DESCRIBE_DELAY_SECONDS)
+
+    for attempt in range(_TERMINATION_CONFIRM_ATTEMPTS):
+        if _termination_is_confirmed(ec2, identifiers):
+            raise LaunchError(message) from cause
+        if attempt + 1 < _TERMINATION_CONFIRM_ATTEMPTS:
+            sleep(_DESCRIBE_DELAY_SECONDS)
+
+    manual_command = (
+        "aws ec2 terminate-instances --profile sbsandbox "
+        f"--region {_REGION} --instance-ids {' '.join(identifiers)}"
+    )
+    raise LaunchError(
+        f"{message}; automatic termination could not be confirmed for "
+        f"{', '.join(identifiers)}. Manually run: {manual_command}"
+    ) from (cleanup_error or cause)
 
 
 def _not_found(error: Exception) -> bool:
@@ -493,6 +585,8 @@ def _refuse_active_approval_replay(
 def _wait_for_instance(
     ec2: Ec2Client,
     instance_id: str,
+    *,
+    sleep: Callable[[float], None],
 ) -> Mapping[str, object]:
     for attempt in range(_DESCRIBE_ATTEMPTS):
         try:
@@ -513,7 +607,7 @@ def _wait_for_instance(
                 )
             return instances[0]
         if attempt + 1 < _DESCRIBE_ATTEMPTS:
-            time.sleep(_DESCRIBE_DELAY_SECONDS)
+            sleep(_DESCRIBE_DELAY_SECONDS)
     raise LaunchError("launched instance did not become describable")
 
 
@@ -640,6 +734,7 @@ def launch_approved_builder(
     ec2: Ec2Client,
     now: datetime,
     clock: Callable[[], datetime] | None = None,
+    sleep: Callable[[float], None] | None = None,
 ) -> BuilderLaunch:
     """Launch one exact approved builder and immediately verify its lifecycle."""
 
@@ -670,6 +765,7 @@ def launch_approved_builder(
     launch_clock = clock or _system_utc_now
     if _utc(launch_clock()) >= expiry:
         raise LaunchError("launch intent has expired")
+    pause = sleep or time.sleep
     request = {
         "ClientToken": actual_sha256,
         "LaunchTemplate": {
@@ -697,13 +793,19 @@ def launch_approved_builder(
             ec2,
             instance_ids,
             "RunInstances did not return exactly one instance",
+            sleep=pause,
         )
     instance_id = instance_ids[0]
+    launch_time: datetime
     try:
-        instance = _wait_for_instance(ec2, instance_id)
+        instance = _wait_for_instance(ec2, instance_id, sleep=pause)
         _verify_launched_instance(instance, intent)
         _verify_shutdown_behavior(ec2, instance_id)
         _verify_no_security_group_ingress(ec2, intent.security_group_id)
+        launch_time_value = instance.get("LaunchTime")
+        if not isinstance(launch_time_value, datetime):
+            raise LaunchError("described instance LaunchTime is missing")
+        launch_time = _utc(launch_time_value)
     except Exception as error:
         message = (
             str(error)
@@ -714,10 +816,10 @@ def launch_approved_builder(
             ec2,
             [instance_id],
             message,
+            sleep=pause,
             cause=error,
         )
 
-    launch_time = current.replace(microsecond=0)
     return BuilderLaunch(
         instance_id=instance_id,
         launch_intent_sha256=actual_sha256,

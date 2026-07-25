@@ -355,8 +355,10 @@ class FakeEc2:
                     raise response
                 assert isinstance(response, dict)
                 return deepcopy(response)
+            requested_ids = kwargs.get("InstanceIds")
+            assert isinstance(requested_ids, list)
             return _instance_state_response(
-                self.terminated_instance_ids,
+                requested_ids,
                 self.termination_default_state,
             )
         if not self.describe_responses:
@@ -407,6 +409,7 @@ def _launch(ec2: FakeEc2, *, payload: bytes = INTENT_BYTES):
         ec2=ec2,
         now=NOW,
         clock=lambda: NOW,
+        sleep=lambda _seconds: None,
     )
 
 
@@ -417,8 +420,8 @@ def test_launch_requires_exact_unexpired_intent_hash_and_one_instance():
 
     assert launch.instance_id == INSTANCE_ID
     assert launch.launch_intent_sha256 == INTENT_SHA256
-    assert launch.launch_time == "2026-07-25T03:00:00Z"
-    assert launch.terminate_at == "2026-07-26T03:00:00Z"
+    assert launch.launch_time == "2026-07-25T03:05:00Z"
+    assert launch.terminate_at == "2026-07-26T03:05:00Z"
     assert ec2.identity_calls == [{}]
     assert ec2.template_calls == [
         {
@@ -682,7 +685,11 @@ def test_launch_terminates_all_returned_instances_if_run_instances_returns_two()
     with pytest.raises(LaunchError):
         _launch(ec2)
 
-    assert ec2.describe_calls == [{"Filters": _replay_filters()}]
+    assert ec2.describe_calls == [
+        {"Filters": _replay_filters()},
+        {"InstanceIds": [INSTANCE_ID]},
+        {"InstanceIds": [SECOND_INSTANCE_ID]},
+    ]
     assert ec2.terminate_calls == [
         {"InstanceIds": [INSTANCE_ID, SECOND_INSTANCE_ID]}
     ]
@@ -700,7 +707,10 @@ def test_launch_rejects_a_malformed_second_run_instance_and_terminates_the_known
     with pytest.raises(LaunchError):
         _launch(ec2)
 
-    assert ec2.describe_calls == [{"Filters": _replay_filters()}]
+    assert ec2.describe_calls == [
+        {"Filters": _replay_filters()},
+        {"InstanceIds": [INSTANCE_ID]},
+    ]
     assert ec2.attribute_calls == []
     assert ec2.terminate_calls == [{"InstanceIds": [INSTANCE_ID]}]
 
@@ -831,6 +841,40 @@ def test_cleanup_retries_transient_termination_and_confirms_state():
     ]
 
 
+def test_cleanup_retries_a_malformed_termination_response():
+    ec2 = FakeEc2()
+    instance = _described_instance()
+    instance["ImageId"] = "ami-fedcba98765432100"
+    ec2.describe_responses = [
+        {"Reservations": [{"Instances": [instance]}]}
+    ]
+    ec2.terminate_outcomes = [
+        {
+            "TerminatingInstances": [
+                {
+                    "CurrentState": {"Name": []},
+                    "InstanceId": INSTANCE_ID,
+                }
+            ]
+        },
+        None,
+    ]
+
+    with pytest.raises(
+        LaunchError,
+        match="launched instance safety attributes do not match the intent",
+    ):
+        _launch(ec2)
+
+    assert ec2.terminate_calls == [
+        {"InstanceIds": [INSTANCE_ID]},
+        {"InstanceIds": [INSTANCE_ID]},
+    ]
+    assert ec2.termination_describe_calls == [
+        {"InstanceIds": [INSTANCE_ID]}
+    ]
+
+
 def test_cleanup_that_never_confirms_names_instance_and_manual_command():
     ec2 = FakeEc2()
     instance = _described_instance()
@@ -919,9 +963,9 @@ def test_cli_requires_explicit_hash_and_prints_lifecycle_and_cost(
     assert output == {
         "instance_id": INSTANCE_ID,
         "launch_intent_sha256": INTENT_SHA256,
-        "launch_time": "2026-07-25T03:00:00Z",
+        "launch_time": "2026-07-25T03:05:00Z",
         "max_compute_usd": "131.78",
-        "terminate_at": "2026-07-26T03:00:00Z",
+        "terminate_at": "2026-07-26T03:05:00Z",
     }
     assert session.calls == [
         ("ec2", "us-east-1"),
