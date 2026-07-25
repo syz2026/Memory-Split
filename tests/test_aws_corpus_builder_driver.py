@@ -15,7 +15,7 @@ from cluster.aws.corpus_builder.contracts import (
 )
 from cluster.aws.corpus_builder.s3 import PublicationError
 from corpusgen.parallel import FixtureRenderer, fixture_catalog
-from test_aws_corpus_builder_s3 import VersionedFakeS3
+from test_aws_corpus_builder_s3 import FakeClientError, VersionedFakeS3
 
 from cluster.aws.corpus_builder import driver
 
@@ -39,6 +39,22 @@ class RecordingRunner:
         if self.before is not None:
             self.before(phase)
         return action()
+
+
+class InterruptingUploadS3(VersionedFakeS3):
+    def __init__(self) -> None:
+        super().__init__()
+        self.render_uploads = 0
+        self.interrupted = False
+
+    def put_object(self, **kwargs: object):
+        metadata = kwargs.get("Metadata")
+        if isinstance(metadata, dict) and metadata.get("phase") == "render-pack":
+            self.render_uploads += 1
+            if self.render_uploads == 2 and not self.interrupted:
+                self.interrupted = True
+                raise FakeClientError("interrupted during render upload")
+        return super().put_object(**kwargs)
 
 
 def _request(tmp_path: Path) -> driver.CorpusBuildRequest:
@@ -71,8 +87,31 @@ def _install_fixture_pipeline(
     monkeypatch: pytest.MonkeyPatch,
     *,
     cleanroom_shards: list[bytes] | None = None,
-) -> None:
+) -> dict[str, object]:
     real_execute = driver._execute_phase
+    state: dict[str, object] = {"render_roots": []}
+
+    def production_inputs(context) -> driver.VerifiedProductionInputs:
+        value = state.get("inputs")
+        if isinstance(value, driver.VerifiedProductionInputs):
+            return value
+        sidecar = _write(
+            context.request.work_root / "fixture-inputs" / "dense.bin",
+            b"fixture-sidecar\n",
+        )
+        value = driver.VerifiedProductionInputs(
+            catalog=fixture_catalog(3),
+            renderer=FixtureRenderer(),
+            sidecars={"dense": sidecar},
+        )
+        state["inputs"] = value
+        return value
+
+    def phase_action_root(context, phase: str) -> Path:
+        action_root = getattr(driver, "_phase_action_root", None)
+        if callable(action_root):
+            return action_root(context, phase)
+        return driver._phase_local_root(context.request, phase)
 
     def verify(corpus: Path, *, expected_build_id: str):
         receipt = json.loads((corpus / "receipt.json").read_bytes())
@@ -87,6 +126,10 @@ def _install_fixture_pipeline(
             return real_execute(context, phase)
 
         if phase == "render-pack":
+            root = phase_action_root(context, phase)
+            render_roots = state["render_roots"]
+            assert isinstance(render_roots, list)
+            render_roots.append(root)
             receipt = (
                 json.dumps(
                     {"build_id": context.request.build_id},
@@ -95,9 +138,9 @@ def _install_fixture_pipeline(
                 ).encode("ascii")
                 + b"\n"
             )
-            _write(context.request.output_root / "receipt.json", receipt)
+            _write(root / "receipt.json", receipt)
             _write(
-                context.request.output_root / "shards" / "00000.bin",
+                root / "shards" / "00000.bin",
                 b"original-corpus-shard\n",
             )
             artifacts = tuple(
@@ -105,17 +148,47 @@ def _install_fixture_pipeline(
                     path=path,
                     relative_key=(
                         "phase-artifacts/render-pack/"
-                        f"{path.relative_to(context.request.output_root).as_posix()}"
+                        f"{path.relative_to(root).as_posix()}"
                     ),
                 )
                 for path in sorted(
                     (
-                        context.request.output_root / "receipt.json",
-                        context.request.output_root / "shards" / "00000.bin",
+                        root / "receipt.json",
+                        root / "shards" / "00000.bin",
                     )
                 )
             )
             return driver._PhaseOutcome(artifacts=artifacts)
+
+        if phase == "catalog":
+            inputs = production_inputs(context)
+            artifact = phase_action_root(context, phase) / "production-inputs.json"
+            _write(
+                artifact,
+                (
+                    json.dumps(
+                        {
+                            "catalog_sha256": inputs.catalog.sha256,
+                            "renderer_id": inputs.renderer.renderer_id,
+                            "sidecars": {
+                                name: hashlib.sha256(path.read_bytes()).hexdigest()
+                                for name, path in inputs.sidecars.items()
+                            },
+                        },
+                        separators=(",", ":"),
+                        sort_keys=True,
+                    ).encode("ascii")
+                    + b"\n"
+                ),
+            )
+            return driver._PhaseOutcome(
+                artifacts=(
+                    driver._Artifact(
+                        path=artifact,
+                        relative_key=f"phase-artifacts/{phase}/{artifact.name}",
+                    ),
+                )
+            )
 
         if phase == "local-verify":
             verify(
@@ -143,10 +216,7 @@ def _install_fixture_pipeline(
             )
 
         artifact = _write(
-            context.request.work_root
-            / "phases"
-            / phase
-            / "phase-artifact.json",
+            phase_action_root(context, phase) / "phase-artifact.json",
             (
                 json.dumps(
                     {"build_id": context.request.build_id, "phase": phase},
@@ -166,7 +236,9 @@ def _install_fixture_pipeline(
         )
 
     monkeypatch.setattr(driver, "verify_parallel_corpus", verify)
+    monkeypatch.setattr(driver, "_load_context_production_inputs", production_inputs)
     monkeypatch.setattr(driver, "_execute_phase", execute)
+    return state
 
 
 def _receipt_payload(s3: VersionedFakeS3, key_fragment: str) -> bytes:
@@ -233,6 +305,153 @@ def test_driver_reuses_only_exact_verified_phase_receipts(
     driver.run_corpus_build(request, s3=s3, runner=resumed)
 
     assert resumed.phases == list(driver.PHASES[3:])
+
+
+def test_changed_shard_count_cannot_reuse_phase_receipts(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    _install_fixture_pipeline(monkeypatch)
+    request = _request(tmp_path)
+    s3 = VersionedFakeS3()
+    with pytest.raises(RuntimeError, match="interrupted"):
+        driver.run_corpus_build(
+            request,
+            s3=s3,
+            runner=RecordingRunner(stop_before="render-pack"),
+        )
+    changed = replace(request, shard_count=request.shard_count + 1)
+    resumed = RecordingRunner(stop_before="source-stage")
+
+    with pytest.raises(RuntimeError, match="interrupted before source-stage"):
+        driver.run_corpus_build(changed, s3=s3, runner=resumed)
+
+    assert resumed.phases == ["source-stage"]
+
+
+def test_reused_catalog_rejects_changed_production_inputs(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    state = _install_fixture_pipeline(monkeypatch)
+    request = _request(tmp_path)
+    s3 = VersionedFakeS3()
+    with pytest.raises(RuntimeError, match="interrupted"):
+        driver.run_corpus_build(
+            request,
+            s3=s3,
+            runner=RecordingRunner(stop_before="render-pack"),
+        )
+    inputs = state["inputs"]
+    assert isinstance(inputs, driver.VerifiedProductionInputs)
+    inputs.sidecars["dense"].write_bytes(b"changed-sidecar\n")
+    resumed = RecordingRunner()
+
+    with pytest.raises(PublicationError, match="catalog.*input"):
+        driver.run_corpus_build(request, s3=s3, runner=resumed)
+
+    assert resumed.phases == []
+
+
+def test_interrupted_action_keeps_partial_output_private(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    state = _install_fixture_pipeline(monkeypatch)
+    request = _request(tmp_path)
+    s3 = VersionedFakeS3()
+    execute = driver._execute_phase
+    interrupted = False
+
+    def interrupt_after_output(context, phase: str):
+        nonlocal interrupted
+        outcome = execute(context, phase)
+        if phase == "render-pack" and not interrupted:
+            interrupted = True
+            raise RuntimeError("interrupted during render-pack action")
+        return outcome
+
+    monkeypatch.setattr(driver, "_execute_phase", interrupt_after_output)
+
+    with pytest.raises(RuntimeError, match="during render-pack action"):
+        driver.run_corpus_build(request, s3=s3, runner=RecordingRunner())
+
+    render_roots = state["render_roots"]
+    assert isinstance(render_roots, list)
+    assert render_roots
+    assert render_roots[0] != request.output_root
+    assert not request.output_root.exists()
+
+    resumed = RecordingRunner()
+    driver.run_corpus_build(request, s3=s3, runner=resumed)
+
+    assert resumed.phases == list(driver.PHASES[3:])
+    assert len(render_roots) == 2
+    assert len(set(render_roots)) == 2
+    assert all(root != request.output_root for root in render_roots)
+
+
+def test_interrupted_upload_reruns_in_a_fresh_private_attempt(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    state = _install_fixture_pipeline(monkeypatch)
+    request = _request(tmp_path)
+    s3 = InterruptingUploadS3()
+    first = RecordingRunner()
+
+    with pytest.raises(PublicationError, match="upload failed"):
+        driver.run_corpus_build(request, s3=s3, runner=first)
+
+    assert first.phases == list(driver.PHASES[:4])
+    assert s3.render_uploads == 2
+    assert not any(
+        "/receipts/phases/03-render-pack-" in str(call["Key"])
+        for call in s3.put_calls
+    )
+
+    resumed = RecordingRunner()
+    driver.run_corpus_build(request, s3=s3, runner=resumed)
+
+    render_roots = state["render_roots"]
+    assert isinstance(render_roots, list)
+    assert resumed.phases == list(driver.PHASES[3:])
+    assert len(render_roots) == 2
+    assert len(set(render_roots)) == 2
+    assert all(root != request.output_root for root in render_roots)
+
+
+def test_successful_phase_discards_private_producer_scratch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    _install_fixture_pipeline(monkeypatch)
+    request = _request(tmp_path)
+    s3 = VersionedFakeS3()
+    execute = driver._execute_phase
+    containers: list[Path] = []
+
+    def leave_private_scratch(context, phase: str):
+        outcome = execute(context, phase)
+        if phase == "render-pack":
+            container = context.attempt_container
+            assert isinstance(container, Path)
+            containers.append(container)
+            _write(container / "producer-private" / "scratch.bin", b"scratch\n")
+        return outcome
+
+    monkeypatch.setattr(driver, "_execute_phase", leave_private_scratch)
+
+    with pytest.raises(RuntimeError, match="interrupted before local-verify"):
+        driver.run_corpus_build(
+            request,
+            s3=s3,
+            runner=RecordingRunner(stop_before="local-verify"),
+        )
+
+    assert containers
+    assert not containers[0].exists()
+    assert request.output_root.is_dir()
 
 
 def test_resume_rejects_missing_exact_object_before_running_phase(

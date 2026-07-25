@@ -8,6 +8,7 @@ import math
 import os
 import re
 import secrets
+import shutil
 import stat
 import tempfile
 from collections.abc import Callable, Mapping
@@ -46,6 +47,7 @@ from corpusgen.parallel import (
     verify_parallel_corpus,
 )
 from corpusgen.parallel.canonical import canonical_json_bytes
+from corpusgen.parallel.safeio import atomic_rename_noreplace, fsync_directory
 from corpusgen.reasoning_v2.contracts import load_recipe
 from corpusgen.reasoning_v2.source_lock import (
     SourceLock,
@@ -69,6 +71,7 @@ PHASES = (
     "s3-publish",
     "cleanroom-verify",
 )
+_LOCAL_OUTPUT_PHASES = frozenset(PHASES[:5])
 
 _SHA256_RE = re.compile(r"[0-9a-f]{64}\Z")
 _COMMIT_RE = re.compile(r"[0-9a-f]{40}\Z")
@@ -294,6 +297,9 @@ class _BuildContext:
     receipt_versions: dict[str, S3ObjectVersion] = field(default_factory=dict)
     production_inputs: VerifiedProductionInputs | None = None
     source_lock: SourceLock | None = None
+    attempt_phase: str | None = None
+    attempt_container: Path | None = None
+    attempt_output: Path | None = None
 
 
 def _file_commitment(path: Path, description: str) -> tuple[int, str]:
@@ -383,8 +389,12 @@ def _request_seed(request: CorpusBuildRequest) -> str:
         canonical_json_bytes(
             {
                 "build_id": request.build_id,
+                "bucket": request.bucket,
+                "kms_key_arn": request.kms_key_arn,
                 "package_sha256": request.package_sha256,
-                "schema": "memorysplit-aws-corpus-driver-v1",
+                "prefix": request.prefix,
+                "schema": "memorysplit-aws-corpus-driver-v2",
+                "shard_count": request.shard_count,
                 "source_lock_sha256": request.source_lock_sha256,
             }
         )
@@ -420,6 +430,175 @@ def _phase_local_root(request: CorpusBuildRequest, phase: str) -> Path:
     if phase == "render-pack":
         return request.output_root
     return request.work_root / "phases" / phase
+
+
+def _phase_action_root(context: _BuildContext, phase: str) -> Path:
+    if phase in _LOCAL_OUTPUT_PHASES:
+        if context.attempt_phase != phase or context.attempt_output is None:
+            raise PublicationError(f"{phase} lacks an active private phase attempt")
+        return context.attempt_output
+    return _phase_local_root(context.request, phase)
+
+
+def _begin_phase_attempt(context: _BuildContext, phase: str) -> None:
+    if phase not in _LOCAL_OUTPUT_PHASES:
+        return
+    if (
+        context.attempt_phase is not None
+        or context.attempt_container is not None
+        or context.attempt_output is not None
+    ):
+        raise PublicationError("another private phase attempt is already active")
+    stable = _phase_local_root(context.request, phase)
+    stable.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    container = Path(
+        tempfile.mkdtemp(
+            prefix=f".{stable.name}.{phase}.attempt-",
+            dir=stable.parent,
+        )
+    )
+    os.chmod(container, 0o700)
+    context.attempt_phase = phase
+    context.attempt_container = container
+    context.attempt_output = container / "output"
+
+
+def _clear_phase_attempt(context: _BuildContext) -> None:
+    context.attempt_phase = None
+    context.attempt_container = None
+    context.attempt_output = None
+
+
+def _tree_commitments(
+    root: Path,
+    *,
+    description: str,
+) -> tuple[tuple[str, int, str], ...]:
+    return tuple(
+        (
+            path.relative_to(root).as_posix(),
+            *_file_commitment(path, description),
+        )
+        for path in _walk_regular_files(root)
+    )
+
+
+def _promote_phase_output(
+    context: _BuildContext,
+    phase: str,
+    outcome: _PhaseOutcome,
+) -> _PhaseOutcome:
+    if phase not in _LOCAL_OUTPUT_PHASES:
+        return outcome
+    source = context.attempt_output
+    container = context.attempt_container
+    if (
+        context.attempt_phase != phase
+        or source is None
+        or container is None
+    ):
+        raise PublicationError(f"{phase} lacks a private phase attempt")
+    if outcome.objects:
+        raise PublicationError(f"{phase} returned exact objects instead of local output")
+
+    expected_artifacts: set[Path] = set()
+    for artifact in outcome.artifacts:
+        relative = _safe_relative(artifact.relative_key, "phase artifact key")
+        expected_prefix = ("phase-artifacts", phase)
+        if relative.parts[:2] != expected_prefix or len(relative.parts) < 3:
+            raise PublicationError(
+                f"{phase} artifact must use phase-artifacts/{phase}/<path>"
+            )
+        suffix = PurePosixPath(*relative.parts[2:])
+        expected = source.joinpath(*suffix.parts)
+        if artifact.path != expected:
+            raise PublicationError(
+                f"{phase} artifact path is outside its private attempt"
+            )
+        count, _digest = _file_commitment(artifact.path, f"{phase} attempt artifact")
+        if count <= 0:
+            raise PublicationError(f"{phase} artifact must not be empty")
+        expected_artifacts.add(artifact.path)
+
+    actual_artifacts = set(_walk_regular_files(source))
+    if actual_artifacts != expected_artifacts:
+        raise PublicationError(f"{phase} private attempt inventory differs")
+
+    stable = _phase_local_root(context.request, phase)
+    destination_parent = stable.parent
+    source_parent_fd = -1
+    destination_parent_fd = -1
+    promoted = False
+    try:
+        source_parent_fd = os.open(
+            container,
+            os.O_RDONLY
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+        )
+        destination_parent_fd = os.open(
+            destination_parent,
+            os.O_RDONLY
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+        )
+        try:
+            atomic_rename_noreplace(
+                source_parent_fd,
+                source.name,
+                destination_parent_fd,
+                stable.name,
+            )
+        except FileExistsError:
+            pass
+        else:
+            fsync_directory(destination_parent_fd)
+            promoted = True
+    except OSError as error:
+        raise PublicationError(f"{phase} output cannot be atomically published") from error
+    finally:
+        if source_parent_fd >= 0:
+            os.close(source_parent_fd)
+        if destination_parent_fd >= 0:
+            os.close(destination_parent_fd)
+
+    if promoted:
+        try:
+            shutil.rmtree(container)
+        except OSError as error:
+            raise PublicationError(
+                f"{phase} private attempt container cannot be removed"
+            ) from error
+    else:
+        attempted = _tree_commitments(
+            source,
+            description=f"{phase} private attempt artifact",
+        )
+        persisted = _tree_commitments(
+            stable,
+            description=f"{phase} persistent artifact",
+        )
+        if attempted != persisted:
+            raise PublicationError(
+                f"{phase} persistent output conflicts with verified attempt"
+            )
+        try:
+            shutil.rmtree(container)
+        except OSError as error:
+            raise PublicationError(
+                f"{phase} duplicate private attempt cannot be removed"
+            ) from error
+
+    remapped = tuple(
+        _Artifact(
+            path=stable / artifact.path.relative_to(source),
+            relative_key=artifact.relative_key,
+        )
+        for artifact in outcome.artifacts
+    )
+    return _PhaseOutcome(artifacts=remapped)
 
 
 def _artifact_key(request: CorpusBuildRequest, phase: str, artifact: _Artifact) -> str:
@@ -734,6 +913,48 @@ def _load_context_production_inputs(
     return inputs
 
 
+def _production_inputs_manifest(
+    inputs: VerifiedProductionInputs,
+) -> dict[str, object]:
+    return {
+        "catalog_sha256": inputs.catalog.sha256,
+        "renderer_id": inputs.renderer.renderer_id,
+        "sidecars": {
+            name: _file_commitment(path, f"production sidecar {name}")[1]
+            for name, path in inputs.sidecars.items()
+        },
+    }
+
+
+def _authenticate_catalog_inputs(
+    context: _BuildContext,
+    *,
+    root: Path | None = None,
+) -> VerifiedProductionInputs:
+    catalog_root = (
+        _phase_local_root(context.request, "catalog")
+        if root is None
+        else root
+    )
+    path = catalog_root / "production-inputs.json"
+    try:
+        payload = path.read_bytes()
+        recorded = json.loads(payload)
+        canonical = canonical_json_bytes(recorded)
+    except (OSError, TypeError, ValueError, json.JSONDecodeError) as error:
+        raise PublicationError("catalog production input manifest cannot be read") from error
+    if (
+        not isinstance(recorded, dict)
+        or set(recorded) != {"catalog_sha256", "renderer_id", "sidecars"}
+        or canonical != payload
+    ):
+        raise PublicationError("catalog production input manifest is invalid")
+    current = _load_context_production_inputs(context)
+    if recorded != _production_inputs_manifest(current):
+        raise PublicationError("catalog production inputs differ from recorded authority")
+    return current
+
+
 def _integer_lane_weights() -> tuple[tuple[str, int], ...]:
     recipe = load_recipe(_RECIPE_PATH)
     denominator = math.lcm(*(share.denominator for _lane, share in recipe.lane_shares))
@@ -811,10 +1032,11 @@ def _execute_phase(context: _BuildContext, phase: str) -> _PhaseOutcome:
     request = context.request
     if phase == "source-stage":
         lock = _load_context_source_lock(context)
+        output = _phase_action_root(context, phase)
         staged = stage_source_lock(
             lock,
             request.work_root / "source-input",
-            _phase_local_root(request, phase),
+            output,
             expected_generator_commit=lock.generator_commit,
         )
         verify_source_tree(
@@ -822,14 +1044,15 @@ def _execute_phase(context: _BuildContext, phase: str) -> _PhaseOutcome:
             staged,
             expected_generator_commit=lock.generator_commit,
         )
-        return _tree_outcome(_phase_local_root(request, phase), phase=phase)
+        return _tree_outcome(output, phase=phase)
 
     if phase == "wikidata-view":
         lock = _load_context_source_lock(context)
+        output = _phase_action_root(context, phase)
         view = build_wikidata_derived_view(
             request.source_lock_path,
             _source_root(context),
-            _phase_local_root(request, phase),
+            output,
             expected_generator_commit=lock.generator_commit,
         )
         verify_wikidata_derived_view(
@@ -838,37 +1061,31 @@ def _execute_phase(context: _BuildContext, phase: str) -> _PhaseOutcome:
             view.root,
             expected_generator_commit=lock.generator_commit,
         )
-        return _tree_outcome(_phase_local_root(request, phase), phase=phase)
+        return _tree_outcome(output, phase=phase)
 
     if phase == "catalog":
         inputs = _load_context_production_inputs(context)
-        manifest = {
-            "catalog_sha256": inputs.catalog.sha256,
-            "renderer_id": inputs.renderer.renderer_id,
-            "sidecars": {
-                name: _file_commitment(path, f"production sidecar {name}")[1]
-                for name, path in inputs.sidecars.items()
-            },
-        }
+        output = _phase_action_root(context, phase)
         _write_local_receipt(
-            _phase_local_root(request, phase) / "production-inputs.json",
-            manifest,
+            output / "production-inputs.json",
+            _production_inputs_manifest(inputs),
         )
-        return _tree_outcome(_phase_local_root(request, phase), phase=phase)
+        return _tree_outcome(output, phase=phase)
 
     if phase == "render-pack":
-        inputs = _load_context_production_inputs(context)
+        inputs = _authenticate_catalog_inputs(context)
+        output = _phase_action_root(context, phase)
         receipt = build_parallel_corpus(
             inputs.catalog,
             inputs.renderer,
             _parallel_config(request),
-            request.output_root,
+            output,
             workers=request.workers,
             sidecar_paths=dict(inputs.sidecars),
         )
         if receipt.get("build_id") != request.build_id:
             raise PublicationError("rendered corpus build ID differs from request")
-        return _tree_outcome(request.output_root, phase=phase)
+        return _tree_outcome(output, phase=phase)
 
     if phase == "local-verify":
         receipt = verify_parallel_corpus(
@@ -877,11 +1094,12 @@ def _execute_phase(context: _BuildContext, phase: str) -> _PhaseOutcome:
         )
         if receipt.get("build_id") != request.build_id:
             raise PublicationError("local verifier returned the wrong build ID")
+        output = _phase_action_root(context, phase)
         _write_local_receipt(
-            _phase_local_root(request, phase) / "verification.json",
+            output / "verification.json",
             cast(Mapping[str, object], receipt),
         )
-        return _tree_outcome(_phase_local_root(request, phase), phase=phase)
+        return _tree_outcome(output, phase=phase)
 
     if phase == "s3-publish":
         receipt = verify_parallel_corpus(
@@ -956,19 +1174,31 @@ def run_corpus_build(
                         "clean-room receipt does not agree with S3 publication"
                     )
             _restore_or_verify_local_phase(context, phase, receipt.objects)
+            if phase == "catalog":
+                _authenticate_catalog_inputs(context)
         else:
-            value = runner.run(
-                phase,
-                lambda phase=phase: _execute_phase(context, phase),
-            )
-            if not isinstance(value, _PhaseOutcome):
-                raise TypeError(f"{phase} runner returned an invalid phase outcome")
-            if phase == "cleanroom-verify":
-                published = context.receipts.get("s3-publish")
-                if published is None or value.objects != published.objects:
-                    raise PublicationError(
-                        "clean-room verification does not agree with S3 publication"
+            _begin_phase_attempt(context, phase)
+            try:
+                value = runner.run(
+                    phase,
+                    lambda phase=phase: _execute_phase(context, phase),
+                )
+                if not isinstance(value, _PhaseOutcome):
+                    raise TypeError(f"{phase} runner returned an invalid phase outcome")
+                if phase == "catalog":
+                    _authenticate_catalog_inputs(
+                        context,
+                        root=_phase_action_root(context, phase),
                     )
+                if phase == "cleanroom-verify":
+                    published = context.receipts.get("s3-publish")
+                    if published is None or value.objects != published.objects:
+                        raise PublicationError(
+                            "clean-room verification does not agree with S3 publication"
+                        )
+                value = _promote_phase_output(context, phase, value)
+            finally:
+                _clear_phase_attempt(context)
             objects = _publish_artifacts(context, phase, value)
             receipt = _receipt(request, phase, objects)
             receipt_version = publish_phase_receipt(
