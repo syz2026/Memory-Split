@@ -126,6 +126,15 @@ def test_watchdog_is_enabled_before_any_package_download_and_uploads_timeout_mar
     assert "SSEKMSKeyId" in text
 
 
+def test_watchdog_shutdown_is_unconditional_when_timeout_upload_fails():
+    text = render_bootstrap(fixture_config())
+
+    assert "trap '/usr/sbin/shutdown -h now' EXIT" in text
+    assert "TimeoutStartSec=3min" in text
+    assert "--key \"v2/builds/${MEMORYSPLIT_BUILD_ID}/operational/timeout.json\"" in text
+    assert "--output json >/dev/null 2>&1 || true" in text
+
+
 def test_rendered_bootstrap_pins_every_input_authority_without_mutable_reads():
     config = fixture_config()
     text = render_bootstrap(config)
