@@ -7,7 +7,7 @@ import hmac
 import json
 import re
 import time
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
@@ -23,11 +23,16 @@ from .contracts import (
 
 _INSTANCE_TYPE = "i4i.16xlarge"
 _REGION = "us-east-1"
+_TARGET_ACCOUNT_ID = "056956104102"
 _MAX_RUNTIME = timedelta(hours=24)
 _DESCRIBE_ATTEMPTS = 20
 _DESCRIBE_DELAY_SECONDS = 0.25
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
-_INSTANCE_ID_RE = re.compile(r"^i-[A-Za-z0-9][A-Za-z0-9-]{0,63}$")
+_INSTANCE_ID_RE = re.compile(r"^i-(?:[0-9a-f]{8}|[0-9a-f]{17})$")
+_INSTANCE_PROFILE_ACCOUNT_RE = re.compile(
+    r"^arn:aws:iam::([0-9]{12}):instance-profile/"
+)
+_ACTIVE_INSTANCE_STATES = ("pending", "running", "stopping", "stopped")
 
 _PRICE_FILTERS = (
     ("capacitystatus", "Used"),
@@ -44,12 +49,19 @@ class LaunchError(ValueError):
 
 
 class Ec2Client(Protocol):
+    def get_caller_identity(self, **kwargs: object) -> Mapping[str, object]: ...
+
     def describe_launch_template_versions(
         self,
         **kwargs: object,
     ) -> Mapping[str, object]: ...
 
     def get_products(self, **kwargs: object) -> Mapping[str, object]: ...
+
+    def describe_security_groups(
+        self,
+        **kwargs: object,
+    ) -> Mapping[str, object]: ...
 
     def run_instances(self, **kwargs: object) -> Mapping[str, object]: ...
 
@@ -94,6 +106,10 @@ def _intent_expiry(value: str) -> datetime:
         raise LaunchError("launch intent has an invalid expiry") from error
 
 
+def _system_utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
 def _tag_values(intent: LaunchIntent) -> dict[str, str]:
     canonical = launch_intent_to_bytes(intent)
     intent_sha256 = hashlib.sha256(canonical).hexdigest()
@@ -101,6 +117,51 @@ def _tag_values(intent: LaunchIntent) -> dict[str, str]:
         "MemorySplitCorpusBuilder": "true",
         "Name": f"memorysplit-corpus-builder-{intent_sha256}",
     }
+
+
+def _verify_target_account(ec2: Ec2Client, intent: LaunchIntent) -> None:
+    try:
+        response = ec2.get_caller_identity()
+    except Exception as error:
+        raise LaunchError("target AWS account identity recheck failed") from error
+    response = _mapping(response, label="caller identity response")
+    profile_match = _INSTANCE_PROFILE_ACCOUNT_RE.match(
+        intent.instance_profile_arn
+    )
+    if (
+        response.get("Account") != _TARGET_ACCOUNT_ID
+        or intent.ami_owner_id != _TARGET_ACCOUNT_ID
+        or profile_match is None
+        or profile_match.group(1) != _TARGET_ACCOUNT_ID
+    ):
+        raise LaunchError(
+            "caller, AMI owner, and instance profile must match "
+            f"target AWS account {_TARGET_ACCOUNT_ID}"
+        )
+
+
+def _verify_no_security_group_ingress(
+    ec2: Ec2Client,
+    security_group_id: str,
+) -> None:
+    try:
+        response = ec2.describe_security_groups(
+            GroupIds=[security_group_id],
+        )
+    except Exception as error:
+        raise LaunchError("security-group ingress recheck failed") from error
+    response = _mapping(response, label="security-group response")
+    groups = _list(
+        response.get("SecurityGroups"),
+        label="security groups",
+    )
+    if len(groups) != 1:
+        raise LaunchError("security group is missing or ambiguous")
+    group = _mapping(groups[0], label="security group")
+    if group.get("GroupId") != security_group_id:
+        raise LaunchError("security group ID drift")
+    if group.get("IpPermissions") != []:
+        raise LaunchError("security group has inbound rules")
 
 
 def approved_tag_specifications(
@@ -386,6 +447,49 @@ def _described_instances(response: object) -> list[Mapping[str, object]]:
     return instances
 
 
+def _refuse_active_approval_replay(
+    ec2: Ec2Client,
+    intent: LaunchIntent,
+) -> None:
+    tags = _tag_values(intent)
+    try:
+        response = ec2.describe_instances(
+            Filters=[
+                {
+                    "Name": "tag:MemorySplitCorpusBuilder",
+                    "Values": [tags["MemorySplitCorpusBuilder"]],
+                },
+                {
+                    "Name": "tag:Name",
+                    "Values": [tags["Name"]],
+                },
+                {
+                    "Name": "instance-state-name",
+                    "Values": list(_ACTIVE_INSTANCE_STATES),
+                },
+            ]
+        )
+    except Exception as error:
+        raise LaunchError("approval-replay recheck failed") from error
+    response = _mapping(response, label="approval-replay response")
+    if response.get("NextToken") not in (None, ""):
+        raise LaunchError("approval-replay response is unexpectedly paginated")
+    for instance in _described_instances(response):
+        state = instance.get("State")
+        identifier = _instance_id(instance.get("InstanceId"))
+        if (
+            identifier is None
+            or not isinstance(state, Mapping)
+            or state.get("Name") not in _ACTIVE_INSTANCE_STATES
+            or _tags(instance.get("Tags")) != tags
+        ):
+            raise LaunchError("approval-replay response is malformed")
+        raise LaunchError(
+            "approved intent already has an active instance: "
+            f"{identifier}"
+        )
+
+
 def _wait_for_instance(
     ec2: Ec2Client,
     instance_id: str,
@@ -535,6 +639,7 @@ def launch_approved_builder(
     approved_intent_sha256: str,
     ec2: Ec2Client,
     now: datetime,
+    clock: Callable[[], datetime] | None = None,
 ) -> BuilderLaunch:
     """Launch one exact approved builder and immediately verify its lifecycle."""
 
@@ -553,12 +658,20 @@ def launch_approved_builder(
     except ValueError as error:
         raise LaunchError(f"launch intent is invalid: {error}") from error
     current = _utc(now)
-    if current >= _intent_expiry(intent.not_after):
+    expiry = _intent_expiry(intent.not_after)
+    if current >= expiry:
         raise LaunchError("launch intent has expired")
 
+    _verify_target_account(ec2, intent)
     _recheck_launch_template(ec2, intent)
     _recheck_hourly_price(ec2, intent)
+    _verify_no_security_group_ingress(ec2, intent.security_group_id)
+    _refuse_active_approval_replay(ec2, intent)
+    launch_clock = clock or _system_utc_now
+    if _utc(launch_clock()) >= expiry:
+        raise LaunchError("launch intent has expired")
     request = {
+        "ClientToken": actual_sha256,
         "LaunchTemplate": {
             "LaunchTemplateId": intent.launch_template_id,
             "Version": intent.launch_template_version,
@@ -590,6 +703,7 @@ def launch_approved_builder(
         instance = _wait_for_instance(ec2, instance_id)
         _verify_launched_instance(instance, intent)
         _verify_shutdown_behavior(ec2, instance_id)
+        _verify_no_security_group_ingress(ec2, intent.security_group_id)
     except Exception as error:
         message = (
             str(error)

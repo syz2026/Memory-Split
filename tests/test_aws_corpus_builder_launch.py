@@ -99,6 +99,26 @@ def _expected_tags(payload: bytes = INTENT_BYTES) -> dict[str, str]:
     }
 
 
+def _replay_filters(payload: bytes = INTENT_BYTES) -> list[dict[str, object]]:
+    return [
+        {
+            "Name": "tag:MemorySplitCorpusBuilder",
+            "Values": ["true"],
+        },
+        {
+            "Name": "tag:Name",
+            "Values": [
+                f"memorysplit-corpus-builder-"
+                f"{hashlib.sha256(payload).hexdigest()}"
+            ],
+        },
+        {
+            "Name": "instance-state-name",
+            "Values": ["pending", "running", "stopping", "stopped"],
+        },
+    ]
+
+
 def _launch_template_data() -> dict[str, object]:
     return {
         "ImageId": AMI_ID,
@@ -331,6 +351,7 @@ def _launch(ec2: FakeEc2, *, payload: bytes = INTENT_BYTES):
         approved_intent_sha256=hashlib.sha256(payload).hexdigest(),
         ec2=ec2,
         now=NOW,
+        clock=lambda: NOW,
     )
 
 
@@ -343,6 +364,7 @@ def test_launch_requires_exact_unexpired_intent_hash_and_one_instance():
     assert launch.launch_intent_sha256 == INTENT_SHA256
     assert launch.launch_time == "2026-07-25T03:00:00Z"
     assert launch.terminate_at == "2026-07-26T03:00:00Z"
+    assert ec2.identity_calls == [{}]
     assert ec2.template_calls == [
         {
             "LaunchTemplateId": LAUNCH_TEMPLATE_ID,
@@ -366,6 +388,7 @@ def test_launch_requires_exact_unexpired_intent_hash_and_one_instance():
     }
     assert ec2.run_calls == [
         {
+            "ClientToken": INTENT_SHA256,
             "LaunchTemplate": {
                 "LaunchTemplateId": LAUNCH_TEMPLATE_ID,
                 "Version": LAUNCH_TEMPLATE_VERSION,
@@ -383,7 +406,10 @@ def test_launch_requires_exact_unexpired_intent_hash_and_one_instance():
             ],
         }
     ]
-    assert ec2.describe_calls == [{"InstanceIds": [INSTANCE_ID]}]
+    assert ec2.describe_calls == [
+        {"Filters": _replay_filters()},
+        {"InstanceIds": [INSTANCE_ID]},
+    ]
     assert ec2.attribute_calls == [
         {
             "Attribute": "instanceInitiatedShutdownBehavior",
@@ -391,6 +417,10 @@ def test_launch_requires_exact_unexpired_intent_hash_and_one_instance():
         }
     ]
     assert ec2.terminate_calls == []
+    assert ec2.security_group_calls == [
+        {"GroupIds": [SECURITY_GROUP_ID]},
+        {"GroupIds": [SECURITY_GROUP_ID]},
+    ]
 
 
 @pytest.mark.parametrize(
@@ -469,24 +499,7 @@ def test_launch_refuses_an_active_instance_with_the_approved_intent_tag():
 
     assert ec2.run_calls == []
     assert ec2.describe_calls == [
-        {
-            "Filters": [
-                {
-                    "Name": "tag:MemorySplitCorpusBuilder",
-                    "Values": ["true"],
-                },
-                {
-                    "Name": "tag:Name",
-                    "Values": [
-                        f"memorysplit-corpus-builder-{INTENT_SHA256}"
-                    ],
-                },
-                {
-                    "Name": "instance-state-name",
-                    "Values": ["pending", "running", "stopping", "stopped"],
-                },
-            ]
-        }
+        {"Filters": _replay_filters()}
     ]
 
 
@@ -496,6 +509,19 @@ def test_run_instances_uses_the_approved_hash_as_its_client_token():
     _launch(ec2)
 
     assert ec2.run_calls[0]["ClientToken"] == INTENT_SHA256
+
+
+def test_run_instances_rejects_a_non_aws_instance_id_shape():
+    ec2 = FakeEc2()
+    ec2.run_response = {"Instances": [{"InstanceId": "i-builder"}]}
+
+    with pytest.raises(
+        LaunchError,
+        match="RunInstances did not return exactly one instance",
+    ):
+        _launch(ec2)
+
+    assert ec2.terminate_calls == []
 
 
 def test_launch_rechecks_expiry_after_all_read_only_checks():
@@ -601,7 +627,7 @@ def test_launch_terminates_all_returned_instances_if_run_instances_returns_two()
     with pytest.raises(LaunchError):
         _launch(ec2)
 
-    assert ec2.describe_calls == []
+    assert ec2.describe_calls == [{"Filters": _replay_filters()}]
     assert ec2.terminate_calls == [
         {"InstanceIds": [INSTANCE_ID, SECOND_INSTANCE_ID]}
     ]
@@ -619,7 +645,7 @@ def test_launch_rejects_a_malformed_second_run_instance_and_terminates_the_known
     with pytest.raises(LaunchError):
         _launch(ec2)
 
-    assert ec2.describe_calls == []
+    assert ec2.describe_calls == [{"Filters": _replay_filters()}]
     assert ec2.attribute_calls == []
     assert ec2.terminate_calls == [{"InstanceIds": [INSTANCE_ID]}]
 
@@ -704,6 +730,7 @@ def test_describe_polls_until_the_launched_instance_exists():
 
     assert launch.instance_id == INSTANCE_ID
     assert ec2.describe_calls == [
+        {"Filters": _replay_filters()},
         {"InstanceIds": [INSTANCE_ID]},
         {"InstanceIds": [INSTANCE_ID]},
     ]
@@ -742,7 +769,7 @@ class FakeSession:
 
     def client(self, service_name: str, *, region_name: str | None = None):
         self.calls.append((service_name, region_name))
-        assert service_name in {"ec2", "pricing"}
+        assert service_name in {"ec2", "pricing", "sts"}
         return self._client
 
 
@@ -791,6 +818,7 @@ def test_cli_requires_explicit_hash_and_prints_lifecycle_and_cost(
     assert session.calls == [
         ("ec2", "us-east-1"),
         ("pricing", "us-east-1"),
+        ("sts", "us-east-1"),
     ]
 
 

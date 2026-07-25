@@ -28,9 +28,13 @@ _MAX_INTENT_BYTES = 128 * 1024
 
 
 class _AwsLaunchClient:
-    def __init__(self, ec2: object, pricing: object) -> None:
+    def __init__(self, ec2: object, pricing: object, sts: object) -> None:
         self._ec2 = ec2
         self._pricing = pricing
+        self._sts = sts
+
+    def get_caller_identity(self, **kwargs: object) -> Mapping[str, object]:
+        return self._sts.get_caller_identity(**kwargs)
 
     def describe_launch_template_versions(
         self,
@@ -40,6 +44,12 @@ class _AwsLaunchClient:
 
     def get_products(self, **kwargs: object) -> Mapping[str, object]:
         return self._pricing.get_products(**kwargs)
+
+    def describe_security_groups(
+        self,
+        **kwargs: object,
+    ) -> Mapping[str, object]:
+        return self._ec2.describe_security_groups(**kwargs)
 
     def run_instances(self, **kwargs: object) -> Mapping[str, object]:
         return self._ec2.run_instances(**kwargs)
@@ -121,11 +131,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         ec2 = session.client("ec2", region_name=arguments.region)
         pricing = session.client("pricing", region_name="us-east-1")
+        sts = session.client("sts", region_name=arguments.region)
         launch = launch_approved_builder(
             intent_bytes,
             approved_intent_sha256=arguments.approve_intent_sha256,
-            ec2=_AwsLaunchClient(ec2, pricing),
+            ec2=_AwsLaunchClient(ec2, pricing, sts),
             now=_utc_now(),
+            clock=_utc_now,
         )
     except (LaunchError, ValueError, OSError) as error:
         print(f"error: {error}", file=sys.stderr)
