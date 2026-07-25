@@ -757,6 +757,7 @@ it, then publish that local plan exclusively:
 
 ```bash
 CANARY_PLAN="$REVIEW_ROOT/canary-plan-${INSTANCE_ID}.json"
+CANARY_APPROVAL="$OPERATOR_ROOT/approvals/canary-${INSTANCE_ID}.json"
 
 # DRY RUN: verifies the release, provider selection, PKCS7 identity receipt,
 # explicit instance ID, and exact release-mounted phase argv.
@@ -788,11 +789,13 @@ python3 -m msctl --profile "$PROFILE" --repo-root . \
   --instance-id "$INSTANCE_ID" \
   > "$REVIEW_ROOT/canary-run-review-${INSTANCE_ID}.json"
 
-# APPLY only after reviewing the exact instance and immutable argv.
+# APPLY only after reviewing and signing the exact approval_resources object,
+# instance, plan digest, and immutable argv from the dry run.
 python3 -m msctl --profile "$PROFILE" --repo-root . \
   canary run \
   --canary-plan "$CANARY_PLAN" \
   --instance-id "$INSTANCE_ID" \
+  --approval "$CANARY_APPROVAL" \
   --apply > "$REVIEW_ROOT/canary-run-result-${INSTANCE_ID}.json"
 ```
 

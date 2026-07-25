@@ -435,6 +435,9 @@ def _environment_identity(
             expected_region=selection.region,
             expected_ami_id=selection.ami_id,
             expected_account_id=selection.aws_account_id,
+            expected_instance_type=str(
+                getattr(profile, "instance_type", "")
+            ),
         )
     except AwsIdentityError as error:
         raise MsctlError(

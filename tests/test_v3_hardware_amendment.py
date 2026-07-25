@@ -1131,6 +1131,7 @@ def test_v3_profiles_support_full_dry_run_lifecycle(
             "provider_selection_sha256": selection.sha256,
             "hardware_amendment_sha256": amendment.sha256,
             "sealed_fixture_sha256": manifest.sealed_fixture_sha256,
+            "environment_receipt_sha256": "7" * 64,
         },
         decision={"protected_launch_allowed": True},
         path=None,
@@ -1331,6 +1332,21 @@ def test_v3_profiles_support_full_dry_run_lifecycle(
         expected_sha256=intent_sha256,
         expected_control_bundle_sha256=backend.control_bundle.sha256,
     )
+    for protected in (
+        resumed["operation_intent"],
+        evaluated["operation_intent"],
+    ):
+        protected_intent = backend._operation_envelope(
+            protected,
+            instance_id=instance_id,
+            terminate_at=terminate_at,
+        )
+        protected_payload = canonical_json(protected_intent)
+        assert _validate_intent(
+            protected_payload,
+            expected_sha256=hashlib.sha256(protected_payload).hexdigest(),
+            expected_control_bundle_sha256=backend.control_bundle.sha256,
+        ) == protected_intent
     started_receipt = _receipt(
         validated_intent,
         intent_sha256=intent_sha256,

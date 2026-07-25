@@ -143,6 +143,7 @@ def build_parser() -> JsonArgumentParser:
     )
     canary_run.add_argument("--canary-plan", required=True)
     canary_run.add_argument("--instance-id", required=True)
+    canary_run.add_argument("--approval")
     canary_run.add_argument("--apply", action="store_true")
 
     provider = _leaf(commands, "provider", help_text="provider selection")

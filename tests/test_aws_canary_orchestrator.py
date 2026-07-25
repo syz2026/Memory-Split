@@ -139,6 +139,7 @@ def test_canary_plan_and_run_are_dry_run_first_and_content_addressed(
             control_bundle_sha256="c" * 64,
         )
 
+    approval_calls = []
     backend = AwsP5Backend(
         profile=profile,
         runtime=runtime,
@@ -146,6 +147,7 @@ def test_canary_plan_and_run_are_dry_run_first_and_content_addressed(
             "arn:aws:iam::123456789012:instance-profile/memorysplit-gpu"
         ),
         state_root=tmp_path / "state",
+        approval_verifier=lambda **kwargs: approval_calls.append(kwargs),
     )
     calls = []
     monkeypatch.setattr(
@@ -202,14 +204,31 @@ def test_canary_plan_and_run_are_dry_run_first_and_content_addressed(
         apply=False,
     )
     assert run_dry["submitted"] == 0
+    assert run_dry["approval_resources"]["orchestration_plan_sha256"] == (
+        plan_sha256
+    )
+    assert calls == []
+    with pytest.raises(MsctlError) as missing_approval:
+        backend.canary_run(
+            plan_path=destination,
+            instance_id=instance_id,
+            apply=True,
+        )
+    assert missing_approval.value.code == "APPROVAL_REQUIRED"
     assert calls == []
     run = backend.canary_run(
         plan_path=destination,
         instance_id=instance_id,
+        approval_path=tmp_path / "canary-approval.json",
         apply=True,
     )
     assert run["submitted"] == 1
     assert run["command_id"] == "cmd-canary-12345678"
+    assert approval_calls[0]["operation"] == "canary"
+    assert approval_calls[0]["scope_sha256"] == plan_sha256
+    assert approval_calls[0]["resources"]["environment_receipt_sha256"] == (
+        plan["environment_receipt_sha256"]
+    )
     assert calls == [
         ("instance", instance_id),
         ("ssm", instance_id),

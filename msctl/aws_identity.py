@@ -59,6 +59,7 @@ class AwsIdentityError(ValueError):
 @dataclass(frozen=True)
 class VerifiedEnvironmentIdentity:
     instance_id: str
+    instance_type: str
     boot_id: str
     region: str
     ami_id: str
@@ -156,6 +157,7 @@ def verify_environment_receipt(
     expected_ami_id: str,
     expected_account_id: str,
     expected_instance_id: str | None = None,
+    expected_instance_type: str | None = None,
 ) -> VerifiedEnvironmentIdentity:
     """Verify one canonical v3 receipt and its AWS PKCS7 identity signature."""
 
@@ -187,6 +189,7 @@ def verify_environment_receipt(
             "environment receipt identity document must be an object"
         )
     instance_id = identity.get("instanceId")
+    instance_type = identity.get("instanceType")
     boot_id = value["boot_id"]
     pkcs7 = value["aws_instance_identity_pkcs7"]
     if (
@@ -196,12 +199,17 @@ def verify_environment_receipt(
         or identity.get("imageId") != expected_ami_id
         or identity.get("region") != expected_region
         or identity.get("accountId") != expected_account_id
-        or identity.get("instanceType") is None
+        or not isinstance(instance_type, str)
+        or not instance_type
         or not isinstance(instance_id, str)
         or re.fullmatch(r"i-[0-9a-f]{8,17}", instance_id) is None
         or (
             expected_instance_id is not None
             and instance_id != expected_instance_id
+        )
+        or (
+            expected_instance_type is not None
+            and instance_type != expected_instance_type
         )
         or not isinstance(boot_id, str)
         or re.fullmatch(
@@ -218,6 +226,7 @@ def verify_environment_receipt(
         )
     return VerifiedEnvironmentIdentity(
         instance_id=instance_id,
+        instance_type=instance_type,
         boot_id=boot_id,
         region=expected_region,
         ami_id=expected_ami_id,

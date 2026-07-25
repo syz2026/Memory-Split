@@ -231,6 +231,7 @@ _COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
 _AWS_STATUSES = {
     "INTENT_PUBLISHED",
     "SENDING",
+    "RECOVERY_REQUIRED",
     "Pending",
     "InProgress",
     "Delayed",

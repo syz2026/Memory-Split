@@ -4133,6 +4133,13 @@ def test_aws_approval_binds_every_extended_execution_resource(tmp_path):
         instance_id="i-0123456789abcdef0",
         terminate_at=_AWS_TERMINATE_AT,
     )
+    resources.update(
+        {
+            "dataset_pointer_sha256": "5" * 64,
+            "dataset_verification_sha256": "6" * 64,
+            "environment_receipt_sha256": "7" * 64,
+        }
+    )
     unsigned = {
         "schema_version": 1,
         "receipt_id": "aws-submit-fixture",
@@ -4432,7 +4439,7 @@ def test_aws_provisions_only_the_fixed_argv_document_hash(tmp_path):
 
 
 def test_aws_remote_wrapper_acquires_once_and_writes_terminal_receipt(tmp_path):
-    from msctl.aws_argv import RemoteIntentError, execute_intent
+    from msctl.aws_argv import RemoteIntentError, _receipt, execute_intent
     from msctl.aws_p5 import AwsP5Backend
     from msctl.jsonutil import canonical_json
 
@@ -4512,6 +4519,10 @@ def test_aws_remote_wrapper_acquires_once_and_writes_terminal_receipt(tmp_path):
     assert first["executed"] is True
     assert second["executed"] is False
     assert second["idempotent"] is True
+    assert second["terminal"] is True
+    assert second["status"] == "success"
+    assert second["recovery_required"] is False
+    assert second["returncode"] == 0
     assert len(executor.calls) == len(intent["steps"])
     assert store.metadata[intent["started_receipt_uri"]] == {
         "operation-id": intent["operation_id"],
@@ -4529,6 +4540,26 @@ def test_aws_remote_wrapper_acquires_once_and_writes_terminal_receipt(tmp_path):
         ))
         for _, environment in executor.calls
     )
+    stuck_store = Store()
+    stuck_store.objects[intent["started_receipt_uri"]] = _receipt(
+        intent,
+        intent_sha256=digest,
+        kind="started",
+        nonce="a" * 32,
+    )
+    stuck_executor = Executor()
+    stuck = execute_intent(
+        intent_uri=intent_uri,
+        intent_sha256=digest,
+        store=stuck_store,
+        executor=stuck_executor,
+    )
+    assert stuck["executed"] is False
+    assert stuck["terminal"] is False
+    assert stuck["status"] == "recovery-required"
+    assert stuck["recovery_required"] is True
+    assert stuck["returncode"] == 75
+    assert stuck_executor.calls == []
     corrupt_store = Store()
     corrupt_store.objects[intent["started_receipt_uri"]] = b"{}\n"
     with pytest.raises(RemoteIntentError, match="started receipt"):
@@ -4538,6 +4569,37 @@ def test_aws_remote_wrapper_acquires_once_and_writes_terminal_receipt(tmp_path):
             store=corrupt_store,
             executor=Executor(),
         )
+
+
+def test_aws_remote_wrapper_main_returns_nonzero_for_recovery(monkeypatch):
+    import msctl.aws_argv as aws_argv
+
+    monkeypatch.setenv("AWS_REGION", "us-east-1")
+    monkeypatch.setattr(aws_argv, "AwsCliObjectStore", lambda **_kwargs: object())
+    monkeypatch.setattr(aws_argv, "SubprocessArgvExecutor", lambda: object())
+    monkeypatch.setattr(
+        aws_argv,
+        "execute_intent",
+        lambda **_kwargs: {
+            "schema_version": 1,
+            "operation_id": "1" * 64,
+            "executed": False,
+            "idempotent": True,
+            "terminal": False,
+            "status": "recovery-required",
+            "recovery_required": True,
+            "returncode": 75,
+        },
+    )
+
+    assert aws_argv.main(
+        [
+            "--intent-uri",
+            "s3://memorysplit-prod/intents/intent.json",
+            "--intent-sha256",
+            "2" * 64,
+        ]
+    ) == 75
 
 
 def test_aws_remote_wrapper_rejects_unknown_checkpoint_receipt_fields(tmp_path):
@@ -4835,6 +4897,53 @@ def test_aws_submit_response_loss_never_resends_the_same_operation(tmp_path):
         )
     assert getattr(caught.value, "code", None) == "SUBMISSION_UNCERTAIN"
     assert all("send-command" not in argv for argv, _ in second_runner.calls)
+
+    recovery_runner = _FakeAwsRunner(
+        {
+            "receipt": {
+                "checksum_sha256": "started-checksum",
+                "content_length": 1,
+                "metadata": {
+                    "operation-id": intent["operation_id"],
+                    "intent-sha256": digest,
+                    "receipt-kind": "started",
+                },
+                "version_id": "started-version-1",
+            }
+        },
+        MsctlError("AWS_COMMAND_FAILED", "terminal receipt absent"),
+        {"commands": []},
+    )
+    recovery = AwsP5Backend(runner=recovery_runner, **common)
+    with pytest.raises(Exception) as recovery_required:
+        recovery.submit(
+            release=release,
+            manifest=manifest,
+            instance_id=selected["instance_id"],
+            terminate_at=_AWS_TERMINATE_AT,
+            approval_path=tmp_path / "approval.json",
+            apply=True,
+        )
+    assert getattr(recovery_required.value, "code", None) == (
+        "REMOTE_RECOVERY_REQUIRED"
+    )
+    recovered_states = [
+        json.loads(
+            (
+                tmp_path
+                / "state"
+                / "runs"
+                / f"{run.run_id}.json"
+            ).read_text()
+        )
+        for run in manifest.runs
+    ]
+    assert {state["status"] for state in recovered_states} == {
+        "RECOVERY_REQUIRED"
+    }
+    assert all(
+        "send-command" not in argv for argv, _ in recovery_runner.calls
+    )
 
 
 def test_aws_submit_rejects_state_bound_to_a_different_operation_intent(

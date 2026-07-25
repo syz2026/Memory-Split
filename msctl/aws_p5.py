@@ -32,6 +32,7 @@ from evals.confirmatory.sealing import (
     sealed_fixture_sha256,
 )
 
+from . import aws_identity
 from .approval import verify_scope_approval
 from .aws_control_bundle import (
     build_control_bundle_bytes,
@@ -147,10 +148,6 @@ _AMI_RE = re.compile(r"^ami-[0-9a-f]{8,17}$")
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 _COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
-_BOOT_ID_RE = re.compile(
-    r"^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-"
-    r"[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
-)
 _BUCKET_RE = re.compile(
     r"^(?![0-9]+(?:\.[0-9]+){3}$)(?!-)(?!.*\.\.)(?!.*\.-)(?!.*-\.)"
     r"[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$"
@@ -467,6 +464,7 @@ def aws_resource_request(
         "evaluate": (1, 8, 360, "evals/confirmatory/runner.py"),
         "cancel": (1, 0, 0, "aws:ssm:cancel-command"),
         "cleanup": (1, 0, 0, "aws:ec2:terminate-instances"),
+        "canary": (1, 8, 60, "cluster/aws/p5/canary_orchestrator.py"),
     }
     if operation not in policy:
         raise MsctlError(
@@ -1157,6 +1155,74 @@ class AwsP5Backend:
         scratch_root = getattr(self.profile, "scratch_root", "/mnt/memorysplit")
         return f"{scratch_root}/releases/{release.archive_sha256}"
 
+    def _validated_lifecycle_evidence(
+        self,
+        *,
+        operation: str,
+        manifest: object,
+        evidence: Mapping[str, str] | None,
+        context: V3LifecycleContext | None,
+    ) -> dict[str, str]:
+        protected_v3 = _is_v3_manifest(manifest) and operation in {
+            "submit",
+            "resume",
+            "evaluate",
+        }
+        if evidence is None and protected_v3:
+            raise MsctlError(
+                "LIFECYCLE_EVIDENCE_REQUIRED",
+                "v3 submit, resume, and evaluate require verified dataset "
+                "and environment lifecycle evidence",
+            )
+        lifecycle_evidence = (
+            dict(evidence)
+            if evidence is not None
+            else {
+                "dataset_pointer_sha256": manifest.dataset_sha256,
+                "dataset_verification_sha256": manifest.dataset_sha256,
+                "environment_receipt_sha256": self._runtime_sha256(),
+            }
+        )
+        expected_fields = {
+            "dataset_pointer_sha256",
+            "dataset_verification_sha256",
+            "environment_receipt_sha256",
+        }
+        if set(lifecycle_evidence) != expected_fields:
+            raise MsctlError(
+                "LIFECYCLE_EVIDENCE_INVALID",
+                "AWS lifecycle evidence fields do not match the contract",
+            )
+        for field, digest in lifecycle_evidence.items():
+            require_sha256(digest, label=field)
+        if protected_v3:
+            readiness = context.readiness if context is not None else None
+            expected_environment = (
+                readiness.bindings.get("environment_receipt_sha256")
+                if readiness is not None
+                else None
+            )
+            try:
+                expected_environment = require_sha256(
+                    expected_environment,
+                    label="launch readiness environment receipt",
+                )
+            except MsctlError as error:
+                raise MsctlError(
+                    "LAUNCH_READINESS_REQUIRED",
+                    "v3 lifecycle readiness lacks its signed environment binding",
+                ) from error
+            if (
+                lifecycle_evidence["environment_receipt_sha256"]
+                != expected_environment
+            ):
+                raise MsctlError(
+                    "ENVIRONMENT_RECEIPT_MISMATCH",
+                    "v3 lifecycle evidence does not match the signed "
+                    "launch-readiness environment binding",
+                )
+        return lifecycle_evidence
+
     def _training_operation_intent(
         self,
         *,
@@ -1170,25 +1236,12 @@ class AwsP5Backend:
         context: V3LifecycleContext | None = None,
     ) -> dict[str, object]:
         v3_bindings = self._v3_bindings(manifest, context)
-        lifecycle_evidence = dict(
-            evidence
-            or {
-                "dataset_pointer_sha256": manifest.dataset_sha256,
-                "dataset_verification_sha256": manifest.dataset_sha256,
-                "environment_receipt_sha256": self._runtime_sha256(),
-            }
+        lifecycle_evidence = self._validated_lifecycle_evidence(
+            operation=operation,
+            manifest=manifest,
+            evidence=evidence,
+            context=context,
         )
-        if set(lifecycle_evidence) != {
-            "dataset_pointer_sha256",
-            "dataset_verification_sha256",
-            "environment_receipt_sha256",
-        }:
-            raise MsctlError(
-                "LIFECYCLE_EVIDENCE_INVALID",
-                "AWS lifecycle evidence fields do not match the contract",
-            )
-        for field, digest in lifecycle_evidence.items():
-            require_sha256(digest, label=field)
         release_root = self._release_root(release)
         scratch_root = getattr(self.profile, "scratch_root", "/mnt/memorysplit")
         staging = f"{scratch_root}/staging"
@@ -2419,6 +2472,7 @@ class AwsP5Backend:
         *,
         plan_path: Path | str,
         instance_id: str,
+        approval_path: Path | str | None = None,
         apply: bool,
     ) -> dict[str, object]:
         """Plan or send one exact canary intent to one explicit instance."""
@@ -2443,6 +2497,30 @@ class AwsP5Backend:
             control_bundle_sha256=self.control_bundle.sha256,
         )
         intent_sha256 = hashlib.sha256(canonical_json(intent)).hexdigest()
+        approval_resources = aws_resource_request(
+            "canary",
+            profile=self.profile,
+            bindings={
+                "ami_id": self.runtime.ami_id,
+                "container_image": self.runtime.container_image,
+                "container_digest": self.runtime.container_digest,
+                "instance_id": instance_id,
+                "instance_type": self.profile.instance_type,
+                "profile_sha256": self.profile.sha256,
+                "provider": self.profile.provider,
+                "release_sha256": plan["release_sha256"],
+                "runtime_sha256": self._runtime_sha256(),
+                "provider_selection_sha256": plan[
+                    "provider_selection"
+                ]["provider_selection_sha256"],
+                "environment_receipt_sha256": plan[
+                    "environment_receipt_sha256"
+                ],
+                "command_plan_sha256": plan["command_plan_sha256"],
+                "orchestration_plan_sha256": plan_sha256,
+                "control_bundle_sha256": self.control_bundle.sha256,
+            },
+        )
         result = {
             "schema_version": 3,
             "operation": "canary",
@@ -2451,12 +2529,27 @@ class AwsP5Backend:
             "plan_uri": plan_uri,
             "intent": intent,
             "intent_sha256": intent_sha256,
+            "approval_resources": approval_resources,
             "submitted": 0,
             "idempotent": False,
         }
         if not apply:
             return result
 
+        if approval_path is None:
+            raise MsctlError(
+                "APPROVAL_REQUIRED",
+                "canary run --apply requires an explicit signed approval receipt",
+            )
+        self.approval_verifier(
+            path=approval_path,
+            operation="canary",
+            release_sha256=str(plan["release_sha256"]),
+            scope_sha256=plan_sha256,
+            resources=approval_resources,
+            profile=self.profile,
+            environ=self.environ,
+        )
         self._require_canary_instance(instance_id)
         self._require_ssm_online(instance_id)
         self._ensure_argv_document()
@@ -3378,6 +3471,7 @@ class AwsP5Backend:
         release: object,
         instance_id: str,
         terminate_at: str,
+        evidence: Mapping[str, str] | None = None,
         context: V3LifecycleContext | None = None,
     ) -> dict[str, object]:
         operation_intent = self._training_operation_intent(
@@ -3385,6 +3479,7 @@ class AwsP5Backend:
             release=release,
             manifest=manifest,
             terminate_at=terminate_at,
+            evidence=evidence,
             context=context,
         )
         return {
@@ -3745,6 +3840,98 @@ class AwsP5Backend:
                 )
         return release, manifest
 
+    def _read_lifecycle_environment_receipt(self, path: Path) -> bytes:
+        maximum = 4 * 1024 * 1024
+        chunks: list[bytes] = []
+        try:
+            before = path.stat(follow_symlinks=False)
+            if (
+                not stat.S_ISREG(before.st_mode)
+                or before.st_nlink != 1
+                or before.st_size <= 0
+                or before.st_size > maximum
+            ):
+                raise MsctlError(
+                    "ENVIRONMENT_RECEIPT_INVALID",
+                    "AWS environment receipt must be one bounded singly "
+                    "linked regular file",
+                )
+            descriptor = os.open(
+                path,
+                os.O_RDONLY
+                | getattr(os, "O_NOFOLLOW", 0)
+                | getattr(os, "O_CLOEXEC", 0),
+            )
+            try:
+                opened = os.fstat(descriptor)
+                if (
+                    not stat.S_ISREG(opened.st_mode)
+                    or opened.st_nlink != 1
+                    or (
+                        opened.st_dev,
+                        opened.st_ino,
+                        opened.st_size,
+                        opened.st_mtime_ns,
+                        opened.st_ctime_ns,
+                    )
+                    != (
+                        before.st_dev,
+                        before.st_ino,
+                        before.st_size,
+                        before.st_mtime_ns,
+                        before.st_ctime_ns,
+                    )
+                ):
+                    raise MsctlError(
+                        "ENVIRONMENT_RECEIPT_INVALID",
+                        "AWS environment receipt changed before it was opened",
+                    )
+                total = 0
+                while True:
+                    chunk = os.read(descriptor, min(1 << 20, maximum + 1 - total))
+                    if not chunk:
+                        break
+                    chunks.append(chunk)
+                    total += len(chunk)
+                    if total > maximum:
+                        raise MsctlError(
+                            "ENVIRONMENT_RECEIPT_INVALID",
+                            "AWS environment receipt exceeds the size bound",
+                        )
+                after = os.fstat(descriptor)
+            finally:
+                os.close(descriptor)
+        except MsctlError:
+            raise
+        except OSError as error:
+            raise MsctlError(
+                "ENVIRONMENT_RECEIPT_INVALID",
+                "AWS environment receipt cannot be read safely",
+            ) from error
+        data = b"".join(chunks)
+        if (
+            before.st_dev,
+            before.st_ino,
+            before.st_size,
+            before.st_mtime_ns,
+            before.st_ctime_ns,
+        ) != (
+            after.st_dev,
+            after.st_ino,
+            after.st_size,
+            after.st_mtime_ns,
+            after.st_ctime_ns,
+        ) or (
+            not stat.S_ISREG(after.st_mode)
+            or after.st_nlink != 1
+            or len(data) != after.st_size
+        ):
+            raise MsctlError(
+                "ENVIRONMENT_RECEIPT_INVALID",
+                "AWS environment receipt changed while it was read",
+            )
+        return data
+
     def _load_lifecycle_evidence(
         self,
         *,
@@ -3753,6 +3940,7 @@ class AwsP5Backend:
         dataset_root: Path | str | None,
         dataset_verification: Path | str | None,
         environment_receipt: Path | str,
+        selection: ProviderSelection | None = None,
         expected_instance_id: str | None = None,
     ) -> dict[str, str]:
         pointer_path = Path(dataset_pointer)
@@ -3839,12 +4027,62 @@ class AwsP5Backend:
             )
 
         environment_path = Path(environment_receipt)
-        environment_bytes = environment_path.read_bytes()
-        environment = require_object(
-            load_json(environment_path, label="AWS environment receipt"),
-            label="AWS environment receipt",
+        environment_bytes = self._read_lifecycle_environment_receipt(
+            environment_path
         )
         v3_environment = _is_v3_manifest(manifest)
+        if v3_environment:
+            if (
+                selection is None
+                or expected_instance_id is None
+                or _INSTANCE_ID_RE.fullmatch(expected_instance_id) is None
+                or selection.sha256
+                != getattr(manifest, "provider_selection_sha256", None)
+                or selection.selected_profile_id
+                != getattr(self.profile, "profile_id", None)
+                or selection.provider != self.profile.provider
+                or selection.profile_sha256 != self.profile.sha256
+                or selection.instance_type != self.profile.instance_type
+                or selection.region != self.runtime.region
+                or selection.ami_id != self.runtime.ami_id
+                or selection.container_image != self.runtime.container_image
+                or selection.container_digest != self.runtime.container_digest
+            ):
+                raise MsctlError(
+                    "ENVIRONMENT_RECEIPT_INVALID",
+                    "AWS environment receipt lacks its validated provider "
+                    "selection binding",
+                )
+            try:
+                verified_environment = aws_identity.verify_environment_receipt(
+                    environment_bytes,
+                    expected_profile_sha256=self.profile.sha256,
+                    expected_container_digest=selection.container_digest,
+                    expected_region=selection.region,
+                    expected_ami_id=selection.ami_id,
+                    expected_account_id=selection.aws_account_id,
+                    expected_instance_id=expected_instance_id,
+                    expected_instance_type=selection.instance_type,
+                )
+            except AwsIdentityError as error:
+                raise MsctlError(
+                    "ENVIRONMENT_RECEIPT_INVALID",
+                    "AWS authenticated receipt does not bind the selected "
+                    "account, instance, type, region, AMI, and profile",
+                ) from error
+            environment_sha256 = verified_environment.receipt_sha256
+        else:
+            try:
+                environment = require_object(
+                    json.loads(environment_bytes.decode("utf-8")),
+                    label="AWS environment receipt",
+                )
+            except (UnicodeDecodeError, json.JSONDecodeError) as error:
+                raise MsctlError(
+                    "ENVIRONMENT_RECEIPT_INVALID",
+                    "AWS environment receipt must contain valid UTF-8 JSON",
+                ) from error
+            environment_sha256 = hashlib.sha256(environment_bytes).hexdigest()
         environment_fields = {
             "schema_version",
             "profile_sha256",
@@ -3852,67 +4090,54 @@ class AwsP5Backend:
             "aws_instance_identity_document",
             "aws_instance_identity_pkcs7",
         }
-        if v3_environment:
-            environment_fields.add("boot_id")
-        require_exact_keys(
-            environment,
-            environment_fields,
-            label="AWS environment receipt",
-        )
-        identity = require_object(
-            environment["aws_instance_identity_document"],
-            label="AWS instance identity document",
-        )
-        pkcs7 = environment["aws_instance_identity_pkcs7"]
-        try:
-            decoded_pkcs7 = base64.b64decode(
-                "".join(str(pkcs7).split()),
-                validate=True,
+        if not v3_environment:
+            require_exact_keys(
+                environment,
+                environment_fields,
+                label="AWS environment receipt",
             )
-        except (ValueError, TypeError) as error:
-            raise MsctlError(
-                "ENVIRONMENT_RECEIPT_INVALID",
-                "AWS identity PKCS7 is not valid base64",
-            ) from error
-        if (
-            environment_bytes != canonical_json(environment) + b"\n"
-            or environment["schema_version"] != (
-                3 if v3_environment else 1
+            identity = require_object(
+                environment["aws_instance_identity_document"],
+                label="AWS instance identity document",
             )
-            or environment["profile_sha256"] != self.profile.sha256
-            or environment["container_image_digest"]
-            != self.runtime.container_digest
-            or identity.get("imageId") != self.runtime.ami_id
-            or identity.get("region") != self.runtime.region
-            or (
-                expected_instance_id is not None
-                and identity.get("instanceId") != expected_instance_id
-            )
-            or (
-                v3_environment
-                and (
-                    not isinstance(environment.get("boot_id"), str)
-                    or _BOOT_ID_RE.fullmatch(str(environment["boot_id"]))
-                    is None
+            pkcs7 = environment["aws_instance_identity_pkcs7"]
+            try:
+                decoded_pkcs7 = base64.b64decode(
+                    "".join(str(pkcs7).split()),
+                    validate=True,
                 )
-            )
-            or not decoded_pkcs7
-            or not self.identity_verifier(
-                identity,
-                "".join(str(pkcs7).split()),
-                self.runtime.region,
-            )
-        ):
-            raise MsctlError(
-                "ENVIRONMENT_RECEIPT_INVALID",
-                "AWS authenticated receipt does not bind the selected runtime",
-            )
+            except (ValueError, TypeError) as error:
+                raise MsctlError(
+                    "ENVIRONMENT_RECEIPT_INVALID",
+                    "AWS identity PKCS7 is not valid base64",
+                ) from error
+            if (
+                environment_bytes != canonical_json(environment) + b"\n"
+                or environment["schema_version"] != 1
+                or environment["profile_sha256"] != self.profile.sha256
+                or environment["container_image_digest"]
+                != self.runtime.container_digest
+                or identity.get("imageId") != self.runtime.ami_id
+                or identity.get("region") != self.runtime.region
+                or (
+                    expected_instance_id is not None
+                    and identity.get("instanceId") != expected_instance_id
+                )
+                or not decoded_pkcs7
+                or not self.identity_verifier(
+                    identity,
+                    "".join(str(pkcs7).split()),
+                    self.runtime.region,
+                )
+            ):
+                raise MsctlError(
+                    "ENVIRONMENT_RECEIPT_INVALID",
+                    "AWS authenticated receipt does not bind the selected runtime",
+                )
         return {
             "dataset_pointer_sha256": sha256_file(pointer_path),
             "dataset_verification_sha256": source_sha256,
-            "environment_receipt_sha256": hashlib.sha256(
-                environment_bytes
-            ).hexdigest(),
+            "environment_receipt_sha256": environment_sha256,
         }
 
     def render(
@@ -6681,6 +6906,7 @@ class AwsP5Backend:
                 release=release,
                 instance_id=instance_id,
                 terminate_at=terminate_at,
+                evidence=evidence,
                 context=context,
             )
             plan["operation_intent"] = operation_intent
@@ -6780,20 +7006,42 @@ class AwsP5Backend:
                         instance_id=instance_id,
                     )
                     if recovered is None:
-                        if started or terminal:
+                        if terminal and not started:
+                            raise MsctlError(
+                                "REMOTE_RECEIPT_INVALID",
+                                "remote terminal receipt exists without its "
+                                "started acquisition receipt",
+                            )
+                        if terminal:
                             return {
                                 "provider": self.profile.provider,
                                 "seed": manifest.seed,
                                 "instance_id": instance_id,
                                 "operation_id": next(iter(operation_ids)),
-                                "status": (
-                                    "REMOTE_TERMINAL"
-                                    if terminal
-                                    else "REMOTE_STARTED"
-                                ),
+                                "status": "REMOTE_TERMINAL",
                                 "submitted": 0,
                                 "idempotent": True,
                             }
+                        if started:
+                            now = _timestamp()
+                            for state in existing:
+                                state["status"] = "RECOVERY_REQUIRED"
+                                state["updated_at"] = now
+                            self._write_paired_states(
+                                store,
+                                manifest,
+                                existing,
+                                context,
+                            )
+                            raise MsctlError(
+                                "REMOTE_RECOVERY_REQUIRED",
+                                "remote execution was acquired but has no "
+                                "terminal receipt; automatic success or resend "
+                                "is forbidden",
+                                details={
+                                    "operation_id": next(iter(operation_ids)),
+                                },
+                            )
                         raise MsctlError(
                             "SUBMISSION_UNCERTAIN",
                             "send was attempted but no safe resend proof exists",
@@ -7144,7 +7392,13 @@ class AwsP5Backend:
                         instance_id=instance_id,
                     )
                     if recovered is None:
-                        if started or terminal:
+                        if terminal and not started:
+                            raise MsctlError(
+                                "REMOTE_RECEIPT_INVALID",
+                                "remote terminal receipt exists without its "
+                                "started acquisition receipt",
+                            )
+                        if terminal:
                             return {
                                 "provider": self.profile.provider,
                                 "seed": manifest.seed,
@@ -7152,14 +7406,31 @@ class AwsP5Backend:
                                 "operation_id": operation_intent[
                                     "operation_id"
                                 ],
-                                "status": (
-                                    "REMOTE_TERMINAL"
-                                    if terminal
-                                    else "REMOTE_STARTED"
-                                ),
+                                "status": "REMOTE_TERMINAL",
                                 "submitted": 0,
                                 "idempotent": True,
                             }
+                        if started:
+                            now = _timestamp()
+                            for state in present:
+                                state["status"] = "RECOVERY_REQUIRED"
+                                state["updated_at"] = now
+                            self._write_paired_states(
+                                store,
+                                manifest,
+                                present,
+                                context,
+                            )
+                            raise MsctlError(
+                                "REMOTE_RECOVERY_REQUIRED",
+                                "remote resume was acquired but has no terminal "
+                                "receipt; automatic success or resend is forbidden",
+                                details={
+                                    "operation_id": operation_intent[
+                                        "operation_id"
+                                    ],
+                                },
+                            )
                         raise MsctlError(
                             "SUBMISSION_UNCERTAIN",
                             "resume send was attempted without safe resend proof",
@@ -7681,16 +7952,12 @@ class AwsP5Backend:
                         ],
                     }
                 )
-        lifecycle_evidence = dict(
-            evidence
-            or {
-                "dataset_pointer_sha256": manifest.dataset_sha256,
-                "dataset_verification_sha256": manifest.dataset_sha256,
-                "environment_receipt_sha256": self._runtime_sha256(),
-            }
+        lifecycle_evidence = self._validated_lifecycle_evidence(
+            operation="evaluate",
+            manifest=manifest,
+            evidence=evidence,
+            context=context,
         )
-        for field, digest in lifecycle_evidence.items():
-            require_sha256(digest, label=field)
         return {
             "schema_version": 3 if v3_bindings else 1,
             "operation": "evaluate",
@@ -8137,7 +8404,13 @@ class AwsP5Backend:
                         instance_id=instance_id,
                     )
                     if recovered is None:
-                        if started or terminal:
+                        if terminal and not started:
+                            raise MsctlError(
+                                "REMOTE_RECEIPT_INVALID",
+                                "remote terminal receipt exists without its "
+                                "started acquisition receipt",
+                            )
+                        if terminal:
                             return {
                                 "provider": self.profile.provider,
                                 "seed": manifest.seed,
@@ -8145,14 +8418,25 @@ class AwsP5Backend:
                                 "operation_id": operation_intent[
                                     "operation_id"
                                 ],
-                                "status": (
-                                    "REMOTE_TERMINAL"
-                                    if terminal
-                                    else "REMOTE_STARTED"
-                                ),
+                                "status": "REMOTE_TERMINAL",
                                 "submitted": 0,
                                 "idempotent": True,
                             }
+                        if started:
+                            existing["status"] = "RECOVERY_REQUIRED"
+                            existing["updated_at"] = _timestamp()
+                            store.write_evaluation(manifest.sha256, existing)
+                            raise MsctlError(
+                                "REMOTE_RECOVERY_REQUIRED",
+                                "remote evaluation was acquired but has no "
+                                "terminal receipt; automatic success or resend "
+                                "is forbidden",
+                                details={
+                                    "operation_id": operation_intent[
+                                        "operation_id"
+                                    ],
+                                },
+                            )
                         raise MsctlError(
                             "SUBMISSION_UNCERTAIN",
                             "evaluation send has no safe resend proof",
@@ -8462,6 +8746,7 @@ class AwsP5Backend:
             return not apply, self.canary_run(
                 plan_path=args.canary_plan,
                 instance_id=args.instance_id,
+                approval_path=args.approval,
                 apply=apply,
             )
         if command == "env ensure" and self.profile.provider in _V3_PROFILES:
@@ -8634,10 +8919,17 @@ class AwsP5Backend:
                     dataset_root=dataset_root,
                     dataset_verification=dataset_verification,
                     environment_receipt=environment_receipt,
+                    selection=(
+                        context.selection if context is not None else None
+                    ),
                     expected_instance_id=(
-                        str(requested_instance_id)
-                        if command == "submit"
-                        else None
+                        context.instance_id
+                        if context is not None
+                        else (
+                            str(requested_instance_id)
+                            if command == "submit"
+                            else None
+                        )
                     ),
                 )
             if command == "runs render":

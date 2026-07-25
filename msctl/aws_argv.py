@@ -275,6 +275,22 @@ _FORBIDDEN_ENVIRONMENT = {
     "AWS_SHARED_CREDENTIALS_FILE",
     "AWS_WEB_IDENTITY_TOKEN_FILE",
 }
+_SHELL_INTERPRETERS = {
+    "/bin/bash",
+    "/bin/dash",
+    "/bin/sh",
+    "/usr/bin/bash",
+    "/usr/bin/dash",
+    "/usr/bin/sh",
+}
+_SEALED_EVALUATION_MEMBERS = (
+    "checkpoints.jsonl",
+    "items.jsonl",
+    "sealed-gold.jsonl",
+    "stores.jsonl",
+    "study-lock.json",
+    "validity.json",
+)
 
 
 class RemoteIntentError(ValueError):
@@ -663,6 +679,625 @@ def _validate_canary_intent(
     return intent
 
 
+def _required_option(argv: list[str], option: str, expected: str) -> None:
+    if argv.count(option) != 1:
+        raise RemoteIntentError(f"v3 operation step must bind {option} exactly once")
+    index = argv.index(option)
+    if index + 1 >= len(argv) or argv[index + 1] != expected:
+        raise RemoteIntentError(f"v3 operation step has a stale {option} binding")
+
+
+def _s3_location(root: str, suffix: str) -> tuple[str, str]:
+    parsed = urlsplit(root)
+    prefix = parsed.path.removeprefix("/").rstrip("/")
+    key = f"{prefix}/{suffix}" if prefix else suffix
+    return str(parsed.hostname), key
+
+
+def _aws_get_argv(
+    *,
+    region: str,
+    s3_root: str,
+    suffix: str,
+    destination: str,
+) -> list[str]:
+    bucket, key = _s3_location(s3_root, suffix)
+    return [
+        "/usr/bin/env",
+        "aws",
+        "--no-cli-pager",
+        "--region",
+        region,
+        "s3api",
+        "get-object",
+        "--bucket",
+        bucket,
+        "--key",
+        key,
+        "--checksum-mode",
+        "ENABLED",
+        destination,
+    ]
+
+
+def _validate_v3_python_step(
+    *,
+    name: str,
+    argv: list[str],
+    intent: Mapping[str, object],
+    release_root: str,
+    control_root: str,
+) -> None:
+    operation = str(intent["operation"])
+    scratch = "/mnt/memorysplit"
+    staging = f"{scratch}/staging"
+    provider = str(intent["provider"])
+    profile_path = f"{release_root}/cluster/profiles/{provider}.json"
+    allowed_scripts = {
+        f"{control_root}/cluster/aws/p5/bootstrap.py",
+        f"{release_root}/msctl/aws_launch_manifest.py",
+        f"{release_root}/msctl/aws_resume_launch.py",
+        f"{release_root}/cluster/aws/p5/launch_seed_pair.py",
+        f"{release_root}/cluster/aws/p5/terminal_artifacts.py",
+    }
+    expected_scripts = {
+        "bootstrap": f"{control_root}/cluster/aws/p5/bootstrap.py",
+        "build-launcher-manifest": (
+            f"{release_root}/msctl/aws_launch_manifest.py"
+        ),
+        "verify-terminal-checkpoints": (
+            f"{release_root}/cluster/aws/p5/terminal_artifacts.py"
+        ),
+        "publish-paired-evaluation": (
+            f"{release_root}/cluster/aws/p5/terminal_artifacts.py"
+        ),
+    }
+    if name == "paired-launch":
+        expected_scripts[name] = (
+            f"{release_root}/msctl/aws_resume_launch.py"
+            if operation == "resume"
+            else f"{release_root}/cluster/aws/p5/launch_seed_pair.py"
+        )
+    script = expected_scripts.get(name)
+    if script is None or argv[:2] != ["/usr/bin/python3", script]:
+        raise RemoteIntentError(
+            "v3 Python step is not pinned to its release or control root"
+        )
+    if any(
+        item.startswith("/") and item.endswith(".py") and item not in allowed_scripts
+        for item in argv
+    ):
+        raise RemoteIntentError(
+            "v3 operation references a script outside the pinned roots"
+        )
+    if name == "bootstrap":
+        _required_option(
+            argv,
+            "--profile",
+            f"{control_root}/cluster/profiles/{provider}.json",
+        )
+        _required_option(
+            argv,
+            "--release-archive",
+            f"{staging}/releases/{intent['release_sha256']}/release.zip",
+        )
+        _required_option(argv, "--release-sha256", str(intent["release_sha256"]))
+        _required_option(argv, "--dataset-receipt", f"{scratch}/dataset/receipt.json")
+        _required_option(
+            argv,
+            "--cohort-assignment",
+            f"{staging}/releases/{intent['release_sha256']}/"
+            "cohort-assignment-v3.json",
+        )
+        _required_option(argv, "--receipt", f"{staging}/bootstrap-receipt.json")
+        _required_option(
+            argv,
+            "--aws-private-home",
+            "/var/lib/memorysplit/aws-private-home",
+        )
+        if argv[-2:] != ["--authorize-destructive-instance-store", "--apply"]:
+            raise RemoteIntentError("v3 bootstrap mutation flags are not exact")
+    elif name == "build-launcher-manifest":
+        _required_option(argv, "--profile", profile_path)
+        _required_option(
+            argv,
+            "--out",
+            f"{staging}/launcher-manifest-{intent['run_manifest_sha256']}.json",
+        )
+        _required_option(argv, "--scratch-root", scratch)
+        _required_option(argv, "--seed", str(intent["seed"]))
+        _required_option(argv, "--profile-sha256", str(intent["profile_sha256"]))
+        _required_option(argv, "--release-sha256", str(intent["release_sha256"]))
+        _required_option(
+            argv,
+            "--run-manifest-sha256",
+            str(intent["run_manifest_sha256"]),
+        )
+        _required_option(
+            argv,
+            "--bootstrap-receipt",
+            f"{staging}/bootstrap-receipt.json",
+        )
+        _required_option(argv, "--corpus-receipt", f"{scratch}/dataset/receipt.json")
+    elif name == "paired-launch":
+        _required_option(argv, "--seed", str(intent["seed"]))
+        _required_option(
+            argv,
+            "--manifest",
+            f"{staging}/launcher-manifest-{intent['run_manifest_sha256']}.json",
+        )
+        _required_option(argv, "--profile", profile_path)
+        _required_option(argv, "--repo-root", release_root)
+        _required_option(argv, "--scratch-root", scratch)
+        if operation == "resume":
+            _required_option(
+                argv,
+                "--launcher",
+                f"{release_root}/cluster/aws/p5/launch_seed_pair.py",
+            )
+            checkpoint = cast(dict[str, object], intent["checkpoint_receipt"])
+            _required_option(
+                argv,
+                "--checkpoint-receipt",
+                f"{staging}/resume/{checkpoint['sha256']}/receipt.json",
+            )
+            _required_option(
+                argv,
+                "--checkpoint-receipt-sha256",
+                str(checkpoint["sha256"]),
+            )
+        if argv[-1] != "--apply":
+            raise RemoteIntentError("v3 paired launcher must use the closed apply path")
+    elif name == "verify-terminal-checkpoints":
+        if len(argv) < 3 or argv[2] != "verify-terminal":
+            raise RemoteIntentError("v3 checkpoint verifier subcommand is invalid")
+        _required_option(
+            argv,
+            "--receipt",
+            f"{scratch}/receipts/checkpoints/seed-{intent['seed']}/receipt.json",
+        )
+        _required_option(
+            argv,
+            "--run-root",
+            f"{scratch}/runs/seed-{intent['seed']}",
+        )
+    elif name == "publish-paired-evaluation":
+        if len(argv) < 3 or argv[2] != "publish-evaluation":
+            raise RemoteIntentError("v3 evaluation publisher subcommand is invalid")
+        _required_option(argv, "--evaluation-root", f"{scratch}/evaluations")
+        _required_option(
+            argv,
+            "--checkpoint-receipt",
+            f"{scratch}/receipts/checkpoints/seed-{intent['seed']}/receipt.json",
+        )
+    for option, expected in (
+        (
+            "--s3-root",
+            str(cast(dict[str, object], intent["environment"])["MS_S3_ROOT"]),
+        ),
+        ("--provider", provider),
+        ("--run-manifest-sha256", str(intent["run_manifest_sha256"])),
+    ):
+        if option in argv:
+            _required_option(argv, option, expected)
+
+
+def _validate_v3_docker_step(
+    *,
+    name: str,
+    argv: list[str],
+    intent: Mapping[str, object],
+    release_root: str,
+) -> None:
+    environment = cast(dict[str, object], intent["environment"])
+    scratch = "/mnt/memorysplit"
+    sealed_root = (
+        f"{scratch}/sealed-evaluation/{intent['sealed_evaluation_sha256']}"
+    )
+    image_indexes = [
+        index
+        for index, item in enumerate(argv)
+        if item.endswith("@" + str(environment["MS_CONTAINER_DIGEST"]))
+    ]
+    if len(image_indexes) != 1:
+        raise RemoteIntentError("v3 Docker step does not use the pinned image digest")
+    image_index = image_indexes[0]
+    image = argv[image_index]
+    if (
+        argv[0:2] != ["/usr/bin/docker", "run"]
+        or image_index + 3 >= len(argv)
+        or argv[image_index + 1 : image_index + 3]
+        != ["/opt/venv/bin/python", "-m"]
+    ):
+        raise RemoteIntentError("v3 Docker execution boundary is not closed")
+    module = argv[image_index + 3]
+    if name == "verify-sealed-evaluation":
+        if module != "msctl.aws_sealed_evaluation":
+            raise RemoteIntentError("v3 sealed verifier module is invalid")
+        _required_option(argv, "--root", "/sealed")
+        _required_option(
+            argv,
+            "--expected-release-sha256",
+            str(intent["sealed_evaluation_sha256"]),
+        )
+        _required_option(
+            argv,
+            "--expected-study-lock-sha256",
+            str(intent["study_lock_sha256"]),
+        )
+        expected_argv = [
+            "/usr/bin/docker",
+            "run",
+            "--rm",
+            "--network",
+            "none",
+            "--read-only",
+            "--user",
+            f"{environment['MS_RUNTIME_UID']}:{environment['MS_RUNTIME_GID']}",
+            "--mount",
+            f"type=bind,src={release_root},dst=/workspace,readonly",
+            "--mount",
+            f"type=bind,src={sealed_root},dst=/sealed,readonly",
+            "--workdir",
+            "/workspace",
+            image,
+            "/opt/venv/bin/python",
+            "-m",
+            "msctl.aws_sealed_evaluation",
+            "--root",
+            "/sealed",
+            "--expected-release-sha256",
+            str(intent["sealed_evaluation_sha256"]),
+            "--expected-study-lock-sha256",
+            str(intent["study_lock_sha256"]),
+        ]
+    elif name in {"evaluate-dense", "evaluate-split90"}:
+        arm = name.removeprefix("evaluate-")
+        if module != "evals.confirmatory":
+            raise RemoteIntentError("v3 evaluator module is invalid")
+        _required_option(
+            argv,
+            "--run",
+            f"{scratch}/runs/seed-{intent['seed']}/{arm}/run",
+        )
+        _required_option(argv, "--sealed-release", "/sealed")
+        _required_option(
+            argv,
+            "--expected-study-lock-sha256",
+            str(intent["study_lock_sha256"]),
+        )
+        output_index = argv.index("--output-dir") if "--output-dir" in argv else -1
+        if (
+            output_index < 0
+            or output_index + 1 >= len(argv)
+            or not argv[output_index + 1].startswith(f"{scratch}/evaluations/")
+            or not argv[output_index + 1].removeprefix(
+                f"{scratch}/evaluations/"
+            )
+            or "/" in argv[output_index + 1].removeprefix(
+                f"{scratch}/evaluations/"
+            )
+        ):
+            raise RemoteIntentError("v3 evaluation output path is outside its root")
+        run_root = f"{scratch}/runs/seed-{intent['seed']}"
+        evaluation_root = f"{scratch}/evaluations"
+        expected_argv = [
+            "/usr/bin/docker",
+            "run",
+            "--rm",
+            "--read-only",
+            "--network",
+            "none",
+            "--gpus",
+            "all",
+            "--user",
+            f"{environment['MS_RUNTIME_UID']}:{environment['MS_RUNTIME_GID']}",
+            "--security-opt",
+            "no-new-privileges",
+            "--cap-drop",
+            "ALL",
+            "--tmpfs",
+            "/tmp:rw,nosuid,nodev,noexec,size=1073741824",
+            "--env",
+            "HOME=/tmp",
+            "--env",
+            "PYTHONNOUSERSITE=1",
+            "--mount",
+            f"type=bind,src={release_root},dst=/workspace,readonly",
+            "--mount",
+            f"type=bind,src={sealed_root},dst=/sealed,readonly",
+            "--mount",
+            f"type=bind,src={run_root},dst={run_root},readonly",
+            "--mount",
+            f"type=bind,src={evaluation_root},dst={evaluation_root}",
+            "--workdir",
+            "/workspace",
+            image,
+            "/opt/venv/bin/python",
+            "-m",
+            "evals.confirmatory",
+            "evaluate",
+            "--run",
+            f"{run_root}/{arm}/run",
+            "--sealed-release",
+            "/sealed",
+            "--expected-study-lock-sha256",
+            str(intent["study_lock_sha256"]),
+            "--device",
+            "cuda",
+            "--output-dir",
+            argv[output_index + 1],
+        ]
+    else:
+        raise RemoteIntentError("v3 operation contains an unexpected Docker step")
+    if argv != expected_argv:
+        raise RemoteIntentError("v3 Docker argv differs from the closed operation plan")
+
+
+def _validate_v3_steps(
+    intent: Mapping[str, object],
+    steps: list[dict[str, object]],
+) -> None:
+    operation = str(intent["operation"])
+    release_root = f"/mnt/memorysplit/releases/{intent['release_sha256']}"
+    control_root = f"/opt/memorysplit/control/{intent['control_bundle_sha256']}"
+    environment = cast(dict[str, object], intent["environment"])
+    region = str(environment["AWS_REGION"])
+    s3_root = str(environment["MS_S3_ROOT"])
+    scratch = "/mnt/memorysplit"
+    staging = f"{scratch}/staging"
+    submit_names = [
+        "auto-termination",
+        "prepare-aws-private-home",
+        "prepare-staging",
+        "materialize-release-archive",
+        "materialize-release-receipt",
+        "materialize-cohort-assignment",
+        "materialize-dataset",
+        "bootstrap",
+        "build-launcher-manifest",
+        "paired-launch",
+    ]
+    resume_names = [
+        "prepare-resume-staging",
+        "materialize-resume-receipt",
+        "materialize-resume-dense",
+        "materialize-resume-split90",
+        "paired-launch",
+    ]
+    evaluation_names = [
+        "prepare-sealed-evaluation",
+        "prepare-evaluation-output",
+        *[
+            f"materialize-sealed-evaluation-{member.replace('.', '-')}"
+            for member in _SEALED_EVALUATION_MEMBERS
+        ],
+        "verify-sealed-evaluation",
+        "verify-terminal-checkpoints",
+        "evaluate-dense",
+        "evaluate-split90",
+        "publish-paired-evaluation",
+    ]
+    expected_names = {
+        "submit": submit_names,
+        "resume": resume_names,
+        "evaluate": evaluation_names,
+    }[operation]
+    names = [str(step["name"]) for step in steps]
+    if names != expected_names:
+        raise RemoteIntentError(
+            "v3 operation steps do not match the closed operation plan"
+        )
+    checkpoint = (
+        cast(dict[str, object], intent["checkpoint_receipt"])
+        if operation == "resume"
+        else None
+    )
+    checkpoint_rows = (
+        {
+            str(row["arm"]): cast(dict[str, object], row)
+            for row in cast(list[object], checkpoint["checkpoints"])
+            if isinstance(row, dict)
+        }
+        if checkpoint is not None
+        else {}
+    )
+    for step in steps:
+        name = str(step["name"])
+        argv = cast(list[str], step["argv"])
+        if any(item in _SHELL_INTERPRETERS for item in argv):
+            raise RemoteIntentError("v3 operation must not invoke a shell interpreter")
+        if name == "auto-termination":
+            expected = [
+                "/usr/bin/systemd-run",
+                "--unit",
+                "memorysplit-auto-terminate",
+                "--on-calendar",
+                str(intent["terminate_at"]),
+                "/sbin/shutdown",
+                "-h",
+                "now",
+            ]
+            if argv != expected:
+                raise RemoteIntentError("v3 auto-termination argv is not exact")
+        elif name == "prepare-aws-private-home":
+            if argv != [
+                "/usr/bin/install",
+                "-d",
+                "-m",
+                "0700",
+                "-o",
+                "0",
+                "-g",
+                "0",
+                "/var/lib/memorysplit/aws-private-home",
+            ]:
+                raise RemoteIntentError("v3 private HOME preparation is not exact")
+        elif name == "prepare-staging":
+            if argv != [
+                "/usr/bin/install",
+                "-d",
+                "-m",
+                "0700",
+                f"{staging}/releases/{intent['release_sha256']}",
+                f"{scratch}/dataset",
+            ]:
+                raise RemoteIntentError("v3 staging preparation is not exact")
+        elif name == "prepare-resume-staging":
+            assert checkpoint is not None
+            if argv != [
+                "/usr/bin/install",
+                "-d",
+                "-m",
+                "0700",
+                f"{staging}/resume/{checkpoint['sha256']}",
+            ]:
+                raise RemoteIntentError("v3 resume staging path is not exact")
+        elif name in {"prepare-sealed-evaluation", "prepare-evaluation-output"}:
+            destination = (
+                f"{scratch}/sealed-evaluation/"
+                f"{intent['sealed_evaluation_sha256']}"
+                if name == "prepare-sealed-evaluation"
+                else f"{scratch}/evaluations"
+            )
+            if argv != [
+                "/usr/bin/install",
+                "-d",
+                "-m",
+                "0700",
+                "-o",
+                str(environment["MS_RUNTIME_UID"]),
+                "-g",
+                str(environment["MS_RUNTIME_GID"]),
+                destination,
+            ]:
+                raise RemoteIntentError("v3 evaluation directory setup is not exact")
+        elif name == "materialize-release-archive":
+            if argv != _aws_get_argv(
+                region=region,
+                s3_root=s3_root,
+                suffix=f"releases/{intent['release_sha256']}/release.zip",
+                destination=(
+                    f"{staging}/releases/{intent['release_sha256']}/release.zip"
+                ),
+            ):
+                raise RemoteIntentError("v3 release materialization is not exact")
+        elif name == "materialize-release-receipt":
+            if argv != _aws_get_argv(
+                region=region,
+                s3_root=s3_root,
+                suffix=f"releases/{intent['release_sha256']}/RELEASE.json",
+                destination=(
+                    f"{staging}/releases/{intent['release_sha256']}/RELEASE.json"
+                ),
+            ):
+                raise RemoteIntentError(
+                    "v3 release receipt materialization is not exact"
+                )
+        elif name == "materialize-cohort-assignment":
+            if argv != _aws_get_argv(
+                region=region,
+                s3_root=s3_root,
+                suffix=(
+                    f"releases/{intent['release_sha256']}/"
+                    "cohort-assignment-v3.json"
+                ),
+                destination=(
+                    f"{staging}/releases/{intent['release_sha256']}/"
+                    "cohort-assignment-v3.json"
+                ),
+            ):
+                raise RemoteIntentError("v3 cohort materialization is not exact")
+        elif name == "materialize-dataset":
+            if argv != [
+                "/usr/bin/env",
+                "aws",
+                "--no-cli-pager",
+                "--region",
+                region,
+                "s3",
+                "sync",
+                f"{s3_root}/dataset",
+                f"{scratch}/dataset",
+                "--no-follow-symlinks",
+                "--only-show-errors",
+            ]:
+                raise RemoteIntentError("v3 dataset materialization is not exact")
+        elif name == "materialize-resume-receipt":
+            assert checkpoint is not None
+            if argv != _aws_get_argv(
+                region=region,
+                s3_root=s3_root,
+                suffix=(
+                    f"checkpoints/seed-{intent['seed']}/receipts/"
+                    f"{checkpoint['sha256']}.json"
+                ),
+                destination=f"{staging}/resume/{checkpoint['sha256']}/receipt.json",
+            ):
+                raise RemoteIntentError(
+                    "v3 checkpoint receipt materialization is not exact"
+                )
+        elif name in {"materialize-resume-dense", "materialize-resume-split90"}:
+            assert checkpoint is not None
+            arm = name.removeprefix("materialize-resume-")
+            row = checkpoint_rows.get(arm)
+            if row is None or argv != _aws_get_argv(
+                region=region,
+                s3_root=s3_root,
+                suffix=(
+                    f"checkpoints/seed-{intent['seed']}/{arm}/sha256/"
+                    f"{row['resume_sha256']}.pt"
+                ),
+                destination=str(row["resume_path"]),
+            ):
+                raise RemoteIntentError("v3 checkpoint materialization is not exact")
+        elif name.startswith("materialize-sealed-evaluation-"):
+            member = next(
+                (
+                    candidate
+                    for candidate in _SEALED_EVALUATION_MEMBERS
+                    if name
+                    == "materialize-sealed-evaluation-"
+                    + candidate.replace(".", "-")
+                ),
+                None,
+            )
+            if member is None or argv != _aws_get_argv(
+                region=region,
+                s3_root=s3_root,
+                suffix=(
+                    f"sealed-evaluation/{intent['sealed_evaluation_sha256']}/"
+                    f"{member}"
+                ),
+                destination=(
+                    f"{scratch}/sealed-evaluation/"
+                    f"{intent['sealed_evaluation_sha256']}/{member}"
+                ),
+            ):
+                raise RemoteIntentError(
+                    "v3 sealed evaluation materialization is not exact"
+                )
+        elif argv[0] == "/usr/bin/python3":
+            _validate_v3_python_step(
+                name=name,
+                argv=argv,
+                intent=intent,
+                release_root=release_root,
+                control_root=control_root,
+            )
+        elif argv[0] == "/usr/bin/docker":
+            _validate_v3_docker_step(
+                name=name,
+                argv=argv,
+                intent=intent,
+                release_root=release_root,
+            )
+        else:
+            raise RemoteIntentError(
+                "v3 operation executable is outside the closed allowlist"
+            )
+
+
 def _validate_intent(
     payload: bytes,
     *,
@@ -811,7 +1446,26 @@ def _validate_intent(
         or not all(isinstance(value, str) and value for value in environment.values())
         or _REGION_RE.fullmatch(str(environment["AWS_REGION"])) is None
     ):
-        raise RemoteIntentError("operation environment is not closed and credential-free")
+        raise RemoteIntentError(
+            "operation environment is not closed and credential-free"
+        )
+    if schema_version == 3 and (
+        environment["AWS_REGION"] not in {"us-east-1", "us-west-2"}
+        or re.fullmatch(r"^ami-[0-9a-f]{8,17}$", environment["MS_AWS_AMI_ID"])
+        is None
+        or re.fullmatch(
+            r"^sha256:[0-9a-f]{64}$",
+            environment["MS_CONTAINER_DIGEST"],
+        )
+        is None
+        or any(
+            not environment[field].isdigit() or int(environment[field]) <= 0
+            for field in ("MS_RUNTIME_GID", "MS_RUNTIME_UID")
+        )
+    ):
+        raise RemoteIntentError(
+            "v3 operation environment is not pinned to a supported runtime"
+        )
     s3_root = _s3_uri(environment["MS_S3_ROOT"])
     if intent["operation"] == "evaluate" and schema_version == 3:
         _validate_evaluation_checkpoint_receipt(
@@ -872,6 +1526,8 @@ def _validate_intent(
             raise RemoteIntentError(
                 "submit must establish expiry and private HOME before bootstrap"
             )
+    if schema_version == 3:
+        _validate_v3_steps(intent, cast(list[dict[str, object]], steps))
     return intent
 
 
@@ -1039,6 +1695,7 @@ def execute_intent(
             kind="started",
         )
         terminal = store.read_if_exists(str(intent["terminal_receipt_uri"]))
+        terminal_value: dict[str, object] | None = None
         if terminal is not None:
             terminal_value = _validate_receipt(
                 terminal,
@@ -1059,6 +1716,17 @@ def execute_intent(
             "executed": False,
             "idempotent": True,
             "terminal": terminal is not None,
+            "status": (
+                terminal_value["status"]
+                if terminal_value is not None
+                else "recovery-required"
+            ),
+            "recovery_required": terminal is None,
+            "returncode": (
+                terminal_value["returncode"]
+                if terminal_value is not None
+                else 75
+            ),
         }
     intent_environment = cast(dict[str, object], intent["environment"])
     environment = {
