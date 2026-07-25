@@ -219,8 +219,8 @@ with no output.
   snapshot into the intent; the mutable request mapping is never re-read.
 - Intent bytes are written mode `0600` to a randomized same-directory
   temporary, fsynced and closed under the failure guard, then atomically
-  renamed. Interrupted writes remove the temporary and never expose the final
-  intent path.
+  published without replacement by hard link. Interrupted writes never expose
+  a partial final intent path.
 - No real AWS client or network call was made. All live-path tests replace
   `_live_clients` with fakes.
 - Only the three assigned Python files and this report changed. The untracked
@@ -229,3 +229,62 @@ with no output.
 Operational prerequisite: package publication must preserve the packager's
 immutable revision in S3 object metadata under `revision`; preflight now fails
 closed if that binding is absent or malformed.
+
+## Controller second-review corrections
+
+Fix commit:
+`de66716c3ad9f55cd893ef44c5d1e674610e8af6`
+(`fix: close AWS preflight publication races`)
+
+### Second-review RED
+
+```text
+python -m pytest -q tests/test_aws_corpus_builder_preflight.py
+```
+
+Expected RED: `5 failed, 45 passed in 0.27s`. The failures demonstrated:
+
+1. missing or malformed package revision metadata did not name
+   `Metadata["revision"]`;
+2. an invalid programmatic clock constructed opted-in live clients before
+   `run_preflight` rejected it;
+3. a destination created during publication was silently replaced by rename;
+4. failure of the first temporary-file `fstat` left the temporary behind; and
+5. cleanup unlink failures were suppressed instead of accompanying the primary
+   error.
+
+### Second-review GREEN
+
+```text
+python -m pytest -q tests/test_aws_corpus_builder_preflight.py
+python -m py_compile \
+  cluster/aws/corpus_builder/preflight.py \
+  scripts/aws_corpus_builder_preflight.py
+git diff --check
+```
+
+Fresh result: `50 passed in 0.18s`; compilation and whitespace checks exited 0
+with no output.
+
+### Second-review self-review
+
+- Publication now hard-links the completed same-directory temporary to the
+  destination. This operation atomically fails if any racer owns the final
+  name, and the final inode is verified against the written inode before
+  success.
+- The writer records temporary creation before its first `fstat`. Every
+  failure path attempts cleanup of each name it created, including both links
+  when publication partially completed.
+- Cleanup unlink failures are attached as exception notes. The original write,
+  validation, or publication exception remains the raised primary error.
+- Canonical UTC time validation runs with the other client-free checks before
+  `_live_clients`; the direct `run_preflight` validation remains in place.
+- Missing or malformed package revision metadata now identifies the exact
+  required key, `Metadata["revision"]`.
+- No real AWS client or network call was made.
+
+An uncatchable kill before publication can leave a private
+`.name.pid.random.tmp` file. It is not the canonical intent path and cannot be
+mistaken for a published or reusable launch intent. No automatic sweep is
+performed because a matching filename and owner alone do not prove that a
+stale file belongs to this invocation.
