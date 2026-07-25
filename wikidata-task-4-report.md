@@ -157,3 +157,176 @@ No blocking defect was found in self-review.
 
 - `4483c7297a2ede3f66644209aca50dabf332b467` —
   `feat: add indexed Wikidata renderer`
+
+## Review follow-up
+
+### Status and implementation
+
+PASS. The complete three-archive set is now identity-checked before and after
+every Wikidata render. The set is the closed tuple authenticated from the
+verified view receipt at renderer construction, so each boundary checks the
+alias archive, inductive archive, and transductive archive regardless of which
+training split selected the record. The selected archive SHA-256 remains bound
+to the catalog record.
+
+The public constructor and render signatures did not change:
+
+```text
+WikidataGraphRenderer(source_root: Path, wikidata_view: WikidataDerivedView)
+render(record: CatalogRecord, routes: RouteIndex) -> ProductionRenderedRecord
+```
+
+FineWeb-Edu, FineMath, synthetic graph, `ProofEnvelope`,
+`ProductionRenderedRecord`, and the shared exposure-renderer contracts are new
+production code introduced by `4483c72`; they were not preserved from an
+earlier committed or reviewed shared renderer. Follow-up behavioral coverage
+now proves:
+
+- FineWeb reads all three allowed 10BT paths and rejects an unapproved path
+  before opening it;
+- FineMath processes FineWeb, 4plus, then 3plus and preserves exact
+  cross-deduplicated selection;
+- synthetic graph replays the catalog seed and frozen world dimensions;
+- non-NFC and non-finite payloads are rejected;
+- duplicate synthetic source record IDs and oversized graph cores are
+  rejected; and
+- source hash and target-count commitment drift are rejected.
+
+### Archive-set RED/GREEN evidence
+
+Pre-render RED, with an inductive record while independently mutating the
+alias archive and the non-selected transductive archive:
+
+```text
+FF                                                                       [100%]
+2 failed in 0.74s
+```
+
+Both failures were the expected `Failed: DID NOT RAISE`, proving the old
+record-selected check did not cover either archive.
+
+Pre-render GREEN after replacing the selected-archive check with a complete-set
+boundary check:
+
+```text
+..                                                                       [100%]
+2 passed in 0.62s
+```
+
+Post-render RED mutated each same archive from inside token/sidecar
+construction, after the pre-render boundary:
+
+```text
+FF                                                                       [100%]
+2 failed in 0.69s
+```
+
+Final combined boundary GREEN:
+
+```text
+....                                                                     [100%]
+4 passed in 1.16s
+```
+
+The six added non-Wikidata behavioral characterization cases passed in
+`0.40s`. They exercised the already-introduced production behavior and did not
+require a production-code change.
+
+The complete focused renderer file now passes:
+
+```text
+.........................                                                [100%]
+25 passed in 2.45s
+```
+
+### Producer design and plan amendments
+
+The producer design now places the content-addressed derived-view authority
+between immutable source staging and the production catalog. It requires the
+catalog index and every Wikidata locator to bind the view receipt SHA-256, and
+requires inner production bindings plus the outer receipt to bind the
+inventoried canonical view receipt. The outer receipt additionally binds its
+fixed release-relative path.
+
+The implementation plan now records Task 3W before Task 3 and Task 5A. Task 3
+consumes `WikidataGraphCatalogSource` over that verified view; Task 5A consumes
+`lookup_training_triple()` and `lookup_alias()` and explicitly forbids legacy
+iterators and per-record archive/full-stream scans. Task 7 carries the view
+receipt through publication. No scientific quota or fixed source identity was
+changed.
+
+### Complete regression gate
+
+The required eight-file invocation covered:
+
+```text
+tests/test_reasoning_v2_wikidata_source.py
+tests/test_reasoning_v2_catalog.py
+tests/test_reasoning_v2_renderers.py
+tests/test_reasoning_v2_semantic.py
+tests/test_reasoning_v2_source_lock.py
+tests/test_tokenizer.py
+tests/test_srgm_worlds.py
+tests/test_current_sources.py
+```
+
+The first restricted-sandbox invocation reached `354 passed` and `17 failed`;
+every failure had the same environmental root cause: fixture `git init` could
+not create `.git/hooks` (`Operation not permitted`). A representative failing
+test passed alone outside that filesystem sandbox (`1 passed in 0.45s`), and
+the complete local, network-free rerun passed:
+
+```text
+........................................................................ [ 19%]
+........................................................................ [ 38%]
+........................................................................ [ 58%]
+........................................................................ [ 77%]
+........................................................................ [ 97%]
+...........                                                              [100%]
+371 passed in 25.50s
+```
+
+All pytest invocations used explicit `--basetemp` paths under `/tmp`; those
+directories were removed afterward. No AWS or network operation was used.
+
+Final static gates:
+
+```text
+python -m py_compile \
+  corpusgen/reasoning_v2/wikidata_source.py \
+  corpusgen/reasoning_v2/catalog.py \
+  corpusgen/reasoning_v2/renderers.py
+# exit 0, no output
+
+git diff --check
+git diff --check cb57697..HEAD
+# both exit 0, no output
+```
+
+### Follow-up self-review
+
+- Full-set closure: `_reverify_archives()` traverses the closed three-entry
+  receipt-derived tuple at both render boundaries; alias and non-selected
+  training drift can no longer pass silently.
+- Race resistance: each check opens without symlink following and compares
+  named/opened regular-file identity, owner, mode, link count, size, inode, and
+  timestamps against the construction-time pin.
+- Complexity: each render adds six constant-time metadata checks over a fixed
+  three-file set. It does not rehash archive bytes or scan logical streams.
+- Authority layering: source archive identity, selected-record SHA-256,
+  locator/view commitment, indexed triple replay, and alias lookup remain
+  independently checked.
+- Compatibility: no public API, renderer version, locator schema, token
+  fitting, semantic routing, or sidecar behavior changed.
+- Scope: implementation/test changes, the two required producer documents,
+  and this report are the only follow-up files changed. The supplied untracked
+  brief and review patch remain untouched.
+
+No blocking defect or unresolved concern was found in follow-up self-review.
+
+### Follow-up commits
+
+- `3ac34d216d695f1a7b278586e5c0ff119ef44dd6` —
+  `fix: verify complete Wikidata archive set`
+- `44fbe732dd54cefb20e0e907f2a9bb398a0e1546` —
+  `docs: bind Wikidata view in producer flow`
