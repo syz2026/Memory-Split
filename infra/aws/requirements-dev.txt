@@ -1,0 +1,2 @@
+# Offline CloudFormation schema linting. Guard is a standalone v3.2.0 binary.
+cfn-lint==1.53.2

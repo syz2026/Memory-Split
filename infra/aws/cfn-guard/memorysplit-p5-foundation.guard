@@ -1,0 +1,910 @@
+# MemorySplit Task 5A: static no-instance/private-foundation invariants.
+# Exact SSM canonical JSON identity and closed outputs are checked by pytest.
+
+let ec2_instances = Resources.*[ Type == 'AWS::EC2::Instance' ]
+let auto_scaling_groups = Resources.*[
+  Type == 'AWS::AutoScaling::AutoScalingGroup'
+]
+let ec2_fleets = Resources.*[ Type == 'AWS::EC2::EC2Fleet' ]
+let spot_fleets = Resources.*[ Type == 'AWS::EC2::SpotFleet' ]
+let capacity_reservations = Resources.*[
+  Type == 'AWS::EC2::CapacityReservation'
+]
+let capacity_reservation_fleets = Resources.*[
+  Type == 'AWS::EC2::CapacityReservationFleet'
+]
+
+let internet_gateways = Resources.*[ Type == 'AWS::EC2::InternetGateway' ]
+let nat_gateways = Resources.*[ Type == 'AWS::EC2::NatGateway' ]
+let elastic_ips = Resources.*[ Type == 'AWS::EC2::EIP' ]
+let gateway_attachments = Resources.*[
+  Type == 'AWS::EC2::VPCGatewayAttachment'
+]
+let public_routes = Resources.*[
+  Type == 'AWS::EC2::Route'
+  Properties.DestinationCidrBlock == '0.0.0.0/0'
+]
+
+let subnets = Resources.*[ Type == 'AWS::EC2::Subnet' ]
+let all_resources = Resources.*
+let iam_resources = Resources.*[ Type == /AWS::IAM::.*/ ]
+let iam_roles = Resources.*[ Type == 'AWS::IAM::Role' ]
+let iam_instance_profiles = Resources.*[
+  Type == 'AWS::IAM::InstanceProfile'
+]
+let iam_policy_resources = Resources.*[ Type == 'AWS::IAM::Policy' ]
+let iam_managed_policy_resources = Resources.*[
+  Type == 'AWS::IAM::ManagedPolicy'
+]
+let s3_bucket_policy_resources = Resources.*[
+  Type == 'AWS::S3::BucketPolicy'
+]
+let sns_topic_policy_resources = Resources.*[
+  Type == 'AWS::SNS::TopicPolicy'
+]
+let nested_property_structs = Resources.*.Properties.*[
+  this is_struct
+]
+let unexpected_nested_policy_containers = %nested_property_structs[
+  PolicyDocument exists
+]
+let train_inline_policies = Resources.TrainRole.Properties.Policies[*]
+let evaluator_inline_policies = Resources.EvaluatorRole.Properties.Policies[*]
+let controller_inline_policies = Resources.ControllerRole.Properties.Policies[*]
+let signer_inline_policies = Resources.SignerRole.Properties.Policies[*]
+
+let train_list_prefixes = [
+  '${ArtifactRootPrefix}/canary-roundtrip',
+  '${ArtifactRootPrefix}/canary-roundtrip/*',
+  '${ArtifactRootPrefix}/checkpoints',
+  '${ArtifactRootPrefix}/checkpoints/*',
+  '${ArtifactRootPrefix}/dataset',
+  '${ArtifactRootPrefix}/dataset/*',
+  '${ArtifactRootPrefix}/logs',
+  '${ArtifactRootPrefix}/logs/*',
+  '${ArtifactRootPrefix}/operations/intents',
+  '${ArtifactRootPrefix}/operations/intents/*',
+  '${ArtifactRootPrefix}/operations/*/receipts',
+  '${ArtifactRootPrefix}/operations/*/receipts/*',
+  '${ArtifactRootPrefix}/receipts/bootstrap',
+  '${ArtifactRootPrefix}/receipts/bootstrap/*',
+  '${ArtifactRootPrefix}/receipts/canary',
+  '${ArtifactRootPrefix}/receipts/canary/*',
+  '${ArtifactRootPrefix}/receipts/checkpoints',
+  '${ArtifactRootPrefix}/receipts/checkpoints/*',
+  '${ArtifactRootPrefix}/receipts/interruption',
+  '${ArtifactRootPrefix}/receipts/interruption/*',
+  '${ArtifactRootPrefix}/receipts/runs',
+  '${ArtifactRootPrefix}/receipts/runs/*',
+  '${ArtifactRootPrefix}/releases',
+  '${ArtifactRootPrefix}/releases/*',
+  '${ArtifactRootPrefix}/snapshots',
+  '${ArtifactRootPrefix}/snapshots/*'
+]
+let train_read_resources = [
+  '${ArtifactBucket.Arn}/${ArtifactRootPrefix}/dataset/*',
+  '${ArtifactBucket.Arn}/${ArtifactRootPrefix}/operations/intents/*',
+  '${ArtifactBucket.Arn}/${ArtifactRootPrefix}/releases/*'
+]
+let train_write_resources = [
+  '${ArtifactBucket.Arn}/${ArtifactRootPrefix}/canary-roundtrip/*',
+  '${ArtifactBucket.Arn}/${ArtifactRootPrefix}/checkpoints/*',
+  '${ArtifactBucket.Arn}/${ArtifactRootPrefix}/logs/*',
+  '${ArtifactBucket.Arn}/${ArtifactRootPrefix}/operations/*/receipts/*',
+  '${ArtifactBucket.Arn}/${ArtifactRootPrefix}/receipts/bootstrap/*',
+  '${ArtifactBucket.Arn}/${ArtifactRootPrefix}/receipts/canary/*',
+  '${ArtifactBucket.Arn}/${ArtifactRootPrefix}/receipts/checkpoints/*',
+  '${ArtifactBucket.Arn}/${ArtifactRootPrefix}/receipts/interruption/*',
+  '${ArtifactBucket.Arn}/${ArtifactRootPrefix}/receipts/runs/*',
+  '${ArtifactBucket.Arn}/${ArtifactRootPrefix}/snapshots/*'
+]
+let evaluator_list_prefixes = [
+  '${ArtifactRootPrefix}/checkpoints',
+  '${ArtifactRootPrefix}/checkpoints/*',
+  '${ArtifactRootPrefix}/evaluations',
+  '${ArtifactRootPrefix}/evaluations/*',
+  '${ArtifactRootPrefix}/receipts/checkpoints',
+  '${ArtifactRootPrefix}/receipts/checkpoints/*',
+  '${ArtifactRootPrefix}/receipts/evaluations',
+  '${ArtifactRootPrefix}/receipts/evaluations/*',
+  '${ArtifactRootPrefix}/sealed',
+  '${ArtifactRootPrefix}/sealed/*'
+]
+let evaluator_read_resources = [
+  '${ArtifactBucket.Arn}/${ArtifactRootPrefix}/checkpoints/*',
+  '${ArtifactBucket.Arn}/${ArtifactRootPrefix}/receipts/checkpoints/*',
+  '${ArtifactBucket.Arn}/${ArtifactRootPrefix}/sealed/*'
+]
+let evaluator_write_resources = [
+  '${ArtifactBucket.Arn}/${ArtifactRootPrefix}/evaluations/*',
+  '${ArtifactBucket.Arn}/${ArtifactRootPrefix}/receipts/evaluations/*'
+]
+let controller_list_prefixes = [
+  '${ArtifactRootPrefix}/canaries',
+  '${ArtifactRootPrefix}/canaries/*',
+  '${ArtifactRootPrefix}/canary-roundtrip',
+  '${ArtifactRootPrefix}/canary-roundtrip/*',
+  '${ArtifactRootPrefix}/checkpoints',
+  '${ArtifactRootPrefix}/checkpoints/*',
+  '${ArtifactRootPrefix}/collections',
+  '${ArtifactRootPrefix}/collections/*',
+  '${ArtifactRootPrefix}/dataset',
+  '${ArtifactRootPrefix}/dataset/*',
+  '${ArtifactRootPrefix}/environments',
+  '${ArtifactRootPrefix}/environments/*',
+  '${ArtifactRootPrefix}/evaluations',
+  '${ArtifactRootPrefix}/evaluations/*',
+  '${ArtifactRootPrefix}/logs',
+  '${ArtifactRootPrefix}/logs/*',
+  '${ArtifactRootPrefix}/operations/intents',
+  '${ArtifactRootPrefix}/operations/intents/*',
+  '${ArtifactRootPrefix}/operations/*/receipts',
+  '${ArtifactRootPrefix}/operations/*/receipts/*',
+  '${ArtifactRootPrefix}/receipts/bootstrap',
+  '${ArtifactRootPrefix}/receipts/bootstrap/*',
+  '${ArtifactRootPrefix}/receipts/canary',
+  '${ArtifactRootPrefix}/receipts/canary/*',
+  '${ArtifactRootPrefix}/receipts/checkpoints',
+  '${ArtifactRootPrefix}/receipts/checkpoints/*',
+  '${ArtifactRootPrefix}/receipts/collections',
+  '${ArtifactRootPrefix}/receipts/collections/*',
+  '${ArtifactRootPrefix}/receipts/evaluations',
+  '${ArtifactRootPrefix}/receipts/evaluations/*',
+  '${ArtifactRootPrefix}/receipts/interruption',
+  '${ArtifactRootPrefix}/receipts/interruption/*',
+  '${ArtifactRootPrefix}/receipts/runs',
+  '${ArtifactRootPrefix}/receipts/runs/*',
+  '${ArtifactRootPrefix}/releases',
+  '${ArtifactRootPrefix}/releases/*',
+  '${ArtifactRootPrefix}/snapshots',
+  '${ArtifactRootPrefix}/snapshots/*'
+]
+let controller_read_resources = [
+  '${ArtifactBucket.Arn}/${ArtifactRootPrefix}/canaries/*',
+  '${ArtifactBucket.Arn}/${ArtifactRootPrefix}/canary-roundtrip/*',
+  '${ArtifactBucket.Arn}/${ArtifactRootPrefix}/checkpoints/*',
+  '${ArtifactBucket.Arn}/${ArtifactRootPrefix}/checkpoints/receipts/*',
+  '${ArtifactBucket.Arn}/${ArtifactRootPrefix}/checkpoints/sha256/*',
+  '${ArtifactBucket.Arn}/${ArtifactRootPrefix}/collections/*',
+  '${ArtifactBucket.Arn}/${ArtifactRootPrefix}/dataset/*',
+  '${ArtifactBucket.Arn}/${ArtifactRootPrefix}/environments/*',
+  '${ArtifactBucket.Arn}/${ArtifactRootPrefix}/evaluations/*',
+  '${ArtifactBucket.Arn}/${ArtifactRootPrefix}/logs/*',
+  '${ArtifactBucket.Arn}/${ArtifactRootPrefix}/operations/intents/*',
+  '${ArtifactBucket.Arn}/${ArtifactRootPrefix}/operations/*/receipts/*',
+  '${ArtifactBucket.Arn}/${ArtifactRootPrefix}/receipts/bootstrap/*',
+  '${ArtifactBucket.Arn}/${ArtifactRootPrefix}/receipts/canary/*',
+  '${ArtifactBucket.Arn}/${ArtifactRootPrefix}/receipts/checkpoints/*',
+  '${ArtifactBucket.Arn}/${ArtifactRootPrefix}/receipts/collections/*',
+  '${ArtifactBucket.Arn}/${ArtifactRootPrefix}/receipts/evaluations/*',
+  '${ArtifactBucket.Arn}/${ArtifactRootPrefix}/receipts/interruption/*',
+  '${ArtifactBucket.Arn}/${ArtifactRootPrefix}/receipts/runs/*',
+  '${ArtifactBucket.Arn}/${ArtifactRootPrefix}/releases/*',
+  '${ArtifactBucket.Arn}/${ArtifactRootPrefix}/snapshots/*'
+]
+let controller_write_resources = [
+  '${ArtifactBucket.Arn}/${ArtifactRootPrefix}/canaries/*',
+  '${ArtifactBucket.Arn}/${ArtifactRootPrefix}/checkpoints/receipts/*',
+  '${ArtifactBucket.Arn}/${ArtifactRootPrefix}/checkpoints/sha256/*',
+  '${ArtifactBucket.Arn}/${ArtifactRootPrefix}/dataset/*',
+  '${ArtifactBucket.Arn}/${ArtifactRootPrefix}/environments/*',
+  '${ArtifactBucket.Arn}/${ArtifactRootPrefix}/operations/intents/*'
+]
+let endpoint_object_resources = [
+  '${ArtifactBucket.Arn}/${ArtifactRootPrefix}/canaries/*',
+  '${ArtifactBucket.Arn}/${ArtifactRootPrefix}/canary-roundtrip/*',
+  '${ArtifactBucket.Arn}/${ArtifactRootPrefix}/checkpoints/*',
+  '${ArtifactBucket.Arn}/${ArtifactRootPrefix}/collections/*',
+  '${ArtifactBucket.Arn}/${ArtifactRootPrefix}/dataset/*',
+  '${ArtifactBucket.Arn}/${ArtifactRootPrefix}/environments/*',
+  '${ArtifactBucket.Arn}/${ArtifactRootPrefix}/evaluations/*',
+  '${ArtifactBucket.Arn}/${ArtifactRootPrefix}/logs/*',
+  '${ArtifactBucket.Arn}/${ArtifactRootPrefix}/operations/*',
+  '${ArtifactBucket.Arn}/${ArtifactRootPrefix}/receipts/*',
+  '${ArtifactBucket.Arn}/${ArtifactRootPrefix}/releases/*',
+  '${ArtifactBucket.Arn}/${ArtifactRootPrefix}/sealed/*',
+  '${ArtifactBucket.Arn}/${ArtifactRootPrefix}/snapshots/*'
+]
+let endpoint_list_prefixes = [
+  '${ArtifactRootPrefix}/canaries',
+  '${ArtifactRootPrefix}/canaries/*',
+  '${ArtifactRootPrefix}/canary-roundtrip',
+  '${ArtifactRootPrefix}/canary-roundtrip/*',
+  '${ArtifactRootPrefix}/checkpoints',
+  '${ArtifactRootPrefix}/checkpoints/*',
+  '${ArtifactRootPrefix}/collections',
+  '${ArtifactRootPrefix}/collections/*',
+  '${ArtifactRootPrefix}/dataset',
+  '${ArtifactRootPrefix}/dataset/*',
+  '${ArtifactRootPrefix}/environments',
+  '${ArtifactRootPrefix}/environments/*',
+  '${ArtifactRootPrefix}/evaluations',
+  '${ArtifactRootPrefix}/evaluations/*',
+  '${ArtifactRootPrefix}/logs',
+  '${ArtifactRootPrefix}/logs/*',
+  '${ArtifactRootPrefix}/operations',
+  '${ArtifactRootPrefix}/operations/*',
+  '${ArtifactRootPrefix}/receipts',
+  '${ArtifactRootPrefix}/receipts/*',
+  '${ArtifactRootPrefix}/releases',
+  '${ArtifactRootPrefix}/releases/*',
+  '${ArtifactRootPrefix}/sealed',
+  '${ArtifactRootPrefix}/sealed/*',
+  '${ArtifactRootPrefix}/snapshots',
+  '${ArtifactRootPrefix}/snapshots/*'
+]
+let train_readable_resources = [
+  '${ArtifactBucket.Arn}/${ArtifactRootPrefix}/canary-roundtrip/*',
+  '${ArtifactBucket.Arn}/${ArtifactRootPrefix}/checkpoints/*',
+  '${ArtifactBucket.Arn}/${ArtifactRootPrefix}/dataset/*',
+  '${ArtifactBucket.Arn}/${ArtifactRootPrefix}/logs/*',
+  '${ArtifactBucket.Arn}/${ArtifactRootPrefix}/operations/intents/*',
+  '${ArtifactBucket.Arn}/${ArtifactRootPrefix}/operations/*/receipts/*',
+  '${ArtifactBucket.Arn}/${ArtifactRootPrefix}/receipts/bootstrap/*',
+  '${ArtifactBucket.Arn}/${ArtifactRootPrefix}/receipts/canary/*',
+  '${ArtifactBucket.Arn}/${ArtifactRootPrefix}/receipts/checkpoints/*',
+  '${ArtifactBucket.Arn}/${ArtifactRootPrefix}/receipts/interruption/*',
+  '${ArtifactBucket.Arn}/${ArtifactRootPrefix}/receipts/runs/*',
+  '${ArtifactBucket.Arn}/${ArtifactRootPrefix}/releases/*',
+  '${ArtifactBucket.Arn}/${ArtifactRootPrefix}/snapshots/*'
+]
+let evaluator_readable_resources = [
+  '${ArtifactBucket.Arn}/${ArtifactRootPrefix}/checkpoints/*',
+  '${ArtifactBucket.Arn}/${ArtifactRootPrefix}/evaluations/*',
+  '${ArtifactBucket.Arn}/${ArtifactRootPrefix}/receipts/checkpoints/*',
+  '${ArtifactBucket.Arn}/${ArtifactRootPrefix}/receipts/evaluations/*',
+  '${ArtifactBucket.Arn}/${ArtifactRootPrefix}/sealed/*'
+]
+let endpoint_all_resources = [
+  '${ArtifactBucket.Arn}/${ArtifactRootPrefix}/canaries/*',
+  '${ArtifactBucket.Arn}/${ArtifactRootPrefix}/canary-roundtrip/*',
+  '${ArtifactBucket.Arn}/${ArtifactRootPrefix}/checkpoints/*',
+  '${ArtifactBucket.Arn}/${ArtifactRootPrefix}/collections/*',
+  '${ArtifactBucket.Arn}/${ArtifactRootPrefix}/dataset/*',
+  '${ArtifactBucket.Arn}/${ArtifactRootPrefix}/environments/*',
+  '${ArtifactBucket.Arn}/${ArtifactRootPrefix}/evaluations/*',
+  '${ArtifactBucket.Arn}/${ArtifactRootPrefix}/logs/*',
+  '${ArtifactBucket.Arn}/${ArtifactRootPrefix}/operations/*',
+  '${ArtifactBucket.Arn}/${ArtifactRootPrefix}/receipts/*',
+  '${ArtifactBucket.Arn}/${ArtifactRootPrefix}/releases/*',
+  '${ArtifactBucket.Arn}/${ArtifactRootPrefix}/sealed/*',
+  '${ArtifactBucket.Arn}/${ArtifactRootPrefix}/snapshots/*',
+  'arn:${AWS::Partition}:s3:::prod-${AWS::Region}-starport-layer-bucket/*'
+]
+let train_s3_sids = [
+  'LocateArtifactBucket',
+  'ListTrainPrefixes',
+  'ReadTrainingInputs',
+  'ReadWriteTrainingArtifacts'
+]
+let train_s3_actions = [
+  's3:AbortMultipartUpload',
+  's3:GetBucketLocation',
+  's3:GetObject',
+  's3:GetObjectAttributes',
+  's3:GetObjectTagging',
+  's3:GetObjectVersion',
+  's3:ListBucket',
+  's3:ListBucketVersions',
+  's3:ListMultipartUploadParts',
+  's3:PutObject',
+  's3:PutObjectTagging'
+]
+let evaluator_s3_sids = [
+  'LocateArtifactBucket',
+  'ListEvaluatorPrefixes',
+  'ReadEvaluationInputs',
+  'ReadWriteEvaluationEvidence'
+]
+let evaluator_s3_actions = [
+  's3:GetBucketLocation',
+  's3:GetObject',
+  's3:GetObjectAttributes',
+  's3:GetObjectVersion',
+  's3:ListBucket',
+  's3:ListBucketVersions',
+  's3:PutObject',
+  's3:PutObjectTagging'
+]
+let controller_s3_sids = [
+  'ListControllerPrefixes',
+  'ReadLifecycleArtifacts',
+  'WriteControllerPublications'
+]
+let controller_s3_actions = [
+  's3:GetObject',
+  's3:GetObjectVersion',
+  's3:ListBucket',
+  's3:ListBucketVersions',
+  's3:PutObject'
+]
+let endpoint_s3_sids = [
+  'MemorySplitBucketLocation',
+  'MemorySplitBucketListing',
+  'MemorySplitVersionedObjects',
+  'EcrLayerDownloads'
+]
+let endpoint_s3_actions = [
+  's3:AbortMultipartUpload',
+  's3:GetBucketLocation',
+  's3:GetObject',
+  's3:GetObjectAttributes',
+  's3:GetObjectTagging',
+  's3:GetObjectVersion',
+  's3:ListBucket',
+  's3:ListBucketVersions',
+  's3:ListMultipartUploadParts',
+  's3:PutObject',
+  's3:PutObjectTagging'
+]
+let direct_policy_s3_sids = [
+  'DenyInsecureTransport',
+  'DenyUnexpectedEncryptionAlgorithm',
+  'DenyUnexpectedKmsKey',
+  'MemorySplitBucketLocation',
+  'MemorySplitBucketListing',
+  'MemorySplitVersionedObjects',
+  'EcrLayerDownloads'
+]
+let direct_policy_s3_actions = [
+  's3:AbortMultipartUpload',
+  's3:GetBucketLocation',
+  's3:GetObject',
+  's3:GetObjectAttributes',
+  's3:GetObjectTagging',
+  's3:GetObjectVersion',
+  's3:ListBucket',
+  's3:ListBucketVersions',
+  's3:ListMultipartUploadParts',
+  's3:PutObject',
+  's3:PutObjectTagging'
+]
+let direct_policy_s3_resources = [
+  '${ArtifactBucket.Arn}/*',
+  '${ArtifactBucket.Arn}/${ArtifactRootPrefix}/canaries/*',
+  '${ArtifactBucket.Arn}/${ArtifactRootPrefix}/canary-roundtrip/*',
+  '${ArtifactBucket.Arn}/${ArtifactRootPrefix}/checkpoints/*',
+  '${ArtifactBucket.Arn}/${ArtifactRootPrefix}/collections/*',
+  '${ArtifactBucket.Arn}/${ArtifactRootPrefix}/dataset/*',
+  '${ArtifactBucket.Arn}/${ArtifactRootPrefix}/environments/*',
+  '${ArtifactBucket.Arn}/${ArtifactRootPrefix}/evaluations/*',
+  '${ArtifactBucket.Arn}/${ArtifactRootPrefix}/logs/*',
+  '${ArtifactBucket.Arn}/${ArtifactRootPrefix}/operations/*',
+  '${ArtifactBucket.Arn}/${ArtifactRootPrefix}/receipts/*',
+  '${ArtifactBucket.Arn}/${ArtifactRootPrefix}/releases/*',
+  '${ArtifactBucket.Arn}/${ArtifactRootPrefix}/sealed/*',
+  '${ArtifactBucket.Arn}/${ArtifactRootPrefix}/snapshots/*',
+  'arn:${AWS::Partition}:s3:::prod-${AWS::Region}-starport-layer-bucket/*'
+]
+let train_policy_statements = Resources.TrainRole.Properties.Policies[*].PolicyDocument.Statement[*]
+let train_all_s3_statements = %train_policy_statements[
+  Action == /(?i)^s3:.*/ or
+  some Action[*] == /(?i)^s3:.*/
+]
+let train_s3_read_statements = %train_policy_statements[
+  Action == 's3:GetObject' or
+  some Action[*] == 's3:GetObject'
+]
+let train_s3_write_statements = %train_policy_statements[
+  Action == 's3:PutObject' or
+  some Action[*] == 's3:PutObject'
+]
+let train_s3_list_statements = %train_policy_statements[
+  Action == 's3:ListBucket' or
+  some Action[*] == 's3:ListBucket'
+]
+let evaluator_policy_statements = Resources.EvaluatorRole.Properties.Policies[*].PolicyDocument.Statement[*]
+let evaluator_all_s3_statements = %evaluator_policy_statements[
+  Action == /(?i)^s3:.*/ or
+  some Action[*] == /(?i)^s3:.*/
+]
+let evaluator_s3_read_statements = %evaluator_policy_statements[
+  Action == 's3:GetObject' or
+  some Action[*] == 's3:GetObject'
+]
+let evaluator_s3_write_statements = %evaluator_policy_statements[
+  Action == 's3:PutObject' or
+  some Action[*] == 's3:PutObject'
+]
+let evaluator_s3_list_statements = %evaluator_policy_statements[
+  Action == 's3:ListBucket' or
+  some Action[*] == 's3:ListBucket'
+]
+let controller_policy_statements = Resources.ControllerRole.Properties.Policies[*].PolicyDocument.Statement[*]
+let controller_all_s3_statements = %controller_policy_statements[
+  Action == /(?i)^s3:.*/ or
+  some Action[*] == /(?i)^s3:.*/
+]
+let controller_s3_read_statements = %controller_policy_statements[
+  Action == 's3:GetObject' or
+  some Action[*] == 's3:GetObject'
+]
+let controller_s3_write_statements = %controller_policy_statements[
+  Action == 's3:PutObject' or
+  some Action[*] == 's3:PutObject'
+]
+let controller_s3_list_statements = %controller_policy_statements[
+  Action == 's3:ListBucket' or
+  some Action[*] == 's3:ListBucket'
+]
+let endpoint_policy_statements = Resources.S3Endpoint.Properties.PolicyDocument.Statement[*]
+let endpoint_all_s3_statements = %endpoint_policy_statements[
+  Action == /(?i)^s3:.*/ or
+  some Action[*] == /(?i)^s3:.*/
+]
+let endpoint_s3_list_statements = %endpoint_policy_statements[
+  Action == 's3:ListBucket' or
+  some Action[*] == 's3:ListBucket'
+]
+let bucket_policy_statements = Resources.ArtifactBucketPolicy.Properties.PolicyDocument.Statement[*]
+let data_key_policy_statements = Resources.DataKey.Properties.KeyPolicy.Statement[*]
+let approval_key_policy_statements = Resources.ApprovalSigningKey.Properties.KeyPolicy.Statement[*]
+let train_assume_role_statements = Resources.TrainRole.Properties.AssumeRolePolicyDocument.Statement[*]
+let evaluator_assume_role_statements = Resources.EvaluatorRole.Properties.AssumeRolePolicyDocument.Statement[*]
+let controller_assume_role_statements = Resources.ControllerRole.Properties.AssumeRolePolicyDocument.Statement[*]
+let signer_assume_role_statements = Resources.SignerRole.Properties.AssumeRolePolicyDocument.Statement[*]
+let signer_policy_statements = Resources.SignerRole.Properties.Policies[*].PolicyDocument.Statement[*]
+let bucket_policy_all_s3_statements = %bucket_policy_statements[
+  Action == '*' or
+  Action == /(?i)^s3:.*/ or
+  some Action[*] == '*' or
+  some Action[*] == /(?i)^s3:.*/
+]
+let data_key_all_s3_statements = %data_key_policy_statements[
+  Action == '*' or
+  Action == /(?i)^s3:.*/ or
+  some Action[*] == '*' or
+  some Action[*] == /(?i)^s3:.*/
+]
+let approval_key_all_s3_statements = %approval_key_policy_statements[
+  Action == '*' or
+  Action == /(?i)^s3:.*/ or
+  some Action[*] == '*' or
+  some Action[*] == /(?i)^s3:.*/
+]
+let train_assume_all_s3_statements = %train_assume_role_statements[
+  Action == '*' or
+  Action == /(?i)^s3:.*/ or
+  some Action[*] == '*' or
+  some Action[*] == /(?i)^s3:.*/
+]
+let evaluator_assume_all_s3_statements = %evaluator_assume_role_statements[
+  Action == '*' or
+  Action == /(?i)^s3:.*/ or
+  some Action[*] == '*' or
+  some Action[*] == /(?i)^s3:.*/
+]
+let controller_assume_all_s3_statements = %controller_assume_role_statements[
+  Action == '*' or
+  Action == /(?i)^s3:.*/ or
+  some Action[*] == '*' or
+  some Action[*] == /(?i)^s3:.*/
+]
+let signer_assume_all_s3_statements = %signer_assume_role_statements[
+  Action == '*' or
+  Action == /(?i)^s3:.*/ or
+  some Action[*] == '*' or
+  some Action[*] == /(?i)^s3:.*/
+]
+let signer_all_s3_statements = %signer_policy_statements[
+  Action == '*' or
+  Action == /(?i)^s3:.*/ or
+  some Action[*] == '*' or
+  some Action[*] == /(?i)^s3:.*/
+]
+
+rule policy_statement_basics(statements) {
+  %statements {
+    NotAction !exists
+    NotResource !exists
+    Action is_string or Action is_list
+    when Action is_string {
+      Action != '*'
+    }
+    when Action is_list {
+      Action[*] is_string
+      Action[*] != '*'
+    }
+  }
+}
+
+rule exact_s3_statement_shape(
+  statements,
+  allowed_sids,
+  allowed_actions,
+  allowed_resources
+) {
+  %statements {
+    Sid IN %allowed_sids
+    Action is_string or Action is_list
+    Resource is_struct or Resource is_list
+    when Action is_string {
+      Action IN %allowed_actions
+    }
+    when Action is_list {
+      Action[*] is_string
+      Action[*] IN %allowed_actions
+    }
+    when Resource is_struct {
+      Resource[ keys == 'Fn::Sub' ] !empty or
+      Resource[ keys == 'Fn::GetAtt' ] !empty
+      Resource[ keys != /^(Fn::Sub|Fn::GetAtt)$/ ] empty
+      Resource[ keys == 'Fn::Sub' ] IN %allowed_resources
+      Resource[ keys == 'Fn::GetAtt' ] == ['ArtifactBucket', 'Arn']
+    }
+    when Resource is_list {
+      Resource[*] is_struct
+      Resource[*][ keys != /^(Fn::Sub|Fn::GetAtt)$/ ] empty
+      Resource[*][ keys == 'Fn::Sub' ] IN %allowed_resources
+      Resource[*][ keys == 'Fn::GetAtt' ] == ['ArtifactBucket', 'Arn']
+    }
+  }
+}
+
+rule no_ec2_instances {
+  %ec2_instances empty
+}
+
+rule no_auto_scaling_groups {
+  %auto_scaling_groups empty
+}
+
+rule no_ec2_fleets {
+  %ec2_fleets empty
+}
+
+rule no_spot_fleets {
+  %spot_fleets empty
+}
+
+rule no_capacity_reservations {
+  %capacity_reservations empty
+}
+
+rule no_capacity_reservation_fleets {
+  %capacity_reservation_fleets empty
+}
+
+rule no_internet_gateways {
+  %internet_gateways empty
+}
+
+rule no_nat_gateways {
+  %nat_gateways empty
+}
+
+rule no_elastic_ips {
+  %elastic_ips empty
+}
+
+rule no_public_gateway_attachments {
+  %gateway_attachments empty
+}
+
+rule no_default_public_routes {
+  %public_routes empty
+}
+
+rule all_subnets_disable_public_ip when %subnets !empty {
+  %subnets.Properties.MapPublicIpOnLaunch == false
+}
+
+rule train_security_group_has_zero_ingress {
+  Resources.TrainSecurityGroup.Type == 'AWS::EC2::SecurityGroup'
+  Resources.TrainSecurityGroup.Properties.SecurityGroupIngress empty
+}
+
+rule endpoint_ingress_is_https_only {
+  Resources.EndpointSecurityGroup.Properties.SecurityGroupIngress[*].FromPort == 443
+  Resources.EndpointSecurityGroup.Properties.SecurityGroupIngress[*].ToPort == 443
+  Resources.EndpointSecurityGroup.Properties.SecurityGroupIngress[*].IpProtocol == 'tcp'
+  Resources.EndpointSecurityGroup.Properties.SecurityGroupIngress[*].CidrIp !exists
+  Resources.EndpointSecurityGroup.Properties.SecurityGroupIngress[*].CidrIpv6 !exists
+}
+
+rule launch_template_is_private_imdsv2_p5 {
+  Resources.P5LaunchTemplate.Type == 'AWS::EC2::LaunchTemplate'
+  Resources.P5LaunchTemplate.Properties.LaunchTemplateData.InstanceType == 'p5.48xlarge'
+  Resources.P5LaunchTemplate.Properties.LaunchTemplateData.KeyName !exists
+  Resources.P5LaunchTemplate.Properties.LaunchTemplateData.MetadataOptions.HttpTokens == 'required'
+  Resources.P5LaunchTemplate.Properties.LaunchTemplateData.MetadataOptions.HttpEndpoint == 'enabled'
+  Resources.P5LaunchTemplate.Properties.LaunchTemplateData.MetadataOptions.HttpPutResponseHopLimit == 1
+  Resources.P5LaunchTemplate.Properties.LaunchTemplateData.NetworkInterfaces[*].AssociatePublicIpAddress == false
+  Resources.P5LaunchTemplate.Properties.LaunchTemplateData.NetworkInterfaces[*].SubnetId.Ref == 'PrivateSubnetA'
+  Resources.P5LaunchTemplate.Properties.LaunchTemplateData.BlockDeviceMappings[*].Ebs.Encrypted == true
+  Resources.P5LaunchTemplate.Properties.LaunchTemplateData.DisableApiTermination == false
+}
+
+rule retained_versioned_kms_bucket {
+  Resources.ArtifactBucket.Type == 'AWS::S3::Bucket'
+  Resources.ArtifactBucket.DeletionPolicy == 'Retain'
+  Resources.ArtifactBucket.UpdateReplacePolicy == 'Retain'
+  Resources.ArtifactBucket.Properties.VersioningConfiguration.Status == 'Enabled'
+  Resources.ArtifactBucket.Properties.BucketEncryption.ServerSideEncryptionConfiguration[*].ServerSideEncryptionByDefault.SSEAlgorithm == 'aws:kms'
+  Resources.ArtifactBucket.Properties.PublicAccessBlockConfiguration.BlockPublicAcls == true
+  Resources.ArtifactBucket.Properties.PublicAccessBlockConfiguration.BlockPublicPolicy == true
+  Resources.ArtifactBucket.Properties.PublicAccessBlockConfiguration.IgnorePublicAcls == true
+  Resources.ArtifactBucket.Properties.PublicAccessBlockConfiguration.RestrictPublicBuckets == true
+}
+
+rule retained_symmetric_data_key {
+  Resources.DataKey.Type == 'AWS::KMS::Key'
+  Resources.DataKey.DeletionPolicy == 'Retain'
+  Resources.DataKey.UpdateReplacePolicy == 'Retain'
+  Resources.DataKey.Properties.KeySpec == 'SYMMETRIC_DEFAULT'
+  Resources.DataKey.Properties.KeyUsage == 'ENCRYPT_DECRYPT'
+  Resources.DataKey.Properties.EnableKeyRotation == true
+}
+
+rule retained_p384_approval_key {
+  Resources.ApprovalSigningKey.Type == 'AWS::KMS::Key'
+  Resources.ApprovalSigningKey.DeletionPolicy == 'Retain'
+  Resources.ApprovalSigningKey.UpdateReplacePolicy == 'Retain'
+  Resources.ApprovalSigningKey.Properties.KeySpec == 'ECC_NIST_P384'
+  Resources.ApprovalSigningKey.Properties.KeyUsage == 'SIGN_VERIFY'
+}
+
+rule immutable_kms_ecr {
+  Resources.ContainerRepository.Type == 'AWS::ECR::Repository'
+  Resources.ContainerRepository.DeletionPolicy == 'Retain'
+  Resources.ContainerRepository.UpdateReplacePolicy == 'Retain'
+  Resources.ContainerRepository.Properties.ImageTagMutability == 'IMMUTABLE'
+  Resources.ContainerRepository.Properties.ImageScanningConfiguration.ScanOnPush == true
+  Resources.ContainerRepository.Properties.EncryptionConfiguration.EncryptionType == 'KMS'
+}
+
+rule exact_iam_policy_containers {
+  let all_resource_count = count(%all_resources)
+  let iam_resource_count = count(%iam_resources)
+  let iam_role_count = count(%iam_roles)
+  let iam_instance_profile_count = count(%iam_instance_profiles)
+  let train_inline_policy_count = count(%train_inline_policies)
+  let evaluator_inline_policy_count = count(%evaluator_inline_policies)
+  let controller_inline_policy_count = count(%controller_inline_policies)
+  let signer_inline_policy_count = count(%signer_inline_policies)
+  let train_managed_policy_count = count(Resources.TrainRole.Properties.ManagedPolicyArns[*])
+  let s3_bucket_policy_count = count(%s3_bucket_policy_resources)
+  let nested_policy_container_count = count(%unexpected_nested_policy_containers)
+
+  %all_resource_count == 32
+  %iam_resource_count == 5
+  %iam_role_count == 4
+  %iam_instance_profile_count == 1
+  %iam_policy_resources empty
+  %iam_managed_policy_resources empty
+  %s3_bucket_policy_count == 1
+  %sns_topic_policy_resources empty
+  %nested_policy_container_count == 4
+
+  Resources.TrainRole.Type == 'AWS::IAM::Role'
+  Resources.EvaluatorRole.Type == 'AWS::IAM::Role'
+  Resources.ControllerRole.Type == 'AWS::IAM::Role'
+  Resources.SignerRole.Type == 'AWS::IAM::Role'
+  Resources.TrainInstanceProfile.Type == 'AWS::IAM::InstanceProfile'
+
+  %train_inline_policy_count == 1
+  %evaluator_inline_policy_count == 1
+  %controller_inline_policy_count == 1
+  %signer_inline_policy_count == 1
+  Resources.TrainRole.Properties.Policies[*].PolicyName == 'TrainArtifactData'
+  Resources.EvaluatorRole.Properties.Policies[*].PolicyName == 'EvaluatorArtifacts'
+  Resources.ControllerRole.Properties.Policies[*].PolicyName == 'ControllerOperations'
+  Resources.SignerRole.Properties.Policies[*].PolicyName == 'SignApprovals'
+
+  %train_managed_policy_count == 1
+  Resources.TrainRole.Properties.ManagedPolicyArns[*][ keys == 'Fn::Sub' ] == 'arn:${AWS::Partition}:iam::aws:policy/AmazonSSMManagedInstanceCore'
+  Resources.EvaluatorRole.Properties.ManagedPolicyArns !exists
+  Resources.ControllerRole.Properties.ManagedPolicyArns !exists
+  Resources.SignerRole.Properties.ManagedPolicyArns !exists
+  Resources.TrainRole.Properties.PermissionsBoundary !exists
+  Resources.EvaluatorRole.Properties.PermissionsBoundary !exists
+  Resources.ControllerRole.Properties.PermissionsBoundary !exists
+  Resources.SignerRole.Properties.PermissionsBoundary !exists
+  Resources.TrainInstanceProfile.Properties.Roles[*].Ref == 'TrainRole'
+}
+
+rule separate_operation_roles {
+  Resources.TrainRole.Type == 'AWS::IAM::Role'
+  Resources.EvaluatorRole.Type == 'AWS::IAM::Role'
+  Resources.ControllerRole.Type == 'AWS::IAM::Role'
+  Resources.SignerRole.Type == 'AWS::IAM::Role'
+  Resources.TrainInstanceProfile.Type == 'AWS::IAM::InstanceProfile'
+}
+
+rule meaningful_role_policy_invariants {
+  Resources.TrainRole.Properties.AssumeRolePolicyDocument.Statement[ Sid == 'Ec2AssumeRole' ].Principal.Service == 'ec2.amazonaws.com'
+  Resources.TrainRole.Properties.Policies[*].PolicyDocument.Statement[ Sid == 'ListTrainPrefixes' ] !empty
+  Resources.TrainRole.Properties.Policies[*].PolicyDocument.Statement[ Sid == 'ListTrainPrefixes' ].Condition exists
+  Resources.EvaluatorRole.Properties.Policies[*].PolicyDocument.Statement[ Sid == 'ListEvaluatorPrefixes' ] !empty
+  Resources.EvaluatorRole.Properties.Policies[*].PolicyDocument.Statement[ Sid == 'ListEvaluatorPrefixes' ].Condition exists
+
+  Resources.ControllerRole.Properties.Policies[*].PolicyDocument.Statement[ Sid == 'RunApprovedLaunchTemplate' ] {
+    Action == 'ec2:RunInstances'
+    Condition.Bool[ keys == 'ec2:IsLaunchTemplateResource' ] == 'true'
+  }
+  Resources.ControllerRole.Properties.Policies[*].PolicyDocument.Statement[ Sid == 'TerminateBoundInstance' ] {
+    Action == 'ec2:TerminateInstances'
+    Condition.StringEquals[ keys == 'ec2:ResourceTag/MemorySplitManaged' ] == 'true'
+  }
+  Resources.ControllerRole.Properties.Policies[*].PolicyDocument.Statement[ Sid == 'SendToTaggedInstances' ] {
+    Action == 'ssm:SendCommand'
+    Condition.StringEquals[ keys == 'ssm:resourceTag/MemorySplitManaged' ] == 'true'
+  }
+  Resources.ControllerRole.Properties.Policies[*].PolicyDocument.Statement[ Sid == 'CreateEbsGrant' ] {
+    Action == 'kms:CreateGrant'
+    Condition.Bool[ keys == 'kms:GrantIsForAWSResource' ] == 'true'
+  }
+  Resources.SignerRole.Properties.Policies[*].PolicyDocument.Statement[ Sid == 'SignWithApprovalKey' ] {
+    some Action[*] == 'kms:Sign'
+  }
+}
+
+rule exact_s3_role_separation {
+  Resources.ArtifactBucketPolicy.Properties.PolicyDocument.Statement[ Sid == 'DenyInsecureTransport' ] {
+    Effect == 'Deny'
+    Principal == '*'
+    Condition.Bool[ keys == 'aws:SecureTransport' ] == 'false'
+  }
+  Resources.ArtifactBucketPolicy.Properties.PolicyDocument.Statement[ Sid == 'DenyUnexpectedEncryptionAlgorithm' ] {
+    Effect == 'Deny'
+    Principal == '*'
+    Action == 's3:PutObject'
+    Condition.Null[ keys == 's3:x-amz-server-side-encryption' ] == 'false'
+    Condition.StringNotEquals[ keys == 's3:x-amz-server-side-encryption' ] == 'aws:kms'
+  }
+  Resources.ArtifactBucketPolicy.Properties.PolicyDocument.Statement[ Sid == 'DenyUnexpectedKmsKey' ] {
+    Effect == 'Deny'
+    Principal == '*'
+    Action == 's3:PutObject'
+    Condition.Null[ keys == 's3:x-amz-server-side-encryption-aws-kms-key-id' ] == 'false'
+    Condition.StringNotEquals[ keys == 's3:x-amz-server-side-encryption-aws-kms-key-id' ][ keys == 'Fn::GetAtt' ] == ['DataKey', 'Arn']
+  }
+  Resources.TrainRole.Properties.Policies[*].PolicyDocument.Statement[ Sid == 'ListTrainPrefixes' ].Condition[ keys == 'ForAnyValue:StringLike' ][ keys == 's3:prefix' ][*][ keys == 'Fn::Sub' ] IN %train_list_prefixes
+  Resources.TrainRole.Properties.Policies[*].PolicyDocument.Statement[ Sid == 'ReadTrainingInputs' ] {
+    some Action[*] == 's3:GetObject'
+    Resource[*][ keys == 'Fn::Sub' ] IN %train_read_resources
+  }
+  Resources.TrainRole.Properties.Policies[*].PolicyDocument.Statement[ Sid == 'ReadWriteTrainingArtifacts' ] {
+    some Action[*] == 's3:PutObject'
+    Resource[*][ keys == 'Fn::Sub' ] IN %train_write_resources
+  }
+  %train_s3_list_statements.Condition[ keys == 'ForAnyValue:StringLike' ][ keys == 's3:prefix' ][*][ keys == 'Fn::Sub' ] IN %train_list_prefixes
+  %train_s3_read_statements.Resource[*][ keys == 'Fn::Sub' ] IN %train_readable_resources
+  %train_s3_write_statements.Resource[*][ keys == 'Fn::Sub' ] IN %train_write_resources
+
+  Resources.EvaluatorRole.Properties.Policies[*].PolicyDocument.Statement[ Sid == 'ListEvaluatorPrefixes' ].Condition[ keys == 'ForAnyValue:StringLike' ][ keys == 's3:prefix' ][*][ keys == 'Fn::Sub' ] IN %evaluator_list_prefixes
+  Resources.EvaluatorRole.Properties.Policies[*].PolicyDocument.Statement[ Sid == 'ReadEvaluationInputs' ] {
+    Action[*] != 's3:PutObject'
+    Resource[*][ keys == 'Fn::Sub' ] IN %evaluator_read_resources
+  }
+  Resources.EvaluatorRole.Properties.Policies[*].PolicyDocument.Statement[ Sid == 'ReadWriteEvaluationEvidence' ] {
+    some Action[*] == 's3:PutObject'
+    Resource[*][ keys == 'Fn::Sub' ] IN %evaluator_write_resources
+  }
+  %evaluator_s3_list_statements.Condition[ keys == 'ForAnyValue:StringLike' ][ keys == 's3:prefix' ][*][ keys == 'Fn::Sub' ] IN %evaluator_list_prefixes
+  %evaluator_s3_read_statements.Resource[*][ keys == 'Fn::Sub' ] IN %evaluator_readable_resources
+  %evaluator_s3_write_statements.Resource[*][ keys == 'Fn::Sub' ] IN %evaluator_write_resources
+
+  Resources.ControllerRole.Properties.Policies[*].PolicyDocument.Statement[ Sid == 'ListControllerPrefixes' ].Condition[ keys == 'ForAnyValue:StringLike' ][ keys == 's3:prefix' ][*][ keys == 'Fn::Sub' ] IN %controller_list_prefixes
+  Resources.ControllerRole.Properties.Policies[*].PolicyDocument.Statement[ Sid == 'ReadLifecycleArtifacts' ] {
+    Action[*] != 's3:PutObject'
+    Resource[*][ keys == 'Fn::Sub' ] IN %controller_read_resources
+  }
+  Resources.ControllerRole.Properties.Policies[*].PolicyDocument.Statement[ Sid == 'WriteControllerPublications' ] {
+    Action == 's3:PutObject'
+    Resource[*][ keys == 'Fn::Sub' ] IN %controller_write_resources
+  }
+  %controller_s3_list_statements.Condition[ keys == 'ForAnyValue:StringLike' ][ keys == 's3:prefix' ][*][ keys == 'Fn::Sub' ] IN %controller_list_prefixes
+  %controller_s3_read_statements.Resource[*][ keys == 'Fn::Sub' ] IN %controller_read_resources
+  %controller_s3_write_statements.Resource[*][ keys == 'Fn::Sub' ] IN %controller_write_resources
+  Resources.S3Endpoint.Properties.PolicyDocument.Statement[ Sid == 'MemorySplitBucketLocation' ] {
+    Action == 's3:GetBucketLocation'
+    Resource[ keys == 'Fn::GetAtt' ] == ['ArtifactBucket', 'Arn']
+  }
+  Resources.S3Endpoint.Properties.PolicyDocument.Statement[ Sid == 'MemorySplitBucketListing' ] {
+    some Action[*] == 's3:ListBucket'
+    some Action[*] == 's3:ListBucketVersions'
+    Condition[ keys == 'ForAnyValue:StringLike' ][ keys == 's3:prefix' ][*][ keys == 'Fn::Sub' ] IN %endpoint_list_prefixes
+  }
+  Resources.S3Endpoint.Properties.PolicyDocument.Statement[ Sid == 'MemorySplitVersionedObjects' ] {
+    Resource[*][ keys == 'Fn::Sub' ] IN %endpoint_object_resources
+  }
+  %endpoint_s3_list_statements.Condition[ keys == 'ForAnyValue:StringLike' ][ keys == 's3:prefix' ][*][ keys == 'Fn::Sub' ] IN %endpoint_list_prefixes
+}
+
+rule reject_unreviewed_s3_statements {
+  policy_statement_basics(%bucket_policy_statements)
+  policy_statement_basics(%data_key_policy_statements)
+  policy_statement_basics(%approval_key_policy_statements)
+  policy_statement_basics(%train_assume_role_statements)
+  policy_statement_basics(%evaluator_assume_role_statements)
+  policy_statement_basics(%controller_assume_role_statements)
+  policy_statement_basics(%signer_assume_role_statements)
+  policy_statement_basics(%train_policy_statements)
+  policy_statement_basics(%evaluator_policy_statements)
+  policy_statement_basics(%controller_policy_statements)
+  policy_statement_basics(%signer_policy_statements)
+
+  %train_policy_statements {
+    NotAction !exists
+    NotResource !exists
+    Action is_string or Action is_list
+    when Action is_string {
+      Action != /.*\*.*/
+    }
+    when Action is_list {
+      Action[*] != /.*\*.*/
+    }
+  }
+  %evaluator_policy_statements {
+    NotAction !exists
+    NotResource !exists
+    Action is_string or Action is_list
+    when Action is_string {
+      Action != /.*\*.*/
+    }
+    when Action is_list {
+      Action[*] != /.*\*.*/
+    }
+  }
+  %controller_policy_statements {
+    NotAction !exists
+    NotResource !exists
+    Action is_string or Action is_list
+    when Action is_string {
+      Action != /.*\*.*/
+    }
+    when Action is_list {
+      Action[*] != /.*\*.*/
+    }
+  }
+  %endpoint_policy_statements {
+    NotAction !exists
+    NotResource !exists
+    Action is_string or Action is_list
+    when Action is_string {
+      Action != /.*\*.*/
+    }
+    when Action is_list {
+      Action[*] != /.*\*.*/
+    }
+  }
+
+  exact_s3_statement_shape(
+    %train_all_s3_statements,
+    %train_s3_sids,
+    %train_s3_actions,
+    %train_readable_resources
+  )
+  exact_s3_statement_shape(
+    %evaluator_all_s3_statements,
+    %evaluator_s3_sids,
+    %evaluator_s3_actions,
+    %evaluator_readable_resources
+  )
+  exact_s3_statement_shape(
+    %controller_all_s3_statements,
+    %controller_s3_sids,
+    %controller_s3_actions,
+    %controller_read_resources
+  )
+  exact_s3_statement_shape(
+    %endpoint_all_s3_statements,
+    %endpoint_s3_sids,
+    %endpoint_s3_actions,
+    %endpoint_all_resources
+  )
+  exact_s3_statement_shape(
+    %bucket_policy_all_s3_statements,
+    %direct_policy_s3_sids,
+    %direct_policy_s3_actions,
+    %direct_policy_s3_resources
+  )
+  %data_key_all_s3_statements empty
+  %approval_key_all_s3_statements empty
+  %train_assume_all_s3_statements empty
+  %evaluator_assume_all_s3_statements empty
+  %controller_assume_all_s3_statements empty
+  %signer_assume_all_s3_statements empty
+  %signer_all_s3_statements empty
+}

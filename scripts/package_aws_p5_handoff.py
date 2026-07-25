@@ -201,6 +201,7 @@ _FORBIDDEN_COMPONENT_PATTERNS = tuple(
         r"privatekeys?(?:v[0-9]+)?",
         r"corpus(?:es)?(?:v[0-9]+)?",
         r"results?(?:v[0-9]+)?",
+        r"snapshots?(?:v[0-9]+)?",
     )
 )
 _SHARED_SUFFIXES: dict[str, set[str]] = {
@@ -251,6 +252,12 @@ _PROVIDER_EXCLUDED = {
     "cluster/profiles/illumina-usfc-prd.json",
     "scripts/package_illumina_handoff.py",
     "tests/test_package_illumina_handoff.py",
+}
+_OPERATOR_SIDE_ROOTS = {"infra", "runtime"}
+_OPERATOR_SIDE_EXCLUDED = {
+    "infra/aws/cfn-guard/memorysplit-p5-foundation.guard",
+    "infra/aws/cloudformation/memorysplit-p5-foundation.yaml",
+    "infra/aws/requirements-dev.txt",
 }
 _PRIVATE_KEY_PATTERN = re.compile(
     rb"-----BEGIN (?:RSA |EC |DSA |OPENSSH |PGP )?PRIVATE KEY"
@@ -1017,12 +1024,16 @@ def _classification(path: str) -> str:
         return "included"
     if path == STATIC_ENVIRONMENT_LOCK_PATH:
         return "forbidden"
+    if _path_contains_forbidden_content(path):
+        return "forbidden"
+    if path in _OPERATOR_SIDE_EXCLUDED:
+        return "excluded"
+    if parts[0] in _OPERATOR_SIDE_ROOTS:
+        return "unknown"
     if path in _ROOT_EXCLUDED or path in _PROVIDER_EXCLUDED:
         return "excluded"
     if parts[0] in _EXCLUDED_TOP_LEVEL:
         return "excluded"
-    if _path_contains_forbidden_content(path):
-        return "forbidden"
     if set(parts) & _DISPOSABLE_COMPONENTS:
         return "excluded"
     if path in PROVIDER_BRIDGE_MEMBERS:
@@ -1457,9 +1468,13 @@ def _collect_payload(
     lifecycle: AuthenticatedProviderLifecycle | None = None,
 ) -> _Collected:
     included: list[_Tracked] = []
+    operator_side: list[_Tracked] = []
     unknown: list[str] = []
     forbidden: list[str] = []
     for item in tracked:
+        parts = PurePosixPath(item.path).parts
+        if parts and parts[0] in _OPERATOR_SIDE_ROOTS:
+            operator_side.append(item)
         classification = _classification(item.path)
         if classification == "included":
             included.append(item)
@@ -1467,6 +1482,18 @@ def _collect_payload(
             unknown.append(item.path)
         elif classification == "forbidden":
             forbidden.append(item.path)
+
+    snapshot_targets = {
+        item.path: item for item in [*included, *operator_side]
+    }
+    _assert_repository_unchanged(repository, revision)
+    snapshot = _read_git_blobs(
+        repository,
+        [snapshot_targets[path] for path in sorted(snapshot_targets)],
+    )
+    for item in operator_side:
+        _scan_secret(item.path, snapshot[item.path])
+
     if forbidden:
         raise PackageError(
             f"forbidden tracked path cannot be released: {forbidden[0]}"
@@ -1483,8 +1510,6 @@ def _collect_payload(
     payload: dict[str, bytes] = {}
     modes: dict[str, str] = {}
     member_rows: list[dict[str, object]] = []
-    _assert_repository_unchanged(repository, revision)
-    snapshot = _read_git_blobs(repository, included)
     for item in included:
         data = snapshot[item.path]
         _scan_secret(item.path, data)
