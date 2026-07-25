@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import subprocess
 from dataclasses import replace
 from pathlib import Path
@@ -71,6 +72,92 @@ def fixture_config() -> BootstrapConfig:
     )
 
 
+def _write_stub(path: Path, body: str) -> None:
+    path.write_text(
+        "#!/usr/bin/env bash\nset -u\n" + body,
+        encoding="utf-8",
+    )
+    path.chmod(0o755)
+
+
+def _run_sandboxed_bootstrap(
+    text: str,
+    tmp_path: Path,
+    *,
+    name: str,
+) -> tuple[subprocess.CompletedProcess[str], list[str], Path, dict[str, str], Path]:
+    sandbox = tmp_path / name
+    command_dir = sandbox / "bin"
+    state_root = sandbox / "root"
+    call_log = sandbox / "calls.log"
+    command_dir.mkdir(parents=True)
+    state_root.mkdir()
+
+    _write_stub(
+        command_dir / "systemctl",
+        'printf "systemctl %s\\n" "$*" >>"${CALL_LOG}"\nexit 0\n',
+    )
+    _write_stub(
+        command_dir / "udevadm",
+        'printf "udevadm %s\\n" "$*" >>"${CALL_LOG}"\nexit 73\n',
+    )
+    _write_stub(
+        command_dir / "shutdown",
+        'printf "shutdown %s\\n" "$*" >>"${CALL_LOG}"\nexit 0\n',
+    )
+    _write_stub(
+        command_dir / "timeout",
+        'printf "timeout %s\\n" "$*" >>"${CALL_LOG}"\nexit 124\n',
+    )
+    _write_stub(
+        command_dir / "aws",
+        'printf "aws %s\\n" "$*" >>"${CALL_LOG}"\nexit 1\n',
+    )
+    for command in (
+        "blkid",
+        "findmnt",
+        "lsblk",
+        "mdadm",
+        "mkfs.xfs",
+        "mount",
+        "wipefs",
+    ):
+        _write_stub(command_dir / command, "exit 0\n")
+
+    script_path = sandbox / "bootstrap.sh"
+    script_path.write_text(text, encoding="utf-8")
+    script_path.chmod(0o700)
+    environment = dict(os.environ)
+    environment.update(
+        {
+            "CALL_LOG": str(call_log),
+            "PATH": f"{command_dir}:{environment['PATH']}",
+        }
+    )
+    completed = subprocess.run(
+        ["bash", str(script_path), str(state_root)],
+        cwd=command_dir,
+        env=environment,
+        text=True,
+        capture_output=True,
+        check=False,
+        timeout=10,
+    )
+    calls = (
+        call_log.read_text(encoding="utf-8").splitlines()
+        if call_log.exists()
+        else []
+    )
+    return completed, calls, state_root, environment, call_log
+
+
+def _call_index(calls: list[str], prefix: str) -> int:
+    for index, call in enumerate(calls):
+        if call.startswith(prefix):
+            return index
+    raise AssertionError(f"missing call {prefix!r}; recorded calls: {calls!r}")
+
+
 def test_bootstrap_mounts_exactly_four_nvmes_as_raid0_xfs_and_starts_watchdog():
     text = render_bootstrap(fixture_config())
 
@@ -80,7 +167,8 @@ def test_bootstrap_mounts_exactly_four_nvmes_as_raid0_xfs_and_starts_watchdog():
     assert "--chunk=512" in text
     assert "mkfs.xfs" in text
     assert "mount -t xfs -o noatime,nodiratime" in text
-    assert "OnActiveSec=23h30m" in text
+    assert "OnBootSec=23h30m" in text
+    assert "OnActiveSec=" not in text
     assert "Persistent=true" in text
     assert "/usr/sbin/shutdown -h now" in text
 
@@ -111,14 +199,9 @@ def test_bootstrap_records_device_serials_uuid_and_owner_only_directories():
     assert "/mnt/memorysplit-builder/cleanroom" in text
 
 
-def test_watchdog_is_enabled_before_any_package_download_and_uploads_timeout_marker():
+def test_watchdog_uploads_timeout_marker():
     text = render_bootstrap(fixture_config())
 
-    enabled_at = text.index(
-        "systemctl enable --now memorysplit-corpus-watchdog.timer"
-    )
-    downloaded_at = text.index("download-inputs")
-    assert enabled_at < downloaded_at
     assert "memorysplit-corpus-watchdog.service" in text
     assert "memorysplit-corpus-watchdog.timer" in text
     assert "operational/timeout.json" in text
@@ -126,13 +209,76 @@ def test_watchdog_is_enabled_before_any_package_download_and_uploads_timeout_mar
     assert "SSEKMSKeyId" in text
 
 
-def test_watchdog_shutdown_is_unconditional_when_timeout_upload_fails():
+def test_rendered_bootstrap_activates_watchdog_before_any_storage_command(
+    tmp_path: Path,
+):
     text = render_bootstrap(fixture_config())
+    completed, calls, _root, _environment, _call_log = _run_sandboxed_bootstrap(
+        text,
+        tmp_path,
+        name="ordered",
+    )
 
-    assert "trap '/usr/sbin/shutdown -h now' EXIT" in text
-    assert "TimeoutStartSec=3min" in text
-    assert "--key \"v2/builds/${MEMORYSPLIT_BUILD_ID}/operational/timeout.json\"" in text
-    assert "--output json >/dev/null 2>&1 || true" in text
+    assert completed.returncode != 0
+    assert _call_index(
+        calls,
+        "systemctl enable --now memorysplit-corpus-watchdog.timer",
+    ) < _call_index(calls, "udevadm settle")
+
+    regressed = text.replace(
+        "    install_watchdog\n"
+        "    trap on_exit EXIT\n"
+        "    initialize_runtime\n"
+        "    discover_instance_store_nvmes\n",
+        "    trap on_exit EXIT\n"
+        "    initialize_runtime\n"
+        "    discover_instance_store_nvmes\n"
+        "    install_watchdog\n",
+        1,
+    )
+    assert regressed != text
+    _failed, regressed_calls, *_rest = _run_sandboxed_bootstrap(
+        regressed,
+        tmp_path,
+        name="regressed",
+    )
+    assert not any(
+        call.startswith(
+            "systemctl enable --now memorysplit-corpus-watchdog.timer"
+        )
+        for call in regressed_calls
+    )
+
+
+def test_watchdog_initiates_shutdown_before_timed_out_marker_upload(
+    tmp_path: Path,
+):
+    completed, _calls, root, environment, call_log = _run_sandboxed_bootstrap(
+        render_bootstrap(fixture_config()),
+        tmp_path,
+        name="timeout",
+    )
+    watchdog = (
+        root / "usr" / "local" / "sbin" / "memorysplit-corpus-watchdog"
+    )
+    assert watchdog.is_file(), completed.stderr
+    call_log.write_text("", encoding="utf-8")
+
+    watchdog_result = subprocess.run(
+        [str(watchdog)],
+        cwd=root,
+        env=environment,
+        text=True,
+        capture_output=True,
+        check=False,
+        timeout=10,
+    )
+    watchdog_calls = call_log.read_text(encoding="utf-8").splitlines()
+
+    assert watchdog_result.returncode == 0
+    assert watchdog_calls[0] == "shutdown -h now"
+    assert watchdog_calls[1].startswith("timeout 5s ")
+    assert watchdog_calls[-1] == "shutdown -h now"
 
 
 def test_rendered_bootstrap_pins_every_input_authority_without_mutable_reads():
