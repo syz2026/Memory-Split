@@ -157,12 +157,13 @@ def test_operator_docs_cover_closed_profiles_and_complete_lifecycle() -> None:
     assert text.count("scripts/sign_msctl_approval.py") >= 5
     for operation in (
         "canary",
-        "submit",
         "resume",
         "fleet-advance",
         "evaluate",
     ):
         assert f"--operation {operation}" in text
+    assert "APPROVAL_OPERATION=submit" in text
+    assert '--operation "$APPROVAL_OPERATION"' in text
     assert text.count('--state-root "$OPERATOR_ROOT/state"') >= 8
     assert 'status "${STATUS_ARGS[@]}" --cached' in text
     assert ":latest" not in text
