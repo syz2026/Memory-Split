@@ -11,6 +11,7 @@ import sqlite3
 import stat
 import threading
 import unicodedata
+import weakref
 from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
 from fractions import Fraction
@@ -240,18 +241,27 @@ class TargetLengths(Protocol):
     def __getitem__(self, index: int) -> int: ...
 
 
+@dataclass(frozen=True, slots=True)
+class _WikidataGraphAuthority:
+    view: WikidataDerivedView
+    view_sha256: str
+    source_lock_sha256: str
+    archive_hashes: tuple[tuple[str, str], ...]
+    training_edge_count: int
+    training_rows: int
+
+
+_WIKIDATA_GRAPH_AUTHORITIES: weakref.WeakKeyDictionary[
+    object,
+    _WikidataGraphAuthority,
+] = weakref.WeakKeyDictionary()
+
+
 class WikidataGraphCatalogSource:
     lane_id: LaneId = "wikidata_graph"
     finite = False
 
-    __slots__ = (
-        "_archive_hashes",
-        "_source_lock_sha256",
-        "_training_edge_count",
-        "_training_rows",
-        "_view",
-        "_view_sha256",
-    )
+    __slots__ = ("__weakref__",)
 
     def __init__(self, view: WikidataDerivedView) -> None:
         if not isinstance(view, WikidataDerivedView):
@@ -260,33 +270,56 @@ class WikidataGraphCatalogSource:
         if distinct_edges <= 0:
             raise ValueError("Wikidata derived view has no distinct training edges")
         receipt = view.receipt
-        self._view = view
-        self._view_sha256 = view.receipt_sha256
-        self._source_lock_sha256 = receipt.source_lock_sha256
-        self._archive_hashes = tuple(
-            (record.path, record.sha256) for record in receipt.archives
+        _WIKIDATA_GRAPH_AUTHORITIES[self] = _WikidataGraphAuthority(
+            view=view,
+            view_sha256=view.receipt_sha256,
+            source_lock_sha256=receipt.source_lock_sha256,
+            archive_hashes=tuple(
+                (record.path, record.sha256) for record in receipt.archives
+            ),
+            training_edge_count=distinct_edges,
+            training_rows=receipt.training_rows,
         )
-        self._training_edge_count = distinct_edges
-        self._training_rows = receipt.training_rows
+
+    def _authority(self) -> _WikidataGraphAuthority:
+        try:
+            return _WIKIDATA_GRAPH_AUTHORITIES[self]
+        except (KeyError, TypeError) as error:
+            raise ValueError(
+                "authenticated production Wikidata catalog source is required"
+            ) from error
+
+    def _fresh_verified_authority(self) -> tuple[int, str, str]:
+        authority = self._authority()
+        distinct_edges = sum(
+            1 for _triple in iter_distinct_training_edges(authority.view)
+        )
+        if distinct_edges != authority.training_edge_count:
+            raise ValueError("Wikidata distinct-edge count changed")
+        return (
+            distinct_edges,
+            authority.view_sha256,
+            authority.source_lock_sha256,
+        )
 
     @property
     def training_edge_count(self) -> int:
-        return self._training_edge_count
+        return self._authority().training_edge_count
 
     @property
     def wikidata_view_sha256(self) -> str:
-        return self._view_sha256
+        return self._authority().view_sha256
 
     @property
     def wikidata_source_lock_sha256(self) -> str:
-        return self._source_lock_sha256
+        return self._authority().source_lock_sha256
 
     @staticmethod
     def _training_edge_key(triple: V2TrainingTriple) -> str:
         return f"Q{triple.subject}\t{triple.relation}\tQ{triple.object}"
 
     def _archive_sha256(self, archive_path: str) -> str:
-        for path, sha256 in self._archive_hashes:
+        for path, sha256 in self._authority().archive_hashes:
             if path == archive_path:
                 return sha256
         raise ValueError(f"Wikidata archive is absent from the view: {archive_path}")
@@ -313,7 +346,7 @@ class WikidataGraphCatalogSource:
                 ("split", "train"),
                 ("training_edge_key", edge_key),
                 ("training_split", triple.training_split),
-                ("wikidata_view_sha256", self._view_sha256),
+                ("wikidata_view_sha256", self._authority().view_sha256),
             ),
             semantic_flags=(
                 ("graph-training-edge",)
@@ -328,11 +361,12 @@ class WikidataGraphCatalogSource:
         source_root: Path | None = None,
     ) -> Iterator[str]:
         del source_root
+        authority = self._authority()
         emitted = 0
-        for triple in iter_distinct_training_edges(self._view):
+        for triple in iter_distinct_training_edges(authority.view):
             emitted += 1
             yield self._training_edge_key(triple)
-        if emitted != self._training_edge_count:
+        if emitted != authority.training_edge_count:
             raise ValueError("Wikidata distinct-edge count changed")
 
     def iter_drafts(
@@ -341,17 +375,18 @@ class WikidataGraphCatalogSource:
         target_lengths: TargetLengths,
     ) -> Iterator[CatalogDraft]:
         del source_root
+        authority = self._authority()
         available_records = len(target_lengths)
-        if self._training_edge_count > available_records:
+        if authority.training_edge_count > available_records:
             raise ValueError(
                 "Wikidata distinct edges exceed allocated records: "
-                f"distinct_edges={self._training_edge_count}, "
+                f"distinct_edges={authority.training_edge_count}, "
                 f"allocated_records={available_records}"
             )
 
         emitted = 0
         for edge_index, triple in enumerate(
-            iter_distinct_training_edges(self._view)
+            iter_distinct_training_edges(authority.view)
         ):
             emitted += 1
             yield self._draft(
@@ -359,13 +394,13 @@ class WikidataGraphCatalogSource:
                 phase="edge",
                 phase_index=edge_index,
             )
-        if emitted != self._training_edge_count:
+        if emitted != authority.training_edge_count:
             raise ValueError("Wikidata distinct-edge count changed")
 
         revisit_index = 0
         while emitted < available_records:
             training_rows = 0
-            for triple in iter_v2_training_triples(self._view):
+            for triple in iter_v2_training_triples(authority.view):
                 training_rows += 1
                 yield self._draft(
                     triple,
@@ -376,7 +411,7 @@ class WikidataGraphCatalogSource:
                 revisit_index += 1
                 if emitted == available_records:
                     return
-            if training_rows != self._training_rows:
+            if training_rows != authority.training_rows:
                 raise ValueError("Wikidata training-row count changed")
 
 
@@ -792,31 +827,11 @@ def _validated_lane_sources(
         if not callable(getattr(source, "iter_drafts", None)):
             raise ValueError(f"lane source iterator is missing: {lane_id}")
         if lane_id == "wikidata_graph":
-            training_edge_count = getattr(source, "training_edge_count", None)
-            edge_iterator = getattr(source, "iter_training_edge_keys", None)
-            view_sha256 = getattr(source, "wikidata_view_sha256", None)
-            view_source_lock_sha256 = getattr(
-                source,
-                "wikidata_source_lock_sha256",
-                None,
-            )
-            if (
-                type(training_edge_count) is not int
-                or training_edge_count <= 0
-                or not callable(edge_iterator)
-            ):
+            if type(source) is not WikidataGraphCatalogSource:
                 raise ValueError(
-                    "Wikidata graph training-edge authority is required"
+                    "authenticated production Wikidata catalog source is required"
                 )
-            if (
-                type(view_sha256) is not str
-                or _SHA256_RE.fullmatch(view_sha256) is None
-                or type(view_source_lock_sha256) is not str
-                or _SHA256_RE.fullmatch(view_source_lock_sha256) is None
-            ):
-                raise ValueError(
-                    "Wikidata graph verified-view authority is required"
-                )
+            source._authority()
         result[lane_id] = cast(LaneCatalogSource, source)
     return result
 
@@ -1710,10 +1725,10 @@ def _spool_source_authority(
 
 def _spool_wikidata_training_edge_authority(
     connection: sqlite3.Connection,
-    source: LaneCatalogSource,
+    source: WikidataGraphCatalogSource,
     source_root: Path,
+    expected_count: int,
 ) -> int:
-    expected_count = getattr(source, "training_edge_count")
     try:
         iterator = iter(source.iter_training_edge_keys(source_root))
     except Exception as error:
@@ -2044,21 +2059,18 @@ def build_input_catalog(
         source_root,
         expected_generator_commit=expected_generator_commit,
     )
-    wikidata_source = sources["wikidata_graph"]
-    wikidata_view_sha256 = cast(
-        str,
-        getattr(wikidata_source, "wikidata_view_sha256"),
+    wikidata_source = cast(
+        WikidataGraphCatalogSource,
+        sources["wikidata_graph"],
     )
-    if (
-        getattr(wikidata_source, "wikidata_source_lock_sha256")
-        != source_lock.sha256
-    ):
+    (
+        wikidata_distinct_edges,
+        wikidata_view_sha256,
+        wikidata_source_lock_sha256,
+    ) = wikidata_source._fresh_verified_authority()
+    if wikidata_source_lock_sha256 != source_lock.sha256:
         raise ValueError("Wikidata derived view source-lock binding disagrees")
     wikidata_records = len(lengths_by_lane["wikidata_graph"])
-    wikidata_distinct_edges = getattr(
-        wikidata_source,
-        "training_edge_count",
-    )
     if wikidata_distinct_edges > wikidata_records:
         raise ValueError(
             "Wikidata distinct edges exceed allocated records: "
@@ -2088,8 +2100,9 @@ def build_input_catalog(
         _spool_source_authority(spool.connection, source_lock)
         _spool_wikidata_training_edge_authority(
             spool.connection,
-            sources["wikidata_graph"],
+            wikidata_source,
             source_root,
+            wikidata_distinct_edges,
         )
         _spool_drafts(
             spool.connection,
