@@ -120,6 +120,57 @@ class PinnedBytes:
     byte_count: int
 
 
+@dataclass(frozen=True)
+class PinnedDigest:
+    sha256: str
+    byte_count: int
+
+
+def hash_regular_at(parent_fd: int, name: str, *, label: str) -> PinnedDigest:
+    """Hash one descriptor-pinned regular file without buffering its payload."""
+
+    _safe_name(name, label=label)
+    try:
+        fd = os.open(name, _FILE_FLAGS, dir_fd=parent_fd)
+    except FileNotFoundError as error:
+        raise FileNotFoundError(f"{label} is missing") from error
+    except OSError as error:
+        raise ValueError(f"{label} is symlinked or unsafe") from error
+    try:
+        before = os.fstat(fd)
+        if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1:
+            raise ValueError(f"{label} is not a singly linked regular file")
+        digest = hashlib.sha256()
+        offset = 0
+        while True:
+            chunk = os.pread(fd, 1 << 20, offset)
+            if not chunk:
+                break
+            digest.update(chunk)
+            offset += len(chunk)
+        after = os.fstat(fd)
+        if (
+            before.st_dev,
+            before.st_ino,
+            before.st_size,
+            before.st_mtime_ns,
+            before.st_ctime_ns,
+        ) != (
+            after.st_dev,
+            after.st_ino,
+            after.st_size,
+            after.st_mtime_ns,
+            after.st_ctime_ns,
+        ) or offset != after.st_size:
+            raise ValueError(f"{label} changed while open")
+        return PinnedDigest(
+            sha256=digest.hexdigest(),
+            byte_count=after.st_size,
+        )
+    finally:
+        os.close(fd)
+
+
 def read_regular_at(parent_fd: int, name: str, *, label: str) -> PinnedBytes:
     _safe_name(name, label=label)
     try:
@@ -310,6 +361,10 @@ class PinnedDirectory:
     def read_regular(self, name: str, *, label: str) -> PinnedBytes:
         self._verify_identity()
         return read_regular_at(self.fd, name, label=label)
+
+    def hash_regular(self, name: str, *, label: str) -> PinnedDigest:
+        self._verify_identity()
+        return hash_regular_at(self.fd, name, label=label)
 
     def entries(self) -> tuple[str, ...]:
         self._verify_identity()

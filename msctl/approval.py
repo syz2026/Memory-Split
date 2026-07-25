@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import json
 import os
 from datetime import UTC, datetime
 from pathlib import Path
@@ -20,7 +21,13 @@ from .jsonutil import (
     require_schema_version,
     require_sha256,
 )
-from .profile import IlluminaProfile
+from .profile import (
+    AWS_GPU_PROFILES,
+    AWS_P5_PROFILE,
+    AWS_P5_V3_PROFILE,
+    AWS_P6_B300_V3_PROFILE,
+    IlluminaProfile,
+)
 from .slurm import resource_request
 
 
@@ -30,8 +37,46 @@ APPROVAL_OPERATIONS = {
     "cancel",
     "evaluate",
     "cleanup",
+    "fleet-advance",
+    "canary",
 }
 KEY_ENV = "MSCTL_APPROVAL_KEY"
+KEYS_ENV = "MSCTL_APPROVAL_KEYS"
+_V3_RESOURCE_FIELDS = {
+    "cohort_assignment_sha256",
+    "preregistration_sha256",
+    "hardware_amendment_sha256",
+    "provider_selection_sha256",
+    "sealed_fixture_sha256",
+    "fleet_plan_sha256",
+    "fleet_wave",
+    "control_bundle_sha256",
+}
+_AWS_LIFECYCLE_EVIDENCE_FIELDS = {
+    "dataset_pointer_sha256",
+    "dataset_verification_sha256",
+    "environment_receipt_sha256",
+}
+_V3_FINAL_EVALUATION_RESOURCE_FIELDS = {
+    "sealed_evaluation_sha256",
+    "study_lock_sha256",
+}
+_V3_CANARY_RESOURCE_FIELDS = {
+    "ami_id",
+    "container_image",
+    "container_digest",
+    "instance_id",
+    "instance_type",
+    "profile_sha256",
+    "provider",
+    "release_sha256",
+    "runtime_sha256",
+    "provider_selection_sha256",
+    "environment_receipt_sha256",
+    "command_plan_sha256",
+    "orchestration_plan_sha256",
+    "control_bundle_sha256",
+}
 
 
 def _parse_expiry(value: object) -> datetime:
@@ -53,6 +98,55 @@ def _parse_expiry(value: object) -> datetime:
             "approval expiry must be in UTC",
         )
     return parsed
+
+
+def _approval_secret(
+    environ: dict[str, str],
+    *,
+    key_id: str,
+) -> bytes:
+    configured = environ.get(KEYS_ENV)
+    if configured is not None:
+        try:
+            pairs = json.loads(configured, object_pairs_hook=list)
+        except json.JSONDecodeError as error:
+            raise MsctlError(
+                "APPROVAL_KEY_UNAVAILABLE",
+                f"{KEYS_ENV} must be a JSON object of key IDs to secrets",
+            ) from error
+        if not isinstance(pairs, list):
+            pairs = []
+        keys: dict[str, str] = {}
+        for pair in pairs:
+            if (
+                not isinstance(pair, tuple)
+                or len(pair) != 2
+                or not isinstance(pair[0], str)
+                or not isinstance(pair[1], str)
+                or pair[0] in keys
+                or not pair[0]
+                or len(pair[1].encode("utf-8")) < 32
+            ):
+                raise MsctlError(
+                    "APPROVAL_KEY_UNAVAILABLE",
+                    f"{KEYS_ENV} contains an invalid key entry",
+                )
+            keys[pair[0]] = pair[1]
+        secret = keys.get(key_id)
+        if secret is None:
+            raise MsctlError(
+                "APPROVAL_KEY_UNAVAILABLE",
+                "approval key_id does not select a configured signing key",
+                details={"key_id": key_id},
+            )
+        return secret.encode("utf-8")
+    secret = environ.get(KEY_ENV)
+    if secret is None or len(secret.encode("utf-8")) < 32:
+        raise MsctlError(
+            "APPROVAL_KEY_UNAVAILABLE",
+            f"{KEY_ENV} must contain at least 32 bytes",
+        )
+    return secret.encode("utf-8")
 
 
 def verify_approval(
@@ -142,18 +236,13 @@ def verify_scope_approval(
     signature = require_sha256(
         receipt["signature"], label="approval receipt.signature"
     )
-    env = os.environ if environ is None else environ
-    secret = env.get(KEY_ENV)
-    if secret is None or len(secret.encode("utf-8")) < 32:
-        raise MsctlError(
-            "APPROVAL_KEY_UNAVAILABLE",
-            f"{KEY_ENV} must contain at least 32 bytes",
-        )
+    env = dict(os.environ if environ is None else environ)
+    secret = _approval_secret(env, key_id=receipt["key_id"])
     unsigned = {
         key: value for key, value in receipt.items() if key != "signature"
     }
     expected = hmac.new(
-        secret.encode("utf-8"),
+        secret,
         canonical_json(unsigned),
         hashlib.sha256,
     ).hexdigest()
@@ -219,17 +308,28 @@ def verify_scope_approval(
         "script",
     }
     expected_resource_fields = set(resources)
-    extended_aws_operation = (
-        profile.provider == "aws-p5.48xlarge"
-        and operation in {"submit", "resume", "evaluate", "cleanup"}
+    v3_aws = profile.provider in {
+        AWS_P5_V3_PROFILE,
+        AWS_P6_B300_V3_PROFILE,
+    }
+    extended_aws_operation = profile.provider in AWS_GPU_PROFILES and (
+        operation in {"submit", "resume", "evaluate", "cleanup"}
+        or (v3_aws and operation == "cancel")
     )
-    if extended_aws_operation:
+    canary_aws_operation = v3_aws and operation == "canary"
+    if canary_aws_operation:
+        expected_resource_fields = (
+            base_resource_fields | _V3_CANARY_RESOURCE_FIELDS
+        )
+    elif extended_aws_operation:
         expected_resource_fields = base_resource_fields | {
             "ami_id",
             "container_image",
             "container_digest",
             "instance_id",
+            "instance_type",
             "profile_sha256",
+            "provider",
             "release_sha256",
             "run_manifest_sha256",
             "runtime_sha256",
@@ -238,6 +338,15 @@ def verify_scope_approval(
         }
         if operation == "resume":
             expected_resource_fields.add("checkpoint_receipt_sha256")
+        if operation in {"submit", "resume", "evaluate"}:
+            expected_resource_fields |= _AWS_LIFECYCLE_EVIDENCE_FIELDS
+        if v3_aws:
+            expected_resource_fields |= _V3_RESOURCE_FIELDS
+            if operation == "evaluate":
+                expected_resource_fields |= _V3_FINAL_EVALUATION_RESOURCE_FIELDS
+                expected_resource_fields.add("checkpoint_receipt_sha256")
+            if operation in {"submit", "resume", "evaluate"}:
+                expected_resource_fields.add("launch_readiness_sha256")
     require_exact_keys(
         receipt_resources,
         expected_resource_fields,
@@ -261,7 +370,37 @@ def verify_scope_approval(
             resources.get("gpu_hours"),
             label="resource request.gpu_hours",
         )
-        if extended_aws_operation:
+        if canary_aws_operation:
+            for field in (
+                "profile_sha256",
+                "release_sha256",
+                "runtime_sha256",
+                "provider_selection_sha256",
+                "environment_receipt_sha256",
+                "command_plan_sha256",
+                "orchestration_plan_sha256",
+                "control_bundle_sha256",
+            ):
+                require_sha256(
+                    resources.get(field),
+                    label=f"resource request.{field}",
+                )
+            if (
+                resources.get("provider") != profile.provider
+                or resources.get("instance_type")
+                != getattr(profile, "instance_type", None)
+                or resources.get("profile_sha256")
+                != getattr(profile, "sha256", None)
+                or resources.get("gres") != getattr(profile, "gres", None)
+            ):
+                raise MsctlError(
+                    "APPROVAL_INVALID",
+                    "canary approval does not bind the selected AWS profile",
+                )
+        elif extended_aws_operation:
+            profile_gres = getattr(profile, "gres", None)
+            if profile_gres is None and profile.provider == AWS_P5_PROFILE:
+                profile_gres = "gpu:h100:8"
             for field in (
                 "profile_sha256",
                 "release_sha256",
@@ -271,6 +410,58 @@ def verify_scope_approval(
                 require_sha256(
                     resources.get(field),
                     label=f"resource request.{field}",
+                )
+            if operation in {"submit", "resume", "evaluate"}:
+                for field in _AWS_LIFECYCLE_EVIDENCE_FIELDS:
+                    require_sha256(
+                        resources.get(field),
+                        label=f"resource request.{field}",
+                    )
+            if v3_aws:
+                for field in (
+                    "cohort_assignment_sha256",
+                    "preregistration_sha256",
+                    "hardware_amendment_sha256",
+                    "provider_selection_sha256",
+                    "sealed_fixture_sha256",
+                    "fleet_plan_sha256",
+                    "control_bundle_sha256",
+                ):
+                    require_sha256(
+                        resources.get(field),
+                        label=f"resource request.{field}",
+                    )
+                if operation == "evaluate":
+                    for field in (
+                        *_V3_FINAL_EVALUATION_RESOURCE_FIELDS,
+                        "checkpoint_receipt_sha256",
+                    ):
+                        require_sha256(
+                            resources.get(field),
+                            label=f"resource request.{field}",
+                        )
+                require_nonnegative_int(
+                    resources.get("fleet_wave"),
+                    label="resource request.fleet_wave",
+                )
+                if operation in {"submit", "resume", "evaluate"}:
+                    require_sha256(
+                        resources.get("launch_readiness_sha256"),
+                        label="resource request.launch_readiness_sha256",
+                    )
+            if (
+                resources.get("provider") != profile.provider
+                or resources.get("instance_type")
+                != getattr(profile, "instance_type", None)
+                or resources.get("profile_sha256")
+                != getattr(profile, "sha256", None)
+                or resources.get("gres") != profile_gres
+                or resources.get("seed")
+                not in getattr(profile, "assigned_seeds", ())
+            ):
+                raise MsctlError(
+                    "APPROVAL_INVALID",
+                    "approval resources do not bind the selected AWS profile",
                 )
             if operation == "resume":
                 require_sha256(

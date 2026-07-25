@@ -9,7 +9,16 @@ import sys
 from collections.abc import Callable
 from pathlib import Path
 
+from .aws_control_bundle import plan_control_bundle
+from .aws_fleet import plan_fleet
 from .aws_p5 import build_aws_backend
+from .aws_readiness import DIAGNOSTIC_IDS, plan_launch_readiness
+from .aws_sealed_finalization import finalize_sealed_evaluation
+from .aws_selection import (
+    load_hardware_amendment,
+    load_provider_selection,
+    plan_provider_selection,
+)
 from .cleanup import apply_cleanup, make_cleanup_plan
 from .collect import collect_evidence
 from .contracts import load_release
@@ -32,7 +41,12 @@ from .operations import (
     status_runs,
     submit_runs,
 )
-from .profile import AWS_P5_PROFILE, SUPPORTED_PROFILE, load_profile
+from .profile import (
+    AWS_GPU_PROFILES,
+    AWS_P5_PROFILE,
+    SUPPORTED_PROFILE,
+    load_profile,
+)
 
 
 SCHEMA_VERSION = 1
@@ -88,6 +102,175 @@ def build_parser() -> JsonArgumentParser:
     capacity_sub = capacity.add_subparsers(dest="action", required=True)
     _leaf(capacity_sub, "check", help_text="query bounded Slurm capacity")
 
+    control = _leaf(commands, "control", help_text="AWS control bootstrap")
+    control_sub = control.add_subparsers(dest="action", required=True)
+    control_bundle = _leaf(
+        control_sub,
+        "bundle",
+        help_text="render or exclusively publish the deterministic control bundle",
+    )
+    control_bundle.add_argument("--out", required=True)
+    control_bundle.add_argument("--apply", action="store_true")
+    control_install = _leaf(
+        control_sub,
+        "install",
+        help_text="install reviewed control bytes through stock AWS SSM",
+    )
+    control_install.add_argument("--instance-id", required=True)
+    control_install.add_argument("--bundle", required=True)
+    control_install.add_argument("--bundle-sha256", required=True)
+    control_install.add_argument("--apply", action="store_true")
+
+    canary = _leaf(commands, "canary", help_text="AWS GPU qualification canary")
+    canary_sub = canary.add_subparsers(dest="action", required=True)
+    canary_plan = _leaf(
+        canary_sub,
+        "plan",
+        help_text="render or exclusively publish one authenticated canary plan",
+    )
+    canary_plan.add_argument("--release", required=True)
+    canary_plan.add_argument(
+        "--amendment",
+        default=str(DEFAULT_ROOT / "configs" / "hardware-amendment-v3.json"),
+    )
+    canary_plan.add_argument("--provider-selection", required=True)
+    canary_plan.add_argument("--environment-receipt", required=True)
+    canary_plan.add_argument("--instance-id", required=True)
+    canary_plan.add_argument("--out", required=True)
+    canary_plan.add_argument("--apply", action="store_true")
+    canary_run = _leaf(
+        canary_sub,
+        "run",
+        help_text="plan or send one immutable canary intent through AWS SSM",
+    )
+    canary_run.add_argument("--canary-plan", required=True)
+    canary_run.add_argument("--instance-id", required=True)
+    canary_run.add_argument("--approval")
+    canary_run.add_argument("--apply", action="store_true")
+
+    provider = _leaf(commands, "provider", help_text="provider selection")
+    provider_sub = provider.add_subparsers(dest="action", required=True)
+    select = _leaf(
+        provider_sub,
+        "select",
+        help_text="render or exclusively publish a v3 provider selection",
+    )
+    select.add_argument(
+        "--amendment",
+        default=str(DEFAULT_ROOT / "configs" / "hardware-amendment-v3.json"),
+    )
+    select.add_argument("--region", required=True)
+    select.add_argument("--ami-id", required=True)
+    select.add_argument("--ami-evidence", required=True)
+    select.add_argument("--container-image", required=True)
+    select.add_argument("--container-digest", required=True)
+    select.add_argument("--ecr-evidence", required=True)
+    select.add_argument("--image-build-receipt", required=True)
+    select.add_argument("--capacity-reservation-id")
+    select.add_argument("--capacity-block-offering-id")
+    select.add_argument("--selected-at", required=True)
+    select.add_argument("--out", required=True)
+    select.add_argument("--apply", action="store_true")
+
+    readiness = _leaf(commands, "readiness", help_text="protected launch gate")
+    readiness_sub = readiness.add_subparsers(dest="action", required=True)
+    readiness_create = _leaf(
+        readiness_sub,
+        "create",
+        help_text="render or exclusively publish protected-launch readiness",
+    )
+    readiness_create.add_argument("--release", required=True)
+    readiness_create.add_argument(
+        "--amendment",
+        default=str(DEFAULT_ROOT / "configs" / "hardware-amendment-v3.json"),
+    )
+    readiness_create.add_argument("--provider-selection", required=True)
+    readiness_create.add_argument("--environment-receipt", required=True)
+    readiness_create.add_argument("--qualification-receipt", required=True)
+    readiness_create.add_argument(
+        "--diagnostic-receipt",
+        action="append",
+        required=True,
+    )
+    readiness_create.add_argument("--sealed-evaluation-fixture", required=True)
+    readiness_create.add_argument("--reviewer", required=True)
+    readiness_create.add_argument("--reviewed-at", required=True)
+    readiness_create.add_argument("--key-id", required=True)
+    readiness_create.add_argument("--out", required=True)
+    readiness_create.add_argument("--apply", action="store_true")
+
+    sealed_evaluation = _leaf(
+        commands,
+        "sealed-evaluation",
+        help_text="sealed evaluator release lifecycle",
+    )
+    sealed_evaluation_sub = sealed_evaluation.add_subparsers(
+        dest="action",
+        required=True,
+    )
+    sealed_finalize = _leaf(
+        sealed_evaluation_sub,
+        "finalize",
+        help_text="build the post-training N=10 evaluator release",
+    )
+    sealed_finalize.add_argument("--fixture", required=True)
+    sealed_finalize.add_argument(
+        "--checkpoint-record",
+        action="append",
+        required=True,
+    )
+    sealed_finalize.add_argument(
+        "--validity-receipt",
+        action="append",
+        required=True,
+    )
+    sealed_finalize.add_argument("--preregistration-sha256", required=True)
+    sealed_finalize.add_argument("--out", required=True)
+    sealed_finalize.add_argument("--apply", action="store_true")
+
+    fleet = _leaf(commands, "fleet", help_text="explicit AWS fleet planning")
+    fleet_sub = fleet.add_subparsers(dest="action", required=True)
+    fleet_plan = _leaf(
+        fleet_sub,
+        "plan",
+        help_text="render or exclusively publish a deterministic fleet plan",
+    )
+    fleet_plan.add_argument(
+        "--amendment",
+        default=str(DEFAULT_ROOT / "configs" / "hardware-amendment-v3.json"),
+    )
+    fleet_plan.add_argument("--provider-selection", required=True)
+    fleet_plan.add_argument(
+        "--manifest",
+        dest="manifest_paths",
+        action="append",
+        required=True,
+    )
+    fleet_plan.add_argument(
+        "--instance-id",
+        dest="instance_ids",
+        action="append",
+        required=True,
+    )
+    fleet_plan.add_argument("--out", required=True)
+    fleet_plan.add_argument("--apply", action="store_true")
+    fleet_advance = _leaf(
+        fleet_sub,
+        "advance",
+        help_text="verify and unbind one completed same-instance fleet wave",
+    )
+    fleet_advance.add_argument(
+        "--amendment",
+        default=str(DEFAULT_ROOT / "configs" / "hardware-amendment-v3.json"),
+    )
+    fleet_advance.add_argument("--provider-selection", required=True)
+    fleet_advance.add_argument("--fleet-plan", required=True)
+    fleet_advance.add_argument("--to-manifest", required=True)
+    fleet_advance.add_argument("--instance-id", required=True)
+    fleet_advance.add_argument("--checkpoint-receipt", required=True)
+    fleet_advance.add_argument("--approval")
+    fleet_advance.add_argument("--apply", action="store_true")
+
     env = _leaf(commands, "env", help_text="environment lifecycle")
     env_sub = env.add_subparsers(dest="action", required=True)
     ensure_env = _leaf(env_sub, "ensure", help_text="plan or build environment")
@@ -127,6 +310,9 @@ def build_parser() -> JsonArgumentParser:
     instantiate.add_argument("--dataset-receipt", required=True)
     instantiate.add_argument("--seed", required=True, type=int)
     instantiate.add_argument("--out", required=True)
+    instantiate.add_argument("--hardware-amendment")
+    instantiate.add_argument("--provider-selection")
+    instantiate.add_argument("--sealed-evaluation-fixture")
     instantiate.add_argument("--apply", action="store_true")
     render = _leaf(runs_sub, "render", help_text="render deterministic Slurm argv")
     render.add_argument("--release", required=True)
@@ -137,6 +323,9 @@ def build_parser() -> JsonArgumentParser:
     render_dataset.add_argument("--dataset-root")
     render_dataset.add_argument("--dataset-verification")
     render.add_argument("--environment-receipt")
+    render.add_argument("--hardware-amendment")
+    render.add_argument("--provider-selection")
+    render.add_argument("--fleet-plan")
 
     for name in ("submit", "resume", "cancel", "evaluate"):
         leaf = _leaf(commands, name, help_text=f"plan or {name} runs")
@@ -149,18 +338,35 @@ def build_parser() -> JsonArgumentParser:
             dataset_binding.add_argument("--dataset-root")
             dataset_binding.add_argument("--dataset-verification")
             leaf.add_argument("--environment-receipt")
+            leaf.add_argument("--launch-readiness")
+            leaf.add_argument("--qualification-receipt")
+            leaf.add_argument("--diagnostic-receipt", action="append")
+            if name in {"submit", "resume"}:
+                leaf.add_argument("--sealed-evaluation-fixture")
+            if name == "evaluate":
+                leaf.add_argument("--sealed-evaluation-release")
+                leaf.add_argument("--expected-sealed-evaluation-sha256")
+                leaf.add_argument("--expected-study-lock-sha256")
         leaf.add_argument("--approval")
+        leaf.add_argument("--hardware-amendment")
+        leaf.add_argument("--provider-selection")
+        leaf.add_argument("--fleet-plan")
         if name == "submit":
             leaf.add_argument("--instance-id")
             leaf.add_argument("--terminate-at")
         if name == "resume":
             leaf.add_argument("--checkpoint-receipt", required=True)
+        if name == "evaluate":
+            leaf.add_argument("--checkpoint-receipt")
         leaf.add_argument("--apply", action="store_true")
 
     status = _leaf(commands, "status", help_text="reconcile run status")
     status.add_argument("--release", required=True)
     status.add_argument("--manifest", required=True)
     status.add_argument("--cached", action="store_true")
+    status.add_argument("--hardware-amendment")
+    status.add_argument("--provider-selection")
+    status.add_argument("--fleet-plan")
 
     collect = _leaf(commands, "collect", help_text="collect result evidence")
     collect.add_argument("--source", required=True)
@@ -173,11 +379,17 @@ def build_parser() -> JsonArgumentParser:
     cleanup_plan.add_argument("--root")
     cleanup_plan.add_argument("--release")
     cleanup_plan.add_argument("--manifest")
+    cleanup_plan.add_argument("--hardware-amendment")
+    cleanup_plan.add_argument("--provider-selection")
+    cleanup_plan.add_argument("--fleet-plan")
     cleanup_apply = _leaf(cleanup_sub, "apply", help_text="apply frozen cleanup")
     cleanup_apply.add_argument("--plan")
     cleanup_apply.add_argument("--release", required=True)
     cleanup_apply.add_argument("--manifest")
     cleanup_apply.add_argument("--approval")
+    cleanup_apply.add_argument("--hardware-amendment")
+    cleanup_apply.add_argument("--provider-selection")
+    cleanup_apply.add_argument("--fleet-plan")
     cleanup_apply.add_argument("--apply", action="store_true", required=True)
     return parser
 
@@ -207,6 +419,30 @@ def _require_cli_values(args: argparse.Namespace, *names: str) -> None:
                 ]
             },
         )
+
+
+def _diagnostic_receipts(values: list[str] | None) -> dict[str, str]:
+    result: dict[str, str] = {}
+    for value in values or []:
+        name, separator, path = value.partition("=")
+        if (
+            separator != "="
+            or name not in DIAGNOSTIC_IDS
+            or name in result
+            or not path
+        ):
+            raise MsctlError(
+                "CLI_USAGE",
+                "--diagnostic-receipt must be one unique NAME=PATH for each gate",
+            )
+        result[name] = path
+    if set(result) != set(DIAGNOSTIC_IDS):
+        raise MsctlError(
+            "CLI_USAGE",
+            "all six named diagnostic receipts are required",
+            details={"missing": sorted(set(DIAGNOSTIC_IDS) - set(result))},
+        )
+    return result
 
 
 def _auth_check(profile) -> dict[str, object]:
@@ -245,11 +481,20 @@ def dispatch(
     aws_backend_factory: Callable[..., object] = build_aws_backend,
     environ: dict[str, str] | None = None,
 ) -> tuple[bool, dict[str, object]]:
-    profile = (profile_loader or load_profile)(args.profile)
     command = _command_name(args)
     environment = dict(os.environ if environ is None else environ)
+    if command == "sealed-evaluation finalize":
+        return not args.apply, finalize_sealed_evaluation(
+            fixture_root=args.fixture,
+            checkpoint_records=args.checkpoint_record,
+            validity_receipts=args.validity_receipt,
+            preregistration_sha256=args.preregistration_sha256,
+            out=args.out,
+            apply=args.apply,
+        )
+    profile = (profile_loader or load_profile)(args.profile)
     provider = getattr(profile, "provider", None)
-    if provider not in {SUPPORTED_PROFILE, AWS_P5_PROFILE}:
+    if provider != SUPPORTED_PROFILE and provider not in AWS_GPU_PROFILES:
         raise MsctlError(
             "PROVIDER_UNSUPPORTED",
             "profile provider is not supported",
@@ -265,10 +510,75 @@ def dispatch(
             repo_root=args.repo_root,
             apply=args.apply,
             cohort_loader=cohort_loader,
+            hardware_amendment=args.hardware_amendment,
+            provider_selection=args.provider_selection,
+            sealed_evaluation_fixture=args.sealed_evaluation_fixture,
         )
-    if provider == AWS_P5_PROFILE:
+    if command == "control bundle":
+        return not args.apply, plan_control_bundle(
+            source_root=args.repo_root,
+            out=args.out,
+            apply=args.apply,
+        )
+    if command == "provider select":
+        return not args.apply, plan_provider_selection(
+            profile=profile,
+            amendment_path=args.amendment,
+            region=args.region,
+            ami_id=args.ami_id,
+            ami_evidence=args.ami_evidence,
+            container_image=args.container_image,
+            container_digest=args.container_digest,
+            ecr_evidence=args.ecr_evidence,
+            image_build_receipt=args.image_build_receipt,
+            capacity_reservation_id=args.capacity_reservation_id,
+            capacity_block_offering_id=args.capacity_block_offering_id,
+            selected_at=args.selected_at,
+            out=args.out,
+            apply=args.apply,
+        )
+    if command == "readiness create":
+        amendment = load_hardware_amendment(args.amendment)
+        selection = load_provider_selection(
+            args.provider_selection,
+            amendment=amendment,
+            profile=profile,
+        )
+        return not args.apply, plan_launch_readiness(
+            out=args.out,
+            apply=args.apply,
+            profile=profile,
+            amendment=amendment,
+            selection=selection,
+            release=load_release(args.release),
+            environment_receipt=args.environment_receipt,
+            qualification_receipt=args.qualification_receipt,
+            diagnostic_receipts=_diagnostic_receipts(
+                args.diagnostic_receipt
+            ),
+            sealed_evaluation_fixture=args.sealed_evaluation_fixture,
+            reviewer=args.reviewer,
+            reviewed_at=args.reviewed_at,
+            key_id=args.key_id,
+            environ=environment,
+        )
+    if command == "fleet plan":
+        return not args.apply, plan_fleet(
+            profile=profile,
+            amendment_path=args.amendment,
+            provider_selection_path=args.provider_selection,
+            manifest_paths=args.manifest_paths,
+            instance_ids=args.instance_ids,
+            repo_root=args.repo_root,
+            out=args.out,
+            apply=args.apply,
+        )
+    if provider in AWS_GPU_PROFILES:
         if command == "submit":
-            _require_cli_values(args, "instance_id", "terminate_at")
+            if provider == AWS_P5_PROFILE:
+                _require_cli_values(args, "instance_id", "terminate_at")
+            else:
+                _require_cli_values(args, "terminate_at")
         if command in {"runs render", "submit", "resume", "evaluate"}:
             _require_cli_values(
                 args,
@@ -296,6 +606,14 @@ def dispatch(
             environ=environment,
         )
         return backend.dispatch(command, args)
+    if (
+        command == "evaluate"
+        and getattr(args, "checkpoint_receipt", None) is not None
+    ):
+        raise MsctlError(
+            "CLI_USAGE",
+            "--checkpoint-receipt is supported only for AWS v3 evaluation",
+        )
     if command in {"runs render", "submit", "resume", "evaluate"}:
         _require_cli_values(args, "dataset_pointer", "shared_root")
         if (args.dataset_root is None) == (args.dataset_verification is None):

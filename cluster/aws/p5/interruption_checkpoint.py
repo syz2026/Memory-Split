@@ -25,11 +25,65 @@ from urllib.request import Request, urlopen
 
 
 PROVIDER = "aws-p5.48xlarge"
+INSTANCE_TYPE = "p5.48xlarge"
+GRES = "gpu:h100:8"
+_LEGACY_CANDIDATE_RECEIPT_TYPE = "aws-p5-interruption-candidate"
+_LEGACY_INTERRUPTION_RECEIPT_TYPE = "aws-p5-paired-interruption"
+_LEGACY_RESUME_COMMIT_PROTOCOL = "aws-p5-resume-commit-v1"
+_NEUTRAL_CANDIDATE_RECEIPT_TYPE = "aws-gpu-interruption-candidate"
+_NEUTRAL_INTERRUPTION_RECEIPT_TYPE = "aws-gpu-paired-interruption"
+_NEUTRAL_RESUME_COMMIT_PROTOCOL = "aws-gpu-resume-commit-v1"
+_PROFILE_CONTRACTS = {
+    PROVIDER: {
+        "instance_type": INSTANCE_TYPE,
+        "gres": GRES,
+        "assigned_seeds": (1, 2, 3, 4),
+        "candidate_receipt_type": _LEGACY_CANDIDATE_RECEIPT_TYPE,
+        "interruption_receipt_type": _LEGACY_INTERRUPTION_RECEIPT_TYPE,
+        "resume_commit_protocol": _LEGACY_RESUME_COMMIT_PROTOCOL,
+    },
+    "aws-p5.48xlarge-v3": {
+        "instance_type": "p5.48xlarge",
+        "gres": "gpu:h100:8",
+        "assigned_seeds": tuple(range(10)),
+        "candidate_receipt_type": _NEUTRAL_CANDIDATE_RECEIPT_TYPE,
+        "interruption_receipt_type": _NEUTRAL_INTERRUPTION_RECEIPT_TYPE,
+        "resume_commit_protocol": _NEUTRAL_RESUME_COMMIT_PROTOCOL,
+    },
+    "aws-p6-b300.48xlarge-v3": {
+        "instance_type": "p6-b300.48xlarge",
+        "gres": "gpu:b300:8",
+        "assigned_seeds": tuple(range(10)),
+        "candidate_receipt_type": _NEUTRAL_CANDIDATE_RECEIPT_TYPE,
+        "interruption_receipt_type": _NEUTRAL_INTERRUPTION_RECEIPT_TYPE,
+        "resume_commit_protocol": _NEUTRAL_RESUME_COMMIT_PROTOCOL,
+    },
+}
 RESUMABLE_EXIT_CODE = 75
 NON_RESUMABLE_EXIT_CODE = 74
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
+_KMS_KEY_ARN_RE = re.compile(
+    r"^arn:aws:kms:(?P<region>us-(?:east-1|west-2)):[0-9]{12}:"
+    r"key/[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-"
+    r"[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+)
 _ARMS = ("dense", "split90")
+_CHECKPOINT_METADATA_FIELDS = {
+    "schema_version",
+    "receipt_type",
+    "run_id",
+    "condition",
+    "seed",
+    "step",
+    "max_steps",
+    "world_size",
+    "config_fingerprint",
+    "checkpoint_path",
+    "checkpoint_sha256",
+    "checkpoint_bytes",
+    "terminal",
+}
 _IMDS_ROOT = "http://169.254.169.254/latest"
 
 
@@ -97,10 +151,58 @@ class InterruptionRequest:
     config_sha256: Mapping[str, str]
     timeout_seconds: float
     upload_reserve_seconds: float
+    provider: str = PROVIDER
+    profile_sha256: str | None = None
+    instance_type: str = INSTANCE_TYPE
+    gres: str = GRES
+    assigned_seeds: tuple[int, ...] = (1, 2, 3, 4)
+    candidate_receipt_type: str = _LEGACY_CANDIDATE_RECEIPT_TYPE
+    interruption_receipt_type: str = _LEGACY_INTERRUPTION_RECEIPT_TYPE
+    resume_commit_protocol: str = _LEGACY_RESUME_COMMIT_PROTOCOL
+    checkpoint_metadata_paths: Mapping[str, Path] | None = None
+    checkpoint_receipt_path: Path | None = None
+    run_ids: Mapping[str, str] | None = None
+    run_manifest_sha256: str | None = None
+    cohort_assignment_sha256: str | None = None
+    preregistration_sha256: str | None = None
+    hardware_amendment_sha256: str | None = None
+    provider_selection_sha256: str | None = None
+    sealed_fixture_sha256: str | None = None
 
     def __post_init__(self) -> None:
-        if type(self.seed) is not int or self.seed not in {1, 2, 3, 4}:
-            raise ValueError("interruption seed must be one of 1, 2, 3, 4")
+        contract = _PROFILE_CONTRACTS.get(self.provider)
+        if (
+            contract is None
+            or self.instance_type != contract["instance_type"]
+            or self.gres != contract["gres"]
+            or self.assigned_seeds != contract["assigned_seeds"]
+            or self.candidate_receipt_type
+            != contract["candidate_receipt_type"]
+            or self.interruption_receipt_type
+            != contract["interruption_receipt_type"]
+            or self.resume_commit_protocol
+            != contract["resume_commit_protocol"]
+        ):
+            raise ValueError(
+                "interruption request does not match a closed AWS GPU profile"
+            )
+        if (
+            self.profile_sha256 is not None
+            and (
+                not isinstance(self.profile_sha256, str)
+                or _SHA256_RE.fullmatch(self.profile_sha256) is None
+            )
+        ):
+            raise ValueError("interruption profile SHA-256 must be lowercase hex")
+        if self.provider != PROVIDER and self.profile_sha256 is None:
+            raise ValueError(
+                "v3 interruption requests require an explicit profile SHA-256"
+            )
+        if type(self.seed) is not int or self.seed not in self.assigned_seeds:
+            choices = ", ".join(str(seed) for seed in self.assigned_seeds)
+            raise ValueError(
+                f"interruption seed must be assigned to the profile: {choices}"
+            )
         if not isinstance(self.notice, str) or not self.notice:
             raise ValueError("interruption notice must be non-empty")
         for label, mapping in (
@@ -155,6 +257,51 @@ class InterruptionRequest:
                 "upload reserve must be positive and below checkpoint timeout"
             )
         _split_s3_uri(self.s3_root + "/sentinel")
+        bridge_values = (
+            self.checkpoint_metadata_paths,
+            self.checkpoint_receipt_path,
+            self.run_ids,
+            self.run_manifest_sha256,
+            self.cohort_assignment_sha256,
+            self.preregistration_sha256,
+            self.hardware_amendment_sha256,
+            self.provider_selection_sha256,
+            self.sealed_fixture_sha256,
+        )
+        if any(value is not None for value in bridge_values):
+            if self.provider == PROVIDER or any(
+                value is None for value in bridge_values
+            ):
+                raise ValueError(
+                    "checkpoint receipt bridge requires one complete v3 binding"
+                )
+            assert self.checkpoint_metadata_paths is not None
+            assert self.checkpoint_receipt_path is not None
+            assert self.run_ids is not None
+            if (
+                set(self.checkpoint_metadata_paths) != set(_ARMS)
+                or set(self.run_ids) != set(_ARMS)
+                or any(
+                    not isinstance(path, Path)
+                    for path in self.checkpoint_metadata_paths.values()
+                )
+                or not isinstance(self.checkpoint_receipt_path, Path)
+                or any(
+                    not isinstance(run_id, str) or not run_id
+                    for run_id in self.run_ids.values()
+                )
+            ):
+                raise ValueError("checkpoint receipt bridge pair is invalid")
+            for label, digest in (
+                ("run manifest", self.run_manifest_sha256),
+                ("cohort assignment", self.cohort_assignment_sha256),
+                ("preregistration", self.preregistration_sha256),
+                ("hardware amendment", self.hardware_amendment_sha256),
+                ("provider selection", self.provider_selection_sha256),
+                ("sealed fixture", self.sealed_fixture_sha256),
+            ):
+                if not isinstance(digest, str) or _SHA256_RE.fullmatch(digest) is None:
+                    raise ValueError(f"{label} SHA-256 must be lowercase hex")
 
 
 @dataclass(frozen=True)
@@ -163,6 +310,9 @@ class InterruptionResult:
     exit_code: int
     receipt_path: Path
     receipt_upload_verified: bool
+    checkpoint_receipt_path: Path | None = None
+    checkpoint_receipt_sha256: str | None = None
+    checkpoint_receipt_uri: str | None = None
 
 
 def _default_runner(
@@ -225,12 +375,23 @@ class S3ObjectStore:
         *,
         region: str,
         environment: Mapping[str, str],
+        kms_key_id: str | None = None,
         runner: Callable[
             [Sequence[str], Mapping[str, str], float], CommandResult
         ] = _default_runner,
     ) -> None:
         if not isinstance(region, str) or not region:
             raise ValueError("S3 region must be non-empty")
+        if kms_key_id is not None:
+            kms_match = (
+                _KMS_KEY_ARN_RE.fullmatch(kms_key_id)
+                if isinstance(kms_key_id, str)
+                else None
+            )
+            if kms_match is None or kms_match.group("region") != region:
+                raise ValueError(
+                    "S3 KMS key must be an immutable key ARN in the upload region"
+                )
         expected_environment = {
             "AWS_REGION",
             "HOME",
@@ -265,6 +426,7 @@ class S3ObjectStore:
         ):
             raise ValueError("S3 private HOME must be owned, mode 0700, and empty")
         self._region = region
+        self._kms_key_id = kms_key_id
         self._environment = dict(environment)
         self._runner = runner
 
@@ -327,6 +489,16 @@ class S3ObjectStore:
         )
         if remaining <= 0:
             return None
+        encryption_argv = (
+            [
+                "--server-side-encryption",
+                "aws:kms",
+                "--ssekms-key-id",
+                self._kms_key_id,
+            ]
+            if self._kms_key_id is not None
+            else []
+        )
         put = None
         try:
             put = self._runner(
@@ -348,6 +520,7 @@ class S3ObjectStore:
                     f"sha256={digest}",
                     "--if-none-match",
                     "*",
+                    *encryption_argv,
                     "--region",
                     self._region,
                     "--output",
@@ -395,11 +568,22 @@ class S3ObjectStore:
         except (OSError, subprocess.SubprocessError):
             return None
         head_value = _load_json_output(head)
+        encryption_matches = (
+            head_value is not None
+            and (
+                self._kms_key_id is None
+                or (
+                    head_value.get("ServerSideEncryption") == "aws:kms"
+                    and head_value.get("SSEKMSKeyId") == self._kms_key_id
+                )
+            )
+        )
         if (
             head_value is None
             or head_value.get("ChecksumSHA256") != checksum
             or head_value.get("ContentLength") != size
             or head_value.get("Metadata") != {"sha256": digest}
+            or not encryption_matches
             or _remaining_seconds(
                 deadline=deadline,
                 monotonic=monotonic,
@@ -625,6 +809,72 @@ def _checkpoint_identity(path: Path) -> _FileIdentity | None:
         os.close(descriptor)
 
 
+def _checkpoint_metadata(
+    path: Path,
+    *,
+    arm: str,
+    request: InterruptionRequest,
+    pinned: _PinnedCheckpoint,
+) -> dict[str, object] | None:
+    descriptor = _open_checkpoint(path)
+    if descriptor is None:
+        return None
+    try:
+        before = os.fstat(descriptor)
+        if before.st_size <= 0 or before.st_size > 64 * 1024:
+            return None
+        payload = b""
+        while len(payload) <= before.st_size:
+            chunk = os.read(descriptor, before.st_size - len(payload) + 1)
+            if not chunk:
+                break
+            payload += chunk
+        after = os.fstat(descriptor)
+    finally:
+        os.close(descriptor)
+    if (
+        before.st_dev,
+        before.st_ino,
+        before.st_size,
+        before.st_mtime_ns,
+        before.st_ctime_ns,
+    ) != (
+        after.st_dev,
+        after.st_ino,
+        after.st_size,
+        after.st_mtime_ns,
+        after.st_ctime_ns,
+    ) or len(payload) != after.st_size:
+        return None
+    try:
+        value = _canonical_payload(payload, label=f"{arm} checkpoint metadata")
+    except ValueError:
+        return None
+    run_ids = request.run_ids
+    if (
+        set(value) != _CHECKPOINT_METADATA_FIELDS
+        or value["schema_version"] != 1
+        or value["receipt_type"] != "memorysplit-training-checkpoint-v1"
+        or run_ids is None
+        or value["run_id"] != run_ids[arm]
+        or value["condition"] != arm
+        or value["seed"] != request.seed
+        or type(value["step"]) is not int
+        or value["step"] <= 0
+        or type(value["max_steps"]) is not int
+        or value["max_steps"] < value["step"]
+        or value["world_size"] != 4
+        or value["checkpoint_path"] != "ckpt.pt"
+        or value["checkpoint_sha256"] != pinned.sha256
+        or value["checkpoint_bytes"] != pinned.bytes
+        or not isinstance(value["terminal"], bool)
+        or not isinstance(value["config_fingerprint"], str)
+        or _SHA256_RE.fullmatch(value["config_fingerprint"]) is None
+    ):
+        return None
+    return value
+
+
 def _generation_changed(
     baseline: _FileIdentity | None,
     current: _FileIdentity,
@@ -830,10 +1080,20 @@ def _checkpoint_uri(
     )
 
 
+def _checkpoint_receipt_uri(
+    request: InterruptionRequest,
+    digest: str,
+) -> str:
+    return (
+        f"{request.s3_root.rstrip('/')}/checkpoints/seed-{request.seed}/"
+        f"receipts/{digest}.json"
+    )
+
+
 def _evidence_uri(request: InterruptionRequest, digest: str) -> str:
     return (
         f"{request.s3_root.rstrip('/')}/receipts/interruption/evidence/"
-        f"sha256/{digest}.json"
+        f"seed-{request.seed}/sha256/{digest}.json"
     )
 
 
@@ -991,6 +1251,8 @@ def handle_interruption(
             wall_monotonic=wall_monotonic,
             sleep=sleep,
         )
+        bridge_enabled = request.checkpoint_receipt_path is not None
+        bridge_metadata: dict[str, dict[str, object]] = {}
         checkpoint_rows = []
         all_verified = not signal_errors
         for arm in _ARMS:
@@ -1043,6 +1305,41 @@ def handle_interruption(
                     ),
                 }
             )
+        if bridge_enabled:
+            assert request.checkpoint_metadata_paths is not None
+            for arm in _ARMS:
+                pinned = stable[arm]
+                metadata = None
+                while (
+                    pinned is not None
+                    and _remaining_seconds(
+                        deadline=checkpoint_deadline,
+                        monotonic=monotonic,
+                        wall_deadline=checkpoint_wall_deadline,
+                        wall_monotonic=wall_monotonic,
+                    )
+                    > 0
+                ):
+                    metadata = _checkpoint_metadata(
+                        request.checkpoint_metadata_paths[arm],
+                        arm=arm,
+                        request=request,
+                        pinned=pinned,
+                    )
+                    if metadata is not None:
+                        break
+                    sleep(0.01)
+                if metadata is None:
+                    all_verified = False
+                else:
+                    bridge_metadata[arm] = metadata
+            if len(
+                {
+                    metadata["step"]
+                    for metadata in bridge_metadata.values()
+                }
+            ) != 1:
+                all_verified = False
 
         deadline_exhausted = (
             _remaining_seconds(
@@ -1059,6 +1356,7 @@ def handle_interruption(
             wall_deadline=wall_deadline,
             wall_monotonic=wall_monotonic,
         ) <= 0
+        legacy_p5 = request.provider == PROVIDER
         candidate = {
             "checkpoints": checkpoint_rows,
             "code_commit": request.code_commit,
@@ -1066,13 +1364,21 @@ def handle_interruption(
             "deadline_exhausted": deadline_exhausted,
             "notice": request.notice,
             "paired": True,
-            "provider": PROVIDER,
-            "receipt_type": "aws-p5-interruption-candidate",
+            "provider": request.provider,
+            "receipt_type": request.candidate_receipt_type,
             "release_sha256": request.release_sha256,
-            "schema_version": 3,
+            "schema_version": 3 if legacy_p5 else 4,
             "seed": request.seed,
             "signal_errors": signal_errors,
         }
+        if not legacy_p5:
+            candidate.update(
+                {
+                    "gres": request.gres,
+                    "instance_type": request.instance_type,
+                    "profile_sha256": request.profile_sha256,
+                }
+            )
         candidate_path = staging / "candidate.json"
         candidate_written = _write_immutable_json(
             candidate_path,
@@ -1098,6 +1404,100 @@ def handle_interruption(
                 wall_monotonic=wall_monotonic,
             )
 
+        checkpoint_receipt_uploaded = None
+        checkpoint_receipt_digest = None
+        checkpoint_receipt_uri = None
+        if bridge_enabled and all_verified:
+            assert request.checkpoint_receipt_path is not None
+            assert request.run_ids is not None
+            local_checkpoints_published = all(
+                stable[arm] is not None
+                and _publish_local_handoff(
+                    stable[arm].path,
+                    request.checkpoint_receipt_path.parent / f"{arm}.pt",
+                    deadline=deadline,
+                    monotonic=monotonic,
+                    wall_deadline=wall_deadline,
+                    wall_monotonic=wall_monotonic,
+                )
+                for arm in _ARMS
+            )
+            if local_checkpoints_published:
+                receipt_value = {
+                    "schema_version": 3,
+                    "provider": request.provider,
+                    "release_sha256": request.release_sha256,
+                    "run_manifest_sha256": request.run_manifest_sha256,
+                    "dataset_sha256": request.corpus_receipt_sha256,
+                    "source_commit": request.code_commit,
+                    "cohort_assignment_sha256": (
+                        request.cohort_assignment_sha256
+                    ),
+                    "preregistration_sha256": request.preregistration_sha256,
+                    "hardware_amendment_sha256": (
+                        request.hardware_amendment_sha256
+                    ),
+                    "provider_selection_sha256": (
+                        request.provider_selection_sha256
+                    ),
+                    "profile_sha256": request.profile_sha256,
+                    "sealed_fixture_sha256": (
+                        request.sealed_fixture_sha256
+                    ),
+                    "checkpoints": [
+                        {
+                            "run_id": request.run_ids[arm],
+                            "arm": arm,
+                            "seed": request.seed,
+                            "path": f"{arm}.pt",
+                            "sha256": stable[arm].sha256,
+                            "config_sha256": request.config_sha256[arm],
+                            "dataset_sha256": request.corpus_receipt_sha256,
+                            "source_commit": request.code_commit,
+                            "step": bridge_metadata[arm]["step"],
+                            "world_size": 4,
+                        }
+                        for arm in _ARMS
+                    ],
+                }
+                receipt_written = _write_immutable_json(
+                    request.checkpoint_receipt_path,
+                    receipt_value,
+                    deadline=deadline,
+                    monotonic=monotonic,
+                    wall_deadline=wall_deadline,
+                    wall_monotonic=wall_monotonic,
+                )
+                if receipt_written is not None:
+                    receipt_bytes, checkpoint_receipt_digest = receipt_written
+                    checkpoint_receipt_uri = _checkpoint_receipt_uri(
+                        request,
+                        checkpoint_receipt_digest,
+                    )
+                    checkpoint_receipt_uploaded = object_store.put_verified(
+                        request.checkpoint_receipt_path,
+                        checkpoint_receipt_uri,
+                        expected_sha256=checkpoint_receipt_digest,
+                        deadline=deadline,
+                        monotonic=monotonic,
+                        wall_deadline=wall_deadline,
+                        wall_monotonic=wall_monotonic,
+                    )
+                    if (
+                        checkpoint_receipt_uploaded is None
+                        or checkpoint_receipt_uploaded.uri
+                        != checkpoint_receipt_uri
+                        or checkpoint_receipt_uploaded.sha256
+                        != checkpoint_receipt_digest
+                        or checkpoint_receipt_uploaded.bytes
+                        != len(receipt_bytes)
+                    ):
+                        all_verified = False
+                else:
+                    all_verified = False
+            else:
+                all_verified = False
+
         marker_path = staging / "commit.json"
         marker_uploaded = None
         marker_digest = None
@@ -1110,6 +1510,16 @@ def handle_interruption(
             and candidate_uploaded.uri == candidate_uri
             and candidate_uploaded.sha256 == candidate_digest
             and candidate_uploaded.bytes == len(_candidate_bytes)
+            and (
+                not bridge_enabled
+                or (
+                    checkpoint_receipt_uploaded is not None
+                    and checkpoint_receipt_uploaded.uri
+                    == checkpoint_receipt_uri
+                    and checkpoint_receipt_uploaded.sha256
+                    == checkpoint_receipt_digest
+                )
+            )
             and _remaining_seconds(
                 deadline=deadline,
                 monotonic=monotonic,
@@ -1131,11 +1541,20 @@ def handle_interruption(
                     "uri": candidate_uploaded.uri,
                 },
                 "commit_id": nonce,
-                "protocol": "aws-p5-resume-commit-v1",
-                "receipt_type": "aws-p5-paired-interruption",
-                "schema_version": 1,
+                "protocol": request.resume_commit_protocol,
+                "receipt_type": request.interruption_receipt_type,
+                "schema_version": 1 if legacy_p5 else 2,
                 "seed": request.seed,
             }
+            if not legacy_p5:
+                marker.update(
+                    {
+                        "gres": request.gres,
+                        "instance_type": request.instance_type,
+                        "profile_sha256": request.profile_sha256,
+                        "provider": request.provider,
+                    }
+                )
             marker_written = _write_immutable_json(
                 marker_path,
                 marker,
@@ -1165,6 +1584,10 @@ def handle_interruption(
             and marker_uploaded.bytes == len(marker_bytes)
             and marker_digest
             == hashlib.sha256(marker_bytes).hexdigest()
+            and (
+                not bridge_enabled
+                or checkpoint_receipt_uploaded is not None
+            )
             and _publish_local_handoff(
                 marker_path,
                 request.receipt_path,
@@ -1191,6 +1614,21 @@ def handle_interruption(
         ),
         receipt_path=request.receipt_path,
         receipt_upload_verified=resumable,
+        checkpoint_receipt_path=(
+            request.checkpoint_receipt_path
+            if resumable and bridge_enabled
+            else None
+        ),
+        checkpoint_receipt_sha256=(
+            checkpoint_receipt_digest
+            if resumable and bridge_enabled
+            else None
+        ),
+        checkpoint_receipt_uri=(
+            checkpoint_receipt_uri
+            if resumable and bridge_enabled
+            else None
+        ),
     )
 
 
@@ -1209,26 +1647,78 @@ def verify_resume_commit(
     candidate_bytes: bytes,
     marker_bytes: bytes,
     checkpoint_objects: Mapping[str, bytes],
+    expected_provider: str = PROVIDER,
+    expected_profile_sha256: str | None = None,
+    expected_instance_type: str | None = None,
+    expected_gres: str | None = None,
+    expected_candidate_receipt_type: str = _LEGACY_CANDIDATE_RECEIPT_TYPE,
+    expected_interruption_receipt_type: str = _LEGACY_INTERRUPTION_RECEIPT_TYPE,
+    expected_resume_commit_protocol: str = _LEGACY_RESUME_COMMIT_PROTOCOL,
 ) -> bool:
     """Derive resume eligibility from immutable fetched bytes only."""
 
+    contract = _PROFILE_CONTRACTS.get(expected_provider)
+    if contract is None:
+        raise ValueError("resume verifier provider is not a closed AWS GPU profile")
+    instance_type = expected_instance_type or str(contract["instance_type"])
+    gres = expected_gres or str(contract["gres"])
+    if (
+        instance_type != contract["instance_type"]
+        or gres != contract["gres"]
+        or expected_candidate_receipt_type
+        != contract["candidate_receipt_type"]
+        or expected_interruption_receipt_type
+        != contract["interruption_receipt_type"]
+        or expected_resume_commit_protocol
+        != contract["resume_commit_protocol"]
+        or (
+            expected_profile_sha256 is not None
+            and (
+                not isinstance(expected_profile_sha256, str)
+                or _SHA256_RE.fullmatch(expected_profile_sha256) is None
+            )
+        )
+        or (
+            expected_provider != PROVIDER
+            and expected_profile_sha256 is None
+        )
+    ):
+        raise ValueError("resume verifier profile binding is invalid")
+    legacy_p5 = expected_provider == PROVIDER
     candidate = _canonical_payload(candidate_bytes, label="resume candidate")
     marker = _canonical_payload(marker_bytes, label="resume commit marker")
-    if set(marker) != {
+    marker_fields = {
         "candidate",
         "commit_id",
         "protocol",
         "receipt_type",
         "schema_version",
         "seed",
-    }:
+    }
+    if not legacy_p5:
+        marker_fields |= {
+            "provider",
+            "profile_sha256",
+            "instance_type",
+            "gres",
+        }
+    if set(marker) != marker_fields:
         raise ValueError("resume commit marker fields do not match")
     if (
-        marker["protocol"] != "aws-p5-resume-commit-v1"
-        or marker["receipt_type"] != "aws-p5-paired-interruption"
-        or marker["schema_version"] != 1
+        marker["protocol"] != expected_resume_commit_protocol
+        or marker["receipt_type"] != expected_interruption_receipt_type
+        or marker["schema_version"] != (1 if legacy_p5 else 2)
         or not isinstance(marker["commit_id"], str)
         or re.fullmatch(r"[0-9a-f]{32}", marker["commit_id"]) is None
+        or (
+            not legacy_p5
+            and (
+                marker["provider"] != expected_provider
+                or marker["profile_sha256"] != expected_profile_sha256
+                or marker["instance_type"] != instance_type
+                or marker["gres"] != gres
+            )
+        )
     ):
         raise ValueError("resume commit marker identity does not match")
     candidate_ref = marker["candidate"]
@@ -1240,11 +1730,12 @@ def verify_resume_commit(
         or candidate_ref["sha256"] != candidate_digest
         or not isinstance(candidate_ref["uri"], str)
         or not candidate_ref["uri"].endswith(
-            f"/evidence/sha256/{candidate_digest}.json"
+            f"/evidence/seed-{candidate.get('seed')}/sha256/"
+            f"{candidate_digest}.json"
         )
     ):
         raise ValueError("resume candidate hash binding does not match")
-    if set(candidate) != {
+    candidate_fields = {
         "checkpoints",
         "code_commit",
         "corpus_receipt_sha256",
@@ -1257,21 +1748,32 @@ def verify_resume_commit(
         "schema_version",
         "seed",
         "signal_errors",
-    }:
+    }
+    if not legacy_p5:
+        candidate_fields |= {"profile_sha256", "instance_type", "gres"}
+    if set(candidate) != candidate_fields:
         raise ValueError("resume candidate fields do not match")
     if (
-        candidate["receipt_type"] != "aws-p5-interruption-candidate"
-        or candidate["provider"] != PROVIDER
-        or candidate["schema_version"] != 3
+        candidate["receipt_type"] != expected_candidate_receipt_type
+        or candidate["provider"] != expected_provider
+        or candidate["schema_version"] != (3 if legacy_p5 else 4)
         or candidate["paired"] is not True
         or candidate["deadline_exhausted"] is not False
         or candidate["signal_errors"] != {}
         or marker["seed"] != candidate["seed"]
+        or (
+            not legacy_p5
+            and (
+                candidate["profile_sha256"] != expected_profile_sha256
+                or candidate["instance_type"] != instance_type
+                or candidate["gres"] != gres
+            )
+        )
     ):
         raise ValueError("resume candidate is not eligible")
     if (
         type(candidate["seed"]) is not int
-        or candidate["seed"] not in {1, 2, 3, 4}
+        or candidate["seed"] not in contract["assigned_seeds"]
         or not isinstance(candidate["notice"], str)
         or not candidate["notice"]
         or not isinstance(candidate["code_commit"], str)
@@ -1414,6 +1916,23 @@ class ImdsV2Client:
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
+    parser.add_argument("--provider", default=PROVIDER)
+    parser.add_argument("--profile-sha256")
+    parser.add_argument("--instance-type", default=INSTANCE_TYPE)
+    parser.add_argument("--gres", default=GRES)
+    parser.add_argument("--assigned-seed", type=int, action="append")
+    parser.add_argument(
+        "--candidate-receipt-type",
+        default=_LEGACY_CANDIDATE_RECEIPT_TYPE,
+    )
+    parser.add_argument(
+        "--interruption-receipt-type",
+        default=_LEGACY_INTERRUPTION_RECEIPT_TYPE,
+    )
+    parser.add_argument(
+        "--resume-commit-protocol",
+        default=_LEGACY_RESUME_COMMIT_PROTOCOL,
+    )
     parser.add_argument("--seed", type=int, required=True)
     parser.add_argument("--dense-pid", type=int, required=True)
     parser.add_argument("--split90-pid", type=int, required=True)
@@ -1444,6 +1963,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         region = os.environ.get("AWS_REGION", "")
         store = S3ObjectStore(
             region=region,
+            kms_key_id=os.environ.get("MS_S3_KMS_KEY_ID") or None,
             environment={
                 name: os.environ[name]
                 for name in ("AWS_REGION", "HOME", "LANG", "LC_ALL", "PATH")
@@ -1472,6 +1992,21 @@ def main(argv: Sequence[str] | None = None) -> int:
             },
             timeout_seconds=arguments.timeout_seconds,
             upload_reserve_seconds=arguments.upload_reserve_seconds,
+            provider=arguments.provider,
+            profile_sha256=arguments.profile_sha256,
+            instance_type=arguments.instance_type,
+            gres=arguments.gres,
+            assigned_seeds=tuple(
+                arguments.assigned_seed
+                if arguments.assigned_seed is not None
+                else _PROFILE_CONTRACTS.get(arguments.provider, {}).get(
+                    "assigned_seeds",
+                    (),
+                )
+            ),
+            candidate_receipt_type=arguments.candidate_receipt_type,
+            interruption_receipt_type=arguments.interruption_receipt_type,
+            resume_commit_protocol=arguments.resume_commit_protocol,
         )
         result = handle_interruption(request, object_store=store)
         report = {

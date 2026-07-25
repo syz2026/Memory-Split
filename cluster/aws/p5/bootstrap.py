@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Verify and stage one immutable AWS P5 execution environment."""
+"""Verify and stage one immutable profile-selected AWS GPU environment."""
 
 from __future__ import annotations
 
 import argparse
+import base64
 import hashlib
 import json
 import os
@@ -28,8 +29,11 @@ from cluster.aws.p5.interruption_checkpoint import (
     S3ObjectStore,
 )
 from cluster.aws.p5.profile import (
-    AwsP5Profile,
-    AwsP5Runtime,
+    AWS_P5_V3_PROFILE_ID,
+    AWS_P6_B300_V3_PROFILE_ID,
+    LEGACY_AWS_P5_PROFILE_ID,
+    AwsGpuProfile,
+    AwsGpuRuntime,
     load_aws_p5_profile,
     validate_runtime_environment,
 )
@@ -37,10 +41,32 @@ from cluster.aws.p5.profile import (
 
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
-_H100_RE = re.compile(r"^NVIDIA H100 80GB(?: HBM3)?$")
 _CONTAINER_IMAGE_RE = re.compile(
     r"^[A-Za-z0-9][A-Za-z0-9./:_-]*@sha256:[0-9a-f]{64}$"
 )
+_V3_PROFILE_IDS = frozenset(
+    {AWS_P5_V3_PROFILE_ID, AWS_P6_B300_V3_PROFILE_ID}
+)
+_V3_RELEASE_METADATA_FIELDS = {
+    "schema_version",
+    "package_format_version",
+    "provider",
+    "selected_profile_id",
+    "source",
+    "seed_assignment",
+    "cohort_assignment",
+    "preregistration",
+    "hardware_amendment",
+    "profile",
+    "environment",
+    "dataset_pointer",
+    "container_base_lock",
+    "config_sha256",
+    "contract_locks",
+    "members",
+}
+_V2_COHORT_ID = "memorysplit-confirmatory-v2-360m-n5"
+_V3_COHORT_ID = "memorysplit-confirmatory-v3-360m-n10-aws"
 
 
 class BootstrapError(ValueError):
@@ -54,12 +80,15 @@ class BootstrapEvidence:
     ami_id: str
     boot_id: str
     account_id: str
+    identity_document: Mapping[str, object]
+    identity_pkcs7: str
     role_name: str
     role_arn: str
     gpu_names: tuple[str, ...]
     fabric_manager_active: bool
     instance_store_devices: tuple[str, ...]
     container_image: str
+    storage_prepared: bool = False
 
 
 @dataclass(frozen=True)
@@ -72,6 +101,8 @@ class BootstrapArtifacts:
     corpus_build_id: str
     cohort_assignment_sha256: str
     code_commit: str
+    provider: str = LEGACY_AWS_P5_PROFILE_ID
+    assigned_seeds: tuple[int, ...] = (1, 2, 3, 4)
 
 
 @dataclass(frozen=True)
@@ -156,9 +187,104 @@ def _default_boot_id() -> str:
         raise BootstrapError("kernel boot ID is unavailable") from error
 
 
+def _inspect_existing_storage(
+    profile: AwsGpuProfile,
+    *,
+    owner_uid: int,
+    owner_gid: int,
+    runner: Callable[
+        [Sequence[str], Mapping[str, str], float], CommandResult
+    ],
+    command_environment: Mapping[str, str],
+) -> tuple[str, ...] | None:
+    """Return exact RAID members, or null when no environment exists."""
+
+    raid_device = "/dev/md/memorysplit"
+    mount = _bounded_result(
+        runner,
+        [
+            "findmnt",
+            "--json",
+            "--target",
+            profile.scratch_root,
+            "--output",
+            "TARGET,SOURCE,FSTYPE,OPTIONS",
+        ],
+        command_environment,
+        operation="existing scratch mount probe",
+        timeout_seconds=30.0,
+    )
+    detail = _bounded_result(
+        runner,
+        ["mdadm", "--detail", "--export", raid_device],
+        command_environment,
+        operation="existing RAID probe",
+        timeout_seconds=30.0,
+    )
+    if mount.returncode != 0 or detail.returncode != 0:
+        if mount.returncode in {1, 32} and detail.returncode in {1, 2}:
+            return None
+        raise BootstrapError(
+            "scratch mount and RAID must either both be absent or exactly reusable"
+        )
+    try:
+        mount_value = json.loads(mount.stdout)
+    except json.JSONDecodeError as error:
+        raise BootstrapError("findmnt returned invalid JSON") from error
+    rows = (
+        mount_value.get("filesystems")
+        if isinstance(mount_value, dict)
+        else None
+    )
+    if not isinstance(rows, list) or len(rows) != 1 or not isinstance(rows[0], dict):
+        raise BootstrapError("existing scratch mount identity is ambiguous")
+    row = rows[0]
+    options = row.get("options")
+    if (
+        row.get("target") != profile.scratch_root
+        or row.get("source") != raid_device
+        or row.get("fstype") != "xfs"
+        or not isinstance(options, str)
+        or "noatime" not in options.split(",")
+        or "nodiratime" not in options.split(",")
+    ):
+        raise BootstrapError("existing scratch mount does not match the profile")
+    try:
+        scratch_status = os.stat(profile.scratch_root, follow_symlinks=False)
+    except OSError as error:
+        raise BootstrapError(
+            "existing scratch root cannot be inspected"
+        ) from error
+    if (
+        not stat.S_ISDIR(scratch_status.st_mode)
+        or stat.S_IMODE(scratch_status.st_mode) != 0o700
+        or scratch_status.st_uid != owner_uid
+        or scratch_status.st_gid != owner_gid
+    ):
+        raise BootstrapError("existing scratch root identity has drifted")
+    exported: dict[str, str] = {}
+    for line in detail.stdout.splitlines():
+        key, separator, value = line.partition("=")
+        if separator != "=" or not key or key in exported:
+            raise BootstrapError("mdadm detail output is malformed")
+        exported[key] = value
+    devices = sorted(
+        value for key, value in exported.items() if key.endswith("_DEV")
+    )
+    if (
+        exported.get("MD_LEVEL") != "raid0"
+        or exported.get("MD_DEVICES") != str(profile.instance_store_devices)
+        or len(devices) != profile.instance_store_devices
+        or len(set(devices)) != len(devices)
+        or any(not device.startswith("/dev/") for device in devices)
+    ):
+        raise BootstrapError("existing RAID identity does not match the profile")
+    return tuple(devices)
+
+
 def inspect_hardware(
-    profile: AwsP5Profile,
-    runtime: AwsP5Runtime,
+    profile: AwsGpuProfile,
+    runtime: AwsGpuRuntime,
     *,
     metadata_get: Callable[[str], str | None],
     runner: Callable[
@@ -167,15 +293,18 @@ def inspect_hardware(
     command_environment: Mapping[str, str],
     container_image: str,
     boot_id_get: Callable[[], str] = _default_boot_id,
+    allow_existing_storage: bool = False,
 ) -> BootstrapEvidence:
-    """Verify actual P5 identity, accelerators, Fabric Manager, NVMe, and image."""
+    """Verify actual AWS GPU identity, accelerators, NVMe, and image."""
 
     instance_id = _metadata_value(metadata_get, "meta-data/instance-id")
     if re.fullmatch(r"i-[0-9a-f]{8,17}", instance_id) is None:
         raise BootstrapError("IMDSv2 instance ID is invalid")
     instance_type = _metadata_value(metadata_get, "meta-data/instance-type")
     if instance_type != profile.instance_type:
-        raise BootstrapError("instance must be exactly p5.48xlarge")
+        raise BootstrapError(
+            f"instance must be exactly {profile.instance_type}"
+        )
     ami_id = _metadata_value(metadata_get, "meta-data/ami-id")
     if ami_id != runtime.ami_id:
         raise BootstrapError("running AMI does not match MS_AWS_AMI_ID")
@@ -209,6 +338,19 @@ def inspect_hardware(
         raise BootstrapError("IMDSv2 identity document is invalid JSON") from error
     if not isinstance(identity, dict):
         raise BootstrapError("IMDSv2 identity document must be an object")
+    identity_pkcs7 = _metadata_value(
+        metadata_get,
+        "dynamic/instance-identity/pkcs7",
+    )
+    compact_pkcs7 = "".join(identity_pkcs7.split())
+    try:
+        decoded_pkcs7 = base64.b64decode(compact_pkcs7, validate=True)
+    except (ValueError, TypeError) as error:
+        raise BootstrapError(
+            "IMDSv2 identity PKCS7 is not valid base64"
+        ) from error
+    if not decoded_pkcs7:
+        raise BootstrapError("IMDSv2 identity PKCS7 is empty")
     account_id = identity.get("accountId")
     if (
         not isinstance(account_id, str)
@@ -269,9 +411,13 @@ def inspect_hardware(
         line.strip() for line in gpu_result.stdout.splitlines() if line.strip()
     )
     if len(gpu_names) != profile.allocated_gpus:
-        raise BootstrapError("exactly eight H100 devices are required")
-    if any(_H100_RE.fullmatch(name) is None for name in gpu_names):
-        raise BootstrapError("every accelerator must be an NVIDIA H100 80GB")
+        raise BootstrapError(
+            "exactly eight profile accelerator devices are required"
+        )
+    if any(not profile.matches_gpu_name(name) for name in gpu_names):
+        raise BootstrapError(
+            f"every accelerator must match {profile.gpu_model}"
+        )
 
     fabric = _bounded_result(
         runner,
@@ -282,6 +428,19 @@ def inspect_hardware(
     )
     if fabric.returncode != 0 or fabric.stdout.strip() != "active":
         raise BootstrapError("NVIDIA Fabric Manager must be active")
+
+    existing_storage_devices = (
+        _inspect_existing_storage(
+            profile,
+            owner_uid=runtime.uid,
+            owner_gid=runtime.gid,
+            runner=runner,
+            command_environment=command_environment,
+        )
+        if allow_existing_storage
+        else None
+    )
+    storage_prepared = existing_storage_devices is not None
 
     block_result = _checked(
         runner,
@@ -325,23 +484,28 @@ def inspect_hardware(
             or any(character in path for character in "\x00\n\r\t ")
             or type(size) is not int
             or size != profile.instance_store_device_bytes
-            or not isinstance(mountpoints, list)
-            or any(point not in {None, ""} for point in mountpoints)
-            or any(
-                row.get(field) not in {None, ""}
-                for field in (
-                    "fstype",
-                    "fsver",
-                    "label",
-                    "uuid",
-                    "pttype",
-                    "parttype",
-                )
-            )
             or (
-                children is not None
-                and children != []
-                and children != ()
+                not storage_prepared
+                and (
+                    not isinstance(mountpoints, list)
+                    or any(point not in {None, ""} for point in mountpoints)
+                    or any(
+                        row.get(field) not in {None, ""}
+                        for field in (
+                            "fstype",
+                            "fsver",
+                            "label",
+                            "uuid",
+                            "pttype",
+                            "parttype",
+                        )
+                    )
+                    or (
+                        children is not None
+                        and children != []
+                        and children != ()
+                    )
+                )
             )
         ):
             if isinstance(children, list) and children:
@@ -365,73 +529,81 @@ def inspect_hardware(
         devices.append(path)
     if len(devices) != profile.instance_store_devices:
         raise BootstrapError(
-            "exactly eight unmounted instance-store devices are required"
+            "exactly eight profile instance-store devices are required"
         )
     if len(set(devices)) != len(devices):
         raise BootstrapError("instance-store device paths must be unique")
     devices.sort()
-    swap_result = _checked(
-        runner,
-        [
-            "swapon",
-            "--show",
-            "--noheadings",
-            "--raw",
-            "--output",
-            "NAME",
-        ],
-        command_environment,
-        operation="swap discovery",
-    )
-    swap_devices = {
-        line.strip()
-        for line in swap_result.stdout.splitlines()
-        if line.strip()
-    }
-    if swap_devices & set(devices):
-        raise BootstrapError("instance-store device is active swap")
-    for device in devices:
-        block_name = Path(device).name
-        holders = _checked(
-            runner,
-            ["ls", "-A", f"/sys/class/block/{block_name}/holders"],
-            command_environment,
-            operation="instance-store holder discovery",
+    if (
+        existing_storage_devices is not None
+        and tuple(devices) != existing_storage_devices
+    ):
+        raise BootstrapError(
+            "existing RAID members differ from profile instance-store devices"
         )
-        if holders.stdout.strip():
-            raise BootstrapError("instance-store device has active holders")
-        md_result = _bounded_result(
+    if not storage_prepared:
+        swap_result = _checked(
             runner,
-            ["mdadm", "--examine", "--brief", device],
+            [
+                "swapon",
+                "--show",
+                "--noheadings",
+                "--raw",
+                "--output",
+                "NAME",
+            ],
             command_environment,
-            operation="mdadm admission probe",
-            timeout_seconds=30.0,
+            operation="swap discovery",
         )
-        if md_result.returncode == 0:
-            raise BootstrapError(
-                "instance-store device already has md/RAID membership"
+        swap_devices = {
+            line.strip()
+            for line in swap_result.stdout.splitlines()
+            if line.strip()
+        }
+        if swap_devices & set(devices):
+            raise BootstrapError("instance-store device is active swap")
+        for device in devices:
+            block_name = Path(device).name
+            holders = _checked(
+                runner,
+                ["ls", "-A", f"/sys/class/block/{block_name}/holders"],
+                command_environment,
+                operation="instance-store holder discovery",
             )
-        if md_result.returncode != 1:
-            raise BootstrapError("mdadm admission probe failed")
-        wipe_result = _checked(
-            runner,
-            ["wipefs", "--json", device],
-            command_environment,
-            operation="instance-store signature discovery",
-        )
-        try:
-            wipe_value = json.loads(wipe_result.stdout)
-        except json.JSONDecodeError as error:
-            raise BootstrapError("wipefs returned invalid JSON") from error
-        if (
-            not isinstance(wipe_value, dict)
-            or not isinstance(wipe_value.get("signatures"), list)
-        ):
-            raise BootstrapError("wipefs JSON is missing signatures")
-        if wipe_value["signatures"]:
-            raise BootstrapError(
-                "instance-store device has a filesystem signature"
+            if holders.stdout.strip():
+                raise BootstrapError("instance-store device has active holders")
+            md_result = _bounded_result(
+                runner,
+                ["mdadm", "--examine", "--brief", device],
+                command_environment,
+                operation="mdadm admission probe",
+                timeout_seconds=30.0,
             )
+            if md_result.returncode == 0:
+                raise BootstrapError(
+                    "instance-store device already has md/RAID membership"
+                )
+            if md_result.returncode != 1:
+                raise BootstrapError("mdadm admission probe failed")
+            wipe_result = _checked(
+                runner,
+                ["wipefs", "--json", device],
+                command_environment,
+                operation="instance-store signature discovery",
+            )
+            try:
+                wipe_value = json.loads(wipe_result.stdout)
+            except json.JSONDecodeError as error:
+                raise BootstrapError("wipefs returned invalid JSON") from error
+            if (
+                not isinstance(wipe_value, dict)
+                or not isinstance(wipe_value.get("signatures"), list)
+            ):
+                raise BootstrapError("wipefs JSON is missing signatures")
+            if wipe_value["signatures"]:
+                raise BootstrapError(
+                    "instance-store device has a filesystem signature"
+                )
 
     if (
         not isinstance(container_image, str)
@@ -464,18 +636,21 @@ def inspect_hardware(
         ami_id=ami_id,
         boot_id=boot_id,
         account_id=account_id,
+        identity_document=dict(identity),
+        identity_pkcs7=compact_pkcs7,
         role_name=role_name,
         role_arn=role_arn,
         gpu_names=gpu_names,
         fabric_manager_active=True,
         instance_store_devices=tuple(devices),
         container_image=container_image,
+        storage_prepared=storage_prepared,
     )
 
 
 def build_aws_command_environment(
-    profile: AwsP5Profile,
-    runtime: AwsP5Runtime,
+    profile: AwsGpuProfile,
+    runtime: AwsGpuRuntime,
     *,
     private_home: Path,
 ) -> dict[str, str]:
@@ -504,8 +679,8 @@ def build_aws_command_environment(
 
 
 def render_bootstrap_commands(
-    profile: AwsP5Profile,
-    runtime: AwsP5Runtime,
+    profile: AwsGpuProfile,
+    runtime: AwsGpuRuntime,
     evidence: BootstrapEvidence,
     *,
     owner_uid: int,
@@ -523,7 +698,7 @@ def render_bootstrap_commands(
         destructive_authorized, bool
     ):
         raise BootstrapError("bootstrap authorization flags must be booleans")
-    if apply and not destructive_authorized:
+    if apply and not destructive_authorized and not evidence.storage_prepared:
         raise BootstrapError(
             "destructive instance-store authorization is required for apply"
         )
@@ -531,7 +706,7 @@ def render_bootstrap_commands(
         raise BootstrapError("bootstrap evidence has an incomplete NVMe set")
     scratch = profile.scratch_root
     raid_device = "/dev/md/memorysplit"
-    return [
+    commands = [
         [
             "mdadm",
             "--create",
@@ -594,6 +769,12 @@ def render_bootstrap_commands(
             runtime.region,
         ],
     ]
+    if evidence.storage_prepared:
+        # Reuse only the RAID identity verified by _inspect_existing_storage.
+        # Directory ownership and immutable inputs are still re-applied and
+        # reverified, but no block-device operation is repeated.
+        return [commands[2], *commands[4:]]
+    return commands
 
 
 def _required_sha256(value: str, *, label: str) -> str:
@@ -656,6 +837,8 @@ def _verify_release_archive(
     *,
     expected_members_sha256: str,
     code_commit: str,
+    provider: str = LEGACY_AWS_P5_PROFILE_ID,
+    assigned_seeds: Sequence[int] = (1, 2, 3, 4),
 ) -> tuple[ReleaseMember, ...]:
     _required_sha256(
         expected_members_sha256,
@@ -757,21 +940,59 @@ def _verify_release_archive(
             raise BootstrapError(
                 "release metadata must contain valid UTF-8 JSON"
             ) from error
+        assignment = (
+            metadata.get("seed_assignment")
+            if isinstance(metadata, dict)
+            else None
+        )
+        v3_provider = provider in _V3_PROFILE_IDS
+        assignment_providers = {provider}
+        if v3_provider:
+            assignment_providers.add(AWS_P5_V3_PROFILE_ID)
+        source = metadata.get("source") if isinstance(metadata, dict) else None
+        valid_source = (
+            isinstance(source, dict)
+            and source.get("commit") == code_commit
+            and source.get("dirty") is False
+            and (
+                (
+                    set(source) == {"commit", "dirty", "tree"}
+                    and isinstance(source.get("tree"), str)
+                    and re.fullmatch(
+                        r"(?:[0-9a-f]{40}|[0-9a-f]{64})",
+                        source["tree"],
+                    )
+                    is not None
+                )
+                if v3_provider
+                else set(source) == {"commit", "dirty"}
+            )
+        )
+        valid_assignment = (
+            isinstance(assignment, dict)
+            and set(assignment) == {"arms", "cohort_id", "provider", "seeds"}
+            and assignment.get("arms") == ["dense", "split90"]
+            and assignment.get("cohort_id")
+            == (_V3_COHORT_ID if v3_provider else _V2_COHORT_ID)
+            and assignment.get("provider") in assignment_providers
+            and assignment.get("seeds") == list(assigned_seeds)
+        )
         if (
             not isinstance(metadata, dict)
             or _canonical_pretty(metadata) != metadata_bytes
             or metadata.get("schema_version") != 1
-            or metadata.get("package_format_version") != 1
-            or metadata.get("provider") != "aws-p5.48xlarge"
-            or metadata.get("source")
-            != {"commit": code_commit, "dirty": False}
-            or metadata.get("seed_assignment")
-            != {
-                "arms": ["dense", "split90"],
-                "cohort_id": "memorysplit-confirmatory-v2-360m-n5",
-                "provider": "aws-p5.48xlarge",
-                "seeds": [1, 2, 3, 4],
-            }
+            or metadata.get("package_format_version")
+            != ("aws-gpu-v3" if v3_provider else 1)
+            or metadata.get("provider") != provider
+            or (
+                v3_provider
+                and (
+                    set(metadata) != _V3_RELEASE_METADATA_FIELDS
+                    or metadata.get("selected_profile_id") != provider
+                )
+            )
+            or not valid_source
+            or not valid_assignment
         ):
             raise BootstrapError("release metadata identity does not match")
         rows = metadata.get("members")
@@ -843,6 +1064,7 @@ def verify_bootstrap_artifacts(
     cohort_assignment: Path,
     cohort_assignment_sha256: str,
     code_commit: str,
+    profile: AwsGpuProfile | None = None,
 ) -> BootstrapArtifacts:
     """Hash ZIP, release, dataset, and cohort bytes and cross-check bindings."""
 
@@ -892,15 +1114,30 @@ def verify_bootstrap_artifacts(
         bound_archive = release_value["archive"]["sha256"]
         bound_commit = release_value["source"]["commit"]
         bound_cohort = release_value["cohort_assignment_sha256"]
-        bound_dataset = release_value["dataset_receipt_sha256"]
         bound_members = release_value["members_sha256"]
+    except (KeyError, TypeError) as error:
+        raise BootstrapError("release receipt is missing artifact bindings") from error
+    v3_package = release_value.get("package_format_version") == "aws-gpu-v3"
+    try:
+        if v3_package:
+            bound_dataset_pointer = _required_sha256(
+                release_value["dataset_pointer_sha256"],
+                label="release receipt dataset pointer",
+            )
+            bound_dataset = None
+        else:
+            bound_dataset = _required_sha256(
+                release_value["dataset_receipt_sha256"],
+                label="release receipt dataset",
+            )
+            bound_dataset_pointer = None
     except (KeyError, TypeError) as error:
         raise BootstrapError("release receipt is missing artifact bindings") from error
     if (
         bound_archive != release_digest
         or bound_commit != code_commit
         or bound_cohort != cohort_digest
-        or bound_dataset != corpus_digest
+        or (bound_dataset is not None and bound_dataset != corpus_digest)
     ):
         raise BootstrapError("release receipt artifact bindings do not match")
     release_members = _verify_release_archive(
@@ -910,7 +1147,25 @@ def verify_bootstrap_artifacts(
             label="release receipt members",
         ),
         code_commit=code_commit,
+        provider=(
+            profile.provider
+            if profile is not None
+            else LEGACY_AWS_P5_PROFILE_ID
+        ),
+        assigned_seeds=(
+            profile.assigned_seeds
+            if profile is not None
+            else (1, 2, 3, 4)
+        ),
     )
+    if bound_dataset_pointer is not None and not any(
+        member.path == "DATASET-POINTER-AWS.json"
+        and member.sha256 == bound_dataset_pointer
+        for member in release_members
+    ):
+        raise BootstrapError(
+            "release receipt dataset pointer binding does not match"
+        )
     return BootstrapArtifacts(
         release_sha256=release_digest,
         release_receipt_sha256=release_receipt_digest,
@@ -920,7 +1175,73 @@ def verify_bootstrap_artifacts(
         corpus_build_id=corpus_build_id,
         cohort_assignment_sha256=cohort_digest,
         code_commit=code_commit,
+        provider=(
+            profile.provider
+            if profile is not None
+            else LEGACY_AWS_P5_PROFILE_ID
+        ),
+        assigned_seeds=(
+            profile.assigned_seeds
+            if profile is not None
+            else (1, 2, 3, 4)
+        ),
     )
+
+
+def _verify_existing_release_root(
+    target: Path,
+    *,
+    members: Sequence[ReleaseMember],
+    owner_uid: int,
+    owner_gid: int,
+) -> None:
+    """Reverify an existing digest root byte-for-byte without mutating it."""
+
+    try:
+        target_status = target.stat(follow_symlinks=False)
+    except OSError as error:
+        raise BootstrapError("existing release root cannot be inspected") from error
+    if (
+        target.is_symlink()
+        or not stat.S_ISDIR(target_status.st_mode)
+        or stat.S_IMODE(target_status.st_mode) != 0o555
+        or target_status.st_uid != owner_uid
+        or target_status.st_gid != owner_gid
+    ):
+        raise BootstrapError("existing release root identity has drifted")
+    expected = {member.path: member for member in members}
+    actual_files: set[str] = set()
+    for path in target.rglob("*"):
+        relative = path.relative_to(target).as_posix()
+        status = path.stat(follow_symlinks=False)
+        if path.is_symlink():
+            raise BootstrapError("existing release root contains a symlink")
+        if stat.S_ISDIR(status.st_mode):
+            if (
+                stat.S_IMODE(status.st_mode) != 0o555
+                or status.st_uid != owner_uid
+                or status.st_gid != owner_gid
+            ):
+                raise BootstrapError("existing release directory identity drifted")
+            continue
+        member = expected.get(relative)
+        if (
+            member is None
+            or not stat.S_ISREG(status.st_mode)
+            or status.st_nlink != 1
+            or status.st_uid != owner_uid
+            or status.st_gid != owner_gid
+            or stat.S_IMODE(status.st_mode)
+            != (0o555 if member.executable else 0o444)
+            or status.st_size != member.bytes
+            or hashlib.sha256(path.read_bytes()).hexdigest() != member.sha256
+        ):
+            raise BootstrapError(
+                f"existing release member identity drifted: {relative}"
+            )
+        actual_files.add(relative)
+    if actual_files != set(expected):
+        raise BootstrapError("existing release member inventory has drifted")
 
 
 def extract_verified_release(
@@ -946,6 +1267,8 @@ def extract_verified_release(
         release_archive,
         expected_members_sha256=artifacts.release_members_sha256,
         code_commit=artifacts.code_commit,
+        provider=artifacts.provider,
+        assigned_seeds=artifacts.assigned_seeds,
     )
     if members != artifacts.release_members:
         raise BootstrapError("release member evidence changed before extraction")
@@ -957,7 +1280,16 @@ def extract_verified_release(
         raise BootstrapError("release parent must be a real directory")
     target = releases / artifacts.release_sha256
     if target.exists() or target.is_symlink():
-        raise BootstrapError("digest-named release root already exists")
+        _verify_existing_release_root(
+            target,
+            members=members,
+            owner_uid=owner_uid,
+            owner_gid=owner_gid,
+        )
+        return PreparedRelease(
+            root=target,
+            members_sha256=artifacts.release_members_sha256,
+        )
     staging = releases / (
         f".{artifacts.release_sha256}.{os.getpid()}.extracting"
     )
@@ -1026,8 +1358,8 @@ def extract_verified_release(
 
 def build_bootstrap_receipt(
     *,
-    profile: AwsP5Profile,
-    runtime: AwsP5Runtime,
+    profile: AwsGpuProfile,
+    runtime: AwsGpuRuntime,
     evidence: BootstrapEvidence,
     artifacts: BootstrapArtifacts,
     prepared_release: PreparedRelease,
@@ -1042,6 +1374,8 @@ def build_bootstrap_receipt(
         != Path(profile.scratch_root)
         / "releases"
         / artifacts.release_sha256
+        or artifacts.provider != profile.provider
+        or artifacts.assigned_seeds != profile.assigned_seeds
     ):
         raise BootstrapError("prepared release evidence does not match bootstrap")
     return {
@@ -1065,7 +1399,7 @@ def build_bootstrap_receipt(
         "instance_type": evidence.instance_type,
         "profile_sha256": profile.sha256,
         "provider": profile.provider,
-        "receipt_type": "aws-p5-bootstrap",
+        "receipt_type": profile.bootstrap_receipt_type,
         "region": runtime.region,
         "release_members_sha256": prepared_release.members_sha256,
         "release_root": (
@@ -1079,6 +1413,40 @@ def build_bootstrap_receipt(
         "schema_version": 2,
         "scratch_root": profile.scratch_root,
     }
+
+
+def build_runtime_environment_receipt(
+    *,
+    profile: AwsGpuProfile,
+    runtime: AwsGpuRuntime,
+    evidence: BootstrapEvidence,
+) -> dict[str, object]:
+    """Build the authenticated runtime receipt consumed by lifecycle gates."""
+
+    identity = dict(evidence.identity_document)
+    if (
+        identity.get("accountId") != evidence.account_id
+        or identity.get("instanceId") != evidence.instance_id
+        or identity.get("instanceType") != evidence.instance_type
+        or identity.get("imageId") != evidence.ami_id
+        or identity.get("region") != runtime.region
+        or not evidence.identity_pkcs7
+    ):
+        raise BootstrapError(
+            "runtime environment identity differs from bootstrap evidence"
+        )
+    receipt: dict[str, object] = {
+        "schema_version": (
+            3 if profile.profile_id in _V3_PROFILE_IDS else 1
+        ),
+        "profile_sha256": profile.sha256,
+        "container_image_digest": runtime.container_digest,
+        "aws_instance_identity_document": identity,
+        "aws_instance_identity_pkcs7": evidence.identity_pkcs7,
+    }
+    if profile.profile_id in _V3_PROFILE_IDS:
+        receipt["boot_id"] = evidence.boot_id
+    return receipt
 
 
 def _canonical_json(value: object) -> bytes:
@@ -1106,22 +1474,46 @@ def publish_bootstrap_receipt(
     """Write and independently verify one canonical S3 bootstrap receipt."""
 
     receipt_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    if receipt_path.is_symlink():
-        raise BootstrapError("bootstrap receipt path must not be a symlink")
+    payload = _canonical_json(dict(receipt))
+    if receipt_path.exists() or receipt_path.is_symlink():
+        if (
+            receipt_path.is_symlink()
+            or not receipt_path.is_file()
+            or receipt_path.stat(follow_symlinks=False).st_nlink != 1
+            or receipt_path.read_bytes() != payload
+        ):
+            raise BootstrapError(
+                "existing bootstrap receipt identity has drifted"
+            )
+        receipt_digest = hashlib.sha256(payload).hexdigest()
+        return bool(
+            object_store.put_verified(
+                receipt_path,
+                receipt_uri,
+                expected_sha256=receipt_digest,
+                deadline=monotonic() + timeout_seconds,
+                monotonic=monotonic,
+            )
+        )
     temporary = receipt_path.with_name(
         f".{receipt_path.name}.{os.getpid()}.tmp"
     )
     try:
         with temporary.open("xb") as handle:
-            handle.write(_canonical_json(dict(receipt)))
+            handle.write(payload)
             handle.flush()
             os.fsync(handle.fileno())
         os.chmod(temporary, 0o600)
-        os.replace(temporary, receipt_path)
+        try:
+            os.link(temporary, receipt_path, follow_symlinks=False)
+        except FileExistsError as error:
+            raise BootstrapError(
+                "bootstrap receipt appeared during publication"
+            ) from error
     finally:
         if temporary.exists():
             temporary.unlink()
-    receipt_digest = hashlib.sha256(receipt_path.read_bytes()).hexdigest()
+    receipt_digest = hashlib.sha256(payload).hexdigest()
     return bool(
         object_store.put_verified(
             receipt_path,
@@ -1166,6 +1558,8 @@ def _parser() -> argparse.ArgumentParser:
 def main(argv: Sequence[str] | None = None) -> int:
     try:
         arguments = _parser().parse_args(argv)
+        # Keep the historical patch point while the alias loads every closed
+        # AWS GPU profile through the neutral implementation.
         profile = load_aws_p5_profile(arguments.profile)
         runtime = validate_runtime_environment(profile, os.environ)
         if (
@@ -1189,6 +1583,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             command_environment=command_environment,
             container_image=arguments.container_image,
             boot_id_get=_default_boot_id,
+            allow_existing_storage=True,
         )
         commands = render_bootstrap_commands(
             profile,
@@ -1235,6 +1630,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             cohort_assignment=arguments.cohort_assignment,
             cohort_assignment_sha256=arguments.cohort_assignment_sha256,
             code_commit=arguments.code_commit,
+            profile=profile,
         )
         prepared_release = extract_verified_release(
             release_archive=arguments.release_archive,
@@ -1245,6 +1641,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         store = S3ObjectStore(
             region=runtime.region,
+            kms_key_id=runtime.kms_key_id,
             environment=command_environment,
         )
         receipt_path = arguments.receipt or (
@@ -1253,21 +1650,6 @@ def main(argv: Sequence[str] | None = None) -> int:
         receipt_uri = (
             f"{runtime.s3_root}/receipts/bootstrap/{evidence.instance_id}.json"
         )
-        pending = build_bootstrap_receipt(
-            profile=profile,
-            runtime=runtime,
-            evidence=evidence,
-            artifacts=artifacts,
-            prepared_release=prepared_release,
-            durable_upload_verified=False,
-        )
-        if not publish_bootstrap_receipt(
-            pending,
-            receipt_path=receipt_path,
-            receipt_uri=receipt_uri,
-            object_store=store,
-        ):
-            raise BootstrapError("bootstrap receipt upload was not verified")
         final = build_bootstrap_receipt(
             profile=profile,
             runtime=runtime,
@@ -1283,10 +1665,31 @@ def main(argv: Sequence[str] | None = None) -> int:
             object_store=store,
         ):
             raise BootstrapError("final bootstrap receipt upload was not verified")
+        environment_receipt = build_runtime_environment_receipt(
+            profile=profile,
+            runtime=runtime,
+            evidence=evidence,
+        )
+        environment_path = receipt_path.with_name("environment-receipt.json")
+        environment_uri = (
+            f"{runtime.s3_root}/receipts/environment/{evidence.instance_id}/"
+            f"{evidence.boot_id}.json"
+        )
+        if not publish_bootstrap_receipt(
+            environment_receipt,
+            receipt_path=environment_path,
+            receipt_uri=environment_uri,
+            object_store=store,
+        ):
+            raise BootstrapError(
+                "authenticated environment receipt upload was not verified"
+            )
         print(
             json.dumps(
                 {
                     "dry_run": False,
+                    "environment_receipt": str(environment_path),
+                    "environment_receipt_uri": environment_uri,
                     "ok": True,
                     "receipt": str(receipt_path),
                     "schema_version": 1,

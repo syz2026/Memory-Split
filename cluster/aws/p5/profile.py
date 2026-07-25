@@ -1,4 +1,4 @@
-"""Strict AWS P5 profile and runtime-environment validation."""
+"""Strict closed AWS GPU profile and runtime-environment validation."""
 
 from __future__ import annotations
 
@@ -11,7 +11,18 @@ from typing import Mapping
 from urllib.parse import urlsplit
 
 
-PROFILE_ID = "aws-p5.48xlarge"
+LEGACY_AWS_P5_PROFILE_ID = "aws-p5.48xlarge"
+AWS_P5_V3_PROFILE_ID = "aws-p5.48xlarge-v3"
+AWS_P6_B300_V3_PROFILE_ID = "aws-p6-b300.48xlarge-v3"
+AWS_GPU_PROFILE_IDS = frozenset(
+    {
+        LEGACY_AWS_P5_PROFILE_ID,
+        AWS_P5_V3_PROFILE_ID,
+        AWS_P6_B300_V3_PROFILE_ID,
+    }
+)
+# Historical public constant retained for callers that bind the legacy profile.
+PROFILE_ID = LEGACY_AWS_P5_PROFILE_ID
 _MAX_PROFILE_BYTES = 65_536
 _AMI_RE = re.compile(r"^ami-[0-9a-f]{8,17}$")
 _CONTAINER_DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
@@ -65,11 +76,112 @@ _PROCESS_ENV_ALLOWLIST = (
     "LANG",
     "LC_ALL",
 )
+_P5_GPU_NAME_PATTERNS = (r"^NVIDIA H100 80GB(?: HBM3)?$",)
+_P6_B300_GPU_NAME_PATTERNS = (r"^NVIDIA B300$",)
+_CPU_AFFINITY_HALVES = ((0, 95), (96, 191))
+_LEGACY_P5_SOFTWARE_MINIMUMS = {
+    "cuda_minimum": "12.1",
+    "driver_minimum": "530",
+    "efa_minimum": "1.24.1",
+    "linux_kernel_minimum": "5.10",
+    "ofi_nccl_minimum": "1.7.2",
+}
+_P5_SOFTWARE_MINIMUMS = {
+    "cuda_minimum": "13.0",
+    "driver_minimum": "580",
+    "efa_minimum": "1.24.1",
+    "linux_kernel_minimum": "5.10",
+    "ofi_nccl_minimum": "1.7.2",
+}
+_P6_SOFTWARE_MINIMUMS = {
+    "cuda_minimum": "13.0",
+    "driver_minimum": "580",
+    "efa_minimum": "1.44.0",
+    "linux_kernel_minimum": "6.1",
+    "ofi_nccl_minimum": "1.17.1",
+}
+
+
+def _v3_profile_value(
+    *,
+    profile_id: str,
+    instance_type: str,
+    memory_gib: int,
+    gpu_model: str,
+    gpu_name_patterns: tuple[str, ...],
+    gres: str,
+    software_minimums: Mapping[str, str],
+    purchase_model: str,
+) -> dict[str, object]:
+    return {
+        "assigned_seeds": list(range(10)),
+        "cpu": {
+            "affinity_halves": [list(group) for group in _CPU_AFFINITY_HALVES],
+            "memory_gib": memory_gib,
+            "vcpus": 192,
+        },
+        "gpu": {
+            "allocated": 8,
+            "gres": gres,
+            "model": gpu_model,
+            "name_patterns": list(gpu_name_patterns),
+            "seed_train_groups": [4, 4],
+        },
+        "instance_type": instance_type,
+        "process_env_allowlist": list(_PROCESS_ENV_ALLOWLIST),
+        "profile_id": profile_id,
+        "provider": profile_id,
+        "purchase_model": purchase_model,
+        "runtime": {
+            "ami_id_env": "MS_AWS_AMI_ID",
+            "container_digest_env": "MS_CONTAINER_DIGEST",
+            "kms_key_id_env": "MS_S3_KMS_KEY_ID",
+            "region_env": "AWS_REGION",
+            "runtime_gid_env": "MS_RUNTIME_GID",
+            "runtime_uid_env": "MS_RUNTIME_UID",
+        },
+        "schema_version": 3,
+        "software": dict(software_minimums),
+        "storage": {
+            "durable_uri_env": "MS_S3_ROOT",
+            "instance_store": {
+                "device_bytes": 3_840_000_000_000,
+                "devices": 8,
+                "model": "Amazon EC2 NVMe Instance Storage",
+                "raid_level": "0",
+            },
+            "scratch_root": "/mnt/memorysplit",
+        },
+    }
+
+
+_KNOWN_V3_PROFILE_VALUES = {
+    AWS_P5_V3_PROFILE_ID: _v3_profile_value(
+        profile_id=AWS_P5_V3_PROFILE_ID,
+        instance_type="p5.48xlarge",
+        memory_gib=2048,
+        gpu_model="NVIDIA H100 80GB",
+        gpu_name_patterns=_P5_GPU_NAME_PATTERNS,
+        gres="gpu:h100:8",
+        software_minimums=_P5_SOFTWARE_MINIMUMS,
+        purchase_model="on_demand",
+    ),
+    AWS_P6_B300_V3_PROFILE_ID: _v3_profile_value(
+        profile_id=AWS_P6_B300_V3_PROFILE_ID,
+        instance_type="p6-b300.48xlarge",
+        memory_gib=4096,
+        gpu_model="NVIDIA B300",
+        gpu_name_patterns=_P6_B300_GPU_NAME_PATTERNS,
+        gres="gpu:b300:8",
+        software_minimums=_P6_SOFTWARE_MINIMUMS,
+        purchase_model="capacity_block",
+    ),
+}
 
 
 @dataclass(frozen=True)
-class AwsP5Profile:
-    """Normalized, immutable P5 hardware and storage contract."""
+class AwsGpuProfile:
+    """Normalized, immutable profile for one closed AWS GPU contract."""
 
     schema_version: int
     profile_id: str
@@ -79,8 +191,11 @@ class AwsP5Profile:
     vcpus: int
     memory_gib: int
     gpu_model: str
+    gpu_name_patterns: tuple[str, ...]
     allocated_gpus: int
     train_groups: tuple[int, int]
+    cpu_affinity_halves: tuple[tuple[int, int], tuple[int, int]]
+    gres: str
     scratch_root: str
     durable_uri_env: str
     instance_store_model: str
@@ -90,15 +205,67 @@ class AwsP5Profile:
     region_env: str
     ami_id_env: str
     container_digest_env: str
+    kms_key_id_env: str | None
     runtime_uid_env: str
     runtime_gid_env: str
     assigned_seeds: tuple[int, ...]
     process_env_allowlist: tuple[str, ...]
+    cuda_minimum: str
+    driver_minimum: str
+    linux_kernel_minimum: str
+    efa_minimum: str
+    ofi_nccl_minimum: str
     sha256: str
+
+    @property
+    def cpu_affinity(self) -> tuple[tuple[int, int], tuple[int, int]]:
+        """Compatibility-friendly name for the two disjoint CPU halves."""
+
+        return self.cpu_affinity_halves
+
+    @property
+    def software_minimums(self) -> Mapping[str, str]:
+        return {
+            "cuda": self.cuda_minimum,
+            "driver": self.driver_minimum,
+            "efa": self.efa_minimum,
+            "linux_kernel": self.linux_kernel_minimum,
+            "ofi_nccl": self.ofi_nccl_minimum,
+        }
+
+    @property
+    def bootstrap_receipt_type(self) -> str:
+        if self.profile_id == LEGACY_AWS_P5_PROFILE_ID:
+            return "aws-p5-bootstrap"
+        return "aws-gpu-bootstrap"
+
+    @property
+    def interruption_candidate_receipt_type(self) -> str:
+        if self.profile_id == LEGACY_AWS_P5_PROFILE_ID:
+            return "aws-p5-interruption-candidate"
+        return "aws-gpu-interruption-candidate"
+
+    @property
+    def interruption_receipt_type(self) -> str:
+        if self.profile_id == LEGACY_AWS_P5_PROFILE_ID:
+            return "aws-p5-paired-interruption"
+        return "aws-gpu-paired-interruption"
+
+    @property
+    def resume_commit_protocol(self) -> str:
+        if self.profile_id == LEGACY_AWS_P5_PROFILE_ID:
+            return "aws-p5-resume-commit-v1"
+        return "aws-gpu-resume-commit-v1"
+
+    def matches_gpu_name(self, name: str) -> bool:
+        return isinstance(name, str) and any(
+            re.fullmatch(pattern, name) is not None
+            for pattern in self.gpu_name_patterns
+        )
 
 
 @dataclass(frozen=True)
-class AwsP5Runtime:
+class AwsGpuRuntime:
     """Validated operator-provided immutable AWS identities."""
 
     region: str
@@ -108,6 +275,12 @@ class AwsP5Runtime:
     container_digest: str
     uid: int
     gid: int
+    kms_key_id: str | None = None
+
+
+# Compatibility aliases for the established AWS P5 API.
+AwsP5Profile = AwsGpuProfile
+AwsP5Runtime = AwsGpuRuntime
 
 
 def _unique_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
@@ -149,7 +322,7 @@ def _exact_string(value: object, expected: str, *, label: str) -> str:
     return value
 
 
-def _parse_profile(raw: object, *, sha256: str) -> AwsP5Profile:
+def _parse_legacy_profile(raw: object, *, sha256: str) -> AwsGpuProfile:
     value = _object(raw, fields=_ROOT_FIELDS, label="profile")
     _exact_int(value["schema_version"], 1, label="profile.schema_version")
     profile_id = _exact_string(
@@ -293,7 +466,7 @@ def _parse_profile(raw: object, *, sha256: str) -> AwsP5Profile:
             "profile.process_env_allowlist must match the closed safe allowlist"
         )
 
-    return AwsP5Profile(
+    return AwsGpuProfile(
         schema_version=1,
         profile_id=profile_id,
         provider=provider,
@@ -302,8 +475,11 @@ def _parse_profile(raw: object, *, sha256: str) -> AwsP5Profile:
         vcpus=vcpus,
         memory_gib=memory_gib,
         gpu_model=gpu_model,
+        gpu_name_patterns=_P5_GPU_NAME_PATTERNS,
         allocated_gpus=allocated_gpus,
         train_groups=(4, 4),
+        cpu_affinity_halves=_CPU_AFFINITY_HALVES,
+        gres="gpu:h100:8",
         scratch_root=scratch_root,
         durable_uri_env=durable_uri_env,
         instance_store_model=instance_store_model,
@@ -313,16 +489,112 @@ def _parse_profile(raw: object, *, sha256: str) -> AwsP5Profile:
         region_env=region_env,
         ami_id_env=ami_id_env,
         container_digest_env=container_digest_env,
+        kms_key_id_env=None,
         runtime_uid_env=runtime_uid_env,
         runtime_gid_env=runtime_gid_env,
         assigned_seeds=(1, 2, 3, 4),
         process_env_allowlist=_PROCESS_ENV_ALLOWLIST,
+        cuda_minimum=_LEGACY_P5_SOFTWARE_MINIMUMS["cuda_minimum"],
+        driver_minimum=_LEGACY_P5_SOFTWARE_MINIMUMS["driver_minimum"],
+        linux_kernel_minimum=_LEGACY_P5_SOFTWARE_MINIMUMS[
+            "linux_kernel_minimum"
+        ],
+        efa_minimum=_LEGACY_P5_SOFTWARE_MINIMUMS["efa_minimum"],
+        ofi_nccl_minimum=_LEGACY_P5_SOFTWARE_MINIMUMS["ofi_nccl_minimum"],
         sha256=sha256,
     )
 
 
-def load_aws_p5_profile(path: Path | str) -> AwsP5Profile:
-    """Load one regular JSON file under the closed P5 v1 schema."""
+def _same_typed_json(actual: object, expected: object) -> bool:
+    if type(actual) is not type(expected):
+        return False
+    if isinstance(expected, dict):
+        return set(actual) == set(expected) and all(
+            _same_typed_json(actual[key], value)
+            for key, value in expected.items()
+        )
+    if isinstance(expected, list):
+        return len(actual) == len(expected) and all(
+            _same_typed_json(item, expected_item)
+            for item, expected_item in zip(actual, expected, strict=True)
+        )
+    return actual == expected
+
+
+def _parse_v3_profile(
+    raw: object,
+    *,
+    expected: Mapping[str, object],
+    sha256: str,
+) -> AwsGpuProfile:
+    if not _same_typed_json(raw, expected):
+        raise ValueError(
+            "profile must exactly match one closed known AWS GPU profile"
+        )
+    value = raw
+    cpu = value["cpu"]
+    gpu = value["gpu"]
+    storage = value["storage"]
+    instance_store = storage["instance_store"]
+    runtime = value["runtime"]
+    software = value["software"]
+    return AwsGpuProfile(
+        schema_version=3,
+        profile_id=value["profile_id"],
+        provider=value["provider"],
+        instance_type=value["instance_type"],
+        purchase_model=value["purchase_model"],
+        vcpus=cpu["vcpus"],
+        memory_gib=cpu["memory_gib"],
+        gpu_model=gpu["model"],
+        gpu_name_patterns=tuple(gpu["name_patterns"]),
+        allocated_gpus=gpu["allocated"],
+        train_groups=tuple(gpu["seed_train_groups"]),
+        cpu_affinity_halves=tuple(
+            tuple(group) for group in cpu["affinity_halves"]
+        ),
+        gres=gpu["gres"],
+        scratch_root=storage["scratch_root"],
+        durable_uri_env=storage["durable_uri_env"],
+        instance_store_model=instance_store["model"],
+        instance_store_devices=instance_store["devices"],
+        instance_store_device_bytes=instance_store["device_bytes"],
+        raid_level=instance_store["raid_level"],
+        region_env=runtime["region_env"],
+        ami_id_env=runtime["ami_id_env"],
+        container_digest_env=runtime["container_digest_env"],
+        kms_key_id_env=runtime["kms_key_id_env"],
+        runtime_uid_env=runtime["runtime_uid_env"],
+        runtime_gid_env=runtime["runtime_gid_env"],
+        assigned_seeds=tuple(value["assigned_seeds"]),
+        process_env_allowlist=tuple(value["process_env_allowlist"]),
+        cuda_minimum=software["cuda_minimum"],
+        driver_minimum=software["driver_minimum"],
+        linux_kernel_minimum=software["linux_kernel_minimum"],
+        efa_minimum=software["efa_minimum"],
+        ofi_nccl_minimum=software["ofi_nccl_minimum"],
+        sha256=sha256,
+    )
+
+
+def _parse_profile(raw: object, *, sha256: str) -> AwsGpuProfile:
+    if not isinstance(raw, dict):
+        raise ValueError("profile must be an object")
+    profile_id = raw.get("profile_id")
+    if not isinstance(profile_id, str):
+        raise ValueError("profile.profile_id must be a known string")
+    if profile_id == LEGACY_AWS_P5_PROFILE_ID:
+        return _parse_legacy_profile(raw, sha256=sha256)
+    expected = _KNOWN_V3_PROFILE_VALUES.get(profile_id)
+    if expected is None:
+        raise ValueError(
+            "profile_id is not one of the closed known AWS GPU profiles"
+        )
+    return _parse_v3_profile(raw, expected=expected, sha256=sha256)
+
+
+def load_aws_gpu_profile(path: Path | str) -> AwsGpuProfile:
+    """Load one regular JSON file under the closed AWS GPU profile contract."""
 
     profile_path = Path(path)
     if profile_path.is_symlink():
@@ -344,6 +616,10 @@ def load_aws_p5_profile(path: Path | str) -> AwsP5Profile:
     except (UnicodeDecodeError, json.JSONDecodeError) as error:
         raise ValueError("profile must contain valid UTF-8 JSON") from error
     return _parse_profile(raw, sha256=hashlib.sha256(data).hexdigest())
+
+
+# Established loader name retained as a true alias.
+load_aws_p5_profile = load_aws_gpu_profile
 
 
 def _required_environment(
@@ -386,9 +662,9 @@ def _nonroot_id(value: str, *, label: str) -> int:
 
 
 def validate_runtime_environment(
-    profile: AwsP5Profile,
+    profile: AwsGpuProfile,
     environment: Mapping[str, str],
-) -> AwsP5Runtime:
+) -> AwsGpuRuntime:
     """Validate region, S3 prefix, AMI, digest, and absence of ambient secrets."""
 
     alternate_sources = sorted(
@@ -454,7 +730,20 @@ def validate_runtime_environment(
         _required_environment(environment, profile.runtime_gid_env),
         label="MS_RUNTIME_GID",
     )
-    return AwsP5Runtime(
+    kms_key_id = None
+    if profile.kms_key_id_env is not None:
+        kms_key_id = _required_environment(environment, profile.kms_key_id_env)
+        kms_match = re.fullmatch(
+            r"arn:aws:kms:(?P<region>us-(?:east-1|west-2)):"
+            r"[0-9]{12}:key/[0-9a-f]{8}-[0-9a-f]{4}-"
+            r"[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}",
+            kms_key_id,
+        )
+        if kms_match is None or kms_match.group("region") != region:
+            raise ValueError(
+                "MS_S3_KMS_KEY_ID must be an immutable KMS key ARN in AWS_REGION"
+            )
+    return AwsGpuRuntime(
         region=region,
         s3_root=s3_root,
         ami_id=ami_id,
@@ -462,4 +751,8 @@ def validate_runtime_environment(
         container_digest=container_digest,
         uid=uid,
         gid=gid,
+        kms_key_id=kms_key_id,
     )
+
+
+validate_aws_gpu_runtime_environment = validate_runtime_environment

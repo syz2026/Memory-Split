@@ -39,6 +39,14 @@ _RECEIPT_FIELDS = {
     "source_commit",
     "checkpoints",
 }
+_V3_PROVENANCE_FIELDS = {
+    "cohort_assignment_sha256",
+    "preregistration_sha256",
+    "hardware_amendment_sha256",
+    "provider_selection_sha256",
+    "profile_sha256",
+    "sealed_fixture_sha256",
+}
 _RECEIPT_CHECKPOINT_FIELDS = {
     "run_id",
     "arm",
@@ -50,6 +58,14 @@ _RECEIPT_CHECKPOINT_FIELDS = {
     "source_commit",
     "step",
     "world_size",
+}
+_V3_RECEIPT_CHECKPOINT_FIELDS = _RECEIPT_CHECKPOINT_FIELDS | {
+    "checkpoint_uri",
+    "configuration_uri",
+    "run_binding_sha256",
+    "run_binding_uri",
+    "checkpoint_record_sha256",
+    "checkpoint_record_uri",
 }
 
 
@@ -140,6 +156,14 @@ def bind_resume_checkpoints(
         checkpoint_receipt_sha256,
         label="checkpoint receipt",
     )
+    group_sizes = {
+        arm: size
+        for arm, size in zip(
+            _ARMS,
+            plan.profile.train_groups,
+            strict=True,
+        )
+    }
     if len(checkpoints) != 2:
         raise ResumeLaunchError("resume requires one complete checkpoint pair")
     by_arm: dict[str, Mapping[str, object]] = {}
@@ -155,7 +179,7 @@ def bind_resume_checkpoints(
             arm not in _ARMS
             or arm in by_arm
             or type(row["world_size"]) is not int
-            or row["world_size"] != 4
+            or row["world_size"] != group_sizes.get(arm)
         ):
             raise ResumeLaunchError(
                 "resume requires distinct Dense/Split90 world-size-4 checkpoints"
@@ -266,10 +290,11 @@ def prepare_resume_output_roots(
     *,
     seed: int,
     checkpoint_receipt_sha256: str,
+    assigned_seeds: Sequence[int] = (1, 2, 3, 4),
 ) -> Path:
     """Atomically archive a prior paired output before a resume attempt."""
 
-    if type(seed) is not int or seed not in {1, 2, 3, 4}:
+    if type(seed) is not int or seed not in assigned_seeds:
         raise ResumeLaunchError("resume seed is not assigned to AWS")
     receipt_sha256 = _sha256(
         checkpoint_receipt_sha256,
@@ -392,11 +417,22 @@ def _verify_checkpoint_receipt(
         raise ResumeLaunchError(
             "checkpoint receipt is not valid UTF-8 JSON"
         ) from error
-    if not isinstance(receipt, dict) or set(receipt) != _RECEIPT_FIELDS:
+    if not isinstance(receipt, dict):
+        raise ResumeLaunchError("checkpoint receipt must be one JSON object")
+    schema_version = receipt.get("schema_version")
+    fields = (
+        _RECEIPT_FIELDS | _V3_PROVENANCE_FIELDS
+        if schema_version == 3
+        else _RECEIPT_FIELDS
+    )
+    if set(receipt) != fields:
         raise ResumeLaunchError("checkpoint receipt fields do not match")
+    launcher_manifest = _load_launcher_manifest(plan.manifest_path)
+    expected_launcher_schema = 3 if schema_version == 3 else 1
     if (
-        receipt["schema_version"] != 2
-        or receipt["provider"] != "aws-p5.48xlarge"
+        schema_version not in {2, 3}
+        or launcher_manifest.get("schema_version") != expected_launcher_schema
+        or receipt["provider"] != plan.profile.provider
         or receipt["release_sha256"] != plan.release_sha256
         or receipt["run_manifest_sha256"] != manifest_sha256
         or receipt["dataset_sha256"] != plan.corpus_receipt_sha256
@@ -405,15 +441,57 @@ def _verify_checkpoint_receipt(
         raise ResumeLaunchError(
             "checkpoint receipt does not bind the reviewed launch plan"
         )
+    if schema_version == 3:
+        canonical = (
+            json.dumps(
+                receipt,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=True,
+                allow_nan=False,
+            )
+            + "\n"
+        ).encode("ascii")
+        if payload != canonical:
+            raise ResumeLaunchError(
+                "schema-v3 checkpoint receipt must be canonical JSON"
+            )
+        for field in _V3_PROVENANCE_FIELDS:
+            digest = _sha256(
+                receipt[field],
+                label=f"checkpoint receipt {field}",
+            )
+            if launcher_manifest.get(field) != digest:
+                raise ResumeLaunchError(
+                    "schema-v3 checkpoint provenance differs from the launcher"
+                )
     rows = receipt["checkpoints"]
     if not isinstance(rows, list) or len(rows) != 2:
         raise ResumeLaunchError("checkpoint receipt pair is incomplete")
+    row_field_sets = {
+        frozenset(row)
+        for row in rows
+        if isinstance(row, dict)
+    }
+    allowed_row_field_sets = {frozenset(_RECEIPT_CHECKPOINT_FIELDS)}
+    if schema_version == 3:
+        allowed_row_field_sets.add(
+            frozenset(_V3_RECEIPT_CHECKPOINT_FIELDS)
+        )
+    if (
+        len(row_field_sets) != 1
+        or not all(isinstance(row, dict) for row in rows)
+        or not row_field_sets <= allowed_row_field_sets
+    ):
+        raise ResumeLaunchError(
+            "checkpoint receipt row fields do not match"
+        )
+    durable_terminal = row_field_sets == {
+        frozenset(_V3_RECEIPT_CHECKPOINT_FIELDS)
+    }
     receipt_by_arm: dict[str, dict[str, object]] = {}
     for row in rows:
-        if not isinstance(row, dict) or set(row) != _RECEIPT_CHECKPOINT_FIELDS:
-            raise ResumeLaunchError(
-                "checkpoint receipt row fields do not match"
-            )
+        assert isinstance(row, dict)
         arm = row["arm"]
         if (
             arm not in _ARMS
@@ -422,7 +500,8 @@ def _verify_checkpoint_receipt(
             or row["dataset_sha256"] != plan.corpus_receipt_sha256
             or row["source_commit"] != plan.code_commit
             or type(row["world_size"]) is not int
-            or row["world_size"] != 4
+            or row["world_size"]
+            != plan.profile.train_groups[_ARMS.index(str(arm))]
             or type(row["step"]) is not int
             or row["step"] <= 0
         ):
@@ -431,6 +510,50 @@ def _verify_checkpoint_receipt(
             )
         _sha256(row["sha256"], label=f"{arm} checkpoint")
         _sha256(row["config_sha256"], label=f"{arm} config")
+        if durable_terminal:
+            run_binding_sha256 = _sha256(
+                row["run_binding_sha256"],
+                label=f"{arm} run binding",
+            )
+            record_sha256 = _sha256(
+                row["checkpoint_record_sha256"],
+                label=f"{arm} checkpoint record",
+            )
+            prefix = f"/checkpoints/seed-{plan.seed}/{arm}"
+            expected_suffixes = {
+                "checkpoint_uri": f"{prefix}/sha256/{row['sha256']}.pt",
+                "configuration_uri": (
+                    f"{prefix}/configuration/sha256/"
+                    f"{row['config_sha256']}.yaml"
+                ),
+                "run_binding_uri": (
+                    f"{prefix}/run-binding/sha256/"
+                    f"{run_binding_sha256}.json"
+                ),
+                "checkpoint_record_uri": (
+                    f"{prefix}/records/{record_sha256}.json"
+                ),
+            }
+            roots = {
+                str(row[field])[: -len(suffix)]
+                for field, suffix in expected_suffixes.items()
+                if isinstance(row[field], str)
+                and str(row[field]).startswith("s3://")
+                and str(row[field]).endswith(suffix)
+            }
+            if len(roots) != 1 or any(
+                not isinstance(row[field], str)
+                or not str(row[field]).startswith("s3://")
+                or not str(row[field]).endswith(suffix)
+                or any(
+                    character in str(row[field])
+                    for character in "\n\r\x00"
+                )
+                for field, suffix in expected_suffixes.items()
+            ):
+                raise ResumeLaunchError(
+                    "checkpoint receipt durable artifact URI is invalid"
+                )
         receipt_by_arm[str(arm)] = row
     if set(receipt_by_arm) != set(_ARMS):
         raise ResumeLaunchError("checkpoint receipt arms are incomplete")
@@ -443,6 +566,8 @@ def _verify_checkpoint_receipt(
         if (
             binding is None
             or launch is None
+            or row["run_id"] != launch.run_id
+            or row["path"] != f"{arm}.pt"
             or row["sha256"] != binding.get("resume_sha256")
             or row["world_size"] != binding.get("world_size")
             or row["config_sha256"] != launch.config_sha256
@@ -450,6 +575,27 @@ def _verify_checkpoint_receipt(
             raise ResumeLaunchError(
                 "checkpoint receipt differs from the executable binding"
             )
+
+
+def _load_launcher_manifest(path: Path) -> dict[str, object]:
+    try:
+        if path.is_symlink() or not path.is_file():
+            raise ResumeLaunchError("launcher manifest must be a regular file")
+        payload = path.read_bytes()
+        value = json.loads(
+            payload.decode("utf-8"),
+            object_pairs_hook=_strict_object,
+            parse_constant=lambda constant: (_ for _ in ()).throw(
+                ResumeLaunchError(
+                    f"launcher manifest contains non-finite {constant}"
+                )
+            ),
+        )
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ResumeLaunchError("launcher manifest is invalid") from error
+    if not isinstance(value, dict):
+        raise ResumeLaunchError("launcher manifest must contain an object")
+    return value
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -532,6 +678,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             checkpoint_receipt_sha256=(
                 arguments.checkpoint_receipt_sha256
             ),
+            assigned_seeds=plan.profile.assigned_seeds,
         )
         client = reviewed_launcher.ImdsV2Client()
         with reviewed_launcher.installed_shutdown_handlers() as shutdown_source:
@@ -542,9 +689,17 @@ def main(argv: Sequence[str] | None = None) -> int:
                     reviewed_launcher._production_interruption_handler
                 ),
                 shutdown_source=shutdown_source,
+                terminal_handler=(
+                    reviewed_launcher._production_terminal_handler
+                    if reviewed_launcher._is_v3_profile(plan.profile)
+                    else None
+                ),
             )
         report = {
             "child_pids": dict(sorted(result.child_pids.items())),
+            "checkpoint_receipt": result.checkpoint_receipt,
+            "checkpoint_receipt_sha256": result.checkpoint_receipt_sha256,
+            "checkpoint_receipt_uri": result.checkpoint_receipt_uri,
             "dry_run": False,
             "failed_arm": result.failed_arm,
             "interruption_receipt": result.interruption_receipt,

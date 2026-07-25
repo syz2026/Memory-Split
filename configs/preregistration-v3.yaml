@@ -1,0 +1,115 @@
+schema_version: 3
+preregistration_id: memorysplit-confirmatory-v3
+cohort_id: memorysplit-confirmatory-v3-360m-n10-aws
+frozen: true
+current_scientific_status: incomplete
+protected_outcomes_inspected: false
+protected_launch_allowed: false
+canonical_hypothesis: >-
+  At matched parameters, initialization, raw tokens, token order, optimizer
+  schedule and inference budget, removing direct next-token loss from selected
+  factual payloads improves OOD relational reasoning.
+
+protected_cohort:
+  condition_pair:
+    - dense
+    - split90
+  model_parameters: 356033536
+  terminal_n_pairs: 10
+  seeds:
+    - 0
+    - 1
+    - 2
+    - 3
+    - 4
+    - 5
+    - 6
+    - 7
+    - 8
+    - 9
+  training:
+    nominal_tokens_per_parameter: 20
+    targets_per_update: 524288
+    optimizer_steps: 13582
+    raw_target_tokens: 7120879616
+  matched_pair_invariants:
+    - model_architecture
+    - parameters
+    - initialization
+    - data_seed
+    - raw_target_tokens
+    - token_bytes
+    - token_order
+    - packing_boundaries
+    - optimizer
+    - optimizer_schedule
+    - targets_per_update
+    - training_steps
+    - inference_budget
+    - evaluation_items
+    - exact_graph_memory
+  claim_bearing_difference: direct_target_weights_on_routed_factual_payloads
+
+scientific_provider_assignment:
+  provider: aws-p5.48xlarge-v3
+  seeds:
+    - 0
+    - 1
+    - 2
+    - 3
+    - 4
+    - 5
+    - 6
+    - 7
+    - 8
+    - 9
+  supersedable_only_by: configs/hardware-amendment-v3.json
+
+hardware_execution_rule:
+  selected_profile_count: 1
+  same_profile_for_all_ten_pairs: true
+  mixed_profiles_forbidden: true
+  accelerator_groups:
+    dense: 4
+    split90: 4
+  concurrent_pairs_per_instance: 1
+  provisioning_by_msctl_forbidden: true
+
+analysis:
+  independent_unit: paired_training_bundle
+  single_primary_hypothesis: true
+  fixed_checkpoint_aulc:
+    enabled: true
+    optimizer_steps:
+      - 1358
+      - 3396
+      - 6791
+      - 10187
+      - 13582
+    interpolation: none
+
+protected_launch_gate:
+  all_required: true
+  diagnostics_complete: false
+  artifact_bindings_complete: false
+  selected_profile_qualified: false
+  rule: >-
+    protected_launch_allowed remains false until diagnostics, immutable artifact
+    bindings, and selected-profile qualification are all complete.
+
+artifact_bindings:
+  dataset:
+    state: unfrozen
+    sha256: null
+  environment:
+    state: unfrozen
+    sha256: null
+  sealed_evaluation:
+    state: unfrozen
+    sha256: null
+  provider_selection:
+    state: absent
+    sha256: null
+  run_manifests:
+    state: absent
+    sha256: null

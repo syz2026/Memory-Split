@@ -90,6 +90,7 @@ _ATOMIC_TEMPORARY_NAME = re.compile(
     r"\.tmp-(?P<pid>[1-9][0-9]*)-(?P<nonce>[0-9a-f]{16})$"
 )
 TRAINER_CAPABILITIES = {
+    "checkpoint_metadata": True,
     "rank_zero_pid_file": True,
     "receipt_v2": True,
     "resume_sha256": True,
@@ -903,6 +904,7 @@ class Trainer:
         linked_snapshot_targets = set()
         allowed_root = {
             "ckpt.pt",
+            "checkpoint-meta.json",
             "config.yaml",
             "log.jsonl",
             "snapshots",
@@ -918,6 +920,7 @@ class Trainer:
             match = _ATOMIC_TEMPORARY_NAME.fullmatch(name)
             if match is None or match.group("target") not in {
                 "ckpt.pt",
+                "checkpoint-meta.json",
                 "log.jsonl",
             }:
                 raise ValueError(
@@ -1455,7 +1458,13 @@ class Trainer:
                 device=self.local_rank,
             )
 
-    def save_ckpt(self) -> None:
+    def save_ckpt(self, *, terminal: bool = False) -> None:
+        if not isinstance(terminal, bool):
+            raise ValueError("terminal checkpoint flag must be boolean")
+        if terminal and self.step != self.max_steps:
+            raise ValueError(
+                "terminal checkpoint requires the configured final step"
+            )
         rng_by_rank = self._rng_states_by_rank()
         data_states = self._data_states_by_rank()
 
@@ -1478,6 +1487,40 @@ class Trainer:
             self._output.root.write_atomic(
                 "ckpt.pt",
                 lambda handle: torch.save(state, handle),
+                replace=True,
+            )
+            checkpoint = self._output.root.hash_regular(
+                "ckpt.pt",
+                label="checkpoint",
+            )
+            metadata = {
+                "schema_version": 1,
+                "receipt_type": "memorysplit-training-checkpoint-v1",
+                "run_id": self.cfg.get("run_id"),
+                "condition": self.cfg.get("condition"),
+                "seed": self.cfg.get("seed"),
+                "step": self.step,
+                "max_steps": self.max_steps,
+                "world_size": self.world_size,
+                "config_fingerprint": self.config_fingerprint,
+                "checkpoint_path": "ckpt.pt",
+                "checkpoint_sha256": checkpoint.sha256,
+                "checkpoint_bytes": checkpoint.byte_count,
+                "terminal": terminal,
+            }
+            metadata_bytes = (
+                json.dumps(
+                    metadata,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    ensure_ascii=True,
+                    allow_nan=False,
+                )
+                + "\n"
+            ).encode("ascii")
+            self._output.root.write_atomic(
+                "checkpoint-meta.json",
+                lambda handle: handle.write(metadata_bytes),
                 replace=True,
             )
 
@@ -1743,7 +1786,7 @@ class Trainer:
             )
             if checkpoint_due or checkpoint_requested:
                 last_ckpt = time.time()
-        self.save_ckpt()
+        self.save_ckpt(terminal=self.step == self.max_steps)
         return running if running is not None else float("nan")
 
 

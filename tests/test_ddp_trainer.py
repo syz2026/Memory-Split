@@ -601,9 +601,16 @@ def test_cpu_gloo_update_matches_single_process_and_resume_is_exact(tmp_path):
     assert [row["step"] for row in log_rows] == [1, 2]
     assert all(row["tokens_per_step"] == 20 for row in log_rows)
     assert set(path.name for path in ddp_out.iterdir()) == {
+        "checkpoint-meta.json",
         "config.yaml",
         "log.jsonl",
         "snapshots",
         "ckpt.pt",
     }
+    checkpoint_metadata = json.loads(
+        (ddp_out / "checkpoint-meta.json").read_text()
+    )
+    assert checkpoint_metadata["step"] == checkpoint_metadata["max_steps"] == 2
+    assert checkpoint_metadata["world_size"] == 2
+    assert checkpoint_metadata["terminal"] is True
     assert len(list((ddp_out / "snapshots").glob("*.pt"))) == 1

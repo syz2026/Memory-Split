@@ -41,10 +41,10 @@ from evals.confirmatory.contracts import (
     canonical_sha256,
     validate_contract_bundle,
 )
+from evals.confirmatory.run_binding import validate_run_binding
 
 
 MSCTL_EVALUATOR_CONTRACT = "memorysplit-confirmatory-evaluator-v1"
-RUN_BINDING_SCHEMA = "memorysplit.confirmatory.run-binding.v2"
 OUTCOME_SCHEMA = "memorysplit.confirmatory.outcome.v2"
 METRICS_SCHEMA = "memorysplit.confirmatory.metrics.v2"
 INFERENCE_EVIDENCE_SCHEMA = "memorysplit.confirmatory.inference-evidence.v2"
@@ -60,22 +60,6 @@ _CANDIDATE_RESPONSE_RE = re.compile(rf" candidate=({_CANONICAL_CANDIDATE_VALUE})
 _FINAL_RESPONSE_RE = re.compile(
     rf" candidate=({_CANONICAL_CANDIDATE_VALUE})"
     rf" final=({_CANONICAL_CANDIDATE_VALUE})"
-)
-_RUN_FIELDS = frozenset(
-    {
-        "record_type",
-        "schema_version",
-        "run_id",
-        "checkpoint_path",
-        "checkpoint_sha256",
-        "configuration_path",
-        "configuration_sha256",
-        "route_dose_sha256",
-        "corpus_sha256",
-        "code_sha256",
-        "seed",
-        "condition_id",
-    }
 )
 _HARDENED_ARTIFACTS = (
     "checkpoints.jsonl",
@@ -864,44 +848,23 @@ def _canonical_jsonl(
 
 
 def _load_run_binding(run: Path) -> RunBinding:
-    raw = _strict_mapping(
+    raw = validate_run_binding(
         _canonical_object(
             _read_regular_file(run / "run.json", "run binding"),
             "run.json",
-        ),
-        _RUN_FIELDS,
-        "run binding",
+        )
     )
-    if raw["record_type"] != RUN_BINDING_SCHEMA:
-        raise ValueError("run binding record_type is invalid")
-    if (
-        type(raw["schema_version"]) is not int
-        or raw["schema_version"] != CONTRACT_VERSION
-    ):
-        raise ValueError("run binding schema_version is invalid")
     return RunBinding(
-        run_id=_string(raw["run_id"], "run_id"),
-        checkpoint_path=_string(raw["checkpoint_path"], "checkpoint_path"),
-        checkpoint_sha256=_sha256(
-            raw["checkpoint_sha256"],
-            "checkpoint_sha256",
-        ),
-        configuration_path=_string(
-            raw["configuration_path"],
-            "configuration_path",
-        ),
-        configuration_sha256=_sha256(
-            raw["configuration_sha256"],
-            "configuration_sha256",
-        ),
-        route_dose_sha256=_sha256(
-            raw["route_dose_sha256"],
-            "route_dose_sha256",
-        ),
-        corpus_sha256=_sha256(raw["corpus_sha256"], "corpus_sha256"),
-        code_sha256=_sha256(raw["code_sha256"], "code_sha256"),
-        seed=_integer(raw["seed"], "seed"),
-        condition_id=_condition(raw["condition_id"], "run condition_id"),
+        run_id=str(raw["run_id"]),
+        checkpoint_path=str(raw["checkpoint_path"]),
+        checkpoint_sha256=str(raw["checkpoint_sha256"]),
+        configuration_path=str(raw["configuration_path"]),
+        configuration_sha256=str(raw["configuration_sha256"]),
+        route_dose_sha256=str(raw["route_dose_sha256"]),
+        corpus_sha256=str(raw["corpus_sha256"]),
+        code_sha256=str(raw["code_sha256"]),
+        seed=int(raw["seed"]),
+        condition_id=str(raw["condition_id"]),
     )
 
 
@@ -957,8 +920,12 @@ def _load_study_lock(
     wrong_lock_sha256 = "0" * 64 if actual != "0" * 64 else "1" * 64
     readiness_probe = api.ValidityEvidence.from_dict(
         {
-            "record_type": api.VALIDITY_EVIDENCE_SCHEMA,
-            "schema_version": CONTRACT_VERSION,
+            "record_type": (
+                api.VALIDITY_EVIDENCE_SCHEMA_V3
+                if typed.is_v3
+                else api.VALIDITY_EVIDENCE_SCHEMA
+            ),
+            "schema_version": typed.schema_version,
             "study_lock_sha256": wrong_lock_sha256,
             "preregistration_sha256": typed.preregistration_sha256,
             "receipts": [],
@@ -1295,15 +1262,24 @@ def _score_and_summarize(
     return outcomes_bytes, metrics_bytes
 
 
-def _inference_bytes() -> bytes:
+def _inference_bytes(lock: _StudyLockView) -> bytes:
+    required_seeds = len(lock.typed.confirmatory_seeds)
     return canonical_json_bytes(
         {
-            "record_type": getattr(
-                reporting,
-                "INFERENCE_EVIDENCE_SCHEMA",
-                INFERENCE_EVIDENCE_SCHEMA,
+            "record_type": (
+                getattr(
+                    reporting,
+                    "INFERENCE_EVIDENCE_SCHEMA_V3",
+                    "memorysplit.confirmatory.inference-evidence.v3",
+                )
+                if lock.typed.is_v3
+                else getattr(
+                    reporting,
+                    "INFERENCE_EVIDENCE_SCHEMA",
+                    INFERENCE_EVIDENCE_SCHEMA,
+                )
             ),
-            "schema_version": CONTRACT_VERSION,
+            "schema_version": lock.typed.schema_version,
             "primary_test": {
                 "contrast_id": getattr(
                     reporting,
@@ -1317,8 +1293,8 @@ def _inference_bytes() -> bytes:
                 ),
                 "alternative": "greater",
                 "alpha": 0.05,
-                "n_pairs": 5,
-                "sign_assignments": 32,
+                "n_pairs": required_seeds,
+                "sign_assignments": 1 << required_seeds,
                 "equality_counted": True,
             },
             "paired_seed_bundle_deltas": [],
@@ -1672,7 +1648,7 @@ def evaluate(
     artifacts = MappingProxyType(
         {
             "checkpoints.jsonl": checkpoint.content,
-            "inference.json": _inference_bytes(),
+            "inference.json": _inference_bytes(lock),
             "items.jsonl": items_content,
             "metrics.json": metrics_content,
             "outcomes.jsonl": outcomes_content,

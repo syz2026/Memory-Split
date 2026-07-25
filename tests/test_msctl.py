@@ -3218,6 +3218,7 @@ def _aws_profile_object():
         profile_id="aws-p5.48xlarge",
         provider="aws-p5.48xlarge",
         instance_type="p5.48xlarge",
+        gres="gpu:h100:8",
         purchase_model="on_demand",
         allocated_gpus=8,
         train_groups=(4, 4),
@@ -3373,7 +3374,7 @@ def test_aws_evaluation_runs_task8_module_in_pinned_container(tmp_path):
         image_index = argv.index(_aws_runtime_object().container_image)
         assert argv[:2] == ["/usr/bin/docker", "run"]
         assert argv[image_index + 1 : image_index + 5] == [
-            "/usr/bin/python3",
+            "/opt/venv/bin/python",
             "-m",
             "evals.confirmatory",
             "evaluate",
@@ -3437,6 +3438,9 @@ def test_aws_pair_journal_repairs_crash_after_first_arm_write(tmp_path):
             {
                 "schema_version": 1,
                 "provider": "aws-p5.48xlarge",
+                "instance_type": "p5.48xlarge",
+                "profile_sha256": backend.profile.sha256,
+                "gres": "gpu:h100:8",
                 "run_manifest_sha256": manifest.sha256,
                 "operation_id": intent["operation_id"],
                 "states": states,
@@ -3445,6 +3449,83 @@ def test_aws_pair_journal_repairs_crash_after_first_arm_write(tmp_path):
         store.write_run(str(states[0]["run_id"]), states[0])
         backend._repair_paired_states(store, manifest)
         assert store.read_run(str(states[1]["run_id"])) == states[1]
+
+
+def test_aws_pair_journal_restores_both_stale_arm_files(tmp_path):
+    from msctl.aws_p5 import AwsP5Backend
+    from msctl.state import StateStore
+
+    backend = AwsP5Backend(
+        profile=_aws_profile_object(),
+        runtime=_aws_runtime_object(),
+        instance_profile_arn=(
+            "arn:aws:iam::123456789012:instance-profile/memorysplit-p5"
+        ),
+        state_root=tmp_path / "state",
+        runner=_FakeAwsRunner(),
+    )
+    manifest = _aws_manifest_object()
+    release = _aws_release_object()
+    intent = backend._operation_envelope(
+        backend._training_operation_intent(
+            operation="submit",
+            release=release,
+            manifest=manifest,
+            terminate_at=_AWS_TERMINATE_AT,
+        ),
+        instance_id="i-0123456789abcdef0",
+        terminate_at=_AWS_TERMINATE_AT,
+    )
+    digest = hashlib.sha256(_canonical(intent)).hexdigest()
+    states = [
+        backend._new_aws_run_state(
+            run=run,
+            manifest=manifest,
+            operation="submit",
+            instance_id="i-0123456789abcdef0",
+            terminate_at=_AWS_TERMINATE_AT,
+            intent=intent,
+            published={
+                "intent_sha256": digest,
+                "intent_uri": (
+                    f"{_aws_runtime_object().s3_root}/operations/intents/"
+                    f"sha256/{digest}.json"
+                ),
+            },
+            attempt=1,
+        )
+        for run in manifest.runs
+    ]
+    stale = [dict(state) for state in states]
+    durable = [dict(state) for state in states]
+    for state in stale:
+        state["updated_at"] = "2026-07-25T00:00:00Z"
+    for state in durable:
+        state["status"] = "SENDING"
+        state["send_attempted"] = True
+        state["updated_at"] = "2026-07-25T00:00:01Z"
+
+    store = StateStore(backend.state_root)
+    with store.locked():
+        for state in stale:
+            store.write_run(str(state["run_id"]), state)
+        store.write_aws_pair(
+            manifest.sha256,
+            {
+                "schema_version": 1,
+                "provider": backend.profile.provider,
+                "instance_type": backend.profile.instance_type,
+                "profile_sha256": backend.profile.sha256,
+                "gres": backend.profile.gres,
+                "run_manifest_sha256": manifest.sha256,
+                "operation_id": intent["operation_id"],
+                "states": durable,
+            },
+        )
+        backend._repair_paired_states(store, manifest)
+        assert [
+            store.read_run(str(state["run_id"])) for state in durable
+        ] == durable
 
 
 def _bound_instance(
@@ -3456,6 +3537,7 @@ def _bound_instance(
     return {
         "instance_id": instance_id,
         "instance_type": "p5.48xlarge",
+        "profile_instance_type": "p5.48xlarge",
         "state": "running",
         "instance_profile_arn": (
             "arn:aws:iam::123456789012:instance-profile/memorysplit-p5"
@@ -3466,6 +3548,8 @@ def _bound_instance(
         "release_sha256": release_sha256 or manifest.release_sha256,
         "dataset_sha256": manifest.dataset_sha256,
         "run_manifest_sha256": manifest.sha256,
+        "profile_sha256": _aws_profile_object().sha256,
+        "gres": "gpu:h100:8",
     }
 
 
@@ -3479,6 +3563,7 @@ def _selected_instance(
     profile = _aws_profile_object()
     tags = {
         "provider": "aws-p5.48xlarge",
+        "profile_instance_type": "p5.48xlarge",
         "seed": manifest.seed,
         "cohort_sha256": manifest.cohort_assignment_sha256,
         "release_sha256": manifest.release_sha256,
@@ -3491,14 +3576,15 @@ def _selected_instance(
                     "ami_id": runtime.ami_id,
                     "container_image": runtime.container_image,
                     "container_digest": runtime.container_digest,
-                    "gid": getattr(runtime, "gid", None),
+                    "gid": getattr(runtime, "gid", 1000),
                     "region": runtime.region,
                     "s3_root": runtime.s3_root,
-                    "uid": getattr(runtime, "uid", None),
+                    "uid": getattr(runtime, "uid", 1000),
                 }
             )
         ).hexdigest(),
         "container_digest": runtime.container_digest,
+        "gres": "gpu:h100:8",
         "terminate_at": _AWS_TERMINATE_AT,
     }
     if not bound:
@@ -3642,6 +3728,34 @@ def _aws_run_state(
     state["send_attempted"] = True
     state["status"] = status
     return state
+
+
+def _validated_operation_receipts(intent, *, returncode):
+    from msctl.aws_argv import _receipt, _validate_receipt
+
+    intent_sha256 = hashlib.sha256(_canonical(intent)).hexdigest()
+    receipts = {}
+    for kind in ("started", "terminal"):
+        payload = _receipt(
+            intent,
+            intent_sha256=intent_sha256,
+            kind=kind,
+            nonce="a" * 32,
+            returncode=returncode if kind == "terminal" else None,
+        )
+        receipts[kind] = {
+            "kind": kind,
+            "uri": intent[f"{kind}_receipt_uri"],
+            "sha256": hashlib.sha256(payload).hexdigest(),
+            "version_id": f"{kind}-version-1",
+            "value": _validate_receipt(
+                payload,
+                intent,
+                intent_sha256=intent_sha256,
+                kind=kind,
+            ),
+        }
+    return receipts
 
 
 def test_aws_cli_runner_is_argv_only_sanitized_and_strict(tmp_path):
@@ -4124,6 +4238,13 @@ def test_aws_approval_binds_every_extended_execution_resource(tmp_path):
         instance_id="i-0123456789abcdef0",
         terminate_at=_AWS_TERMINATE_AT,
     )
+    resources.update(
+        {
+            "dataset_pointer_sha256": "5" * 64,
+            "dataset_verification_sha256": "6" * 64,
+            "environment_receipt_sha256": "7" * 64,
+        }
+    )
     unsigned = {
         "schema_version": 1,
         "receipt_id": "aws-submit-fixture",
@@ -4423,7 +4544,7 @@ def test_aws_provisions_only_the_fixed_argv_document_hash(tmp_path):
 
 
 def test_aws_remote_wrapper_acquires_once_and_writes_terminal_receipt(tmp_path):
-    from msctl.aws_argv import RemoteIntentError, execute_intent
+    from msctl.aws_argv import RemoteIntentError, _receipt, execute_intent
     from msctl.aws_p5 import AwsP5Backend
     from msctl.jsonutil import canonical_json
 
@@ -4503,6 +4624,10 @@ def test_aws_remote_wrapper_acquires_once_and_writes_terminal_receipt(tmp_path):
     assert first["executed"] is True
     assert second["executed"] is False
     assert second["idempotent"] is True
+    assert second["terminal"] is True
+    assert second["status"] == "success"
+    assert second["recovery_required"] is False
+    assert second["returncode"] == 0
     assert len(executor.calls) == len(intent["steps"])
     assert store.metadata[intent["started_receipt_uri"]] == {
         "operation-id": intent["operation_id"],
@@ -4520,6 +4645,26 @@ def test_aws_remote_wrapper_acquires_once_and_writes_terminal_receipt(tmp_path):
         ))
         for _, environment in executor.calls
     )
+    stuck_store = Store()
+    stuck_store.objects[intent["started_receipt_uri"]] = _receipt(
+        intent,
+        intent_sha256=digest,
+        kind="started",
+        nonce="a" * 32,
+    )
+    stuck_executor = Executor()
+    stuck = execute_intent(
+        intent_uri=intent_uri,
+        intent_sha256=digest,
+        store=stuck_store,
+        executor=stuck_executor,
+    )
+    assert stuck["executed"] is False
+    assert stuck["terminal"] is False
+    assert stuck["status"] == "recovery-required"
+    assert stuck["recovery_required"] is True
+    assert stuck["returncode"] == 75
+    assert stuck_executor.calls == []
     corrupt_store = Store()
     corrupt_store.objects[intent["started_receipt_uri"]] = b"{}\n"
     with pytest.raises(RemoteIntentError, match="started receipt"):
@@ -4529,6 +4674,37 @@ def test_aws_remote_wrapper_acquires_once_and_writes_terminal_receipt(tmp_path):
             store=corrupt_store,
             executor=Executor(),
         )
+
+
+def test_aws_remote_wrapper_main_returns_nonzero_for_recovery(monkeypatch):
+    import msctl.aws_argv as aws_argv
+
+    monkeypatch.setenv("AWS_REGION", "us-east-1")
+    monkeypatch.setattr(aws_argv, "AwsCliObjectStore", lambda **_kwargs: object())
+    monkeypatch.setattr(aws_argv, "SubprocessArgvExecutor", lambda: object())
+    monkeypatch.setattr(
+        aws_argv,
+        "execute_intent",
+        lambda **_kwargs: {
+            "schema_version": 1,
+            "operation_id": "1" * 64,
+            "executed": False,
+            "idempotent": True,
+            "terminal": False,
+            "status": "recovery-required",
+            "recovery_required": True,
+            "returncode": 75,
+        },
+    )
+
+    assert aws_argv.main(
+        [
+            "--intent-uri",
+            "s3://memorysplit-prod/intents/intent.json",
+            "--intent-sha256",
+            "2" * 64,
+        ]
+    ) == 75
 
 
 def test_aws_remote_wrapper_rejects_unknown_checkpoint_receipt_fields(tmp_path):
@@ -4700,6 +4876,7 @@ def test_aws_remote_wrapper_rejects_redirected_operation_receipts(tmp_path):
 def test_aws_submit_response_loss_never_resends_the_same_operation(tmp_path):
     import base64
 
+    from msctl.aws_argv import _receipt
     from msctl.aws_p5 import (
         ARGV_DOCUMENT_NAME,
         ARGV_DOCUMENT_SHA256,
@@ -4810,9 +4987,9 @@ def test_aws_submit_response_loss_never_resends_the_same_operation(tmp_path):
     assert {state["intent_sha256"] for state in states} == {digest}
 
     second_runner = _FakeAwsRunner(
+        {"commands": []},
         MsctlError("AWS_COMMAND_FAILED", "started receipt absent"),
         MsctlError("AWS_COMMAND_FAILED", "terminal receipt absent"),
-        {"commands": []},
     )
     second = AwsP5Backend(runner=second_runner, **common)
     with pytest.raises(Exception) as caught:
@@ -4826,6 +5003,176 @@ def test_aws_submit_response_loss_never_resends_the_same_operation(tmp_path):
         )
     assert getattr(caught.value, "code", None) == "SUBMISSION_UNCERTAIN"
     assert all("send-command" not in argv for argv, _ in second_runner.calls)
+
+    started_payload = _receipt(
+        intent,
+        intent_sha256=digest,
+        kind="started",
+        nonce="b" * 32,
+    )
+    started_checksum = base64.b64encode(
+        hashlib.sha256(started_payload).digest()
+    ).decode("ascii")
+    receipt_metadata = {
+        "operation-id": intent["operation_id"],
+        "intent-sha256": digest,
+    }
+    started_object = {
+        "receipt": {
+            "checksum_sha256": started_checksum,
+            "content_length": len(started_payload),
+            "metadata": {**receipt_metadata, "receipt-kind": "started"},
+            "version_id": "started-version-2",
+        }
+    }
+
+    class OperationReceiptRunner(_FakeAwsRunner):
+        def __init__(self, *outputs, payloads):
+            super().__init__(*outputs)
+            self.payloads = payloads
+
+        def run_json(self, argv, *, operation):
+            if "get-object" in argv:
+                destination = Path(argv[argv.index("--checksum-mode") + 2])
+                key = argv[argv.index("--key") + 1]
+                kind = Path(key).stem
+                destination.write_bytes(self.payloads[kind])
+            return super().run_json(argv, operation=operation)
+
+    recovery_runner = OperationReceiptRunner(
+        {"commands": []},
+        started_object,
+        started_object,
+        MsctlError("AWS_COMMAND_FAILED", "terminal receipt absent"),
+        payloads={"started": started_payload},
+    )
+    recovery = AwsP5Backend(runner=recovery_runner, **common)
+    with pytest.raises(Exception) as recovery_required:
+        recovery.submit(
+            release=release,
+            manifest=manifest,
+            instance_id=selected["instance_id"],
+            terminate_at=_AWS_TERMINATE_AT,
+            approval_path=tmp_path / "approval.json",
+            apply=True,
+        )
+    assert getattr(recovery_required.value, "code", None) == (
+        "REMOTE_RECOVERY_REQUIRED"
+    )
+    recovered_states = [
+        json.loads(
+            (
+                tmp_path
+                / "state"
+                / "runs"
+                / f"{run.run_id}.json"
+            ).read_text()
+        )
+        for run in manifest.runs
+    ]
+    assert {state["status"] for state in recovered_states} == {
+        "RECOVERY_REQUIRED"
+    }
+    assert all(
+        "send-command" not in argv for argv, _ in recovery_runner.calls
+    )
+
+    terminal_payload = _receipt(
+        intent,
+        intent_sha256=digest,
+        kind="terminal",
+        nonce="b" * 32,
+        returncode=0,
+    )
+    terminal_checksum = base64.b64encode(
+        hashlib.sha256(terminal_payload).digest()
+    ).decode("ascii")
+    terminal_object = {
+        "receipt": {
+            "checksum_sha256": terminal_checksum,
+            "content_length": len(terminal_payload),
+            "metadata": {**receipt_metadata, "receipt-kind": "terminal"},
+            "version_id": "terminal-version-1",
+        }
+    }
+
+    terminal_runner = OperationReceiptRunner(
+        {"commands": []},
+        started_object,
+        started_object,
+        terminal_object,
+        terminal_object,
+        payloads={
+            "started": started_payload,
+            "terminal": terminal_payload,
+        },
+    )
+    reconciler = AwsP5Backend(runner=terminal_runner, **common)
+    terminal_result = reconciler.status(
+        release=release,
+        manifest=manifest,
+        cached=False,
+    )
+    assert terminal_result["status"] == "REMOTE_TERMINAL_SUCCESS"
+    assert terminal_result["returncode"] == 0
+    assert terminal_result["terminal_receipt_sha256"] == hashlib.sha256(
+        terminal_payload
+    ).hexdigest()
+    assert all(
+        "send-command" not in argv for argv, _ in terminal_runner.calls
+    )
+    terminal_states = [
+        json.loads(
+            (
+                tmp_path
+                / "state"
+                / "runs"
+                / f"{run.run_id}.json"
+            ).read_text()
+        )
+        for run in manifest.runs
+    ]
+    assert {state["status"] for state in terminal_states} == {
+        "REMOTE_TERMINAL_SUCCESS"
+    }
+
+    mismatched_payload = _receipt(
+        intent,
+        intent_sha256=digest,
+        kind="terminal",
+        nonce="c" * 32,
+        returncode=0,
+    )
+    mismatched_checksum = base64.b64encode(
+        hashlib.sha256(mismatched_payload).digest()
+    ).decode("ascii")
+    mismatched_object = {
+        "receipt": {
+            "checksum_sha256": mismatched_checksum,
+            "content_length": len(mismatched_payload),
+            "metadata": {**receipt_metadata, "receipt-kind": "terminal"},
+            "version_id": "terminal-version-2",
+        }
+    }
+    mismatch_runner = OperationReceiptRunner(
+        {"commands": []},
+        started_object,
+        started_object,
+        mismatched_object,
+        mismatched_object,
+        payloads={
+            "started": started_payload,
+            "terminal": mismatched_payload,
+        },
+    )
+    mismatch = AwsP5Backend(runner=mismatch_runner, **common)
+    with pytest.raises(MsctlError) as mismatched:
+        mismatch.status(
+            release=release,
+            manifest=manifest,
+            cached=False,
+        )
+    assert mismatched.value.code == "REMOTE_RECEIPT_INVALID"
 
 
 def test_aws_submit_rejects_state_bound_to_a_different_operation_intent(
@@ -5572,6 +5919,7 @@ def test_aws_resume_requires_world_size_four_and_forwards_both_receipts(
 ):
     from msctl.aws_p5 import AwsP5Backend
     from msctl.contracts import verify_checkpoint_receipt
+    from msctl.state import StateStore
 
     manifest = _aws_manifest_object()
     release = _aws_release_object()
@@ -5590,6 +5938,20 @@ def test_aws_resume_requires_world_size_four_and_forwards_both_receipts(
         state_root=tmp_path / "state",
         runner=_FakeAwsRunner(),
     )
+    states = [
+        _aws_run_state(
+            backend,
+            release,
+            manifest,
+            run,
+            status="Success",
+            command_id="training-command-12345678",
+        )
+        for run in manifest.runs
+    ]
+    store = StateStore(backend.state_root)
+    with store.locked():
+        backend._write_paired_states(store, manifest, states)
 
     planned = backend.resume(
         release=release,
@@ -5602,6 +5964,13 @@ def test_aws_resume_requires_world_size_four_and_forwards_both_receipts(
     intent = planned["operation_intent"]
     assert intent["operation"] == "resume"
     assert intent["checkpoint_receipt"]["sha256"] == receipt.sha256
+    assert planned["approval_resources"]["instance_id"] == (
+        "i-0123456789abcdef0"
+    )
+    assert planned["approval_resources"]["terminate_at"] == _AWS_TERMINATE_AT
+    assert planned["approval_resources"]["checkpoint_receipt_sha256"] == (
+        receipt.sha256
+    )
     by_arm = {
         row["arm"]: row for row in intent["checkpoint_receipt"]["checkpoints"]
     }
@@ -6018,8 +6387,8 @@ def test_aws_resume_response_loss_reconciles_without_resending(tmp_path):
                 "shutdown_behavior": "terminate",
             }
         },
-        MsctlError("AWS_COMMAND_FAILED", "missing started receipt"),
-        MsctlError("AWS_COMMAND_FAILED", "missing terminal receipt"),
+        MsctlError("AWS_COMMAND_FAILED", "started receipt does not exist"),
+        MsctlError("AWS_COMMAND_FAILED", "terminal receipt does not exist"),
         {
             "commands": [
                 {
@@ -6057,10 +6426,326 @@ def test_aws_resume_response_loss_reconciles_without_resending(tmp_path):
     )
 
 
-def test_aws_evaluation_uses_canonical_confirmatory_runner_interface(tmp_path):
+def test_aws_evaluate_accepts_receipted_success_without_command_status(
+    tmp_path,
+    monkeypatch,
+):
     from msctl.aws_p5 import AwsP5Backend
+    from msctl.jsonutil import canonical_json
+    from msctl.state import StateStore
 
     manifest = _aws_manifest_object()
+    release = _aws_release_object()
+    backend = AwsP5Backend(
+        profile=_aws_profile_object(),
+        runtime=_aws_runtime_object(),
+        instance_profile_arn=(
+            "arn:aws:iam::123456789012:instance-profile/memorysplit-p5"
+        ),
+        state_root=tmp_path / "state",
+        runner=_FakeAwsRunner(),
+        approval_verifier=lambda **_: {},
+    )
+    training_intent = backend._operation_envelope(
+        backend._training_operation_intent(
+            operation="submit",
+            release=release,
+            manifest=manifest,
+            terminate_at=_AWS_TERMINATE_AT,
+        ),
+        instance_id="i-0123456789abcdef0",
+        terminate_at=_AWS_TERMINATE_AT,
+    )
+    intent_sha256 = hashlib.sha256(
+        canonical_json(training_intent)
+    ).hexdigest()
+    states = [
+        backend._new_aws_run_state(
+            run=run,
+            manifest=manifest,
+            operation="submit",
+            instance_id="i-0123456789abcdef0",
+            terminate_at=_AWS_TERMINATE_AT,
+            intent=training_intent,
+            published={
+                "intent_sha256": intent_sha256,
+                "intent_uri": (
+                    f"{backend.runtime.s3_root}/operations/intents/sha256/"
+                    f"{intent_sha256}.json"
+                ),
+            },
+            attempt=1,
+        )
+        for run in manifest.runs
+    ]
+    for state in states:
+        state["status"] = "SENDING"
+        state["send_attempted"] = True
+    backend.state_root.mkdir(parents=True)
+    (backend.state_root / f"intent-{intent_sha256}.json").write_bytes(
+        canonical_json(training_intent)
+    )
+    store = StateStore(backend.state_root)
+    with store.locked():
+        backend._write_paired_states(store, manifest, states)
+
+    receipts = _validated_operation_receipts(
+        training_intent,
+        returncode=0,
+    )
+    monkeypatch.setattr(
+        backend,
+        "_validate_selected_instance_binding",
+        lambda *_args, **_kwargs: {},
+    )
+
+    def no_command_lookup(**_kwargs):
+        raise AssertionError("receipt-only success must not query SSM commands")
+
+    monkeypatch.setattr(
+        backend,
+        "_find_operation_command",
+        no_command_lookup,
+    )
+    monkeypatch.setattr(
+        backend,
+        "_operation_receipt_exists",
+        lambda intent, *, kind: (
+            receipts[kind]
+            if intent["operation_id"] == training_intent["operation_id"]
+            else None
+        ),
+    )
+
+    def no_command_status(*_args, **_kwargs):
+        raise AssertionError("receipt-only success must not query command status")
+
+    monkeypatch.setattr(backend, "_command_status", no_command_status)
+    monkeypatch.setattr(backend, "_require_ssm_online", lambda *_: None)
+    monkeypatch.setattr(backend, "_ensure_argv_document", lambda: None)
+
+    def publish_intent(intent):
+        digest = hashlib.sha256(canonical_json(intent)).hexdigest()
+        return {
+            "intent_sha256": digest,
+            "intent_uri": (
+                f"{backend.runtime.s3_root}/operations/intents/sha256/"
+                f"{digest}.json"
+            ),
+            "version_id": "intent-version-1",
+        }
+
+    monkeypatch.setattr(backend, "_publish_operation_intent", publish_intent)
+    monkeypatch.setattr(
+        backend,
+        "_send_operation_intent",
+        lambda **_: "evaluation-command-12345678",
+    )
+
+    result = backend.evaluate(
+        release=release,
+        manifest=manifest,
+        approval_path=tmp_path / "approval.json",
+        apply=True,
+    )
+
+    assert result["status"] == "Pending"
+    assert result["command_id"] == "evaluation-command-12345678"
+    with store.locked():
+        reconciled = [
+            store.read_run(run.run_id) for run in manifest.runs
+        ]
+    assert {state["status"] for state in reconciled} == {
+        "REMOTE_TERMINAL_SUCCESS"
+    }
+    assert {state["command_id"] for state in reconciled} == {None}
+    assert backend.runner.calls == []
+
+
+def test_aws_resume_accepts_receipted_failure_without_command_status(
+    tmp_path,
+    monkeypatch,
+):
+    from msctl.aws_p5 import AwsP5Backend
+    from msctl.contracts import verify_checkpoint_receipt
+    from msctl.jsonutil import canonical_json
+    from msctl.state import StateStore
+
+    manifest = _aws_manifest_object()
+    release = _aws_release_object()
+    checkpoint_receipt = verify_checkpoint_receipt(
+        _aws_checkpoint_receipt(tmp_path, manifest),
+        release=release,
+        manifest=manifest,
+    )
+    backend = AwsP5Backend(
+        profile=_aws_profile_object(),
+        runtime=_aws_runtime_object(),
+        instance_profile_arn=(
+            "arn:aws:iam::123456789012:instance-profile/memorysplit-p5"
+        ),
+        state_root=tmp_path / "state",
+        runner=_FakeAwsRunner(),
+        approval_verifier=lambda **_: {},
+    )
+    training_intent = backend._operation_envelope(
+        backend._training_operation_intent(
+            operation="submit",
+            release=release,
+            manifest=manifest,
+            terminate_at=_AWS_TERMINATE_AT,
+        ),
+        instance_id="i-0123456789abcdef0",
+        terminate_at=_AWS_TERMINATE_AT,
+    )
+    intent_sha256 = hashlib.sha256(
+        canonical_json(training_intent)
+    ).hexdigest()
+    states = [
+        backend._new_aws_run_state(
+            run=run,
+            manifest=manifest,
+            operation="submit",
+            instance_id="i-0123456789abcdef0",
+            terminate_at=_AWS_TERMINATE_AT,
+            intent=training_intent,
+            published={
+                "intent_sha256": intent_sha256,
+                "intent_uri": (
+                    f"{backend.runtime.s3_root}/operations/intents/sha256/"
+                    f"{intent_sha256}.json"
+                ),
+            },
+            attempt=1,
+        )
+        for run in manifest.runs
+    ]
+    for state in states:
+        state["status"] = "SENDING"
+        state["send_attempted"] = True
+    backend.state_root.mkdir(parents=True)
+    (backend.state_root / f"intent-{intent_sha256}.json").write_bytes(
+        canonical_json(training_intent)
+    )
+    store = StateStore(backend.state_root)
+    with store.locked():
+        backend._write_paired_states(store, manifest, states)
+
+    bad_checkpoints = list(checkpoint_receipt.checkpoints)
+    bad_checkpoints[0] = SimpleNamespace(
+        **{
+            **vars(bad_checkpoints[0]),
+            "config_sha256": "f" * 64,
+        }
+    )
+    bad_receipt = SimpleNamespace(
+        **{
+            **vars(checkpoint_receipt),
+            "checkpoints": tuple(bad_checkpoints),
+        }
+    )
+    with pytest.raises(Exception) as invalid_checkpoint:
+        backend.resume(
+            release=release,
+            manifest=manifest,
+            checkpoint_receipt=bad_receipt,
+            approval_path=tmp_path / "approval.json",
+            apply=True,
+        )
+    assert getattr(invalid_checkpoint.value, "code", None) == (
+        "CHECKPOINT_PROVENANCE_MISMATCH"
+    )
+    assert backend.runner.calls == []
+
+    receipts = _validated_operation_receipts(
+        training_intent,
+        returncode=17,
+    )
+    monkeypatch.setattr(
+        backend,
+        "_validate_selected_instance_binding",
+        lambda *_args, **_kwargs: {},
+    )
+
+    def no_command_lookup(**_kwargs):
+        raise AssertionError("receipt-only failure must not query SSM commands")
+
+    monkeypatch.setattr(
+        backend,
+        "_find_operation_command",
+        no_command_lookup,
+    )
+    monkeypatch.setattr(
+        backend,
+        "_operation_receipt_exists",
+        lambda intent, *, kind: (
+            receipts[kind]
+            if intent["operation_id"] == training_intent["operation_id"]
+            else None
+        ),
+    )
+
+    def no_command_status(*_args, **_kwargs):
+        raise AssertionError("receipt-only failure must not query command status")
+
+    monkeypatch.setattr(backend, "_command_status", no_command_status)
+    monkeypatch.setattr(backend, "_require_ssm_online", lambda *_: None)
+    monkeypatch.setattr(backend, "_ensure_argv_document", lambda: None)
+    monkeypatch.setattr(
+        backend,
+        "_checkpoint_publication",
+        lambda **_: {
+            "receipt_sha256": checkpoint_receipt.sha256,
+            "objects": [],
+            "commands": [],
+            "verified": True,
+        },
+    )
+
+    def publish_intent(intent):
+        digest = hashlib.sha256(canonical_json(intent)).hexdigest()
+        return {
+            "intent_sha256": digest,
+            "intent_uri": (
+                f"{backend.runtime.s3_root}/operations/intents/sha256/"
+                f"{digest}.json"
+            ),
+            "version_id": "intent-version-1",
+        }
+
+    monkeypatch.setattr(backend, "_publish_operation_intent", publish_intent)
+    monkeypatch.setattr(
+        backend,
+        "_send_operation_intent",
+        lambda **_: "resume-command-12345678",
+    )
+
+    result = backend.resume(
+        release=release,
+        manifest=manifest,
+        checkpoint_receipt=checkpoint_receipt,
+        approval_path=tmp_path / "approval.json",
+        apply=True,
+    )
+
+    assert result["status"] == "Pending"
+    assert result["attempt"] == 2
+    with store.locked():
+        resumed = [store.read_run(run.run_id) for run in manifest.runs]
+    assert {state["operation"] for state in resumed} == {"resume"}
+    assert {tuple(state["prior_command_ids"]) for state in resumed} == {()}
+    assert {state["checkpoint_receipt_sha256"] for state in resumed} == {
+        checkpoint_receipt.sha256
+    }
+    assert backend.runner.calls == []
+
+
+def test_aws_evaluation_uses_canonical_confirmatory_runner_interface(tmp_path):
+    from msctl.aws_p5 import AwsP5Backend
+    from msctl.state import StateStore
+
+    manifest = _aws_manifest_object()
+    release = _aws_release_object()
     backend = AwsP5Backend(
         profile=_aws_profile_object(),
         runtime=_aws_runtime_object(),
@@ -6070,13 +6755,31 @@ def test_aws_evaluation_uses_canonical_confirmatory_runner_interface(tmp_path):
         state_root=tmp_path / "state",
         runner=_FakeAwsRunner(),
     )
+    states = [
+        _aws_run_state(
+            backend,
+            release,
+            manifest,
+            run,
+            status="Success",
+            command_id="training-command-12345678",
+        )
+        for run in manifest.runs
+    ]
+    store = StateStore(backend.state_root)
+    with store.locked():
+        backend._write_paired_states(store, manifest, states)
 
     planned = backend.evaluate(
-        release=_aws_release_object(),
+        release=release,
         manifest=manifest,
         approval_path=None,
         apply=False,
     )
+    assert planned["approval_resources"]["instance_id"] == (
+        "i-0123456789abcdef0"
+    )
+    assert planned["approval_resources"]["terminate_at"] == _AWS_TERMINATE_AT
 
     commands = planned["operation_intent"]["steps"]
     assert len(commands) == 2
@@ -6085,7 +6788,7 @@ def test_aws_evaluation_uses_canonical_confirmatory_runner_interface(tmp_path):
         image_index = argv.index(_aws_runtime_object().container_image)
         assert argv[:2] == ["/usr/bin/docker", "run"]
         assert argv[image_index + 1 : image_index + 5] == [
-            "/usr/bin/python3",
+            "/opt/venv/bin/python",
             "-m",
             "evals.confirmatory",
             "evaluate",

@@ -16,7 +16,14 @@ from evals.confirmatory.contracts import (
 
 
 STUDY_LOCK_SCHEMA = "memorysplit.confirmatory.study-lock.v2"
+STUDY_LOCK_SCHEMA_V3 = "memorysplit.confirmatory.study-lock.v3"
 VALIDITY_EVIDENCE_SCHEMA = "memorysplit.confirmatory.validity-evidence.v2"
+VALIDITY_EVIDENCE_SCHEMA_V3 = (
+    "memorysplit.confirmatory.validity-evidence.v3"
+)
+V3_CONTRACT_VERSION = 3
+LEGACY_CONFIRMATORY_SEEDS = tuple(range(5))
+V3_CONFIRMATORY_SEEDS = tuple(range(10))
 FROZEN_PREREGISTRATION_SHA256 = (
     "fee38e363298d3def46b741320c9d7df4523d0ff3cd249187cf52d54046cbbf0"
 )
@@ -88,8 +95,13 @@ def _integer(value: object, name: str) -> int:
     return value
 
 
-def _schema(value: object, name: str) -> int:
-    if type(value) is not int or value != CONTRACT_VERSION:
+def _schema(
+    value: object,
+    name: str,
+    *,
+    expected: int = CONTRACT_VERSION,
+) -> int:
+    if type(value) is not int or value != expected:
         raise ValueError(f"{name} schema_version is invalid")
     return value
 
@@ -270,6 +282,7 @@ class ReleaseBinding:
     required_strata: tuple[str, ...]
     required_memory_modes: tuple[str, ...]
     required_controls: tuple[str, ...]
+    sealed_fixture_sha256: str | None = None
 
     FIELDS: ClassVar[frozenset[str]] = frozenset(
         {
@@ -291,6 +304,9 @@ class ReleaseBinding:
             "required_controls",
         }
     )
+    V3_FIELDS: ClassVar[frozenset[str]] = FIELDS | {
+        "sealed_fixture_sha256"
+    }
 
     def __post_init__(self) -> None:
         for field in (
@@ -355,13 +371,28 @@ class ReleaseBinding:
                 field,
                 _ordered_strings(getattr(self, field), field, expected=expected),
             )
+        if self.sealed_fixture_sha256 is not None:
+            object.__setattr__(
+                self,
+                "sealed_fixture_sha256",
+                _hash(
+                    self.sealed_fixture_sha256,
+                    "sealed_fixture_sha256",
+                ),
+            )
 
     @classmethod
     def from_dict(cls, raw: Mapping[str, Any]) -> "ReleaseBinding":
         return cls(**dict(_strict_fields(raw, cls.FIELDS, "release binding")))
 
+    @classmethod
+    def from_v3_dict(cls, raw: Mapping[str, Any]) -> "ReleaseBinding":
+        return cls(
+            **dict(_strict_fields(raw, cls.V3_FIELDS, "v3 release binding"))
+        )
+
     def to_dict(self) -> dict[str, Any]:
-        return {
+        value = {
             "items_sha256": self.items_sha256,
             "sealed_gold_sha256": self.sealed_gold_sha256,
             "stores_sha256": self.stores_sha256,
@@ -381,6 +412,9 @@ class ReleaseBinding:
             "required_memory_modes": list(self.required_memory_modes),
             "required_controls": list(self.required_controls),
         }
+        if self.sealed_fixture_sha256 is not None:
+            value["sealed_fixture_sha256"] = self.sealed_fixture_sha256
+        return value
 
 
 @dataclass(frozen=True)
@@ -404,17 +438,25 @@ class StudyLock:
     )
 
     def __post_init__(self) -> None:
-        if self.record_type != STUDY_LOCK_SCHEMA:
+        if self.record_type not in {STUDY_LOCK_SCHEMA, STUDY_LOCK_SCHEMA_V3}:
             raise ValueError("study lock record_type is invalid")
-        _schema(self.schema_version, "study lock")
+        is_v3 = self.record_type == STUDY_LOCK_SCHEMA_V3
+        _schema(
+            self.schema_version,
+            "study lock",
+            expected=V3_CONTRACT_VERSION if is_v3 else CONTRACT_VERSION,
+        )
         preregistration = _hash(
             self.preregistration_sha256,
             "preregistration_sha256",
         )
-        if preregistration != FROZEN_PREREGISTRATION_SHA256:
+        if not is_v3 and preregistration != FROZEN_PREREGISTRATION_SHA256:
             raise ValueError("study lock preregistration commitment is invalid")
         object.__setattr__(self, "preregistration_sha256", preregistration)
-        if not isinstance(self.release, ReleaseBinding):
+        if (
+            not isinstance(self.release, ReleaseBinding)
+            or is_v3 != (self.release.sealed_fixture_sha256 is not None)
+        ):
             raise ValueError("study lock release is invalid")
         checkpoints = tuple(
             checkpoint
@@ -430,15 +472,23 @@ class StudyLock:
             raise ValueError("study lock checkpoints are not ordered")
         if len(set(checkpoint_keys)) != len(checkpoint_keys):
             raise ValueError("study lock checkpoints contain duplicate slots")
+        required_seeds = (
+            V3_CONFIRMATORY_SEEDS if is_v3 else LEGACY_CONFIRMATORY_SEEDS
+        )
         required_slots = {
             (seed, condition)
-            for seed in range(5)
+            for seed in required_seeds
             for condition in (ConditionId.DENSE, ConditionId.SPLIT90)
         }
-        if not required_slots <= {
+        observed_slots = {
             (checkpoint.seed, checkpoint.condition_id)
             for checkpoint in checkpoints
-        }:
+        }
+        if (
+            required_slots != observed_slots
+            if is_v3
+            else not required_slots <= observed_slots
+        ):
             raise ValueError("study lock omits a protected Dense/Split90 slot")
         object.__setattr__(self, "checkpoints", checkpoints)
         commitments = tuple(
@@ -459,11 +509,16 @@ class StudyLock:
     @classmethod
     def from_dict(cls, raw: Mapping[str, Any]) -> "StudyLock":
         value = _strict_fields(raw, cls.FIELDS, "study lock")
+        is_v3 = value["record_type"] == STUDY_LOCK_SCHEMA_V3
         return cls(
             record_type=value["record_type"],
             schema_version=value["schema_version"],
             preregistration_sha256=value["preregistration_sha256"],
-            release=ReleaseBinding.from_dict(value["release"]),
+            release=(
+                ReleaseBinding.from_v3_dict(value["release"])
+                if is_v3
+                else ReleaseBinding.from_dict(value["release"])
+            ),
             checkpoints=value["checkpoints"],
             validity_receipts=value["validity_receipts"],
         )
@@ -482,6 +537,18 @@ class StudyLock:
                 for commitment in self.validity_receipts
             ],
         }
+
+    @property
+    def is_v3(self) -> bool:
+        return self.record_type == STUDY_LOCK_SCHEMA_V3
+
+    @property
+    def confirmatory_seeds(self) -> tuple[int, ...]:
+        return (
+            V3_CONFIRMATORY_SEEDS
+            if self.is_v3
+            else LEGACY_CONFIRMATORY_SEEDS
+        )
 
 
 @dataclass(frozen=True)
@@ -546,9 +613,17 @@ class ValidityEvidence:
     )
 
     def __post_init__(self) -> None:
-        if self.record_type != VALIDITY_EVIDENCE_SCHEMA:
+        if self.record_type not in {
+            VALIDITY_EVIDENCE_SCHEMA,
+            VALIDITY_EVIDENCE_SCHEMA_V3,
+        }:
             raise ValueError("validity evidence record_type is invalid")
-        _schema(self.schema_version, "validity evidence")
+        is_v3 = self.record_type == VALIDITY_EVIDENCE_SCHEMA_V3
+        _schema(
+            self.schema_version,
+            "validity evidence",
+            expected=V3_CONTRACT_VERSION if is_v3 else CONTRACT_VERSION,
+        )
         object.__setattr__(
             self,
             "study_lock_sha256",
@@ -558,7 +633,7 @@ class ValidityEvidence:
             self.preregistration_sha256,
             "preregistration_sha256",
         )
-        if preregistration != FROZEN_PREREGISTRATION_SHA256:
+        if not is_v3 and preregistration != FROZEN_PREREGISTRATION_SHA256:
             raise ValueError("validity evidence preregistration is invalid")
         object.__setattr__(self, "preregistration_sha256", preregistration)
         receipts = tuple(
@@ -617,6 +692,13 @@ def evaluate_readiness(
     lock: StudyLock,
     evidence: ValidityEvidence,
 ) -> ReadinessResult:
+    expected_evidence_schema = (
+        VALIDITY_EVIDENCE_SCHEMA_V3
+        if lock.is_v3
+        else VALIDITY_EVIDENCE_SCHEMA
+    )
+    if evidence.record_type != expected_evidence_schema:
+        raise ValueError("validity evidence schema disagrees with study lock")
     if evidence.study_lock_sha256 != canonical_sha256(lock.to_dict()):
         raise ValueError("validity evidence study-lock commitment mismatch")
     if evidence.preregistration_sha256 != lock.preregistration_sha256:

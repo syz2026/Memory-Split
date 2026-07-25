@@ -1,4 +1,4 @@
-"""Strict five-seed cohort assignment and run-config contract."""
+"""Strict v2/v3 cohort assignment and run-config contracts."""
 
 from __future__ import annotations
 
@@ -17,16 +17,24 @@ from .errors import MsctlError
 COHORT_ID = "memorysplit-confirmatory-v2-360m-n5"
 ILLUMINA_PROVIDER = "illumina-usfc-prd"
 AWS_PROVIDER = "aws-p5.48xlarge"
+V3_COHORT_ID = "memorysplit-confirmatory-v3-360m-n10-aws"
+V3_SCIENTIFIC_PROVIDER = "aws-p5.48xlarge-v3"
 MODEL_PARAMETERS = 356_033_536
 TARGETS_PER_UPDATE = 524_288
 OPTIMIZER_STEPS = 13_582
 RAW_TARGET_TOKENS = 7_120_879_616
 SEEDS = tuple(range(5))
+V3_SEEDS = tuple(range(10))
 ARMS = ("dense", "split90")
 SNAPSHOT_STEPS = (1_358, 3_396, 6_791, 10_187, 13_582)
 _RUN_CONFIG_PATHS = frozenset(
     f"configs/360m-v2/{arm}-s{seed}.yaml"
     for seed in SEEDS
+    for arm in ARMS
+)
+_V3_RUN_CONFIG_PATHS = frozenset(
+    f"configs/360m-v3/{arm}-s{seed}.yaml"
+    for seed in V3_SEEDS
     for arm in ARMS
 )
 _ASSIGNMENT_FIELDS = {
@@ -94,7 +102,7 @@ class CohortRunConfig:
 
 @dataclass(frozen=True)
 class CohortAssignment:
-    """The frozen provider assignment and its ten validated run configs."""
+    """A frozen provider assignment and its validated paired run configs."""
 
     cohort_id: str
     model_parameters: int
@@ -106,12 +114,24 @@ class CohortAssignment:
     configs: tuple[CohortRunConfig, ...]
     assignment_sha256: str
     preregistration_sha256: str
+    schema_version: int = 2
+    provider_seed_map: tuple[tuple[str, tuple[int, ...]], ...] = ()
 
     @property
     def config_sha256s(self) -> dict[str, str]:
         return {config.path: config.sha256 for config in self.configs}
 
     def configs_for_provider(self, provider: str) -> tuple[CohortRunConfig, ...]:
+        if self.provider_seed_map:
+            providers = dict(self.provider_seed_map)
+            if provider not in providers:
+                raise MsctlError(
+                    "COHORT_INVALID",
+                    "cohort provider is unsupported",
+                    details={"provider": provider},
+                )
+            seeds = set(providers[provider])
+            return tuple(config for config in self.configs if config.seed in seeds)
         if provider == ILLUMINA_PROVIDER:
             seeds = set(self.illumina_seeds)
         elif provider == AWS_PROVIDER:
@@ -470,6 +490,17 @@ def load_cohort_assignment_bytes(
         _fail("cohort assignment snapshot must be immutable bytes")
     if type(preregistration_data) is not bytes:
         _fail("preregistration snapshot must be immutable bytes")
+    assignment_value = _json_object(
+        assignment_data,
+        label="cohort assignment",
+    )
+    if assignment_value.get("schema_version") == 3:
+        return _load_v3_cohort_assignment_bytes(
+            assignment_data=assignment_data,
+            preregistration_data=preregistration_data,
+            config_data=config_data,
+            assignment_value=assignment_value,
+        )
     configs = dict(config_data)
     if set(configs) != _RUN_CONFIG_PATHS or not all(
         isinstance(path, str) and type(data) is bytes
@@ -482,8 +513,7 @@ def load_cohort_assignment_bytes(
                 "unknown": sorted(set(configs) - _RUN_CONFIG_PATHS),
             },
         )
-    value = _json_object(assignment_data, label="cohort assignment")
-    illumina, aws = _validate_assignment(value)
+    illumina, aws = _validate_assignment(assignment_value)
     preregistration_sha256, preregistered_snapshot_steps = (
         _validate_preregistration(preregistration_data)
     )
@@ -523,10 +553,276 @@ def load_cohort_assignment_bytes(
     )
 
 
+def _validate_v3_preregistration(data: bytes) -> tuple[str, tuple[int, ...]]:
+    value = _yaml_object(data, label="v3 preregistration")
+    protected = value.get("protected_cohort")
+    analysis = value.get("analysis")
+    hardware = value.get("hardware_execution_rule")
+    launch_gate = value.get("protected_launch_gate")
+    if not all(
+        isinstance(item, dict)
+        for item in (protected, analysis, hardware, launch_gate)
+    ):
+        _fail("v3 preregistration is missing a required contract section")
+    assert isinstance(protected, dict)
+    assert isinstance(analysis, dict)
+    assert isinstance(hardware, dict)
+    assert isinstance(launch_gate, dict)
+    training = protected.get("training")
+    fixed = analysis.get("fixed_checkpoint_aulc")
+    if not isinstance(training, dict) or not isinstance(fixed, dict):
+        _fail("v3 preregistration training or checkpoint schedule is missing")
+    seeds_value = protected.get("seeds")
+    if not isinstance(seeds_value, list):
+        _fail("v3 preregistration seeds must be a list")
+    seeds = tuple(
+        _require_int(seed, label=f"v3 preregistration seed[{index}]")
+        for index, seed in enumerate(seeds_value)
+    )
+    snapshots = _validate_snapshot_steps(
+        fixed.get("optimizer_steps"),
+        label="v3 preregistration snapshot_steps",
+        max_steps=OPTIMIZER_STEPS,
+    )
+    if (
+        value.get("schema_version") != 3
+        or value.get("cohort_id") != V3_COHORT_ID
+        or value.get("frozen") is not True
+        or value.get("current_scientific_status") != "incomplete"
+        or value.get("protected_outcomes_inspected") is not False
+        or value.get("protected_launch_allowed") is not False
+        or protected.get("condition_pair") != list(ARMS)
+        or protected.get("model_parameters") != MODEL_PARAMETERS
+        or protected.get("terminal_n_pairs") != len(V3_SEEDS)
+        or seeds != V3_SEEDS
+        or training.get("targets_per_update") != TARGETS_PER_UPDATE
+        or training.get("optimizer_steps") != OPTIMIZER_STEPS
+        or training.get("raw_target_tokens") != RAW_TARGET_TOKENS
+        or snapshots != SNAPSHOT_STEPS
+        or hardware.get("selected_profile_count") != 1
+        or hardware.get("same_profile_for_all_ten_pairs") is not True
+        or hardware.get("mixed_profiles_forbidden") is not True
+        or hardware.get("accelerator_groups")
+        != {"dense": 4, "split90": 4}
+        or hardware.get("concurrent_pairs_per_instance") != 1
+        or hardware.get("provisioning_by_msctl_forbidden") is not True
+        or launch_gate.get("all_required") is not True
+        or launch_gate.get("diagnostics_complete") is not False
+        or launch_gate.get("artifact_bindings_complete") is not False
+        or launch_gate.get("selected_profile_qualified") is not False
+    ):
+        _fail("v3 preregistration violates the frozen ten-pair contract")
+    return hashlib.sha256(data).hexdigest(), snapshots
+
+
+def _validate_v3_assignment(value: dict[str, object]) -> tuple[int, ...]:
+    _require_exact_fields(value, _ASSIGNMENT_FIELDS, label="v3 cohort assignment")
+    for field in (
+        "schema_version",
+        "model_parameters",
+        "optimizer_steps",
+        "raw_target_tokens",
+        "targets_per_update",
+    ):
+        _require_int(value[field], label=f"v3 cohort assignment.{field}")
+    providers = value["provider_seeds"]
+    if not isinstance(providers, dict) or set(providers) != {
+        V3_SCIENTIFIC_PROVIDER
+    }:
+        _fail("v3 cohort assignment provider_seeds is invalid")
+    raw_seeds = providers[V3_SCIENTIFIC_PROVIDER]
+    if not isinstance(raw_seeds, list):
+        _fail("v3 cohort provider seeds must be a list")
+    seeds = tuple(
+        _require_int(seed, label="v3 cohort provider seed")
+        for seed in raw_seeds
+    )
+    if (
+        value["schema_version"] != 3
+        or value["cohort_id"] != V3_COHORT_ID
+        or value["model_parameters"] != MODEL_PARAMETERS
+        or value["targets_per_update"] != TARGETS_PER_UPDATE
+        or value["optimizer_steps"] != OPTIMIZER_STEPS
+        or value["raw_target_tokens"] != RAW_TARGET_TOKENS
+        or TARGETS_PER_UPDATE * OPTIMIZER_STEPS != RAW_TARGET_TOKENS
+        or seeds != V3_SEEDS
+        or len(set(seeds)) != len(seeds)
+    ):
+        _fail("v3 cohort assignment does not match the frozen ten-seed contract")
+    return seeds
+
+
+def _expected_v3_config(
+    seed: int,
+    arm: str,
+    snapshot_steps: tuple[int, ...],
+) -> dict[str, object]:
+    expected = _expected_config(seed, arm, snapshot_steps)
+    expected.update(
+        {
+            "schema_version": 3,
+            "cohort_id": V3_COHORT_ID,
+            "run_id": f"memorysplit-v3-360m-s{seed}-{arm}",
+        }
+    )
+    return expected
+
+
+def _load_v3_run_config(
+    data: bytes,
+    *,
+    relative: str,
+    seed: int,
+    arm: str,
+) -> CohortRunConfig:
+    value = _yaml_object(data, label=f"v3 run config {relative}")
+    _require_exact_fields(value, _CONFIG_FIELDS, label=f"v3 run config {relative}")
+    for field in _INTEGER_CONFIG_FIELDS:
+        _require_int(value[field], label=f"v3 run config {relative}.{field}")
+    for field in _FLOAT_CONFIG_FIELDS:
+        if isinstance(value[field], bool) or not isinstance(value[field], float):
+            _fail(f"v3 run config {relative}.{field} must be a float")
+    if not isinstance(value["compile"], bool):
+        _fail(f"v3 run config {relative}.compile must be boolean")
+    snapshot_steps = _validate_snapshot_steps(
+        value["snapshot_steps"],
+        label=f"v3 run config {relative}.snapshot_steps",
+        max_steps=value["max_steps"],
+    )
+    _portable_logical_path(
+        value["train_corpus"],
+        label=f"v3 run config {relative}.train_corpus",
+    )
+    _portable_logical_path(
+        value["out_dir"],
+        label=f"v3 run config {relative}.out_dir",
+    )
+    if value != _expected_v3_config(seed, arm, snapshot_steps):
+        _fail(f"v3 run config {relative} violates frozen Dense/Split90 invariants")
+    return CohortRunConfig(
+        path=relative,
+        sha256=hashlib.sha256(data).hexdigest(),
+        run_id=str(value["run_id"]),
+        condition=arm,
+        seed=seed,
+        snapshot_steps=snapshot_steps,
+    )
+
+
+def _load_v3_cohort_assignment_bytes(
+    *,
+    assignment_data: bytes,
+    preregistration_data: bytes,
+    config_data: Mapping[str, bytes],
+    assignment_value: dict[str, object] | None = None,
+) -> CohortAssignment:
+    configs = dict(config_data)
+    if set(configs) != _V3_RUN_CONFIG_PATHS or not all(
+        isinstance(path, str) and type(data) is bytes
+        for path, data in configs.items()
+    ):
+        _fail(
+            "v3 cohort config snapshot must contain exactly twenty immutable cells",
+            details={
+                "missing": sorted(_V3_RUN_CONFIG_PATHS - set(configs)),
+                "unknown": sorted(set(configs) - _V3_RUN_CONFIG_PATHS),
+            },
+        )
+    value = assignment_value or _json_object(
+        assignment_data,
+        label="v3 cohort assignment",
+    )
+    seeds = _validate_v3_assignment(value)
+    preregistration_sha256, preregistered_snapshots = (
+        _validate_v3_preregistration(preregistration_data)
+    )
+    parsed_configs = tuple(
+        _load_v3_run_config(
+            configs[f"configs/360m-v3/{arm}-s{seed}.yaml"],
+            relative=f"configs/360m-v3/{arm}-s{seed}.yaml",
+            seed=seed,
+            arm=arm,
+        )
+        for seed in V3_SEEDS
+        for arm in ARMS
+    )
+    if any(
+        config.snapshot_steps != preregistered_snapshots
+        for config in parsed_configs
+    ):
+        _fail("v3 run configs do not match the frozen checkpoint schedule")
+    return CohortAssignment(
+        cohort_id=V3_COHORT_ID,
+        model_parameters=MODEL_PARAMETERS,
+        targets_per_update=TARGETS_PER_UPDATE,
+        optimizer_steps=OPTIMIZER_STEPS,
+        raw_target_tokens=RAW_TARGET_TOKENS,
+        illumina_seeds=(),
+        aws_p5_seeds=seeds,
+        configs=parsed_configs,
+        assignment_sha256=hashlib.sha256(assignment_data).hexdigest(),
+        preregistration_sha256=preregistration_sha256,
+        schema_version=3,
+        provider_seed_map=((V3_SCIENTIFIC_PROVIDER, seeds),),
+    )
+
+
+def _load_v3_cohort_assignment(path: Path) -> CohortAssignment:
+    if path.name != "cohort-assignment-v3.json" or path.parent.name != "configs":
+        _fail("v3 cohort assignment must be configs/cohort-assignment-v3.json")
+    configs_root = path.parent
+    run_root = configs_root / "360m-v3"
+    if run_root.is_symlink() or not run_root.is_dir():
+        _fail("v3 cohort run-config directory must be a regular directory")
+    expected_names = {
+        PurePosixPath(relative).name for relative in _V3_RUN_CONFIG_PATHS
+    }
+    try:
+        actual_names = {entry.name for entry in run_root.iterdir()}
+    except OSError as error:
+        raise MsctlError(
+            "COHORT_INVALID",
+            "v3 cohort run-config directory cannot be read",
+        ) from error
+    if actual_names != expected_names:
+        _fail(
+            "v3 cohort run configs must contain exactly twenty paired cells",
+            details={
+                "missing": sorted(expected_names - actual_names),
+                "unknown": sorted(actual_names - expected_names),
+            },
+        )
+    repo_root = configs_root.parent
+    config_data: dict[str, bytes] = {}
+    for relative in sorted(_V3_RUN_CONFIG_PATHS):
+        candidate = repo_root / relative
+        try:
+            candidate.resolve(strict=True).relative_to(repo_root.resolve())
+        except (FileNotFoundError, ValueError) as error:
+            raise MsctlError(
+                "COHORT_INVALID",
+                "v3 cohort run config escapes the repository root",
+            ) from error
+        config_data[relative] = _read_regular(
+            candidate,
+            label=f"v3 run config {relative}",
+        )
+    return _load_v3_cohort_assignment_bytes(
+        assignment_data=_read_regular(path, label="v3 cohort assignment"),
+        preregistration_data=_read_regular(
+            configs_root / "preregistration-v3.yaml",
+            label="v3 preregistration",
+        ),
+        config_data=config_data,
+    )
+
+
 def load_cohort_assignment(path: Path | str) -> CohortAssignment:
     """Load and cross-check the canonical assignment, preregistration, and runs."""
 
     assignment_path = Path(path)
+    if assignment_path.name == "cohort-assignment-v3.json":
+        return _load_v3_cohort_assignment(assignment_path)
     if assignment_path.parent.name != "configs":
         _fail("cohort assignment must live directly under configs")
     configs_root = assignment_path.parent

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Render and supervise one symmetric Dense/Split90 P5 seed pair."""
+"""Render and supervise one profile-selected symmetric AWS GPU seed pair."""
 
 from __future__ import annotations
 
@@ -38,19 +38,29 @@ from cluster.aws.p5.corpus_contract import (
     verify_canonical_corpus,
 )
 from cluster.aws.p5.profile import (
-    AwsP5Profile,
-    AwsP5Runtime,
-    load_aws_p5_profile,
-    validate_runtime_environment,
+    AWS_P5_V3_PROFILE_ID,
+    AWS_P6_B300_V3_PROFILE_ID,
+    AwsGpuProfile,
+    AwsGpuRuntime,
+    load_aws_gpu_profile,
+    validate_aws_gpu_runtime_environment,
+)
+from cluster.aws.p5.terminal_artifacts import (
+    TerminalPublication,
+    publish_terminal_pair,
 )
 
 
+# Historical module constant retained for legacy receipt/import compatibility.
 PROVIDER = "aws-p5.48xlarge"
 COHORT_ID = "memorysplit-confirmatory-v2-360m-n5"
+V3_COHORT_ID = "memorysplit-confirmatory-v3-360m-n10-aws"
+_V3_PROFILE_IDS = frozenset(
+    {AWS_P5_V3_PROFILE_ID, AWS_P6_B300_V3_PROFILE_ID}
+)
 _ARMS = ("dense", "split90")
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
-_H100_RE = re.compile(r"^NVIDIA H100 80GB(?: HBM3)?$")
 _CONTAINER_IMAGE_RE = re.compile(
     r"^[A-Za-z0-9][A-Za-z0-9./:_-]*@sha256:[0-9a-f]{64}$"
 )
@@ -70,6 +80,38 @@ _MANIFEST_FIELDS = frozenset(
         "runs",
     }
 )
+_V3_PROVENANCE_FIELDS = frozenset(
+    {
+        "run_manifest_sha256",
+        "preregistration_sha256",
+        "hardware_amendment_sha256",
+        "provider_selection_sha256",
+        "sealed_fixture_sha256",
+        "fleet_plan_sha256",
+        "fleet_wave",
+        "launch_readiness_sha256",
+        "control_bundle_sha256",
+    }
+)
+_V3_MANIFEST_FIELDS = _MANIFEST_FIELDS | _V3_PROVENANCE_FIELDS
+_V3_RELEASE_METADATA_FIELDS = {
+    "schema_version",
+    "package_format_version",
+    "provider",
+    "selected_profile_id",
+    "source",
+    "seed_assignment",
+    "cohort_assignment",
+    "preregistration",
+    "hardware_amendment",
+    "profile",
+    "environment",
+    "dataset_pointer",
+    "container_base_lock",
+    "config_sha256",
+    "contract_locks",
+    "members",
+}
 _RUN_FIELDS = frozenset(
     {
         "arm",
@@ -109,6 +151,7 @@ _CONFIG_FIELDS = frozenset(
         "ckpt_minutes",
     }
 )
+_V3_CONFIG_FIELDS = (_CONFIG_FIELDS - {"snap_frac"}) | {"snapshot_steps"}
 _BOOTSTRAP_FIELDS = frozenset(
     {
         "schema_version",
@@ -154,6 +197,8 @@ class VerifiedFile:
 @dataclass(frozen=True)
 class ArmLaunch:
     arm: str
+    run_id: str
+    condition_id: str
     argv: tuple[str, ...]
     environment: Mapping[str, str]
     cwd: Path
@@ -172,13 +217,17 @@ class ArmLaunch:
     master_port: int
     cpu_affinity: tuple[int, int]
     data_loader_workers: int
+    max_steps: int
+    model_id: str
+    raw_token_count: int
+    route_dose_sha256: str
 
 
 @dataclass(frozen=True)
 class LaunchPlan:
     seed: int
-    profile: AwsP5Profile
-    runtime: AwsP5Runtime
+    profile: AwsGpuProfile
+    runtime: AwsGpuRuntime
     repo_root: Path
     scratch_root: Path
     manifest_path: Path
@@ -187,10 +236,12 @@ class LaunchPlan:
     release_sha256: str
     release_members_sha256: str
     corpus_receipt_sha256: str
+    ordered_stream_sha256: str
     code_commit: str
     container_image: str
     runtime_uid: int
     runtime_gid: int
+    launch_manifest: Mapping[str, object]
 
 
 @dataclass(frozen=True)
@@ -202,6 +253,12 @@ class SupervisionResult:
     peer_terminated: bool = False
     resumable: bool = False
     interruption_receipt: str | None = None
+    checkpoint_receipt: str | None = None
+    checkpoint_receipt_sha256: str | None = None
+    checkpoint_receipt_uri: str | None = None
+    checkpoint_record_paths: Mapping[str, str] | None = None
+    checkpoint_record_sha256: Mapping[str, str] | None = None
+    checkpoint_record_uris: Mapping[str, str] | None = None
 
 
 class ProcessHandle(Protocol):
@@ -301,10 +358,19 @@ def _canonical_pretty(value: object) -> bytes:
     ).encode("ascii")
 
 
+def _is_v3_profile(profile: AwsGpuProfile) -> bool:
+    return profile.profile_id in _V3_PROFILE_IDS
+
+
+def _cohort_id(profile: AwsGpuProfile) -> str:
+    return V3_COHORT_ID if _is_v3_profile(profile) else COHORT_ID
+
+
 def _validate_release_root(
     repo: Path,
     scratch: Path,
     *,
+    profile: AwsGpuProfile,
     release_sha256: str,
     release_members_sha256: str,
     code_commit: str,
@@ -385,21 +451,56 @@ def _validate_release_root(
         metadata = json.loads(metadata_bytes.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError) as error:
         raise LaunchError("release metadata must contain UTF-8 JSON") from error
+    assignment = metadata.get("seed_assignment") if isinstance(metadata, dict) else None
+    assignment_providers = {profile.provider}
+    if _is_v3_profile(profile):
+        # The hardware amendment may supersede the original scientific P5-v3
+        # assignment while the release itself remains selected-profile bound.
+        assignment_providers.add(AWS_P5_V3_PROFILE_ID)
+    valid_assignment = (
+        isinstance(assignment, dict)
+        and set(assignment) == {"arms", "cohort_id", "provider", "seeds"}
+        and assignment.get("arms") == ["dense", "split90"]
+        and assignment.get("cohort_id") == _cohort_id(profile)
+        and assignment.get("provider") in assignment_providers
+        and assignment.get("seeds") == list(profile.assigned_seeds)
+    )
+    v3_package = _is_v3_profile(profile)
+    source = metadata.get("source") if isinstance(metadata, dict) else None
+    valid_source = (
+        isinstance(source, dict)
+        and source.get("commit") == code_commit
+        and source.get("dirty") is False
+        and (
+            (
+                set(source) == {"commit", "dirty", "tree"}
+                and isinstance(source.get("tree"), str)
+                and re.fullmatch(
+                    r"(?:[0-9a-f]{40}|[0-9a-f]{64})",
+                    source["tree"],
+                )
+                is not None
+            )
+            if v3_package
+            else set(source) == {"commit", "dirty"}
+        )
+    )
     if (
         not isinstance(metadata, dict)
         or _canonical_pretty(metadata) != metadata_bytes
         or metadata.get("schema_version") != 1
-        or metadata.get("package_format_version") != 1
-        or metadata.get("provider") != PROVIDER
-        or metadata.get("source")
-        != {"commit": code_commit, "dirty": False}
-        or metadata.get("seed_assignment")
-        != {
-            "arms": ["dense", "split90"],
-            "cohort_id": COHORT_ID,
-            "provider": PROVIDER,
-            "seeds": [1, 2, 3, 4],
-        }
+        or metadata.get("package_format_version")
+        != ("aws-gpu-v3" if v3_package else 1)
+        or metadata.get("provider") != profile.provider
+        or (
+            v3_package
+            and (
+                set(metadata) != _V3_RELEASE_METADATA_FIELDS
+                or metadata.get("selected_profile_id") != profile.profile_id
+            )
+        )
+        or not valid_source
+        or not valid_assignment
     ):
         raise LaunchError("release metadata identity does not match")
     rows = metadata.get("members")
@@ -509,7 +610,7 @@ def _load_config(path: Path) -> dict[str, object]:
         scalar = raw_value.strip()
         if (
             not scalar
-            or scalar[0] in "[{&*!|>@`"
+            or scalar[0] in "{&*!|>@`"
             or " #" in scalar
             or "\t" in scalar
         ):
@@ -525,6 +626,15 @@ def _load_config(path: Path) -> dict[str, object]:
             scalar,
         ):
             parsed = float(scalar)
+        elif scalar.startswith("[") and scalar.endswith("]"):
+            try:
+                parsed = json.loads(scalar)
+            except json.JSONDecodeError as error:
+                raise LaunchError("config list scalar is invalid") from error
+            if not isinstance(parsed, list) or any(
+                type(item) is not int for item in parsed
+            ):
+                raise LaunchError("config list scalar must contain integers")
         elif scalar.startswith('"') and scalar.endswith('"'):
             try:
                 parsed = json.loads(scalar)
@@ -539,7 +649,11 @@ def _load_config(path: Path) -> dict[str, object]:
         else:
             raise LaunchError("config contains an unsupported YAML scalar")
         value[key] = parsed
-    _exact_fields(value, _CONFIG_FIELDS, label="config")
+    _exact_fields(
+        value,
+        _V3_CONFIG_FIELDS if value.get("schema_version") == 3 else _CONFIG_FIELDS,
+        label="config",
+    )
     return value
 
 
@@ -554,11 +668,16 @@ def _validate_config(
     seed: int,
     arm: str,
     corpus_path: str,
+    v3: bool = False,
 ) -> str:
     expected = {
-        "schema_version": 2,
-        "cohort_id": COHORT_ID,
-        "run_id": f"memorysplit-v2-360m-s{seed}-{arm}",
+        "schema_version": 3 if v3 else 2,
+        "cohort_id": V3_COHORT_ID if v3 else COHORT_ID,
+        "run_id": (
+            f"memorysplit-v3-360m-s{seed}-{arm}"
+            if v3
+            else f"memorysplit-v2-360m-s{seed}-{arm}"
+        ),
         "condition": arm,
         "seed": seed,
         "model": "d360m",
@@ -581,9 +700,12 @@ def _validate_config(
         "device": "cuda",
         "log_every": 20,
         "eval_every": 250,
-        "snap_frac": 0.1,
         "ckpt_minutes": 30,
     }
+    if v3:
+        expected["snapshot_steps"] = [1_358, 3_396, 6_791, 10_187, 13_582]
+    else:
+        expected["snap_frac"] = 0.1
     for name, expected_value in expected.items():
         actual = config[name]
         if isinstance(expected_value, int) and not isinstance(
@@ -609,8 +731,8 @@ def _validate_bootstrap_receipt(
     path: Path,
     *,
     expected_sha256: str,
-    profile: AwsP5Profile,
-    runtime: AwsP5Runtime,
+    profile: AwsGpuProfile,
+    runtime: AwsGpuRuntime,
     release_sha256: str,
     release_members_sha256: str,
     cohort_sha256: str,
@@ -627,9 +749,9 @@ def _validate_bootstrap_receipt(
     _exact_fields(receipt, _BOOTSTRAP_FIELDS, label="bootstrap receipt")
     expected = {
         "schema_version": 2,
-        "receipt_type": "aws-p5-bootstrap",
-        "provider": PROVIDER,
-        "instance_type": "p5.48xlarge",
+        "receipt_type": profile.bootstrap_receipt_type,
+        "provider": profile.provider,
+        "instance_type": profile.instance_type,
         "region": runtime.region,
         "ami_id": runtime.ami_id,
         "container_digest": runtime.container_digest,
@@ -766,14 +888,20 @@ def _default_port_available(port: int) -> bool:
         sock.close()
 
 
-def _arm_by_name(runs: object) -> dict[str, dict[str, object]]:
+def _arm_by_name(
+    runs: object,
+) -> dict[str, dict[str, object]]:
     if not isinstance(runs, list) or len(runs) != 2:
         raise LaunchError("run manifest must contain one complete pair")
     result = {}
     for run in runs:
         if not isinstance(run, dict):
             raise LaunchError("run manifest pair entries must be objects")
-        _exact_fields(run, _RUN_FIELDS, label="run manifest entry")
+        _exact_fields(
+            run,
+            _RUN_FIELDS,
+            label="run manifest entry",
+        )
         arm = run["arm"]
         if arm not in _ARMS or arm in result:
             raise LaunchError("run manifest must contain a unique explicit pair")
@@ -804,20 +932,23 @@ def load_launch_plan(
 ) -> LaunchPlan:
     """Validate all trust roots and return an immutable paired launch plan."""
 
-    profile = load_aws_p5_profile(profile_path)
+    profile = load_aws_gpu_profile(profile_path)
     try:
-        runtime = validate_runtime_environment(profile, environment)
+        runtime = validate_aws_gpu_runtime_environment(profile, environment)
     except ValueError as error:
         raise LaunchError(str(error)) from error
     if type(seed) is not int or seed not in profile.assigned_seeds:
-        raise LaunchError("seed must be assigned to AWS: one of 1, 2, 3, 4")
+        choices = ", ".join(str(item) for item in profile.assigned_seeds)
+        raise LaunchError(f"seed must be assigned to AWS: one of {choices}")
     actual_instance_type = (
         _default_instance_type()
         if observed_instance_type is None
         else observed_instance_type
     )
-    if actual_instance_type != "p5.48xlarge":
-        raise LaunchError("launch requires an actual p5.48xlarge instance")
+    if actual_instance_type != profile.instance_type:
+        raise LaunchError(
+            f"launch requires an actual {profile.instance_type} instance"
+        )
     actual_instance_id = (
         _default_instance_id()
         if observed_instance_id is None
@@ -847,10 +978,12 @@ def load_launch_plan(
         if gpu_names is None
         else tuple(gpu_names)
     )
-    if len(actual_gpu_names) != 8:
-        raise LaunchError("launch requires exactly eight H100 devices")
-    if any(_H100_RE.fullmatch(name) is None for name in actual_gpu_names):
-        raise LaunchError("launch requires eight NVIDIA H100 80GB devices")
+    if len(actual_gpu_names) != profile.allocated_gpus:
+        raise LaunchError("launch requires exactly eight profile GPU devices")
+    if any(not profile.matches_gpu_name(name) for name in actual_gpu_names):
+        raise LaunchError(
+            f"launch requires eight {profile.gpu_model} devices"
+        )
 
     repo = Path(repo_root).resolve(strict=True)
     scratch = Path(scratch_root).resolve(strict=True)
@@ -860,16 +993,27 @@ def load_launch_plan(
         os.path.abspath(profile.scratch_root)
     ):
         raise LaunchError(
-            "scratch root must be exactly the profile /mnt/memorysplit path"
+            f"scratch root must be exactly {profile.scratch_root}"
         )
     manifest_file = Path(manifest_path)
     manifest_digest = _hash_regular(manifest_file, label="run manifest")
     manifest = _load_json(manifest_file, label="run manifest")
-    _exact_fields(manifest, _MANIFEST_FIELDS, label="run manifest")
-    _exact_int(manifest["schema_version"], 1, label="manifest schema version")
-    if manifest["provider"] != PROVIDER:
-        raise LaunchError("run manifest provider must be aws-p5.48xlarge")
-    if manifest["cohort_id"] != COHORT_ID:
+    is_v3 = _is_v3_profile(profile)
+    _exact_fields(
+        manifest,
+        _V3_MANIFEST_FIELDS if is_v3 else _MANIFEST_FIELDS,
+        label="run manifest",
+    )
+    _exact_int(
+        manifest["schema_version"],
+        3 if is_v3 else 1,
+        label="manifest schema version",
+    )
+    if manifest["provider"] != profile.provider:
+        raise LaunchError(
+            f"run manifest provider must be {profile.provider}"
+        )
+    if manifest["cohort_id"] != _cohort_id(profile):
         raise LaunchError("run manifest cohort ID does not match")
     if type(manifest["seed"]) is not int or manifest["seed"] != seed:
         raise LaunchError("run manifest seed does not match assigned seed")
@@ -889,6 +1033,14 @@ def load_launch_plan(
         manifest["cohort_assignment_sha256"],
         label="manifest cohort assignment",
     )
+    if is_v3:
+        for field in _V3_PROVENANCE_FIELDS - {"fleet_wave"}:
+            _sha256(
+                manifest[field],
+                label=f"manifest {field.replace('_', ' ')}",
+            )
+        if type(manifest["fleet_wave"]) is not int or manifest["fleet_wave"] < 0:
+            raise LaunchError("manifest fleet wave must be a nonnegative integer")
     code_commit = _commit(manifest["code_commit"])
 
     corpus_binding = manifest["corpus_receipt"]
@@ -964,6 +1116,7 @@ def load_launch_plan(
         _validate_release_root(
             repo,
             scratch,
+            profile=profile,
             release_sha256=release_sha256,
             release_members_sha256=release_members_sha256,
             code_commit=code_commit,
@@ -971,15 +1124,41 @@ def load_launch_plan(
     )
 
     runs = _arm_by_name(manifest["runs"])
+    route_dose_by_sidecar = {
+        str(record["name"]): _sha256(
+            record["stream_sha256"],
+            label=f"{record['name']} stream",
+        )
+        for record in corpus_evidence.receipt["sidecar_sets"]
+    }
     parsed_runs = []
     ports = []
     worker_budgets = []
-    for arm, expected_port_offset, expected_affinity in (
-        ("dense", 0, (0, 95)),
-        ("split90", 1, (96, 191)),
+    for (
+        arm,
+        expected_port_offset,
+        expected_affinity,
+        gpu_offset,
+        group_size,
+    ) in (
+        (
+            "dense",
+            0,
+            profile.cpu_affinity_halves[0],
+            0,
+            profile.train_groups[0],
+        ),
+        (
+            "split90",
+            1,
+            profile.cpu_affinity_halves[1],
+            profile.train_groups[0],
+            profile.train_groups[1],
+        ),
     ):
         run = runs[arm]
-        expected_config = f"configs/360m-v2/{arm}-s{seed}.yaml"
+        config_version = "v3" if is_v3 else "v2"
+        expected_config = f"configs/360m-{config_version}/{arm}-s{seed}.yaml"
         config_relative = _portable_relative(
             run["config"], label=f"{arm} config path"
         )
@@ -999,7 +1178,18 @@ def load_launch_plan(
             seed=seed,
             arm=arm,
             corpus_path="dataset/corpus-receipt.json",
+            v3=is_v3,
         )
+        run_id = str(config["run_id"])
+        condition_id = str(config["condition"])
+        max_steps = int(config["max_steps"])
+        sidecar_name = str(config["sidecar_name"])
+        try:
+            route_dose_sha256 = route_dose_by_sidecar[sidecar_name]
+        except KeyError as error:
+            raise LaunchError(
+                f"{arm} route-dose sidecar is absent from the verified corpus"
+            ) from error
         out_dir = _inside_output(
             scratch, out_relative, label=f"{arm} output"
         )
@@ -1021,7 +1211,9 @@ def load_launch_plan(
             or any(type(item) is not int for item in affinity)
             or tuple(affinity) != expected_affinity
         ):
-            raise LaunchError(f"{arm} CPU affinity must use one P5 CPU half")
+            raise LaunchError(
+                f"{arm} CPU affinity must use its profile CPU half"
+            )
         workers = run["data_loader_workers"]
         if type(workers) is not int or workers <= 0 or workers > 48:
             raise LaunchError(f"{arm} data-loader worker budget is invalid")
@@ -1091,7 +1283,9 @@ def load_launch_plan(
             / f"seed-{seed}"
             / f"{arm}.json"
         )
-        gpu_ids = "0,1,2,3" if arm == "dense" else "4,5,6,7"
+        gpu_ids = ",".join(
+            str(index) for index in range(gpu_offset, gpu_offset + group_size)
+        )
         container_name = f"memorysplit-s{seed}-{arm}"
         cidfile_path = (
             scratch
@@ -1142,7 +1336,7 @@ def load_launch_plan(
             "--pids-limit",
             "4096",
             "--tmpfs",
-            "/tmp:rw,noexec,nosuid,nodev,size=4g",
+            "/tmp:rw,exec,nosuid,nodev,size=4g",
             "--mount",
             f"type=bind,src={mount_values['release']},dst=/workspace,readonly",
             "--mount",
@@ -1165,11 +1359,11 @@ def load_launch_plan(
             "--env",
             "PYTHONUNBUFFERED=1",
             container_image,
-            "/opt/conda/bin/python",
+            "/opt/venv/bin/python",
             "-m",
             "torch.distributed.run",
             "--nnodes=1",
-            "--nproc_per_node=4",
+            f"--nproc_per_node={group_size}",
             "--rdzv_backend=c10d",
             f"--rdzv_endpoint=127.0.0.1:{port}",
             "/workspace/scripts/run_train.py",
@@ -1181,6 +1375,8 @@ def load_launch_plan(
         parsed_runs.append(
             ArmLaunch(
                 arm=arm,
+                run_id=run_id,
+                condition_id=condition_id,
                 argv=container_argv,
                 environment=child_environment,
                 cwd=scratch,
@@ -1199,6 +1395,10 @@ def load_launch_plan(
                 master_port=port,
                 cpu_affinity=tuple(affinity),
                 data_loader_workers=workers,
+                max_steps=max_steps,
+                model_id=str(config["model"]),
+                raw_token_count=int(config["total_tokens"]),
+                route_dose_sha256=route_dose_sha256,
             )
         )
         verified_files.append(
@@ -1225,10 +1425,12 @@ def load_launch_plan(
         release_sha256=release_sha256,
         release_members_sha256=release_members_sha256,
         corpus_receipt_sha256=corpus_sha256,
+        ordered_stream_sha256=ordered_sha256,
         code_commit=code_commit,
         container_image=str(bootstrap_receipt["container_image"]),
         runtime_uid=int(bootstrap_receipt["runtime_uid"]),
         runtime_gid=int(bootstrap_receipt["runtime_gid"]),
+        launch_manifest=dict(manifest),
     )
 
 
@@ -1252,8 +1454,9 @@ def render_plan(plan: LaunchPlan) -> dict[str, object]:
             for launch in plan.arms
         ],
         "dry_run": True,
+        "gres": plan.profile.gres,
         "ok": True,
-        "provider": PROVIDER,
+        "provider": plan.profile.provider,
         "schema_version": 1,
         "seed": plan.seed,
     }
@@ -1261,6 +1464,7 @@ def render_plan(plan: LaunchPlan) -> dict[str, object]:
 
 _TRAINER_CONTRACT_FIELDS = frozenset(
     {
+        "checkpoint_metadata",
         "rank_zero_pid_file",
         "receipt_v2",
         "resume_sha256",
@@ -1300,7 +1504,7 @@ def render_trainer_preflight(plan: LaunchPlan) -> tuple[str, ...]:
         "--env",
         "HOME=/tmp/home",
         plan.container_image,
-        "/opt/conda/bin/python",
+        "/opt/venv/bin/python",
         "/workspace/scripts/run_train.py",
         "--capabilities-json",
     )
@@ -1338,7 +1542,7 @@ def preflight_trainer_contract(
     ] = _run_trainer_preflight,
     timeout_seconds: float = 120.0,
 ) -> None:
-    """Fail before launch unless the integrated trainer exposes every P5 hook."""
+    """Fail unless the integrated trainer exposes every AWS launcher hook."""
 
     if (
         isinstance(timeout_seconds, bool)
@@ -1386,6 +1590,7 @@ def preflight_trainer_contract(
     missing = sorted(name for name, supported in contract.items() if not supported)
     if missing:
         labels = {
+            "checkpoint_metadata": "checkpoint metadata",
             "rank_zero_pid_file": "rank-zero PID file",
             "receipt_v2": "memorysplit-parallel-corpus-v2 receipt",
             "resume_sha256": "explicit resume SHA",
@@ -1751,17 +1956,21 @@ def _acquire_host_lock(scratch_root: Path):
     try:
         descriptor = os.open(lock_path, flags, 0o600)
     except OSError as error:
-        raise LaunchError("P5 seed-pair lock is unsafe or unavailable") from error
+        raise LaunchError(
+            "AWS GPU seed-pair lock is unsafe or unavailable"
+        ) from error
     handle = os.fdopen(descriptor, "r+b", buffering=0)
     try:
         if not stat.S_ISREG(os.fstat(descriptor).st_mode):
-            raise LaunchError("P5 seed-pair lock must be a regular file")
+            raise LaunchError(
+                "AWS GPU seed-pair lock must be a regular file"
+            )
         os.fchmod(descriptor, 0o600)
         fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError as error:
         handle.close()
         raise LaunchError(
-            "another seed pair is already active on this P5"
+            "another seed pair is already active on this AWS GPU host"
         ) from error
     except BaseException:
         handle.close()
@@ -1785,6 +1994,7 @@ def supervise_pair(
     ]
     | None = None,
     shutdown_source: Callable[[], int | None] | None = None,
+    terminal_handler: Callable[[LaunchPlan], TerminalPublication] | None = None,
 ) -> SupervisionResult:
     """Hold the host-wide lock while supervising exactly one seed pair."""
 
@@ -1799,6 +2009,7 @@ def supervise_pair(
             trainer_preflight=trainer_preflight,
             rank_zero_resolver=rank_zero_resolver,
             shutdown_source=shutdown_source,
+            terminal_handler=terminal_handler,
         )
     finally:
         fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
@@ -1821,6 +2032,7 @@ def _supervise_pair_locked(
     ]
     | None = None,
     shutdown_source: Callable[[], int | None] | None = None,
+    terminal_handler: Callable[[LaunchPlan], TerminalPublication] | None = None,
 ) -> SupervisionResult:
     """Launch both arms, then accept only paired zero exit status."""
 
@@ -1933,6 +2145,17 @@ def _supervise_pair_locked(
                         child_pids=child_pids,
                         resumable=interruption.resumable,
                         interruption_receipt=str(interruption.receipt_path),
+                        checkpoint_receipt=(
+                            str(interruption.checkpoint_receipt_path)
+                            if interruption.checkpoint_receipt_path is not None
+                            else None
+                        ),
+                        checkpoint_receipt_sha256=(
+                            interruption.checkpoint_receipt_sha256
+                        ),
+                        checkpoint_receipt_uri=(
+                            interruption.checkpoint_receipt_uri
+                        ),
                     )
 
             statuses = {
@@ -1960,10 +2183,54 @@ def _supervise_pair_locked(
                 )
             if all(status == 0 for status in statuses.values()):
                 _terminate_all(tuple(processes.values()))
+                publication = None
+                if terminal_handler is not None:
+                    try:
+                        publication = terminal_handler(plan)
+                    except Exception as error:
+                        raise LaunchError(
+                            "paired training completed but terminal artifact "
+                            "publication failed"
+                        ) from error
                 return SupervisionResult(
                     status="completed",
                     returncode=0,
                     child_pids=child_pids,
+                    checkpoint_receipt=(
+                        str(publication.receipt_path)
+                        if publication is not None
+                        else None
+                    ),
+                    checkpoint_receipt_sha256=(
+                        publication.receipt_sha256
+                        if publication is not None
+                        else None
+                    ),
+                    checkpoint_receipt_uri=(
+                        publication.receipt_uri
+                        if publication is not None
+                        else None
+                    ),
+                    checkpoint_record_paths=(
+                        {
+                            arm: str(path)
+                            for arm, path in (
+                                publication.checkpoint_record_paths.items()
+                            )
+                        }
+                        if publication is not None
+                        else None
+                    ),
+                    checkpoint_record_sha256=(
+                        dict(publication.checkpoint_record_sha256)
+                        if publication is not None
+                        else None
+                    ),
+                    checkpoint_record_uris=(
+                        dict(publication.checkpoint_record_uris)
+                        if publication is not None
+                        else None
+                    ),
                 )
             sleep(0.25)
     except KeyboardInterrupt:
@@ -2053,10 +2320,52 @@ def _production_interruption_handler(
     notice: str,
 ) -> InterruptionResult:
     staging = plan.scratch_root / "staging"
+    bridge: dict[str, object] = {}
+    if _is_v3_profile(plan.profile):
+        operation_id = os.environ.get("MS_OPERATION_ID", "")
+        if _SHA256_RE.fullmatch(operation_id) is None:
+            raise LaunchError(
+                "v3 interruption publication requires the bound operation ID"
+            )
+        manifest = plan.launch_manifest
+        bridge = {
+            "checkpoint_metadata_paths": {
+                launch.arm: launch.checkpoint_path.parent
+                / "checkpoint-meta.json"
+                for launch in plan.arms
+            },
+            "checkpoint_receipt_path": (
+                plan.scratch_root
+                / "receipts"
+                / "checkpoints"
+                / f"seed-{plan.seed}"
+                / "interrupted"
+                / operation_id
+                / "receipt.json"
+            ),
+            "run_ids": {
+                launch.arm: launch.run_id for launch in plan.arms
+            },
+            "run_manifest_sha256": manifest["run_manifest_sha256"],
+            "cohort_assignment_sha256": manifest[
+                "cohort_assignment_sha256"
+            ],
+            "preregistration_sha256": manifest["preregistration_sha256"],
+            "hardware_amendment_sha256": manifest[
+                "hardware_amendment_sha256"
+            ],
+            "provider_selection_sha256": manifest[
+                "provider_selection_sha256"
+            ],
+            "sealed_fixture_sha256": manifest[
+                "sealed_fixture_sha256"
+            ],
+        }
     with tempfile.TemporaryDirectory(prefix="aws-home-", dir=staging) as home:
         os.chmod(home, 0o700)
         store = S3ObjectStore(
             region=plan.runtime.region,
+            kms_key_id=plan.runtime.kms_key_id,
             environment={
                 "AWS_REGION": plan.runtime.region,
                 "HOME": home,
@@ -2086,8 +2395,42 @@ def _production_interruption_handler(
             },
             timeout_seconds=120.0,
             upload_reserve_seconds=30.0,
+            provider=plan.profile.provider,
+            profile_sha256=plan.profile.sha256,
+            instance_type=plan.profile.instance_type,
+            gres=plan.profile.gres,
+            assigned_seeds=plan.profile.assigned_seeds,
+            candidate_receipt_type=(
+                plan.profile.interruption_candidate_receipt_type
+            ),
+            interruption_receipt_type=plan.profile.interruption_receipt_type,
+            resume_commit_protocol=plan.profile.resume_commit_protocol,
+            **bridge,
         )
         return handle_interruption(request, object_store=store)
+
+
+def _production_terminal_handler(plan: LaunchPlan) -> TerminalPublication:
+    operation_id = os.environ.get("MS_OPERATION_ID", "")
+    staging = plan.scratch_root / "staging"
+    with tempfile.TemporaryDirectory(prefix="aws-home-", dir=staging) as home:
+        os.chmod(home, 0o700)
+        store = S3ObjectStore(
+            region=plan.runtime.region,
+            kms_key_id=plan.runtime.kms_key_id,
+            environment={
+                "AWS_REGION": plan.runtime.region,
+                "HOME": home,
+                "LANG": "C.UTF-8",
+                "LC_ALL": "C.UTF-8",
+                "PATH": "/usr/bin:/bin",
+            },
+        )
+        return publish_terminal_pair(
+            plan,
+            object_store=store,
+            operation_id=operation_id,
+        )
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -2128,12 +2471,23 @@ def main(argv: Sequence[str] | None = None) -> int:
                 notice_source=client.interruption_notice,
                 interruption_handler=_production_interruption_handler,
                 shutdown_source=shutdown_source,
+                terminal_handler=(
+                    _production_terminal_handler
+                    if _is_v3_profile(plan.profile)
+                    else None
+                ),
             )
         report = {
             "child_pids": dict(sorted(result.child_pids.items())),
             "dry_run": False,
             "failed_arm": result.failed_arm,
             "interruption_receipt": result.interruption_receipt,
+            "checkpoint_receipt": result.checkpoint_receipt,
+            "checkpoint_receipt_sha256": result.checkpoint_receipt_sha256,
+            "checkpoint_receipt_uri": result.checkpoint_receipt_uri,
+            "checkpoint_record_paths": result.checkpoint_record_paths,
+            "checkpoint_record_sha256": result.checkpoint_record_sha256,
+            "checkpoint_record_uris": result.checkpoint_record_uris,
             "ok": result.returncode == 0,
             "peer_terminated": result.peer_terminated,
             "resumable": result.resumable,

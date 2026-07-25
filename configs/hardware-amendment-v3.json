@@ -1,0 +1,53 @@
+{
+  "allowed_profiles": [
+    {
+      "gpu_model": "NVIDIA H100 80GB",
+      "instance_type": "p5.48xlarge",
+      "path": "cluster/profiles/aws-p5.48xlarge-v3.json",
+      "profile_id": "aws-p5.48xlarge-v3",
+      "provider": "aws-p5.48xlarge-v3",
+      "sha256": "0969f70b2d10fb9f2065a7b6f10904658c514fa88cde6b818ae56020826d96bd"
+    },
+    {
+      "gpu_model": "NVIDIA B300",
+      "instance_type": "p6-b300.48xlarge",
+      "path": "cluster/profiles/aws-p6-b300.48xlarge-v3.json",
+      "profile_id": "aws-p6-b300.48xlarge-v3",
+      "provider": "aws-p6-b300.48xlarge-v3",
+      "sha256": "f4b3fc95d5f035decbebb5150854dbe81c7440af4a2097697b106246b8db375f"
+    }
+  ],
+  "amendment_id": "memorysplit-confirmatory-v3-hardware-amendment",
+  "bindings": {
+    "cohort_assignment": {
+      "path": "configs/cohort-assignment-v3.json",
+      "sha256": "2fc8bae1343fa0ff65c2dd6548be20c5b34b009dae10906070b39cc48d14dd5d"
+    },
+    "preregistration": {
+      "path": "configs/preregistration-v3.yaml",
+      "sha256": "de7f2213cc4918665252b3c469778c1caa72066c84c7bae6ebe92c28b070a25a"
+    }
+  },
+  "cohort_id": "memorysplit-confirmatory-v3-360m-n10-aws",
+  "original_scientific_provider_assignment": "aws-p5.48xlarge-v3",
+  "protected_outcomes_inspected": false,
+  "schema_version": 3,
+  "selection_rule": {
+    "mixed_profiles_forbidden": true,
+    "same_profile_for_all_pairs": true,
+    "seeds": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9
+    ],
+    "selected_profile_count": 1
+  },
+  "supersedes_hardware_selection": true
+}

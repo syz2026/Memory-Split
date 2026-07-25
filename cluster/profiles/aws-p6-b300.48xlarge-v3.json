@@ -1,0 +1,75 @@
+{
+  "assigned_seeds": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9
+  ],
+  "cpu": {
+    "affinity_halves": [
+      [
+        0,
+        95
+      ],
+      [
+        96,
+        191
+      ]
+    ],
+    "memory_gib": 4096,
+    "vcpus": 192
+  },
+  "gpu": {
+    "allocated": 8,
+    "gres": "gpu:b300:8",
+    "model": "NVIDIA B300",
+    "name_patterns": [
+      "^NVIDIA B300$"
+    ],
+    "seed_train_groups": [
+      4,
+      4
+    ]
+  },
+  "instance_type": "p6-b300.48xlarge",
+  "process_env_allowlist": [
+    "AWS_REGION",
+    "LANG",
+    "LC_ALL"
+  ],
+  "profile_id": "aws-p6-b300.48xlarge-v3",
+  "provider": "aws-p6-b300.48xlarge-v3",
+  "purchase_model": "capacity_block",
+  "runtime": {
+    "ami_id_env": "MS_AWS_AMI_ID",
+    "container_digest_env": "MS_CONTAINER_DIGEST",
+    "kms_key_id_env": "MS_S3_KMS_KEY_ID",
+    "region_env": "AWS_REGION",
+    "runtime_gid_env": "MS_RUNTIME_GID",
+    "runtime_uid_env": "MS_RUNTIME_UID"
+  },
+  "schema_version": 3,
+  "software": {
+    "cuda_minimum": "13.0",
+    "driver_minimum": "580",
+    "efa_minimum": "1.44.0",
+    "linux_kernel_minimum": "6.1",
+    "ofi_nccl_minimum": "1.17.1"
+  },
+  "storage": {
+    "durable_uri_env": "MS_S3_ROOT",
+    "instance_store": {
+      "device_bytes": 3840000000000,
+      "devices": 8,
+      "model": "Amazon EC2 NVMe Instance Storage",
+      "raid_level": "0"
+    },
+    "scratch_root": "/mnt/memorysplit"
+  }
+}

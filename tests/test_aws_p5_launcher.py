@@ -12,6 +12,7 @@ import time
 import zipfile
 from copy import deepcopy
 from pathlib import Path
+from types import SimpleNamespace
 from urllib.error import HTTPError
 
 import pytest
@@ -73,6 +74,10 @@ SAFE_ENVIRONMENT = {
     "LANG": "C.UTF-8",
     "LC_ALL": "C.UTF-8",
     "MS_S3_ROOT": "s3://memorysplit-prod/cohort-v2",
+    "MS_S3_KMS_KEY_ID": (
+        "arn:aws:kms:us-east-1:123456789012:"
+        "key/12345678-1234-4234-9234-123456789abc"
+    ),
     "MS_AWS_AMI_ID": "ami-0123456789abcdef0",
     "MS_CONTAINER_DIGEST": "sha256:" + "a" * 64,
     "MS_CONTAINER_IMAGE": CONTAINER_IMAGE,
@@ -267,6 +272,7 @@ def _launcher_fixture(tmp_path: Path, seed: int = 1) -> dict[str, Path | dict]:
             "import json\n"
             "import sys\n"
             "CAPABILITIES = {\n"
+            "    'checkpoint_metadata': True,\n"
             "    'rank_zero_pid_file': True,\n"
             "    'receipt_v2': True,\n"
             "    'resume_sha256': True,\n"
@@ -502,7 +508,7 @@ def test_dry_run_renders_exact_symmetric_four_plus_four_commands(tmp_path, seed)
     assert dense["arm"] == "dense"
     assert dense["argv"][0:3] == ["docker", "run", "--rm"]
     assert dense["argv"][-12:] == [
-        "/opt/conda/bin/python",
+        "/opt/venv/bin/python",
         "-m",
         "torch.distributed.run",
         "--nnodes=1",
@@ -523,6 +529,9 @@ def test_dry_run_renders_exact_symmetric_four_plus_four_commands(tmp_path, seed)
     assert "--network=host" in dense["argv"]
     assert "--ipc=host" in dense["argv"]
     assert "--pid=host" in dense["argv"]
+    tmpfs = dense["argv"][dense["argv"].index("--tmpfs") + 1]
+    assert "exec" in tmpfs.split(",")
+    assert "noexec" not in tmpfs.split(",")
     assert ["--name", f"memorysplit-s{seed}-dense"] == dense["argv"][
         dense["argv"].index("--name") : dense["argv"].index("--name") + 2
     ]
@@ -755,7 +764,7 @@ def test_trainer_contract_preflight_runs_inside_pinned_container(tmp_path):
     assert "--read-only" in argv
     assert CONTAINER_IMAGE in argv
     assert argv[-3:] == [
-        "/opt/conda/bin/python",
+        "/opt/venv/bin/python",
         "/workspace/scripts/run_train.py",
         "--capabilities-json",
     ]
@@ -799,6 +808,7 @@ def test_trainer_contract_preflight_fails_before_any_output_or_spawn(tmp_path):
 def test_trainer_contract_preflight_rejects_missing_capability(tmp_path):
     plan = _load_fixture_plan(_launcher_fixture(tmp_path))
     contract = {
+        "checkpoint_metadata": True,
         "rank_zero_pid_file": True,
         "receipt_v2": True,
         "resume_sha256": True,
@@ -846,7 +856,8 @@ def test_trainer_preflight_rejects_source_tokens_without_behavior(tmp_path):
 def test_trainer_preflight_rejects_duplicate_or_noncanonical_json(tmp_path):
     plan = _load_fixture_plan(_launcher_fixture(tmp_path))
     duplicate = (
-        '{"rank_zero_pid_file":true,"rank_zero_pid_file":true,'
+        '{"checkpoint_metadata":true,"rank_zero_pid_file":true,'
+        '"rank_zero_pid_file":true,'
         '"receipt_v2":true,"resume_sha256":true,"sidecar_name":true,'
         '"sigusr1_checkpoint":true}\n'
     )
@@ -1677,7 +1688,7 @@ def test_interruption_signals_both_rank_zero_processes_and_emits_paired_receipt(
     assert "resumable" not in receipt
     assert receipt["protocol"] == "aws-p5-resume-commit-v1"
     candidate_call = next(
-        call for call in store.calls if "/evidence/sha256/" in call[1]
+        call for call in store.calls if "/evidence/seed-1/sha256/" in call[1]
     )
     candidate = json.loads(candidate_call[5])
     assert [item["arm"] for item in candidate["checkpoints"]] == [
@@ -1689,6 +1700,163 @@ def test_interruption_signals_both_rank_zero_processes_and_emits_paired_receipt(
         for item in candidate["checkpoints"]
     )
     assert len(store.calls) == 4
+
+
+@pytest.mark.parametrize(
+    "profile_name",
+    ["aws-p5.48xlarge-v3", "aws-p6-b300.48xlarge-v3"],
+)
+def test_v3_interruption_uses_neutral_profile_bound_receipt_protocol(
+    tmp_path,
+    profile_name,
+):
+    legacy = _interruption_request(tmp_path)
+    profile = load_aws_p5_profile(
+        ROOT / "cluster" / "profiles" / f"{profile_name}.json"
+    )
+    values = dict(legacy.__dict__)
+    values.update(
+        {
+            "seed": 0,
+            "provider": profile.provider,
+            "profile_sha256": profile.sha256,
+            "instance_type": profile.instance_type,
+            "gres": profile.gres,
+            "assigned_seeds": profile.assigned_seeds,
+            "candidate_receipt_type": (
+                profile.interruption_candidate_receipt_type
+            ),
+            "interruption_receipt_type": profile.interruption_receipt_type,
+            "resume_commit_protocol": profile.resume_commit_protocol,
+            "checkpoint_metadata_paths": {
+                "dense": tmp_path / "dense-checkpoint-meta.json",
+                "split90": tmp_path / "split90-checkpoint-meta.json",
+            },
+            "checkpoint_receipt_path": (
+                tmp_path / "v3-checkpoint" / "receipt.json"
+            ),
+            "run_ids": {
+                "dense": "v3-dense-s0",
+                "split90": "v3-split90-s0",
+            },
+            "run_manifest_sha256": "8" * 64,
+            "cohort_assignment_sha256": "9" * 64,
+            "preregistration_sha256": "a" * 64,
+            "hardware_amendment_sha256": "b" * 64,
+            "provider_selection_sha256": "c" * 64,
+            "sealed_fixture_sha256": "d" * 64,
+        }
+    )
+    request = InterruptionRequest(**values)
+    mismatched = dict(values)
+    mismatched["candidate_receipt_type"] = "aws-p5-interruption-candidate"
+    with pytest.raises(ValueError, match="closed AWS GPU profile"):
+        InterruptionRequest(**mismatched)
+
+    def signal_process(pid, _signum):
+        arm = {101: "dense", 202: "split90"}[pid]
+        payload = f"{profile.profile_id}-{arm}-checkpoint".encode()
+        _atomic_checkpoint(
+            request.checkpoint_paths[arm],
+            payload,
+        )
+        _atomic_checkpoint(
+            request.checkpoint_metadata_paths[arm],
+            (
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "receipt_type": "memorysplit-training-checkpoint-v1",
+                        "run_id": request.run_ids[arm],
+                        "condition": arm,
+                        "seed": 0,
+                        "step": 42,
+                        "max_steps": 1358,
+                        "world_size": 4,
+                        "config_fingerprint": request.config_sha256[arm],
+                        "checkpoint_path": "ckpt.pt",
+                        "checkpoint_sha256": hashlib.sha256(
+                            payload
+                        ).hexdigest(),
+                        "checkpoint_bytes": len(payload),
+                        "terminal": False,
+                    },
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+                + "\n"
+            ).encode("ascii"),
+        )
+
+    store = _FakeStore()
+    result = handle_interruption(
+        request,
+        signal_process=signal_process,
+        object_store=store,
+        sleep=lambda _delay: None,
+    )
+
+    assert result.resumable is True
+    assert result.checkpoint_receipt_path == request.checkpoint_receipt_path
+    assert result.checkpoint_receipt_sha256
+    assert result.checkpoint_receipt_uri.endswith(
+        f"/receipts/{result.checkpoint_receipt_sha256}.json"
+    )
+    from cluster.aws.p5.terminal_artifacts import (
+        verify_checkpoint_receipt_bytes,
+    )
+
+    bridged = verify_checkpoint_receipt_bytes(
+        request.checkpoint_receipt_path.read_bytes(),
+        expected={
+            "provider": request.provider,
+            "run_manifest_sha256": request.run_manifest_sha256,
+            "sealed_fixture_sha256": request.sealed_fixture_sha256,
+        },
+    )
+    assert {row["step"] for row in bridged["checkpoints"]} == {42}
+    marker = json.loads(request.receipt_path.read_bytes())
+    assert marker["receipt_type"] == "aws-gpu-paired-interruption"
+    assert marker["protocol"] == "aws-gpu-resume-commit-v1"
+    assert marker["provider"] == request.provider
+    assert marker["profile_sha256"] == request.profile_sha256
+    assert marker["instance_type"] == request.instance_type
+    assert marker["gres"] == request.gres
+    candidate_bytes = next(
+        call[5] for call in store.calls if "/evidence/seed-0/sha256/" in call[1]
+    )
+    candidate = json.loads(candidate_bytes)
+    assert candidate["receipt_type"] == "aws-gpu-interruption-candidate"
+    assert candidate["provider"] == request.provider
+    assert candidate["profile_sha256"] == request.profile_sha256
+    marker_bytes = next(
+        call[5] for call in store.calls if "/resume-commits/" in call[1]
+    )
+    checkpoint_objects = {
+        call[1]: call[5]
+        for call in store.calls
+        if "/checkpoints/" in call[1] and call[1].endswith(".pt")
+    }
+    assert interruption_module.verify_resume_commit(
+        candidate_bytes=candidate_bytes,
+        marker_bytes=marker_bytes,
+        checkpoint_objects=checkpoint_objects,
+        expected_provider=request.provider,
+        expected_profile_sha256=request.profile_sha256,
+        expected_instance_type=request.instance_type,
+        expected_gres=request.gres,
+        expected_candidate_receipt_type=request.candidate_receipt_type,
+        expected_interruption_receipt_type=(
+            request.interruption_receipt_type
+        ),
+        expected_resume_commit_protocol=request.resume_commit_protocol,
+    )
+    with pytest.raises(ValueError):
+        interruption_module.verify_resume_commit(
+            candidate_bytes=candidate_bytes,
+            marker_bytes=marker_bytes,
+            checkpoint_objects=checkpoint_objects,
+        )
 
 
 def test_interruption_never_labels_failed_upload_resumable(tmp_path):
@@ -1748,7 +1916,7 @@ def test_interruption_uploads_immutable_bytes_from_new_atomic_generation(tmp_pat
     assert dense_upload[0] != request.checkpoint_paths["dense"]
     assert dense_upload[6] & 0o222 == 0
     candidate_call = next(
-        call for call in store.calls if "/evidence/sha256/" in call[1]
+        call for call in store.calls if "/evidence/seed-1/sha256/" in call[1]
     )
     candidate = json.loads(candidate_call[5])
     dense = next(item for item in candidate["checkpoints"] if item["arm"] == "dense")
@@ -1919,7 +2087,7 @@ def test_resume_commit_is_derived_from_every_fetched_object_hash(tmp_path):
     ).hexdigest()
     rebound_marker["candidate"]["uri"] = (
         "s3://memorysplit-prod/cohort-v2/receipts/interruption/"
-        f"evidence/sha256/{rebound_marker['candidate']['sha256']}.json"
+        f"evidence/seed-1/sha256/{rebound_marker['candidate']['sha256']}.json"
     )
     rebound_marker_bytes = (
         json.dumps(rebound_marker, sort_keys=True, separators=(",", ":"))
@@ -2421,6 +2589,7 @@ def _metadata(instance_type="p5.48xlarge"):
                 "region": SAFE_ENVIRONMENT["AWS_REGION"],
             }
         ),
+        "dynamic/instance-identity/pkcs7": "c2lnbmF0dXJl",
     }
     return values.__getitem__
 
@@ -2914,6 +3083,88 @@ def test_bootstrap_extracts_only_verified_task7_release_read_only(tmp_path):
         path.stat().st_mode & 0o222 == 0
         for path in prepared.root.rglob("*")
     )
+    reused = bootstrap_module.extract_verified_release(
+        release_archive=archive,
+        artifacts=artifacts,
+        scratch_root=tmp_path / "scratch",
+        owner_uid=os.getuid(),
+        owner_gid=os.getgid(),
+    )
+    assert reused == prepared
+
+    changed = prepared.root / "scripts" / "run_train.py"
+    changed.chmod(0o644)
+    changed.write_bytes(b"print('drifted release')\n")
+    changed.chmod(0o444)
+    with pytest.raises(BootstrapError, match="identity drifted"):
+        bootstrap_module.extract_verified_release(
+            release_archive=archive,
+            artifacts=artifacts,
+            scratch_root=tmp_path / "scratch",
+            owner_uid=os.getuid(),
+            owner_gid=os.getgid(),
+        )
+
+
+def test_existing_bootstrap_storage_is_reused_only_with_exact_root_identity(
+    tmp_path,
+):
+    scratch = tmp_path / "scratch"
+    scratch.mkdir(mode=0o700)
+    profile = SimpleNamespace(
+        scratch_root=str(scratch),
+        instance_store_devices=2,
+    )
+
+    def runner(argv, _environment, _timeout):
+        if argv[0] == "findmnt":
+            return CommandResult(
+                returncode=0,
+                stdout=json.dumps(
+                    {
+                        "filesystems": [
+                            {
+                                "target": str(scratch),
+                                "source": "/dev/md/memorysplit",
+                                "fstype": "xfs",
+                                "options": "rw,noatime,nodiratime",
+                            }
+                        ]
+                    }
+                ),
+                stderr="",
+            )
+        if argv[0] == "mdadm":
+            return CommandResult(
+                returncode=0,
+                stdout=(
+                    "MD_LEVEL=raid0\n"
+                    "MD_DEVICES=2\n"
+                    "MD_DEVICE_0_DEV=/dev/nvme1n1\n"
+                    "MD_DEVICE_1_DEV=/dev/nvme2n1\n"
+                ),
+                stderr="",
+            )
+        pytest.fail(f"unexpected storage probe: {argv}")
+
+    expected = bootstrap_module._inspect_existing_storage(
+        profile,
+        owner_uid=os.getuid(),
+        owner_gid=os.getgid(),
+        runner=runner,
+        command_environment={},
+    )
+    assert expected == ("/dev/nvme1n1", "/dev/nvme2n1")
+
+    scratch.chmod(0o755)
+    with pytest.raises(BootstrapError, match="identity has drifted"):
+        bootstrap_module._inspect_existing_storage(
+            profile,
+            owner_uid=os.getuid(),
+            owner_gid=os.getgid(),
+            runner=runner,
+            command_environment={},
+        )
 
 
 def test_bootstrap_rejects_hash_consistent_outer_archive_with_bad_inner_sum(
@@ -3016,6 +3267,26 @@ def test_bootstrap_verifies_all_hashes_and_publishes_canonical_receipt(tmp_path)
     assert receipt["runtime_uid"] == RUNTIME_UID
     assert receipt["runtime_gid"] == RUNTIME_GID
     assert receipt["boot_id"] == BOOT_ID
+    assert publish_bootstrap_receipt(
+        receipt,
+        receipt_path=receipt_path,
+        receipt_uri=(
+            "s3://memorysplit-prod/cohort-v2/receipts/bootstrap/"
+            "i-0123456789abcdef0.json"
+        ),
+        object_store=store,
+    )
+    changed = {**receipt, "release_sha256": "0" * 64}
+    with pytest.raises(BootstrapError, match="identity has drifted"):
+        publish_bootstrap_receipt(
+            changed,
+            receipt_path=receipt_path,
+            receipt_uri=(
+                "s3://memorysplit-prod/cohort-v2/receipts/bootstrap/"
+                "i-0123456789abcdef0.json"
+            ),
+            object_store=store,
+        )
 
 
 def test_bootstrap_rejects_non_utf8_release_receipt(tmp_path):

@@ -23,6 +23,15 @@ from .jsonutil import (
 
 SUPPORTED_PROFILE = "illumina-usfc-prd"
 AWS_P5_PROFILE = "aws-p5.48xlarge"
+AWS_P5_V3_PROFILE = "aws-p5.48xlarge-v3"
+AWS_P6_B300_V3_PROFILE = "aws-p6-b300.48xlarge-v3"
+AWS_GPU_PROFILES = frozenset(
+    {
+        AWS_P5_PROFILE,
+        AWS_P5_V3_PROFILE,
+        AWS_P6_B300_V3_PROFILE,
+    }
+)
 _LEGACY_RESUME_ENV = (
     "MS_DENSE_RESUME_PATH",
     "MS_DENSE_RESUME_SHA256",
@@ -406,21 +415,21 @@ def _profile_provider(path: Path | str) -> str:
     return provider
 
 
-def _load_aws_p5_profile(path: Path | str) -> object:
+def _load_aws_gpu_profile(path: Path | str) -> object:
     module_name = "cluster.aws.p5.profile"
     try:
         module = importlib.import_module(module_name)
     except (ImportError, ModuleNotFoundError) as error:
         raise MsctlError(
             "PROVIDER_ADAPTER_UNAVAILABLE",
-            "the AWS P5 profile adapter is not installed",
+            "the AWS GPU profile adapter is not installed",
             details={"adapter": module_name},
         ) from error
-    loader = getattr(module, "load_aws_p5_profile", None)
+    loader = getattr(module, "load_aws_gpu_profile", None)
     if not callable(loader):
         raise MsctlError(
             "PROVIDER_ADAPTER_UNAVAILABLE",
-            "the AWS P5 profile adapter has no supported loader",
+            "the AWS GPU profile adapter has no supported loader",
             details={"adapter": module_name},
         )
     try:
@@ -430,25 +439,30 @@ def _load_aws_p5_profile(path: Path | str) -> object:
     except (OSError, TypeError, ValueError) as error:
         raise MsctlError(
             "PROFILE_INVALID",
-            "AWS P5 profile validation failed",
+            "AWS GPU profile validation failed",
         ) from error
+    provider = getattr(profile, "provider", None)
     if (
-        getattr(profile, "provider", None) != AWS_P5_PROFILE
-        or getattr(profile, "profile_id", None) != AWS_P5_PROFILE
+        provider not in AWS_GPU_PROFILES
+        or getattr(profile, "profile_id", None) != provider
     ):
         raise MsctlError(
             "PROFILE_INVALID",
-            "AWS P5 adapter returned the wrong provider",
+            "AWS GPU adapter returned the wrong provider",
         )
     return profile
+
+
+# Private compatibility alias for existing in-process callers.
+_load_aws_p5_profile = _load_aws_gpu_profile
 
 
 def load_profile(path: Path | str) -> IlluminaProfile | object:
     provider = _profile_provider(path)
     if provider == SUPPORTED_PROFILE:
         return _load_illumina_profile(path)
-    if provider == AWS_P5_PROFILE:
-        return _load_aws_p5_profile(path)
+    if provider in AWS_GPU_PROFILES:
+        return _load_aws_gpu_profile(path)
     raise MsctlError(
         "PROVIDER_UNSUPPORTED",
         "profile provider is not supported",

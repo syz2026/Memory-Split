@@ -11,6 +11,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from .approval import verify_approval
+from .aws_selection import load_hardware_amendment, load_provider_selection
+from .aws_sealed_evaluation import load_sealed_evaluation_fixture
 from .contracts import (
     RunManifest,
     bind_release,
@@ -32,7 +34,14 @@ from .jsonutil import (
     require_object,
     sha256_file,
 )
-from .profile import AWS_P5_PROFILE, SUPPORTED_PROFILE, IlluminaProfile
+from .profile import (
+    AWS_GPU_PROFILES,
+    AWS_P5_PROFILE,
+    AWS_P5_V3_PROFILE,
+    AWS_P6_B300_V3_PROFILE,
+    SUPPORTED_PROFILE,
+    IlluminaProfile,
+)
 from .slurm import (
     ACTIVE_STATES,
     BOOTSTRAP_SHA256,
@@ -200,11 +209,16 @@ def instantiate_run_manifest(
     apply: bool,
     cohort_loader: Callable[[Path | str], object] | None = None,
     dataset_verifier: Callable[..., object] | None = None,
+    hardware_amendment: Path | str | None = None,
+    provider_selection: Path | str | None = None,
+    sealed_evaluation_fixture: Path | str | None = None,
 ) -> dict[str, object]:
     provider = getattr(profile, "provider", None)
     owned_seeds = {
         SUPPORTED_PROFILE: (0,),
         AWS_P5_PROFILE: (1, 2, 3, 4),
+        AWS_P5_V3_PROFILE: tuple(range(10)),
+        AWS_P6_B300_V3_PROFILE: tuple(range(10)),
     }.get(provider)
     if (
         owned_seeds is None
@@ -228,9 +242,15 @@ def instantiate_run_manifest(
         "source_sha256" if provider == SUPPORTED_PROFILE else "sha256",
         None,
     )
+    release_profile = release.metadata.get("profile")
+    release_profile_sha256 = (
+        release_profile.get("sha256")
+        if isinstance(release_profile, dict)
+        else release.metadata.get("profile_sha256")
+    )
     if (
         not isinstance(profile_sha256, str)
-        or release.metadata.get("profile_sha256") != profile_sha256
+        or release_profile_sha256 != profile_sha256
     ):
         raise MsctlError(
             "PROFILE_RELEASE_MISMATCH",
@@ -238,8 +258,12 @@ def instantiate_run_manifest(
         )
 
     root = Path(repo_root)
-    assignment_path = root / "configs" / "cohort-assignment-v2.json"
-    study_lock_path = root / "configs" / "preregistration-v2.yaml"
+    is_v3 = provider in {AWS_P5_V3_PROFILE, AWS_P6_B300_V3_PROFILE}
+    cohort_version = "v3" if is_v3 else "v2"
+    assignment_relative = f"configs/cohort-assignment-{cohort_version}.json"
+    preregistration_relative = f"configs/preregistration-{cohort_version}.yaml"
+    assignment_path = root / assignment_relative
+    study_lock_path = root / preregistration_relative
     loader = cohort_loader or _load_cohort_adapter
     cohort = loader(assignment_path)
     assignment_sha256 = getattr(cohort, "assignment_sha256", None)
@@ -250,13 +274,13 @@ def instantiate_run_manifest(
         )
     verified_assignment_sha256 = verify_release_member(
         release,
-        member_path="configs/cohort-assignment-v2.json",
+        member_path=assignment_relative,
         local_path=assignment_path,
         label="cohort assignment",
     )
     study_lock_sha256 = verify_release_member(
         release,
-        member_path="configs/preregistration-v2.yaml",
+        member_path=preregistration_relative,
         local_path=study_lock_path,
         label="study lock",
     )
@@ -270,9 +294,12 @@ def instantiate_run_manifest(
             "cohort adapter hashes differ from verified release members",
         )
     assignment = release.metadata.get("seed_assignment")
+    assignment_providers = (
+        {AWS_P5_V3_PROFILE, provider} if is_v3 else {provider}
+    )
     if not isinstance(assignment, dict) or (
         assignment.get("cohort_id") != getattr(cohort, "cohort_id", None)
-        or assignment.get("provider") != provider
+        or assignment.get("provider") not in assignment_providers
         or seed not in assignment.get("seeds", [])
         or assignment.get("arms") != ["dense", "split90"]
     ):
@@ -281,7 +308,11 @@ def instantiate_run_manifest(
             "release does not bind the requested cohort seed pair",
         )
 
-    provider_configs = cohort.configs_for_provider(provider)
+    provider_configs = (
+        tuple(getattr(cohort, "configs", ()))
+        if is_v3
+        else cohort.configs_for_provider(provider)
+    )
     selected = tuple(config for config in provider_configs if config.seed == seed)
     if (
         len(selected) != 2
@@ -321,7 +352,7 @@ def instantiate_run_manifest(
     )
     dataset_sha256 = sha256_file(dataset_receipt)
     dataset_verification = None
-    if provider == AWS_P5_PROFILE:
+    if provider in AWS_GPU_PROFILES:
         ordered_sha256 = receipt_value.get("ordered_stream_sha256")
         verifier = dataset_verifier or _load_task4_dataset_verifier
         try:
@@ -350,17 +381,91 @@ def instantiate_run_manifest(
                 "DATASET_RECEIPT_INVALID",
                 "dataset receipt schema version must be an integer",
             )
-    manifest = {
-        "schema_version": 2,
-        "provider": provider,
-        "seed": seed,
-        "release_sha256": release.archive_sha256,
-        "dataset_sha256": dataset_sha256,
-        "cohort_assignment_sha256": assignment_sha256,
-        "study_lock_sha256": study_lock_sha256,
-        "source_commit": release.source_commit,
-        "runs": run_rows,
-    }
+    if is_v3:
+        if (
+            hardware_amendment is None
+            or provider_selection is None
+            or sealed_evaluation_fixture is None
+        ):
+            raise MsctlError(
+                "RUN_MANIFEST_INVALID",
+                "v3 instantiation requires amendment, provider selection, "
+                "and sealed evaluation fixture",
+            )
+        amendment = load_hardware_amendment(hardware_amendment)
+        verified_amendment_sha256 = verify_release_member(
+            release,
+            member_path="configs/hardware-amendment-v3.json",
+            local_path=hardware_amendment,
+            label="hardware amendment",
+        )
+        if (
+            verified_amendment_sha256 != amendment.sha256
+            or amendment.cohort_assignment_sha256 != assignment_sha256
+            or amendment.preregistration_sha256 != study_lock_sha256
+        ):
+            raise MsctlError(
+                "RELEASE_COHORT_MISMATCH",
+                "release hardware amendment does not bind the v3 cohort",
+            )
+        selection = load_provider_selection(
+            provider_selection,
+            amendment=amendment,
+            profile=profile,
+        )
+        if (
+            selection.provider != provider
+            or selection.profile_sha256 != profile_sha256
+            or selection.cohort_assignment_sha256 != assignment_sha256
+            or selection.preregistration_sha256 != study_lock_sha256
+            or seed not in selection.seeds
+        ):
+            raise MsctlError(
+                "PROVIDER_SELECTION_MISMATCH",
+                "provider selection does not bind the requested seed manifest",
+            )
+        # The pre-launch fixture is independent of post-training checkpoints
+        # and the finalized evaluator study lock.
+        sealed_fixture = load_sealed_evaluation_fixture(
+            sealed_evaluation_fixture
+        )
+        allocated_gpus = getattr(profile, "allocated_gpus", None)
+        if allocated_gpus != 8:
+            raise MsctlError(
+                "PROFILE_INVALID",
+                "v3 manifests require one exact eight-GPU profile",
+            )
+        estimated_instance_hours = 24.0
+        estimated_gpu_hours = estimated_instance_hours * allocated_gpus
+        manifest = {
+            "schema_version": 3,
+            "provider": provider,
+            "seed": seed,
+            "source_commit": release.source_commit,
+            "release_sha256": release.archive_sha256,
+            "dataset_sha256": dataset_sha256,
+            "cohort_assignment_sha256": assignment_sha256,
+            "preregistration_sha256": study_lock_sha256,
+            "hardware_amendment_sha256": amendment.sha256,
+            "provider_selection_sha256": selection.sha256,
+            "profile_sha256": profile_sha256,
+            "sealed_fixture_sha256": sealed_fixture.sha256,
+            "estimated_instance_hours": estimated_instance_hours,
+            "estimated_gpu_hours": estimated_gpu_hours,
+            "runs": run_rows,
+        }
+    else:
+        manifest = {
+            "schema_version": 2,
+            "provider": provider,
+            "seed": seed,
+            "release_sha256": release.archive_sha256,
+            "dataset_sha256": dataset_sha256,
+            "cohort_assignment_sha256": assignment_sha256,
+            "study_lock_sha256": study_lock_sha256,
+            "source_commit": release.source_commit,
+            "runs": run_rows,
+        }
     result = {
         "manifest": manifest,
         "manifest_sha256": canonical_sha256(manifest),

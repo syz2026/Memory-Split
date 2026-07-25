@@ -103,6 +103,7 @@ def test_run_train_capabilities_json_is_strict_and_does_not_require_config():
         check=False,
     )
     expected = {
+        "checkpoint_metadata": True,
         "rank_zero_pid_file": True,
         "receipt_v2": True,
         "resume_sha256": True,
@@ -222,16 +223,34 @@ def test_default_auto_resume_loads_existing_checkpoint_without_rewriting_config(
 ):
     bp, mp = write_corpus(tmp_path)
     cfg = base_cfg(tmp_path, bp, mp)
+    cfg.update({"run_id": "seed-7-dense", "condition": "dense"})
     cfg["max_steps"] = 2
     first = Trainer(cfg)
     first.train_steps(1)
     config_before = (first.out_dir / "config.yaml").read_bytes()
+    partial_metadata = json.loads(
+        (first.out_dir / "checkpoint-meta.json").read_text()
+    )
+    assert partial_metadata["run_id"] == "seed-7-dense"
+    assert partial_metadata["condition"] == "dense"
+    assert partial_metadata["step"] == 1
+    assert partial_metadata["terminal"] is False
+    assert partial_metadata["checkpoint_sha256"] == file_sha256(first.ckpt_path)
     first.close()
 
     resumed = Trainer(cfg, resume="auto")
 
     assert resumed.step == 1
     assert (resumed.out_dir / "config.yaml").read_bytes() == config_before
+    resumed.train_steps(1)
+    terminal_metadata = json.loads(
+        (resumed.out_dir / "checkpoint-meta.json").read_text()
+    )
+    assert terminal_metadata["step"] == terminal_metadata["max_steps"] == 2
+    assert terminal_metadata["terminal"] is True
+    assert terminal_metadata["checkpoint_sha256"] == file_sha256(
+        resumed.ckpt_path
+    )
     resumed.close()
 
 

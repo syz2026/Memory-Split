@@ -1,4 +1,4 @@
-"""MemorySplit v2 confirmatory evaluation and inference core."""
+"""MemorySplit v2/v3 confirmatory evaluation and inference core."""
 
 from evals.confirmatory.actions import (
     ACTION_SLOTS,
@@ -68,7 +68,9 @@ from evals.confirmatory.metrics import (
 )
 from evals.confirmatory.reporting import (
     ARTIFACT_REPORT_SCHEMA,
+    ARTIFACT_REPORT_SCHEMA_V3,
     INFERENCE_EVIDENCE_SCHEMA,
+    INFERENCE_EVIDENCE_SCHEMA_V3,
     METRICS_SCHEMA,
     PRACTICAL_NULL_REPLAY_GAP,
     PRACTICAL_NULL_REPLAY_STATUS,
@@ -84,13 +86,30 @@ from evals.confirmatory.reporting import (
     publish_artifact_report,
     validate_artifact_report,
 )
+from evals.confirmatory.run_binding import (
+    RUN_BINDING_FIELDS,
+    RUN_BINDING_SCHEMA,
+    build_run_binding,
+    validate_run_binding,
+    write_run_binding,
+)
+from evals.confirmatory.sealing import (
+    SEALED_FIXTURE_MEMBERS,
+    SEALED_FIXTURE_SCHEMA,
+    sealed_fixture_sha256,
+)
 from evals.confirmatory.study_lock import (
     FROZEN_PREREGISTRATION_SHA256,
+    LEGACY_CONFIRMATORY_SEEDS,
     REQUIRED_CONTROL_IDS,
     REQUIRED_GATE_IDS,
     REQUIRED_RECEIPTS,
     STUDY_LOCK_SCHEMA,
+    STUDY_LOCK_SCHEMA_V3,
     VALIDITY_EVIDENCE_SCHEMA,
+    VALIDITY_EVIDENCE_SCHEMA_V3,
+    V3_CONFIRMATORY_SEEDS,
+    V3_CONTRACT_VERSION,
     ReadinessResult,
     ReceiptCommitment,
     ReceiptState,
@@ -120,12 +139,14 @@ from evals.confirmatory.status import (
 __all__ = [
     "ACTION_SLOTS",
     "ARTIFACT_REPORT_SCHEMA",
+    "ARTIFACT_REPORT_SCHEMA_V3",
     "CHECKPOINT_SCHEMA",
     "CONFIRMATORY_SEED_COUNT",
     "CONTRACT_VERSION",
     "FROZEN_PREREGISTRATION_SHA256",
     "HIERARCHY",
     "INFERENCE_EVIDENCE_SCHEMA",
+    "INFERENCE_EVIDENCE_SCHEMA_V3",
     "ITEM_SCHEMA",
     "MAX_READS",
     "METRICS_SCHEMA",
@@ -141,10 +162,19 @@ __all__ = [
     "REQUIRED_GATE_IDS",
     "REQUIRED_RECEIPTS",
     "RELEASE_SEALING_LAUNCH_GAP",
+    "RUN_BINDING_FIELDS",
+    "RUN_BINDING_SCHEMA",
+    "SEALED_FIXTURE_MEMBERS",
+    "SEALED_FIXTURE_SCHEMA",
     "SEALED_GOLD_SCHEMA",
     "STORE_SCHEMA",
     "STUDY_LOCK_SCHEMA",
+    "STUDY_LOCK_SCHEMA_V3",
     "VALIDITY_EVIDENCE_SCHEMA",
+    "VALIDITY_EVIDENCE_SCHEMA_V3",
+    "V3_CONFIRMATORY_SEEDS",
+    "V3_CONTRACT_VERSION",
+    "LEGACY_CONFIRMATORY_SEEDS",
     "ActionOp",
     "ActionSlot",
     "Arm",
@@ -189,6 +219,7 @@ __all__ = [
     "ReceiptState",
     "ReleaseBinding",
     "build_artifact_report",
+    "build_run_binding",
     "canonical_json_bytes",
     "canonical_sha256",
     "classify_status",
@@ -208,11 +239,14 @@ __all__ = [
     "positive_fixture",
     "practical_null_fixture",
     "publish_artifact_report",
+    "sealed_fixture_sha256",
     "store_content_sha256",
     "validate_action_slots",
     "validate_artifact_report",
     "validate_contract_bundle",
     "validate_item_outcome_binding",
+    "validate_run_binding",
     "verify_proof_and_answer",
     "verify_sealed_gold",
+    "write_run_binding",
 ]
