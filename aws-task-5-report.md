@@ -437,3 +437,126 @@ second). The S3 gateway endpoint has no endpoint-hour charge.
   an explicit remaining boundary, not silently widened policy.
 - Governance cleanup removes billed object versions rather than merely adding
   delete markers, and is scoped away from package/source inputs.
+
+## Second-review payload binding and residual-risk follow-up
+
+Implementation commit:
+`ba5579d441d8249db45d61041b8bdada3aab21a8`.
+
+### Bootstrap payload hash authority
+
+The Task 6 renderer is not present or importable in this foundation worktree,
+and copying the renderer here would duplicate runtime logic and violate the
+owned-file boundary. This follow-up therefore uses the review-approved small
+fixture approach.
+
+The committed test fixture is the SHA-256 of the ASCII bytes of the actual
+base64 user-data payload produced by Task 6's `fixture_config` at reviewed
+bootstrap commit `48835f7`:
+
+```text
+raw rendered bytes:  26,605
+gzip bytes:           6,878
+base64 characters:    9,172
+base64 SHA-256:        0381b939d78fb48b4ba6593ce3f5bc1472f22ed798f9cd79388f7030a40e80aa
+```
+
+The foundation now requires `BootstrapUserDataSha256`, constrained to exactly
+64 lowercase hexadecimal characters with no default, and emits the same value
+as the closed, non-exported `BootstrapUserDataSha256` stack output. The test
+feeds the reviewed fixture hash through the parameter constraint and asserts
+that the output references that parameter, proving the authority value is
+carried end to end by this stack.
+
+This is deliberately not represented as content validation inside
+CloudFormation: an authorized stack updater can still supply arbitrary chunks
+and their matching digest because CloudFormation cannot hash the concatenated
+parameter value. The separately assigned preflight change is the completing
+control: it will hash the deployed launch template's actual user data, compare
+that result with this stack output, freshly render the reviewed Task 6
+bootstrap from the approved launch inputs, and require all three values to
+match before authorizing a launch.
+
+### Remaining guard non-vacuity
+
+`launch_template_is_private_imdsv2_i4i` now requires exactly one
+`NetworkInterfaces` entry and exactly one `BlockDeviceMappings` entry before
+checking their nested fields. Two new mutations delete those arrays
+independently. Both the Python selector model and the real CloudFormation Guard
+engine reject each deletion; the mutation suite now contains 15 cases.
+
+### Accepted SSM package-authorization residual
+
+The SSM document is an integrity boundary, not an independent package
+authorization boundary. A principal that can assume `ControllerRole` can call
+`SendCommand` directly with any existing object under `v2/packages/*` and a
+matching caller-supplied digest, bypassing the preflight software gate. The SSM
+document cannot verify a package signature or cross-bind one parameter to
+another.
+
+Compensating controls are:
+
+- the on-instance builder verifies the exact S3 object version and SHA-256
+  before execution;
+- preflight binds the production software gate to that exact verified package
+  object and carries it into the approved launch authority; and
+- `ControllerRole` is operator-only, separately assumed, and not attached to
+  the builder instance.
+
+The URI pattern was not narrowed to an invented build-scoped layout. The
+current frozen infrastructure contract guarantees only `v2/packages/*`, and
+SSM `allowedPattern` cannot require that a URI's path segment equals the
+separate `BuildId`, an S3 version ID, or a signed authority. Requiring an
+unfrozen path shape could reject valid approved packages without closing the
+direct-call authorization gap. This residual therefore remains explicitly
+accepted at the operator-role trust boundary.
+
+### Second-review RED/GREEN and verification
+
+Payload authority RED:
+
+```text
+3 failed, 35 passed in 0.45s
+```
+
+Payload parameter/output GREEN:
+
+```text
+38 passed in 0.34s
+```
+
+Launch-array non-vacuity RED and GREEN:
+
+```text
+RED:   1 failed, 39 passed in 0.46s
+GREEN: 40 passed in 0.39s
+```
+
+Fresh real-guard mutation run:
+
+```text
+CFN_GUARD=.cfn-guard-tool/bin/cfn-guard \
+  python -m pytest -q tests/test_aws_corpus_builder_foundation.py
+40 passed in 2.60s
+
+cfn-guard 3.2.0 validate --rules <guard> --data <template>
+exit 0, no findings
+```
+
+`cfn-lint 1.53.2`, `python -m py_compile
+tests/test_aws_corpus_builder_foundation.py`, and `git diff --check` each exited
+0 with no findings. The temporary Guard binary was removed after validation.
+
+### Second-review self-review
+
+- The hash is explicitly defined over the concatenated base64 text, matching
+  the downstream comparison contract; it is not ambiguously defined over the
+  decoded gzip bytes or rendered shell text.
+- The fixture proves stack plumbing but does not pretend to replace the live
+  preflight render-and-compare gate.
+- Both wildcard launch arrays now have required-match counts and executable
+  deletion mutations.
+- The SSM direct-call package risk is stated as residual authorization risk,
+  not conflated with its strong object-integrity checks.
+- No deployment, change set, AWS API call, push, amend, or edit outside the
+  owned files occurred. `PENDING-REVIEW-FINDINGS.md` remains untracked.
