@@ -32,11 +32,14 @@ Task 4C receipts-driven cohort aggregation/report: implementation committed
   parent verification 310 + 209 + 495 + 8 passed, package 106 passed
   full suite 3010 passed with only the two inherited v2 failures
 Task 4D durable cohort evaluation/report evidence collection: complete
-  commits 6caa483 + d5b7ad3, review pending
+  commits 6caa483 + d5b7ad3 + 2fdaed4, review clean
   exact brief verification 711 + 209 + 522 + 8 passed, package 107 passed
   full suite 3204 passed with only the two inherited v2 failures
   committed package dry-run passed
   cohort collect-cohort publishes one 1012-object receipt; outcomes are
   certified solely by the Task 4C report replay
+  reconciliation independently reran touched surfaces: 673 passed
+  original line adopted for its torch-free parser import, stricter mirrors
+  and fail-closed checks; recovery line archived unmerged
 selected evaluate stays blocked pending Task 4E; cleanup stays blocked
   even with ten per-seed collection states plus a cohort collection state
