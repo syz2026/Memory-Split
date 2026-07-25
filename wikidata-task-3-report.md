@@ -375,3 +375,168 @@ Exact output: none; exit status `0`.
 Concerns: process RSS is allocator- and platform-sensitive, so the committed
 test checks the cross-cardinality spread rather than exact byte values. No
 known correctness concern remains.
+
+## Bounded-memory evidence remediation (reviewed head `c441e28`)
+
+Status: **DONE**
+
+The prior 8 MiB RSS-spread assertion has been removed. RSS is no longer the
+acceptance signal because process high-water measurements cannot attribute
+retention to the adapter.
+
+### Mutation-sensitive regression
+
+The replacement regression copies the committed `catalog.py` into the pytest
+basetemp and imports it as a temporary module. The test changes exactly one
+adapter loop in that copy: after each distinct edge, it appends `bytearray(1)`
+to a module-owned list. No production file is edited. This deliberately linear
+variant retains one small object per edge along the same adapter path exercised
+by the real implementation.
+
+Each measurement runs in a fresh process. It builds and imports the view and
+selected catalog module before starting `tracemalloc`, emits every draft, runs
+`gc.collect()` at the first, midpoint, final-distinct-edge, and final-draft
+checkpoints, and records the maximum live allocation snapshot. Each snapshot
+retains only traces whose most recent allocating frame is the exact selected
+`catalog.py` path. Allocations in archive construction, the derived-view
+reader, pytest, and unrelated allocator churn therefore do not contribute to
+the signal.
+
+Cardinalities are 1,000 and 20,000 distinct edges, a delta of 19,000. The same
+regression predicate is applied to both implementations:
+
+```text
+high.peak_live_bytes <= low.peak_live_bytes
+high.peak_live_blocks <= low.peak_live_blocks
+```
+
+The accepted marginal bound is therefore exactly **0 attributed live bytes per
+additional edge** and **0 attributed live allocation blocks per additional
+edge**. This is a structural no-retention assertion, not a looser absolute
+memory threshold.
+
+Exact measurements:
+
+| Variant | Edges | Drafts | Peak attributed live blocks | Peak attributed live bytes |
+|---|---:|---:|---:|---:|
+| streaming | 1,000 | 1,100 | 15 | 1,123 |
+| streaming | 20,000 | 20,100 | 15 | 1,123 |
+| linear mutation | 1,000 | 1,100 | 2,016 | 67,919 |
+| linear mutation | 20,000 | 20,100 | 40,016 | 1,334,079 |
+
+Streaming result:
+
+```text
+PASS: live_block_growth=0, live_byte_growth=0,
+marginal_live_bytes_per_edge=0
+```
+
+Linear-mutation result using the identical predicate:
+
+```text
+FAIL: live_block_growth=38000, live_byte_growth=1266160,
+marginal_live_bytes_per_edge=1666/25 (66.64 bytes/edge)
+```
+
+The committed outer test requires the real implementation to pass and requires
+the deliberately linear variant to raise the regression assertion. Its
+isolated command was:
+
+```bash
+BASE="/tmp/memorysplit-wd3-memory-peak-$$" &&
+trap 'rm -rf -- "$BASE"' EXIT &&
+python -m pytest -q \
+  tests/test_reasoning_v2_catalog.py::test_attributed_memory_regression_kills_linear_retention_variant \
+  --basetemp="$BASE" -s
+```
+
+Exact output:
+
+```text
+.
+1 passed in 11.02s
+```
+
+The mutation was therefore killed: the bounded-memory regression failed
+against the one-object-per-edge implementation and passed against the real
+streaming implementation.
+
+### Final verification
+
+Focused catalog command (the explicit basetemp was removed by the exit trap):
+
+```bash
+BASE="/tmp/memorysplit-wd3-focused-final-$$" &&
+trap 'rm -rf -- "$BASE"' EXIT &&
+python -m pytest -q \
+  tests/test_reasoning_v2_catalog.py \
+  --basetemp="$BASE"
+```
+
+Exact output:
+
+```text
+..................................................                       [100%]
+50 passed in 15.24s
+```
+
+Combined required command:
+
+```bash
+BASE="/tmp/memorysplit-wd3-combined-final-$$" &&
+trap 'rm -rf -- "$BASE"' EXIT &&
+python -m pytest -q \
+  tests/test_reasoning_v2_catalog.py \
+  tests/test_reasoning_v2_source_lock.py \
+  --basetemp="$BASE"
+```
+
+Exact output:
+
+```text
+........................................................................ [ 52%]
+.................................................................        [100%]
+137 passed in 15.86s
+```
+
+Compile command:
+
+```bash
+python -m py_compile \
+  corpusgen/reasoning_v2/catalog.py \
+  tests/test_reasoning_v2_catalog.py
+```
+
+Exact output: none; exit status `0`.
+
+Patch check:
+
+```bash
+git diff --check
+```
+
+Exact output: none; exit status `0`.
+
+### Self-review
+
+- Mutation validity: the temporary variant differs only by a module-owned list
+  and one `bytearray(1)` append in the distinct-edge draft loop. Its catalog
+  output count matches the real adapter at both cardinalities.
+- Signal attribution: tracing begins after view construction and module import;
+  exact-filename filtering counts only still-live allocations made by the
+  selected adapter module, and checkpoint snapshots retain the maximum.
+- Detection power: the mutation grows by 1,266,160 attributed live bytes and
+  38,000 attributed blocks over 19,000 edges, and the zero-marginal predicate
+  rejects it without relying on allocator RSS behavior.
+- Streaming result: the real adapter's peak remains exactly 1,123 attributed
+  live bytes in 15 blocks at both cardinalities.
+- Closed findings: production authority, fresh verification, drift,
+  provenance, ordering, and non-production fixture behavior remain covered by
+  the unchanged focused suite.
+- Scope: only the catalog test and this report changed in this remediation. No
+  network, AWS, push, amend, or out-of-scope edit occurred.
+
+Concerns: the temporary source mutation deliberately fails closed if the
+adapter loop is refactored and its exact marker no longer matches; the mutation
+must then be relocated to the new edge loop. No known correctness concern
+remains.

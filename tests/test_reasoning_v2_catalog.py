@@ -1,22 +1,24 @@
 from __future__ import annotations
 
 import copy
+import gc
 import gzip
 import hashlib
+import importlib.util
 import io
 import inspect
 import json
 import os
-import resource
 import subprocess
 import sys
 import tarfile
 import threading
+import tracemalloc
 from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass, replace
 from fractions import Fraction
 from pathlib import Path
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 from typing import cast
 
 import pytest
@@ -1355,11 +1357,65 @@ def test_lane_sources_receive_compact_balanced_target_lengths(
         )
 
 
-def _measure_production_adapter_rss(
+def _linear_retention_catalog_variant(
+    workspace: Path,
+) -> tuple[ModuleType, Path, str]:
+    catalog_path = Path(cast(str, catalog_module.__file__)).resolve()
+    source = catalog_path.read_text(encoding="utf-8")
+    class_marker = "\n\nclass WikidataGraphCatalogSource:\n"
+    loop_marker = """\
+        for edge_index, triple in enumerate(
+            iter_distinct_training_edges(authority.view)
+        ):
+            emitted += 1
+            yield self._draft(
+"""
+    assert source.count(class_marker) == 1
+    assert source.count(loop_marker) == 1
+    source = source.replace(
+        class_marker,
+        (
+            "\n\n_LINEAR_RETENTION_FOR_MEMORY_TEST: list[bytearray] = []"
+            f"{class_marker}"
+        ),
+    )
+    source = source.replace(
+        loop_marker,
+        loop_marker.replace(
+            "            emitted += 1\n",
+            (
+                "            emitted += 1\n"
+                "            _LINEAR_RETENTION_FOR_MEMORY_TEST.append("
+                "bytearray(1))\n"
+            ),
+        ),
+    )
+    variant_path = workspace / "catalog_linear_retention_variant.py"
+    variant_path.write_text(source, encoding="utf-8")
+    module_name = (
+        f"_memorysplit_catalog_linear_retention_{os.getpid()}_"
+        f"{workspace.name}"
+    )
+    spec = importlib.util.spec_from_file_location(module_name, variant_path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
+    try:
+        spec.loader.exec_module(module)
+    except BaseException:
+        sys.modules.pop(module_name, None)
+        raise
+    return module, variant_path, module_name
+
+
+def _measure_adapter_attributed_live_allocations(
     workspace: Path,
     edge_count: int,
+    *,
+    linear_retention: bool,
 ) -> dict[str, int]:
     monkeypatch = pytest.MonkeyPatch()
+    variant_module_name: str | None = None
     try:
         workspace.mkdir()
         contract_root = fixed_contract_environment.__wrapped__(
@@ -1411,108 +1467,188 @@ def _measure_production_adapter_rss(
         assert view.receipt.distinct_edges == edge_count
         del entries, training_rows, authority, fixture, lock, resolver, recipe
 
-        read_fd, write_fd = os.pipe()
-        pid = os.fork()
-        if pid == 0:
-            os.close(read_fd)
-            try:
-                rss_scale = 1 if sys.platform == "darwin" else 1024
-                baseline = (
-                    resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
-                    * rss_scale
-                )
-                source = catalog_module.WikidataGraphCatalogSource(view)
-                lengths = catalog_module._BalancedTargetLengths.create(
-                    edge_count + 100,
-                    1,
-                )
-                drafts = sum(
-                    1
-                    for _draft in source.iter_drafts(
-                        source_root,
-                        lengths,
-                    )
-                )
-                peak = (
-                    resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
-                    * rss_scale
-                )
-                payload = canonical_json_bytes(
-                    {
-                        "baseline_rss_bytes": baseline,
-                        "drafts": drafts,
-                        "edge_count": edge_count,
-                        "peak_rss_bytes": peak,
-                        "rss_growth_bytes": max(0, peak - baseline),
-                    }
-                )
-                os.write(write_fd, payload)
-                os.close(write_fd)
-                os._exit(0)
-            except BaseException as exc:
-                os.write(
-                    write_fd,
-                    canonical_json_bytes(
-                        {
-                            "error": f"{type(exc).__name__}: {exc}",
-                        }
+        selected_catalog = cast(ModuleType, catalog_module)
+        selected_path = Path(cast(str, selected_catalog.__file__)).resolve()
+        if linear_retention:
+            (
+                selected_catalog,
+                selected_path,
+                variant_module_name,
+            ) = _linear_retention_catalog_variant(workspace)
+
+        tracemalloc.start(1)
+        try:
+            source = selected_catalog.WikidataGraphCatalogSource(view)
+            lengths = selected_catalog._BalancedTargetLengths.create(
+                edge_count + 100,
+                1,
+            )
+            checkpoints = {
+                1,
+                edge_count // 2,
+                edge_count,
+                edge_count + 100,
+            }
+            peak_live_blocks = 0
+            peak_live_bytes = 0
+            drafts = 0
+            for drafts, _draft in enumerate(
+                source.iter_drafts(
+                    source_root,
+                    lengths,
+                ),
+                start=1,
+            ):
+                if drafts not in checkpoints:
+                    continue
+                gc.collect()
+                snapshot = tracemalloc.take_snapshot().filter_traces(
+                    (
+                        tracemalloc.Filter(
+                            True,
+                            str(selected_path),
+                            all_frames=False,
+                        ),
                     ),
                 )
-                os.close(write_fd)
-                os._exit(1)
+                peak_live_blocks = max(
+                    peak_live_blocks,
+                    len(snapshot.traces),
+                )
+                peak_live_bytes = max(
+                    peak_live_bytes,
+                    sum(trace.size for trace in snapshot.traces),
+                )
+        finally:
+            tracemalloc.stop()
 
-        os.close(write_fd)
-        chunks: list[bytes] = []
-        while chunk := os.read(read_fd, 65_536):
-            chunks.append(chunk)
-        os.close(read_fd)
-        _waited_pid, status = os.waitpid(pid, 0)
-        result = json.loads(b"".join(chunks))
-        if status != 0:
-            raise AssertionError(result["error"])
-        return cast(dict[str, int], result)
+        return {
+            "drafts": drafts,
+            "edge_count": edge_count,
+            "linear_retention": int(linear_retention),
+            "peak_live_blocks": peak_live_blocks,
+            "peak_live_bytes": peak_live_bytes,
+        }
     finally:
+        if variant_module_name is not None:
+            sys.modules.pop(variant_module_name, None)
         monkeypatch.undo()
 
 
-def test_production_adapter_rss_growth_is_near_constant_across_cardinalities(
-    tmp_path: Path,
-):
-    cardinalities = (1_000, 10_000, 100_000)
+def _run_attributed_allocation_probe(
+    workspace: Path,
+    edge_count: int,
+    *,
+    linear_retention: bool,
+) -> dict[str, int]:
     test_module = Path(__file__).resolve()
     script = (
         "import json, sys\n"
         "from pathlib import Path\n"
         f"sys.path.insert(0, {str(test_module.parent)!r})\n"
         "from test_reasoning_v2_catalog import "
-        "_measure_production_adapter_rss\n"
-        "result = _measure_production_adapter_rss("
-        "Path(sys.argv[1]), int(sys.argv[2]))\n"
+        "_measure_adapter_attributed_live_allocations\n"
+        "result = _measure_adapter_attributed_live_allocations(\n"
+        "    Path(sys.argv[1]), int(sys.argv[2]),\n"
+        "    linear_retention=sys.argv[3] == 'linear',\n"
+        ")\n"
         "print(json.dumps(result, sort_keys=True))\n"
     )
-    measurements = []
-    for edge_count in cardinalities:
-        completed = subprocess.run(
-            [
-                sys.executable,
-                "-c",
-                script,
-                str(tmp_path / f"rss-{edge_count}"),
-                str(edge_count),
-            ],
-            cwd=test_module.parents[1],
-            check=True,
-            capture_output=True,
-            text=True,
-        )
-        measurements.append(json.loads(completed.stdout))
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            script,
+            str(workspace),
+            str(edge_count),
+            "linear" if linear_retention else "streaming",
+        ],
+        cwd=test_module.parents[1],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return cast(dict[str, int], json.loads(completed.stdout))
 
-    assert tuple(row["edge_count"] for row in measurements) == cardinalities
-    assert tuple(row["drafts"] for row in measurements) == tuple(
+
+def _attributed_allocation_growth(
+    measurements: tuple[dict[str, int], dict[str, int]],
+) -> dict[str, int | Fraction]:
+    low, high = measurements
+    edge_delta = high["edge_count"] - low["edge_count"]
+    assert edge_delta > 0
+    byte_growth = high["peak_live_bytes"] - low["peak_live_bytes"]
+    block_growth = high["peak_live_blocks"] - low["peak_live_blocks"]
+    return {
+        "edge_delta": edge_delta,
+        "live_block_growth": block_growth,
+        "live_byte_growth": byte_growth,
+        "marginal_live_bytes_per_edge": Fraction(
+            max(0, byte_growth),
+            edge_delta,
+        ),
+    }
+
+
+def _assert_zero_marginal_attributed_retention(
+    measurements: tuple[dict[str, int], dict[str, int]],
+) -> dict[str, int | Fraction]:
+    growth = _attributed_allocation_growth(measurements)
+    assert growth["live_byte_growth"] <= 0, (
+        "adapter-attributed live bytes grew with edge cardinality: "
+        f"{growth}"
+    )
+    assert growth["live_block_growth"] <= 0, (
+        "adapter-attributed live allocation blocks grew with edge "
+        f"cardinality: {growth}"
+    )
+    return growth
+
+
+def test_attributed_memory_regression_kills_linear_retention_variant(
+    tmp_path: Path,
+):
+    cardinalities = (1_000, 20_000)
+    streaming = tuple(
+        _run_attributed_allocation_probe(
+            tmp_path / f"streaming-{edge_count}",
+            edge_count,
+            linear_retention=False,
+        )
+        for edge_count in cardinalities
+    )
+    linear = tuple(
+        _run_attributed_allocation_probe(
+            tmp_path / f"linear-{edge_count}",
+            edge_count,
+            linear_retention=True,
+        )
+        for edge_count in cardinalities
+    )
+    assert tuple(row["drafts"] for row in streaming) == tuple(
         edge_count + 100 for edge_count in cardinalities
     )
-    growth = tuple(row["rss_growth_bytes"] for row in measurements)
-    assert max(growth) - min(growth) < 8 * 1024 * 1024, measurements
+    assert tuple(row["drafts"] for row in linear) == tuple(
+        edge_count + 100 for edge_count in cardinalities
+    )
+
+    streaming_growth = _assert_zero_marginal_attributed_retention(
+        cast(tuple[dict[str, int], dict[str, int]], streaming)
+    )
+    linear_measurements = cast(
+        tuple[dict[str, int], dict[str, int]],
+        linear,
+    )
+    linear_growth = _attributed_allocation_growth(linear_measurements)
+    with pytest.raises(
+        AssertionError,
+        match="adapter-attributed live bytes grew",
+    ):
+        _assert_zero_marginal_attributed_retention(linear_measurements)
+
+    assert streaming_growth["marginal_live_bytes_per_edge"] == 0
+    assert linear_growth["live_block_growth"] >= cardinalities[1] - cardinalities[0]
+    assert linear_growth["marginal_live_bytes_per_edge"] >= 16
 
 
 def test_source_tree_is_reverified_after_lane_consumption(
