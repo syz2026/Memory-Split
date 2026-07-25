@@ -373,20 +373,20 @@ Fix commit:
 `32e4c81ca9422b312c418de78872bbb2d37cf140`
 (`fix: pin bootstrap digest in profile contract`)
 
-### Provisional integration value
+### Authoritative integration value
 
-The following digest is deliberately provisional:
+The frozen profile now carries the authoritative SHA-256 of the deterministic
+gzip member:
 
 ```text
-4a666e5a093da098a8066aadd4b4ed368dc4571a8cde54e525bf2e387db06861
+11f5fbfd7bee7a01e42956654020d21eeec7455305a2da3c8c7e9fb37a0b139f
 ```
 
-It is named `PROVISIONAL_BOOTSTRAP_USER_DATA_SHA256` in `contracts.py` and
-asserted literally by
-`test_profile_bootstrap_hash_is_loudly_provisional`. When the authoritative
-build-invariant payload lands, integration must update the contracts constant,
-the canonical profile JSON, and that test/fixture together. Changing only one
-fails loudly.
+It is named `BOOTSTRAP_USER_DATA_SHA256` in `contracts.py` and asserted
+literally by
+`test_profile_bootstrap_hash_matches_authoritative_build_invariant_payload`.
+The payload is build-invariant, so this digest is stable across builds. It must
+remain synchronized with the foundation's `BootstrapUserDataSha256` parameter.
 
 ### Pinned-authority RED
 
@@ -425,7 +425,7 @@ with no output.
 
 - The canonical profile requires the new field, validates lowercase SHA-256
   grammar, serializes it byte-for-byte, and pins it to the versioned
-  provisional constant.
+  authoritative constant.
 - Exact pinning in `contracts.py` prevents an alternate `--builder-profile`
   path containing another syntactically valid digest from becoming authority.
 - Gate 8 receives the already validated `CorpusBuilderProfile`; both the
@@ -439,4 +439,67 @@ with no output.
   dry-run, or intent emission.
 - The frozen profile's canonical bytes, and therefore every resulting
   `profile_sha256`, intentionally change with this contract addition.
+- No real AWS client or network call was made.
+
+## Authoritative build-invariant digest integration
+
+Integration commit:
+`6fb22ea38c303d6ba54b4978b4aacf1b21bae266`
+(`fix: install authoritative bootstrap digest`)
+
+Gate 8 hashes the bytes obtained by strict base64 decoding of launch-template
+`UserData`. The project-wide canonical definition is therefore the
+deterministic gzip member, not the rendered UTF-8 source or base64 transport.
+Because the rendered bootstrap is build-invariant, the reviewed gzip-member
+digest is stable across builds:
+
+```text
+rendered UTF-8: 36,486 bytes
+  sha256 7a551e1bc5bfc614c3ca699c8359b46143e4c10417a68be1f75b5b73edfdda37
+gzip member:     9,594 bytes
+  sha256 11f5fbfd7bee7a01e42956654020d21eeec7455305a2da3c8c7e9fb37a0b139f
+base64 string:  12,792 bytes
+  sha256 0e93ee325ff77776caf8e5e910e6a7b84850d901d5b596981ad3525fd5fff50d
+```
+
+The authoritative gzip digest must stay synchronized with the foundation's
+`BootstrapUserDataSha256` parameter. A mismatch remains a gate-8 failure.
+
+### Authoritative-digest RED
+
+```text
+python -m pytest -q \
+  tests/test_aws_corpus_builder_preflight.py::test_profile_bootstrap_hash_matches_authoritative_build_invariant_payload
+```
+
+Observed RED: `1 failed in 0.10s`; the old embedded fixture was 83 bytes rather
+than the canonical 9,594-byte gzip member.
+
+### Authoritative-digest GREEN
+
+```text
+python -m pytest -q tests/test_aws_corpus_builder_preflight.py
+python -m pytest -q tests/test_aws_corpus_builder_contracts.py
+python -m py_compile \
+  cluster/aws/corpus_builder/contracts.py \
+  cluster/aws/corpus_builder/preflight.py \
+  scripts/aws_corpus_builder_preflight.py
+git diff --check
+```
+
+Fresh results: `61 passed in 0.14s` for preflight and `46 passed in 0.04s` for
+contracts (`107 passed` total). Compilation and whitespace checks exited 0
+with no output.
+
+### Authoritative-digest self-review
+
+- The provisional name, comment, digest, test framing, and profile value are
+  removed. `BOOTSTRAP_USER_DATA_SHA256` now names the authoritative reviewed
+  gzip-member digest.
+- The self-contained preflight fixture embeds the canonical base64 transport,
+  strictly decodes it, decompresses it, and independently asserts all three
+  byte counts and SHA-256 values above.
+- Gate authority is unchanged: callers cannot supply or override the digest;
+  deployed decoded bytes, the snapshotted stack output, and the frozen profile
+  must still agree.
 - No real AWS client or network call was made.
