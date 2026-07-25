@@ -10,7 +10,6 @@ import re
 import stat
 import subprocess
 import sys
-import tarfile
 import warnings
 import zipfile
 import uuid
@@ -37,8 +36,43 @@ SOURCE_COMMIT = "a" * 40
 ASSIGNMENT_PATH = "configs/cohort-assignment-v2.json"
 CORPUS_IDENTITY_PATH = "configs/reasoning-dataset-v2.json"
 EVALUATION_IDENTITY_PATH = "configs/preregistration-v2.yaml"
+DATASET_POINTER_PATH = "DATASET-POINTER-AWS.json"
 NORMALIZED_TIME = (1980, 1, 1, 0, 0, 0)
 SNAPSHOT_STEPS = [1_358, 3_396, 6_791, 10_187, 13_582]
+
+# The canonical AWS-only N=10 confirmatory cohort. These are restated here
+# rather than imported so the verifier, the packager and this suite are three
+# independent statements of one contract; the mirror test below pins them to
+# msctl.aws_contracts so drift fails instead of propagating silently.
+V3_COHORT_ID = "memorysplit-confirmatory-v3-360m-n10-aws"
+V3_PREREGISTRATION_ID = "memorysplit-confirmatory-v3"
+V3_SEEDS = tuple(range(10))
+V3_ASSIGNMENT_PATH = "configs/cohort-assignment-v3.json"
+V3_EVALUATION_IDENTITY_PATH = "configs/preregistration-v3.yaml"
+V3_PROFILE_ID = "aws-p5.48xlarge-v3"
+V3_PROFILE_PATH = "cluster/profiles/aws-p5.48xlarge-v3.json"
+V3_CONFIG_ROOT = "configs/360m-v3"
+V3_PACKAGE_FORMAT_VERSION = 2
+V3_ENVIRONMENT_RECEIPT_FIELDS = [
+    "schema_version",
+    "receipt_type",
+    "provider",
+    "profile_sha256",
+    "runtime_lock_sha256",
+    "control_bundle_sha256",
+    "source_commit",
+    "source_tree",
+    "container_image",
+    "container_image_digest",
+    "aws_instance_identity_document",
+    "aws_instance_identity_pkcs7",
+    "account_id",
+    "instance_id",
+    "region",
+    "ami_id",
+    "boot_id",
+    "runtime_facts",
+]
 
 
 @dataclass(frozen=True)
@@ -83,19 +117,6 @@ def _assignment() -> dict[str, object]:
         "raw_target_tokens": 7_120_879_616,
         "targets_per_update": 524_288,
     }
-
-
-def _git_bytes(revision: str, path: str) -> bytes:
-    completed = subprocess.run(
-        ["git", "-C", str(REPO_ROOT), "show", f"{revision}:{path}"],
-        capture_output=True,
-        check=False,
-    )
-    assert completed.returncode == 0, completed.stderr.decode(
-        "utf-8",
-        errors="replace",
-    )
-    return completed.stdout
 
 
 def _aws_profile() -> dict[str, object]:
@@ -451,6 +472,252 @@ def _build_release(
     )
 
 
+def _v3_assignment(
+    *,
+    seeds: tuple[int, ...] = V3_SEEDS,
+    cohort_id: str = V3_COHORT_ID,
+    schema_version: int = 3,
+    provider_seeds: dict[str, list[int]] | None = None,
+) -> dict[str, object]:
+    return {
+        "cohort_id": cohort_id,
+        "model_parameters": 356_033_536,
+        "optimizer_steps": 13_582,
+        "provider_seeds": (
+            {AWS: list(seeds)} if provider_seeds is None else provider_seeds
+        ),
+        "raw_target_tokens": 7_120_879_616,
+        "schema_version": schema_version,
+        "targets_per_update": 524_288,
+    }
+
+
+def _v3_profile() -> dict[str, object]:
+    profile = _aws_profile()
+    profile["profile_id"] = V3_PROFILE_ID
+    profile["assigned_seeds"] = list(V3_SEEDS)
+    return profile
+
+
+def _v3_runtime_environment_contract(profile_sha256: str) -> dict[str, object]:
+    contract = _runtime_environment_contract(profile_sha256)
+    contract["runtime_environment_receipt"]["required_fields"] = list(
+        V3_ENVIRONMENT_RECEIPT_FIELDS
+    )
+    return contract
+
+
+def _v3_dataset_pointer() -> dict[str, object]:
+    return {
+        "schema_version": 1,
+        "provider": AWS,
+        "dataset_id": "memorysplit-v2-20x-reasoning-max-cohort",
+        "durable_uri_env": "MS_S3_ROOT",
+        "materialization": "s3",
+        "relative_path": "dataset",
+        "required_receipt": "dataset/receipt.json",
+        "required_sidecars": [
+            "dense_target_weights",
+            "split90_target_weights",
+        ],
+        "scratch_root": "/mnt/memorysplit",
+        "source_lock_manifest": CORPUS_IDENTITY_PATH,
+        "full_corpus_in_release": False,
+    }
+
+
+def _v3_run_config(
+    seed: int,
+    arm: str,
+    *,
+    run_id: str | None = None,
+    cohort_id: str = V3_COHORT_ID,
+    train_corpus: str = "dataset/receipt.json",
+) -> bytes:
+    value = {
+        "schema_version": 2,
+        "cohort_id": cohort_id,
+        "run_id": run_id or f"memorysplit-v3-360m-s{seed}-{arm}",
+        "condition": arm,
+        "seed": seed,
+        "model": "d360m",
+        "ctx": 1024,
+        "train_corpus": train_corpus,
+        "sidecar_name": (
+            "dense_target_weights" if arm == "dense" else "split90_target_weights"
+        ),
+        "out_dir": f"runs/seed-{seed}/{arm}",
+        "micro_batch_size": 8,
+        "tokens_per_step": 524_288,
+        "max_steps": 13_582,
+        "total_tokens": 7_120_879_616,
+        "lr": 0.001,
+        "warmup_steps": 300,
+        "weight_decay": 0.1,
+        "compile": True,
+        "device": "cuda",
+        "log_every": 20,
+        "eval_every": 250,
+        "snapshot_steps": SNAPSHOT_STEPS,
+        "ckpt_minutes": 30,
+    }
+    return yaml.safe_dump(value, sort_keys=False).encode("utf-8")
+
+
+def _build_v3_release(
+    root: Path,
+    *,
+    seeds: tuple[int, ...] = V3_SEEDS,
+    source_commit: str = SOURCE_COMMIT,
+    source_dirty: bool = False,
+    assignment_bytes: bytes | None = None,
+    corpus_bytes: bytes | None = None,
+    evaluation_bytes: bytes | None = None,
+    profile_bytes: bytes | None = None,
+    dataset_pointer_bytes: bytes | None = None,
+    environment: dict[str, object] | None = None,
+    package_format_version: int = V3_PACKAGE_FORMAT_VERSION,
+    config_root: str = V3_CONFIG_ROOT,
+    config_bytes: dict[tuple[int, str], bytes] | None = None,
+) -> FixtureRelease:
+    root.mkdir(parents=True)
+    assignment_content = assignment_bytes or _canonical_pretty(_v3_assignment())
+    corpus_content = corpus_bytes or _canonical_pretty(
+        {
+            "schema_version": 2,
+            "contract_id": "memorysplit-reasoning-dataset-v2",
+            "raw_target_tokens": 7_120_879_616,
+        }
+    )
+    evaluation_content = evaluation_bytes or (
+        b"schema_version: 3\n"
+        b"preregistration_id: memorysplit-confirmatory-v3\n"
+        b"frozen: true\n"
+    )
+    profile_content = profile_bytes or _canonical_pretty(_v3_profile())
+    pointer_content = dataset_pointer_bytes or _canonical_pretty(
+        _v3_dataset_pointer()
+    )
+    selected_configs = config_bytes or {}
+    payload = {
+        V3_ASSIGNMENT_PATH: assignment_content,
+        CORPUS_IDENTITY_PATH: corpus_content,
+        V3_EVALUATION_IDENTITY_PATH: evaluation_content,
+        V3_PROFILE_PATH: profile_content,
+        DATASET_POINTER_PATH: pointer_content,
+    }
+    for seed in seeds:
+        for arm in ("dense", "split90"):
+            payload[f"{config_root}/{arm}-s{seed}.yaml"] = selected_configs.get(
+                (seed, arm),
+                _v3_run_config(seed, arm),
+            )
+
+    member_rows = [
+        {
+            "path": name,
+            "bytes": len(payload[name]),
+            "sha256": _sha256(payload[name]),
+            "git_blob": "b" * 40,
+            "git_mode": "100644",
+        }
+        for name in sorted(payload)
+    ]
+    seed_assignment = {
+        "cohort_id": V3_COHORT_ID,
+        "provider": AWS,
+        "seeds": list(seeds),
+        "arms": ["dense", "split90"],
+    }
+    config_sha256 = {
+        name: _sha256(content)
+        for name, content in payload.items()
+        if name.startswith(f"{config_root}/")
+    }
+    environment_contract = environment or _v3_runtime_environment_contract(
+        _sha256(profile_content)
+    )
+    metadata = {
+        "schema_version": 1,
+        "package_format_version": package_format_version,
+        "provider": AWS,
+        "source": {
+            "commit": source_commit,
+            "dirty": source_dirty,
+            "tree": "c" * 40,
+        },
+        "seed_assignment": seed_assignment,
+        "cohort_assignment": {
+            "path": V3_ASSIGNMENT_PATH,
+            "sha256": _sha256(assignment_content),
+        },
+        "profile": {
+            "path": V3_PROFILE_PATH,
+            "sha256": _sha256(profile_content),
+        },
+        "environment": environment_contract,
+        "dataset_pointer": {
+            "path": DATASET_POINTER_PATH,
+            "sha256": _sha256(pointer_content),
+        },
+        "config_sha256": config_sha256,
+        "members": member_rows,
+    }
+    payload["RELEASE-METADATA.json"] = _canonical_pretty(metadata)
+    sums = "".join(
+        f"{_sha256(payload[name])}  {name}\n" for name in sorted(payload)
+    ).encode("utf-8")
+    entries = sorted(payload.items())
+    entries.append(("SHA256SUMS", sums))
+
+    members_sha256 = _sha256(sums)
+    release_id = f"aws-p5-r1-{members_sha256[:16]}"
+    archive_name = f"ms-aws-p5-r1-{members_sha256[:16]}.zip"
+    archive_path = root / archive_name
+    _write_zip(archive_path, entries)
+    archive_content = archive_path.read_bytes()
+    archive_sha256 = _sha256(archive_content)
+    receipt_path = root / "RELEASE-AWS-P5.json"
+    receipt = {
+        "schema_version": 1,
+        "package_format_version": package_format_version,
+        "release_id": release_id,
+        "provider": AWS,
+        "archive": {
+            "path": archive_name,
+            "sha256": archive_sha256,
+            "bytes": len(archive_content),
+        },
+        "source": metadata["source"],
+        "seed_assignment": seed_assignment,
+        "cohort_assignment": metadata["cohort_assignment"],
+        "profile": metadata["profile"],
+        "environment": environment_contract,
+        "dataset_pointer": metadata["dataset_pointer"],
+        "cohort_assignment_sha256": _sha256(assignment_content),
+        "profile_sha256": _sha256(profile_content),
+        "dataset_pointer_sha256": _sha256(pointer_content),
+        "config_sha256": config_sha256,
+        "members_sha256": members_sha256,
+    }
+    receipt_path.write_bytes(_canonical_pretty(receipt))
+    sha256_path = root / f"{archive_name}.sha256"
+    sha256_path.write_text(
+        f"{archive_sha256}  {archive_name}\n",
+        encoding="ascii",
+    )
+    return FixtureRelease(
+        receipt=receipt_path,
+        archive=archive_path,
+        sha256_file=sha256_path,
+        release_id=release_id,
+        archive_sha256=archive_sha256,
+        assignment_sha256=_sha256(assignment_content),
+        corpus_sha256=_sha256(corpus_content),
+        evaluation_sha256=_sha256(evaluation_content),
+    )
+
+
 def _invoke(illumina: Path, aws: Path) -> subprocess.CompletedProcess[str]:
     assert SCRIPT.is_file(), "cohort release verifier has not been implemented"
     return subprocess.run(
@@ -462,6 +729,16 @@ def _invoke(illumina: Path, aws: Path) -> subprocess.CompletedProcess[str]:
             "--aws",
             str(aws),
         ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+
+def _invoke_aws_only(aws: Path) -> subprocess.CompletedProcess[str]:
+    assert SCRIPT.is_file(), "cohort release verifier has not been implemented"
+    return subprocess.run(
+        [sys.executable, str(SCRIPT), "--aws", str(aws)],
         capture_output=True,
         text=True,
         check=False,
@@ -488,29 +765,14 @@ def _load_module(path: Path, prefix: str):
     return module
 
 
-def _materialize_integration_ref(root: Path, revision: str) -> Path:
-    archive_path = root / "integration.tar"
-    checkout = root / "integration"
-    root.mkdir()
-    checkout.mkdir()
+def _git(root: Path, *arguments: str) -> None:
     completed = subprocess.run(
-        [
-            "git",
-            "-C",
-            str(REPO_ROOT),
-            "archive",
-            "--format=tar",
-            f"--output={archive_path}",
-            revision,
-        ],
+        ["git", "-C", str(root), *arguments],
         capture_output=True,
         text=True,
         check=False,
     )
     assert completed.returncode == 0, completed.stderr
-    with tarfile.open(archive_path, mode="r") as archive:
-        archive.extractall(checkout, filter="data")
-    return checkout
 
 
 def _assert_rejected(completed: subprocess.CompletedProcess[str]) -> None:
@@ -696,27 +958,27 @@ def _pair(tmp_path: Path) -> tuple[FixtureRelease, FixtureRelease]:
 def test_accepts_release_built_by_integrated_illumina_packager(
     tmp_path: Path,
 ) -> None:
-    integration_root = _materialize_integration_ref(
-        tmp_path / "integrated-ref",
-        COHORT_AULC_REF,
-    )
     package_tests = _load_module(
-        integration_root / "tests/test_package_illumina_handoff.py",
+        REPO_ROOT / "tests" / "test_package_illumina_handoff.py",
         "integrated_illumina_package_tests",
     )
     package_module = _load_module(
-        integration_root / "scripts/package_illumina_handoff.py",
+        REPO_ROOT / "scripts" / "package_illumina_handoff.py",
         "integrated_illumina_packager",
     )
     fixture_root = tmp_path / "real-illumina"
     fixture_root.mkdir()
     source = package_tests._minimal_repo(fixture_root)
-    reasoning_identity = (integration_root / CORPUS_IDENTITY_PATH).read_bytes()
-    package_tests._write(source / CORPUS_IDENTITY_PATH, reasoning_identity)
-    package_tests._commit_mutation(source, "add reasoning identity")
+    package_tests._write(
+        source / CORPUS_IDENTITY_PATH,
+        (REPO_ROOT / CORPUS_IDENTITY_PATH).read_bytes(),
+    )
+    _git(source, "add", "-f", CORPUS_IDENTITY_PATH)
+    _git(source, "commit", "-qm", "add reasoning identity")
     illumina = package_module.build_handoff(
         source_root=source,
         out_dir=tmp_path / "real-illumina-release",
+        apply=True,
     )
     with zipfile.ZipFile(illumina.archive) as archive:
         assignment = archive.read(ASSIGNMENT_PATH)
@@ -738,22 +1000,21 @@ def test_accepts_release_built_by_integrated_illumina_packager(
     completed = _invoke(illumina.release, aws.receipt)
 
     assert completed.returncode == 0, completed.stdout
-    assert json.loads(completed.stdout)["ok"] is True
+    report = json.loads(completed.stdout)
+    assert report["ok"] is True
+    assert report["cohort_id"] == COHORT_ID
+    assert report["complete_cohort"] == [0, 1, 2, 3, 4]
 
 
 def test_accepts_release_built_by_final_aws_packager(
     tmp_path: Path,
 ) -> None:
-    integration_root = _materialize_integration_ref(
-        tmp_path / "aws-package-ref",
-        AWS_PACKAGE_REF,
-    )
     package_tests = _load_module(
-        integration_root / "tests/test_package_aws_p5_handoff.py",
+        REPO_ROOT / "tests" / "test_package_aws_p5_handoff.py",
         "final_aws_package_tests",
     )
     package_module = _load_module(
-        integration_root / "scripts/package_aws_p5_handoff.py",
+        REPO_ROOT / "scripts" / "package_aws_p5_handoff.py",
         "final_aws_packager",
     )
     fixture_root = tmp_path / "real-aws"
@@ -764,25 +1025,275 @@ def test_accepts_release_built_by_final_aws_packager(
         out_dir=tmp_path / "real-aws-release",
         apply=True,
     )
+
+    completed = _invoke_aws_only(aws.release)
+
+    assert completed.returncode == 0, completed.stdout
+    report = json.loads(completed.stdout)
+    assert report["ok"] is True
+    assert report["cohort_id"] == V3_COHORT_ID
+    assert report["complete_cohort"] == list(V3_SEEDS)
+    assert report["arms"] == ["dense", "split90"]
+    assert report["aws"] == {
+        "provider": AWS,
+        "release_id": aws.release_id,
+        "archive_sha256": aws.sha256,
+        "seeds": list(V3_SEEDS),
+    }
     with zipfile.ZipFile(aws.archive) as archive:
-        assignment = archive.read(ASSIGNMENT_PATH)
-        corpus = archive.read(CORPUS_IDENTITY_PATH)
-        evaluation = archive.read(EVALUATION_IDENTITY_PATH)
-    receipt = json.loads(aws.release.read_text(encoding="utf-8"))
+        assert report["cohort_assignment_sha256"] == _sha256(
+            archive.read(V3_ASSIGNMENT_PATH)
+        )
+        assert report["corpus_identity_sha256"] == _sha256(
+            archive.read(CORPUS_IDENTITY_PATH)
+        )
+        assert report["evaluation_identity_sha256"] == _sha256(
+            archive.read(V3_EVALUATION_IDENTITY_PATH)
+        )
+
+
+def test_rejects_v2_cohort_release_that_omits_the_illumina_half(
+    tmp_path: Path,
+) -> None:
+    _, aws = _pair(tmp_path)
+
+    _assert_rejected(_invoke_aws_only(aws.receipt))
+
+
+def test_accepts_v3_aws_only_cohort_and_emits_canonical_json(
+    tmp_path: Path,
+) -> None:
+    aws = _build_v3_release(tmp_path / "aws-v3")
+
+    completed = _invoke_aws_only(aws.receipt)
+
+    assert completed.returncode == 0, completed.stdout
+    assert completed.stderr == ""
+    assert len(completed.stdout.splitlines()) == 1
+    report = json.loads(completed.stdout)
+    assert completed.stdout == (
+        json.dumps(
+            report,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+            allow_nan=False,
+        )
+        + "\n"
+    )
+    assert report == {
+        "schema_version": 1,
+        "ok": True,
+        "cohort_id": V3_COHORT_ID,
+        "source_commit": SOURCE_COMMIT,
+        "cohort_assignment_sha256": aws.assignment_sha256,
+        "corpus_identity_sha256": aws.corpus_sha256,
+        "evaluation_identity_sha256": aws.evaluation_sha256,
+        "arms": ["dense", "split90"],
+        "complete_cohort": list(V3_SEEDS),
+        "aws": {
+            "provider": AWS,
+            "release_id": aws.release_id,
+            "archive_sha256": aws.archive_sha256,
+            "seeds": list(V3_SEEDS),
+        },
+    }
+
+
+def test_rejects_v3_cohort_paired_with_an_illumina_release(
+    tmp_path: Path,
+) -> None:
     illumina = _build_release(
         tmp_path / "illumina",
         provider=ILLUMINA,
         seeds=(0,),
-        source_commit=receipt["source"]["commit"],
-        assignment_bytes=assignment,
-        corpus_bytes=corpus,
-        evaluation_bytes=evaluation,
+    )
+    aws = _build_v3_release(tmp_path / "aws-v3")
+
+    _assert_rejected(_invoke(illumina.receipt, aws.receipt))
+
+
+@pytest.mark.parametrize(
+    "seeds",
+    [
+        tuple(range(9)),
+        tuple(range(11)),
+        (0, 1, 2, 3, 4),
+    ],
+    ids=("short", "long", "five-seed"),
+)
+def test_rejects_v3_cohort_without_exact_ten_seed_coverage(
+    tmp_path: Path,
+    seeds: tuple[int, ...],
+) -> None:
+    aws = _build_v3_release(tmp_path / "aws-v3", seeds=seeds)
+
+    _assert_rejected(_invoke_aws_only(aws.receipt))
+
+
+def test_rejects_v3_cohort_that_names_a_second_provider(
+    tmp_path: Path,
+) -> None:
+    aws = _build_v3_release(
+        tmp_path / "aws-v3",
+        assignment_bytes=_canonical_pretty(
+            _v3_assignment(
+                provider_seeds={
+                    AWS: list(range(1, 10)),
+                    ILLUMINA: [0],
+                }
+            )
+        ),
     )
 
-    completed = _invoke(illumina.receipt, aws.release)
+    _assert_rejected(_invoke_aws_only(aws.receipt))
 
-    assert completed.returncode == 0, completed.stdout
-    assert json.loads(completed.stdout)["ok"] is True
+
+def test_rejects_v3_cohort_with_a_v2_assignment_schema_version(
+    tmp_path: Path,
+) -> None:
+    aws = _build_v3_release(
+        tmp_path / "aws-v3",
+        assignment_bytes=_canonical_pretty(_v3_assignment(schema_version=2)),
+    )
+
+    _assert_rejected(_invoke_aws_only(aws.receipt))
+
+
+def test_rejects_v3_cohort_with_a_v2_package_format_version(
+    tmp_path: Path,
+) -> None:
+    aws = _build_v3_release(
+        tmp_path / "aws-v3",
+        package_format_version=1,
+    )
+
+    _assert_rejected(_invoke_aws_only(aws.receipt))
+
+
+def test_rejects_v3_cohort_served_from_the_v2_config_root(
+    tmp_path: Path,
+) -> None:
+    aws = _build_v3_release(
+        tmp_path / "aws-v3",
+        config_root="configs/360m-v2",
+    )
+
+    _assert_rejected(_invoke_aws_only(aws.receipt))
+
+
+def test_rejects_v3_release_that_reuses_the_v2_provider_profile(
+    tmp_path: Path,
+) -> None:
+    aws = _build_v3_release(
+        tmp_path / "aws-v3",
+        profile_bytes=_canonical_pretty(_aws_profile()),
+    )
+
+    _assert_rejected(_invoke_aws_only(aws.receipt))
+
+
+def test_rejects_v3_release_with_the_v2_environment_receipt_contract(
+    tmp_path: Path,
+) -> None:
+    profile_content = _canonical_pretty(_v3_profile())
+    aws = _build_v3_release(
+        tmp_path / "aws-v3",
+        profile_bytes=profile_content,
+        environment=_runtime_environment_contract(_sha256(profile_content)),
+    )
+
+    _assert_rejected(_invoke_aws_only(aws.receipt))
+
+
+def test_rejects_v3_run_config_bound_to_the_v2_corpus_receipt(
+    tmp_path: Path,
+) -> None:
+    aws = _build_v3_release(
+        tmp_path / "aws-v3",
+        config_bytes={
+            (7, "split90"): _v3_run_config(
+                7,
+                "split90",
+                train_corpus="dataset/corpus-receipt.json",
+            )
+        },
+    )
+
+    _assert_rejected(_invoke_aws_only(aws.receipt))
+
+
+def test_rejects_v3_run_config_carrying_a_v2_run_id(tmp_path: Path) -> None:
+    aws = _build_v3_release(
+        tmp_path / "aws-v3",
+        config_bytes={
+            (3, "dense"): _v3_run_config(
+                3,
+                "dense",
+                run_id="memorysplit-v2-360m-s3-dense",
+            )
+        },
+    )
+
+    _assert_rejected(_invoke_aws_only(aws.receipt))
+
+
+def test_rejects_v3_release_with_a_non_v3_preregistration_identity(
+    tmp_path: Path,
+) -> None:
+    aws = _build_v3_release(
+        tmp_path / "aws-v3",
+        evaluation_bytes=(
+            b"schema_version: 2\n"
+            b"preregistration_id: memorysplit-confirmatory-v2\n"
+            b"frozen: true\n"
+        ),
+    )
+
+    _assert_rejected(_invoke_aws_only(aws.receipt))
+
+
+def test_rejects_v3_release_whose_dataset_pointer_is_not_exact(
+    tmp_path: Path,
+) -> None:
+    pointer = _v3_dataset_pointer()
+    pointer["full_corpus_in_release"] = True
+    aws = _build_v3_release(
+        tmp_path / "aws-v3",
+        dataset_pointer_bytes=_canonical_pretty(pointer),
+    )
+
+    _assert_rejected(_invoke_aws_only(aws.receipt))
+
+
+def test_v3_verifier_contract_mirrors_the_canonical_aws_contract_module() -> None:
+    module = _load_verifier_module()
+    contract = module.V3_CONTRACT
+
+    from msctl import aws_contracts
+
+    assert contract.cohort_id == aws_contracts.COHORT_ID
+    assert contract.assignment_path == aws_contracts.COHORT_ASSIGNMENT_PATH
+    assert contract.evaluation_identity_path == aws_contracts.PREREGISTRATION_PATH
+    assert contract.preregistration_id == aws_contracts.PREREGISTRATION_ID
+    assert contract.config_root == f"{aws_contracts.CONFIG_ROOT}/"
+    assert contract.aws_profile_path == aws_contracts.PROFILE_PATH
+    assert contract.dataset_pointer_path == aws_contracts.DATASET_POINTER_PATH
+    assert contract.expected_seeds[aws_contracts.PROVIDER] == aws_contracts.SEEDS
+    assert contract.complete_cohort == aws_contracts.SEEDS
+    assert contract.arms == aws_contracts.ARMS
+    assert contract.snapshot_steps == aws_contracts.SNAPSHOT_STEPS
+    assert (
+        contract.package_format_version == aws_contracts.PACKAGE_FORMAT_VERSION
+    )
+    assert contract.environment_receipt_fields == (
+        aws_contracts.AWS_ENVIRONMENT_RECEIPT_V2_FIELDS
+    )
+    assert {
+        f"{contract.config_root}{arm}-s{seed}.yaml"
+        for seed in contract.expected_seeds[aws_contracts.PROVIDER]
+        for arm in contract.arms
+    } == set(aws_contracts.EXPECTED_CONFIG_PATHS)
 
 
 def test_rejects_snap_frac_even_when_every_hash_is_rebound(
