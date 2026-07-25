@@ -1,4 +1,13 @@
-"""Closed receipts and descriptor-pinned Wikidata archive authority."""
+"""Closed receipts and descriptor-pinned Wikidata archive authority.
+
+Threat model: the builder is the sole workload on a dedicated, single-tenant
+EC2 instance, with no untrusted process sharing its UID. Finite races, crashes,
+interrupted writes, concurrent legitimate builders, and accidental namespace
+reuse are in scope. An unbounded same-UID adversary that continuously races
+every rename or unlink is out of scope; POSIX needs privilege separation to
+defend against that actor. Detectable ambiguity fails closed, and race handling
+is deliberately bounded rather than retrying forever.
+"""
 
 from __future__ import annotations
 
@@ -4663,6 +4672,13 @@ class _QuarantineExchangeState:
     marker_at_marker: bool
 
 
+@dataclass(frozen=True)
+class _EmergencyQuarantineState:
+    candidate_at_final: bool
+    candidate_at_emergency: bool
+    candidate_at_manual: bool
+
+
 def _marker_pool_slot_name(
     pool: _QuarantineMarkerPool,
     slot_index: int,
@@ -5057,6 +5073,190 @@ def _restore_emergency_wrong_source(
             )
 
 
+def _classify_emergency_quarantine(
+    authority: _PrivateBuildAuthority,
+    published_name: str,
+    emergency_name: str,
+) -> _EmergencyQuarantineState:
+    return _EmergencyQuarantineState(
+        candidate_at_final=_named_derived_directory_matches(
+            authority.namespace_fd,
+            published_name,
+            authority.descriptor,
+            authority.identity,
+            "failed candidate at final name during emergency quarantine",
+        ),
+        candidate_at_emergency=_named_derived_directory_matches(
+            authority.namespace_fd,
+            emergency_name,
+            authority.descriptor,
+            authority.identity,
+            "failed candidate at emergency quarantine name",
+        ),
+        candidate_at_manual=_named_derived_directory_matches(
+            authority.namespace_fd,
+            authority.name,
+            authority.descriptor,
+            authority.identity,
+            "failed candidate at original private name",
+        ),
+    )
+
+
+def _sync_and_classify_emergency_quarantine(
+    authority: _PrivateBuildAuthority,
+    published_name: str,
+    emergency_name: str,
+) -> _EmergencyQuarantineState:
+    fsync_directory(authority.namespace_fd)
+    return _classify_emergency_quarantine(
+        authority,
+        published_name,
+        emergency_name,
+    )
+
+
+def _emergency_cleanup_error(
+    cleanup_name: str,
+    *,
+    candidate_at_final: bool,
+    last_error: BaseException | None,
+    relocation_error: BaseException | None = None,
+) -> ValueError:
+    cleanup_path = f"wikidata/{cleanup_name}"
+    if candidate_at_final:
+        error = ValueError(
+            "Wikidata emergency quarantine exhausted; retained failed "
+            f"candidate verified at {cleanup_path}; manual cleanup required "
+            f"at {cleanup_path}; this path must not be trusted"
+        )
+    else:
+        error = ValueError(
+            "Wikidata emergency quarantine exhausted; retained failed "
+            "candidate verified after relocation; manual cleanup required at "
+            f"{cleanup_path}"
+        )
+    if last_error is not None:
+        error.add_note(f"last emergency quarantine error: {last_error!r}")
+    if relocation_error is not None:
+        error.add_note(
+            f"terminal emergency relocation also failed: "
+            f"{relocation_error!r}"
+        )
+    return error
+
+
+def _finish_emergency_quarantine_exhaustion(
+    authority: _PrivateBuildAuthority,
+    published_name: str,
+    emergency_name: str,
+    last_error: BaseException | None,
+) -> str:
+    terminal_error: BaseException | None = None
+    try:
+        state = _sync_and_classify_emergency_quarantine(
+            authority,
+            published_name,
+            emergency_name,
+        )
+    except BaseException as error:
+        terminal_error = error
+        state = _classify_emergency_quarantine(
+            authority,
+            published_name,
+            emergency_name,
+        )
+
+    if state.candidate_at_emergency and not state.candidate_at_final:
+        return emergency_name
+    if state.candidate_at_manual and not state.candidate_at_final:
+        raise _emergency_cleanup_error(
+            authority.name,
+            candidate_at_final=False,
+            last_error=last_error,
+            relocation_error=terminal_error,
+        )
+    if not state.candidate_at_final:
+        error = ValueError(
+            "Wikidata emergency quarantine exhausted after final-name "
+            "identity reclassification; the retained failed candidate is "
+            "not bound to the final, emergency, or original private name"
+        )
+        if last_error is not None:
+            error.add_note(
+                f"last emergency quarantine error: {last_error!r}"
+            )
+        if terminal_error is not None:
+            error.add_note(
+                f"terminal emergency reclassification also failed: "
+                f"{terminal_error!r}"
+            )
+        raise error
+
+    relocation_error: BaseException | None = terminal_error
+    try:
+        atomic_rename_noreplace(
+            authority.namespace_fd,
+            published_name,
+            authority.namespace_fd,
+            authority.name,
+        )
+    except BaseException as error:
+        relocation_error = error
+
+    try:
+        relocated = _sync_and_classify_emergency_quarantine(
+            authority,
+            published_name,
+            emergency_name,
+        )
+    except BaseException as error:
+        if relocation_error is None:
+            relocation_error = error
+        relocated = _classify_emergency_quarantine(
+            authority,
+            published_name,
+            emergency_name,
+        )
+
+    if (
+        relocated.candidate_at_manual
+        and not relocated.candidate_at_final
+    ):
+        raise _emergency_cleanup_error(
+            authority.name,
+            candidate_at_final=False,
+            last_error=last_error,
+            relocation_error=relocation_error,
+        )
+    if (
+        relocated.candidate_at_emergency
+        and not relocated.candidate_at_final
+    ):
+        return emergency_name
+    if relocated.candidate_at_final:
+        raise _emergency_cleanup_error(
+            published_name,
+            candidate_at_final=True,
+            last_error=last_error,
+            relocation_error=relocation_error,
+        )
+
+    error = ValueError(
+        "Wikidata emergency quarantine exhausted after terminal relocation; "
+        "the final name was identity-reclassified and does not denote the "
+        "retained failed candidate"
+    )
+    if last_error is not None:
+        error.add_note(f"last emergency quarantine error: {last_error!r}")
+    if relocation_error is not None:
+        error.add_note(
+            f"terminal emergency relocation also failed: "
+            f"{relocation_error!r}"
+        )
+    raise error
+
+
 def _emergency_quarantine_published_candidate(
     authority: _PrivateBuildAuthority,
     published_name: str,
@@ -5115,28 +5315,25 @@ def _emergency_quarantine_published_candidate(
             fsync_directory(authority.namespace_fd)
             return emergency_name
 
-        if _named_derived_directory_matches(
-            authority.namespace_fd,
+        state = _sync_and_classify_emergency_quarantine(
+            authority,
+            published_name,
             emergency_name,
-            authority.descriptor,
-            authority.identity,
-            "emergency-quarantined failed candidate",
-        ):
-            fsync_directory(authority.namespace_fd)
-            _check_named_derived_directory(
-                authority.namespace_fd,
-                emergency_name,
-                authority.descriptor,
-                authority.identity,
-                "retained emergency-quarantined failed candidate",
+        )
+        if state.candidate_at_emergency and not state.candidate_at_final:
+            return emergency_name
+        if state.candidate_at_manual and not state.candidate_at_final:
+            raise _emergency_cleanup_error(
+                authority.name,
+                candidate_at_final=False,
+                last_error=last_error,
             )
-            try:
-                entry_lstat(authority.namespace_fd, published_name)
-            except FileNotFoundError:
-                return emergency_name
-            raise ValueError(
-                "Wikidata final name was reoccupied after emergency quarantine"
+        if state.candidate_at_final:
+            last_error = ValueError(
+                "the exact failed candidate reoccupied the final name after "
+                "an emergency move"
             )
+            continue
 
         try:
             _restore_emergency_wrong_source(
@@ -5168,10 +5365,12 @@ def _emergency_quarantine_published_candidate(
         fsync_directory(authority.namespace_fd)
         return emergency_name
 
-    exhausted = ValueError("Wikidata emergency quarantine retry exhausted")
-    if last_error is not None:
-        exhausted.add_note(f"last emergency quarantine error: {last_error!r}")
-    raise exhausted
+    return _finish_emergency_quarantine_exhaustion(
+        authority,
+        published_name,
+        emergency_name,
+        last_error,
+    )
 
 
 def _release_owned_quarantine_marker(

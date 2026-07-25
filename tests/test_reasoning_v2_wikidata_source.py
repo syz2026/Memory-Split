@@ -3780,6 +3780,249 @@ def test_transient_occupied_emergency_slot_retries_boundedly(
     assert emergency.stat().st_ino == candidate_inode
 
 
+@pytest.mark.parametrize(
+    "fallback_blocked",
+    [False, True],
+    ids=["relocated", "manual-cleanup-required-at-final"],
+)
+def test_persistent_emergency_occupation_reclassifies_and_names_cleanup_path(
+    archive_authority: _AuthorityFixture,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    fallback_blocked: bool,
+):
+    output_root = tmp_path / "derived"
+    final_name: str | None = None
+    manual_name: str | None = None
+    candidate_inode: int | None = None
+    emergency_inode: int | None = None
+    failure_count = 0
+    emergency_attempts = 0
+    manual_attempts = 0
+    original_rename = wikidata_source_module.atomic_rename_noreplace
+
+    def fail_after_publish(phase, authority, receipt_sha256):
+        nonlocal final_name, manual_name, candidate_inode
+        nonlocal emergency_inode, failure_count
+        if phase != "before_postpublish_verify":
+            return
+        final_name = receipt_sha256
+        manual_name = authority.name
+        namespace = output_root / "wikidata"
+        candidate_inode = (namespace / receipt_sha256).stat().st_ino
+        failure_count += 1
+        if failure_count == 7:
+            emergency = namespace / f".wikidata-marker-{receipt_sha256}-7"
+            emergency.mkdir(mode=0o700)
+            emergency_inode = emergency.stat().st_ino
+        raise RuntimeError("forced persistent-emergency failure")
+
+    def persistently_occupy_emergency(
+        source_directory_fd,
+        source_name,
+        destination_directory_fd,
+        destination_name,
+    ):
+        nonlocal emergency_attempts, manual_attempts
+        is_emergency = (
+            failure_count == 7
+            and final_name is not None
+            and source_name == final_name
+            and destination_name
+            == f".wikidata-marker-{final_name}-7"
+        )
+        if is_emergency:
+            emergency_attempts += 1
+        is_manual_fallback = (
+            fallback_blocked
+            and failure_count == 7
+            and final_name is not None
+            and manual_name is not None
+            and source_name == final_name
+            and destination_name == manual_name
+        )
+        if is_manual_fallback:
+            manual_attempts += 1
+            raise PermissionError("injected manual relocation failure")
+        return original_rename(
+            source_directory_fd,
+            source_name,
+            destination_directory_fd,
+            destination_name,
+        )
+
+    monkeypatch.setattr(
+        wikidata_source_module,
+        "_derived_view_build_hook",
+        fail_after_publish,
+    )
+    monkeypatch.setattr(
+        wikidata_source_module,
+        "atomic_rename_noreplace",
+        persistently_occupy_emergency,
+    )
+
+    raised: pytest.ExceptionInfo[RuntimeError] | None = None
+    for _failure in range(7):
+        with pytest.raises(
+            RuntimeError,
+            match="forced persistent-emergency failure",
+        ) as current:
+            _build_view(archive_authority, output_root)
+        raised = current
+
+    assert raised is not None
+    assert final_name is not None
+    assert manual_name is not None
+    assert candidate_inode is not None
+    assert emergency_inode is not None
+    assert emergency_attempts == (
+        wikidata_source_module._EMERGENCY_QUARANTINE_ATTEMPTS
+    )
+    namespace = output_root / "wikidata"
+    final = namespace / final_name
+    manual = namespace / manual_name
+    emergency = namespace / f".wikidata-marker-{final_name}-7"
+    assert emergency.stat().st_ino == emergency_inode
+    notes = getattr(raised.value, "__notes__", ())
+
+    if fallback_blocked:
+        assert manual_attempts == 1
+        assert final.stat().st_ino == candidate_inode
+        assert not manual.exists()
+        cleanup_path = f"wikidata/{final_name}"
+        assert any(
+            cleanup_path in note
+            and "retained failed candidate" in note
+            and "must not be trusted" in note
+            for note in notes
+        )
+    else:
+        assert manual_attempts == 0
+        assert not final.exists()
+        assert manual.stat().st_ino == candidate_inode
+        cleanup_path = f"wikidata/{manual_name}"
+        assert any(
+            f"manual cleanup required at {cleanup_path}" in note
+            for note in notes
+        )
+
+
+@pytest.mark.parametrize(
+    "reoccupant",
+    ["different-winner", "exact-candidate"],
+)
+def test_emergency_postmove_reoccupation_is_identity_classified(
+    archive_authority: _AuthorityFixture,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    reoccupant: str,
+):
+    output_root = tmp_path / "derived"
+    seed = _build_view(archive_authority, output_root)
+    namespace = output_root / "wikidata"
+    held_winner = namespace / "held-concurrent-winner"
+    seed.root.rename(held_winner)
+    winner_inode = held_winner.stat().st_ino
+    final_name: str | None = None
+    candidate_inode: int | None = None
+    failure_count = 0
+    emergency_moves = 0
+    restoration_calls = 0
+    original_rename = wikidata_source_module.atomic_rename_noreplace
+    original_restore = wikidata_source_module._restore_emergency_wrong_source
+
+    def fail_after_publish(phase, _authority, receipt_sha256):
+        nonlocal final_name, candidate_inode, failure_count
+        if phase != "before_postpublish_verify":
+            return
+        final_name = receipt_sha256
+        candidate_inode = (namespace / receipt_sha256).stat().st_ino
+        failure_count += 1
+        raise RuntimeError("forced postmove reoccupation failure")
+
+    def reoccupy_after_emergency_move(
+        source_directory_fd,
+        source_name,
+        destination_directory_fd,
+        destination_name,
+    ):
+        nonlocal emergency_moves
+        is_emergency = (
+            failure_count == 7
+            and final_name is not None
+            and source_name == final_name
+            and destination_name
+            == f".wikidata-marker-{final_name}-7"
+        )
+        result = original_rename(
+            source_directory_fd,
+            source_name,
+            destination_directory_fd,
+            destination_name,
+        )
+        if is_emergency:
+            emergency_moves += 1
+            if emergency_moves == 1:
+                final = namespace / final_name
+                if reoccupant == "different-winner":
+                    held_winner.rename(final)
+                else:
+                    (namespace / destination_name).rename(final)
+        return result
+
+    def record_wrong_source_restoration(*args, **kwargs):
+        nonlocal restoration_calls
+        restoration_calls += 1
+        return original_restore(*args, **kwargs)
+
+    monkeypatch.setattr(
+        wikidata_source_module,
+        "_derived_view_build_hook",
+        fail_after_publish,
+    )
+    monkeypatch.setattr(
+        wikidata_source_module,
+        "atomic_rename_noreplace",
+        reoccupy_after_emergency_move,
+    )
+    monkeypatch.setattr(
+        wikidata_source_module,
+        "_restore_emergency_wrong_source",
+        record_wrong_source_restoration,
+    )
+
+    raised: pytest.ExceptionInfo[RuntimeError] | None = None
+    for _failure in range(7):
+        with pytest.raises(
+            RuntimeError,
+            match="forced postmove reoccupation failure",
+        ) as current:
+            _build_view(archive_authority, output_root)
+        raised = current
+
+    assert raised is not None
+    assert failure_count == 7
+    assert final_name is not None
+    assert candidate_inode is not None
+    notes = getattr(raised.value, "__notes__", ())
+    assert not any(
+        "published candidate quarantine also failed" in note for note in notes
+    )
+    emergency = namespace / f".wikidata-marker-{final_name}-7"
+    assert emergency.stat().st_ino == candidate_inode
+    assert restoration_calls == 0
+
+    if reoccupant == "different-winner":
+        assert emergency_moves == 1
+        assert (namespace / final_name).stat().st_ino == winner_inode
+        assert not held_winner.exists()
+    else:
+        assert emergency_moves == 2
+        assert not (namespace / final_name).exists()
+        assert held_winner.stat().st_ino == winner_inode
+
+
 def test_emergency_quarantine_restores_substituted_source(
     archive_authority: _AuthorityFixture,
     tmp_path: Path,
