@@ -202,3 +202,145 @@ git diff --check
 6. Task 2's package allowlist does not yet include `driver.py`, and the
    unsupported marker remains in the out-of-scope adapter module. Packaging is
    expected to update both after the production adapter integration.
+
+## Review-fix follow-up
+
+- Reviewed head: `a1352cb613bdd7b34446f48b921cb512b9ba1454`
+- Authority/recovery fix:
+  `dab5c94fb3d2e4a4a240d8c86716583444af0ed5`
+- No commit was amended and no remote was pushed.
+- The verified production factory boundary remains unchanged; no missing lane
+  adapter was implemented in this task.
+
+### Review RED/GREEN evidence
+
+The failure matrix was added before the production fixes. Initial focused RED:
+
+```text
+python -m pytest -q tests/test_aws_corpus_builder_driver.py \
+  --basetemp=/tmp/memorysplit-aws-task4-review-red
+..FFFF.....                                                              [100%]
+4 failed, 7 passed in 0.35s
+```
+
+The four expected failures demonstrated that:
+
+1. a changed `shard_count` reused the old phase chain;
+2. a changed production sidecar crossed a reused catalog receipt;
+3. an action interrupted after writing render output polluted `output_root`;
+4. an upload retry wrote both attempts directly into the same persistent root.
+
+A further producer-scratch test was RED against non-recursive attempt cleanup:
+
+```text
+python -m pytest -q \
+  tests/test_aws_corpus_builder_driver.py::test_successful_phase_discards_private_producer_scratch \
+  --basetemp=/tmp/memorysplit-task4-scratch-red
+1 failed in 0.32s
+```
+
+Focused GREEN:
+
+```text
+python -m pytest -q tests/test_aws_corpus_builder_driver.py \
+  --basetemp=/tmp/memorysplit-task4-report-focused
+............                                                             [100%]
+12 passed in 0.37s
+```
+
+Required producer regression:
+
+```text
+python -m pytest -q \
+  tests/test_aws_corpus_builder_driver.py \
+  tests/test_parallel_corpus.py \
+  --basetemp=/tmp/memorysplit-task4-review-final2
+........................................................................ [ 86%]
+...........                                                              [100%]
+83 passed in 6.85s
+```
+
+Static verification:
+
+```text
+python -m py_compile \
+  cluster/aws/corpus_builder/driver.py \
+  scripts/build_parallel_corpus.py \
+  tests/test_aws_corpus_builder_driver.py \
+  tests/test_parallel_corpus.py
+# silent, exit 0
+
+git diff --check
+# silent, exit 0
+```
+
+Every named `/tmp/memorysplit-task4-*` pytest tree above was deleted after its
+run.
+
+### `CorpusBuildRequest` field audit
+
+The resume seed is now schema `memorysplit-aws-corpus-driver-v2`.
+
+Fields bound into the seed because they affect corpus or publication authority:
+
+- `build_id`: canonical corpus identity, receipt identity, and S3 namespace;
+- `package_sha256`: executable generator and packaged configuration identity;
+- `source_lock_sha256`: exact source identity;
+- `shard_count`: shard assignment, receipt configuration, and corpus bytes;
+- `bucket` and `prefix`: exact publication namespace; and
+- `kms_key_arn`: exact encryption authority recorded by every object receipt.
+
+The last three values are frozen by request validation, but are still bound so
+the resume identity is complete rather than relying only on that validation.
+
+Fields intentionally classified as environmental and excluded from the seed:
+
+- `source_lock_path`: a local locator whose bytes are rehashed against
+  `source_lock_sha256` before any resume lookup;
+- `work_root`: an owner-only scratch/cache location not serialized into corpus
+  output;
+- `output_root`: a local publication location not serialized into corpus
+  output; and
+- `workers`: an execution-parallelism control. The parallel builder excludes it
+  from `_parallel_build_id`; metadata reduction, scheduling, shard assignment,
+  and canonical output order are deterministic across worker counts.
+
+No `CorpusBuildRequest` field is left unaudited.
+
+### Resume and recovery hardening
+
+- A catalog attempt writes a canonical manifest of `catalog.sha256`,
+  `renderer_id`, and every named sidecar SHA-256. The driver recomputes that
+  manifest before promotion, whenever a catalog receipt is reused, and again
+  before rendering. On a reuse path, any adapter, catalog, renderer identity,
+  sidecar set, or sidecar-byte drift fails closed before a downstream phase
+  runner is invoked.
+- Each local-output phase now receives a newly created owner-only attempt
+  container. Its complete declared file inventory is hashed before an atomic
+  no-replace rename publishes it to the stable local root.
+- An interruption inside the phase action leaves only an unreferenced private
+  attempt. It cannot pollute the stable output root or satisfy a receipt lookup.
+- An interruption during S3 upload leaves no phase receipt. The retry executes
+  the phase again in a different private attempt; an existing stable local tree
+  is accepted only after exact relative-path, byte-count, and SHA-256 equality,
+  then upload and receipt publication restart.
+- Producer-private scratch outside the declared output tree is removed with
+  the completed attempt container and never enters the stable inventory.
+- `s3-publish` has no generated local output and reads only the promoted,
+  verified corpus tree. `cleanroom-verify` continues to allocate its own new
+  owner-only download root for each attempt.
+
+### Review-fix self-review
+
+- The v2 seed intentionally invalidates all intermediate v1 receipt keys. If a
+  v1 final receipt already exists for the same build ID, fail-closed final
+  publication requires a new build ID rather than overwriting history.
+- Catalog drift is checked at the receipt boundary, not merely when a render
+  happens to rerun, so even a fully populated downstream receipt chain cannot
+  bypass current production-input authentication.
+- Persistent output from a receipt-less attempt is never used to skip work:
+  the phase reruns privately and must reproduce it exactly.
+- All new failure tests use `VersionedFakeS3`; no AWS SDK client or network
+  operation was used.
+- Only the driver, its focused tests, and this owned report changed. The
+  production adapter remains the known launch blocker described above.
