@@ -854,6 +854,14 @@ class WikidataGraphRenderer(_ExposureRenderer):
                 return sha256, path, identity
         raise ValueError("Wikidata archive path is outside the verified view")
 
+    def _reverify_archives(self, boundary: str) -> None:
+        for relative, _sha256, path, identity in self._archives:
+            _check_regular_identity(
+                path,
+                identity,
+                f"verified Wikidata source archive {relative} {boundary}",
+            )
+
     def render(
         self,
         record: CatalogRecord,
@@ -921,16 +929,12 @@ class WikidataGraphRenderer(_ExposureRenderer):
                 "Wikidata locator archive path does not match its training split"
             )
 
-        archive_sha256, archive, archive_identity = self._archive(archive_path)
+        archive_sha256 = self._archive(archive_path)[0]
         if record.source_byte_sha256 != archive_sha256:
             raise ValueError(
                 "Wikidata record archive SHA-256 does not match the verified view"
             )
-        _check_regular_identity(
-            archive,
-            archive_identity,
-            "verified Wikidata source archive before render",
-        )
+        self._reverify_archives("before render")
 
         try:
             triple = lookup_training_triple(view, training_split, row)
@@ -972,11 +976,7 @@ class WikidataGraphRenderer(_ExposureRenderer):
         # checked on both sides of tokenization and sidecar construction.
         if lookup_training_triple(view, training_split, row) != triple:
             raise ValueError("Wikidata indexed training triple changed during render")
-        _check_regular_identity(
-            archive,
-            archive_identity,
-            "verified Wikidata source archive after render",
-        )
+        self._reverify_archives("after render")
         return rendered
 
 

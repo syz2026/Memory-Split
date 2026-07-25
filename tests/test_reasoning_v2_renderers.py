@@ -5,6 +5,7 @@ import json
 import os
 import sqlite3
 import struct
+import unicodedata
 from dataclasses import replace
 from fractions import Fraction
 from pathlib import Path
@@ -230,6 +231,66 @@ def test_fineweb_renderer_is_exact_deterministic_and_closed(
     assert first.semantic_leaks == ()
 
 
+def test_fineweb_reads_only_the_three_locked_10bt_files(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    route_index,
+):
+    source_root = tmp_path / "sources"
+    calls: list[str] = []
+
+    def texts(path: Path):
+        calls.append(path.relative_to(source_root / "fineweb_edu").as_posix())
+        return iter(("locked educational text " * 16,))
+
+    monkeypatch.setattr(renderers_module, "_iter_parquet_texts", texts)
+    renderer = FineWebEduRenderer(source_root)
+    locked_sources = []
+    for index, relative in enumerate(FINEWEB_PATHS):
+        payload = f"locked-{index}".encode()
+        _write_source(source_root, "fineweb_edu", relative, payload)
+        locked_sources.append((index, relative, payload))
+
+    unapproved = "sample/10BT/003_00000.parquet"
+    unapproved_payload = b"not locked"
+    _write_source(
+        source_root,
+        "fineweb_edu",
+        unapproved,
+        unapproved_payload,
+    )
+    routes = route_index(set())
+    for index, relative, payload in locked_sources:
+        renderer.render(
+            _record(
+                lane_id="fineweb_edu",
+                source_id="fineweb_edu",
+                source_key=f"fineweb:{index}",
+                relative=relative,
+                source_payload=payload,
+                target_count=8,
+                locator=(("row", 0),),
+            ),
+            routes,
+        )
+    assert calls == list(FINEWEB_PATHS)
+
+    with pytest.raises(ValueError, match="locked|10BT|FineWeb"):
+        renderer.render(
+            _record(
+                lane_id="fineweb_edu",
+                source_id="fineweb_edu",
+                source_key="fineweb:unapproved",
+                relative=unapproved,
+                source_payload=unapproved_payload,
+                target_count=8,
+                locator=(("row", 0),),
+            ),
+            routes,
+        )
+    assert unapproved not in calls
+
+
 def test_finemath_renderer_preserves_cross_deduplicated_selection(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -341,6 +402,168 @@ def test_synthetic_renderer_replays_catalog_seed_and_closes_sidecars(
     assert first.dense_target_weights == b"\x01" * record.target_count
     assert set(first.split90_target_weights) == {0, 1}
     assert first.semantic_leaks == ()
+
+
+def _synthetic_rejection_case(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    rendered_records: tuple[RenderedRecord, ...],
+    target_count: int = 48,
+    exposure: int = 0,
+) -> tuple[SyntheticGraphRenderer, CatalogRecord]:
+    source_root = tmp_path / "sources"
+    relative = "src/data.txt"
+    payload = b"frozen generator"
+    _write_source(
+        source_root,
+        "deepmind_mathematics_generator",
+        relative,
+        payload,
+    )
+    monkeypatch.setattr(
+        renderers_module,
+        "iter_worlds",
+        lambda *_args, **_kwargs: iter((SimpleNamespace(world_id=0),)),
+    )
+    monkeypatch.setattr(
+        renderers_module,
+        "iter_graph_records",
+        lambda _tok, worlds_factory: (
+            tuple(worlds_factory()),
+            iter(rendered_records),
+        )[1],
+    )
+    surface = unicodedata.normalize(
+        "NFC",
+        rendered_records[-1].segments[0].text,
+    )
+    fact_id = rendered_records[-1].segments[0].fact_id or "synthetic:fact"
+    record = _record(
+        lane_id="synthetic_graph",
+        source_id="deepmind_mathematics_generator",
+        source_key=rendered_records[-1].schedule.record_id,
+        relative=relative,
+        source_payload=payload,
+        target_count=target_count,
+        locator=(("generation_seed", 5), ("graph_exposure", exposure)),
+        flags=("generated",),
+        facts=(_fact(fact_id, surface),),
+    )
+    return SyntheticGraphRenderer(source_root), record
+
+
+@pytest.mark.parametrize(
+    ("text", "message"),
+    (
+        ("e\u0301", "NFC"),
+        ('{"score":NaN}', "finite"),
+    ),
+)
+def test_renderer_rejects_noncanonical_or_nonfinite_payload(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    route_index,
+    text: str,
+    message: str,
+):
+    rendered = RenderedRecord(
+        segments=(TaggedSegment(text, "payload", "synthetic:fact"),),
+        schedule=ScheduleEntry("graph", "synthetic:record", 0, 0),
+    )
+    renderer, record = _synthetic_rejection_case(
+        tmp_path,
+        monkeypatch,
+        rendered_records=(rendered,),
+    )
+
+    with pytest.raises(ValueError, match=message):
+        renderer.render(record, route_index({"synthetic:fact"}))
+
+
+def test_renderer_rejects_duplicate_source_record_id(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    route_index,
+):
+    first = RenderedRecord(
+        segments=(TaggedSegment('{"target":"first"}', "payload", "fact:first"),),
+        schedule=ScheduleEntry("graph", "duplicate", 0, 0),
+    )
+    second = RenderedRecord(
+        segments=(TaggedSegment('{"target":"second"}', "payload", "fact:second"),),
+        schedule=ScheduleEntry("graph", "duplicate", 1, 0),
+    )
+    renderer, record = _synthetic_rejection_case(
+        tmp_path,
+        monkeypatch,
+        rendered_records=(first, second),
+        exposure=1,
+    )
+
+    with pytest.raises(ValueError, match="duplicate.*record ID"):
+        renderer.render(record, route_index({"fact:second"}))
+
+
+def test_renderer_rejects_oversized_core(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    route_index,
+):
+    rendered = RenderedRecord(
+        segments=(
+            TaggedSegment(
+                '{"target":"' + ("oversized " * 64) + '"}',
+                "payload",
+                "synthetic:fact",
+            ),
+        ),
+        schedule=ScheduleEntry("graph", "oversized", 0, 0),
+    )
+    renderer, record = _synthetic_rejection_case(
+        tmp_path,
+        monkeypatch,
+        rendered_records=(rendered,),
+        target_count=4,
+    )
+
+    with pytest.raises(ValueError, match="core|target|fit"):
+        renderer.render(record, route_index({"synthetic:fact"}))
+
+
+def test_renderer_rejects_source_hash_and_target_count_drift(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    route_index,
+):
+    source_root = tmp_path / "sources"
+    relative = FINEWEB_PATHS[0]
+    payload = b"locked"
+    path = _write_source(source_root, "fineweb_edu", relative, payload)
+    monkeypatch.setattr(
+        renderers_module,
+        "_iter_parquet_texts",
+        lambda _path: iter(("educational text " * 16,)),
+    )
+    record = _record(
+        lane_id="fineweb_edu",
+        source_id="fineweb_edu",
+        source_key="fineweb:drift",
+        relative=relative,
+        source_payload=payload,
+        target_count=8,
+        locator=(("row", 0),),
+    )
+    renderer = FineWebEduRenderer(source_root)
+    routes = route_index(set())
+
+    path.write_bytes(b"changed")
+    with pytest.raises(ValueError, match="hash|SHA-256|drift"):
+        renderer.render(record, routes)
+
+    path.write_bytes(payload)
+    with pytest.raises(ValueError, match="record ID|target.*drift|commitment"):
+        renderer.render(replace(record, target_count=9), routes)
 
 
 def _wikidata_archive_payloads() -> dict[str, bytes]:
@@ -597,6 +820,67 @@ def test_renderer_rejects_caller_constructed_view(
 
     with pytest.raises(ValueError, match="verified"):
         WikidataGraphRenderer(authority.source_root, forged)
+
+
+@pytest.mark.parametrize(
+    "archive_name",
+    (
+        "wikidata5m_alias.tar.gz",
+        "wikidata5m_transductive.tar.gz",
+    ),
+)
+def test_renderer_rejects_drift_in_every_pinned_source_archive(
+    wikidata_render_authority,
+    route_index,
+    archive_name: str,
+):
+    authority = wikidata_render_authority
+    record = _wikidata_records(authority, authority.view, "archive-drift")[0]
+    renderer = WikidataGraphRenderer(authority.source_root, authority.view)
+    routes = route_index(set())
+    archive = authority.source_root / "wikidata5m" / archive_name
+    payload = archive.read_bytes()
+    os.chmod(archive, 0o600)
+    archive.write_bytes(bytes((payload[0] ^ 1,)) + payload[1:])
+
+    with pytest.raises(ValueError, match="Wikidata source archive.*identity drift"):
+        renderer.render(record, routes)
+
+
+@pytest.mark.parametrize(
+    "archive_name",
+    (
+        "wikidata5m_alias.tar.gz",
+        "wikidata5m_transductive.tar.gz",
+    ),
+)
+def test_renderer_rechecks_every_pinned_archive_after_rendering(
+    wikidata_render_authority,
+    route_index,
+    monkeypatch: pytest.MonkeyPatch,
+    archive_name: str,
+):
+    authority = wikidata_render_authority
+    record = _wikidata_records(authority, authority.view, "post-render-drift")[0]
+    renderer = WikidataGraphRenderer(authority.source_root, authority.view)
+    routes = route_index(set())
+    archive = authority.source_root / "wikidata5m" / archive_name
+    payload = archive.read_bytes()
+    real_render_graph = renderers_module._render_graph
+
+    def mutate_archive_during_render(*args, **kwargs):
+        os.chmod(archive, 0o600)
+        archive.write_bytes(bytes((payload[0] ^ 1,)) + payload[1:])
+        return real_render_graph(*args, **kwargs)
+
+    monkeypatch.setattr(
+        renderers_module,
+        "_render_graph",
+        mutate_archive_during_render,
+    )
+
+    with pytest.raises(ValueError, match="Wikidata source archive.*identity drift"):
+        renderer.render(record, routes)
 
 
 def test_renderer_uses_indexed_lookups_without_full_stream_or_archive_scan(
