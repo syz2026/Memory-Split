@@ -188,3 +188,74 @@ The required focused Task 5 suite is independently green as recorded above.
   no installable PyPI distribution and no local binary was available.
 - The optional full repository suite has the three unrelated failures listed
   above; the focused Task 5 suite and `cfn-lint` are clean.
+
+## AWS IaC MCP finding triage follow-up
+
+### Applied findings
+
+- `S3_BUCKET_SSL_REQUESTS_ONLY`: fixed. `DenyInsecureTransport` now denies
+  `s3:*` on both the bucket and all objects when `aws:SecureTransport` is
+  `false`; the other statement fields are unchanged.
+- `SECURITY_GROUP_MISSING_EGRESS_RULE` and
+  `SECURITY_GROUP_DESCRIPTION_RULE`: fixed. The builder group now permits
+  only TCP 443 to the interface-endpoint group and to the operator-supplied
+  `com.amazonaws.us-east-1.s3` managed prefix list. The endpoint group uses
+  the AWS-documented `127.0.0.1/32` no-op egress rule to suppress EC2's
+  create-time default allow-all rule; stateful reply traffic does not require
+  a routed egress allowance. Every ingress and egress rule has a description.
+  The endpoint ingress is a separate resource so the two groups do not form a
+  CloudFormation dependency cycle.
+- `S3_BUCKET_DEFAULT_LOCK_ENABLED`: fixed. The claim-bearing bucket has S3
+  Object Lock enabled in `GOVERNANCE` mode with a default retention period of
+  **365 days**.
+
+Object Lock is compatible with the current publication and clean-room flows in
+`cluster/aws/corpus_builder/s3.py`. Publication uses `PutObject` (including
+`IfNoneMatch: "*"` for no-replace receipts), records returned version IDs, and
+then performs version-pinned HEAD/GET/list verification. Clean-room retrieval
+also uses version-pinned HEAD and GET. The module does not delete objects or
+versions, modify retention, or request governance bypass, so default retention
+does not block any operation it performs.
+
+### Accepted without template changes
+
+- `S3_BUCKET_NO_PUBLIC_RW_ACL`: false positive. `BucketOwnerEnforced` disables
+  ACLs, and all four S3 public-access-block settings are enabled.
+- `S3_BUCKET_REPLICATION_ENABLED`: accepted. Cross-Region replication is
+  outside this builder-foundation scope and would add recurring cost for a
+  rebuildable artifact.
+- `IAM_NO_INLINE_POLICY_CHECK`: accepted. Inline policies deliberately match
+  the reviewed sibling P5 foundation, keep exact statement allowlists
+  versioned with this stack, and prevent their reuse elsewhere.
+
+### Follow-up TDD evidence
+
+Initial RED after adding the SSL, egress, descriptions, and Object Lock
+regressions:
+
+```text
+6 failed, 14 passed in 0.19s
+```
+
+The first implementation reached `20 passed`, but a documentation check showed
+that an empty endpoint egress list would not suppress EC2's create-time
+allow-all rule. Tightening that regression produced the second RED:
+
+```text
+1 failed, 19 passed in 0.17s
+```
+
+After adding the documented localhost no-op rule, final GREEN was:
+
+```text
+20 passed in 0.09s
+```
+
+The final `cfn-lint` 1.53.2 run, `python -m py_compile
+tests/test_aws_corpus_builder_foundation.py`, and `git diff --check` all exited
+0 with no findings. CloudFormation Guard still has no installable PyPI
+distribution in this environment, so the extended local guard file was not
+executed here.
+
+Implementation commit:
+`c24123cbb56bd7dc56c01ae6cee514097abae6e8`.
