@@ -1608,3 +1608,128 @@ Both static checks were silent with exit code zero.
 ### Concerns
 
 None.
+
+## Bounded outer-quarantine-loop closure
+
+Status: `DONE`
+
+Implementation commit:
+`f108898ebe1c3ce1d8906aa4f0cfd044c181bb39` —
+`fix: bound Wikidata quarantine recovery`.
+
+### Critical finding and fix
+
+- The regular exchange state machine previously used an unbounded `while
+  True`. A regular marker-detach failure became the first secondary error.
+  When emergency fallback then raised an exact cleanup-path error, the
+  first-error policy discarded it and continued. A blocked terminal relocation
+  could therefore cycle forever; a successful relocation could raise only the
+  detach error and omit the cleanup path.
+- The outer state machine now has an explicit 16-iteration maximum. Exhaustion
+  always constructs and raises a terminal error; no branch falls back into an
+  unbounded retry.
+- Detach and emergency-fallback failures are aggregated under explicit labels.
+  Nested exception notes are copied into the aggregate text, so diagnostics
+  include the original detach failure, the fallback failure, and any blocked
+  relocation cause.
+- Every aggregate or exhaustion error fsyncs and reclassifies the retained
+  candidate against final, the regular marker name, the emergency name, and
+  the original private name. It names the exact manual cleanup path when one is
+  known. If the candidate remains at final, it explicitly says that the path
+  must not be trusted; otherwise it explicitly says final does not denote the
+  retained failed candidate.
+
+### TDD evidence
+
+The static-emergency-occupation plus regular-detach-failure regression was
+written before production changes. It blocks the terminal relocation and has
+both a five-second monotonic deadline and a bounded classification guard:
+
+```bash
+python -m pytest -q \
+  tests/test_reasoning_v2_wikidata_source.py::test_detach_failure_with_occupied_emergency_terminates_with_cleanup_path \
+  --basetemp=/tmp/memorysplit-wikidata-critical-red
+```
+
+Exact RED result:
+
+```text
+F                                                                        [100%]
+1 failed in 0.45s
+```
+
+The timeout guard fired after the old loop exceeded the expected finite
+classification budget. The old raised text therefore also lacked the original
+detach failure and exact manual cleanup path.
+
+The same test after implementation:
+
+```text
+.                                                                        [100%]
+1 passed in 0.45s
+```
+
+The broader quarantine-focused selection also passed:
+
+```text
+.................                                                        [100%]
+17 passed, 73 deselected in 1.50s
+```
+
+### Final verification
+
+```bash
+python -m pytest -q tests/test_reasoning_v2_wikidata_source.py \
+  --basetemp=/tmp/memorysplit-wikidata-critical-final
+```
+
+```text
+........................................................................ [ 80%]
+..................                                                       [100%]
+90 passed in 3.93s
+```
+
+```bash
+python -m pytest -q tests/test_reasoning_v2_source_lock.py \
+  --basetemp=/tmp/memorysplit-wikidata-critical-final
+```
+
+```text
+........................................................................ [ 82%]
+...............                                                          [100%]
+87 passed in 3.09s
+```
+
+The source-lock suite ran outside the filesystem sandbox because its fixtures
+create temporary Git repositories. No network or AWS access was enabled or
+used.
+
+```bash
+python -m py_compile \
+  corpusgen/reasoning_v2/wikidata_source.py \
+  tests/test_reasoning_v2_wikidata_source.py
+git diff --check
+```
+
+Both static checks were silent with exit code zero.
+
+### Self-review
+
+- The iteration budget is constant and independent of corpus size or external
+  activity. Emergency retry bounds remain unchanged.
+- The regression reproduces the reviewed ordering: regular detach failure,
+  candidate restoration to final, static emergency occupation, and blocked
+  final-to-private relocation. It proves the timeout guard remains idle after
+  the fix and that the raised text contains both injected failures and the
+  identity-derived cleanup path.
+- Terminal classification prioritizes an exact candidate-at-final match. If
+  the finite loop stops while the candidate is already at a retained
+  quarantine name, the error names that path and states that final was
+  reclassified as a different identity.
+- The implementation commit contains exactly the authorized module/test
+  files. This appendix is the only report change. No amend, push, source
+  mutation, AWS operation, network operation, or other worktree edit occurred.
+
+### Concerns
+
+None.
