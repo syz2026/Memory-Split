@@ -23,8 +23,11 @@ Task 4A provider-aware 100-snapshot evaluation bridge: complete
   commits 8fbae08..9bd99a5, review clean
   parent verification 535 + 209 + 495 + 8 passed
 Task 4B receipts-driven StudyLockV3 construction/publication: complete
-  commits c964264 + 955ca45, exact base 9bd99a5
+  commits c964264 + 955ca45 + c92980d, review clean
   exact brief verification 501 + 209 + 495 + 8 passed, package 106 passed
   full suite 2980 passed with only the two pre-existing v2 cohort-release
   failures; committed package dry-run passed
-selected evaluate/cleanup remain blocked; no aggregation/statistics yet
+Task 4C receipts-driven cohort aggregation/report: implementation committed
+  commit 73e6528, review pending
+  parent verification 310 + 209 + 495 + 8 passed, package 106 passed
+selected evaluate/cleanup remain blocked
