@@ -115,26 +115,29 @@ The returned `checks` tuple is exactly:
    explicit numeric version, then verify AMI, instance type, shutdown,
    termination protection, monitoring, IMDSv2, encrypted 200 GiB `gp3`, and
    the AMI-bound root device.
-8. `private-network-and-security-group` — require a private subnet, one
+8. `bootstrap-user-data-sha256` — strictly decode the deployed launch-template
+   `UserData`, hash its exact bytes, and require equality with both the
+   `BootstrapUserDataSha256` stack output and the reviewed expected SHA-256.
+9. `private-network-and-security-group` — require a private subnet, one
    no-public-IP interface, only the output security group, matching VPC, and
    exactly zero ingress rules.
-9. `instance-profile-and-builder-role` — bind the template profile ARN to the
+10. `instance-profile-and-builder-role` — bind the template profile ARN to the
    live IAM instance profile and its one exact builder role.
-10. `bucket-and-kms` — require the exact bucket, enabled versioning, all four
+11. `bucket-and-kms` — require the exact bucket, enabled versioning, all four
     Block Public Access controls, BucketOwnerEnforced ownership, one
     BucketKey-enabled SSE-KMS rule, an enabled customer KMS key, and package
     and source KMS ARNs equal to the live CloudFormation `DataKeyArn`.
-11. `linux-on-demand-price` — parse exactly one current Linux, shared,
+12. `linux-on-demand-price` — parse exactly one current Linux, shared,
     no-preinstall, Used-capacity On-Demand hourly price for
     `i4i.16xlarge` in N. Virginia and require at most `$5.491/hour`.
-12. `maximum-compute-cost` — calculate the 24-hour amount to cents and require
+13. `maximum-compute-cost` — calculate the 24-hour amount to cents and require
     at most `$131.78`.
-13. `ec2-run-instances-dry-run` — call only the injected EC2 client with
+14. `ec2-run-instances-dry-run` — call only the injected EC2 client with
     `DryRun=True`, the exact template ID/version, and one-instance counts;
     accept only the AWS `DryRunOperation` confirmation (or an explicit
     fake-client dry-run acknowledgement).
 
-No `LaunchIntent` is constructed or serialized until all 13 gates, including
+No `LaunchIntent` is constructed or serialized until all 14 gates, including
 the EC2 dry run, have passed.
 
 ## Intent and CLI behavior
@@ -144,6 +147,8 @@ the EC2 dry run, have passed.
 - The CLI accepts exact package/source records and stack-output JSON, supports
   injected `AwsClients` and time for tests, and lazily creates boto3 clients
   only for an explicit live invocation.
+- The CLI requires `--expected-bootstrap-user-data-sha256`; the runbook must
+  supply the SHA-256 of the freshly rendered reviewed bootstrap bytes.
 - The output is exclusively created, canonical, fsynced, mode `0600`, and its
   SHA-256 is printed. Failed gates and failed writes leave no emitted intent.
 - Every focused test uses fakes. No real AWS call was made during this task.
@@ -288,3 +293,74 @@ An uncatchable kill before publication can leave a private
 mistaken for a published or reusable launch intent. No automatic sweep is
 performed because a matching filename and owner alone do not prove that a
 stale file belongs to this invocation.
+
+## Bootstrap user-data integrity gate
+
+Implementation commit:
+`9411945342713dee8388eabcaa0ee46e911621b0`
+(`feat: verify launch template bootstrap integrity`)
+
+### Renderer choice
+
+`cluster/aws/corpus_builder/bootstrap.py` is not present in this worktree, so
+the preflight uses the approved expected-hash fallback. `PreflightRequest`
+requires `expected_bootstrap_user_data_sha256`, and the CLI requires
+`--expected-bootstrap-user-data-sha256`. The runbook must freshly render the
+reviewed bootstrap, hash the raw rendered bytes, and pass that lowercase
+SHA-256 value.
+
+### Bootstrap gate RED
+
+The request-authority test first produced `1 failed in 0.12s` with the expected
+`TypeError` because `PreflightRequest` had no expected-hash field:
+
+```text
+python -m pytest -q \
+  tests/test_aws_corpus_builder_preflight.py::test_request_carries_reviewed_bootstrap_user_data_hash
+```
+
+After adding only that authority field, the focused gate tests produced
+`5 failed, 1 passed, 50 deselected in 0.16s`: the old 13-gate path accepted a
+mismatched payload, ignored missing and malformed stack hashes, and never
+compared the foundation output with the reviewed expected hash.
+
+The CLI RED was `2 failed in 0.21s` before CLI support existed: one missing
+flag reached local validation instead of argparse, and one supplied flag was
+unrecognized.
+
+### Bootstrap gate GREEN
+
+```text
+python -m pytest -q tests/test_aws_corpus_builder_preflight.py
+python -m py_compile \
+  cluster/aws/corpus_builder/preflight.py \
+  scripts/aws_corpus_builder_preflight.py
+git diff --check
+```
+
+Fresh result: `58 passed in 0.20s`; compilation and whitespace checks exited 0
+with no output.
+
+### Bootstrap gate self-review
+
+- Gate 8 runs immediately after `launch-template-version` and before
+  `private-network-and-security-group`; there are now exactly 14 gates.
+- The existing exact launch-template lookup supplies deployed `UserData`.
+  Preflight requires non-empty canonical base64, decodes it, and hashes the
+  decoded bytes rather than the encoded representation.
+- Authorization is a three-way equality: deployed bytes SHA-256, immutable
+  `BootstrapUserDataSha256` stack output, and the independently supplied
+  reviewed expected SHA-256.
+- The expected hash is syntax-checked with the client-free inputs before any
+  live client can be constructed. Missing or malformed stack output fails at
+  gate 8, preserving ordered-gate semantics.
+- Mismatch coverage confirms no intent serialization, private-network lookup,
+  EC2 dry run, or launch can follow the bootstrap gate.
+- The launch intent already pins the exact launch-template ID and version, so
+  the verified bootstrap remains bound without changing the Task 1 intent
+  schema.
+- No real AWS client or network call was made.
+
+Operational prerequisite: until the renderer branch is integrated, the
+runbook is the independent authority that must render the reviewed payload and
+pass its exact raw-byte SHA-256 to preflight.
