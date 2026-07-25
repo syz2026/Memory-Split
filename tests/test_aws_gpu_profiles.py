@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import shlex
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -237,16 +238,49 @@ def test_backend_uses_only_hash_reviewed_credential_process_federation(tmp_path)
         environ=environment,
         runner=runner,
     )
+    Path(environment["MSCTL_AWS_CONFIG_FILE"]).write_text(
+        "original config changed after materialization\n",
+        encoding="utf-8",
+    )
+    original_helper = tmp_path / "federated-credentials"
+    original_helper.write_text("#!/bin/sh\nexit 0\n", encoding="ascii")
     backend.auth_check()
 
     argv = runner.calls[0][0]
     assert argv[:2] == ["env", "-i"]
-    assert f"AWS_CONFIG_FILE={environment['MSCTL_AWS_CONFIG_FILE']}" in argv
+    config_entry = next(
+        item for item in argv if item.startswith("AWS_CONFIG_FILE=")
+    )
+    private_config = Path(config_entry.removeprefix("AWS_CONFIG_FILE="))
+    assert private_config != Path(environment["MSCTL_AWS_CONFIG_FILE"])
+    assert private_config.is_relative_to(
+        tmp_path / "state" / "operator-credentials"
+    )
+    assert private_config.stat().st_mode & 0o777 == 0o400
+    credential_line = next(
+        line
+        for line in private_config.read_text(encoding="utf-8").splitlines()
+        if line.startswith("credential_process = ")
+    )
+    private_helper = Path(
+        shlex.split(credential_line.partition("=")[2].strip())[0]
+    )
+    assert private_helper.stat().st_mode & 0o777 == 0o500
     assert f"AWS_PROFILE={environment['MSCTL_AWS_PROFILE']}" in argv
     assert "AWS_SHARED_CREDENTIALS_FILE=/dev/null" in argv
     assert "AWS_EC2_METADATA_DISABLED=true" in argv
     assert not any(item.startswith("AWS_ACCESS_KEY_ID=") for item in argv)
     assert not any(item.startswith("AWS_SESSION_TOKEN=") for item in argv)
+
+    private_config.chmod(0o600)
+    private_config.write_text(
+        private_config.read_text(encoding="utf-8") + "# changed\n",
+        encoding="utf-8",
+    )
+    private_config.chmod(0o400)
+    with pytest.raises(MsctlError) as changed:
+        backend.auth_check()
+    assert changed.value.code == "AWS_CREDENTIAL_PROCESS_INVALID"
 
 
 def test_default_backend_requires_reviewed_operator_federation(tmp_path):

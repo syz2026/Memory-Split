@@ -815,6 +815,7 @@ def test_mocked_all_v3_waves_finalize_then_evaluate_and_collect(
             "provider_selection_sha256": selection.sha256,
             "hardware_amendment_sha256": amendment.sha256,
             "sealed_fixture_sha256": fixture.sha256,
+            "environment_receipt_sha256": "7" * 64,
         },
         decision={"protected_launch_allowed": True},
         path=None,
@@ -823,6 +824,8 @@ def test_mocked_all_v3_waves_finalize_then_evaluate_and_collect(
     release = SimpleNamespace(
         provider=profile.provider,
         archive_sha256=first_manifest.release_sha256,
+        receipt_sha256="9" * 64,
+        members_sha256="a" * 64,
         source_commit=first_manifest.source_commit,
     )
     collected_seeds = []
@@ -844,6 +847,55 @@ def test_mocked_all_v3_waves_finalize_then_evaluate_and_collect(
             readiness=readiness,
             sealed_evaluation=finalized,
         )
+        terminate_at = "2097-12-31T23:00:00Z"
+        submit_core = backend._training_operation_intent(
+            operation="submit",
+            release=release,
+            manifest=manifest,
+            terminate_at=terminate_at,
+            evidence={
+                "dataset_pointer_sha256": "5" * 64,
+                "dataset_verification_sha256": "6" * 64,
+                "environment_receipt_sha256": "7" * 64,
+            },
+            context=context,
+        )
+        submit_intent = backend._operation_envelope(
+            submit_core,
+            instance_id=binding.instance_id,
+            terminate_at=terminate_at,
+        )
+        submit_intent_sha256 = _digest(canonical_json(submit_intent))
+        persisted = [
+            backend._new_aws_run_state(
+                run=run,
+                manifest=manifest,
+                operation="submit",
+                instance_id=binding.instance_id,
+                terminate_at=terminate_at,
+                intent=submit_intent,
+                published={
+                    "intent_sha256": submit_intent_sha256,
+                    "intent_uri": (
+                        f"{runtime.s3_root}/operations/intents/sha256/"
+                        f"{submit_intent_sha256}.json"
+                    ),
+                },
+                attempt=1,
+                context=context,
+            )
+            for run in manifest.runs
+        ]
+        for state in persisted:
+            state["command_id"] = f"training-command-{manifest.seed:08d}"
+            state["status"] = "Success"
+            state["send_attempted"] = True
+        from msctl.state import StateStore
+
+        store = StateStore(backend.state_root)
+        with store.locked():
+            backend._write_paired_states(store, manifest, persisted, context)
+
         evaluation_plan = backend.evaluate(
             release=release,
             manifest=manifest,
@@ -857,6 +909,15 @@ def test_mocked_all_v3_waves_finalize_then_evaluate_and_collect(
             context=context,
             checkpoint_receipt=checkpoint,
         )
+        assert evaluation_plan["approval_resources"]["instance_id"] == (
+            binding.instance_id
+        )
+        assert evaluation_plan["approval_resources"]["terminate_at"] == (
+            terminate_at
+        )
+        assert evaluation_plan["approval_resources"][
+            "checkpoint_receipt_sha256"
+        ] == checkpoint.sha256
         terminal_steps = [
             step
             for step in evaluation_plan["operation_intent"]["steps"]
@@ -1012,6 +1073,7 @@ def test_evaluation_uses_historical_advance_after_training_tags_are_removed(
                     manifest.hardware_amendment_sha256
                 ),
                 "sealed_fixture_sha256": manifest.sealed_fixture_sha256,
+                "environment_receipt_sha256": "7" * 64,
             },
             decision={"protected_launch_allowed": True},
             path=None,
@@ -1062,6 +1124,20 @@ def test_evaluation_uses_historical_advance_after_training_tags_are_removed(
     assert getattr(wrong_checkpoint.value, "code", None) == (
         "FLEET_ADVANCE_REQUIRED"
     )
+
+    runner.row["provider"] = "recommitted-arbitrary-binding"
+    with pytest.raises(Exception) as conflicting_historical_binding:
+        backend._validate_evaluation_instance_binding(
+            manifest,
+            instance_id=instance_id,
+            terminate_at=terminate_at,
+            checkpoint_receipt_sha256="4" * 64,
+            context=context,
+        )
+    assert getattr(conflicting_historical_binding.value, "code", None) == (
+        "INSTANCE_BINDING_MISMATCH"
+    )
+    runner.row["provider"] = None
 
     validated = backend._validate_evaluation_instance_binding(
         manifest,

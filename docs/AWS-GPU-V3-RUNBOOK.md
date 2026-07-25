@@ -1453,6 +1453,64 @@ python3 -m msctl \
   --approval "$OPERATOR_ROOT/approvals/submit-seed-0.json" \
   > "$REVIEW_ROOT/submit-plan-seed-0.json"
 
+# On the reviewer-controlled signing host, sign only the dry run's exact
+# result.approval_resources. MSCTL_APPROVAL_KEYS is a JSON map from key ID to
+# a secret of at least 32 bytes; never put it in the checkout.
+APPROVAL="$OPERATOR_ROOT/approvals/submit-seed-0.json"
+APPROVAL_OPERATION=submit
+APPROVAL_KEY_ID=REPLACE_WITH_REVIEWER_KEY_ID
+APPROVAL_EXPIRES_AT=REPLACE_WITH_RFC3339_UTC_EXPIRY
+: "${MSCTL_APPROVAL_KEYS:?export the reviewer-controlled key map}"
+umask 077
+python3 - "$REVIEW_ROOT/submit-plan-seed-0.json" "$APPROVAL" \
+  "$APPROVAL_OPERATION" "$APPROVAL_KEY_ID" "$APPROVAL_EXPIRES_AT" <<'PY'
+import hashlib
+import hmac
+import json
+import os
+import sys
+
+from msctl.jsonutil import canonical_json
+
+plan_path, out_path, operation, key_id, expires_at = sys.argv[1:]
+with open(plan_path, "rb") as source:
+    report = json.load(source)
+resources = report["result"]["approval_resources"]
+if not isinstance(resources, dict) or resources.get("operation") != operation:
+    raise SystemExit("dry run lacks exact approval_resources")
+keys = json.loads(os.environ["MSCTL_APPROVAL_KEYS"])
+secret = keys[key_id].encode("utf-8")
+if len(secret) < 32:
+    raise SystemExit("approval key is too short")
+unsigned = {
+    "schema_version": 1,
+    "receipt_id": (
+        f"{operation}-{hashlib.sha256(canonical_json(resources)).hexdigest()}"
+    ),
+    "provider": resources["provider"],
+    "operation": operation,
+    "release_sha256": resources["release_sha256"],
+    "run_manifest_sha256": resources["run_manifest_sha256"],
+    "resources": resources,
+    "limits": {
+        "gpu_hours": resources["gpu_hours"],
+        "jobs": resources["jobs"],
+    },
+    "expires_at": expires_at,
+    "key_id": key_id,
+}
+receipt = {
+    **unsigned,
+    "signature": hmac.new(
+        secret,
+        canonical_json(unsigned),
+        hashlib.sha256,
+    ).hexdigest(),
+}
+with open(out_path, "xb") as destination:
+    destination.write(canonical_json(receipt) + b"\n")
+PY
+
 # APPLY only after argv, ID, wave, ETA, cost, and deadline review.
 python3 -m msctl \
   --profile "$PROFILE" \
@@ -1467,9 +1525,16 @@ python3 -m msctl \
   "${TRAINING_GATE_ARGS[@]}" \
   --instance-id "$INSTANCE_ID" \
   --terminate-at "$TERMINATE_AT" \
-  --approval "$OPERATOR_ROOT/approvals/submit-seed-0.json" \
+  --approval "$APPROVAL" \
   --apply > "$REVIEW_ROOT/submit-result-seed-0.json"
 ```
+
+The signed `resources` value must exactly equal the dry run's
+`result.approval_resources`; `canonical_json` above defines its signed bytes.
+Do not reconstruct or edit it. Repeat the same reviewer-controlled signing flow
+for `resume`, `evaluate`, and every other apply after generating that command's
+fresh dry-run report. A changed checkpoint hash, deadline, instance, lifecycle
+receipt, sealed release, or study lock requires a new dry run and signature.
 
 Poll with `status --cached` first, then the read-only authoritative status
 path. Verify both arms advance together. The trainer’s `ckpt_minutes: 30`
@@ -1508,10 +1573,116 @@ are not finalization records.
 
 ## 12. Resume, advance training waves, finalize, evaluate, and collect
 
-Resume only from a verified paired checkpoint receipt:
+Retrieve every checkpoint receipt by its reviewed content hash into the private
+operator root, then validate its canonical bytes and complete manifest
+provenance before either resume or evaluation. Never use a mutable “latest”
+key, `aws s3 sync`, or an unverified local copy:
 
 ```bash
-CHECKPOINT_RECEIPT="$OPERATOR_ROOT/receipts/checkpoint-seed-0.json"
+set -euo pipefail
+umask 077
+SEED=0
+CHECKPOINT_RECEIPT_SHA256=REPLACE_WITH_LAUNCHER_RECEIPT_SHA256
+# Set this to evaluate for the final durable terminal bundle.
+CHECKPOINT_PURPOSE=resume
+[[ "$SEED" =~ ^(0|[1-9][0-9]*)$ ]]
+[[ "$CHECKPOINT_RECEIPT_SHA256" =~ ^[0-9a-f]{64}$ ]]
+[[ "$CHECKPOINT_PURPOSE" == resume || "$CHECKPOINT_PURPOSE" == evaluate ]]
+[[ "$MS_S3_ROOT" == s3://* ]]
+CHECKPOINT_RECEIPT="$OPERATOR_ROOT/receipts/checkpoint-seed-${SEED}.json"
+CHECKPOINT_TMP="$(mktemp "$OPERATOR_ROOT/receipts/.checkpoint-${SEED}.XXXXXX")"
+CHECKPOINT_GET_REPORT="$REVIEW_ROOT/checkpoint-get-seed-${SEED}.json"
+S3_LOCATION="${MS_S3_ROOT#s3://}"
+if [[ "$S3_LOCATION" == */* ]]; then
+  S3_BUCKET="${S3_LOCATION%%/*}"
+  S3_PREFIX="${S3_LOCATION#*/}"
+else
+  S3_BUCKET="$S3_LOCATION"
+  S3_PREFIX=
+fi
+CHECKPOINT_KEY="${S3_PREFIX:+${S3_PREFIX}/}checkpoints/seed-${SEED}/receipts/${CHECKPOINT_RECEIPT_SHA256}.json"
+trap 'rm -f "$CHECKPOINT_TMP"' EXIT
+
+aws s3api get-object \
+  --region "$REGION" \
+  --bucket "$S3_BUCKET" \
+  --key "$CHECKPOINT_KEY" \
+  --checksum-mode ENABLED \
+  "$CHECKPOINT_TMP" > "$CHECKPOINT_GET_REPORT"
+
+python3 - "$CHECKPOINT_TMP" "$CHECKPOINT_RECEIPT" \
+  "$RELEASE_RECEIPT" "$MANIFEST" "$CHECKPOINT_RECEIPT_SHA256" \
+  "$CHECKPOINT_PURPOSE" <<'PY'
+import os
+import stat
+import sys
+
+from msctl.contracts import (
+    load_release,
+    load_run_manifest,
+    verify_checkpoint_receipt,
+)
+
+temporary, destination, release_path, manifest_path, expected, purpose = (
+    sys.argv[1:]
+)
+if purpose not in {"resume", "evaluate"}:
+    raise SystemExit("checkpoint purpose must be resume or evaluate")
+release = load_release(release_path)
+manifest = load_run_manifest(manifest_path, repo_root=".")
+receipt = verify_checkpoint_receipt(
+    temporary,
+    release=release,
+    manifest=manifest,
+    require_checkpoint_files=False,
+    require_durable_terminal=(purpose == "evaluate"),
+)
+if receipt.sha256 != expected:
+    raise SystemExit("checkpoint receipt SHA-256 mismatch")
+with open(temporary, "rb") as source:
+    payload = source.read()
+try:
+    descriptor = os.open(
+        destination,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+        0o600,
+    )
+except FileExistsError:
+    read_descriptor = os.open(
+        destination,
+        os.O_RDONLY
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_CLOEXEC", 0),
+    )
+    try:
+        before = os.fstat(read_descriptor)
+        with os.fdopen(read_descriptor, "rb", closefd=False) as existing:
+            existing_payload = existing.read(len(payload) + 1)
+        after = os.fstat(read_descriptor)
+    finally:
+        os.close(read_descriptor)
+    identity = lambda value: (
+        value.st_dev,
+        value.st_ino,
+        value.st_size,
+        value.st_mtime_ns,
+        value.st_ctime_ns,
+    )
+    if (
+        not stat.S_ISREG(before.st_mode)
+        or before.st_nlink != 1
+        or identity(before) != identity(after)
+        or existing_payload != payload
+    ):
+        raise SystemExit("existing checkpoint receipt conflicts")
+else:
+    with os.fdopen(descriptor, "wb") as target:
+        target.write(payload)
+        target.flush()
+        os.fsync(target.fileno())
+PY
+rm -f "$CHECKPOINT_TMP"
+trap - EXIT
 
 # DRY RUN.
 python3 -m msctl \
@@ -1553,6 +1724,8 @@ valid only for legacy v2 manifests. For an interrupted run, use the
 `checkpoint_receipt` and `checkpoint_receipt_sha256` emitted by the paired
 launcher; the resume path rejects a receipt whose run IDs, arm paths, hashes,
 world sizes, or manifest provenance differ from its executable bindings.
+Review and sign `resume-plan-seed-0.json` using its exact
+`result.approval_resources` before the apply command.
 
 Completion publication must create one evaluator `run.json` per arm from the
 actual terminal checkpoint and configuration bytes. Use
@@ -1564,17 +1737,50 @@ canonical bytes immutably. The same publication step emits one canonical
 
 Advance an instance to its next assigned training wave as soon as the prior
 pair has successful terminal training and its complete terminal bundle is
-durable. Evaluation and collection do not exist yet and are not inputs:
+durable. Evaluation and collection do not exist yet and are not inputs. Never
+assume that the successor is `seed + 1`: the same-instance successor to seed 0
+is seed 1 for one instance, seed 2 for two instances, and seed 4 for four
+instances. Derive it from the reviewed fleet plan every time:
 
 ```bash
-NEXT_MANIFEST="$OPERATOR_ROOT/manifests/seed-1.json"
-CHECKPOINT_RECEIPT="$OPERATOR_ROOT/receipts/checkpoint-seed-0.json"
-ADVANCE_APPROVAL="$OPERATOR_ROOT/approvals/fleet-advance-seed-0-to-1.json"
+CURRENT_SEED="$SEED"
+NEXT_SEED="$(python3 - "$FLEET_PLAN" "$CURRENT_SEED" "$INSTANCE_ID" <<'PY'
+import json
+import sys
+
+plan_path, current_seed_text, instance_id = sys.argv[1:]
+with open(plan_path, "rb") as source:
+    plan = json.load(source)
+current_seed = int(current_seed_text)
+rows = plan.get("manifests")
+if not isinstance(rows, list):
+    raise SystemExit("fleet plan has no manifest schedule")
+current = [
+    row
+    for row in rows
+    if row.get("seed") == current_seed and row.get("instance_id") == instance_id
+]
+if len(current) != 1 or type(current[0].get("wave")) is not int:
+    raise SystemExit("completed seed is not uniquely bound to this instance")
+successors = [
+    row
+    for row in rows
+    if row.get("instance_id") == instance_id
+    and row.get("wave") == current[0]["wave"] + 1
+]
+if len(successors) != 1 or type(successors[0].get("seed")) is not int:
+    raise SystemExit("fleet plan has no unique same-instance successor")
+print(successors[0]["seed"])
+PY
+)"
+NEXT_MANIFEST="$OPERATOR_ROOT/manifests/seed-${NEXT_SEED}.json"
+CHECKPOINT_RECEIPT="$OPERATOR_ROOT/receipts/checkpoint-seed-${CURRENT_SEED}.json"
+ADVANCE_APPROVAL="$OPERATOR_ROOT/approvals/fleet-advance-seed-${CURRENT_SEED}-to-${NEXT_SEED}.json"
 
 # DRY RUN: verifies paired local terminal state, the canonical durable
 # schema-v3 checkpoint receipt/records, consecutive plan waves, and the exact
 # proposed tag deletion. It does not evaluate or collect.
-python -m msctl \
+python3 -m msctl \
   --profile "$PROFILE" \
   --repo-root . \
   --state-root "$OPERATOR_ROOT/state" \
@@ -1586,10 +1792,10 @@ python -m msctl \
   --instance-id "$INSTANCE_ID" \
   --checkpoint-receipt "$CHECKPOINT_RECEIPT" \
   --approval "$ADVANCE_APPROVAL" \
-  > "$REVIEW_ROOT/fleet-advance-plan-seed-0-to-1.json"
+  > "$REVIEW_ROOT/fleet-advance-plan-seed-${CURRENT_SEED}-to-${NEXT_SEED}.json"
 
 # APPLY only with signed approval for these exact resources.
-python -m msctl \
+python3 -m msctl \
   --profile "$PROFILE" \
   --repo-root . \
   --state-root "$OPERATOR_ROOT/state" \
@@ -1601,7 +1807,7 @@ python -m msctl \
   --instance-id "$INSTANCE_ID" \
   --checkpoint-receipt "$CHECKPOINT_RECEIPT" \
   --approval "$ADVANCE_APPROVAL" \
-  --apply > "$REVIEW_ROOT/fleet-advance-result-seed-0-to-1.json"
+  --apply > "$REVIEW_ROOT/fleet-advance-result-seed-${CURRENT_SEED}-to-${NEXT_SEED}.json"
 ```
 
 Apply rechecks authoritative training SSM success, rematerializes the receipt,

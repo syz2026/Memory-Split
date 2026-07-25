@@ -232,6 +232,8 @@ _AWS_STATUSES = {
     "INTENT_PUBLISHED",
     "SENDING",
     "RECOVERY_REQUIRED",
+    "REMOTE_TERMINAL_FAILED",
+    "REMOTE_TERMINAL_SUCCESS",
     "Pending",
     "InProgress",
     "Delayed",

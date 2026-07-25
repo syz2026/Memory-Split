@@ -61,6 +61,9 @@ from .aws_argv import (
     ARGV_DOCUMENT_CONTENT,
     ARGV_DOCUMENT_NAME,
     ARGV_DOCUMENT_SHA256,
+    RemoteIntentError,
+    _validate_receipt,
+    build_v3_operation_steps,
 )
 from .aws_canary import (
     ORCHESTRATION_PLAN_TYPE,
@@ -96,7 +99,12 @@ from .contracts import (
     verify_release_member,
 )
 from .errors import MsctlError
-from .fsutil import atomic_write_at, open_directory, rename_noreplace_at
+from .fsutil import (
+    atomic_write_at,
+    open_directory,
+    open_directory_at,
+    rename_noreplace_at,
+)
 from .jsonutil import (
     canonical_json,
     canonical_sha256,
@@ -236,6 +244,28 @@ class OperatorCredentialProcess:
     executable: Path
     executable_sha256: str
 
+    def revalidate(self) -> None:
+        config_payload = _reviewed_regular_bytes(
+            self.config_file,
+            label="private AWS credential_process config",
+            max_bytes=_MAX_AWS_CONFIG_BYTES,
+        )
+        executable_payload = _reviewed_regular_bytes(
+            self.executable,
+            label="private AWS credential_process executable",
+            max_bytes=_MAX_CREDENTIAL_PROCESS_BYTES,
+            executable=True,
+        )
+        if (
+            hashlib.sha256(config_payload).hexdigest() != self.config_sha256
+            or hashlib.sha256(executable_payload).hexdigest()
+            != self.executable_sha256
+        ):
+            raise MsctlError(
+                "AWS_CREDENTIAL_PROCESS_INVALID",
+                "private credential_process material changed after review",
+            )
+
     def environment(self) -> tuple[str, ...]:
         return (
             f"AWS_CONFIG_FILE={self.config_file}",
@@ -318,10 +348,146 @@ def _reviewed_regular_bytes(
     return payload
 
 
+def _install_private_credential_file(
+    directory_fd: int,
+    path: Path,
+    payload: bytes,
+    *,
+    mode: int,
+) -> None:
+    flags = (
+        os.O_WRONLY
+        | os.O_CREAT
+        | os.O_EXCL
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+    )
+    descriptor: int | None = None
+    try:
+        try:
+            descriptor = os.open(path.name, flags, mode, dir_fd=directory_fd)
+        except FileExistsError:
+            existing = _reviewed_regular_bytes(
+                path,
+                label="private AWS credential_process material",
+                max_bytes=max(len(payload), 1),
+                executable=bool(mode & 0o111),
+            )
+            if existing != payload:
+                raise MsctlError(
+                    "AWS_CREDENTIAL_PROCESS_INVALID",
+                    "hash-addressed credential material has conflicting bytes",
+                )
+            return
+        view = memoryview(payload)
+        while view:
+            written = os.write(descriptor, view)
+            view = view[written:]
+        os.fsync(descriptor)
+        os.fchmod(descriptor, mode)
+    except OSError as error:
+        raise MsctlError(
+            "AWS_CREDENTIAL_PROCESS_INVALID",
+            "private credential_process material cannot be installed safely",
+        ) from error
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+
+
+def _materialize_operator_credential_process(
+    credential: OperatorCredentialProcess,
+    *,
+    private_root: Path | str,
+    region: str,
+) -> OperatorCredentialProcess:
+    root = Path(private_root).absolute()
+    root_fd = open_directory(
+        root,
+        label="private AWS credential root",
+        create=True,
+        mode=0o700,
+    )
+    directory_fd: int | None = None
+    try:
+        metadata = os.fstat(root_fd)
+        if (
+            not stat.S_ISDIR(metadata.st_mode)
+            or metadata.st_uid not in {0, os.geteuid()}
+            or metadata.st_mode & 0o077
+        ):
+            raise MsctlError(
+                "AWS_CREDENTIAL_PROCESS_INVALID",
+                "private AWS credential root is not owner-private",
+            )
+        directory_name = (
+            f"sha256-{credential.config_sha256}-"
+            f"{credential.executable_sha256}"
+        )
+        directory_fd = open_directory_at(
+            root_fd,
+            directory_name,
+            label="hash-addressed AWS credential directory",
+            create=True,
+            mode=0o700,
+        )
+        directory_metadata = os.fstat(directory_fd)
+        if (
+            directory_metadata.st_uid not in {0, os.geteuid()}
+            or directory_metadata.st_mode & 0o077
+        ):
+            raise MsctlError(
+                "AWS_CREDENTIAL_PROCESS_INVALID",
+                "hash-addressed AWS credential directory is not owner-private",
+            )
+        directory = root / directory_name
+        executable = directory / f"credential-process-{credential.executable_sha256}"
+        executable_payload = _reviewed_regular_bytes(
+            credential.executable,
+            label="AWS credential_process executable",
+            max_bytes=_MAX_CREDENTIAL_PROCESS_BYTES,
+            executable=True,
+        )
+        _install_private_credential_file(
+            directory_fd,
+            executable,
+            executable_payload,
+            mode=0o500,
+        )
+        config_payload = (
+            f"[profile {credential.profile}]\n"
+            f"credential_process = {shlex.quote(str(executable))}\n"
+            f"region = {region}\n"
+            "output = json\n"
+        ).encode("utf-8")
+        config_digest = hashlib.sha256(config_payload).hexdigest()
+        config = directory / f"config-{config_digest}.ini"
+        _install_private_credential_file(
+            directory_fd,
+            config,
+            config_payload,
+            mode=0o400,
+        )
+    finally:
+        if directory_fd is not None:
+            os.close(directory_fd)
+        os.close(root_fd)
+    materialized = OperatorCredentialProcess(
+        config_file=config,
+        config_sha256=config_digest,
+        profile=credential.profile,
+        executable=executable,
+        executable_sha256=credential.executable_sha256,
+    )
+    materialized.revalidate()
+    return materialized
+
+
 def load_operator_credential_process(
     environment: Mapping[str, str],
     *,
     region: str,
+    private_root: Path | str | None = None,
 ) -> OperatorCredentialProcess:
     """Load a hash-pinned credential_process-only AWS CLI configuration."""
 
@@ -416,13 +582,21 @@ def load_operator_credential_process(
             "AWS_CREDENTIAL_PROCESS_INVALID",
             "AWS credential_process executable SHA-256 does not match review",
         )
-    return OperatorCredentialProcess(
+    credential = OperatorCredentialProcess(
         config_file=config_path,
         config_sha256=config_digest,
         profile=profile,
         executable=executable,
         executable_sha256=executable_digest,
     )
+    credential.revalidate()
+    if private_root is not None:
+        return _materialize_operator_credential_process(
+            credential,
+            private_root=private_root,
+            region=region,
+        )
+    return credential
 
 
 def _manifest_schema(manifest: object) -> int | None:
@@ -802,6 +976,8 @@ class AwsP5Backend:
         *,
         operation: str,
     ) -> object:
+        if self.operator_credentials is not None:
+            self.operator_credentials.revalidate()
         return self.runner.run_json(argv, operation=operation)
 
     def auth_check(self) -> dict[str, object]:
@@ -1260,6 +1436,35 @@ class AwsP5Backend:
             "study_lock_sha256": final.study_lock_sha256,
         }
 
+    def _v3_execution_bindings(
+        self,
+        release: object,
+        manifest: object,
+    ) -> dict[str, object]:
+        if not _is_v3_manifest(manifest):
+            return {}
+        return {
+            "container_image": self.runtime.container_image,
+            "release_receipt_sha256": require_sha256(
+                getattr(release, "receipt_sha256", None),
+                label="v3 release receipt",
+            ),
+            "release_members_sha256": require_sha256(
+                getattr(release, "members_sha256", None),
+                label="v3 release member inventory",
+            ),
+            "source_commit": manifest.source_commit,
+            "runs": [
+                {
+                    "run_id": run.run_id,
+                    "arm": run.arm,
+                    "config": run.config,
+                    "config_sha256": run.config_sha256,
+                }
+                for run in sorted(manifest.runs, key=lambda row: row.arm)
+            ],
+        }
+
     def _evaluation_checkpoint_binding(
         self,
         manifest: object,
@@ -1457,6 +1662,7 @@ class AwsP5Backend:
         context: V3LifecycleContext | None = None,
     ) -> dict[str, object]:
         v3_bindings = self._v3_bindings(manifest, context)
+        v3_execution = self._v3_execution_bindings(release, manifest)
         lifecycle_evidence = self._validated_lifecycle_evidence(
             operation=operation,
             manifest=manifest,
@@ -1634,10 +1840,13 @@ class AwsP5Backend:
                                 "RELEASE.json"
                             ),
                             "--release-receipt-sha256",
-                            getattr(
-                                release,
-                                "receipt_sha256",
-                                manifest.release_sha256,
+                            v3_execution.get(
+                                "release_receipt_sha256",
+                                getattr(
+                                    release,
+                                    "receipt_sha256",
+                                    manifest.release_sha256,
+                                ),
                             ),
                             "--dataset-receipt",
                             f"{dataset_root}/receipt.json",
@@ -1685,7 +1894,10 @@ class AwsP5Backend:
                         "--release-sha256",
                         release.archive_sha256,
                         "--release-members-sha256",
-                        getattr(release, "members_sha256", ""),
+                        v3_execution.get(
+                            "release_members_sha256",
+                            getattr(release, "members_sha256", ""),
+                        ),
                         "--cohort-assignment-sha256",
                         manifest.cohort_assignment_sha256,
                         "--code-commit",
@@ -1894,7 +2106,7 @@ class AwsP5Backend:
                 "--apply",
             ]
         steps.append({"name": "paired-launch", "argv": launcher_argv})
-        return {
+        intent = {
             "schema_version": 3 if v3_bindings else 1,
             "operation": operation,
             "provider": self.profile.provider,
@@ -1906,6 +2118,7 @@ class AwsP5Backend:
             "run_manifest_sha256": manifest.sha256,
             "dataset_sha256": manifest.dataset_sha256,
             **v3_bindings,
+            **v3_execution,
             **lifecycle_evidence,
             "runtime_sha256": self._runtime_sha256(),
             "environment": {
@@ -1928,6 +2141,14 @@ class AwsP5Backend:
             "checkpoint_receipt": checkpoint_binding,
             "steps": steps,
         }
+        if v3_bindings and operation in {"submit", "resume"}:
+            intent["steps"] = build_v3_operation_steps(
+                {
+                    **intent,
+                    "terminate_at": terminate_at,
+                }
+            )
+        return intent
 
     def _operation_envelope(
         self,
@@ -3131,7 +3352,7 @@ class AwsP5Backend:
             )
         observed = {field: row[field] for field in expected}
         if allow_historical_binding:
-            valid = True
+            valid = all(value is None for value in observed.values())
         elif require_bound:
             valid = observed == expected
         else:
@@ -3727,6 +3948,23 @@ class AwsP5Backend:
             evidence=evidence,
             context=context,
         )
+        approval_resources = self._submit_resources(
+            release=release,
+            manifest=manifest,
+            instance_id=instance_id,
+            terminate_at=terminate_at,
+            context=context,
+        )
+        approval_resources.update(
+            {
+                field: operation_intent[field]
+                for field in (
+                    "dataset_pointer_sha256",
+                    "dataset_verification_sha256",
+                    "environment_receipt_sha256",
+                )
+            }
+        )
         return {
             "provider": self.profile.provider,
             "instance_type": self.profile.instance_type,
@@ -3741,6 +3979,7 @@ class AwsP5Backend:
                 self._discover_argv(manifest),
                 self._discover_argv(manifest, instance_id=instance_id),
             ],
+            "approval_resources": approval_resources,
             "operation_intent": operation_intent,
             "submitted": 0,
             "idempotent": False,
@@ -3754,10 +3993,10 @@ class AwsP5Backend:
                         "ami_id": self.runtime.ami_id,
                         "container_image": self.runtime.container_image,
                         "container_digest": self.runtime.container_digest,
-                        "gid": getattr(self.runtime, "gid", None),
+                        "gid": getattr(self.runtime, "gid", 1000),
                         "region": self.runtime.region,
                         "s3_root": self.runtime.s3_root,
-                        "uid": getattr(self.runtime, "uid", None),
+                        "uid": getattr(self.runtime, "uid", 1000),
                     }
                 )
             ).hexdigest(),
@@ -3907,6 +4146,61 @@ class AwsP5Backend:
                 "checkpoint_receipt_sha256": checkpoint_receipt_sha256,
             },
         )
+
+    def _dry_run_execution_binding(
+        self,
+        manifest: object,
+        context: V3LifecycleContext | None,
+        *,
+        environment_receipt_sha256: str,
+    ) -> tuple[str, str]:
+        """Return the exact persisted instance/deadline without any AWS call."""
+
+        if not self.state_root.exists():
+            raise MsctlError(
+                "RUN_STATE_MISSING",
+                "AWS dry run requires complete paired submit state to render "
+                "exact approval resources",
+            )
+        store = StateStore(self.state_root)
+        with store.locked():
+            self._repair_paired_states(store, manifest, context)
+            states = [store.read_run(run.run_id) for run in manifest.runs]
+        if any(state is None for state in states):
+            raise MsctlError(
+                "RUN_STATE_MISSING",
+                "AWS dry run requires complete paired submit state to render "
+                "exact approval resources",
+            )
+        present = [state for state in states if state is not None]
+        if not all(
+            self._same_state_binding(state, manifest, context)
+            for state in present
+        ):
+            raise MsctlError(
+                "RUN_ID_CONFLICT",
+                "AWS dry-run state has different immutable provenance",
+            )
+        if {
+            state.get("environment_receipt_sha256") for state in present
+        } != {environment_receipt_sha256}:
+            raise MsctlError(
+                "ENVIRONMENT_RECEIPT_MISMATCH",
+                "AWS dry run must reuse the authenticated launch receipt",
+            )
+        instance_ids = {state.get("instance_id") for state in present}
+        deadlines = {state.get("terminate_at") for state in present}
+        if (
+            len(instance_ids) != 1
+            or len(deadlines) != 1
+            or not isinstance(next(iter(instance_ids)), str)
+            or not isinstance(next(iter(deadlines)), str)
+        ):
+            raise MsctlError(
+                "STATE_INCOMPLETE",
+                "AWS dry run cannot derive one exact approval binding",
+            )
+        return str(next(iter(instance_ids))), str(next(iter(deadlines)))
 
     def _validate_submit_selection(
         self,
@@ -4428,20 +4722,19 @@ class AwsP5Backend:
         validated_context = self._validate_v3_context(manifest, context)
         store = StateStore(self.state_root)
         with store.locked():
+            self._repair_paired_states(store, manifest, context)
             states = self._paired_states(store, manifest, context)
             command_ids = {state.get("command_id") for state in states}
             instance_ids = {state.get("instance_id") for state in states}
             if (
-                None in command_ids
-                or len(command_ids) != 1
+                len(command_ids) != 1
                 or None in instance_ids
                 or len(instance_ids) != 1
             ):
                 raise MsctlError(
                     "SUBMISSION_UNCERTAIN",
-                    "AWS paired state lacks one command and instance",
+                    "AWS paired state lacks one command binding and instance",
                 )
-            command_id = str(next(iter(command_ids)))
             instance_id = str(next(iter(instance_ids)))
             if (
                 validated_context is not None
@@ -4451,6 +4744,7 @@ class AwsP5Backend:
                     "FLEET_PLAN_INVALID",
                     "status state is bound to a different fleet instance",
                 )
+            command_value = next(iter(command_ids))
             if cached:
                 statuses = {str(state.get("status")) for state in states}
                 status = (
@@ -4460,17 +4754,79 @@ class AwsP5Backend:
                     "provider": self.profile.provider,
                     "seed": manifest.seed,
                     "instance_id": instance_id,
-                    "command_id": command_id,
+                    "command_id": command_value,
                     "status": status,
                     "authoritative": False,
                     "runs": states,
                 }
+            if command_value is None:
+                if {state.get("send_attempted") for state in states} != {True}:
+                    raise MsctlError(
+                        "SUBMISSION_UNCERTAIN",
+                        "AWS paired state was not durably marked as sent",
+                    )
+                intent = self._state_operation_intent(states[0])
+                recovered = self._find_operation_command(
+                    operation_id=str(intent["operation_id"]),
+                    instance_id=instance_id,
+                )
+                if recovered is not None:
+                    command_value = str(recovered["command_id"])
+                    status = str(recovered["status"])
+                    now = _timestamp()
+                    for state in states:
+                        state["command_id"] = command_value
+                        state["status"] = status
+                        state["updated_at"] = now
+                    self._write_paired_states(
+                        store,
+                        manifest,
+                        states,
+                        context,
+                    )
+                    return {
+                        "provider": self.profile.provider,
+                        "seed": manifest.seed,
+                        "instance_id": instance_id,
+                        "command_id": command_value,
+                        "status": status,
+                        "authoritative": True,
+                        "runs": states,
+                    }
+                receipt_recovery = self._reconcile_receipted_pair(
+                    store=store,
+                    manifest=manifest,
+                    states=states,
+                    intent=intent,
+                    context=context,
+                    operation_label="execution",
+                )
+                if receipt_recovery is None:
+                    raise MsctlError(
+                        "SUBMISSION_UNCERTAIN",
+                        "AWS send has no command or durable operation receipt",
+                    )
+                return {
+                    "provider": self.profile.provider,
+                    "seed": manifest.seed,
+                    "instance_id": instance_id,
+                    "command_id": None,
+                    **receipt_recovery,
+                    "authoritative": True,
+                    "runs": states,
+                }
+            command_id = str(command_value)
             status = self._command_status(instance_id, command_id)
             now = _timestamp()
-            for run, state in zip(manifest.runs, states):
+            for state in states:
                 state["status"] = status
                 state["updated_at"] = now
-                store.write_run(run.run_id, state)
+            self._write_paired_states(
+                store,
+                manifest,
+                states,
+                context,
+            )
             return {
                 "provider": self.profile.provider,
                 "seed": manifest.seed,
@@ -6209,66 +6565,26 @@ class AwsP5Backend:
         self,
         state: Mapping[str, object],
     ) -> str:
-        operation_id = state.get("operation_id")
-        intent_sha256 = state.get("intent_sha256")
-        require_sha256(operation_id, label="fleet operation ID")
-        require_sha256(intent_sha256, label="fleet intent SHA-256")
-        uri = (
-            f"{self.runtime.s3_root}/operations/{operation_id}/"
-            "receipts/terminal.json"
-        )
-        bucket, key = self._s3_location(
-            uri.removeprefix(f"{self.runtime.s3_root}/")
-        )
-        argv = self._aws_argv(
-            "s3api",
-            "head-object",
-            "--bucket",
-            bucket,
-            "--key",
-            key,
-            "--checksum-mode",
-            "ENABLED",
-            query=(
-                "{receipt:{checksum_sha256:ChecksumSHA256,"
-                "content_length:ContentLength,metadata:Metadata,"
-                "version_id:VersionId}}"
-            ),
-        )
-        output = _aws_output_object(
-            self._run(argv, operation="verify fleet terminal receipt"),
-            {"receipt"},
-            label="fleet terminal receipt",
-        )
-        receipt = _aws_output_object(
-            output["receipt"],
-            {"checksum_sha256", "content_length", "metadata", "version_id"},
-            label="fleet terminal receipt",
-        )
-        metadata = _aws_output_object(
-            receipt["metadata"],
-            {"operation-id", "intent-sha256", "receipt-kind"},
-            label="fleet terminal receipt metadata",
-        )
+        intent = self._state_operation_intent(state)
+        started = self._operation_receipt_exists(intent, kind="started")
+        terminal = self._operation_receipt_exists(intent, kind="terminal")
+        started_value = started.get("value") if started is not None else None
+        terminal_value = terminal.get("value") if terminal is not None else None
         if (
-            not isinstance(receipt["checksum_sha256"], str)
-            or not receipt["checksum_sha256"]
-            or type(receipt["content_length"]) is not int
-            or receipt["content_length"] <= 0
-            or not isinstance(receipt["version_id"], str)
-            or not receipt["version_id"]
-            or metadata
-            != {
-                "operation-id": operation_id,
-                "intent-sha256": intent_sha256,
-                "receipt-kind": "terminal",
-            }
+            started is None
+            or terminal is None
+            or not isinstance(started_value, dict)
+            or not isinstance(terminal_value, dict)
+            or started_value.get("execution_nonce")
+            != terminal_value.get("execution_nonce")
+            or terminal_value.get("status") != "success"
+            or terminal_value.get("returncode") != 0
         ):
             raise MsctlError(
                 "FLEET_ADVANCE_INVALID",
-                "remote terminal receipt does not bind the prior operation",
+                "remote receipt pair does not prove successful training",
             )
-        return uri
+        return str(terminal["uri"])
 
     def _terminal_checkpoint_identity(
         self,
@@ -6563,6 +6879,33 @@ class AwsP5Backend:
                     "fleet advance requires complete prior paired local state",
                 )
             paired = [state for state in states if state is not None]
+            command_ids = {state.get("command_id") for state in paired}
+            if command_ids == {None}:
+                intent = self._state_operation_intent(paired[0])
+                receipt_recovery = self._reconcile_receipted_pair(
+                    store=store,
+                    manifest=previous,
+                    states=paired,
+                    intent=intent,
+                    context=previous_context,
+                    operation_label="training",
+                )
+                if receipt_recovery is None:
+                    raise MsctlError(
+                        "FLEET_ADVANCE_INVALID",
+                        "prior training send has no command or validated "
+                        "terminal receipt",
+                    )
+                command_ids = {state.get("command_id") for state in paired}
+            statuses = {state.get("status") for state in paired}
+            terminal_binding = (
+                statuses == {"Success"}
+                and len(command_ids) == 1
+                and None not in command_ids
+            ) or (
+                statuses == {"REMOTE_TERMINAL_SUCCESS"}
+                and command_ids == {None}
+            )
             if (
                 not all(
                     self._same_state_binding(
@@ -6572,9 +6915,7 @@ class AwsP5Backend:
                     )
                     for state in paired
                 )
-                or {state.get("status") for state in paired} != {"Success"}
-                or len({state.get("command_id") for state in paired}) != 1
-                or None in {state.get("command_id") for state in paired}
+                or not terminal_binding
                 or len({state.get("operation_id") for state in paired}) != 1
                 or len({state.get("intent_sha256") for state in paired}) != 1
                 or len(
@@ -6654,6 +6995,7 @@ class AwsP5Backend:
             "to_seed": to_binding.seed,
             "fleet_plan_sha256": plan.sha256,
             "resources": resources,
+            "approval_resources": resources,
             "commands": [delete_argv],
             "advanced": 0,
             "idempotent": False,
@@ -6674,8 +7016,17 @@ class AwsP5Backend:
             profile=self.profile,
             environ=self.environ,
         )
-        training_command_id = str(paired[0]["command_id"])
-        if self._command_status(instance_id, training_command_id) != "Success":
+        raw_training_command_id = paired[0].get("command_id")
+        training_command_id = (
+            str(raw_training_command_id)
+            if raw_training_command_id is not None
+            else None
+        )
+        if (
+            training_command_id is not None
+            and self._command_status(instance_id, training_command_id)
+            != "Success"
+        ):
             raise MsctlError(
                 "FLEET_ADVANCE_INVALID",
                 "authoritative AWS training is not successfully terminal",
@@ -6895,22 +7246,178 @@ class AwsP5Backend:
                 "STATE_CORRUPT",
                 "AWS pair intent names the wrong run pair",
             )
-        for run_id, state in expected.items():
-            current = store.read_run(run_id)
-            if current is None:
-                store.write_run(run_id, dict(state))
-            elif current != state:
+        current = {
+            run_id: store.read_run(run_id)
+            for run_id in expected
+        }
+        if all(
+            state == expected[run_id]
+            for run_id, state in current.items()
+        ):
+            return
+
+        present = [state for state in current.values() if state is not None]
+        if not all(
+            self._same_state_binding(state, manifest, context)
+            for state in present
+        ):
+            raise MsctlError(
+                "STATE_CORRUPT",
+                "AWS pair state conflicts with its durable repair intent",
+            )
+
+        def updated_at(value: Mapping[str, object]) -> datetime:
+            raw = value.get("updated_at")
+            if not isinstance(raw, str) or not raw.endswith("Z"):
                 raise MsctlError(
                     "STATE_CORRUPT",
-                    "AWS pair state conflicts with its durable repair intent",
+                    "AWS pair state has an invalid repair timestamp",
                 )
+            try:
+                parsed = datetime.fromisoformat(raw[:-1] + "+00:00")
+            except ValueError as error:
+                raise MsctlError(
+                    "STATE_CORRUPT",
+                    "AWS pair state has an invalid repair timestamp",
+                ) from error
+            if parsed.tzinfo is None or parsed.utcoffset() != UTC.utcoffset(parsed):
+                raise MsctlError(
+                    "STATE_CORRUPT",
+                    "AWS pair state has a non-UTC repair timestamp",
+                )
+            return parsed
+
+        comparisons = {
+            run_id: (
+                None
+                if state is None
+                else (
+                    updated_at(state)
+                    > updated_at(expected[run_id])
+                )
+                - (
+                    updated_at(state)
+                    < updated_at(expected[run_id])
+                )
+            )
+            for run_id, state in current.items()
+        }
+        # The pair journal is written before either per-run file. Missing,
+        # equal, or older run files therefore describe an interrupted journal
+        # commit and are safely restored from that durable repair intent.
+        if all(order in {None, -1, 0} for order in comparisons.values()):
+            for run_id, state in current.items():
+                if state != expected[run_id]:
+                    store.write_run(run_id, dict(expected[run_id]))
+            return
+
+        paired_fields = (
+            "instance_id",
+            "terminate_at",
+            "operation",
+            "operation_id",
+            "intent_sha256",
+            "intent_uri",
+            "command_id",
+            "status",
+            "attempt",
+            "send_attempted",
+            "updated_at",
+        )
+        if (
+            len(present) != 2
+            or set(comparisons.values()) != {1}
+            or any(
+                len({state.get(field) for state in present}) != 1
+                for field in paired_fields
+            )
+            or (
+                present[0].get("operation") == "resume"
+                and any(
+                    len(
+                        {
+                            canonical_json(state.get(field))
+                            for state in present
+                        }
+                    )
+                    != 1
+                    for field in (
+                        "checkpoint_receipt_sha256",
+                        "prior_command_ids",
+                    )
+                )
+            )
+        ):
+            raise MsctlError(
+                "STATE_CORRUPT",
+                "AWS pair state conflicts with its durable repair intent",
+            )
+        self._write_paired_states(
+            store,
+            manifest,
+            present,
+            context,
+        )
+
+    def _state_operation_intent(
+        self,
+        state: Mapping[str, object],
+    ) -> dict[str, object]:
+        digest = require_sha256(
+            state.get("intent_sha256"),
+            label="state operation intent",
+        )
+        operation_id = require_sha256(
+            state.get("operation_id"),
+            label="state operation ID",
+        )
+        try:
+            payload = self._read_collection_regular(
+                self.state_root / f"intent-{digest}.json",
+                label="persisted operation intent",
+                maximum=1 << 20,
+            )
+            value = json.loads(payload.decode("utf-8"))
+        except (MsctlError, OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise MsctlError(
+                "STATE_CORRUPT",
+                "persisted operation intent cannot be read safely",
+            ) from error
+        if (
+            not isinstance(value, dict)
+            or not all(isinstance(key, str) for key in value)
+            or payload != canonical_json(value)
+            or hashlib.sha256(payload).hexdigest() != digest
+            or value.get("operation_id") != operation_id
+            or value.get("instance_id") != state.get("instance_id")
+            or value.get("started_receipt_uri")
+            != (
+                f"{self.runtime.s3_root}/operations/{operation_id}/"
+                "receipts/started.json"
+            )
+            or value.get("terminal_receipt_uri")
+            != (
+                f"{self.runtime.s3_root}/operations/{operation_id}/"
+                "receipts/terminal.json"
+            )
+        ):
+            raise MsctlError(
+                "STATE_CORRUPT",
+                "persisted operation intent does not match lifecycle state",
+            )
+        return value
 
     def _operation_receipt_exists(
         self,
         intent: Mapping[str, object],
         *,
         kind: str,
-    ) -> bool:
+    ) -> dict[str, object] | None:
+        if kind not in {"started", "terminal"}:
+            raise MsctlError(
+                "STATE_CORRUPT",
+                "operation receipt kind is invalid",
+            )
         uri = intent.get(f"{kind}_receipt_uri")
         prefix = f"{self.runtime.s3_root}/"
         if not isinstance(uri, str) or not uri.startswith(prefix):
@@ -6942,7 +7449,7 @@ class AwsP5Backend:
             )
         except MsctlError as error:
             if error.code == "AWS_COMMAND_FAILED":
-                return False
+                return None
             raise
         receipt = _aws_output_object(
             output["receipt"],
@@ -6976,7 +7483,237 @@ class AwsP5Backend:
                 "REMOTE_RECEIPT_INVALID",
                 "remote operation receipt metadata is incomplete",
             )
-        return True
+        with tempfile.TemporaryDirectory(
+            prefix="memorysplit-operation-receipt-"
+        ) as temporary:
+            destination = Path(temporary) / f"{kind}.json"
+            get_argv = self._aws_argv(
+                "s3api",
+                "get-object",
+                "--bucket",
+                bucket,
+                "--key",
+                key,
+                "--version-id",
+                str(receipt["version_id"]),
+                "--checksum-mode",
+                "ENABLED",
+                str(destination),
+                query=(
+                    "{receipt:{checksum_sha256:ChecksumSHA256,"
+                    "content_length:ContentLength,metadata:Metadata,"
+                    "version_id:VersionId}}"
+                ),
+            )
+            try:
+                downloaded = _aws_output_object(
+                    self._run(
+                        get_argv,
+                        operation=f"validate {kind} operation receipt",
+                    ),
+                    {"receipt"},
+                    label=f"downloaded {kind} operation receipt",
+                )
+                downloaded_receipt = _aws_output_object(
+                    downloaded["receipt"],
+                    {
+                        "checksum_sha256",
+                        "content_length",
+                        "metadata",
+                        "version_id",
+                    },
+                    label=f"downloaded {kind} operation receipt",
+                )
+                downloaded_metadata = _aws_output_object(
+                    downloaded_receipt["metadata"],
+                    {"operation-id", "intent-sha256", "receipt-kind"},
+                    label=f"downloaded {kind} operation receipt binding",
+                )
+                payload = self._read_collection_regular(
+                    destination,
+                    label=f"downloaded {kind} operation receipt",
+                    maximum=1 << 20,
+                )
+                value = _validate_receipt(
+                    payload,
+                    intent,
+                    intent_sha256=expected_intent_sha256,
+                    kind=kind,
+                )
+            except (
+                KeyError,
+                MsctlError,
+                RemoteIntentError,
+                OSError,
+                TypeError,
+                ValueError,
+            ) as error:
+                raise MsctlError(
+                    "REMOTE_RECEIPT_INVALID",
+                    f"remote {kind} operation receipt could not be validated",
+                ) from error
+        payload_sha256 = hashlib.sha256(payload).hexdigest()
+        expected_checksum = base64.b64encode(
+            bytes.fromhex(payload_sha256)
+        ).decode("ascii")
+        if (
+            downloaded_receipt["checksum_sha256"] != expected_checksum
+            or receipt["checksum_sha256"] != expected_checksum
+            or downloaded_receipt["content_length"] != len(payload)
+            or receipt["content_length"] != len(payload)
+            or downloaded_receipt["version_id"] != receipt["version_id"]
+            or downloaded_metadata != metadata
+        ):
+            raise MsctlError(
+                "REMOTE_RECEIPT_INVALID",
+                f"remote {kind} operation receipt bytes and metadata differ",
+            )
+        return {
+            "kind": kind,
+            "uri": uri,
+            "sha256": payload_sha256,
+            "version_id": receipt["version_id"],
+            "value": value,
+        }
+
+    def _reconcile_receipted_pair(
+        self,
+        *,
+        store: StateStore,
+        manifest: object,
+        states: Sequence[dict[str, object]],
+        intent: Mapping[str, object],
+        context: V3LifecycleContext | None,
+        operation_label: str,
+    ) -> dict[str, object] | None:
+        started = self._operation_receipt_exists(intent, kind="started")
+        terminal = self._operation_receipt_exists(intent, kind="terminal")
+        operation_id = str(intent["operation_id"])
+        if terminal is not None:
+            if started is None:
+                raise MsctlError(
+                    "REMOTE_RECEIPT_INVALID",
+                    "remote terminal receipt exists without its started "
+                    "acquisition receipt",
+                )
+            value = terminal["value"]
+            if not isinstance(value, dict):
+                raise MsctlError(
+                    "REMOTE_RECEIPT_INVALID",
+                    "remote terminal receipt result is unavailable",
+                )
+            started_value = started.get("value")
+            if (
+                not isinstance(started_value, dict)
+                or started_value.get("execution_nonce")
+                != value.get("execution_nonce")
+            ):
+                raise MsctlError(
+                    "REMOTE_RECEIPT_INVALID",
+                    "remote terminal receipt does not match its started receipt",
+                )
+            succeeded = value.get("status") == "success"
+            status = (
+                "REMOTE_TERMINAL_SUCCESS"
+                if succeeded
+                else "REMOTE_TERMINAL_FAILED"
+            )
+            now = _timestamp()
+            for state in states:
+                state["status"] = status
+                state["updated_at"] = now
+            self._write_paired_states(
+                store,
+                manifest,
+                states,
+                context,
+            )
+            return {
+                "status": status,
+                "operation_id": operation_id,
+                "terminal_receipt_uri": terminal["uri"],
+                "terminal_receipt_sha256": terminal["sha256"],
+                "returncode": value["returncode"],
+            }
+        if started is not None:
+            now = _timestamp()
+            for state in states:
+                state["status"] = "RECOVERY_REQUIRED"
+                state["updated_at"] = now
+            self._write_paired_states(
+                store,
+                manifest,
+                states,
+                context,
+            )
+            raise MsctlError(
+                "REMOTE_RECOVERY_REQUIRED",
+                f"remote {operation_label} was acquired but has no terminal "
+                "receipt; automatic success or resend is forbidden",
+                details={"operation_id": operation_id},
+            )
+        return None
+
+    def _reconcile_receipted_evaluation(
+        self,
+        *,
+        store: StateStore,
+        manifest: object,
+        state: dict[str, object],
+        intent: Mapping[str, object],
+    ) -> dict[str, object] | None:
+        started = self._operation_receipt_exists(intent, kind="started")
+        terminal = self._operation_receipt_exists(intent, kind="terminal")
+        operation_id = str(intent["operation_id"])
+        if terminal is not None:
+            if started is None:
+                raise MsctlError(
+                    "REMOTE_RECEIPT_INVALID",
+                    "remote terminal receipt exists without its started "
+                    "acquisition receipt",
+                )
+            value = terminal["value"]
+            if not isinstance(value, dict):
+                raise MsctlError(
+                    "REMOTE_RECEIPT_INVALID",
+                    "remote terminal receipt result is unavailable",
+                )
+            started_value = started.get("value")
+            if (
+                not isinstance(started_value, dict)
+                or started_value.get("execution_nonce")
+                != value.get("execution_nonce")
+            ):
+                raise MsctlError(
+                    "REMOTE_RECEIPT_INVALID",
+                    "remote terminal receipt does not match its started receipt",
+                )
+            status = (
+                "REMOTE_TERMINAL_SUCCESS"
+                if value.get("status") == "success"
+                else "REMOTE_TERMINAL_FAILED"
+            )
+            state["status"] = status
+            state["updated_at"] = _timestamp()
+            store.write_evaluation(manifest.sha256, state)
+            return {
+                "status": status,
+                "operation_id": operation_id,
+                "terminal_receipt_uri": terminal["uri"],
+                "terminal_receipt_sha256": terminal["sha256"],
+                "returncode": value["returncode"],
+            }
+        if started is not None:
+            state["status"] = "RECOVERY_REQUIRED"
+            state["updated_at"] = _timestamp()
+            store.write_evaluation(manifest.sha256, state)
+            raise MsctlError(
+                "REMOTE_RECOVERY_REQUIRED",
+                "remote evaluation was acquired but has no terminal receipt; "
+                "automatic success or resend is forbidden",
+                details={"operation_id": operation_id},
+            )
+        return None
 
     def _find_operation_command(
         self,
@@ -7238,55 +7975,28 @@ class AwsP5Backend:
                             "SUBMISSION_UNCERTAIN",
                             "paired state has divergent SSM command IDs",
                         )
-                    started = self._operation_receipt_exists(
-                        recovered_intent,
-                        kind="started",
-                    )
-                    terminal = self._operation_receipt_exists(
-                        recovered_intent,
-                        kind="terminal",
-                    )
                     recovered = self._find_operation_command(
                         operation_id=str(next(iter(operation_ids))),
                         instance_id=instance_id,
                     )
                     if recovered is None:
-                        if terminal and not started:
-                            raise MsctlError(
-                                "REMOTE_RECEIPT_INVALID",
-                                "remote terminal receipt exists without its "
-                                "started acquisition receipt",
-                            )
-                        if terminal:
+                        receipt_recovery = self._reconcile_receipted_pair(
+                            store=store,
+                            manifest=manifest,
+                            states=existing,
+                            intent=recovered_intent,
+                            context=context,
+                            operation_label="execution",
+                        )
+                        if receipt_recovery is not None:
                             return {
                                 "provider": self.profile.provider,
                                 "seed": manifest.seed,
                                 "instance_id": instance_id,
-                                "operation_id": next(iter(operation_ids)),
-                                "status": "REMOTE_TERMINAL",
+                                **receipt_recovery,
                                 "submitted": 0,
                                 "idempotent": True,
                             }
-                        if started:
-                            now = _timestamp()
-                            for state in existing:
-                                state["status"] = "RECOVERY_REQUIRED"
-                                state["updated_at"] = now
-                            self._write_paired_states(
-                                store,
-                                manifest,
-                                existing,
-                                context,
-                            )
-                            raise MsctlError(
-                                "REMOTE_RECOVERY_REQUIRED",
-                                "remote execution was acquired but has no "
-                                "terminal receipt; automatic success or resend "
-                                "is forbidden",
-                                details={
-                                    "operation_id": next(iter(operation_ids)),
-                                },
-                            )
                         raise MsctlError(
                             "SUBMISSION_UNCERTAIN",
                             "send was attempted but no safe resend proof exists",
@@ -7298,7 +8008,12 @@ class AwsP5Backend:
                         state["command_id"] = command_id
                         state["status"] = status
                         state["updated_at"] = now
-                        store.write_run(run.run_id, state)
+                    self._write_paired_states(
+                        store,
+                        manifest,
+                        existing,
+                        context,
+                    )
                     return {
                         "provider": self.profile.provider,
                         "seed": manifest.seed,
@@ -7320,7 +8035,12 @@ class AwsP5Backend:
                 for run, state in zip(manifest.runs, existing):
                     state["status"] = status
                     state["updated_at"] = now
-                    store.write_run(run.run_id, state)
+                self._write_paired_states(
+                    store,
+                    manifest,
+                    existing,
+                    context,
+                )
                 return {
                     "provider": self.profile.provider,
                     "seed": manifest.seed,
@@ -7505,6 +8225,33 @@ class AwsP5Backend:
             context=context,
         )
         if not apply:
+            persisted_instance, persisted_deadline = (
+                self._dry_run_execution_binding(
+                    manifest,
+                    context,
+                    environment_receipt_sha256=str(
+                        operation_intent["environment_receipt_sha256"]
+                    ),
+                )
+            )
+            approval_resources = self._resume_resources(
+                release=release,
+                manifest=manifest,
+                instance_id=persisted_instance,
+                terminate_at=persisted_deadline,
+                checkpoint_receipt_sha256=checkpoint_receipt.sha256,
+                context=context,
+            )
+            approval_resources.update(
+                {
+                    field: operation_intent[field]
+                    for field in (
+                        "dataset_pointer_sha256",
+                        "dataset_verification_sha256",
+                        "environment_receipt_sha256",
+                    )
+                }
+            )
             return {
                 "provider": self.profile.provider,
                 "seed": manifest.seed,
@@ -7512,6 +8259,7 @@ class AwsP5Backend:
                 "checkpoint_receipt_sha256": checkpoint_receipt.sha256,
                 "checkpoint_commands": checkpoint_publication["commands"],
                 "checkpoint_objects": checkpoint_publication["objects"],
+                "approval_resources": approval_resources,
                 "operation_intent": operation_intent,
                 "submitted": 0,
                 "idempotent": False,
@@ -7624,58 +8372,28 @@ class AwsP5Backend:
                 )
                 command_ids = {state.get("command_id") for state in present}
                 if command_ids == {None}:
-                    started = self._operation_receipt_exists(
-                        operation_intent,
-                        kind="started",
-                    )
-                    terminal = self._operation_receipt_exists(
-                        operation_intent,
-                        kind="terminal",
-                    )
                     recovered = self._find_operation_command(
                         operation_id=str(operation_intent["operation_id"]),
                         instance_id=instance_id,
                     )
                     if recovered is None:
-                        if terminal and not started:
-                            raise MsctlError(
-                                "REMOTE_RECEIPT_INVALID",
-                                "remote terminal receipt exists without its "
-                                "started acquisition receipt",
-                            )
-                        if terminal:
+                        receipt_recovery = self._reconcile_receipted_pair(
+                            store=store,
+                            manifest=manifest,
+                            states=present,
+                            intent=operation_intent,
+                            context=context,
+                            operation_label="resume",
+                        )
+                        if receipt_recovery is not None:
                             return {
                                 "provider": self.profile.provider,
                                 "seed": manifest.seed,
                                 "instance_id": instance_id,
-                                "operation_id": operation_intent[
-                                    "operation_id"
-                                ],
-                                "status": "REMOTE_TERMINAL",
+                                **receipt_recovery,
                                 "submitted": 0,
                                 "idempotent": True,
                             }
-                        if started:
-                            now = _timestamp()
-                            for state in present:
-                                state["status"] = "RECOVERY_REQUIRED"
-                                state["updated_at"] = now
-                            self._write_paired_states(
-                                store,
-                                manifest,
-                                present,
-                                context,
-                            )
-                            raise MsctlError(
-                                "REMOTE_RECOVERY_REQUIRED",
-                                "remote resume was acquired but has no terminal "
-                                "receipt; automatic success or resend is forbidden",
-                                details={
-                                    "operation_id": operation_intent[
-                                        "operation_id"
-                                    ],
-                                },
-                            )
                         raise MsctlError(
                             "SUBMISSION_UNCERTAIN",
                             "resume send was attempted without safe resend proof",
@@ -7687,7 +8405,12 @@ class AwsP5Backend:
                         state["command_id"] = command_id
                         state["status"] = status
                         state["updated_at"] = now
-                        store.write_run(run.run_id, state)
+                    self._write_paired_states(
+                        store,
+                        manifest,
+                        present,
+                        context,
+                    )
                     return {
                         "provider": self.profile.provider,
                         "seed": manifest.seed,
@@ -7709,7 +8432,12 @@ class AwsP5Backend:
                 for run, state in zip(manifest.runs, present):
                     state["status"] = status
                     state["updated_at"] = now
-                    store.write_run(run.run_id, state)
+                self._write_paired_states(
+                    store,
+                    manifest,
+                    present,
+                    context,
+                )
                 return {
                     "provider": self.profile.provider,
                     "seed": manifest.seed,
@@ -7974,10 +8702,15 @@ class AwsP5Backend:
                 label="SSM cancel-command output",
             )
             now = _timestamp()
-            for run, state in zip(manifest.runs, states):
+            for state in states:
                 state["status"] = "Cancelling"
                 state["updated_at"] = now
-                store.write_run(run.run_id, state)
+            self._write_paired_states(
+                store,
+                manifest,
+                states,
+                context,
+            )
             return {
                 "provider": self.profile.provider,
                 "seed": manifest.seed,
@@ -8075,6 +8808,7 @@ class AwsP5Backend:
     ) -> dict[str, object]:
         v3_bindings = self._v3_bindings(manifest, context)
         final_bindings = self._v3_evaluation_bindings(manifest, context)
+        v3_execution = self._v3_execution_bindings(release, manifest)
         checkpoint_binding = self._evaluation_checkpoint_binding(
             manifest,
             checkpoint_receipt,
@@ -8203,7 +8937,7 @@ class AwsP5Backend:
             evidence=evidence,
             context=context,
         )
-        return {
+        intent = {
             "schema_version": 3 if v3_bindings else 1,
             "operation": "evaluate",
             "provider": self.profile.provider,
@@ -8216,6 +8950,7 @@ class AwsP5Backend:
             "dataset_sha256": manifest.dataset_sha256,
             **v3_bindings,
             **final_bindings,
+            **v3_execution,
             **lifecycle_evidence,
             "runtime_sha256": self._runtime_sha256(),
             "environment": {
@@ -8433,6 +9168,9 @@ class AwsP5Backend:
                 ),
             ],
         }
+        if _is_v3_manifest(manifest):
+            intent["steps"] = build_v3_operation_steps(intent)
+        return intent
 
     def evaluate(
         self,
@@ -8461,9 +9199,37 @@ class AwsP5Backend:
             checkpoint_receipt,
         )
         if not apply:
+            persisted_instance, persisted_deadline = (
+                self._dry_run_execution_binding(
+                    manifest,
+                    context,
+                    environment_receipt_sha256=str(
+                        operation_intent["environment_receipt_sha256"]
+                    ),
+                )
+            )
+            approval_resources = self._evaluation_resources(
+                release=release,
+                manifest=manifest,
+                instance_id=persisted_instance,
+                terminate_at=persisted_deadline,
+                context=context,
+                checkpoint_receipt=checkpoint_receipt,
+            )
+            approval_resources.update(
+                {
+                    field: operation_intent[field]
+                    for field in (
+                        "dataset_pointer_sha256",
+                        "dataset_verification_sha256",
+                        "environment_receipt_sha256",
+                    )
+                }
+            )
             return {
                 "provider": self.profile.provider,
                 "seed": manifest.seed,
+                "approval_resources": approval_resources,
                 "operation_intent": operation_intent,
                 "submitted": 0,
                 "idempotent": False,
@@ -8636,52 +9402,28 @@ class AwsP5Backend:
                             "SUBMISSION_UNCERTAIN",
                             "evaluation intent was not durably marked as sent",
                         )
-                    started = self._operation_receipt_exists(
-                        operation_intent,
-                        kind="started",
-                    )
-                    terminal = self._operation_receipt_exists(
-                        operation_intent,
-                        kind="terminal",
-                    )
                     recovered = self._find_operation_command(
                         operation_id=str(operation_intent["operation_id"]),
                         instance_id=instance_id,
                     )
                     if recovered is None:
-                        if terminal and not started:
-                            raise MsctlError(
-                                "REMOTE_RECEIPT_INVALID",
-                                "remote terminal receipt exists without its "
-                                "started acquisition receipt",
+                        receipt_recovery = (
+                            self._reconcile_receipted_evaluation(
+                                store=store,
+                                manifest=manifest,
+                                state=existing,
+                                intent=operation_intent,
                             )
-                        if terminal:
+                        )
+                        if receipt_recovery is not None:
                             return {
                                 "provider": self.profile.provider,
                                 "seed": manifest.seed,
                                 "instance_id": instance_id,
-                                "operation_id": operation_intent[
-                                    "operation_id"
-                                ],
-                                "status": "REMOTE_TERMINAL",
+                                **receipt_recovery,
                                 "submitted": 0,
                                 "idempotent": True,
                             }
-                        if started:
-                            existing["status"] = "RECOVERY_REQUIRED"
-                            existing["updated_at"] = _timestamp()
-                            store.write_evaluation(manifest.sha256, existing)
-                            raise MsctlError(
-                                "REMOTE_RECOVERY_REQUIRED",
-                                "remote evaluation was acquired but has no "
-                                "terminal receipt; automatic success or resend "
-                                "is forbidden",
-                                details={
-                                    "operation_id": operation_intent[
-                                        "operation_id"
-                                    ],
-                                },
-                            )
                         raise MsctlError(
                             "SUBMISSION_UNCERTAIN",
                             "evaluation send has no safe resend proof",
@@ -8947,10 +9689,15 @@ class AwsP5Backend:
                     "termination response has the wrong instance ID",
                 )
             now = _timestamp()
-            for run, state in zip(manifest.runs, states):
+            for state in states:
                 state["status"] = "Terminating"
                 state["updated_at"] = now
-                store.write_run(run.run_id, state)
+            self._write_paired_states(
+                store,
+                manifest,
+                states,
+                context,
+            )
             return {
                 "provider": self.profile.provider,
                 "seed": manifest.seed,
@@ -9329,6 +10076,7 @@ def build_aws_backend(
         operator_credentials = load_operator_credential_process(
             environment,
             region=runtime.region,
+            private_root=Path(state_root) / "operator-credentials",
         )
     return AwsP5Backend(
         profile=profile,

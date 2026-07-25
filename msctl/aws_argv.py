@@ -237,6 +237,13 @@ _V3_FINAL_EVALUATION_FIELDS = {
     "sealed_evaluation_sha256",
     "study_lock_sha256",
 }
+_V3_EXECUTION_FIELDS = {
+    "container_image",
+    "release_receipt_sha256",
+    "release_members_sha256",
+    "source_commit",
+    "runs",
+}
 _ENVIRONMENT_FIELDS = {
     "AWS_REGION",
     "MS_AWS_AMI_ID",
@@ -266,6 +273,7 @@ _EVALUATION_CHECKPOINT_FIELDS = {
     "checkpoint_record_sha256",
     "checkpoint_record_uri",
 }
+_RUN_FIELDS = {"run_id", "arm", "config", "config_sha256"}
 _FORBIDDEN_ENVIRONMENT = {
     "AWS_ACCESS_KEY_ID",
     "AWS_CONFIG_FILE",
@@ -290,6 +298,14 @@ _SEALED_EVALUATION_MEMBERS = (
     "stores.jsonl",
     "study-lock.json",
     "validity.json",
+)
+_COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
+_RUN_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+_ECR_IMAGE_RE = re.compile(
+    r"^[0-9]{12}\.dkr\.ecr\."
+    r"[a-z]{2}(?:-[a-z0-9]+)+-[0-9]+"
+    r"\.amazonaws\.com(?:\.cn)?/"
+    r"[a-z0-9]+(?:[._/-][a-z0-9]+)*@sha256:[0-9a-f]{64}$"
 )
 
 
@@ -399,6 +415,7 @@ def _validate_checkpoint_receipt(value: object) -> None:
             "checkpoint receipt must bind one complete pair"
         )
     arms: set[str] = set()
+    ordered_arms: list[str] = []
     for row in checkpoints:
         if not isinstance(row, dict) or set(row) != _CHECKPOINT_FIELDS:
             raise RemoteIntentError(
@@ -425,7 +442,8 @@ def _validate_checkpoint_receipt(value: object) -> None:
                 "checkpoint binding identity is invalid"
             )
         arms.add(str(arm))
-    if arms != {"dense", "split90"}:
+        ordered_arms.append(str(arm))
+    if arms != {"dense", "split90"} or ordered_arms != ["dense", "split90"]:
         raise RemoteIntentError("checkpoint binding pair is incomplete")
 
 
@@ -434,6 +452,7 @@ def _validate_evaluation_checkpoint_receipt(
     *,
     seed: int,
     s3_root: str,
+    runs: Mapping[str, Mapping[str, object]],
 ) -> None:
     if (
         not isinstance(value, dict)
@@ -462,6 +481,7 @@ def _validate_evaluation_checkpoint_receipt(
             "evaluation checkpoint receipt must bind one complete pair"
         )
     arms: set[str] = set()
+    ordered_arms: list[str] = []
     run_ids: set[str] = set()
     for row in checkpoints:
         if (
@@ -477,10 +497,10 @@ def _validate_evaluation_checkpoint_receipt(
             arm not in {"dense", "split90"}
             or arm in arms
             or not isinstance(run_id, str)
-            or not run_id
-            or "/" in run_id
-            or "\\" in run_id
+            or _RUN_ID_RE.fullmatch(run_id) is None
             or run_id in run_ids
+            or arm not in runs
+            or run_id != runs[arm]["run_id"]
         ):
             raise RemoteIntentError(
                 "evaluation checkpoint artifact identity is invalid"
@@ -493,6 +513,10 @@ def _validate_evaluation_checkpoint_receipt(
             row["configuration_sha256"],
             label=f"{arm} evaluation configuration",
         )
+        if configuration_sha256 != runs[arm]["config_sha256"]:
+            raise RemoteIntentError(
+                "evaluation configuration does not match the run manifest binding"
+            )
         run_binding_sha256 = _sha256(
             row["run_binding_sha256"],
             label=f"{arm} evaluation run binding",
@@ -526,8 +550,9 @@ def _validate_evaluation_checkpoint_receipt(
                 "evaluation checkpoint artifact URI is not canonical"
             )
         arms.add(str(arm))
+        ordered_arms.append(str(arm))
         run_ids.add(run_id)
-    if arms != {"dense", "split90"}:
+    if arms != {"dense", "split90"} or ordered_arms != ["dense", "split90"]:
         raise RemoteIntentError(
             "evaluation checkpoint artifact pair is incomplete"
         )
@@ -720,6 +745,639 @@ def _aws_get_argv(
     ]
 
 
+def build_v3_evaluation_steps(
+    intent: Mapping[str, object],
+) -> list[dict[str, object]]:
+    """Build the single canonical schema-v3 remote evaluation plan."""
+
+    environment = cast(Mapping[str, object], intent["environment"])
+    checkpoint = cast(Mapping[str, object], intent["checkpoint_receipt"])
+    checkpoint_rows = cast(list[Mapping[str, object]], checkpoint["checkpoints"])
+    rows = {str(row["arm"]): row for row in checkpoint_rows}
+    run_rows = {
+        str(row["arm"]): row
+        for row in cast(list[Mapping[str, object]], intent["runs"])
+    }
+    scratch = "/mnt/memorysplit"
+    release_root = f"{scratch}/releases/{intent['release_sha256']}"
+    sealed_root = (
+        f"{scratch}/sealed-evaluation/{intent['sealed_evaluation_sha256']}"
+    )
+    evaluation_root = f"{scratch}/evaluations"
+    receipt_root = f"{scratch}/receipts/checkpoints/seed-{intent['seed']}"
+    record_root = f"{receipt_root}/records"
+    run_root = f"{scratch}/runs/seed-{intent['seed']}"
+    region = str(environment["AWS_REGION"])
+    s3_root = str(environment["MS_S3_ROOT"])
+    uid = str(environment["MS_RUNTIME_UID"])
+    gid = str(environment["MS_RUNTIME_GID"])
+    image = str(intent["container_image"])
+
+    steps: list[dict[str, object]] = [
+        {
+            "name": "prepare-sealed-evaluation",
+            "argv": [
+                "/usr/bin/install",
+                "-d",
+                "-m",
+                "0700",
+                "-o",
+                uid,
+                "-g",
+                gid,
+                sealed_root,
+            ],
+        },
+        {
+            "name": "prepare-evaluation-output",
+            "argv": [
+                "/usr/bin/install",
+                "-d",
+                "-m",
+                "0700",
+                "-o",
+                uid,
+                "-g",
+                gid,
+                evaluation_root,
+            ],
+        },
+        {
+            "name": "prepare-terminal-checkpoint-bundle",
+            "argv": [
+                "/usr/bin/install",
+                "-d",
+                "-m",
+                "0700",
+                "-o",
+                uid,
+                "-g",
+                gid,
+                receipt_root,
+                record_root,
+                f"{run_root}/dense/run",
+                f"{run_root}/split90/run",
+            ],
+        },
+    ]
+    steps.extend(
+        {
+            "name": f"materialize-sealed-evaluation-{member.replace('.', '-')}",
+            "argv": _aws_get_argv(
+                region=region,
+                s3_root=s3_root,
+                suffix=(
+                    f"sealed-evaluation/{intent['sealed_evaluation_sha256']}/"
+                    f"{member}"
+                ),
+                destination=f"{sealed_root}/{member}",
+            ),
+        }
+        for member in _SEALED_EVALUATION_MEMBERS
+    )
+
+    terminal_objects: list[tuple[str, str, str]] = [
+        (
+            "receipt",
+            (
+                f"checkpoints/seed-{intent['seed']}/receipts/"
+                f"{checkpoint['sha256']}.json"
+            ),
+            f"{receipt_root}/receipt.json",
+        )
+    ]
+    for arm in ("dense", "split90"):
+        row = rows[arm]
+        arm_root = f"{run_root}/{arm}/run"
+        terminal_objects.extend(
+            [
+                (
+                    f"{arm}-checkpoint",
+                    (
+                        f"checkpoints/seed-{intent['seed']}/{arm}/sha256/"
+                        f"{row['checkpoint_sha256']}.pt"
+                    ),
+                    f"{arm_root}/ckpt.pt",
+                ),
+                (
+                    f"{arm}-configuration",
+                    (
+                        f"checkpoints/seed-{intent['seed']}/{arm}/"
+                        f"configuration/sha256/{row['configuration_sha256']}.yaml"
+                    ),
+                    f"{arm_root}/configuration.yaml",
+                ),
+                (
+                    f"{arm}-run-binding",
+                    (
+                        f"checkpoints/seed-{intent['seed']}/{arm}/"
+                        f"run-binding/sha256/{row['run_binding_sha256']}.json"
+                    ),
+                    f"{arm_root}/run.json",
+                ),
+                (
+                    f"{arm}-checkpoint-record",
+                    (
+                        f"checkpoints/seed-{intent['seed']}/{arm}/records/"
+                        f"{row['checkpoint_record_sha256']}.json"
+                    ),
+                    (
+                        f"{record_root}/"
+                        f"{row['checkpoint_record_sha256']}.json"
+                    ),
+                ),
+            ]
+        )
+    steps.extend(
+        {
+            "name": f"materialize-terminal-{name}",
+            "argv": _aws_get_argv(
+                region=region,
+                s3_root=s3_root,
+                suffix=suffix,
+                destination=destination,
+            ),
+        }
+        for name, suffix, destination in terminal_objects
+    )
+    steps.extend(
+        [
+            {
+                "name": "verify-sealed-evaluation",
+                "argv": [
+                    "/usr/bin/docker",
+                    "run",
+                    "--rm",
+                    "--network",
+                    "none",
+                    "--read-only",
+                    "--user",
+                    f"{uid}:{gid}",
+                    "--mount",
+                    f"type=bind,src={release_root},dst=/workspace,readonly",
+                    "--mount",
+                    f"type=bind,src={sealed_root},dst=/sealed,readonly",
+                    "--workdir",
+                    "/workspace",
+                    image,
+                    "/opt/venv/bin/python",
+                    "-m",
+                    "msctl.aws_sealed_evaluation",
+                    "--root",
+                    "/sealed",
+                    "--expected-release-sha256",
+                    str(intent["sealed_evaluation_sha256"]),
+                    "--expected-study-lock-sha256",
+                    str(intent["study_lock_sha256"]),
+                ],
+            },
+            {
+                "name": "verify-terminal-checkpoints",
+                "argv": [
+                    "/usr/bin/python3",
+                    f"{release_root}/cluster/aws/p5/terminal_artifacts.py",
+                    "verify-materialized",
+                    "--receipt",
+                    f"{receipt_root}/receipt.json",
+                    "--run-root",
+                    run_root,
+                    "--record-root",
+                    record_root,
+                    "--expected-receipt-sha256",
+                    str(checkpoint["sha256"]),
+                    "--provider",
+                    str(intent["provider"]),
+                    "--run-manifest-sha256",
+                    str(intent["run_manifest_sha256"]),
+                    "--sealed-fixture-sha256",
+                    str(intent["sealed_fixture_sha256"]),
+                ],
+            },
+        ]
+    )
+    for arm in ("dense", "split90"):
+        row = run_rows[arm]
+        steps.append(
+            {
+                "name": f"evaluate-{arm}",
+                "argv": [
+                    "/usr/bin/docker",
+                    "run",
+                    "--rm",
+                    "--read-only",
+                    "--network",
+                    "none",
+                    "--gpus",
+                    "all",
+                    "--user",
+                    f"{uid}:{gid}",
+                    "--security-opt",
+                    "no-new-privileges",
+                    "--cap-drop",
+                    "ALL",
+                    "--tmpfs",
+                    "/tmp:rw,nosuid,nodev,noexec,size=1073741824",
+                    "--env",
+                    "HOME=/tmp",
+                    "--env",
+                    "PYTHONNOUSERSITE=1",
+                    "--mount",
+                    f"type=bind,src={release_root},dst=/workspace,readonly",
+                    "--mount",
+                    f"type=bind,src={sealed_root},dst=/sealed,readonly",
+                    "--mount",
+                    f"type=bind,src={run_root},dst={run_root},readonly",
+                    "--mount",
+                    (
+                        f"type=bind,src={evaluation_root},"
+                        f"dst={evaluation_root}"
+                    ),
+                    "--workdir",
+                    "/workspace",
+                    image,
+                    "/opt/venv/bin/python",
+                    "-m",
+                    "evals.confirmatory",
+                    "evaluate",
+                    "--run",
+                    f"{run_root}/{arm}/run",
+                    "--sealed-release",
+                    "/sealed",
+                    "--expected-study-lock-sha256",
+                    str(intent["study_lock_sha256"]),
+                    "--device",
+                    "cuda",
+                    "--output-dir",
+                    f"{evaluation_root}/{row['run_id']}",
+                ],
+            }
+        )
+    steps.append(
+        {
+            "name": "publish-paired-evaluation",
+            "argv": [
+                "/usr/bin/python3",
+                f"{release_root}/cluster/aws/p5/terminal_artifacts.py",
+                "publish-evaluation",
+                "--evaluation-root",
+                evaluation_root,
+                "--checkpoint-receipt",
+                f"{receipt_root}/receipt.json",
+                "--s3-root",
+                s3_root,
+                "--provider",
+                str(intent["provider"]),
+                "--run-manifest-sha256",
+                str(intent["run_manifest_sha256"]),
+                "--sealed-fixture-sha256",
+                str(intent["sealed_fixture_sha256"]),
+                "--sealed-evaluation-sha256",
+                str(intent["sealed_evaluation_sha256"]),
+                "--study-lock-sha256",
+                str(intent["study_lock_sha256"]),
+                "--fleet-plan-sha256",
+                str(intent["fleet_plan_sha256"]),
+                "--fleet-wave",
+                str(intent["fleet_wave"]),
+                "--launch-readiness-sha256",
+                str(intent["launch_readiness_sha256"]),
+            ],
+        }
+    )
+    return steps
+
+
+def build_v3_training_steps(
+    intent: Mapping[str, object],
+) -> list[dict[str, object]]:
+    """Build the single canonical schema-v3 submit or resume plan."""
+
+    operation = str(intent["operation"])
+    if operation not in {"submit", "resume"}:
+        raise RemoteIntentError("v3 training plan operation is invalid")
+    environment = cast(Mapping[str, object], intent["environment"])
+    scratch = "/mnt/memorysplit"
+    staging = f"{scratch}/staging"
+    release_root = f"{scratch}/releases/{intent['release_sha256']}"
+    control_root = f"/opt/memorysplit/control/{intent['control_bundle_sha256']}"
+    provider = str(intent["provider"])
+    profile_path = f"{release_root}/cluster/profiles/{provider}.json"
+    region = str(environment["AWS_REGION"])
+    s3_root = str(environment["MS_S3_ROOT"])
+    run_rows = cast(list[Mapping[str, object]], intent["runs"])
+
+    if operation == "resume":
+        checkpoint = cast(Mapping[str, object], intent["checkpoint_receipt"])
+        receipt_sha256 = str(checkpoint["sha256"])
+        resume_root = f"{staging}/resume/{receipt_sha256}"
+        steps: list[dict[str, object]] = [
+            {
+                "name": "prepare-resume-staging",
+                "argv": [
+                    "/usr/bin/install",
+                    "-d",
+                    "-m",
+                    "0700",
+                    resume_root,
+                ],
+            },
+            {
+                "name": "materialize-resume-receipt",
+                "argv": _aws_get_argv(
+                    region=region,
+                    s3_root=s3_root,
+                    suffix=(
+                        f"checkpoints/seed-{intent['seed']}/receipts/"
+                        f"{receipt_sha256}.json"
+                    ),
+                    destination=f"{resume_root}/receipt.json",
+                ),
+            },
+        ]
+        checkpoint_rows = cast(
+            list[Mapping[str, object]],
+            checkpoint["checkpoints"],
+        )
+        for row in checkpoint_rows:
+            arm = str(row["arm"])
+            steps.append(
+                {
+                    "name": f"materialize-resume-{arm}",
+                    "argv": _aws_get_argv(
+                        region=region,
+                        s3_root=s3_root,
+                        suffix=(
+                            f"checkpoints/seed-{intent['seed']}/{arm}/sha256/"
+                            f"{row['resume_sha256']}.pt"
+                        ),
+                        destination=str(row["resume_path"]),
+                    ),
+                }
+            )
+        launcher_argv = [
+            "/usr/bin/python3",
+            f"{release_root}/msctl/aws_resume_launch.py",
+            "--seed",
+            str(intent["seed"]),
+            "--manifest",
+            f"{staging}/launcher-manifest-{intent['run_manifest_sha256']}.json",
+            "--profile",
+            profile_path,
+            "--repo-root",
+            release_root,
+            "--scratch-root",
+            scratch,
+            "--launcher",
+            f"{release_root}/cluster/aws/p5/launch_seed_pair.py",
+            "--checkpoint-receipt",
+            f"{resume_root}/receipt.json",
+            "--checkpoint-receipt-sha256",
+            receipt_sha256,
+            "--run-manifest-sha256",
+            str(intent["run_manifest_sha256"]),
+        ]
+        for row in checkpoint_rows:
+            launcher_argv.extend(
+                ["--checkpoint", canonical_json(row).decode("ascii")]
+            )
+        launcher_argv.append("--apply")
+        steps.append({"name": "paired-launch", "argv": launcher_argv})
+        return steps
+
+    steps = [
+        {
+            "name": "auto-termination",
+            "argv": [
+                "/usr/bin/systemd-run",
+                "--unit",
+                "memorysplit-auto-terminate",
+                "--on-calendar",
+                str(intent["terminate_at"]),
+                "/sbin/shutdown",
+                "-h",
+                "now",
+            ],
+        },
+        {
+            "name": "prepare-aws-private-home",
+            "argv": [
+                "/usr/bin/install",
+                "-d",
+                "-m",
+                "0700",
+                "-o",
+                "0",
+                "-g",
+                "0",
+                "/var/lib/memorysplit/aws-private-home",
+            ],
+        },
+        {
+            "name": "prepare-staging",
+            "argv": [
+                "/usr/bin/install",
+                "-d",
+                "-m",
+                "0700",
+                f"{staging}/releases/{intent['release_sha256']}",
+                f"{scratch}/dataset",
+            ],
+        },
+        {
+            "name": "materialize-release-archive",
+            "argv": _aws_get_argv(
+                region=region,
+                s3_root=s3_root,
+                suffix=f"releases/{intent['release_sha256']}/release.zip",
+                destination=(
+                    f"{staging}/releases/{intent['release_sha256']}/release.zip"
+                ),
+            ),
+        },
+        {
+            "name": "materialize-release-receipt",
+            "argv": _aws_get_argv(
+                region=region,
+                s3_root=s3_root,
+                suffix=f"releases/{intent['release_sha256']}/RELEASE.json",
+                destination=(
+                    f"{staging}/releases/{intent['release_sha256']}/RELEASE.json"
+                ),
+            ),
+        },
+        {
+            "name": "materialize-cohort-assignment",
+            "argv": _aws_get_argv(
+                region=region,
+                s3_root=s3_root,
+                suffix=(
+                    f"releases/{intent['release_sha256']}/"
+                    "cohort-assignment-v3.json"
+                ),
+                destination=(
+                    f"{staging}/releases/{intent['release_sha256']}/"
+                    "cohort-assignment-v3.json"
+                ),
+            ),
+        },
+        {
+            "name": "materialize-dataset",
+            "argv": [
+                "/usr/bin/env",
+                "aws",
+                "--no-cli-pager",
+                "--region",
+                region,
+                "s3",
+                "sync",
+                f"{s3_root}/dataset",
+                f"{scratch}/dataset",
+                "--no-follow-symlinks",
+                "--only-show-errors",
+            ],
+        },
+        {
+            "name": "bootstrap",
+            "argv": [
+                "/usr/bin/python3",
+                f"{control_root}/cluster/aws/p5/bootstrap.py",
+                "--profile",
+                f"{control_root}/cluster/profiles/{provider}.json",
+                "--container-image",
+                str(intent["container_image"]),
+                "--release-archive",
+                f"{staging}/releases/{intent['release_sha256']}/release.zip",
+                "--release-sha256",
+                str(intent["release_sha256"]),
+                "--release-receipt",
+                f"{staging}/releases/{intent['release_sha256']}/RELEASE.json",
+                "--release-receipt-sha256",
+                str(intent["release_receipt_sha256"]),
+                "--dataset-receipt",
+                f"{scratch}/dataset/receipt.json",
+                "--dataset-receipt-sha256",
+                str(intent["dataset_sha256"]),
+                "--cohort-assignment",
+                (
+                    f"{staging}/releases/{intent['release_sha256']}/"
+                    "cohort-assignment-v3.json"
+                ),
+                "--cohort-assignment-sha256",
+                str(intent["cohort_assignment_sha256"]),
+                "--code-commit",
+                str(intent["source_commit"]),
+                "--receipt",
+                f"{staging}/bootstrap-receipt.json",
+                "--owner-uid",
+                str(environment["MS_RUNTIME_UID"]),
+                "--owner-gid",
+                str(environment["MS_RUNTIME_GID"]),
+                "--aws-private-home",
+                "/var/lib/memorysplit/aws-private-home",
+                "--authorize-destructive-instance-store",
+                "--apply",
+            ],
+        },
+    ]
+    launcher_manifest_argv = [
+        "/usr/bin/python3",
+        f"{release_root}/msctl/aws_launch_manifest.py",
+        "--profile",
+        profile_path,
+        "--out",
+        f"{staging}/launcher-manifest-{intent['run_manifest_sha256']}.json",
+        "--scratch-root",
+        scratch,
+        "--seed",
+        str(intent["seed"]),
+        "--profile-sha256",
+        str(intent["profile_sha256"]),
+        "--release-sha256",
+        str(intent["release_sha256"]),
+        "--release-members-sha256",
+        str(intent["release_members_sha256"]),
+        "--cohort-assignment-sha256",
+        str(intent["cohort_assignment_sha256"]),
+        "--code-commit",
+        str(intent["source_commit"]),
+        "--preregistration-sha256",
+        str(intent["preregistration_sha256"]),
+        "--hardware-amendment-sha256",
+        str(intent["hardware_amendment_sha256"]),
+        "--provider-selection-sha256",
+        str(intent["provider_selection_sha256"]),
+        "--sealed-fixture-sha256",
+        str(intent["sealed_fixture_sha256"]),
+        "--fleet-plan-sha256",
+        str(intent["fleet_plan_sha256"]),
+        "--launch-readiness-sha256",
+        str(intent["launch_readiness_sha256"]),
+        "--control-bundle-sha256",
+        str(intent["control_bundle_sha256"]),
+        "--run-manifest-sha256",
+        str(intent["run_manifest_sha256"]),
+        "--fleet-wave",
+        str(intent["fleet_wave"]),
+        "--bootstrap-receipt",
+        f"{staging}/bootstrap-receipt.json",
+        "--corpus-receipt",
+        f"{scratch}/dataset/receipt.json",
+    ]
+    for row in run_rows:
+        launcher_manifest_argv.extend(
+            [
+                "--run",
+                canonical_json(
+                    {
+                        "arm": row["arm"],
+                        "config": row["config"],
+                        "config_sha256": row["config_sha256"],
+                    }
+                ).decode("ascii"),
+            ]
+        )
+    steps.extend(
+        [
+            {
+                "name": "build-launcher-manifest",
+                "argv": launcher_manifest_argv,
+            },
+            {
+                "name": "paired-launch",
+                "argv": [
+                    "/usr/bin/python3",
+                    f"{release_root}/cluster/aws/p5/launch_seed_pair.py",
+                    "--seed",
+                    str(intent["seed"]),
+                    "--manifest",
+                    (
+                        f"{staging}/launcher-manifest-"
+                        f"{intent['run_manifest_sha256']}.json"
+                    ),
+                    "--profile",
+                    profile_path,
+                    "--repo-root",
+                    release_root,
+                    "--scratch-root",
+                    scratch,
+                    "--apply",
+                ],
+            },
+        ]
+    )
+    return steps
+
+
+def build_v3_operation_steps(
+    intent: Mapping[str, object],
+) -> list[dict[str, object]]:
+    """Build the canonical remote argv plan for one schema-v3 operation."""
+
+    if intent.get("operation") == "evaluate":
+        return build_v3_evaluation_steps(intent)
+    return build_v3_training_steps(intent)
+
+
 def _validate_v3_python_step(
     *,
     name: str,
@@ -733,153 +1391,149 @@ def _validate_v3_python_step(
     staging = f"{scratch}/staging"
     provider = str(intent["provider"])
     profile_path = f"{release_root}/cluster/profiles/{provider}.json"
-    allowed_scripts = {
-        f"{control_root}/cluster/aws/p5/bootstrap.py",
-        f"{release_root}/msctl/aws_launch_manifest.py",
-        f"{release_root}/msctl/aws_resume_launch.py",
-        f"{release_root}/cluster/aws/p5/launch_seed_pair.py",
-        f"{release_root}/cluster/aws/p5/terminal_artifacts.py",
-    }
-    expected_scripts = {
-        "bootstrap": f"{control_root}/cluster/aws/p5/bootstrap.py",
-        "build-launcher-manifest": (
-            f"{release_root}/msctl/aws_launch_manifest.py"
-        ),
-        "verify-terminal-checkpoints": (
-            f"{release_root}/cluster/aws/p5/terminal_artifacts.py"
-        ),
-        "publish-paired-evaluation": (
-            f"{release_root}/cluster/aws/p5/terminal_artifacts.py"
-        ),
-    }
-    if name == "paired-launch":
-        expected_scripts[name] = (
-            f"{release_root}/msctl/aws_resume_launch.py"
-            if operation == "resume"
-            else f"{release_root}/cluster/aws/p5/launch_seed_pair.py"
-        )
-    script = expected_scripts.get(name)
-    if script is None or argv[:2] != ["/usr/bin/python3", script]:
-        raise RemoteIntentError(
-            "v3 Python step is not pinned to its release or control root"
-        )
-    if any(
-        item.startswith("/") and item.endswith(".py") and item not in allowed_scripts
-        for item in argv
-    ):
-        raise RemoteIntentError(
-            "v3 operation references a script outside the pinned roots"
-        )
+    checkpoint = cast(dict[str, object] | None, intent["checkpoint_receipt"])
+    run_rows = cast(list[dict[str, object]], intent["runs"])
+    expected: list[str]
     if name == "bootstrap":
-        _required_option(
-            argv,
+        expected = [
+            "/usr/bin/python3",
+            f"{control_root}/cluster/aws/p5/bootstrap.py",
             "--profile",
             f"{control_root}/cluster/profiles/{provider}.json",
-        )
-        _required_option(
-            argv,
+            "--container-image",
+            str(intent["container_image"]),
             "--release-archive",
             f"{staging}/releases/{intent['release_sha256']}/release.zip",
-        )
-        _required_option(argv, "--release-sha256", str(intent["release_sha256"]))
-        _required_option(argv, "--dataset-receipt", f"{scratch}/dataset/receipt.json")
-        _required_option(
-            argv,
+            "--release-sha256",
+            str(intent["release_sha256"]),
+            "--release-receipt",
+            f"{staging}/releases/{intent['release_sha256']}/RELEASE.json",
+            "--release-receipt-sha256",
+            str(intent["release_receipt_sha256"]),
+            "--dataset-receipt",
+            f"{scratch}/dataset/receipt.json",
+            "--dataset-receipt-sha256",
+            str(intent["dataset_sha256"]),
             "--cohort-assignment",
-            f"{staging}/releases/{intent['release_sha256']}/"
-            "cohort-assignment-v3.json",
-        )
-        _required_option(argv, "--receipt", f"{staging}/bootstrap-receipt.json")
-        _required_option(
-            argv,
+            (
+                f"{staging}/releases/{intent['release_sha256']}/"
+                "cohort-assignment-v3.json"
+            ),
+            "--cohort-assignment-sha256",
+            str(intent["cohort_assignment_sha256"]),
+            "--code-commit",
+            str(intent["source_commit"]),
+            "--receipt",
+            f"{staging}/bootstrap-receipt.json",
+            "--owner-uid",
+            str(cast(dict[str, object], intent["environment"])["MS_RUNTIME_UID"]),
+            "--owner-gid",
+            str(cast(dict[str, object], intent["environment"])["MS_RUNTIME_GID"]),
             "--aws-private-home",
             "/var/lib/memorysplit/aws-private-home",
-        )
-        if argv[-2:] != ["--authorize-destructive-instance-store", "--apply"]:
-            raise RemoteIntentError("v3 bootstrap mutation flags are not exact")
+            "--authorize-destructive-instance-store",
+            "--apply",
+        ]
     elif name == "build-launcher-manifest":
-        _required_option(argv, "--profile", profile_path)
-        _required_option(
-            argv,
+        expected = [
+            "/usr/bin/python3",
+            f"{release_root}/msctl/aws_launch_manifest.py",
+            "--profile",
+            profile_path,
             "--out",
             f"{staging}/launcher-manifest-{intent['run_manifest_sha256']}.json",
-        )
-        _required_option(argv, "--scratch-root", scratch)
-        _required_option(argv, "--seed", str(intent["seed"]))
-        _required_option(argv, "--profile-sha256", str(intent["profile_sha256"]))
-        _required_option(argv, "--release-sha256", str(intent["release_sha256"]))
-        _required_option(
-            argv,
+            "--scratch-root",
+            scratch,
+            "--seed",
+            str(intent["seed"]),
+            "--profile-sha256",
+            str(intent["profile_sha256"]),
+            "--release-sha256",
+            str(intent["release_sha256"]),
+            "--release-members-sha256",
+            str(intent["release_members_sha256"]),
+            "--cohort-assignment-sha256",
+            str(intent["cohort_assignment_sha256"]),
+            "--code-commit",
+            str(intent["source_commit"]),
+            "--preregistration-sha256",
+            str(intent["preregistration_sha256"]),
+            "--hardware-amendment-sha256",
+            str(intent["hardware_amendment_sha256"]),
+            "--provider-selection-sha256",
+            str(intent["provider_selection_sha256"]),
+            "--sealed-fixture-sha256",
+            str(intent["sealed_fixture_sha256"]),
+            "--fleet-plan-sha256",
+            str(intent["fleet_plan_sha256"]),
+            "--launch-readiness-sha256",
+            str(intent["launch_readiness_sha256"]),
+            "--control-bundle-sha256",
+            str(intent["control_bundle_sha256"]),
             "--run-manifest-sha256",
             str(intent["run_manifest_sha256"]),
-        )
-        _required_option(
-            argv,
+            "--fleet-wave",
+            str(intent["fleet_wave"]),
             "--bootstrap-receipt",
             f"{staging}/bootstrap-receipt.json",
-        )
-        _required_option(argv, "--corpus-receipt", f"{scratch}/dataset/receipt.json")
+            "--corpus-receipt",
+            f"{scratch}/dataset/receipt.json",
+        ]
+        for row in run_rows:
+            expected.extend(
+                [
+                    "--run",
+                    canonical_json(
+                        {
+                            "arm": row["arm"],
+                            "config": row["config"],
+                            "config_sha256": row["config_sha256"],
+                        }
+                    ).decode("ascii"),
+                ]
+            )
     elif name == "paired-launch":
-        _required_option(argv, "--seed", str(intent["seed"]))
-        _required_option(
-            argv,
+        expected = [
+            "/usr/bin/python3",
+            (
+                f"{release_root}/msctl/aws_resume_launch.py"
+                if operation == "resume"
+                else f"{release_root}/cluster/aws/p5/launch_seed_pair.py"
+            ),
+            "--seed",
+            str(intent["seed"]),
             "--manifest",
             f"{staging}/launcher-manifest-{intent['run_manifest_sha256']}.json",
-        )
-        _required_option(argv, "--profile", profile_path)
-        _required_option(argv, "--repo-root", release_root)
-        _required_option(argv, "--scratch-root", scratch)
+            "--profile",
+            profile_path,
+            "--repo-root",
+            release_root,
+            "--scratch-root",
+            scratch,
+        ]
         if operation == "resume":
-            _required_option(
-                argv,
-                "--launcher",
-                f"{release_root}/cluster/aws/p5/launch_seed_pair.py",
+            assert checkpoint is not None
+            expected.extend(
+                [
+                    "--launcher",
+                    f"{release_root}/cluster/aws/p5/launch_seed_pair.py",
+                    "--checkpoint-receipt",
+                    f"{staging}/resume/{checkpoint['sha256']}/receipt.json",
+                    "--checkpoint-receipt-sha256",
+                    str(checkpoint["sha256"]),
+                    "--run-manifest-sha256",
+                    str(intent["run_manifest_sha256"]),
+                ]
             )
-            checkpoint = cast(dict[str, object], intent["checkpoint_receipt"])
-            _required_option(
-                argv,
-                "--checkpoint-receipt",
-                f"{staging}/resume/{checkpoint['sha256']}/receipt.json",
-            )
-            _required_option(
-                argv,
-                "--checkpoint-receipt-sha256",
-                str(checkpoint["sha256"]),
-            )
-        if argv[-1] != "--apply":
-            raise RemoteIntentError("v3 paired launcher must use the closed apply path")
-    elif name == "verify-terminal-checkpoints":
-        if len(argv) < 3 or argv[2] != "verify-terminal":
-            raise RemoteIntentError("v3 checkpoint verifier subcommand is invalid")
-        _required_option(
-            argv,
-            "--receipt",
-            f"{scratch}/receipts/checkpoints/seed-{intent['seed']}/receipt.json",
-        )
-        _required_option(
-            argv,
-            "--run-root",
-            f"{scratch}/runs/seed-{intent['seed']}",
-        )
-    elif name == "publish-paired-evaluation":
-        if len(argv) < 3 or argv[2] != "publish-evaluation":
-            raise RemoteIntentError("v3 evaluation publisher subcommand is invalid")
-        _required_option(argv, "--evaluation-root", f"{scratch}/evaluations")
-        _required_option(
-            argv,
-            "--checkpoint-receipt",
-            f"{scratch}/receipts/checkpoints/seed-{intent['seed']}/receipt.json",
-        )
-    for option, expected in (
-        (
-            "--s3-root",
-            str(cast(dict[str, object], intent["environment"])["MS_S3_ROOT"]),
-        ),
-        ("--provider", provider),
-        ("--run-manifest-sha256", str(intent["run_manifest_sha256"])),
-    ):
-        if option in argv:
-            _required_option(argv, option, expected)
+            for row in cast(list[dict[str, object]], checkpoint["checkpoints"]):
+                expected.extend(
+                    ["--checkpoint", canonical_json(row).decode("ascii")]
+                )
+        expected.append("--apply")
+    else:
+        raise RemoteIntentError("v3 operation contains an unexpected Python step")
+    if argv != expected:
+        raise RemoteIntentError("v3 Python argv differs from the closed operation plan")
 
 
 def _validate_v3_docker_step(
@@ -1038,7 +1692,13 @@ def _validate_v3_steps(
     intent: Mapping[str, object],
     steps: list[dict[str, object]],
 ) -> None:
+    if steps != build_v3_operation_steps(intent):
+        raise RemoteIntentError(
+            "v3 operation steps differ from the closed operation plan"
+        )
     operation = str(intent["operation"])
+    if operation == "evaluate":
+        return
     release_root = f"/mnt/memorysplit/releases/{intent['release_sha256']}"
     control_root = f"/opt/memorysplit/control/{intent['control_bundle_sha256']}"
     environment = cast(dict[str, object], intent["environment"])
@@ -1065,23 +1725,9 @@ def _validate_v3_steps(
         "materialize-resume-split90",
         "paired-launch",
     ]
-    evaluation_names = [
-        "prepare-sealed-evaluation",
-        "prepare-evaluation-output",
-        *[
-            f"materialize-sealed-evaluation-{member.replace('.', '-')}"
-            for member in _SEALED_EVALUATION_MEMBERS
-        ],
-        "verify-sealed-evaluation",
-        "verify-terminal-checkpoints",
-        "evaluate-dense",
-        "evaluate-split90",
-        "publish-paired-evaluation",
-    ]
     expected_names = {
         "submit": submit_names,
         "resume": resume_names,
-        "evaluate": evaluation_names,
     }[operation]
     names = [str(step["name"]) for step in steps]
     if names != expected_names:
@@ -1298,6 +1944,79 @@ def _validate_v3_steps(
             )
 
 
+def _validate_v3_execution_bindings(
+    intent: Mapping[str, object],
+    *,
+    environment: Mapping[str, object],
+) -> dict[str, dict[str, object]]:
+    for field in ("release_receipt_sha256", "release_members_sha256"):
+        _sha256(intent[field], label=f"operation intent {field}")
+    source_commit = intent["source_commit"]
+    container_image = intent["container_image"]
+    if (
+        not isinstance(source_commit, str)
+        or _COMMIT_RE.fullmatch(source_commit) is None
+        or not isinstance(container_image, str)
+        or _ECR_IMAGE_RE.fullmatch(container_image) is None
+        or not container_image.endswith("@" + str(environment["MS_CONTAINER_DIGEST"]))
+    ):
+        raise RemoteIntentError(
+            "v3 release and container execution bindings are invalid"
+        )
+    expected_runtime_sha256 = hashlib.sha256(
+        canonical_json(
+            {
+                "ami_id": environment["MS_AWS_AMI_ID"],
+                "container_image": container_image,
+                "container_digest": environment["MS_CONTAINER_DIGEST"],
+                "gid": int(str(environment["MS_RUNTIME_GID"])),
+                "region": environment["AWS_REGION"],
+                "s3_root": environment["MS_S3_ROOT"],
+                "uid": int(str(environment["MS_RUNTIME_UID"])),
+            }
+        )
+    ).hexdigest()
+    if intent["runtime_sha256"] != expected_runtime_sha256:
+        raise RemoteIntentError(
+            "v3 runtime SHA-256 does not match its closed execution binding"
+        )
+
+    raw_runs = intent["runs"]
+    if not isinstance(raw_runs, list) or len(raw_runs) != 2:
+        raise RemoteIntentError("v3 operation must bind one exact run pair")
+    runs: dict[str, dict[str, object]] = {}
+    ordered_arms: list[str] = []
+    run_ids: set[str] = set()
+    for raw in raw_runs:
+        if not isinstance(raw, dict) or set(raw) != _RUN_FIELDS:
+            raise RemoteIntentError("v3 run binding fields do not match")
+        arm = raw["arm"]
+        run_id = raw["run_id"]
+        config = raw["config"]
+        if (
+            arm not in {"dense", "split90"}
+            or arm in runs
+            or not isinstance(run_id, str)
+            or _RUN_ID_RE.fullmatch(run_id) is None
+            or run_id != f"memorysplit-v3-360m-s{intent['seed']}-{arm}"
+            or run_id in run_ids
+            or not isinstance(config, str)
+            or not config.startswith("configs/")
+            or not config.endswith((".yaml", ".yml"))
+            or "\\" in config
+            or any(part in {"", ".", ".."} for part in config.split("/"))
+            or config != f"configs/360m-v3/{arm}-s{intent['seed']}.yaml"
+        ):
+            raise RemoteIntentError("v3 run binding identity is invalid")
+        _sha256(raw["config_sha256"], label=f"{arm} run configuration")
+        runs[str(arm)] = raw
+        ordered_arms.append(str(arm))
+        run_ids.add(run_id)
+    if ordered_arms != ["dense", "split90"]:
+        raise RemoteIntentError("v3 run bindings are not canonically ordered")
+    return runs
+
+
 def _validate_intent(
     payload: bytes,
     *,
@@ -1317,7 +2036,7 @@ def _validate_intent(
         )
     schema_version = intent.get("schema_version")
     expected_fields = (
-        _BASE_FIELDS | _v3_provenance_fields(intent)
+        _BASE_FIELDS | _v3_provenance_fields(intent) | _V3_EXECUTION_FIELDS
         if schema_version == 3
         else _BASE_FIELDS
     )
@@ -1466,12 +2185,18 @@ def _validate_intent(
         raise RemoteIntentError(
             "v3 operation environment is not pinned to a supported runtime"
         )
+    v3_runs = (
+        _validate_v3_execution_bindings(intent, environment=environment)
+        if schema_version == 3
+        else {}
+    )
     s3_root = _s3_uri(environment["MS_S3_ROOT"])
     if intent["operation"] == "evaluate" and schema_version == 3:
         _validate_evaluation_checkpoint_receipt(
             intent["checkpoint_receipt"],
             seed=intent["seed"],
             s3_root=s3_root,
+            runs=v3_runs,
         )
     started_receipt_uri = _s3_uri(intent["started_receipt_uri"], root=s3_root)
     terminal_receipt_uri = _s3_uri(intent["terminal_receipt_uri"], root=s3_root)
@@ -1645,6 +2370,17 @@ def _validate_receipt(
             != ("success" if returncode == 0 else "failed")
         ):
             raise RemoteIntentError("terminal receipt result is invalid")
+    expected_payload = _receipt(
+        intent,
+        intent_sha256=intent_sha256,
+        kind=kind,
+        nonce=str(nonce),
+        returncode=(
+            int(value["returncode"]) if kind == "terminal" else None
+        ),
+    )
+    if payload != expected_payload:
+        raise RemoteIntentError(f"{kind} receipt is not canonical")
     return value
 
 

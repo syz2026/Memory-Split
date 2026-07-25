@@ -1085,15 +1085,15 @@ def validate_fleet_advance(
         "aws_unbound_tags_sha256",
     ):
         _sha256(evidence[field], label=f"fleet advance evidence {field}")
-    for field in ("training_command_id",):
-        if (
-            not isinstance(evidence[field], str)
-            or _COMMAND_ID_RE.fullmatch(evidence[field]) is None
-        ):
-            _fail(
-                "fleet advance command identity is invalid",
-                code="FLEET_ADVANCE_INVALID",
-            )
+    training_command_id = evidence["training_command_id"]
+    if training_command_id is not None and (
+        not isinstance(training_command_id, str)
+        or _COMMAND_ID_RE.fullmatch(training_command_id) is None
+    ):
+        _fail(
+            "fleet advance command identity is invalid",
+            code="FLEET_ADVANCE_INVALID",
+        )
     for field in ("training_terminal_receipt_uri",):
         uri = evidence[field]
         if (

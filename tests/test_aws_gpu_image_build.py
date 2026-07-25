@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import re
 import shutil
+import sys
 from pathlib import Path
 
 import pytest
@@ -91,6 +92,8 @@ def test_apply_executes_only_the_previously_rendered_argv():
     assert [call[0] for call in calls] == plan["commands"]
     assert all(call[1]["shell"] is False for call in calls)
     assert all(call[1]["check"] is True for call in calls)
+    assert all(call[1]["stdout"] is sys.stderr for call in calls)
+    assert all(call[1]["stderr"] is sys.stderr for call in calls)
 
 
 @pytest.mark.parametrize(

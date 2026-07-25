@@ -9,6 +9,7 @@ import json
 import re
 import stat
 import subprocess
+import sys
 from pathlib import Path
 from typing import Callable, Sequence
 
@@ -262,6 +263,8 @@ def apply_image_plan(
             check=True,
             shell=False,
             stdin=subprocess.DEVNULL,
+            stdout=sys.stderr,
+            stderr=sys.stderr,
         )
 
 

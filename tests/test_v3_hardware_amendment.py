@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 import tempfile
@@ -817,7 +818,7 @@ def test_later_fleet_wave_requires_local_terminal_advance_receipt(tmp_path):
     backend._require_fleet_advance(target, context)
 
 
-def test_fleet_advance_dry_run_then_apply_verifies_and_unbinds_exact_tags(
+def test_fleet_advance_reconciles_terminal_receipt_then_unbinds_exact_tags(
     tmp_path,
     monkeypatch,
 ):
@@ -881,8 +882,8 @@ def test_fleet_advance_dry_run_then_apply_verifies_and_unbinds_exact_tags(
     )
     terminate_at = "2026-07-25T00:00:00Z"
     common = {
-        "status": "Success",
-        "command_id": "training-command-12345678",
+        "status": "SENDING",
+        "command_id": None,
         "operation_id": "1" * 64,
         "intent_sha256": "2" * 64,
         "launch_readiness_sha256": "3" * 64,
@@ -909,20 +910,6 @@ def test_fleet_advance_dry_run_then_apply_verifies_and_unbinds_exact_tags(
         run.run_id: {**common, "run_id": run.run_id, "arm": run.arm}
         for run in previous.runs
     }
-    evaluation = {
-        "status": "Success",
-        "operation": "evaluate",
-        "instance_id": instance_id,
-        "run_manifest_sha256": previous.sha256,
-        "fleet_plan_sha256": plan.sha256,
-        "fleet_wave": 0,
-        "launch_readiness_sha256": "3" * 64,
-        "command_id": "evaluation-command-12345678",
-        "operation_id": "5" * 64,
-        "intent_sha256": "6" * 64,
-            "sealed_evaluation_sha256": "a" * 64,
-            "study_lock_sha256": "b" * 64,
-    }
 
     class Store:
         def locked(self):
@@ -930,10 +917,6 @@ def test_fleet_advance_dry_run_then_apply_verifies_and_unbinds_exact_tags(
 
         def read_run(self, run_id):
             return dict(states[run_id])
-
-        def read_evaluation(self, manifest_sha256):
-            assert manifest_sha256 == previous.sha256
-            return dict(evaluation)
 
     monkeypatch.setattr(aws_p5, "StateStore", lambda _root: Store())
     monkeypatch.setattr(
@@ -972,6 +955,33 @@ def test_fleet_advance_dry_run_then_apply_verifies_and_unbinds_exact_tags(
     monkeypatch.setattr(backend, "_repair_paired_states", lambda *_args: None)
     monkeypatch.setattr(
         backend,
+        "_state_operation_intent",
+        lambda _state: {"operation_id": "1" * 64},
+    )
+    reconciled = []
+
+    def reconcile_terminal(**kwargs):
+        reconciled.append(kwargs["operation_label"])
+        for state in kwargs["states"]:
+            state["status"] = "REMOTE_TERMINAL_SUCCESS"
+        return {
+            "status": "REMOTE_TERMINAL_SUCCESS",
+            "operation_id": "1" * 64,
+            "terminal_receipt_uri": (
+                "s3://memorysplit-prod/cohort-v3/operations/"
+                f"{'1' * 64}/receipts/terminal.json"
+            ),
+            "terminal_receipt_sha256": "7" * 64,
+            "returncode": 0,
+        }
+
+    monkeypatch.setattr(
+        backend,
+        "_reconcile_receipted_pair",
+        reconcile_terminal,
+    )
+    monkeypatch.setattr(
+        backend,
         "_same_state_binding",
         lambda *_args, **_kwargs: True,
     )
@@ -993,20 +1003,23 @@ def test_fleet_advance_dry_run_then_apply_verifies_and_unbinds_exact_tags(
     assert dry_run["from_seed"] == 0
     assert dry_run["to_seed"] == 1
     assert calls == []
+    assert reconciled == ["training"]
 
     approval = tmp_path / "fleet-advance-approval.json"
     approval.write_bytes(b'{"approved":true}\n')
     monkeypatch.setattr(
         backend,
         "_command_status",
-        lambda *_args: "Success",
+        lambda *_args: pytest.fail(
+            "receipt-reconciled training has no SSM command to rerun"
+        ),
     )
     monkeypatch.setattr(
         backend,
         "_verify_state_terminal_receipt",
-        lambda state: (
-            "s3://memorysplit-prod/"
-            f"{state['command_id']}/receipts/terminal.json"
+        lambda _state: (
+            "s3://memorysplit-prod/cohort-v3/operations/"
+            f"{'1' * 64}/receipts/terminal.json"
         ),
     )
     monkeypatch.setattr(
@@ -1031,6 +1044,7 @@ def test_fleet_advance_dry_run_then_apply_verifies_and_unbinds_exact_tags(
     assert len(approval_calls) == 1
     assert approval_calls[0]["operation"] == "fleet-advance"
     assert approval_calls[0]["scope_sha256"] == plan.sha256
+    assert reconciled == ["training", "training"]
     assert all(value is not None for value in observed_bindings[0].values())
     assert all(value is None for value in observed_bindings[1].values())
     assert [operation for _argv, operation in calls] == [
@@ -1038,6 +1052,15 @@ def test_fleet_advance_dry_run_then_apply_verifies_and_unbinds_exact_tags(
         "unbind completed fleet wave",
         "verify fleet wave unbound",
     ]
+    from msctl.aws_fleet import load_fleet_advance
+
+    receipt = load_fleet_advance(
+        backend.state_root,
+        plan=plan,
+        to_binding=plan.binding_for_seed(1),
+    )
+    assert receipt is not None
+    assert receipt.evidence["training_command_id"] is None
 
 
 @pytest.mark.parametrize("profile_path", [P5, P6])
@@ -1059,7 +1082,12 @@ def test_v3_profiles_support_full_dry_run_lifecycle(
         SealedEvaluationRelease,
     )
     from msctl.aws_selection import write_provider_selection
-    from msctl.aws_argv import _receipt, _validate_intent, _validate_receipt
+    from msctl.aws_argv import (
+        RemoteIntentError,
+        _receipt,
+        _validate_intent,
+        _validate_receipt,
+    )
     from msctl.contracts import verify_checkpoint_receipt
     from msctl.state import StateStore
     profile, selection, paths = _manifests(
@@ -1181,6 +1209,8 @@ def test_v3_profiles_support_full_dry_run_lifecycle(
     release = SimpleNamespace(
         provider=profile.provider,
         archive_sha256=manifest.release_sha256,
+        receipt_sha256="6" * 64,
+        members_sha256="7" * 64,
         source_commit=manifest.source_commit,
     )
     evidence = {
@@ -1292,44 +1322,6 @@ def test_v3_profiles_support_full_dry_run_lifecycle(
         evidence=evidence,
         context=context,
     )
-    resumed = backend.resume(
-        release=release,
-        manifest=manifest,
-        checkpoint_receipt=checkpoint_receipt,
-        approval_path=None,
-        apply=False,
-        evidence=evidence,
-        context=context,
-    )
-    cancelled = backend.cancel(
-        release=release,
-        manifest=manifest,
-        approval_path=None,
-        apply=False,
-        context=context,
-    )
-    evaluated = backend.evaluate(
-        release=release,
-        manifest=manifest,
-        approval_path=None,
-        apply=False,
-        evidence=evidence,
-        context=evaluation_context,
-        checkpoint_receipt=checkpoint_receipt,
-    )
-    cleaned = backend.cleanup(
-        release=release,
-        manifest=manifest,
-        approval_path=None,
-        apply=False,
-        context=context,
-    )
-    collected = backend.collect(
-        source=f"results/seed-{manifest.seed}.json",
-        out=tmp_path / "collected.json",
-        apply=False,
-    )
-
     intent = submitted["operation_intent"]
     intent_sha256 = hashlib.sha256(canonical_json(intent)).hexdigest()
     validated_intent = _validate_intent(
@@ -1337,21 +1329,6 @@ def test_v3_profiles_support_full_dry_run_lifecycle(
         expected_sha256=intent_sha256,
         expected_control_bundle_sha256=backend.control_bundle.sha256,
     )
-    for protected in (
-        resumed["operation_intent"],
-        evaluated["operation_intent"],
-    ):
-        protected_intent = backend._operation_envelope(
-            protected,
-            instance_id=instance_id,
-            terminate_at=terminate_at,
-        )
-        protected_payload = canonical_json(protected_intent)
-        assert _validate_intent(
-            protected_payload,
-            expected_sha256=hashlib.sha256(protected_payload).hexdigest(),
-            expected_control_bundle_sha256=backend.control_bundle.sha256,
-        ) == protected_intent
     started_receipt = _receipt(
         validated_intent,
         intent_sha256=intent_sha256,
@@ -1396,6 +1373,60 @@ def test_v3_profiles_support_full_dry_run_lifecycle(
     store = StateStore(backend.state_root)
     with store.locked():
         backend._write_paired_states(store, manifest, states, context)
+
+    resumed = backend.resume(
+        release=release,
+        manifest=manifest,
+        checkpoint_receipt=checkpoint_receipt,
+        approval_path=None,
+        apply=False,
+        evidence=evidence,
+        context=context,
+    )
+    cancelled = backend.cancel(
+        release=release,
+        manifest=manifest,
+        approval_path=None,
+        apply=False,
+        context=context,
+    )
+    evaluated = backend.evaluate(
+        release=release,
+        manifest=manifest,
+        approval_path=None,
+        apply=False,
+        evidence=evidence,
+        context=evaluation_context,
+        checkpoint_receipt=checkpoint_receipt,
+    )
+    cleaned = backend.cleanup(
+        release=release,
+        manifest=manifest,
+        approval_path=None,
+        apply=False,
+        context=context,
+    )
+    collected = backend.collect(
+        source=f"results/seed-{manifest.seed}.json",
+        out=tmp_path / "collected.json",
+        apply=False,
+    )
+
+    for protected in (
+        resumed["operation_intent"],
+        evaluated["operation_intent"],
+    ):
+        protected_intent = backend._operation_envelope(
+            protected,
+            instance_id=instance_id,
+            terminate_at=terminate_at,
+        )
+        protected_payload = canonical_json(protected_intent)
+        assert _validate_intent(
+            protected_payload,
+            expected_sha256=hashlib.sha256(protected_payload).hexdigest(),
+            expected_control_bundle_sha256=backend.control_bundle.sha256,
+        ) == protected_intent
     status = backend.status(
         release=release,
         manifest=manifest,
@@ -1515,6 +1546,39 @@ def test_v3_profiles_support_full_dry_run_lifecycle(
     assert validated_evaluation["checkpoint_receipt"]["sha256"] == (
         checkpoint_receipt.sha256
     )
+    for step_index, step in enumerate(evaluation_envelope["steps"]):
+        for argument_index, argument in enumerate(step["argv"]):
+            changed = copy.deepcopy(evaluation_envelope)
+            changed["steps"][step_index]["argv"][argument_index] = (
+                f"{argument}-recommitted-edit"
+            )
+            identity = {
+                key: value
+                for key, value in changed.items()
+                if key
+                not in {
+                    "operation_id",
+                    "ssm_document",
+                    "started_receipt_uri",
+                    "terminal_receipt_uri",
+                }
+            }
+            operation_id = hashlib.sha256(canonical_json(identity)).hexdigest()
+            changed["operation_id"] = operation_id
+            receipt_root = (
+                f"{runtime.s3_root}/operations/{operation_id}/receipts"
+            )
+            changed["started_receipt_uri"] = f"{receipt_root}/started.json"
+            changed["terminal_receipt_uri"] = f"{receipt_root}/terminal.json"
+            changed_payload = canonical_json(changed)
+            with pytest.raises(RemoteIntentError):
+                _validate_intent(
+                    changed_payload,
+                    expected_sha256=hashlib.sha256(
+                        changed_payload
+                    ).hexdigest(),
+                    expected_control_bundle_sha256=backend.control_bundle.sha256,
+                )
     assert cancelled["cancelled"] == 0
     assert cleaned["terminated"] == 0
     assert collected["collected"] == 0

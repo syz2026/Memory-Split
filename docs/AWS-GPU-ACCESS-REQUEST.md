@@ -65,9 +65,10 @@ the dedicated instance profile, and cohort request/resource tags. Require
 Start, stop, terminate, instance-attribute, and tag permissions must target
 cohort-tagged instances; operators still pass explicit reviewed instance IDs to
 every mutating command. `ec2:DeleteTags` is used only by approved `fleet
-advance` to remove the prior wave's exact key/value bindings after terminal,
-evaluation, and collection evidence has been verified. It is not permission to
-retag an active pair manually.
+advance` to remove the prior wave's exact key/value bindings after successful
+terminal training and its complete durable checkpoint bundle have been
+verified. Evaluation and collection occur later and are not progression
+evidence. This is not permission to retag an active pair manually.
 
 ### SSM command and session access
 

@@ -73,7 +73,10 @@ def _approval_resources(profile: object, operation: str) -> dict[str, object]:
         "dataset_verification_sha256": "d" * 64,
         "environment_receipt_sha256": "e" * 64,
     }
-    if operation == "resume":
+    if operation == "resume" or (
+        operation == "evaluate"
+        and getattr(profile, "provider").endswith("-v3")
+    ):
         resources["checkpoint_receipt_sha256"] = "f" * 64
     if operation == "evaluate":
         resources["sealed_evaluation_sha256"] = "0" * 64
@@ -639,6 +642,8 @@ def _v3_submit_intent(tmp_path: Path) -> tuple[dict[str, object], str]:
     release = SimpleNamespace(
         provider=profile.provider,
         archive_sha256=manifest.release_sha256,
+        receipt_sha256="9" * 64,
+        members_sha256="a" * 64,
         source_commit=manifest.source_commit,
     )
     terminate_at = (
@@ -720,3 +725,51 @@ def test_v3_remote_intent_rejects_unpinned_executables_shells_and_scripts(
                 expected_sha256=hashlib.sha256(changed_payload).hexdigest(),
                 expected_control_bundle_sha256=control_bundle_sha256,
             )
+
+
+def test_v3_submit_rejects_every_recommitted_argv_edit(tmp_path: Path) -> None:
+    intent, control_bundle_sha256 = _v3_submit_intent(tmp_path)
+    python_argv = [
+        item
+        for step in intent["steps"]
+        if step["argv"][0] == "/usr/bin/python3"
+        for item in step["argv"]
+    ]
+    for required in (
+        "--release-receipt",
+        "--release-receipt-sha256",
+        "--code-commit",
+        "--release-members-sha256",
+        "--run-manifest-sha256",
+        "--bootstrap-receipt",
+        "--corpus-receipt",
+        "--run",
+        "--manifest",
+        "--profile",
+        "--repo-root",
+    ):
+        assert required in python_argv
+
+    for step_index, step in enumerate(intent["steps"]):
+        for argument_index, argument in enumerate(step["argv"]):
+            changed = copy.deepcopy(intent)
+            changed["steps"][step_index]["argv"][argument_index] = (
+                f"{argument}-recommitted-edit"
+            )
+            changed_payload = _recommit_intent(changed)
+            with pytest.raises(RemoteIntentError):
+                _validate_intent(
+                    changed_payload,
+                    expected_sha256=hashlib.sha256(changed_payload).hexdigest(),
+                    expected_control_bundle_sha256=control_bundle_sha256,
+                )
+
+    renamed = copy.deepcopy(intent)
+    renamed["steps"][0]["name"] += "-recommitted-edit"
+    renamed_payload = _recommit_intent(renamed)
+    with pytest.raises(RemoteIntentError):
+        _validate_intent(
+            renamed_payload,
+            expected_sha256=hashlib.sha256(renamed_payload).hexdigest(),
+            expected_control_bundle_sha256=control_bundle_sha256,
+        )
