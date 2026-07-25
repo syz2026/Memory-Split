@@ -147,6 +147,24 @@ def _stack_output(
     return value
 
 
+def _snapshot_stack_outputs(outputs: Mapping[str, str]) -> dict[str, str]:
+    if not isinstance(outputs, Mapping):
+        raise ValueError("stack outputs must be a mapping")
+    snapshot: dict[str, str] = {}
+    for key, value in outputs.items():
+        if (
+            not isinstance(key, str)
+            or not key
+            or not isinstance(value, str)
+            or not value
+        ):
+            raise ValueError(
+                "stack output names and values must be non-empty strings"
+            )
+        snapshot[key] = value
+    return snapshot
+
+
 def _record_dict(value: S3ObjectVersion) -> dict[str, object]:
     return {
         "bytes": value.bytes,
@@ -174,8 +192,7 @@ def _load_profile(path: Path) -> tuple[CorpusBuilderProfile, str]:
     return profile, hashlib.sha256(canonical).hexdigest()
 
 
-def _verify_inputs(
-    aws: AwsClients,
+def _validate_input_records(
     package: S3ObjectVersion,
     source_manifest: S3ObjectVersion,
 ) -> None:
@@ -186,11 +203,48 @@ def _verify_inputs(
         parsed = s3_object_version_from_dict(_record_dict(value))
         if parsed != value:
             raise ValueError(f"{label} authority changed during validation")
-        verify_exact_object(aws.s3, value)
     if _build_id(package) != _build_id(source_manifest):
         raise ValueError("package and source manifest build IDs differ")
     if package.kms_key_arn != source_manifest.kms_key_arn:
         raise ValueError("package and source manifest KMS keys differ")
+
+
+def _exact_package_revision(s3: object, package: S3ObjectVersion) -> str:
+    parsed = urlsplit(package.uri)
+    response = _mapping(
+        s3.head_object(
+            Bucket=parsed.netloc,
+            Key=parsed.path.removeprefix("/"),
+            VersionId=package.version_id,
+        ),
+        label="exact package metadata response",
+    )
+    metadata = _mapping(
+        response.get("Metadata"),
+        label="exact package metadata",
+    )
+    revision = metadata.get("revision")
+    if (
+        response.get("VersionId") != package.version_id
+        or metadata.get("sha256") != package.sha256
+        or not isinstance(revision, str)
+        or _OBJECT_ID_RE.fullmatch(revision) is None
+    ):
+        raise ValueError(
+            "exact package object does not bind its immutable revision"
+        )
+    return revision
+
+
+def _verify_inputs(
+    aws: AwsClients,
+    package: S3ObjectVersion,
+    source_manifest: S3ObjectVersion,
+) -> str:
+    _validate_input_records(package, source_manifest)
+    verify_exact_object(aws.s3, package)
+    verify_exact_object(aws.s3, source_manifest)
+    return _exact_package_revision(aws.s3, package)
 
 
 def _read_regular_file(path: Path, *, label: str, maximum: int) -> bytes:
@@ -275,7 +329,12 @@ def _safe_package_member(value: object) -> str:
     return value
 
 
-def _verify_software_gate(path: Path, package: S3ObjectVersion) -> None:
+def _verify_software_gate(
+    path: Path,
+    package: S3ObjectVersion,
+    *,
+    expected_revision: str | None = None,
+) -> str:
     payload = _read_regular_file(
         path,
         label="software gate receipt",
@@ -316,6 +375,10 @@ def _verify_software_gate(path: Path, package: S3ObjectVersion) -> None:
         or _OBJECT_ID_RE.fullmatch(revision) is None
     ):
         raise ValueError("software gate receipt revision is not immutable")
+    if expected_revision is not None and revision != expected_revision:
+        raise ValueError(
+            "software gate receipt revision does not match the exact package"
+        )
     archive = _mapping(receipt["archive"], label="software gate archive")
     if set(archive) != {"bytes", "path", "sha256"}:
         raise ValueError("software gate archive fields do not match package schema")
@@ -353,6 +416,7 @@ def _verify_software_gate(path: Path, package: S3ObjectVersion) -> None:
         raise ValueError(
             f"software gate package omits required production member: {missing[0]}"
         )
+    return revision
 
 
 def _verify_account_region(aws: AwsClients) -> None:
@@ -460,7 +524,7 @@ def _verify_offering(
 def _verify_availability(
     aws: AwsClients,
     outputs: Mapping[str, str],
-) -> Mapping[str, object]:
+) -> tuple[str, Mapping[str, object]]:
     subnet_id = _stack_output(outputs, "PrivateSubnetId", pattern=_SUBNET_RE)
     subnet = _one_mapping(
         aws.ec2.describe_subnets(SubnetIds=[subnet_id]),
@@ -485,7 +549,16 @@ def _verify_availability(
         location_type="availability-zone",
         location=availability_zone,
     )
-    return subnet
+    return subnet_id, subnet
+
+
+def _snapshot_and_verify_availability(
+    aws: AwsClients,
+    outputs: Mapping[str, str],
+) -> tuple[dict[str, str], str, Mapping[str, object]]:
+    snapshot = _snapshot_stack_outputs(outputs)
+    subnet_id, subnet = _verify_availability(aws, snapshot)
+    return snapshot, subnet_id, subnet
 
 
 def _verify_launch_template(
@@ -569,10 +642,10 @@ def _verify_private_network(
     aws: AwsClients,
     outputs: Mapping[str, str],
     *,
+    subnet_id: str,
     subnet: Mapping[str, object],
     launch_data: Mapping[str, object],
 ) -> str:
-    subnet_id = _stack_output(outputs, "PrivateSubnetId", pattern=_SUBNET_RE)
     security_group_id = _stack_output(
         outputs,
         "SecurityGroupId",
@@ -993,6 +1066,33 @@ def _run_gate(
     return result
 
 
+def validate_local_request(request: PreflightRequest) -> None:
+    """Validate every preflight authority that requires no AWS client."""
+
+    checks: list[str] = []
+    _run_gate(
+        checks,
+        PREFLIGHT_CHECKS[0],
+        lambda: _load_profile(request.profile_path),
+    )
+    _run_gate(
+        checks,
+        PREFLIGHT_CHECKS[1],
+        lambda: _validate_input_records(
+            request.package,
+            request.source_manifest,
+        ),
+    )
+    _run_gate(
+        checks,
+        PREFLIGHT_CHECKS[2],
+        lambda: _verify_software_gate(
+            request.software_gate_receipt,
+            request.package,
+        ),
+    )
+
+
 def _validate_now(now: datetime) -> None:
     if (
         not isinstance(now, datetime)
@@ -1019,7 +1119,7 @@ def run_preflight(
         PREFLIGHT_CHECKS[0],
         lambda: _load_profile(request.profile_path),
     )
-    _run_gate(
+    package_revision = _run_gate(
         checks,
         PREFLIGHT_CHECKS[1],
         lambda: _verify_inputs(
@@ -1034,6 +1134,7 @@ def run_preflight(
         lambda: _verify_software_gate(
             request.software_gate_receipt,
             request.package,
+            expected_revision=package_revision,
         ),
     )
     _run_gate(
@@ -1051,17 +1152,20 @@ def run_preflight(
             now=now,
         ),
     )
-    subnet = _run_gate(
+    stack_outputs, subnet_id, subnet = _run_gate(
         checks,
         PREFLIGHT_CHECKS[5],
-        lambda: _verify_availability(aws, request.stack_outputs),
+        lambda: _snapshot_and_verify_availability(
+            aws,
+            request.stack_outputs,
+        ),
     )
     template_id, template_version, launch_data = _run_gate(
         checks,
         PREFLIGHT_CHECKS[6],
         lambda: _verify_launch_template(
             aws,
-            request.stack_outputs,
+            stack_outputs,
             ami_id=request.ami_id,
             ami_root_device_name=ami_root_device_name,
             profile=profile,
@@ -1072,7 +1176,8 @@ def run_preflight(
         PREFLIGHT_CHECKS[7],
         lambda: _verify_private_network(
             aws,
-            request.stack_outputs,
+            stack_outputs,
+            subnet_id=subnet_id,
             subnet=subnet,
             launch_data=launch_data,
         ),
@@ -1082,7 +1187,7 @@ def run_preflight(
         PREFLIGHT_CHECKS[8],
         lambda: _verify_iam(
             aws,
-            request.stack_outputs,
+            stack_outputs,
             launch_data=launch_data,
         ),
     )
@@ -1091,7 +1196,7 @@ def run_preflight(
         PREFLIGHT_CHECKS[9],
         lambda: _verify_bucket_and_kms(
             aws,
-            request.stack_outputs,
+            stack_outputs,
             profile=profile,
             package=request.package,
             source_manifest=request.source_manifest,
@@ -1134,11 +1239,7 @@ def run_preflight(
         ami_owner_id=request.ami_owner_id,
         launch_template_id=template_id,
         launch_template_version=template_version,
-        subnet_id=_stack_output(
-            request.stack_outputs,
-            "PrivateSubnetId",
-            pattern=_SUBNET_RE,
-        ),
+        subnet_id=subnet_id,
         security_group_id=security_group_id,
         instance_profile_arn=instance_profile_arn,
         hourly_usd=hourly_usd,

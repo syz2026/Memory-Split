@@ -43,6 +43,7 @@ AMI_OWNER_ID = "137112412989"
 LAUNCH_TEMPLATE_ID = "lt-0123456789abcdef0"
 LAUNCH_TEMPLATE_VERSION = "7"
 SUBNET_ID = "subnet-0123456789abcdef0"
+OTHER_SUBNET_ID = "subnet-fedcba98765432100"
 SECURITY_GROUP_ID = "sg-0123456789abcdef0"
 VPC_ID = "vpc-0123456789abcdef0"
 INSTANCE_PROFILE_ARN = (
@@ -58,6 +59,7 @@ OTHER_KMS_ARN = (
     "key/fedcba98-7654-3210-fedc-ba9876543210"
 )
 BUILD_ID = "b" * 64
+PACKAGE_REVISION = "e" * 40
 
 EXPECTED_CHECKS = (
     "profile-canonical-sha256",
@@ -74,6 +76,18 @@ EXPECTED_CHECKS = (
     "maximum-compute-cost",
     "ec2-run-instances-dry-run",
 )
+
+
+@pytest.fixture(autouse=True)
+def _forbid_real_live_clients(monkeypatch):
+    def forbidden_live_clients(**_kwargs):
+        raise AssertionError("real boto3 clients are forbidden during tests")
+
+    monkeypatch.setattr(
+        aws_corpus_builder_preflight,
+        "_live_clients",
+        forbidden_live_clients,
+    )
 
 
 def _canonical_json(value: object) -> bytes:
@@ -132,6 +146,7 @@ def _software_gate_receipt(
     package: S3ObjectVersion,
     *,
     complete: bool = True,
+    revision: str = PACKAGE_REVISION,
 ) -> Path:
     rows = []
     for member in sorted(_REQUIRED_PACKAGE_PATHS):
@@ -156,7 +171,7 @@ def _software_gate_receipt(
                 },
                 "format": PACKAGE_FORMAT,
                 "members": rows,
-                "revision": "e" * 40,
+                "revision": revision,
                 "schema_version": 1,
             }
         )
@@ -308,6 +323,8 @@ class FakeEc2:
     def describe_security_groups(self, **kwargs: object) -> dict[str, object]:
         self.owner.calls.append("ec2.describe_security_groups")
         assert kwargs == {"GroupIds": [SECURITY_GROUP_ID]}
+        if self.owner.stack_outputs_to_mutate is not None:
+            self.owner.stack_outputs_to_mutate["PrivateSubnetId"] = OTHER_SUBNET_ID
         group = {
             "GroupId": SECURITY_GROUP_ID,
             "IpPermissions": [],
@@ -387,10 +404,13 @@ class FakeS3:
         digest = record.sha256
         if self.owner.source_drift and record == self.owner.source_manifest:
             digest = "f" * 64
+        metadata = {"sha256": digest}
+        if record == self.owner.package:
+            metadata["revision"] = self.owner.package_revision
         return {
             "ContentLength": record.bytes,
             "ETag": f'"{record.etag}"',
-            "Metadata": {"sha256": digest},
+            "Metadata": metadata,
             "SSEKMSKeyId": record.kms_key_arn,
             "ServerSideEncryption": record.sse_algorithm,
             "VersionId": record.version_id,
@@ -557,6 +577,7 @@ class FakeAws:
         self.calls: list[str] = []
         self.package = _package()
         self.source_manifest = _source_manifest()
+        self.package_revision = PACKAGE_REVISION
         self.account_id = ACCOUNT_ID
         self.image_overrides: dict[str, object] = {}
         self.subnet_overrides: dict[str, object] = {}
@@ -575,6 +596,7 @@ class FakeAws:
         self.kms_overrides: dict[str, object] = {}
         self.hourly_price = Decimal("5.491")
         self.dry_run_denied = False
+        self.stack_outputs_to_mutate: dict[str, str] | None = None
         self.sts = FakeSts(self)
         self.ec2 = FakeEc2(self)
         self.iam = FakeIam(self)
@@ -642,6 +664,7 @@ def test_preflight_emits_intent_only_after_every_read_only_gate_and_ec2_dry_run(
     assert fake.calls == [
         f"s3.head_object:{ARCHIVE_NAME}",
         "s3.head_object:source-manifest.json",
+        f"s3.head_object:{ARCHIVE_NAME}",
         "sts.get_caller_identity",
         "ec2.describe_images",
         "ec2.describe_subnets",
@@ -736,6 +759,36 @@ def test_preflight_fails_closed_without_launch_intent(
         run_preflight(request, aws=fake.clients(), now=NOW)
 
     assert emitted == []
+
+
+def test_preflight_rejects_manifest_forged_for_an_unrelated_revision(tmp_path):
+    fake = FakeAws()
+    request = replace(
+        _request(tmp_path, fake),
+        software_gate_receipt=_software_gate_receipt(
+            tmp_path / "forged-software-gate.json",
+            fake.package,
+            revision="f" * 40,
+        ),
+    )
+
+    with pytest.raises(PreflightError, match="production-software-gate.*revision"):
+        run_preflight(request, aws=fake.clients(), now=NOW)
+
+    assert fake.ec2.run_instances_calls == []
+
+
+def test_intent_uses_the_validated_stack_output_snapshot(tmp_path):
+    fake = FakeAws()
+    request = _request(tmp_path, fake)
+    outputs = request.stack_outputs
+    assert isinstance(outputs, dict)
+    fake.stack_outputs_to_mutate = outputs
+
+    result = run_preflight(request, aws=fake.clients(), now=NOW)
+
+    assert outputs["PrivateSubnetId"] == OTHER_SUBNET_ID
+    assert result.intent.subnet_id == SUBNET_ID
 
 
 @pytest.mark.parametrize(
@@ -935,6 +988,214 @@ def _write_object_record(path: Path, value: S3ObjectVersion) -> None:
             }
         )
     )
+
+
+def _cli_arguments(
+    tmp_path: Path,
+    fake: FakeAws,
+    request: PreflightRequest,
+    *,
+    live: bool = False,
+) -> tuple[list[str], Path, dict[str, Path]]:
+    package_path = tmp_path / "package-record.json"
+    source_path = tmp_path / "source-record.json"
+    outputs_path = tmp_path / "stack-outputs.json"
+    intent_path = tmp_path / "launch-intent.json"
+    _write_object_record(package_path, fake.package)
+    _write_object_record(source_path, fake.source_manifest)
+    outputs_path.write_bytes(_canonical_json(dict(request.stack_outputs)))
+    arguments = [
+        "--builder-profile",
+        str(PROFILE_PATH),
+        "--package-record",
+        str(package_path),
+        "--source-manifest-record",
+        str(source_path),
+        "--software-gate-receipt",
+        str(request.software_gate_receipt),
+        "--stack-outputs",
+        str(outputs_path),
+        "--ami-id",
+        AMI_ID,
+        "--ami-owner-id",
+        AMI_OWNER_ID,
+        "--intent",
+        str(intent_path),
+        "--profile",
+        "sbsandbox",
+        "--region",
+        REGION,
+    ]
+    if live:
+        arguments.append("--live")
+    return (
+        arguments,
+        intent_path,
+        {
+            "package": package_path,
+            "source": source_path,
+            "stack_outputs": outputs_path,
+        },
+    )
+
+
+@pytest.mark.parametrize(
+    "failure",
+    ("profile", "package-record", "software-gate"),
+)
+def test_explicit_live_clients_wait_for_every_purely_local_gate(
+    tmp_path,
+    monkeypatch,
+    failure,
+):
+    fake = FakeAws()
+    request = _request(tmp_path, fake)
+    arguments, intent_path, paths = _cli_arguments(
+        tmp_path,
+        fake,
+        request,
+        live=True,
+    )
+    if failure == "profile":
+        profile = tmp_path / "invalid-profile.json"
+        profile.write_bytes(PROFILE_PATH.read_bytes() + b" ")
+        arguments[arguments.index("--builder-profile") + 1] = str(profile)
+    elif failure == "package-record":
+        paths["package"].write_text("{}", encoding="utf-8")
+    elif failure == "software-gate":
+        _software_gate_receipt(
+            request.software_gate_receipt,
+            fake.package,
+            complete=False,
+        )
+    else:
+        raise AssertionError(failure)
+    constructed = []
+
+    def fake_live_clients(**kwargs):
+        constructed.append(kwargs)
+        return fake.clients()
+
+    monkeypatch.setattr(
+        aws_corpus_builder_preflight,
+        "_live_clients",
+        fake_live_clients,
+    )
+
+    with pytest.raises(PreflightError):
+        aws_corpus_builder_preflight.main(arguments, now=NOW)
+
+    assert constructed == []
+    assert not intent_path.exists()
+
+
+def test_cli_default_requires_injected_clients_without_constructing_live(
+    tmp_path,
+    monkeypatch,
+):
+    fake = FakeAws()
+    request = _request(tmp_path, fake)
+    arguments, intent_path, _paths = _cli_arguments(tmp_path, fake, request)
+    constructed = []
+
+    def fake_live_clients(**kwargs):
+        constructed.append(kwargs)
+        return fake.clients()
+
+    monkeypatch.setattr(
+        aws_corpus_builder_preflight,
+        "_live_clients",
+        fake_live_clients,
+    )
+
+    with pytest.raises(PreflightError, match="injected|--live"):
+        aws_corpus_builder_preflight.main(arguments, now=NOW)
+
+    assert constructed == []
+    assert not intent_path.exists()
+
+
+def test_cli_explicit_live_opt_in_uses_only_the_patched_client_factory(
+    tmp_path,
+    monkeypatch,
+):
+    fake = FakeAws()
+    request = _request(tmp_path, fake)
+    arguments, intent_path, _paths = _cli_arguments(
+        tmp_path,
+        fake,
+        request,
+        live=True,
+    )
+    constructed = []
+
+    def fake_live_clients(**kwargs):
+        constructed.append(kwargs)
+        return fake.clients()
+
+    monkeypatch.setattr(
+        aws_corpus_builder_preflight,
+        "_live_clients",
+        fake_live_clients,
+    )
+
+    assert aws_corpus_builder_preflight.main(arguments, now=NOW) == 0
+    assert constructed == [{"profile": "sbsandbox", "region": REGION}]
+    assert intent_path.is_file()
+
+
+def test_atomic_intent_stays_unpublished_until_temporary_is_fsynced(
+    tmp_path,
+    monkeypatch,
+):
+    intent_path = tmp_path / "launch-intent.json"
+    visible_during_fsync = []
+
+    def interrupt_fsync(_descriptor):
+        visible_during_fsync.append(intent_path.exists())
+        raise OSError("simulated interruption before publication")
+
+    monkeypatch.setattr(
+        aws_corpus_builder_preflight.os,
+        "fsync",
+        interrupt_fsync,
+    )
+
+    with pytest.raises(PreflightError, match="emit"):
+        aws_corpus_builder_preflight._write_intent(
+            intent_path,
+            b'{"complete":true}\n',
+        )
+
+    assert visible_during_fsync == [False]
+    assert not intent_path.exists()
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_interrupted_write_leaves_no_intent_or_temporary_file(
+    tmp_path,
+    monkeypatch,
+):
+    intent_path = tmp_path / "launch-intent.json"
+
+    def interrupt_after_partial_write(descriptor, payload):
+        aws_corpus_builder_preflight.os.write(descriptor, payload[:4])
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(
+        aws_corpus_builder_preflight,
+        "_write_all",
+        interrupt_after_partial_write,
+    )
+
+    with pytest.raises(KeyboardInterrupt):
+        aws_corpus_builder_preflight._write_intent(
+            intent_path,
+            b'{"complete":true}\n',
+        )
+
+    assert not intent_path.exists()
+    assert list(tmp_path.iterdir()) == []
 
 
 def test_preflight_cli_writes_canonical_owner_only_intent_and_prints_hash(

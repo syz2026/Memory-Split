@@ -7,6 +7,7 @@ import argparse
 import hashlib
 import json
 import os
+import secrets
 import stat
 import sys
 from collections.abc import Mapping, Sequence
@@ -27,6 +28,7 @@ from cluster.aws.corpus_builder.preflight import (  # noqa: E402
     PreflightError,
     PreflightRequest,
     run_preflight,
+    validate_local_request,
 )
 
 
@@ -110,53 +112,124 @@ def _write_all(descriptor: int, payload: bytes) -> None:
         written += count
 
 
+def _unlink_if_identity(
+    parent_descriptor: int,
+    name: str,
+    identity: tuple[int, int] | None,
+) -> None:
+    if identity is None:
+        return
+    try:
+        named = os.stat(
+            name,
+            dir_fd=parent_descriptor,
+            follow_symlinks=False,
+        )
+        if (named.st_dev, named.st_ino) == identity:
+            os.unlink(name, dir_fd=parent_descriptor)
+    except OSError:
+        pass
+
+
 def _write_intent(path: Path, payload: bytes) -> None:
     output = Path(os.path.abspath(os.fspath(path)))
     if output.name in {"", ".", ".."}:
         raise PreflightError("launch intent output must name a file")
     if output.parent.is_symlink() or not output.parent.is_dir():
         raise PreflightError("launch intent parent must be a real directory")
-    flags = (
+    parent_flags = (
+        os.O_RDONLY
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    temporary_flags = (
         os.O_WRONLY
         | os.O_CREAT
         | os.O_EXCL
         | getattr(os, "O_CLOEXEC", 0)
         | getattr(os, "O_NOFOLLOW", 0)
     )
+    parent_descriptor = -1
     descriptor = -1
-    created = False
-    created_identity: tuple[int, int] | None = None
+    temporary_name: str | None = None
+    temporary_identity: tuple[int, int] | None = None
+    published = False
     success = False
     try:
-        descriptor = os.open(output, flags, 0o600)
-        created = True
+        parent_descriptor = os.open(output.parent, parent_flags)
+        try:
+            os.stat(
+                output.name,
+                dir_fd=parent_descriptor,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            pass
+        else:
+            raise PreflightError("launch intent output already exists")
+        temporary_name = (
+            f".{output.name}.{os.getpid()}."
+            f"{secrets.token_hex(16)}.tmp"
+        )
+        descriptor = os.open(
+            temporary_name,
+            temporary_flags,
+            0o600,
+            dir_fd=parent_descriptor,
+        )
         opened = os.fstat(descriptor)
-        created_identity = (opened.st_dev, opened.st_ino)
+        temporary_identity = (opened.st_dev, opened.st_ino)
         _write_all(descriptor, payload)
         os.fchmod(descriptor, 0o600)
         os.fsync(descriptor)
         metadata = os.fstat(descriptor)
-        named = os.stat(output, follow_symlinks=False)
+        named = os.stat(
+            temporary_name,
+            dir_fd=parent_descriptor,
+            follow_symlinks=False,
+        )
         if (
             not stat.S_ISREG(metadata.st_mode)
             or not stat.S_ISREG(named.st_mode)
-            or (named.st_dev, named.st_ino) != created_identity
+            or (named.st_dev, named.st_ino) != temporary_identity
             or stat.S_IMODE(metadata.st_mode) != 0o600
             or metadata.st_size != len(payload)
         ):
             raise PreflightError("launch intent output authority drift")
-        os.close(descriptor)
+        descriptor_to_close = descriptor
         descriptor = -1
-        parent_fd = os.open(
-            output.parent,
-            os.O_RDONLY
-            | getattr(os, "O_DIRECTORY", 0)
-            | getattr(os, "O_CLOEXEC", 0),
-        )
+        os.close(descriptor_to_close)
         try:
-            os.fsync(parent_fd)
-        finally:
-            os.close(parent_fd)
+            os.stat(
+                output.name,
+                dir_fd=parent_descriptor,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            pass
+        else:
+            raise PreflightError("launch intent output already exists")
+        os.rename(
+            temporary_name,
+            output.name,
+            src_dir_fd=parent_descriptor,
+            dst_dir_fd=parent_descriptor,
+        )
+        published = True
+        final = os.stat(
+            output.name,
+            dir_fd=parent_descriptor,
+            follow_symlinks=False,
+        )
+        if (
+            not stat.S_ISREG(final.st_mode)
+            or (final.st_dev, final.st_ino) != temporary_identity
+            or stat.S_IMODE(final.st_mode) != 0o600
+            or final.st_size != len(payload)
+        ):
+            raise PreflightError("launch intent output authority drift")
+        os.fsync(parent_descriptor)
         success = True
     except PreflightError:
         raise
@@ -164,13 +237,22 @@ def _write_intent(path: Path, payload: bytes) -> None:
         raise PreflightError("cannot emit launch intent securely") from error
     finally:
         if descriptor >= 0:
-            os.close(descriptor)
-        if created and not success and created_identity is not None:
             try:
-                named = os.stat(output, follow_symlinks=False)
-                if (named.st_dev, named.st_ino) == created_identity:
-                    output.unlink()
-            except (FileNotFoundError, OSError):
+                os.close(descriptor)
+            except OSError:
+                pass
+        if parent_descriptor >= 0:
+            if not success:
+                cleanup_name = output.name if published else temporary_name
+                if cleanup_name is not None:
+                    _unlink_if_identity(
+                        parent_descriptor,
+                        cleanup_name,
+                        temporary_identity,
+                    )
+            try:
+                os.close(parent_descriptor)
+            except OSError:
                 pass
 
 
@@ -195,6 +277,11 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--intent", type=Path, required=True)
     parser.add_argument("--profile", choices=("sbsandbox",), default="sbsandbox")
     parser.add_argument("--region", choices=("us-east-1",), default="us-east-1")
+    parser.add_argument(
+        "--live",
+        action="store_true",
+        help="construct real read-only AWS clients after local validation",
+    )
     return parser
 
 
@@ -205,10 +292,6 @@ def main(
     now: datetime | None = None,
 ) -> int:
     arguments = _parser().parse_args(argv)
-    clients = aws or _live_clients(
-        profile=arguments.profile,
-        region=arguments.region,
-    )
     current_time = now or datetime.now(timezone.utc).replace(microsecond=0)
     request = PreflightRequest(
         profile_path=arguments.builder_profile,
@@ -225,6 +308,22 @@ def main(
         ami_id=arguments.ami_id,
         ami_owner_id=arguments.ami_owner_id,
     )
+    validate_local_request(request)
+    if aws is not None:
+        if arguments.live:
+            raise PreflightError(
+                "--live cannot be combined with injected AWS clients"
+            )
+        clients = aws
+    elif arguments.live:
+        clients = _live_clients(
+            profile=arguments.profile,
+            region=arguments.region,
+        )
+    else:
+        raise PreflightError(
+            "AWS clients must be injected unless --live is explicitly set"
+        )
     result = run_preflight(
         request,
         aws=clients,
