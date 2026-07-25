@@ -301,6 +301,10 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--stack-outputs", type=Path, required=True)
     parser.add_argument("--ami-id", required=True)
     parser.add_argument("--ami-owner-id", required=True)
+    parser.add_argument(
+        "--expected-bootstrap-user-data-sha256",
+        required=True,
+    )
     parser.add_argument("--intent", type=Path, required=True)
     parser.add_argument("--profile", choices=("sbsandbox",), default="sbsandbox")
     parser.add_argument("--region", choices=("us-east-1",), default="us-east-1")
@@ -334,6 +338,9 @@ def main(
         stack_outputs=_load_stack_outputs(arguments.stack_outputs),
         ami_id=arguments.ami_id,
         ami_owner_id=arguments.ami_owner_id,
+        expected_bootstrap_user_data_sha256=(
+            arguments.expected_bootstrap_user_data_sha256
+        ),
     )
     validate_local_request(request, now=current_time)
     if aws is not None:

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import base64
+import binascii
 import hashlib
 import json
 import os
@@ -41,6 +43,7 @@ PREFLIGHT_CHECKS = (
     "ami-identity",
     "instance-type-availability",
     "launch-template-version",
+    "bootstrap-user-data-sha256",
     "private-network-and-security-group",
     "instance-profile-and-builder-role",
     "bucket-and-kms",
@@ -94,6 +97,7 @@ class PreflightRequest:
     stack_outputs: Mapping[str, str]
     ami_id: str
     ami_owner_id: str
+    expected_bootstrap_user_data_sha256: str
 
 
 @dataclass(frozen=True)
@@ -645,6 +649,50 @@ def _verify_launch_template(
     return template_id, version, data
 
 
+def _reviewed_bootstrap_hash(value: object) -> str:
+    if not isinstance(value, str) or _SHA256_RE.fullmatch(value) is None:
+        raise ValueError(
+            "reviewed expected SHA-256 must be 64 lowercase hexadecimal characters"
+        )
+    return value
+
+
+def _verify_bootstrap_user_data(
+    outputs: Mapping[str, str],
+    *,
+    launch_data: Mapping[str, object],
+    expected_sha256: str,
+) -> None:
+    expected = _reviewed_bootstrap_hash(expected_sha256)
+    stack_sha256 = _stack_output(
+        outputs,
+        "BootstrapUserDataSha256",
+        pattern=_SHA256_RE,
+    )
+    if stack_sha256 != expected:
+        raise ValueError(
+            "BootstrapUserDataSha256 does not match the reviewed expected SHA-256"
+        )
+    encoded = launch_data.get("UserData")
+    if not isinstance(encoded, str) or not encoded:
+        raise ValueError("launch template UserData is missing")
+    try:
+        encoded_bytes = encoded.encode("ascii")
+        payload = base64.b64decode(encoded_bytes, validate=True)
+    except (UnicodeEncodeError, binascii.Error, ValueError) as error:
+        raise ValueError(
+            "launch template UserData is not strict base64"
+        ) from error
+    if not payload or base64.b64encode(payload) != encoded_bytes:
+        raise ValueError("launch template UserData is not canonical base64")
+    actual_sha256 = hashlib.sha256(payload).hexdigest()
+    if actual_sha256 != stack_sha256:
+        raise ValueError(
+            "launch template UserData SHA-256 does not match "
+            "BootstrapUserDataSha256"
+        )
+
+
 def _verify_private_network(
     aws: AwsClients,
     outputs: Mapping[str, str],
@@ -1103,6 +1151,13 @@ def validate_local_request(
             request.package,
         ),
     )
+    _run_gate(
+        checks,
+        PREFLIGHT_CHECKS[7],
+        lambda: _reviewed_bootstrap_hash(
+            request.expected_bootstrap_user_data_sha256
+        ),
+    )
 
 
 def _validate_now(now: datetime) -> None:
@@ -1183,9 +1238,18 @@ def run_preflight(
             profile=profile,
         ),
     )
-    security_group_id = _run_gate(
+    _run_gate(
         checks,
         PREFLIGHT_CHECKS[7],
+        lambda: _verify_bootstrap_user_data(
+            stack_outputs,
+            launch_data=launch_data,
+            expected_sha256=request.expected_bootstrap_user_data_sha256,
+        ),
+    )
+    security_group_id = _run_gate(
+        checks,
+        PREFLIGHT_CHECKS[8],
         lambda: _verify_private_network(
             aws,
             stack_outputs,
@@ -1196,7 +1260,7 @@ def run_preflight(
     )
     instance_profile_arn = _run_gate(
         checks,
-        PREFLIGHT_CHECKS[8],
+        PREFLIGHT_CHECKS[9],
         lambda: _verify_iam(
             aws,
             stack_outputs,
@@ -1205,7 +1269,7 @@ def run_preflight(
     )
     _run_gate(
         checks,
-        PREFLIGHT_CHECKS[9],
+        PREFLIGHT_CHECKS[10],
         lambda: _verify_bucket_and_kms(
             aws,
             stack_outputs,
@@ -1216,7 +1280,7 @@ def run_preflight(
     )
     hourly_usd = _run_gate(
         checks,
-        PREFLIGHT_CHECKS[10],
+        PREFLIGHT_CHECKS[11],
         lambda: _current_linux_price(
             aws,
             now=now,
@@ -1225,12 +1289,12 @@ def run_preflight(
     )
     max_compute_usd = _run_gate(
         checks,
-        PREFLIGHT_CHECKS[11],
+        PREFLIGHT_CHECKS[12],
         lambda: _maximum_compute_cost(hourly_usd, profile),
     )
     _run_gate(
         checks,
-        PREFLIGHT_CHECKS[12],
+        PREFLIGHT_CHECKS[13],
         lambda: _verify_dry_run(
             aws,
             template_id=template_id,
