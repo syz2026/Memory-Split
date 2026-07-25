@@ -107,7 +107,7 @@ def _builder_entrypoint_source(text: str) -> str:
     marker = "<<'BUILDER_ENTRYPOINT'\n"
     assert text.count(marker) == 1
     source = text.split(marker, 1)[1].split("\nBUILDER_ENTRYPOINT", 1)[0]
-    compile(source, "memorysplit-corpus-builder", "exec")
+    compile(source, "memorysplit-corpus-builder", "exec", dont_inherit=True)
     return source
 
 
@@ -301,6 +301,13 @@ def test_watchdog_initiates_shutdown_before_timed_out_marker_upload(
         root / "usr" / "local" / "sbin" / "memorysplit-corpus-watchdog"
     )
     assert watchdog.is_file(), completed.stderr
+    (root / "etc" / "memorysplit-corpus-build.env").write_text(
+        (
+            f"MEMORYSPLIT_BUILD_ID={_BUILD_ID}\n"
+            f"MEMORYSPLIT_KMS_KEY_ARN={_KMS_ARN}\n"
+        ),
+        encoding="utf-8",
+    )
     call_log.write_text("", encoding="utf-8")
 
     watchdog_result = subprocess.run(
@@ -364,7 +371,15 @@ def test_invariant_bootstrap_gzip_fits_ec2_user_data_limit():
 def test_fixed_entrypoint_resolves_one_immutable_version_before_download():
     source = _builder_entrypoint_source(render_bootstrap(fixture_config()))
     namespace: dict[str, object] = {"__name__": "memorysplit_entrypoint_test"}
-    exec(compile(source, "memorysplit-corpus-builder", "exec"), namespace)
+    exec(
+        compile(
+            source,
+            "memorysplit-corpus-builder",
+            "exec",
+            dont_inherit=True,
+        ),
+        namespace,
+    )
     calls: list[list[str]] = []
     sha256 = "a" * 64
 
@@ -413,7 +428,15 @@ def test_fixed_entrypoint_resolves_one_immutable_version_before_download():
 def test_fixed_entrypoint_rejects_ambiguous_object_version_history():
     source = _builder_entrypoint_source(render_bootstrap(fixture_config()))
     namespace: dict[str, object] = {"__name__": "memorysplit_entrypoint_test"}
-    exec(compile(source, "memorysplit-corpus-builder", "exec"), namespace)
+    exec(
+        compile(
+            source,
+            "memorysplit-corpus-builder",
+            "exec",
+            dont_inherit=True,
+        ),
+        namespace,
+    )
 
     def ambiguous_history(_arguments: list[str]) -> dict[str, object]:
         return {
@@ -536,30 +559,32 @@ def test_render_bootstrap_is_deterministic_cwd_independent_and_bash_syntax_valid
 
 def test_runtime_script_uses_strict_shell_and_allowlisted_driver_environment():
     text = BOOTSTRAP_SH.read_text(encoding="utf-8")
+    entrypoint = _builder_entrypoint_source(render_bootstrap(fixture_config()))
 
     assert "set -Eeuo pipefail" in text
     assert "umask 077" in text
-    assert "env -i" in text
     for name in (
-        "HOME=",
-        "LANG=",
-        "LC_ALL=",
-        "PATH=",
-        "PYTHONHASHSEED=",
-        "MEMORYSPLIT_BUILD_ID=",
-        "MEMORYSPLIT_SOURCE_MANIFEST=",
-        "MEMORYSPLIT_WORKERS=",
+        '"HOME":',
+        '"LANG":',
+        '"LC_ALL":',
+        '"PATH":',
+        '"PYTHONHASHSEED":',
+        '"MEMORYSPLIT_BUILD_ID":',
+        '"MEMORYSPLIT_SOURCE_MANIFEST":',
+        '"MEMORYSPLIT_WORKERS":',
     ):
-        assert name in text
-    assert "upload_phase_log" in text
+        assert name in entrypoint
+    assert "launch_intent" not in entrypoint.lower()
+    assert "finally:" in entrypoint
+    assert "_request_shutdown()" in entrypoint
     assert "trap " in text
 
 
 def test_runtime_script_rejects_unsafe_archive_members_before_final_extraction():
-    text = BOOTSTRAP_SH.read_text(encoding="utf-8")
+    entrypoint = _builder_entrypoint_source(render_bootstrap(fixture_config()))
 
-    assert "verify-package" in text
-    assert "unsafe package archive member" in text
-    assert "tar -xzf" in text
-    assert text.index("verify-package") < text.index("tar -xzf")
-    assert "/opt/memorysplit" in text
+    assert "unsafe package archive member" in entrypoint
+    assert "tarfile.open" in entrypoint
+    assert "extractall" not in entrypoint
+    assert entrypoint.index("_safe_extract(") < entrypoint.index("_run_driver(")
+    assert "/opt/memorysplit" in entrypoint

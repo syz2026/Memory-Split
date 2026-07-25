@@ -7,7 +7,6 @@ import hashlib
 import json
 import os
 import re
-import shlex
 import stat
 import subprocess
 import sys
@@ -122,53 +121,17 @@ def _validate_config(config: BootstrapConfig) -> BootstrapConfig:
     return config
 
 
-def _rendered_assignments(config: BootstrapConfig) -> str:
-    values: tuple[tuple[str, object], ...] = (
-        ("MEMORYSPLIT_BUILD_ID", config.build_id),
-        ("MEMORYSPLIT_PACKAGE_URI", config.package.uri),
-        ("MEMORYSPLIT_PACKAGE_VERSION_ID", config.package.version_id),
-        ("MEMORYSPLIT_PACKAGE_BYTES", config.package.bytes),
-        ("MEMORYSPLIT_PACKAGE_SHA256", config.package.sha256),
-        ("MEMORYSPLIT_PACKAGE_ETAG", config.package.etag),
-        ("MEMORYSPLIT_PACKAGE_SSE_ALGORITHM", config.package.sse_algorithm),
-        ("MEMORYSPLIT_PACKAGE_KMS_KEY_ARN", config.package.kms_key_arn),
-        ("MEMORYSPLIT_SOURCE_MANIFEST_URI", config.source_manifest.uri),
-        (
-            "MEMORYSPLIT_SOURCE_MANIFEST_VERSION_ID",
-            config.source_manifest.version_id,
-        ),
-        ("MEMORYSPLIT_SOURCE_MANIFEST_BYTES", config.source_manifest.bytes),
-        ("MEMORYSPLIT_SOURCE_MANIFEST_SHA256", config.source_manifest.sha256),
-        ("MEMORYSPLIT_SOURCE_MANIFEST_ETAG", config.source_manifest.etag),
-        (
-            "MEMORYSPLIT_SOURCE_MANIFEST_SSE_ALGORITHM",
-            config.source_manifest.sse_algorithm,
-        ),
-        (
-            "MEMORYSPLIT_SOURCE_MANIFEST_KMS_KEY_ARN",
-            config.source_manifest.kms_key_arn,
-        ),
-        ("MEMORYSPLIT_KMS_KEY_ARN", config.kms_key_arn),
-        ("MEMORYSPLIT_PROFILE_SHA256", config.profile_sha256),
-        ("MEMORYSPLIT_LAUNCH_INTENT_SHA256", config.launch_intent_sha256),
-        ("MEMORYSPLIT_WORKERS", config.workers),
-    )
-    names = " ".join(name for name, _value in values)
-    assignments = [
-        "# Generated from one approved BootstrapConfig; do not edit on-instance.",
-        *(
-            f"readonly {name}={shlex.quote(str(value))}"
-            for name, value in values
-        ),
-        f"export {names}",
-    ]
-    return "\n".join(assignments)
+def render_bootstrap(config: BootstrapConfig | None = None) -> str:
+    """Render deterministic, build-invariant launch-template user data.
 
+    ``config`` remains as a transition-only compatibility argument. Its values
+    are deliberately neither validated nor serialized; the canonical stack
+    integration calls this function with no argument. Per-build authority is
+    supplied later to the installed SSM entry point.
+    """
 
-def render_bootstrap(config: BootstrapConfig) -> str:
-    """Render deterministic launch-template user data for one approved build."""
-
-    config = _validate_config(config)
+    if config is not None and not isinstance(config, BootstrapConfig):
+        raise BootstrapError("config must be a BootstrapConfig or None")
     try:
         template = _SCRIPT_PATH.read_text(encoding="utf-8")
     except OSError as error:
@@ -179,7 +142,11 @@ def render_bootstrap(config: BootstrapConfig) -> str:
         or not template.endswith("\n")
     ):
         raise BootstrapError("bootstrap shell template has invalid framing")
-    return template.replace(_CONFIG_MARKER, _rendered_assignments(config), 1)
+    return template.replace(
+        _CONFIG_MARKER,
+        "# Build-invariant Task 6 bootstrap; per-build values arrive via SSM.",
+        1,
+    )
 
 
 def download_bootstrap_inputs(
