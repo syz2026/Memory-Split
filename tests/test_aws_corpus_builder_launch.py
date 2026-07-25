@@ -85,13 +85,8 @@ INTENT_SHA256 = hashlib.sha256(INTENT_BYTES).hexdigest()
 
 def _expected_tags() -> dict[str, str]:
     return {
-        "Name": "memorysplit-corpus-builder",
-        "memorysplit:hourly-usd": "5.491",
-        "memorysplit:launch-intent-sha256": INTENT_SHA256,
-        "memorysplit:max-compute-usd": "131.78",
-        "memorysplit:package-sha256": PACKAGE_SHA256,
-        "memorysplit:profile-sha256": PROFILE_SHA256,
-        "memorysplit:source-manifest-sha256": SOURCE_MANIFEST_SHA256,
+        "MemorySplitCorpusBuilder": "true",
+        "Name": f"memorysplit-corpus-builder-{INTENT_SHA256}",
     }
 
 
@@ -124,13 +119,7 @@ def _described_instance() -> dict[str, object]:
             "Id": "AIPAJUSTAFIXTURE",
         },
         "InstanceId": INSTANCE_ID,
-        "InstanceInitiatedShutdownBehavior": "terminate",
         "InstanceType": "i4i.16xlarge",
-        "LaunchTemplate": {
-            "LaunchTemplateId": LAUNCH_TEMPLATE_ID,
-            "LaunchTemplateName": "memorysplit-corpus-builder",
-            "Version": LAUNCH_TEMPLATE_VERSION,
-        },
         "MetadataOptions": {
             "HttpEndpoint": "enabled",
             "HttpTokens": "required",
@@ -206,6 +195,7 @@ class FakeEc2:
         self.price_calls: list[dict[str, object]] = []
         self.run_calls: list[dict[str, object]] = []
         self.describe_calls: list[dict[str, object]] = []
+        self.attribute_calls: list[dict[str, object]] = []
         self.terminate_calls: list[dict[str, object]] = []
         self.template_response: dict[str, object] = {
             "LaunchTemplateVersions": [
@@ -226,6 +216,10 @@ class FakeEc2:
         self.describe_responses: list[object] = [
             {"Reservations": [{"Instances": [_described_instance()]}]}
         ]
+        self.attribute_response: dict[str, object] = {
+            "InstanceId": INSTANCE_ID,
+            "InstanceInitiatedShutdownBehavior": {"Value": "terminate"},
+        }
         self.terminate_error: Exception | None = None
 
     def describe_launch_template_versions(
@@ -252,6 +246,13 @@ class FakeEc2:
             raise response
         assert isinstance(response, dict)
         return deepcopy(response)
+
+    def describe_instance_attribute(
+        self,
+        **kwargs: object,
+    ) -> dict[str, object]:
+        self.attribute_calls.append(dict(kwargs))
+        return deepcopy(self.attribute_response)
 
     def terminate_instances(self, **kwargs: object) -> dict[str, object]:
         self.terminate_calls.append(dict(kwargs))
@@ -319,6 +320,12 @@ def test_launch_requires_exact_unexpired_intent_hash_and_one_instance():
         }
     ]
     assert ec2.describe_calls == [{"InstanceIds": [INSTANCE_ID]}]
+    assert ec2.attribute_calls == [
+        {
+            "Attribute": "instanceInitiatedShutdownBehavior",
+            "InstanceId": INSTANCE_ID,
+        }
+    ]
     assert ec2.terminate_calls == []
 
 
@@ -352,15 +359,26 @@ def test_launch_rejects_unapproved_expired_or_noncanonical_intent(
     assert ec2.run_calls == []
 
 
-@pytest.mark.parametrize("failure", ("price-drift", "template-drift"))
+@pytest.mark.parametrize(
+    "failure",
+    ("price-drift", "template-drift", "template-public-ip-implicit"),
+)
 def test_launch_rechecks_price_and_template_immediately_before_launch(failure: str):
     ec2 = FakeEc2()
     if failure == "price-drift":
         ec2.price_response["PriceList"] = [_price_product("5.490")]
-    else:
+    elif failure == "template-drift":
         versions = ec2.template_response["LaunchTemplateVersions"]
         assert isinstance(versions, list)
         versions[0]["VersionNumber"] = 4
+    else:
+        versions = ec2.template_response["LaunchTemplateVersions"]
+        assert isinstance(versions, list)
+        data = versions[0]["LaunchTemplateData"]
+        assert isinstance(data, dict)
+        data.pop("NetworkInterfaces")
+        data["SecurityGroupIds"] = [SECURITY_GROUP_ID]
+        data["SubnetId"] = SUBNET_ID
 
     with pytest.raises(LaunchError):
         _launch(ec2)
@@ -388,6 +406,23 @@ def test_launch_terminates_all_returned_instances_if_run_instances_returns_two()
     ]
 
 
+def test_launch_rejects_a_malformed_second_run_instance_and_terminates_the_known_one():
+    ec2 = FakeEc2()
+    ec2.run_response = {
+        "Instances": [
+            {"InstanceId": INSTANCE_ID},
+            {"State": {"Name": "pending"}},
+        ]
+    }
+
+    with pytest.raises(LaunchError):
+        _launch(ec2)
+
+    assert ec2.describe_calls == []
+    assert ec2.attribute_calls == []
+    assert ec2.terminate_calls == [{"InstanceIds": [INSTANCE_ID]}]
+
+
 @pytest.mark.parametrize(
     "mismatch",
     (
@@ -400,7 +435,7 @@ def test_launch_terminates_all_returned_instances_if_run_instances_returns_two()
         "shutdown",
         "tags",
         "public-ip",
-        "launch-template",
+        "ipv6",
         "spot",
         "non-linux",
     ),
@@ -429,7 +464,9 @@ def test_post_launch_mismatch_terminates_then_raises(mismatch: str):
     elif mismatch == "imds":
         instance["MetadataOptions"]["HttpTokens"] = "optional"
     elif mismatch == "shutdown":
-        instance["InstanceInitiatedShutdownBehavior"] = "stop"
+        ec2.attribute_response["InstanceInitiatedShutdownBehavior"] = {
+            "Value": "stop"
+        }
     elif mismatch == "tags":
         instance["Tags"][0]["Value"] = "other"
     elif mismatch == "public-ip":
@@ -437,8 +474,10 @@ def test_post_launch_mismatch_terminates_then_raises(mismatch: str):
         instance["NetworkInterfaces"][0]["Association"] = {
             "PublicIp": "203.0.113.10"
         }
-    elif mismatch == "launch-template":
-        instance["LaunchTemplate"]["Version"] = "4"
+    elif mismatch == "ipv6":
+        instance["NetworkInterfaces"][0]["Ipv6Addresses"] = [
+            {"Ipv6Address": "2001:db8::10"}
+        ]
     elif mismatch == "spot":
         instance["InstanceLifecycle"] = "spot"
     else:
@@ -558,10 +597,16 @@ def test_cli_requires_explicit_hash_and_prints_lifecycle_and_cost(
     "extra",
     (
         ["--yes"],
+        ["--approve", INTENT_SHA256],
         ["--profile", "default"],
         ["--region", "us-west-2"],
     ),
-    ids=("generic-yes", "wrong-profile", "wrong-region"),
+    ids=(
+        "generic-yes",
+        "abbreviated-approval",
+        "wrong-profile",
+        "wrong-region",
+    ),
 )
 def test_cli_rejects_generic_or_wrong_approval_boundaries(
     tmp_path: Path,
