@@ -1,4 +1,4 @@
-Execution branch: integration/provider-aware-lifecycle
+Execution branch: feat/task-4e1-staged-executor
 Approved plan: /Users/stephenzhang/.cursor/plans/aws_n10_readiness_41a3c374.plan.md
 Corpus producer remains independent: do not modify corpusgen/
 Atomic Task 3C base: b7382e2, review clean
@@ -43,3 +43,8 @@ Task 4D durable cohort evaluation/report evidence collection: complete
   and fail-closed checks; recovery line archived unmerged
 selected evaluate stays blocked pending Task 4E; cleanup stays blocked
   even with ten per-seed collection states plus a cohort collection state
+Task 4E decomposition:
+  4E1 local staged 100-slot executor: in progress
+  4E2 S3 staging/report publication/evidence index: pending
+  4E3 selected evaluator lifecycle: pending
+  4F eleven-receipt-gated cleanup: pending
