@@ -117,7 +117,8 @@ The returned `checks` tuple is exactly:
    the AMI-bound root device.
 8. `bootstrap-user-data-sha256` — strictly decode the deployed launch-template
    `UserData`, hash its exact bytes, and require equality with both the
-   `BootstrapUserDataSha256` stack output and the reviewed expected SHA-256.
+   `BootstrapUserDataSha256` stack output and the frozen profile's
+   `bootstrap_user_data_sha256`.
 9. `private-network-and-security-group` — require a private subnet, one
    no-public-IP interface, only the output security group, matching VPC, and
    exactly zero ingress rules.
@@ -147,8 +148,8 @@ the EC2 dry run, have passed.
 - The CLI accepts exact package/source records and stack-output JSON, supports
   injected `AwsClients` and time for tests, and lazily creates boto3 clients
   only for an explicit live invocation.
-- The CLI requires `--expected-bootstrap-user-data-sha256`; the runbook must
-  supply the SHA-256 of the freshly rendered reviewed bootstrap bytes.
+- The CLI has no bootstrap-hash override. It rejects the removed
+  `--expected-bootstrap-user-data-sha256` flag.
 - The output is exclusively created, canonical, fsynced, mode `0600`, and its
   SHA-256 is printed. Failed gates and failed writes leave no emitted intent.
 - Every focused test uses fakes. No real AWS call was made during this task.
@@ -300,14 +301,13 @@ Implementation commit:
 `9411945342713dee8388eabcaa0ee46e911621b0`
 (`feat: verify launch template bootstrap integrity`)
 
-### Renderer choice
+### Superseded renderer choice
 
 `cluster/aws/corpus_builder/bootstrap.py` is not present in this worktree, so
-the preflight uses the approved expected-hash fallback. `PreflightRequest`
-requires `expected_bootstrap_user_data_sha256`, and the CLI requires
-`--expected-bootstrap-user-data-sha256`. The runbook must freshly render the
-reviewed bootstrap, hash the raw rendered bytes, and pass that lowercase
-SHA-256 value.
+commit `9411945` initially used a caller-supplied expected-hash fallback. Review
+showed that this was not independent authority because the same caller supplied
+the stack-output JSON. That fallback is removed by the Critical correction
+below.
 
 ### Bootstrap gate RED
 
@@ -348,12 +348,9 @@ with no output.
 - The existing exact launch-template lookup supplies deployed `UserData`.
   Preflight requires non-empty canonical base64, decodes it, and hashes the
   decoded bytes rather than the encoded representation.
-- Authorization is a three-way equality: deployed bytes SHA-256, immutable
-  `BootstrapUserDataSha256` stack output, and the independently supplied
-  reviewed expected SHA-256.
-- The expected hash is syntax-checked with the client-free inputs before any
-  live client can be constructed. Missing or malformed stack output fails at
-  gate 8, preserving ordered-gate semantics.
+- The review invalidated the original independence claim: its expected hash
+  and stack output were both invocation-controlled. The Critical correction
+  below replaces that input with a frozen profile contract.
 - Mismatch coverage confirms no intent serialization, private-network lookup,
   EC2 dry run, or launch can follow the bootstrap gate.
 - The launch intent already pins the exact launch-template ID and version, so
@@ -361,6 +358,85 @@ with no output.
   schema.
 - No real AWS client or network call was made.
 
-Operational prerequisite: until the renderer branch is integrated, the
-runbook is the independent authority that must render the reviewed payload and
-pass its exact raw-byte SHA-256 to preflight.
+The caller-supplied fallback described in this historical section is no longer
+accepted.
+
+## CRITICAL CONTRACT CHANGE: profile-pinned bootstrap digest
+
+All branches that consume the corpus-builder profile must pick up both
+`cluster/aws/corpus_builder/contracts.py` and
+`cluster/profiles/aws-i4i.16xlarge-corpus-v1.json`. The profile schema now
+requires `bootstrap_user_data_sha256`; taking only one file will fail canonical
+profile parsing.
+
+Fix commit:
+`32e4c81ca9422b312c418de78872bbb2d37cf140`
+(`fix: pin bootstrap digest in profile contract`)
+
+### Provisional integration value
+
+The following digest is deliberately provisional:
+
+```text
+4a666e5a093da098a8066aadd4b4ed368dc4571a8cde54e525bf2e387db06861
+```
+
+It is named `PROVISIONAL_BOOTSTRAP_USER_DATA_SHA256` in `contracts.py` and
+asserted literally by
+`test_profile_bootstrap_hash_is_loudly_provisional`. When the authoritative
+build-invariant payload lands, integration must update the contracts constant,
+the canonical profile JSON, and that test/fixture together. Changing only one
+fails loudly.
+
+### Pinned-authority RED
+
+```text
+python -m pytest -q tests/test_aws_corpus_builder_preflight.py \
+  -k 'request_cannot_override or profile_bootstrap_hash or profile_missing_or_malformed or alternate_profile or bootstrap_user_data_mismatch or bootstrap_stack_hash or cli_rejects_caller'
+```
+
+Observed RED: `8 failed, 53 deselected in 0.57s`. The failures proved that:
+
+1. `PreflightRequest` still accepted a caller hash;
+2. the profile had no bootstrap digest contract;
+3. missing, malformed, and alternate valid profile digests were not governed
+   by the new schema and pinned value;
+4. gate 8 errors still described caller/output consistency instead of profile
+   authority; and
+5. the CLI still accepted the override flag.
+
+### Pinned-authority GREEN
+
+```text
+python -m pytest -q tests/test_aws_corpus_builder_preflight.py
+python -m pytest -q tests/test_aws_corpus_builder_contracts.py
+python -m py_compile \
+  cluster/aws/corpus_builder/contracts.py \
+  cluster/aws/corpus_builder/preflight.py \
+  scripts/aws_corpus_builder_preflight.py
+git diff --check
+```
+
+Fresh results: `61 passed in 0.78s` for preflight and `46 passed in 0.04s` for
+contracts (`107 passed` total). Compilation and whitespace checks exited 0
+with no output.
+
+### Pinned-authority self-review
+
+- The canonical profile requires the new field, validates lowercase SHA-256
+  grammar, serializes it byte-for-byte, and pins it to the versioned
+  provisional constant.
+- Exact pinning in `contracts.py` prevents an alternate `--builder-profile`
+  path containing another syntactically valid digest from becoming authority.
+- Gate 8 receives the already validated `CorpusBuilderProfile`; both the
+  snapshotted `BootstrapUserDataSha256` output and decoded deployed user-data
+  bytes must equal `profile.bootstrap_user_data_sha256`.
+- `PreflightRequest` no longer has an expected-digest field, and the CLI
+  parser no longer defines an expected-digest flag. A regression asserts that
+  the old flag is rejected.
+- Missing or malformed profile fields fail in gate 1 before any AWS client
+  call. Stack or deployed-payload disagreement fails in gate 8 before network,
+  dry-run, or intent emission.
+- The frozen profile's canonical bytes, and therefore every resulting
+  `profile_sha256`, intentionally change with this contract addition.
+- No real AWS client or network call was made.
