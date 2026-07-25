@@ -212,3 +212,145 @@ request shapes (`GetProducts`, `DescribeLaunchTemplateVersions`,
 No code blocker remains. Operationally, `sbsandbox` must retain read access to
 the Pricing API for the mandatory last-moment price recheck; if it does not,
 the CLI fails closed before `RunInstances`.
+
+## Review fixes after `bf4a182`
+
+### Fix commits
+
+1. `bac63fe1505ea03bb5b72f0a2d7e3e4ee1528bc8` —
+   `test: expose corpus launch safety gaps`
+2. `148b05702449f2b3c7e8aa9f05fcd0fe2b4865d3` —
+   `fix: harden approved corpus launches`
+3. `b92780ee60262ec4c8e2ebe8cb50261be69aae49` —
+   `test: require confirmed launch cleanup`
+4. `5ea16902e9738474db9b34758229c659783da474` —
+   `fix: confirm failed launch termination`
+
+### Review-finding verification
+
+The reviewed implementation had no `ClientToken` or pre-launch tagged-instance
+lookup, reused the initial `now` value after the live rechecks, made one
+unconfirmed termination call, never checked STS identity or security-group
+ingress, synthesized `launch_time` from `now`, and accepted arbitrary
+`i-...` strings. Each finding reproduced against reviewed head `bf4a182`.
+
+### Replay, account, expiry, ingress, and instance-ID TDD
+
+RED after adding focused replay, deterministic token, final-clock, three-way
+account, pre/post ingress, and real instance-ID tests:
+
+```text
+8 failed, 29 passed in 0.88s
+```
+
+The strict instance-ID case independently failed with the old permissive
+validation:
+
+```text
+1 failed in 0.10s
+```
+
+GREEN after the defense-in-depth implementation:
+
+```text
+38 passed in 0.35s
+```
+
+The launch request now uses the approved 64-character SHA-256 as its EC2
+`ClientToken`. Before launch, `DescribeInstances` searches pending, running,
+stopping, and stopped instances for both `MemorySplitCorpusBuilder=true` and
+the existing `Name=memorysplit-corpus-builder-<intent-sha256>` tag. Encoding
+the hash in `Name` preserves the foundation controller role's two-key tag
+allowlist while closing the replay lookup.
+
+The controller now calls injected STS `GetCallerIdentity` and requires account
+`056956104102`; the intent's AMI owner and the account segment of its
+instance-profile ARN must match. The existing `LaunchIntent` fields were
+sufficient, so no contract change was required.
+
+### Confirmed cleanup and EC2 lifecycle-time TDD
+
+RED after adding transient termination, never-confirmed termination, and
+actual `LaunchTime` cases:
+
+```text
+3 failed in 0.11s
+```
+
+A malformed termination response also exposed an unhandled response-shape
+case:
+
+```text
+1 failed in 0.09s
+```
+
+GREEN evidence:
+
+```text
+3 passed in 0.06s
+1 passed in 0.03s
+41 passed in 0.07s
+```
+
+Termination is retried at most three times. Cleanup then polls each known
+instance ID up to 20 times until EC2 reports `shutting-down` or `terminated`;
+`InvalidInstanceID.NotFound` confirms that individual ID is gone. Failure to
+confirm raises an error containing every instance ID and this directly usable
+manual command:
+
+```text
+aws ec2 terminate-instances --profile sbsandbox --region us-east-1 --instance-ids <instance-id>
+```
+
+The success report now uses `DescribeInstances.LaunchTime`, and computes
+`terminate_at` exactly 24 hours from that EC2-reported timestamp.
+
+### Review-fix final verification
+
+```text
+$ python -m pytest -q tests/test_aws_corpus_builder_launch.py
+.........................................                                [100%]
+41 passed in 0.08s
+
+$ python -m pytest -q tests/test_aws_corpus_builder_contracts.py
+..............................................                           [100%]
+46 passed in 0.05s
+
+$ python -m py_compile cluster/aws/corpus_builder/launch.py scripts/aws_corpus_builder_launch.py
+# exit 0, no output
+
+$ git diff --check
+# exit 0, no output
+```
+
+Botocore parameter validation accepted all eight request shapes used by the
+controller, including the new `ClientToken`, `DescribeSecurityGroups`, and STS
+`GetCallerIdentity` calls. No AWS or network call was made.
+
+### Review-fix self-review
+
+- Repeated approvals are rejected when the intent-tagged instance is active;
+  concurrent pre-check races still converge on one EC2 request through the
+  deterministic `ClientToken`.
+- A fresh injected clock is read after account, template, price, ingress, and
+  replay rechecks and immediately before `RunInstances`.
+- Account identity, AMI-owner account, and instance-profile account all fail
+  closed unless they equal `056956104102`.
+- The security group must have exactly zero `IpPermissions` both before
+  launch and after the instance becomes describable; post-launch drift invokes
+  confirmed cleanup.
+- Instance IDs accept only AWS's 8- or 17-lowercase-hex forms.
+- Every known non-compliant instance is retried and polled until an accepted
+  shutdown state. Unconfirmed cleanup cannot return success and gives an
+  operator the exact recovery command.
+- The launch request still has no AMI, type, network, role, storage, or
+  user-data override. Its only new launch parameter is the idempotency token.
+- The CLI still rejects generic or abbreviated approval and remains fixed to
+  `sbsandbox` and `us-east-1`.
+
+### Review-fix concerns
+
+No contract change or code blocker remains. Deployment integration must ensure
+the controller role retains read-only `ec2:DescribeSecurityGroups`,
+`ec2:DescribeInstances`, launch-template, and Pricing permissions. STS
+`GetCallerIdentity` itself does not require an allow policy.
