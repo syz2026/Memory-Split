@@ -392,12 +392,16 @@ rule private_endpoint_inventory {
 
 rule launch_template_is_private_imdsv2_i4i {
   let launch_template_count = count(%launch_templates)
+  let builder_block_device_mapping_count = count(Resources.BuilderLaunchTemplate.Properties.LaunchTemplateData.BlockDeviceMappings[*])
   let builder_instance_tag_count = count(Resources.BuilderLaunchTemplate.Properties.LaunchTemplateData.TagSpecifications[ ResourceType == 'instance' ].Tags[ Key == 'MemorySplitCorpusBuilder' ])
+  let builder_network_interface_count = count(Resources.BuilderLaunchTemplate.Properties.LaunchTemplateData.NetworkInterfaces[*])
   let builder_volume_tag_count = count(Resources.BuilderLaunchTemplate.Properties.LaunchTemplateData.TagSpecifications[ ResourceType == 'volume' ].Tags[ Key == 'MemorySplitCorpusBuilder' ])
   let builder_user_data_part_count = count(Resources.BuilderLaunchTemplate.Properties.LaunchTemplateData.UserData[ keys == 'Fn::Join' ][1][*])
 
   %launch_template_count == 1
+  %builder_block_device_mapping_count == 1
   %builder_instance_tag_count == 1
+  %builder_network_interface_count == 1
   %builder_volume_tag_count == 1
   %builder_user_data_part_count == 6
   Resources.BuilderLaunchTemplate.Properties.LaunchTemplateData.InstanceType == 'i4i.16xlarge'
@@ -428,6 +432,13 @@ rule launch_template_is_private_imdsv2_i4i {
   Resources.BuilderLaunchTemplate.Properties.LaunchTemplateData.BlockDeviceMappings[*].Ebs.KmsKeyId[ keys == 'Fn::GetAtt' ] == ['DataKey', 'Arn']
   Resources.BuilderLaunchTemplate.Properties.LaunchTemplateData.TagSpecifications[ ResourceType == 'instance' ].Tags[ Key == 'MemorySplitCorpusBuilder' ].Value == 'true'
   Resources.BuilderLaunchTemplate.Properties.LaunchTemplateData.TagSpecifications[ ResourceType == 'volume' ].Tags[ Key == 'MemorySplitCorpusBuilder' ].Value == 'true'
+  Parameters.BootstrapUserDataSha256 {
+    Type == 'String'
+    AllowedPattern == '^[0-9a-f]{64}$'
+    Default !exists
+  }
+  Outputs.BootstrapUserDataSha256.Value.Ref == 'BootstrapUserDataSha256'
+  Outputs.BootstrapUserDataSha256.Export !exists
   Parameters.BuilderUserDataGzipBase64Part1 {
     Type == 'String'
     AllowedPattern == '^H4sI[A-Za-z0-9+/]*={0,2}$'

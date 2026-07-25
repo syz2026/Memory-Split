@@ -5,6 +5,14 @@ Description: >-
   public network path, or other paid compute capacity.
 
 Parameters:
+  BootstrapUserDataSha256:
+    Type: String
+    AllowedPattern: '^[0-9a-f]{64}$'
+    ConstraintDescription: >-
+      Must be the lowercase SHA-256 of the concatenated base64 payload.
+    Description: >-
+      SHA-256 of the exact concatenated Task 6 gzip/base64 user-data payload;
+      downstream preflight must verify it before launch.
   BuilderAmiId:
     Type: AWS::EC2::Image::Id
     Description: Immutable Amazon Linux 2023 AMI ID approved for the builder.
@@ -975,6 +983,12 @@ Outputs:
     Description: Retained versioned SSE-KMS corpus bucket name.
     Value:
       Ref: ArtifactBucket
+  BootstrapUserDataSha256:
+    Description: >-
+      Reviewed bootstrap user-data SHA-256 for downstream preflight
+      authorization.
+    Value:
+      Ref: BootstrapUserDataSha256
   BuilderInstanceProfileArn:
     Description: Corpus-builder instance profile ARN.
     Value:

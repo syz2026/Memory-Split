@@ -94,6 +94,7 @@ EXPECTED_RESOURCE_TYPES = {
 }
 EXPECTED_OUTPUTS = {
     "ArtifactBucketName",
+    "BootstrapUserDataSha256",
     "BuilderInstanceProfileArn",
     "BuilderRoleArn",
     "ControllerRoleArn",
@@ -223,6 +224,11 @@ USER_DATA_PARAMETER_NAMES = tuple(
     f"BuilderUserDataGzipBase64Part{index}" for index in range(1, 7)
 )
 USER_DATA_PARAMETER_MAX_LENGTHS = (4096, 4096, 4096, 4096, 4096, 1368)
+# SHA-256 of the ASCII base64 payload rendered by Task 6's fixture_config at
+# reviewed bootstrap commit 48835f7 (26,605 raw / 6,878 gzip / 9,172 base64).
+REVIEWED_TASK6_USER_DATA_SHA256 = (
+    "0381b939d78fb48b4ba6593ce3f5bc1472f22ed798f9cd79388f7030a40e80aa"
+)
 
 
 def test_foundation_files_exist_before_invariants_run() -> None:
@@ -342,6 +348,8 @@ def _assert_guard_selector_model(template: dict[str, object]) -> None:
             [{"Ref": name} for name in USER_DATA_PARAMETER_NAMES],
         ]
     }
+    assert len(data["NetworkInterfaces"]) == 1
+    assert len(data["BlockDeviceMappings"]) == 1
 
     def tag_count(resource_type: str) -> int:
         return sum(
@@ -443,6 +451,7 @@ def test_template_does_not_wrap_static_strings_in_fn_sub(template):
 
 def test_parameters_pin_account_region_and_operator_selected_inputs(template):
     assert set(template["Parameters"]) == {
+        "BootstrapUserDataSha256",
         "BudgetAlertEmail",
         "BuilderAmiId",
         "BuilderAvailabilityZone",
@@ -731,6 +740,34 @@ def test_launch_template_joins_task6_gzip_base64_chunks_without_reencoding(
     }
     assert "Fn::Base64" not in data["UserData"]
     assert data["InstanceInitiatedShutdownBehavior"] == "terminate"
+
+
+def test_reviewed_task6_payload_hash_fixture_is_required_and_exported(
+    template,
+):
+    parameter = template["Parameters"]["BootstrapUserDataSha256"]
+    assert parameter == {
+        "Type": "String",
+        "AllowedPattern": "^[0-9a-f]{64}$",
+        "ConstraintDescription": (
+            "Must be the lowercase SHA-256 of the concatenated base64 payload."
+        ),
+        "Description": (
+            "SHA-256 of the exact concatenated Task 6 gzip/base64 user-data "
+            "payload; downstream preflight must verify it before launch."
+        ),
+    }
+    assert re.fullmatch(
+        parameter["AllowedPattern"],
+        REVIEWED_TASK6_USER_DATA_SHA256,
+    )
+    assert template["Outputs"]["BootstrapUserDataSha256"] == {
+        "Description": (
+            "Reviewed bootstrap user-data SHA-256 for downstream preflight "
+            "authorization."
+        ),
+        "Value": {"Ref": "BootstrapUserDataSha256"},
+    }
 
 
 def test_launch_template_matches_frozen_builder_profile(template):
@@ -1209,7 +1246,9 @@ def test_cfn_guard_declares_non_vacuous_required_matches(template):
     guard = GUARD_PATH.read_text(encoding="utf-8")
     for count_name in (
         "builder_assume_role_statement_count",
+        "builder_block_device_mapping_count",
         "builder_instance_tag_count",
+        "builder_network_interface_count",
         "builder_volume_tag_count",
         "controller_assume_role_statement_count",
         "launch_template_count",
@@ -1251,6 +1290,8 @@ def test_cfn_guard_declares_non_vacuous_required_matches(template):
         "controller-policy-sid",
         "endpoint-policy-sid",
         "instance-builder-tag",
+        "launch-block-device-mappings",
+        "launch-network-interfaces",
         "launch-template-type",
         "launch-user-data",
         "ssm-command",
@@ -1310,6 +1351,14 @@ def test_guard_selector_model_rejects_missing_or_altered_targets(
             for tag in specification["Tags"]
             if tag["Key"] == "MemorySplitCorpusBuilder"
         )["Key"] = "WrongBuilderTag"
+    elif case == "launch-block-device-mappings":
+        del resources["BuilderLaunchTemplate"]["Properties"][
+            "LaunchTemplateData"
+        ]["BlockDeviceMappings"]
+    elif case == "launch-network-interfaces":
+        del resources["BuilderLaunchTemplate"]["Properties"][
+            "LaunchTemplateData"
+        ]["NetworkInterfaces"]
     elif case == "launch-template-type":
         resources["BuilderLaunchTemplate"]["Type"] = "AWS::EC2::Instance"
     elif case == "launch-user-data":
