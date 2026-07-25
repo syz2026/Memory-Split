@@ -61,6 +61,9 @@ let builder_assume_role_statements = Resources.BuilderRole.Properties.AssumeRole
 let controller_assume_role_statements = Resources.ControllerRole.Properties.AssumeRolePolicyDocument.Statement[*]
 let endpoint_policy_statements = Resources.S3Endpoint.Properties.PolicyDocument.Statement[*]
 let bucket_policy_statements = Resources.ArtifactBucketPolicy.Properties.PolicyDocument.Statement[*]
+let bucket_non_transport_statements = %bucket_policy_statements[
+  Sid != 'DenyInsecureTransport'
+]
 let data_key_policy_statements = Resources.DataKey.Properties.KeyPolicy.Statement[*]
 
 let builder_s3_statements = %builder_policy_statements[
@@ -228,7 +231,7 @@ rule exact_s3_statement_shape(statements, allowed_sids) {
 
 rule exact_resource_inventory {
   let all_resource_count = count(%all_resources)
-  %all_resource_count == 24
+  %all_resource_count == 25
 
   Resources.Vpc.Type == 'AWS::EC2::VPC'
   Resources.PrivateSubnet.Type == 'AWS::EC2::Subnet'
@@ -236,6 +239,7 @@ rule exact_resource_inventory {
   Resources.PrivateSubnetRouteTableAssociation.Type == 'AWS::EC2::SubnetRouteTableAssociation'
   Resources.BuilderSecurityGroup.Type == 'AWS::EC2::SecurityGroup'
   Resources.EndpointSecurityGroup.Type == 'AWS::EC2::SecurityGroup'
+  Resources.BuilderToEndpointHttpsIngress.Type == 'AWS::EC2::SecurityGroupIngress'
   Resources.DataKey.Type == 'AWS::KMS::Key'
   Resources.BuilderLogGroup.Type == 'AWS::Logs::LogGroup'
   Resources.ArtifactBucket.Type == 'AWS::S3::Bucket'
@@ -279,20 +283,67 @@ rule no_public_or_unreviewed_network_resources {
 rule private_single_az_network {
   let subnet_count = count(%subnets)
   let endpoint_count = count(%vpc_endpoints)
-  let endpoint_ingress_count = count(Resources.EndpointSecurityGroup.Properties.SecurityGroupIngress[*])
+  let builder_egress = Resources.BuilderSecurityGroup.Properties.SecurityGroupEgress[*]
+  let interface_endpoint_egress = %builder_egress[
+    DestinationSecurityGroupId exists
+  ]
+  let s3_gateway_egress = %builder_egress[
+    DestinationPrefixListId exists
+  ]
+  let builder_egress_count = count(%builder_egress)
+  let interface_endpoint_egress_count = count(%interface_endpoint_egress)
+  let s3_gateway_egress_count = count(%s3_gateway_egress)
+  let endpoint_egress_count = count(Resources.EndpointSecurityGroup.Properties.SecurityGroupEgress[*])
 
   %subnet_count == 1
   %endpoint_count == 8
-  %endpoint_ingress_count == 1
+  %builder_egress_count == 2
+  %interface_endpoint_egress_count == 1
+  %s3_gateway_egress_count == 1
+  %endpoint_egress_count == 1
   %subnets.Properties.MapPublicIpOnLaunch == false
   Resources.PrivateSubnet.Properties.AvailabilityZone.Ref == 'BuilderAvailabilityZone'
   Resources.BuilderSecurityGroup.Properties.SecurityGroupIngress empty
-  Resources.EndpointSecurityGroup.Properties.SecurityGroupIngress[*].FromPort == 443
-  Resources.EndpointSecurityGroup.Properties.SecurityGroupIngress[*].ToPort == 443
-  Resources.EndpointSecurityGroup.Properties.SecurityGroupIngress[*].IpProtocol == 'tcp'
-  Resources.EndpointSecurityGroup.Properties.SecurityGroupIngress[*].SourceSecurityGroupId[ keys == 'Fn::GetAtt' ] == ['BuilderSecurityGroup', 'GroupId']
-  Resources.EndpointSecurityGroup.Properties.SecurityGroupIngress[*].CidrIp !exists
-  Resources.EndpointSecurityGroup.Properties.SecurityGroupIngress[*].CidrIpv6 !exists
+  Resources.EndpointSecurityGroup.Properties.SecurityGroupIngress empty
+  Resources.EndpointSecurityGroup.Properties.SecurityGroupEgress[*] {
+    CidrIp == '127.0.0.1/32'
+    Description == 'No-op rule suppresses default allow-all egress'
+    IpProtocol == '-1'
+    CidrIpv6 !exists
+    DestinationPrefixListId !exists
+    DestinationSecurityGroupId !exists
+  }
+
+  %interface_endpoint_egress {
+    Description == 'HTTPS to the interface VPC endpoints'
+    DestinationSecurityGroupId[ keys == 'Fn::GetAtt' ] == ['EndpointSecurityGroup', 'GroupId']
+    FromPort == 443
+    ToPort == 443
+    IpProtocol == 'tcp'
+    CidrIp !exists
+    CidrIpv6 !exists
+  }
+  %s3_gateway_egress {
+    Description == 'HTTPS to the us-east-1 S3 gateway endpoint'
+    DestinationPrefixListId.Ref == 'S3GatewayPrefixListId'
+    FromPort == 443
+    ToPort == 443
+    IpProtocol == 'tcp'
+    CidrIp !exists
+    CidrIpv6 !exists
+  }
+  Resources.BuilderToEndpointHttpsIngress.Properties {
+    Description == 'HTTPS from the corpus builder security group'
+    FromPort == 443
+    ToPort == 443
+    IpProtocol == 'tcp'
+    GroupId[ keys == 'Fn::GetAtt' ] == ['EndpointSecurityGroup', 'GroupId']
+    SourceSecurityGroupId[ keys == 'Fn::GetAtt' ] == ['BuilderSecurityGroup', 'GroupId']
+    CidrIp !exists
+    CidrIpv6 !exists
+  }
+  Parameters.S3GatewayPrefixListId.Type == 'String'
+  Parameters.S3GatewayPrefixListId.AllowedPattern == '^pl-[0-9a-f]+$'
 }
 
 rule private_endpoint_inventory {
@@ -371,6 +422,10 @@ rule retained_encrypted_state {
   Resources.ArtifactBucket.UpdateReplacePolicy == 'Retain'
   Resources.ArtifactBucket.Properties.BucketName == 'memorysplit-corpus-056956104102-us-east-1'
   Resources.ArtifactBucket.Properties.VersioningConfiguration.Status == 'Enabled'
+  Resources.ArtifactBucket.Properties.ObjectLockEnabled == true
+  Resources.ArtifactBucket.Properties.ObjectLockConfiguration.ObjectLockEnabled == 'Enabled'
+  Resources.ArtifactBucket.Properties.ObjectLockConfiguration.Rule.DefaultRetention.Mode == 'GOVERNANCE'
+  Resources.ArtifactBucket.Properties.ObjectLockConfiguration.Rule.DefaultRetention.Days == 365
   Resources.ArtifactBucket.Properties.BucketEncryption.ServerSideEncryptionConfiguration[*].ServerSideEncryptionByDefault.SSEAlgorithm == 'aws:kms'
   Resources.ArtifactBucket.Properties.BucketEncryption.ServerSideEncryptionConfiguration[*].ServerSideEncryptionByDefault.KMSMasterKeyID[ keys == 'Fn::GetAtt' ] == ['DataKey', 'Arn']
   Resources.ArtifactBucket.Properties.PublicAccessBlockConfiguration.BlockPublicAcls == true
@@ -523,6 +578,9 @@ rule bucket_policy_is_transport_and_kms_deny_only {
   Resources.ArtifactBucketPolicy.Properties.PolicyDocument.Statement[ Sid == 'DenyInsecureTransport' ] {
     Effect == 'Deny'
     Principal == '*'
+    Action == 's3:*'
+    NotAction !exists
+    NotResource !exists
     Condition.Bool[ keys == 'aws:SecureTransport' ] == 'false'
   }
   Resources.ArtifactBucketPolicy.Properties.PolicyDocument.Statement[ Sid == 'DenyUnexpectedEncryptionAlgorithm' ] {
@@ -549,7 +607,7 @@ rule reject_unreviewed_policy_statements {
   policy_statement_basics(%builder_assume_role_statements)
   policy_statement_basics(%controller_assume_role_statements)
   policy_statement_basics(%endpoint_policy_statements)
-  policy_statement_basics(%bucket_policy_statements)
+  policy_statement_basics(%bucket_non_transport_statements)
 
   %controller_s3_statements empty
   %data_key_s3_statements empty

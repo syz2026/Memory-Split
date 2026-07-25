@@ -68,6 +68,7 @@ EXPECTED_RESOURCE_TYPES = {
     "BuilderLogGroup": "AWS::Logs::LogGroup",
     "BuilderRole": "AWS::IAM::Role",
     "BuilderSecurityGroup": "AWS::EC2::SecurityGroup",
+    "BuilderToEndpointHttpsIngress": "AWS::EC2::SecurityGroupIngress",
     "ControllerRole": "AWS::IAM::Role",
     "DataKey": "AWS::KMS::Key",
     "Ec2Endpoint": "AWS::EC2::VPCEndpoint",
@@ -257,6 +258,7 @@ def test_parameters_pin_account_region_and_operator_selected_inputs(template):
         "BuilderAmiId",
         "BuilderAvailabilityZone",
         "PrivateSubnetCidr",
+        "S3GatewayPrefixListId",
         "VpcCidr",
     }
     assert template["Parameters"]["BuilderAmiId"]["Type"] == (
@@ -268,6 +270,10 @@ def test_parameters_pin_account_region_and_operator_selected_inputs(template):
     for name in ("VpcCidr", "PrivateSubnetCidr"):
         parameter = template["Parameters"][name]
         assert re.fullmatch(parameter["AllowedPattern"], parameter["Default"])
+    prefix_list = template["Parameters"]["S3GatewayPrefixListId"]
+    assert prefix_list["Type"] == "String"
+    assert prefix_list["AllowedPattern"] == "^pl-[0-9a-f]+$"
+    assert "com.amazonaws.us-east-1.s3" in prefix_list["Description"]
 
     assertions = template["Rules"]["ApprovedAwsDeployment"]["Assertions"]
     assert assertions == [
@@ -337,20 +343,67 @@ def test_network_is_single_az_private_endpoint_only_and_zero_ingress(template):
 
     builder_group = resources["BuilderSecurityGroup"]["Properties"]
     assert builder_group["SecurityGroupIngress"] == []
-    endpoint_ingress = resources["EndpointSecurityGroup"]["Properties"][
-        "SecurityGroupIngress"
-    ]
-    assert endpoint_ingress == [
+    assert builder_group["SecurityGroupEgress"] == [
         {
-            "Description": "HTTPS from the zero-ingress builder security group",
+            "Description": "HTTPS to the interface VPC endpoints",
+            "DestinationSecurityGroupId": {
+                "Fn::GetAtt": ["EndpointSecurityGroup", "GroupId"]
+            },
             "FromPort": 443,
+            "IpProtocol": "tcp",
+            "ToPort": 443,
+        },
+        {
+            "Description": "HTTPS to the us-east-1 S3 gateway endpoint",
+            "DestinationPrefixListId": {"Ref": "S3GatewayPrefixListId"},
+            "FromPort": 443,
+            "IpProtocol": "tcp",
+            "ToPort": 443,
+        },
+    ]
+    endpoint_group = resources["EndpointSecurityGroup"]["Properties"]
+    assert endpoint_group["SecurityGroupIngress"] == []
+    assert endpoint_group["SecurityGroupEgress"] == [
+        {
+            "CidrIp": "127.0.0.1/32",
+            "Description": "No-op rule suppresses default allow-all egress",
+            "IpProtocol": "-1",
+        }
+    ]
+    assert resources["BuilderToEndpointHttpsIngress"] == {
+        "Type": "AWS::EC2::SecurityGroupIngress",
+        "Properties": {
+            "Description": "HTTPS from the corpus builder security group",
+            "FromPort": 443,
+            "GroupId": {
+                "Fn::GetAtt": ["EndpointSecurityGroup", "GroupId"]
+            },
             "IpProtocol": "tcp",
             "SourceSecurityGroupId": {
                 "Fn::GetAtt": ["BuilderSecurityGroup", "GroupId"]
             },
             "ToPort": 443,
-        }
-    ]
+        },
+    }
+
+    for resource in resources.values():
+        resource_type = resource["Type"]
+        properties = resource["Properties"]
+        if resource_type == "AWS::EC2::SecurityGroup":
+            rules = [
+                *properties["SecurityGroupIngress"],
+                *properties["SecurityGroupEgress"],
+            ]
+        elif resource_type in {
+            "AWS::EC2::SecurityGroupEgress",
+            "AWS::EC2::SecurityGroupIngress",
+        }:
+            rules = [properties]
+        else:
+            continue
+        for rule in rules:
+            assert isinstance(rule.get("Description"), str)
+            assert rule["Description"]
 
     endpoints = _resources(template, "AWS::EC2::VPCEndpoint")
     interface_services: set[str] = set()
@@ -502,6 +555,40 @@ def test_retained_state_is_named_versioned_and_kms_encrypted(template):
         "Fn::GetAtt": ["DataKey", "Arn"]
     }
     assert log_group["Properties"]["RetentionInDays"] == 365
+
+
+def test_claim_bearing_bucket_has_365_day_governance_object_lock(template):
+    properties = template["Resources"]["ArtifactBucket"]["Properties"]
+    assert properties["ObjectLockEnabled"] is True
+    assert properties["ObjectLockConfiguration"] == {
+        "ObjectLockEnabled": "Enabled",
+        "Rule": {
+            "DefaultRetention": {
+                "Days": 365,
+                "Mode": "GOVERNANCE",
+            }
+        },
+    }
+
+
+def test_bucket_policy_denies_every_s3_action_over_plaintext_http(template):
+    statements = {
+        statement["Sid"]: statement
+        for statement in template["Resources"]["ArtifactBucketPolicy"][
+            "Properties"
+        ]["PolicyDocument"]["Statement"]
+    }
+    assert statements["DenyInsecureTransport"] == {
+        "Sid": "DenyInsecureTransport",
+        "Effect": "Deny",
+        "Principal": "*",
+        "Action": "s3:*",
+        "Resource": [
+            {"Fn::GetAtt": ["ArtifactBucket", "Arn"]},
+            {"Fn::Sub": "${ArtifactBucket.Arn}/*"},
+        ],
+        "Condition": {"Bool": {"aws:SecureTransport": "false"}},
+    }
 
 
 def test_builder_role_has_only_approved_actions_and_ssm_managed_policy(template):
@@ -790,6 +877,12 @@ def test_cfn_guard_is_non_vacuous_and_requirements_pin_cfn_lint(template):
         "MemorySplitCorpusBuilder",
         "NotAction !exists",
         "NotResource !exists",
+        "ObjectLockConfiguration",
+        "GOVERNANCE",
+        "SecurityGroupEgress",
+        "DestinationPrefixListId",
+        "S3GatewayPrefixListId",
+        "Action == 's3:*'",
         "SecurityGroupIngress",
         "SYMMETRIC_DEFAULT",
         "count(%all_resources)",
@@ -808,6 +901,8 @@ def test_cfn_guard_is_non_vacuous_and_requirements_pin_cfn_lint(template):
         assert f"when %{logical_id}" not in guard
     for action in EXPECTED_BUILDER_ACTIONS:
         assert action in guard
+    assert "policy_statement_basics(%bucket_non_transport_statements)" in guard
+    assert "policy_statement_basics(%bucket_policy_statements)" not in guard
 
     assert DEV_REQUIREMENTS_PATH.is_file()
     requirements = [
