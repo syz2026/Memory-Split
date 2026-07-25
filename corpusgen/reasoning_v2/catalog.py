@@ -38,6 +38,12 @@ from corpusgen.reasoning_v2.source_lock import (
     SourceLock,
     verify_source_tree,
 )
+from corpusgen.reasoning_v2.wikidata_source import (
+    V2TrainingTriple,
+    WikidataDerivedView,
+    iter_distinct_training_edges,
+    iter_v2_training_triples,
+)
 
 
 _CATALOG_FORMAT = "memorysplit-reasoning-v2-input-catalog-v1"
@@ -187,6 +193,7 @@ class InputCatalog:
     records_path: Path
     index_path: Path
     source_lock_sha256: str
+    wikidata_view_sha256: str
     sha256: str
     record_count: int
     target_count: int
@@ -231,6 +238,146 @@ class TargetLengths(Protocol):
     def __iter__(self) -> Iterator[int]: ...
 
     def __getitem__(self, index: int) -> int: ...
+
+
+class WikidataGraphCatalogSource:
+    lane_id: LaneId = "wikidata_graph"
+    finite = False
+
+    __slots__ = (
+        "_archive_hashes",
+        "_source_lock_sha256",
+        "_training_edge_count",
+        "_training_rows",
+        "_view",
+        "_view_sha256",
+    )
+
+    def __init__(self, view: WikidataDerivedView) -> None:
+        if not isinstance(view, WikidataDerivedView):
+            raise TypeError("view must be a WikidataDerivedView")
+        distinct_edges = sum(1 for _triple in iter_distinct_training_edges(view))
+        if distinct_edges <= 0:
+            raise ValueError("Wikidata derived view has no distinct training edges")
+        receipt = view.receipt
+        self._view = view
+        self._view_sha256 = view.receipt_sha256
+        self._source_lock_sha256 = receipt.source_lock_sha256
+        self._archive_hashes = tuple(
+            (record.path, record.sha256) for record in receipt.archives
+        )
+        self._training_edge_count = distinct_edges
+        self._training_rows = receipt.training_rows
+
+    @property
+    def training_edge_count(self) -> int:
+        return self._training_edge_count
+
+    @property
+    def wikidata_view_sha256(self) -> str:
+        return self._view_sha256
+
+    @property
+    def wikidata_source_lock_sha256(self) -> str:
+        return self._source_lock_sha256
+
+    @staticmethod
+    def _training_edge_key(triple: V2TrainingTriple) -> str:
+        return f"Q{triple.subject}\t{triple.relation}\tQ{triple.object}"
+
+    def _archive_sha256(self, archive_path: str) -> str:
+        for path, sha256 in self._archive_hashes:
+            if path == archive_path:
+                return sha256
+        raise ValueError(f"Wikidata archive is absent from the view: {archive_path}")
+
+    def _draft(
+        self,
+        triple: V2TrainingTriple,
+        *,
+        phase: str,
+        phase_index: int,
+    ) -> CatalogDraft:
+        edge_key = self._training_edge_key(triple)
+        return CatalogDraft(
+            lane_id=self.lane_id,
+            source_id="wikidata5m",
+            source_key=(
+                f"wikidata_graph:{phase}:{phase_index:020d}:{edge_key}"
+            ),
+            source_byte_sha256=self._archive_sha256(triple.archive_path),
+            source_locator=(
+                ("member", triple.member),
+                ("path", triple.archive_path),
+                ("row", triple.row),
+                ("split", "train"),
+                ("training_edge_key", edge_key),
+                ("training_split", triple.training_split),
+                ("wikidata_view_sha256", self._view_sha256),
+            ),
+            semantic_flags=(
+                ("graph-training-edge",)
+                if phase == "edge"
+                else ("graph-revisit",)
+            ),
+            semantic_facts=(),
+        )
+
+    def iter_training_edge_keys(
+        self,
+        source_root: Path | None = None,
+    ) -> Iterator[str]:
+        del source_root
+        emitted = 0
+        for triple in iter_distinct_training_edges(self._view):
+            emitted += 1
+            yield self._training_edge_key(triple)
+        if emitted != self._training_edge_count:
+            raise ValueError("Wikidata distinct-edge count changed")
+
+    def iter_drafts(
+        self,
+        source_root: Path,
+        target_lengths: TargetLengths,
+    ) -> Iterator[CatalogDraft]:
+        del source_root
+        available_records = len(target_lengths)
+        if self._training_edge_count > available_records:
+            raise ValueError(
+                "Wikidata distinct edges exceed allocated records: "
+                f"distinct_edges={self._training_edge_count}, "
+                f"allocated_records={available_records}"
+            )
+
+        emitted = 0
+        for edge_index, triple in enumerate(
+            iter_distinct_training_edges(self._view)
+        ):
+            emitted += 1
+            yield self._draft(
+                triple,
+                phase="edge",
+                phase_index=edge_index,
+            )
+        if emitted != self._training_edge_count:
+            raise ValueError("Wikidata distinct-edge count changed")
+
+        revisit_index = 0
+        while emitted < available_records:
+            training_rows = 0
+            for triple in iter_v2_training_triples(self._view):
+                training_rows += 1
+                yield self._draft(
+                    triple,
+                    phase="revisit",
+                    phase_index=revisit_index,
+                )
+                emitted += 1
+                revisit_index += 1
+                if emitted == available_records:
+                    return
+            if training_rows != self._training_rows:
+                raise ValueError("Wikidata training-row count changed")
 
 
 @dataclass(frozen=True, slots=True)
@@ -645,13 +792,30 @@ def _validated_lane_sources(
         if not callable(getattr(source, "iter_drafts", None)):
             raise ValueError(f"lane source iterator is missing: {lane_id}")
         if lane_id == "wikidata_graph":
+            training_edge_count = getattr(source, "training_edge_count", None)
+            edge_iterator = getattr(source, "iter_training_edge_keys", None)
+            view_sha256 = getattr(source, "wikidata_view_sha256", None)
+            view_source_lock_sha256 = getattr(
+                source,
+                "wikidata_source_lock_sha256",
+                None,
+            )
             if (
-                type(getattr(source, "training_edge_count", None)) is not int
-                or getattr(source, "training_edge_count") <= 0
-                or not callable(getattr(source, "iter_training_edge_keys", None))
+                type(training_edge_count) is not int
+                or training_edge_count <= 0
+                or not callable(edge_iterator)
             ):
                 raise ValueError(
                     "Wikidata graph training-edge authority is required"
+                )
+            if (
+                type(view_sha256) is not str
+                or _SHA256_RE.fullmatch(view_sha256) is None
+                or type(view_source_lock_sha256) is not str
+                or _SHA256_RE.fullmatch(view_source_lock_sha256) is None
+            ):
+                raise ValueError(
+                    "Wikidata graph verified-view authority is required"
                 )
         result[lane_id] = cast(LaneCatalogSource, source)
     return result
@@ -1097,6 +1261,7 @@ def _read_regular_at(
 def _catalog_result(
     output_root: Path,
     source_lock_sha256: str,
+    wikidata_view_sha256: str,
     records_sha256: str,
     record_count: int,
     target_count: int,
@@ -1107,6 +1272,7 @@ def _catalog_result(
         records_path=output_root / "catalog.jsonl",
         index_path=output_root / "catalog-index.json",
         source_lock_sha256=source_lock_sha256,
+        wikidata_view_sha256=wikidata_view_sha256,
         sha256=records_sha256,
         record_count=record_count,
         target_count=target_count,
@@ -1123,6 +1289,7 @@ def _verify_exact_catalog_winner(
     expected_records_bytes: int,
     expected_records_sha256: str,
     source_lock_sha256: str,
+    wikidata_view_sha256: str,
     record_count: int,
     target_count: int,
     lanes: tuple[CatalogLaneIndex, ...],
@@ -1159,6 +1326,7 @@ def _verify_exact_catalog_winner(
         return _catalog_result(
             output_root,
             source_lock_sha256,
+            wikidata_view_sha256,
             expected_records_sha256,
             record_count,
             target_count,
@@ -1876,6 +2044,27 @@ def build_input_catalog(
         source_root,
         expected_generator_commit=expected_generator_commit,
     )
+    wikidata_source = sources["wikidata_graph"]
+    wikidata_view_sha256 = cast(
+        str,
+        getattr(wikidata_source, "wikidata_view_sha256"),
+    )
+    if (
+        getattr(wikidata_source, "wikidata_source_lock_sha256")
+        != source_lock.sha256
+    ):
+        raise ValueError("Wikidata derived view source-lock binding disagrees")
+    wikidata_records = len(lengths_by_lane["wikidata_graph"])
+    wikidata_distinct_edges = getattr(
+        wikidata_source,
+        "training_edge_count",
+    )
+    if wikidata_distinct_edges > wikidata_records:
+        raise ValueError(
+            "Wikidata distinct edges exceed allocated records: "
+            f"distinct_edges={wikidata_distinct_edges}, "
+            f"allocated_records={wikidata_records}"
+        )
     parent_fd = -1
     quarantine_fd = -1
     stage_fd = -1
@@ -1950,6 +2139,7 @@ def build_input_catalog(
                 "schema_version": 1,
                 "source_lock_sha256": source_lock.sha256,
                 "target_count": target_count,
+                "wikidata_view_sha256": wikidata_view_sha256,
             }
         )
         index_fd = _open_new_regular(stage_fd, "catalog-index.json")
@@ -2001,6 +2191,7 @@ def build_input_catalog(
                 expected_records_bytes=records_bytes,
                 expected_records_sha256=records_sha256,
                 source_lock_sha256=source_lock.sha256,
+                wikidata_view_sha256=wikidata_view_sha256,
                 record_count=record_count,
                 target_count=target_count,
                 lanes=lanes,
@@ -2022,6 +2213,7 @@ def build_input_catalog(
         return _catalog_result(
             output_root,
             source_lock.sha256,
+            wikidata_view_sha256,
             records_sha256,
             record_count,
             target_count,
@@ -2076,6 +2268,7 @@ __all__ = (
     "LaneCatalogSource",
     "LaneQuotaShortfall",
     "SemanticFactRow",
+    "WikidataGraphCatalogSource",
     "build_input_catalog",
     "catalog_record_id",
     "records_from_jsonl",

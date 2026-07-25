@@ -18,6 +18,7 @@ import pytest
 
 from corpusgen.parallel.canonical import canonical_json_bytes, sha256_hex
 from corpusgen.reasoning_v2 import catalog as catalog_module
+from corpusgen.reasoning_v2 import wikidata_source as wikidata_source_module
 from corpusgen.reasoning_v2.catalog import (
     CatalogDraft,
     CatalogRecord,
@@ -44,6 +45,11 @@ from reasoning_v2_fixtures import (
     fixed_contract_environment,
     fixture_source_lock,
     full_recipe,
+)
+from test_reasoning_v2_wikidata_source import (
+    EXPECTED_GENERATOR_COMMIT,
+    _base_archive_payloads,
+    _install_archive_authority,
 )
 
 
@@ -101,6 +107,18 @@ class FixtureLane:
         if self.lane_id != "wikidata_graph":
             raise AttributeError("only Wikidata graph has training-edge authority")
         return 3 if self.mutation == "authority_extra" else 2
+
+    @property
+    def wikidata_view_sha256(self) -> str:
+        if self.lane_id != "wikidata_graph":
+            raise AttributeError("only Wikidata graph has verified-view authority")
+        return "f" * 64
+
+    @property
+    def wikidata_source_lock_sha256(self) -> str:
+        if self.lane_id != "wikidata_graph":
+            raise AttributeError("only Wikidata graph has verified-view authority")
+        return self.lock.sha256
 
     def iter_training_edge_keys(self, source_root: Path) -> Iterator[str]:
         del source_root
@@ -316,6 +334,14 @@ class HighCardinalityWikidataLane:
     lane_id: LaneId = "wikidata_graph"
     finite: bool = True
 
+    @property
+    def wikidata_view_sha256(self) -> str:
+        return "f" * 64
+
+    @property
+    def wikidata_source_lock_sha256(self) -> str:
+        return self.lock.sha256
+
     def iter_training_edge_keys(self, source_root: Path) -> Iterator[str]:
         del source_root
         for index in range(self.training_edge_count):
@@ -460,6 +486,264 @@ def _quarantine_entries(parent: Path) -> tuple[Path, ...]:
     root = parent / _QUARANTINE_DIRECTORY
     assert root.is_dir()
     return tuple(sorted(root.iterdir(), key=lambda path: path.name))
+
+
+@pytest.fixture
+def production_wikidata_catalog_source(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    fixture_source_lock: FixtureSourceLock,
+):
+    authority = _install_archive_authority(
+        tmp_path,
+        monkeypatch,
+        fixture_source_lock,
+        _base_archive_payloads(),
+    )
+    lock = SourceLock.from_dict(
+        json.loads(authority.source_lock_path.read_bytes())
+    )
+    source_root = stage_source_lock(
+        lock,
+        authority.source_root,
+        tmp_path / "production-canonical",
+        expected_generator_commit=EXPECTED_GENERATOR_COMMIT,
+    )
+    view = wikidata_source_module.build_wikidata_derived_view(
+        authority.source_lock_path,
+        source_root,
+        tmp_path / "derived",
+        expected_generator_commit=EXPECTED_GENERATOR_COMMIT,
+    )
+    return SimpleNamespace(
+        authority=authority,
+        lock=lock,
+        source_root=source_root,
+        view=view,
+    )
+
+
+def _production_geometry(wikidata_records: int) -> BuildGeometry:
+    lane_quotas = tuple(
+        (
+            lane_id,
+            wikidata_records if lane_id == "wikidata_graph" else 1,
+        )
+        for lane_id in LANE_ORDER
+    )
+    return BuildGeometry(
+        profile="canary",
+        total_targets=sum(quota for _lane, quota in lane_quotas),
+        targets_per_update=1,
+        context_length=1,
+        shard_count=1,
+        allow_fewer_shards=True,
+        lane_quotas=lane_quotas,
+    )
+
+
+def _production_lane_sources(production_wikidata_catalog_source):
+    sources: dict[LaneId, object] = {
+        lane_id: FixtureLane(
+            lane_id=lane_id,
+            lock=production_wikidata_catalog_source.lock,
+        )
+        for lane_id in LANE_ORDER
+        if lane_id != "wikidata_graph"
+    }
+    sources["wikidata_graph"] = catalog_module.WikidataGraphCatalogSource(
+        production_wikidata_catalog_source.view
+    )
+    return sources
+
+
+def test_production_adapter_binds_view_archive_member_split_row_and_edge(
+    production_wikidata_catalog_source,
+):
+    verified_view = production_wikidata_catalog_source.view
+    caller_constructed = wikidata_source_module.WikidataDerivedView(
+        root=verified_view.root,
+        receipt_sha256=verified_view.receipt_sha256,
+        receipt=verified_view.receipt,
+    )
+    with pytest.raises(ValueError, match="verified"):
+        catalog_module.WikidataGraphCatalogSource(caller_constructed)
+
+    source = catalog_module.WikidataGraphCatalogSource(verified_view)
+    drafts = tuple(
+        source.iter_drafts(
+            production_wikidata_catalog_source.source_root,
+            (1, 1),
+        )
+    )
+    archive_hashes = {
+        record.path: record.sha256
+        for record in verified_view.receipt.archives
+    }
+    assert [
+        (
+            draft.source_byte_sha256,
+            draft.source_locator,
+        )
+        for draft in drafts
+    ] == [
+        (
+            archive_hashes["wikidata5m_inductive.tar.gz"],
+            (
+                ("member", "wikidata5m_inductive_train.txt"),
+                ("path", "wikidata5m_inductive.tar.gz"),
+                ("row", 1),
+                ("split", "train"),
+                ("training_edge_key", "Q1\tP1\tQ2"),
+                ("training_split", "inductive_train"),
+                ("wikidata_view_sha256", verified_view.receipt_sha256),
+            ),
+        ),
+        (
+            archive_hashes["wikidata5m_transductive.tar.gz"],
+            (
+                ("member", "wikidata5m_transductive_train.txt"),
+                ("path", "wikidata5m_transductive.tar.gz"),
+                ("row", 1),
+                ("split", "train"),
+                ("training_edge_key", "Q3\tP2\tQ4"),
+                ("training_split", "transductive_train"),
+                ("wikidata_view_sha256", verified_view.receipt_sha256),
+            ),
+        ),
+    ]
+
+
+def test_catalog_receipt_binds_verified_wikidata_view_sha256(
+    tmp_path: Path,
+    production_wikidata_catalog_source,
+):
+    catalog = build_input_catalog(
+        _production_geometry(3),
+        production_wikidata_catalog_source.lock,
+        production_wikidata_catalog_source.source_root,
+        _production_lane_sources(production_wikidata_catalog_source),
+        tmp_path / "catalog",
+        expected_generator_commit=EXPECTED_GENERATOR_COMMIT,
+    )
+    index = json.loads(catalog.to_bytes())
+
+    assert (
+        catalog.wikidata_view_sha256
+        == production_wikidata_catalog_source.view.receipt_sha256
+    )
+    assert (
+        index["wikidata_view_sha256"]
+        == production_wikidata_catalog_source.view.receipt_sha256
+    )
+
+
+def test_distinct_edges_appear_once_before_first_revisit(
+    production_wikidata_catalog_source,
+):
+    source = catalog_module.WikidataGraphCatalogSource(
+        production_wikidata_catalog_source.view
+    )
+    drafts = tuple(
+        source.iter_drafts(
+            production_wikidata_catalog_source.source_root,
+            (1, 1, 1, 1, 1),
+        )
+    )
+    first_revisit = next(
+        index
+        for index, draft in enumerate(drafts)
+        if "graph-revisit" in draft.semantic_flags
+    )
+    before_revisit = tuple(
+        dict(draft.source_locator)["training_edge_key"]
+        for draft in drafts[:first_revisit]
+    )
+
+    assert before_revisit == tuple(
+        source.iter_training_edge_keys(
+            production_wikidata_catalog_source.source_root
+        )
+    )
+    assert len(before_revisit) == source.training_edge_count
+    assert len(set(before_revisit)) == source.training_edge_count
+    assert all(
+        draft.semantic_flags == ("graph-training-edge",)
+        for draft in drafts[:first_revisit]
+    )
+    assert all(
+        draft.semantic_flags == ("graph-revisit",)
+        for draft in drafts[first_revisit:]
+    )
+
+
+def test_edge_count_above_available_records_fails_before_draft_output(
+    tmp_path: Path,
+    production_wikidata_catalog_source,
+):
+    sources = _production_lane_sources(production_wikidata_catalog_source)
+    output_root = tmp_path / "capacity-failure"
+
+    with pytest.raises(
+        ValueError,
+        match="Wikidata distinct edges exceed allocated records",
+    ):
+        build_input_catalog(
+            _production_geometry(1),
+            production_wikidata_catalog_source.lock,
+            production_wikidata_catalog_source.source_root,
+            sources,
+            output_root,
+            expected_generator_commit=EXPECTED_GENERATOR_COMMIT,
+        )
+
+    assert not output_root.exists()
+    assert all(
+        source.started == 0
+        for lane_id, source in sources.items()
+        if lane_id != "wikidata_graph"
+    )
+
+
+def test_end_to_end_catalog_is_byte_identical_across_rebuilds(
+    tmp_path: Path,
+    production_wikidata_catalog_source,
+):
+    second_view = wikidata_source_module.build_wikidata_derived_view(
+        production_wikidata_catalog_source.authority.source_lock_path,
+        production_wikidata_catalog_source.source_root,
+        tmp_path / "derived-second",
+        expected_generator_commit=EXPECTED_GENERATOR_COMMIT,
+    )
+    first_sources = _production_lane_sources(production_wikidata_catalog_source)
+    second_environment = SimpleNamespace(
+        lock=production_wikidata_catalog_source.lock,
+        source_root=production_wikidata_catalog_source.source_root,
+        view=second_view,
+    )
+    second_sources = _production_lane_sources(second_environment)
+    geometry = _production_geometry(5)
+
+    first = build_input_catalog(
+        geometry,
+        production_wikidata_catalog_source.lock,
+        production_wikidata_catalog_source.source_root,
+        first_sources,
+        tmp_path / "catalog-first",
+        expected_generator_commit=EXPECTED_GENERATOR_COMMIT,
+    )
+    second = build_input_catalog(
+        geometry,
+        production_wikidata_catalog_source.lock,
+        production_wikidata_catalog_source.source_root,
+        second_sources,
+        tmp_path / "catalog-second",
+        expected_generator_commit=EXPECTED_GENERATOR_COMMIT,
+    )
+
+    assert first.sha256 == second.sha256
+    assert first.to_bytes() == second.to_bytes()
+    assert first.records_path.read_bytes() == second.records_path.read_bytes()
 
 
 @pytest.mark.parametrize("forged_lock", [False, True])
