@@ -1,0 +1,842 @@
+# MemorySplit Task 5: static private, no-instance corpus-builder invariants.
+# Closed outputs and secret-like byte patterns are checked by pytest.
+
+let ec2_instances = Resources.*[ Type == 'AWS::EC2::Instance' ]
+let auto_scaling_groups = Resources.*[
+  Type == 'AWS::AutoScaling::AutoScalingGroup'
+]
+let ec2_fleets = Resources.*[ Type == 'AWS::EC2::EC2Fleet' ]
+let spot_fleets = Resources.*[ Type == 'AWS::EC2::SpotFleet' ]
+let capacity_reservations = Resources.*[
+  Type == 'AWS::EC2::CapacityReservation'
+]
+let capacity_reservation_fleets = Resources.*[
+  Type == 'AWS::EC2::CapacityReservationFleet'
+]
+
+let internet_gateways = Resources.*[ Type == 'AWS::EC2::InternetGateway' ]
+let nat_gateways = Resources.*[ Type == 'AWS::EC2::NatGateway' ]
+let elastic_ips = Resources.*[ Type == 'AWS::EC2::EIP' ]
+let gateway_attachments = Resources.*[
+  Type == 'AWS::EC2::VPCGatewayAttachment'
+]
+let public_routes = Resources.*[
+  Type == 'AWS::EC2::Route'
+  Properties.DestinationCidrBlock == '0.0.0.0/0'
+]
+let all_routes = Resources.*[ Type == 'AWS::EC2::Route' ]
+let key_pairs = Resources.*[ Type == 'AWS::EC2::KeyPair' ]
+let ecr_repositories = Resources.*[ Type == 'AWS::ECR::Repository' ]
+
+let all_resources = Resources.*
+let subnets = Resources.*[ Type == 'AWS::EC2::Subnet' ]
+let vpc_endpoints = Resources.*[ Type == 'AWS::EC2::VPCEndpoint' ]
+let launch_templates = Resources.*[ Type == 'AWS::EC2::LaunchTemplate' ]
+let iam_resources = Resources.*[ Type == /AWS::IAM::.*/ ]
+let iam_roles = Resources.*[ Type == 'AWS::IAM::Role' ]
+let iam_instance_profiles = Resources.*[
+  Type == 'AWS::IAM::InstanceProfile'
+]
+let iam_policy_resources = Resources.*[ Type == 'AWS::IAM::Policy' ]
+let iam_managed_policy_resources = Resources.*[
+  Type == 'AWS::IAM::ManagedPolicy'
+]
+let s3_bucket_policy_resources = Resources.*[
+  Type == 'AWS::S3::BucketPolicy'
+]
+let sns_topic_policy_resources = Resources.*[
+  Type == 'AWS::SNS::TopicPolicy'
+]
+let nested_property_structs = Resources.*.Properties.*[
+  this is_struct
+]
+let unexpected_nested_policy_containers = %nested_property_structs[
+  PolicyDocument exists
+]
+
+let builder_inline_policies = Resources.BuilderRole.Properties.Policies[*]
+let controller_inline_policies = Resources.ControllerRole.Properties.Policies[*]
+let builder_policy_statements = Resources.BuilderRole.Properties.Policies[*].PolicyDocument.Statement[*]
+let controller_policy_statements = Resources.ControllerRole.Properties.Policies[*].PolicyDocument.Statement[*]
+let builder_assume_role_statements = Resources.BuilderRole.Properties.AssumeRolePolicyDocument.Statement[*]
+let controller_assume_role_statements = Resources.ControllerRole.Properties.AssumeRolePolicyDocument.Statement[*]
+let endpoint_policy_statements = Resources.S3Endpoint.Properties.PolicyDocument.Statement[*]
+let bucket_policy_statements = Resources.ArtifactBucketPolicy.Properties.PolicyDocument.Statement[*]
+let bucket_non_transport_statements = %bucket_policy_statements[
+  Sid != 'DenyInsecureTransport'
+]
+let data_key_policy_statements = Resources.DataKey.Properties.KeyPolicy.Statement[*]
+
+let builder_s3_statements = %builder_policy_statements[
+  Action == /(?i)^s3:.*/ or
+  some Action[*] == /(?i)^s3:.*/
+]
+let endpoint_s3_statements = %endpoint_policy_statements[
+  Action == /(?i)^s3:.*/ or
+  some Action[*] == /(?i)^s3:.*/
+]
+let controller_s3_statements = %controller_policy_statements[
+  Action == /(?i)^s3:.*/ or
+  some Action[*] == /(?i)^s3:.*/
+]
+let data_key_s3_statements = %data_key_policy_statements[
+  Action == '*' or
+  Action == /(?i)^s3:.*/ or
+  some Action[*] == '*' or
+  some Action[*] == /(?i)^s3:.*/
+]
+let builder_assume_s3_statements = %builder_assume_role_statements[
+  Action == '*' or
+  Action == /(?i)^s3:.*/ or
+  some Action[*] == '*' or
+  some Action[*] == /(?i)^s3:.*/
+]
+let controller_assume_s3_statements = %controller_assume_role_statements[
+  Action == '*' or
+  Action == /(?i)^s3:.*/ or
+  some Action[*] == '*' or
+  some Action[*] == /(?i)^s3:.*/
+]
+
+let builder_s3_sids = [
+  'LocateCorpusBucket',
+  'ListCorpusNamespaces',
+  'ReadBuilderInputs',
+  'ReadWriteBuildArtifacts'
+]
+let endpoint_s3_sids = [
+  'CorpusBucketLocation',
+  'CorpusBucketListing',
+  'ReadBuilderInputs',
+  'ReadWriteBuildArtifacts'
+]
+let approved_s3_actions = [
+  's3:AbortMultipartUpload',
+  's3:GetBucketLocation',
+  's3:GetObject',
+  's3:GetObjectAttributes',
+  's3:GetObjectVersion',
+  's3:ListBucket',
+  's3:ListBucketVersions',
+  's3:ListMultipartUploadParts',
+  's3:PutObject'
+]
+let approved_s3_resources = [
+  '${ArtifactBucket.Arn}/v2/builds/*',
+  '${ArtifactBucket.Arn}/v2/packages/*',
+  '${ArtifactBucket.Arn}/v2/sources/*'
+]
+let approved_list_prefixes = [
+  'v2/builds',
+  'v2/builds/*',
+  'v2/packages',
+  'v2/packages/*',
+  'v2/sources',
+  'v2/sources/*'
+]
+let builder_allowed_actions = [
+  's3:GetBucketLocation',
+  's3:ListBucket',
+  's3:ListBucketVersions',
+  's3:GetObject',
+  's3:GetObjectAttributes',
+  's3:GetObjectVersion',
+  's3:PutObject',
+  's3:AbortMultipartUpload',
+  's3:ListMultipartUploadParts',
+  'kms:Decrypt',
+  'kms:DescribeKey',
+  'kms:Encrypt',
+  'kms:GenerateDataKey',
+  'logs:CreateLogStream',
+  'logs:PutLogEvents'
+]
+let controller_allowed_actions = [
+  'ec2:CreateTags',
+  'ec2:DescribeImages',
+  'ec2:DescribeInstanceAttribute',
+  'ec2:DescribeInstances',
+  'ec2:DescribeInstanceTypeOfferings',
+  'ec2:DescribeLaunchTemplateVersions',
+  'ec2:RunInstances',
+  'ec2:TerminateInstances',
+  'iam:PassRole',
+  'kms:CreateGrant',
+  'kms:Decrypt',
+  'kms:DescribeKey',
+  'kms:GenerateDataKeyWithoutPlaintext',
+  'kms:ReEncryptFrom',
+  'kms:ReEncryptTo',
+  's3:BypassGovernanceRetention',
+  's3:DeleteObjectVersion',
+  's3:ListBucketVersions',
+  'ssm:DescribeInstanceInformation',
+  'ssm:GetCommandInvocation',
+  'ssm:ListCommands',
+  'ssm:SendCommand',
+  'sts:GetCallerIdentity'
+]
+
+rule policy_statement_basics(statements) {
+  %statements {
+    NotAction !exists
+    NotResource !exists
+    Action is_string or Action is_list
+    when Action is_string {
+      Action != '*'
+      Action != /.*\*.*/
+    }
+    when Action is_list {
+      Action[*] is_string
+      Action[*] != '*'
+      Action[*] != /.*\*.*/
+    }
+  }
+}
+
+rule exact_action_allowlist(statements, allowed_actions) {
+  %statements {
+    when Action is_string {
+      Action IN %allowed_actions
+    }
+    when Action is_list {
+      Action[*] IN %allowed_actions
+    }
+  }
+}
+
+rule exact_s3_statement_shape(statements, allowed_sids) {
+  %statements {
+    Sid IN %allowed_sids
+    Action is_string or Action is_list
+    Resource is_struct or Resource is_list
+    when Action is_string {
+      Action IN %approved_s3_actions
+    }
+    when Action is_list {
+      Action[*] IN %approved_s3_actions
+    }
+    when Resource is_struct {
+      Resource[ keys == 'Fn::Sub' ] !empty or
+      Resource[ keys == 'Fn::GetAtt' ] !empty
+      Resource[ keys != /^(Fn::Sub|Fn::GetAtt)$/ ] empty
+      Resource[ keys == 'Fn::Sub' ] IN %approved_s3_resources
+      Resource[ keys == 'Fn::GetAtt' ] == ['ArtifactBucket', 'Arn']
+    }
+    when Resource is_list {
+      Resource[*] is_struct
+      Resource[*][ keys != /^(Fn::Sub|Fn::GetAtt)$/ ] empty
+      Resource[*][ keys == 'Fn::Sub' ] IN %approved_s3_resources
+      Resource[*][ keys == 'Fn::GetAtt' ] == ['ArtifactBucket', 'Arn']
+    }
+  }
+}
+
+rule exact_resource_inventory {
+  let all_resource_count = count(%all_resources)
+  %all_resource_count == 25
+
+  Resources.Vpc.Type == 'AWS::EC2::VPC'
+  Resources.PrivateSubnet.Type == 'AWS::EC2::Subnet'
+  Resources.PrivateRouteTable.Type == 'AWS::EC2::RouteTable'
+  Resources.PrivateSubnetRouteTableAssociation.Type == 'AWS::EC2::SubnetRouteTableAssociation'
+  Resources.BuilderSecurityGroup.Type == 'AWS::EC2::SecurityGroup'
+  Resources.EndpointSecurityGroup.Type == 'AWS::EC2::SecurityGroup'
+  Resources.BuilderToEndpointHttpsIngress.Type == 'AWS::EC2::SecurityGroupIngress'
+  Resources.DataKey.Type == 'AWS::KMS::Key'
+  Resources.BuilderLogGroup.Type == 'AWS::Logs::LogGroup'
+  Resources.ArtifactBucket.Type == 'AWS::S3::Bucket'
+  Resources.ArtifactBucketPolicy.Type == 'AWS::S3::BucketPolicy'
+  Resources.BuilderRole.Type == 'AWS::IAM::Role'
+  Resources.ControllerRole.Type == 'AWS::IAM::Role'
+  Resources.BuilderInstanceProfile.Type == 'AWS::IAM::InstanceProfile'
+  Resources.BuilderCommandDocument.Type == 'AWS::SSM::Document'
+  Resources.BuilderLaunchTemplate.Type == 'AWS::EC2::LaunchTemplate'
+  Resources.S3Endpoint.Type == 'AWS::EC2::VPCEndpoint'
+  Resources.Ec2Endpoint.Type == 'AWS::EC2::VPCEndpoint'
+  Resources.Ec2MessagesEndpoint.Type == 'AWS::EC2::VPCEndpoint'
+  Resources.KmsEndpoint.Type == 'AWS::EC2::VPCEndpoint'
+  Resources.LogsEndpoint.Type == 'AWS::EC2::VPCEndpoint'
+  Resources.SsmEndpoint.Type == 'AWS::EC2::VPCEndpoint'
+  Resources.SsmMessagesEndpoint.Type == 'AWS::EC2::VPCEndpoint'
+  Resources.StsEndpoint.Type == 'AWS::EC2::VPCEndpoint'
+  Resources.MonthlyBudget.Type == 'AWS::Budgets::Budget'
+}
+
+rule no_paid_capacity_resources {
+  %ec2_instances empty
+  %auto_scaling_groups empty
+  %ec2_fleets empty
+  %spot_fleets empty
+  %capacity_reservations empty
+  %capacity_reservation_fleets empty
+}
+
+rule no_public_or_unreviewed_network_resources {
+  %internet_gateways empty
+  %nat_gateways empty
+  %elastic_ips empty
+  %gateway_attachments empty
+  %public_routes empty
+  %all_routes empty
+  %key_pairs empty
+  %ecr_repositories empty
+}
+
+rule private_single_az_network {
+  let subnet_count = count(%subnets)
+  let endpoint_count = count(%vpc_endpoints)
+  let builder_egress = Resources.BuilderSecurityGroup.Properties.SecurityGroupEgress[*]
+  let interface_endpoint_egress = %builder_egress[
+    DestinationSecurityGroupId exists
+  ]
+  let s3_gateway_egress = %builder_egress[
+    DestinationPrefixListId exists
+  ]
+  let builder_egress_count = count(%builder_egress)
+  let interface_endpoint_egress_count = count(%interface_endpoint_egress)
+  let s3_gateway_egress_count = count(%s3_gateway_egress)
+  let endpoint_egress_count = count(Resources.EndpointSecurityGroup.Properties.SecurityGroupEgress[*])
+
+  %subnet_count == 1
+  %endpoint_count == 8
+  %builder_egress_count == 2
+  %interface_endpoint_egress_count == 1
+  %s3_gateway_egress_count == 1
+  %endpoint_egress_count == 1
+  %subnets.Properties.MapPublicIpOnLaunch == false
+  Resources.PrivateSubnet.Properties.AvailabilityZone.Ref == 'BuilderAvailabilityZone'
+  Resources.BuilderSecurityGroup.Properties.SecurityGroupIngress empty
+  Resources.EndpointSecurityGroup.Properties.SecurityGroupIngress empty
+  Resources.EndpointSecurityGroup.Properties.SecurityGroupEgress[*] {
+    CidrIp == '127.0.0.1/32'
+    Description == 'No-op rule suppresses default allow-all egress'
+    IpProtocol == '-1'
+    CidrIpv6 !exists
+    DestinationPrefixListId !exists
+    DestinationSecurityGroupId !exists
+  }
+
+  %interface_endpoint_egress {
+    Description == 'HTTPS to the interface VPC endpoints'
+    DestinationSecurityGroupId[ keys == 'Fn::GetAtt' ] == ['EndpointSecurityGroup', 'GroupId']
+    FromPort == 443
+    ToPort == 443
+    IpProtocol == 'tcp'
+    CidrIp !exists
+    CidrIpv6 !exists
+  }
+  %s3_gateway_egress {
+    Description == 'HTTPS to the us-east-1 S3 gateway endpoint'
+    DestinationPrefixListId.Ref == 'S3GatewayPrefixListId'
+    FromPort == 443
+    ToPort == 443
+    IpProtocol == 'tcp'
+    CidrIp !exists
+    CidrIpv6 !exists
+  }
+  Resources.BuilderToEndpointHttpsIngress.Properties {
+    Description == 'HTTPS from the corpus builder security group'
+    FromPort == 443
+    ToPort == 443
+    IpProtocol == 'tcp'
+    GroupId[ keys == 'Fn::GetAtt' ] == ['EndpointSecurityGroup', 'GroupId']
+    SourceSecurityGroupId[ keys == 'Fn::GetAtt' ] == ['BuilderSecurityGroup', 'GroupId']
+    CidrIp !exists
+    CidrIpv6 !exists
+  }
+  Parameters.S3GatewayPrefixListId.Type == 'String'
+  Parameters.S3GatewayPrefixListId.AllowedPattern == '^pl-[0-9a-f]+$'
+}
+
+rule private_endpoint_inventory {
+  Resources.S3Endpoint.Properties.VpcEndpointType == 'Gateway'
+  Resources.S3Endpoint.Properties.RouteTableIds[*].Ref == 'PrivateRouteTable'
+  Resources.S3Endpoint.Properties.ServiceName[ keys == 'Fn::Sub' ] == 'com.amazonaws.${AWS::Region}.s3'
+
+  Resources.Ec2Endpoint.Properties.VpcEndpointType == 'Interface'
+  Resources.Ec2Endpoint.Properties.PrivateDnsEnabled == true
+  Resources.Ec2Endpoint.Properties.ServiceName[ keys == 'Fn::Sub' ] == 'com.amazonaws.${AWS::Region}.ec2'
+  Resources.Ec2Endpoint.Properties.SubnetIds[*].Ref == 'PrivateSubnet'
+
+  Resources.Ec2MessagesEndpoint.Properties.VpcEndpointType == 'Interface'
+  Resources.Ec2MessagesEndpoint.Properties.PrivateDnsEnabled == true
+  Resources.Ec2MessagesEndpoint.Properties.ServiceName[ keys == 'Fn::Sub' ] == 'com.amazonaws.${AWS::Region}.ec2messages'
+  Resources.Ec2MessagesEndpoint.Properties.SubnetIds[*].Ref == 'PrivateSubnet'
+
+  Resources.KmsEndpoint.Properties.VpcEndpointType == 'Interface'
+  Resources.KmsEndpoint.Properties.PrivateDnsEnabled == true
+  Resources.KmsEndpoint.Properties.ServiceName[ keys == 'Fn::Sub' ] == 'com.amazonaws.${AWS::Region}.kms'
+  Resources.KmsEndpoint.Properties.SubnetIds[*].Ref == 'PrivateSubnet'
+
+  Resources.LogsEndpoint.Properties.VpcEndpointType == 'Interface'
+  Resources.LogsEndpoint.Properties.PrivateDnsEnabled == true
+  Resources.LogsEndpoint.Properties.ServiceName[ keys == 'Fn::Sub' ] == 'com.amazonaws.${AWS::Region}.logs'
+  Resources.LogsEndpoint.Properties.SubnetIds[*].Ref == 'PrivateSubnet'
+
+  Resources.SsmEndpoint.Properties.VpcEndpointType == 'Interface'
+  Resources.SsmEndpoint.Properties.PrivateDnsEnabled == true
+  Resources.SsmEndpoint.Properties.ServiceName[ keys == 'Fn::Sub' ] == 'com.amazonaws.${AWS::Region}.ssm'
+  Resources.SsmEndpoint.Properties.SubnetIds[*].Ref == 'PrivateSubnet'
+
+  Resources.SsmMessagesEndpoint.Properties.VpcEndpointType == 'Interface'
+  Resources.SsmMessagesEndpoint.Properties.PrivateDnsEnabled == true
+  Resources.SsmMessagesEndpoint.Properties.ServiceName[ keys == 'Fn::Sub' ] == 'com.amazonaws.${AWS::Region}.ssmmessages'
+  Resources.SsmMessagesEndpoint.Properties.SubnetIds[*].Ref == 'PrivateSubnet'
+
+  Resources.StsEndpoint.Properties.VpcEndpointType == 'Interface'
+  Resources.StsEndpoint.Properties.PrivateDnsEnabled == true
+  Resources.StsEndpoint.Properties.ServiceName[ keys == 'Fn::Sub' ] == 'com.amazonaws.${AWS::Region}.sts'
+  Resources.StsEndpoint.Properties.SubnetIds[*].Ref == 'PrivateSubnet'
+}
+
+rule launch_template_is_private_imdsv2_i4i {
+  let launch_template_count = count(%launch_templates)
+  let builder_block_device_mapping_count = count(Resources.BuilderLaunchTemplate.Properties.LaunchTemplateData.BlockDeviceMappings[*])
+  let builder_instance_tag_count = count(Resources.BuilderLaunchTemplate.Properties.LaunchTemplateData.TagSpecifications[ ResourceType == 'instance' ].Tags[ Key == 'MemorySplitCorpusBuilder' ])
+  let builder_network_interface_count = count(Resources.BuilderLaunchTemplate.Properties.LaunchTemplateData.NetworkInterfaces[*])
+  let builder_volume_tag_count = count(Resources.BuilderLaunchTemplate.Properties.LaunchTemplateData.TagSpecifications[ ResourceType == 'volume' ].Tags[ Key == 'MemorySplitCorpusBuilder' ])
+  let builder_user_data_part_count = count(Resources.BuilderLaunchTemplate.Properties.LaunchTemplateData.UserData[ keys == 'Fn::Join' ][1][*])
+
+  %launch_template_count == 1
+  %builder_block_device_mapping_count == 1
+  %builder_instance_tag_count == 1
+  %builder_network_interface_count == 1
+  %builder_volume_tag_count == 1
+  %builder_user_data_part_count == 6
+  Resources.BuilderLaunchTemplate.Properties.LaunchTemplateData.InstanceType == 'i4i.16xlarge'
+  Resources.BuilderLaunchTemplate.Properties.LaunchTemplateData.ImageId.Ref == 'BuilderAmiId'
+  Resources.BuilderLaunchTemplate.Properties.LaunchTemplateData.UserData[ keys == 'Fn::Join' ][0] == ''
+  Resources.BuilderLaunchTemplate.Properties.LaunchTemplateData.UserData[ keys == 'Fn::Join' ][1][0].Ref == 'BuilderUserDataGzipBase64Part1'
+  Resources.BuilderLaunchTemplate.Properties.LaunchTemplateData.UserData[ keys == 'Fn::Join' ][1][1].Ref == 'BuilderUserDataGzipBase64Part2'
+  Resources.BuilderLaunchTemplate.Properties.LaunchTemplateData.UserData[ keys == 'Fn::Join' ][1][2].Ref == 'BuilderUserDataGzipBase64Part3'
+  Resources.BuilderLaunchTemplate.Properties.LaunchTemplateData.UserData[ keys == 'Fn::Join' ][1][3].Ref == 'BuilderUserDataGzipBase64Part4'
+  Resources.BuilderLaunchTemplate.Properties.LaunchTemplateData.UserData[ keys == 'Fn::Join' ][1][4].Ref == 'BuilderUserDataGzipBase64Part5'
+  Resources.BuilderLaunchTemplate.Properties.LaunchTemplateData.UserData[ keys == 'Fn::Join' ][1][5].Ref == 'BuilderUserDataGzipBase64Part6'
+  Resources.BuilderLaunchTemplate.Properties.LaunchTemplateData.KeyName !exists
+  Resources.BuilderLaunchTemplate.Properties.LaunchTemplateData.InstanceInitiatedShutdownBehavior == 'terminate'
+  Resources.BuilderLaunchTemplate.Properties.LaunchTemplateData.DisableApiTermination == false
+  Resources.BuilderLaunchTemplate.Properties.LaunchTemplateData.EbsOptimized == true
+  Resources.BuilderLaunchTemplate.Properties.LaunchTemplateData.Monitoring.Enabled == true
+  Resources.BuilderLaunchTemplate.Properties.LaunchTemplateData.MetadataOptions.HttpTokens == 'required'
+  Resources.BuilderLaunchTemplate.Properties.LaunchTemplateData.MetadataOptions.HttpEndpoint == 'enabled'
+  Resources.BuilderLaunchTemplate.Properties.LaunchTemplateData.MetadataOptions.HttpProtocolIpv6 == 'disabled'
+  Resources.BuilderLaunchTemplate.Properties.LaunchTemplateData.MetadataOptions.HttpPutResponseHopLimit == 1
+  Resources.BuilderLaunchTemplate.Properties.LaunchTemplateData.MetadataOptions.InstanceMetadataTags == 'disabled'
+  Resources.BuilderLaunchTemplate.Properties.LaunchTemplateData.NetworkInterfaces[*].AssociatePublicIpAddress == false
+  Resources.BuilderLaunchTemplate.Properties.LaunchTemplateData.NetworkInterfaces[*].SubnetId.Ref == 'PrivateSubnet'
+  Resources.BuilderLaunchTemplate.Properties.LaunchTemplateData.BlockDeviceMappings[*].Ebs.DeleteOnTermination == true
+  Resources.BuilderLaunchTemplate.Properties.LaunchTemplateData.BlockDeviceMappings[*].Ebs.Encrypted == true
+  Resources.BuilderLaunchTemplate.Properties.LaunchTemplateData.BlockDeviceMappings[*].Ebs.VolumeSize == 200
+  Resources.BuilderLaunchTemplate.Properties.LaunchTemplateData.BlockDeviceMappings[*].Ebs.VolumeType == 'gp3'
+  Resources.BuilderLaunchTemplate.Properties.LaunchTemplateData.BlockDeviceMappings[*].Ebs.KmsKeyId[ keys == 'Fn::GetAtt' ] == ['DataKey', 'Arn']
+  Resources.BuilderLaunchTemplate.Properties.LaunchTemplateData.TagSpecifications[ ResourceType == 'instance' ].Tags[ Key == 'MemorySplitCorpusBuilder' ].Value == 'true'
+  Resources.BuilderLaunchTemplate.Properties.LaunchTemplateData.TagSpecifications[ ResourceType == 'volume' ].Tags[ Key == 'MemorySplitCorpusBuilder' ].Value == 'true'
+  Parameters.BootstrapUserDataSha256 {
+    Type == 'String'
+    AllowedPattern == '^[0-9a-f]{64}$'
+    ConstraintDescription == 'Must be the lowercase SHA-256 of the base64-decoded gzip member.'
+    Description == 'SHA-256 of the gzip member produced by base64-decoding the exact concatenated Task 6 user-data payload; downstream preflight must verify it before launch.'
+    Default !exists
+  }
+  Outputs.BootstrapUserDataSha256.Description == 'Base64-decoded bootstrap gzip-member SHA-256 for downstream preflight authorization.'
+  Outputs.BootstrapUserDataSha256.Value.Ref == 'BootstrapUserDataSha256'
+  Outputs.BootstrapUserDataSha256.Export !exists
+  Parameters.BuilderUserDataGzipBase64Part1 {
+    Type == 'String'
+    AllowedPattern == '^H4sI[A-Za-z0-9+/]*={0,2}$'
+    MinLength == 8
+    MaxLength == 4096
+    NoEcho == true
+  }
+  Parameters.BuilderUserDataGzipBase64Part2 {
+    Type == 'String'
+    AllowedPattern == '^[A-Za-z0-9+/]*={0,2}$'
+    Default == ''
+    MaxLength == 4096
+    NoEcho == true
+  }
+  Parameters.BuilderUserDataGzipBase64Part3 {
+    Type == 'String'
+    AllowedPattern == '^[A-Za-z0-9+/]*={0,2}$'
+    Default == ''
+    MaxLength == 4096
+    NoEcho == true
+  }
+  Parameters.BuilderUserDataGzipBase64Part4 {
+    Type == 'String'
+    AllowedPattern == '^[A-Za-z0-9+/]*={0,2}$'
+    Default == ''
+    MaxLength == 4096
+    NoEcho == true
+  }
+  Parameters.BuilderUserDataGzipBase64Part5 {
+    Type == 'String'
+    AllowedPattern == '^[A-Za-z0-9+/]*={0,2}$'
+    Default == ''
+    MaxLength == 4096
+    NoEcho == true
+  }
+  Parameters.BuilderUserDataGzipBase64Part6 {
+    Type == 'String'
+    AllowedPattern == '^[A-Za-z0-9+/]*={0,2}$'
+    Default == ''
+    MaxLength == 1368
+    NoEcho == true
+  }
+}
+
+rule retained_encrypted_state {
+  Resources.DataKey.DeletionPolicy == 'Retain'
+  Resources.DataKey.UpdateReplacePolicy == 'Retain'
+  Resources.DataKey.Properties.KeySpec == 'SYMMETRIC_DEFAULT'
+  Resources.DataKey.Properties.KeyUsage == 'ENCRYPT_DECRYPT'
+  Resources.DataKey.Properties.EnableKeyRotation == true
+
+  Resources.ArtifactBucket.DeletionPolicy == 'Retain'
+  Resources.ArtifactBucket.UpdateReplacePolicy == 'Retain'
+  Resources.ArtifactBucket.Properties.BucketName == 'memorysplit-corpus-056956104102-us-east-1'
+  Resources.ArtifactBucket.Properties.VersioningConfiguration.Status == 'Enabled'
+  Resources.ArtifactBucket.Properties.ObjectLockEnabled == true
+  Resources.ArtifactBucket.Properties.ObjectLockConfiguration.ObjectLockEnabled == 'Enabled'
+  Resources.ArtifactBucket.Properties.ObjectLockConfiguration.Rule.DefaultRetention.Mode == 'GOVERNANCE'
+  Resources.ArtifactBucket.Properties.ObjectLockConfiguration.Rule.DefaultRetention.Days == 365
+  Resources.ArtifactBucket.Properties.BucketEncryption.ServerSideEncryptionConfiguration[*].ServerSideEncryptionByDefault.SSEAlgorithm == 'aws:kms'
+  Resources.ArtifactBucket.Properties.BucketEncryption.ServerSideEncryptionConfiguration[*].ServerSideEncryptionByDefault.KMSMasterKeyID[ keys == 'Fn::GetAtt' ] == ['DataKey', 'Arn']
+  Resources.ArtifactBucket.Properties.PublicAccessBlockConfiguration.BlockPublicAcls == true
+  Resources.ArtifactBucket.Properties.PublicAccessBlockConfiguration.BlockPublicPolicy == true
+  Resources.ArtifactBucket.Properties.PublicAccessBlockConfiguration.IgnorePublicAcls == true
+  Resources.ArtifactBucket.Properties.PublicAccessBlockConfiguration.RestrictPublicBuckets == true
+
+  Resources.BuilderLogGroup.DeletionPolicy == 'Retain'
+  Resources.BuilderLogGroup.UpdateReplacePolicy == 'Retain'
+  Resources.BuilderLogGroup.Properties.KmsKeyId[ keys == 'Fn::GetAtt' ] == ['DataKey', 'Arn']
+}
+
+rule exact_iam_policy_containers {
+  let iam_resource_count = count(%iam_resources)
+  let iam_role_count = count(%iam_roles)
+  let iam_instance_profile_count = count(%iam_instance_profiles)
+  let builder_inline_policy_count = count(%builder_inline_policies)
+  let controller_inline_policy_count = count(%controller_inline_policies)
+  let builder_managed_policy_count = count(Resources.BuilderRole.Properties.ManagedPolicyArns[*])
+  let s3_bucket_policy_count = count(%s3_bucket_policy_resources)
+  let nested_policy_container_count = count(%unexpected_nested_policy_containers)
+
+  %iam_resource_count == 3
+  %iam_role_count == 2
+  %iam_instance_profile_count == 1
+  %iam_policy_resources empty
+  %iam_managed_policy_resources empty
+  %s3_bucket_policy_count == 1
+  %sns_topic_policy_resources empty
+  %nested_policy_container_count == 2
+
+  %builder_inline_policy_count == 1
+  %controller_inline_policy_count == 1
+  Resources.BuilderRole.Properties.Policies[*].PolicyName == 'BuilderCorpusData'
+  Resources.ControllerRole.Properties.Policies[*].PolicyName == 'ControllerOperations'
+
+  %builder_managed_policy_count == 1
+  Resources.BuilderRole.Properties.ManagedPolicyArns[*][ keys == 'Fn::Sub' ] == 'arn:${AWS::Partition}:iam::aws:policy/AmazonSSMManagedInstanceCore'
+  Resources.ControllerRole.Properties.ManagedPolicyArns !exists
+  Resources.BuilderRole.Properties.PermissionsBoundary !exists
+  Resources.ControllerRole.Properties.PermissionsBoundary !exists
+  Resources.BuilderInstanceProfile.Properties.Roles[*].Ref == 'BuilderRole'
+}
+
+rule exact_builder_policy {
+  let builder_statement_count = count(%builder_policy_statements)
+  let builder_s3_statement_count = count(%builder_s3_statements)
+  let builder_list_prefix_count = count(Resources.BuilderRole.Properties.Policies[*].PolicyDocument.Statement[ Sid == 'ListCorpusNamespaces' ].Condition[ keys == 'ForAnyValue:StringLike' ][ keys == 's3:prefix' ][*])
+  let builder_assume_role_statement_count = count(%builder_assume_role_statements[ Sid == 'Ec2AssumeRole' ])
+  let builder_describe_data_key_count = count(%builder_policy_statements[ Sid == 'DescribeDataKey' ])
+  let builder_list_corpus_namespaces_count = count(%builder_policy_statements[ Sid == 'ListCorpusNamespaces' ])
+  let builder_locate_corpus_bucket_count = count(%builder_policy_statements[ Sid == 'LocateCorpusBucket' ])
+  let builder_read_builder_inputs_count = count(%builder_policy_statements[ Sid == 'ReadBuilderInputs' ])
+  let builder_read_write_build_artifacts_count = count(%builder_policy_statements[ Sid == 'ReadWriteBuildArtifacts' ])
+  let builder_use_data_key_count = count(%builder_policy_statements[ Sid == 'UseDataKey' ])
+  let builder_write_builder_logs_count = count(%builder_policy_statements[ Sid == 'WriteBuilderLogs' ])
+  let builder_use_data_key_action_count = count(Resources.BuilderRole.Properties.Policies[*].PolicyDocument.Statement[ Sid == 'UseDataKey' ].Action[*])
+
+  %builder_statement_count == 7
+  %builder_s3_statement_count == 4
+  %builder_list_prefix_count == 6
+  %builder_assume_role_statement_count == 1
+  %builder_describe_data_key_count == 1
+  %builder_list_corpus_namespaces_count == 1
+  %builder_locate_corpus_bucket_count == 1
+  %builder_read_builder_inputs_count == 1
+  %builder_read_write_build_artifacts_count == 1
+  %builder_use_data_key_count == 1
+  %builder_write_builder_logs_count == 1
+  %builder_use_data_key_action_count == 3
+  exact_action_allowlist(%builder_policy_statements, %builder_allowed_actions)
+  exact_s3_statement_shape(%builder_s3_statements, %builder_s3_sids)
+
+  Resources.BuilderRole.Properties.AssumeRolePolicyDocument.Statement[ Sid == 'Ec2AssumeRole' ] {
+    Action == 'sts:AssumeRole'
+    Principal.Service == 'ec2.amazonaws.com'
+  }
+  Resources.BuilderRole.Properties.Policies[*].PolicyDocument.Statement[ Sid == 'ListCorpusNamespaces' ] {
+    some Action[*] == 's3:ListBucket'
+    some Action[*] == 's3:ListBucketVersions'
+    Condition[ keys == 'ForAnyValue:StringLike' ][ keys == 's3:prefix' ][*] IN %approved_list_prefixes
+  }
+  Resources.BuilderRole.Properties.Policies[*].PolicyDocument.Statement[ Sid == 'ReadBuilderInputs' ] {
+    Action[*] IN ['s3:GetObject', 's3:GetObjectAttributes', 's3:GetObjectVersion']
+    Resource[*][ keys == 'Fn::Sub' ] IN [
+      '${ArtifactBucket.Arn}/v2/packages/*',
+      '${ArtifactBucket.Arn}/v2/sources/*'
+    ]
+  }
+  Resources.BuilderRole.Properties.Policies[*].PolicyDocument.Statement[ Sid == 'ReadWriteBuildArtifacts' ] {
+    some Action[*] == 's3:PutObject'
+    Resource[*][ keys == 'Fn::Sub' ] == '${ArtifactBucket.Arn}/v2/builds/*'
+  }
+  Resources.BuilderRole.Properties.Policies[*].PolicyDocument.Statement[ Sid == 'UseDataKey' ] {
+    Action[*] IN ['kms:Decrypt', 'kms:Encrypt', 'kms:GenerateDataKey']
+    Resource[ keys == 'Fn::GetAtt' ] == ['DataKey', 'Arn']
+    Condition.StringEquals[ keys == 'kms:EncryptionContext:aws:s3:arn' ][ keys == 'Fn::GetAtt' ] == ['ArtifactBucket', 'Arn']
+    Condition.StringEquals[ keys == 'kms:ViaService' ][ keys == 'Fn::Sub' ] == 's3.${AWS::Region}.amazonaws.com'
+  }
+  Resources.BuilderRole.Properties.Policies[*].PolicyDocument.Statement[ Sid == 'DescribeDataKey' ] {
+    Action == 'kms:DescribeKey'
+    Resource[ keys == 'Fn::GetAtt' ] == ['DataKey', 'Arn']
+    Condition.StringEquals[ keys == 'kms:ViaService' ][ keys == 'Fn::Sub' ] == 's3.${AWS::Region}.amazonaws.com'
+  }
+  Resources.BuilderRole.Properties.Policies[*].PolicyDocument.Statement[ Sid == 'WriteBuilderLogs' ] {
+    Action[*] IN ['logs:CreateLogStream', 'logs:PutLogEvents']
+    Resource[ keys == 'Fn::GetAtt' ] == ['BuilderLogGroup', 'Arn']
+  }
+}
+
+rule exact_controller_policy {
+  let controller_statement_count = count(%controller_policy_statements)
+  let controller_s3_statement_count = count(%controller_s3_statements)
+  let controller_assume_role_statement_count = count(%controller_assume_role_statements[ Sid == 'AccountAssumeRole' ])
+  let controller_cleanup_failed_build_versions_count = count(%controller_policy_statements[ Sid == 'CleanupFailedBuildVersions' ])
+  let controller_create_ebs_grant_count = count(%controller_policy_statements[ Sid == 'CreateEbsGrant' ])
+  let controller_describe_data_key_for_ebs_count = count(%controller_policy_statements[ Sid == 'DescribeDataKeyForEbs' ])
+  let controller_identify_controller_session_count = count(%controller_policy_statements[ Sid == 'IdentifyControllerSession' ])
+  let controller_inspect_ec2_state_count = count(%controller_policy_statements[ Sid == 'InspectEc2State' ])
+  let controller_inspect_ssm_state_count = count(%controller_policy_statements[ Sid == 'InspectSsmState' ])
+  let controller_list_failed_build_versions_count = count(%controller_policy_statements[ Sid == 'ListFailedBuildVersions' ])
+  let controller_pass_only_builder_role_to_ec2_count = count(%controller_policy_statements[ Sid == 'PassOnlyBuilderRoleToEc2' ])
+  let controller_run_approved_launch_template_count = count(%controller_policy_statements[ Sid == 'RunApprovedLaunchTemplate' ])
+  let controller_send_builder_document_count = count(%controller_policy_statements[ Sid == 'SendBuilderDocument' ])
+  let controller_send_to_tagged_builder_count = count(%controller_policy_statements[ Sid == 'SendToTaggedBuilder' ])
+  let controller_tag_approved_launch_resources_count = count(%controller_policy_statements[ Sid == 'TagApprovedLaunchResources' ])
+  let controller_terminate_tagged_builder_count = count(%controller_policy_statements[ Sid == 'TerminateTaggedBuilder' ])
+  let controller_use_data_key_for_ebs_count = count(%controller_policy_statements[ Sid == 'UseDataKeyForEbs' ])
+  let controller_cleanup_action_count = count(Resources.ControllerRole.Properties.Policies[*].PolicyDocument.Statement[ Sid == 'CleanupFailedBuildVersions' ].Action[*])
+  let controller_use_data_key_action_count = count(Resources.ControllerRole.Properties.Policies[*].PolicyDocument.Statement[ Sid == 'UseDataKeyForEbs' ].Action[*])
+
+  %controller_statement_count == 14
+  %controller_s3_statement_count == 2
+  %controller_assume_role_statement_count == 1
+  %controller_cleanup_failed_build_versions_count == 1
+  %controller_create_ebs_grant_count == 1
+  %controller_describe_data_key_for_ebs_count == 1
+  %controller_identify_controller_session_count == 1
+  %controller_inspect_ec2_state_count == 1
+  %controller_inspect_ssm_state_count == 1
+  %controller_list_failed_build_versions_count == 1
+  %controller_pass_only_builder_role_to_ec2_count == 1
+  %controller_run_approved_launch_template_count == 1
+  %controller_send_builder_document_count == 1
+  %controller_send_to_tagged_builder_count == 1
+  %controller_tag_approved_launch_resources_count == 1
+  %controller_terminate_tagged_builder_count == 1
+  %controller_use_data_key_for_ebs_count == 1
+  %controller_cleanup_action_count == 2
+  %controller_use_data_key_action_count == 4
+  exact_action_allowlist(%controller_policy_statements, %controller_allowed_actions)
+
+  Resources.ControllerRole.Properties.Policies[*].PolicyDocument.Statement[ Sid == 'RunApprovedLaunchTemplate' ] {
+    Action == 'ec2:RunInstances'
+    Resource == '*'
+    Condition.ArnEquals[ keys == 'ec2:LaunchTemplate' ][ keys == 'Fn::Sub' ] == 'arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:launch-template/${BuilderLaunchTemplate}'
+    Condition.Bool[ keys == 'ec2:IsLaunchTemplateResource' ] == 'true'
+    Condition.StringEquals[ keys == 'aws:RequestTag/MemorySplitCorpusBuilder' ] == 'true'
+    Condition.StringEquals[ keys == 'ec2:InstanceMarketType' ] == 'on-demand'
+    Condition.StringEquals[ keys == 'ec2:InstanceType' ] == 'i4i.16xlarge'
+    Condition.StringEquals[ keys == 'ec2:MetadataHttpTokens' ] == 'required'
+  }
+  Resources.ControllerRole.Properties.Policies[*].PolicyDocument.Statement[ Sid == 'TagApprovedLaunchResources' ] {
+    Action == 'ec2:CreateTags'
+    Condition.StringEquals[ keys == 'aws:RequestTag/MemorySplitCorpusBuilder' ] == 'true'
+    Condition.StringEquals[ keys == 'ec2:CreateAction' ] == 'RunInstances'
+  }
+  Resources.ControllerRole.Properties.Policies[*].PolicyDocument.Statement[ Sid == 'TerminateTaggedBuilder' ] {
+    Action == 'ec2:TerminateInstances'
+    Resource[ keys == 'Fn::Sub' ] == 'arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:instance/*'
+    Condition.StringEquals[ keys == 'ec2:ResourceTag/MemorySplitCorpusBuilder' ] == 'true'
+  }
+  Resources.ControllerRole.Properties.Policies[*].PolicyDocument.Statement[ Sid == 'PassOnlyBuilderRoleToEc2' ] {
+    Action == 'iam:PassRole'
+    Resource[ keys == 'Fn::GetAtt' ] == ['BuilderRole', 'Arn']
+    Condition.StringEquals[ keys == 'iam:PassedToService' ] == 'ec2.amazonaws.com'
+  }
+  Resources.ControllerRole.Properties.Policies[*].PolicyDocument.Statement[ Sid == 'SendBuilderDocument' ] {
+    Action == 'ssm:SendCommand'
+    Resource[ keys == 'Fn::Sub' ] == 'arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:document/${BuilderCommandDocument}'
+  }
+  Resources.ControllerRole.Properties.Policies[*].PolicyDocument.Statement[ Sid == 'SendToTaggedBuilder' ] {
+    Action == 'ssm:SendCommand'
+    Resource[ keys == 'Fn::Sub' ] == 'arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:instance/*'
+    Condition.StringEquals[ keys == 'ssm:resourceTag/MemorySplitCorpusBuilder' ] == 'true'
+  }
+  Resources.ControllerRole.Properties.Policies[*].PolicyDocument.Statement[ Sid == 'CreateEbsGrant' ] {
+    Action == 'kms:CreateGrant'
+    Resource[ keys == 'Fn::GetAtt' ] == ['DataKey', 'Arn']
+    Condition.Bool[ keys == 'kms:GrantIsForAWSResource' ] == 'true'
+    Condition.StringEquals[ keys == 'kms:ViaService' ][ keys == 'Fn::Sub' ] == 'ec2.${AWS::Region}.amazonaws.com'
+  }
+  Resources.ControllerRole.Properties.Policies[*].PolicyDocument.Statement[ Sid == 'UseDataKeyForEbs' ] {
+    Action[*] IN ['kms:Decrypt', 'kms:GenerateDataKeyWithoutPlaintext', 'kms:ReEncryptFrom', 'kms:ReEncryptTo']
+    Resource[ keys == 'Fn::GetAtt' ] == ['DataKey', 'Arn']
+    Condition[ keys == 'ForAnyValue:StringEquals' ][ keys == 'kms:EncryptionContextKeys' ][*] == 'aws:ebs:id'
+    Condition.StringEquals[ keys == 'kms:ViaService' ][ keys == 'Fn::Sub' ] == 'ec2.${AWS::Region}.amazonaws.com'
+  }
+  Resources.ControllerRole.Properties.Policies[*].PolicyDocument.Statement[ Sid == 'DescribeDataKeyForEbs' ] {
+    Action == 'kms:DescribeKey'
+    Resource[ keys == 'Fn::GetAtt' ] == ['DataKey', 'Arn']
+  }
+  Resources.ControllerRole.Properties.Policies[*].PolicyDocument.Statement[ Sid == 'ListFailedBuildVersions' ] {
+    Action == 's3:ListBucketVersions'
+    Resource[ keys == 'Fn::GetAtt' ] == ['ArtifactBucket', 'Arn']
+    Condition.StringLike[ keys == 's3:prefix' ] == 'v2/builds/*'
+  }
+  Resources.ControllerRole.Properties.Policies[*].PolicyDocument.Statement[ Sid == 'CleanupFailedBuildVersions' ] {
+    Action[*] IN ['s3:BypassGovernanceRetention', 's3:DeleteObjectVersion']
+    Resource[ keys == 'Fn::Sub' ] == '${ArtifactBucket.Arn}/v2/builds/*'
+  }
+}
+
+rule exact_s3_endpoint_policy {
+  let endpoint_s3_statement_count = count(%endpoint_s3_statements)
+  let endpoint_list_prefix_count = count(Resources.S3Endpoint.Properties.PolicyDocument.Statement[ Sid == 'CorpusBucketListing' ].Condition[ keys == 'ForAnyValue:StringLike' ][ keys == 's3:prefix' ][*])
+  let endpoint_corpus_bucket_listing_count = count(%endpoint_policy_statements[ Sid == 'CorpusBucketListing' ])
+  let endpoint_corpus_bucket_location_count = count(%endpoint_policy_statements[ Sid == 'CorpusBucketLocation' ])
+  let endpoint_read_builder_inputs_count = count(%endpoint_policy_statements[ Sid == 'ReadBuilderInputs' ])
+  let endpoint_read_write_build_artifacts_count = count(%endpoint_policy_statements[ Sid == 'ReadWriteBuildArtifacts' ])
+
+  %endpoint_s3_statement_count == 4
+  %endpoint_list_prefix_count == 6
+  %endpoint_corpus_bucket_listing_count == 1
+  %endpoint_corpus_bucket_location_count == 1
+  %endpoint_read_builder_inputs_count == 1
+  %endpoint_read_write_build_artifacts_count == 1
+  exact_s3_statement_shape(%endpoint_s3_statements, %endpoint_s3_sids)
+  Resources.S3Endpoint.Properties.PolicyDocument.Statement[ Sid == 'CorpusBucketListing' ].Condition[ keys == 'ForAnyValue:StringLike' ][ keys == 's3:prefix' ][*] IN %approved_list_prefixes
+}
+
+rule bucket_policy_is_transport_and_kms_deny_only {
+  let bucket_policy_statement_count = count(%bucket_policy_statements)
+  let bucket_deny_insecure_transport_count = count(%bucket_policy_statements[ Sid == 'DenyInsecureTransport' ])
+  let bucket_deny_unexpected_encryption_algorithm_count = count(%bucket_policy_statements[ Sid == 'DenyUnexpectedEncryptionAlgorithm' ])
+  let bucket_deny_unexpected_kms_key_count = count(%bucket_policy_statements[ Sid == 'DenyUnexpectedKmsKey' ])
+  let bucket_algorithm_resource_count = count(Resources.ArtifactBucketPolicy.Properties.PolicyDocument.Statement[ Sid == 'DenyUnexpectedEncryptionAlgorithm' ].Resource[*])
+  let bucket_key_resource_count = count(Resources.ArtifactBucketPolicy.Properties.PolicyDocument.Statement[ Sid == 'DenyUnexpectedKmsKey' ].Resource[*])
+
+  %bucket_policy_statement_count == 3
+  %bucket_deny_insecure_transport_count == 1
+  %bucket_deny_unexpected_encryption_algorithm_count == 1
+  %bucket_deny_unexpected_kms_key_count == 1
+  %bucket_algorithm_resource_count == 3
+  %bucket_key_resource_count == 3
+
+  Resources.ArtifactBucketPolicy.Properties.PolicyDocument.Statement[ Sid == 'DenyInsecureTransport' ] {
+    Effect == 'Deny'
+    Principal == '*'
+    Action == 's3:*'
+    NotAction !exists
+    NotResource !exists
+    Condition.Bool[ keys == 'aws:SecureTransport' ] == 'false'
+  }
+  Resources.ArtifactBucketPolicy.Properties.PolicyDocument.Statement[ Sid == 'DenyUnexpectedEncryptionAlgorithm' ] {
+    Effect == 'Deny'
+    Principal == '*'
+    Action == 's3:PutObject'
+    Resource[*][ keys == 'Fn::Sub' ] IN [
+      '${ArtifactBucket.Arn}/v2/builds/*',
+      '${ArtifactBucket.Arn}/v2/packages/*',
+      '${ArtifactBucket.Arn}/v2/sources/*'
+    ]
+    Condition.Null[ keys == 's3:x-amz-server-side-encryption' ] == 'false'
+    Condition.StringNotEquals[ keys == 's3:x-amz-server-side-encryption' ] == 'aws:kms'
+  }
+  Resources.ArtifactBucketPolicy.Properties.PolicyDocument.Statement[ Sid == 'DenyUnexpectedKmsKey' ] {
+    Effect == 'Deny'
+    Principal == '*'
+    Action == 's3:PutObject'
+    Resource[*][ keys == 'Fn::Sub' ] IN [
+      '${ArtifactBucket.Arn}/v2/builds/*',
+      '${ArtifactBucket.Arn}/v2/packages/*',
+      '${ArtifactBucket.Arn}/v2/sources/*'
+    ]
+    Condition.Null[ keys == 's3:x-amz-server-side-encryption-aws-kms-key-id' ] == 'false'
+    Condition.StringNotEquals[ keys == 's3:x-amz-server-side-encryption-aws-kms-key-id' ][ keys == 'Fn::GetAtt' ] == ['DataKey', 'Arn']
+  }
+}
+
+rule reject_unreviewed_policy_statements {
+  policy_statement_basics(%builder_policy_statements)
+  policy_statement_basics(%controller_policy_statements)
+  policy_statement_basics(%builder_assume_role_statements)
+  policy_statement_basics(%controller_assume_role_statements)
+  policy_statement_basics(%endpoint_policy_statements)
+  policy_statement_basics(%bucket_non_transport_statements)
+
+  %data_key_s3_statements empty
+  %builder_assume_s3_statements empty
+  %controller_assume_s3_statements empty
+}
+
+rule exact_ssm_document_and_budget {
+  let ssm_step_count = count(Resources.BuilderCommandDocument.Properties.Content.mainSteps[*])
+  let ssm_run_step_count = count(Resources.BuilderCommandDocument.Properties.Content.mainSteps[ action == 'aws:runShellScript' ])
+  let ssm_command_count = count(Resources.BuilderCommandDocument.Properties.Content.mainSteps[ action == 'aws:runShellScript' ].inputs.runCommand[*])
+  let ssm_parameter_count = count(Resources.BuilderCommandDocument.Properties.Content.parameters.*)
+
+  %ssm_step_count == 1
+  %ssm_run_step_count == 1
+  %ssm_command_count == 1
+  %ssm_parameter_count == 5
+  Resources.BuilderCommandDocument.Properties.Name == 'MemorySplit-CorpusBuilderV1'
+  Resources.BuilderCommandDocument.Properties.DocumentType == 'Command'
+  Resources.BuilderCommandDocument.Properties.DocumentFormat == 'JSON'
+  Resources.BuilderCommandDocument.Properties.TargetType == '/AWS::EC2::Instance'
+  Resources.BuilderCommandDocument.Properties.Content.schemaVersion == '2.2'
+  Resources.BuilderCommandDocument.Properties.Content.mainSteps[ action == 'aws:runShellScript' ] {
+    name == 'runCorpusBuilder'
+    inputs.timeoutSeconds == '84600'
+    inputs.runCommand[*] == /^\/usr\/local\/bin\/memorysplit-corpus-builder --build-id '\{\{ BuildId \}\}' --package-uri '\{\{ PackageUri \}\}' --package-sha256 '\{\{ PackageSHA256 \}\}' --source-manifest-uri '\{\{ SourceManifestUri \}\}' --source-manifest-sha256 '\{\{ SourceManifestSHA256 \}\}'$/
+  }
+  Resources.BuilderCommandDocument.Properties.Content.parameters.BuildId {
+    type == 'String'
+    allowedPattern == '^[0-9a-f]{64}$'
+  }
+  Resources.BuilderCommandDocument.Properties.Content.parameters.PackageSHA256 {
+    type == 'String'
+    allowedPattern == '^[0-9a-f]{64}$'
+  }
+  Resources.BuilderCommandDocument.Properties.Content.parameters.PackageUri {
+    type == 'String'
+    allowedPattern == '^s3://memorysplit-corpus-056956104102-us-east-1/v2/packages/[A-Za-z0-9._/-]+$'
+  }
+  Resources.BuilderCommandDocument.Properties.Content.parameters.SourceManifestSHA256 {
+    type == 'String'
+    allowedPattern == '^[0-9a-f]{64}$'
+  }
+  Resources.BuilderCommandDocument.Properties.Content.parameters.SourceManifestUri {
+    type == 'String'
+    allowedPattern == '^s3://memorysplit-corpus-056956104102-us-east-1/v2/sources/[A-Za-z0-9._/-]+$'
+  }
+
+  Resources.MonthlyBudget.Properties.Budget.BudgetLimit.Amount == 200
+  Resources.MonthlyBudget.Properties.Budget.BudgetLimit.Unit == 'USD'
+  Resources.MonthlyBudget.Properties.Budget.BudgetType == 'COST'
+  Resources.MonthlyBudget.Properties.Budget.TimeUnit == 'MONTHLY'
+}

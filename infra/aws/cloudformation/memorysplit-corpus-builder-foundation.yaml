@@ -1,0 +1,1044 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  Retained, private, no-instance foundation for the MemorySplit AWS corpus
+  builder. This stack creates no EC2 instance, fleet, capacity reservation,
+  public network path, or other paid compute capacity.
+
+Parameters:
+  BootstrapUserDataSha256:
+    Type: String
+    AllowedPattern: '^[0-9a-f]{64}$'
+    ConstraintDescription: >-
+      Must be the lowercase SHA-256 of the base64-decoded gzip member.
+    Description: >-
+      SHA-256 of the gzip member produced by base64-decoding the exact
+      concatenated Task 6 user-data payload; downstream preflight must verify
+      it before launch.
+  BuilderAmiId:
+    Type: AWS::EC2::Image::Id
+    Description: Immutable Amazon Linux 2023 AMI ID approved for the builder.
+  BuilderUserDataGzipBase64Part1:
+    Type: String
+    AllowedPattern: '^H4sI[A-Za-z0-9+/]*={0,2}$'
+    ConstraintDescription: Must start one deterministic gzip base64 payload.
+    Description: >-
+      First ordered chunk of the Task 6 deterministic gzip/base64 user data;
+      split at 4096-character boundaries.
+    MaxLength: 4096
+    MinLength: 8
+    NoEcho: true
+  BuilderUserDataGzipBase64Part2:
+    Type: String
+    AllowedPattern: '^[A-Za-z0-9+/]*={0,2}$'
+    ConstraintDescription: Must continue the deterministic gzip base64 payload.
+    Default: ""
+    Description: >-
+      Next ordered chunk of the Task 6 deterministic gzip/base64 user data;
+      leave empty after the final chunk.
+    MaxLength: 4096
+    NoEcho: true
+  BuilderUserDataGzipBase64Part3:
+    Type: String
+    AllowedPattern: '^[A-Za-z0-9+/]*={0,2}$'
+    ConstraintDescription: Must continue the deterministic gzip base64 payload.
+    Default: ""
+    Description: >-
+      Next ordered chunk of the Task 6 deterministic gzip/base64 user data;
+      leave empty after the final chunk.
+    MaxLength: 4096
+    NoEcho: true
+  BuilderUserDataGzipBase64Part4:
+    Type: String
+    AllowedPattern: '^[A-Za-z0-9+/]*={0,2}$'
+    ConstraintDescription: Must continue the deterministic gzip base64 payload.
+    Default: ""
+    Description: >-
+      Next ordered chunk of the Task 6 deterministic gzip/base64 user data;
+      leave empty after the final chunk.
+    MaxLength: 4096
+    NoEcho: true
+  BuilderUserDataGzipBase64Part5:
+    Type: String
+    AllowedPattern: '^[A-Za-z0-9+/]*={0,2}$'
+    ConstraintDescription: Must continue the deterministic gzip base64 payload.
+    Default: ""
+    Description: >-
+      Next ordered chunk of the Task 6 deterministic gzip/base64 user data;
+      leave empty after the final chunk.
+    MaxLength: 4096
+    NoEcho: true
+  BuilderUserDataGzipBase64Part6:
+    Type: String
+    AllowedPattern: '^[A-Za-z0-9+/]*={0,2}$'
+    ConstraintDescription: Must continue the deterministic gzip base64 payload.
+    Default: ""
+    Description: >-
+      Next ordered chunk of the Task 6 deterministic gzip/base64 user data;
+      leave empty after the final chunk.
+    MaxLength: 1368
+    NoEcho: true
+  BuilderAvailabilityZone:
+    Type: AWS::EC2::AvailabilityZone::Name
+    Description: Selected us-east-1 Availability Zone for the corpus builder.
+  VpcCidr:
+    Type: String
+    Default: 10.43.0.0/16
+    AllowedPattern: '^(10\.[0-9]{1,3}|172\.(1[6-9]|2[0-9]|3[0-1])|192\.168)\.[0-9]{1,3}\.[0-9]{1,3}/(1[6-9]|2[0-8])$'
+    Description: RFC1918 IPv4 CIDR for the isolated builder VPC.
+  PrivateSubnetCidr:
+    Type: String
+    Default: 10.43.0.0/20
+    AllowedPattern: '^(10\.[0-9]{1,3}|172\.(1[6-9]|2[0-9]|3[0-1])|192\.168)\.[0-9]{1,3}\.[0-9]{1,3}/(1[6-9]|2[0-8])$'
+    Description: RFC1918 IPv4 CIDR for the private builder subnet.
+  S3GatewayPrefixListId:
+    Type: String
+    AllowedPattern: '^pl-[0-9a-f]+$'
+    ConstraintDescription: Must be an AWS-managed prefix list ID.
+    Description: >-
+      AWS-managed prefix list ID for com.amazonaws.us-east-1.s3, resolved and
+      reviewed before stack creation.
+  BudgetAlertEmail:
+    Type: String
+    AllowedPattern: '^[^@\s]+@[^@\s]+\.[^@\s]+$'
+    ConstraintDescription: Must be a valid email address.
+    Description: Email address that confirms and receives AWS Budget alerts.
+
+Rules:
+  ApprovedAwsDeployment:
+    Assertions:
+      - Assert:
+          Fn::Equals:
+            - Ref: AWS::AccountId
+            - "056956104102"
+        AssertDescription: >-
+          This foundation is approved only for AWS account 056956104102.
+      - Assert:
+          Fn::Equals:
+            - Ref: AWS::Region
+            - us-east-1
+        AssertDescription: This foundation is approved only for us-east-1.
+
+Resources:
+  Vpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock:
+        Ref: VpcCidr
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      InstanceTenancy: default
+      Tags:
+        - Key: Name
+          Value:
+            Fn::Sub: ${AWS::StackName}-corpus-builder-private
+        - Key: memorysplit:purpose
+          Value: corpus-builder
+
+  PrivateSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      AvailabilityZone:
+        Ref: BuilderAvailabilityZone
+      CidrBlock:
+        Ref: PrivateSubnetCidr
+      MapPublicIpOnLaunch: false
+      VpcId:
+        Ref: Vpc
+      Tags:
+        - Key: Name
+          Value:
+            Fn::Sub: ${AWS::StackName}-corpus-builder-private
+        - Key: memorysplit:network
+          Value: private
+
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId:
+        Ref: Vpc
+      Tags:
+        - Key: Name
+          Value:
+            Fn::Sub: ${AWS::StackName}-corpus-builder-private
+
+  PrivateSubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId:
+        Ref: PrivateRouteTable
+      SubnetId:
+        Ref: PrivateSubnet
+
+  BuilderSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Zero-ingress security group for approved corpus builders.
+      SecurityGroupEgress:
+        - Description: HTTPS to the interface VPC endpoints
+          DestinationSecurityGroupId:
+            Fn::GetAtt:
+              - EndpointSecurityGroup
+              - GroupId
+          FromPort: 443
+          IpProtocol: tcp
+          ToPort: 443
+        - Description: HTTPS to the us-east-1 S3 gateway endpoint
+          DestinationPrefixListId:
+            Ref: S3GatewayPrefixListId
+          FromPort: 443
+          IpProtocol: tcp
+          ToPort: 443
+      SecurityGroupIngress: []
+      VpcId:
+        Ref: Vpc
+      Tags:
+        - Key: Name
+          Value:
+            Fn::Sub: ${AWS::StackName}-builder-zero-ingress
+
+  EndpointSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: HTTPS ingress only from the corpus builder security group.
+      SecurityGroupEgress:
+        - CidrIp: 127.0.0.1/32
+          Description: No-op rule suppresses default allow-all egress
+          IpProtocol: "-1"
+      SecurityGroupIngress: []
+      VpcId:
+        Ref: Vpc
+      Tags:
+        - Key: Name
+          Value:
+            Fn::Sub: ${AWS::StackName}-corpus-builder-endpoints
+
+  BuilderToEndpointHttpsIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      Description: HTTPS from the corpus builder security group
+      FromPort: 443
+      GroupId:
+        Fn::GetAtt:
+          - EndpointSecurityGroup
+          - GroupId
+      IpProtocol: tcp
+      SourceSecurityGroupId:
+        Fn::GetAtt:
+          - BuilderSecurityGroup
+          - GroupId
+      ToPort: 443
+
+  DataKey:
+    Type: AWS::KMS::Key
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BypassPolicyLockoutSafetyCheck: false
+      Description: Symmetric data key for retained corpus-builder state.
+      EnableKeyRotation: true
+      Enabled: true
+      KeyPolicy:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: EnableAccountIAM
+            Effect: Allow
+            Principal:
+              AWS:
+                Fn::Sub: arn:${AWS::Partition}:iam::${AWS::AccountId}:root
+            Action: kms:*
+            Resource: "*"
+          - Sid: AllowEncryptedBuilderLogs
+            Effect: Allow
+            Principal:
+              Service:
+                Fn::Sub: logs.${AWS::Region}.amazonaws.com
+            Action:
+              - kms:Decrypt
+              - kms:DescribeKey
+              - kms:Encrypt
+              - kms:GenerateDataKey
+              - kms:ReEncryptFrom
+              - kms:ReEncryptTo
+            Resource: "*"
+            Condition:
+              ArnEquals:
+                kms:EncryptionContext:aws:logs:arn:
+                  Fn::Sub: >-
+                    arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/memorysplit/${AWS::StackName}/corpus-builder
+      KeySpec: SYMMETRIC_DEFAULT
+      KeyUsage: ENCRYPT_DECRYPT
+      MultiRegion: false
+      Origin: AWS_KMS
+      PendingWindowInDays: 30
+      Tags:
+        - Key: memorysplit:purpose
+          Value: corpus-builder-retained-data
+
+  BuilderLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      KmsKeyId:
+        Fn::GetAtt:
+          - DataKey
+          - Arn
+      LogGroupName:
+        Fn::Sub: /aws/memorysplit/${AWS::StackName}/corpus-builder
+      RetentionInDays: 365
+      Tags:
+        - Key: memorysplit:purpose
+          Value: corpus-builder-logs
+
+  ArtifactBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: memorysplit-corpus-056956104102-us-east-1
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - BucketKeyEnabled: true
+            ServerSideEncryptionByDefault:
+              KMSMasterKeyID:
+                Fn::GetAtt:
+                  - DataKey
+                  - Arn
+              SSEAlgorithm: aws:kms
+      ObjectLockConfiguration:
+        ObjectLockEnabled: Enabled
+        Rule:
+          DefaultRetention:
+            Days: 365
+            Mode: GOVERNANCE
+      ObjectLockEnabled: true
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      Tags:
+        - Key: memorysplit:purpose
+          Value: claim-bearing-corpus
+      VersioningConfiguration:
+        Status: Enabled
+
+  ArtifactBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket:
+        Ref: ArtifactBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: "*"
+            Action: s3:*
+            Resource:
+              - Fn::GetAtt:
+                  - ArtifactBucket
+                  - Arn
+              - Fn::Sub: ${ArtifactBucket.Arn}/*
+            Condition:
+              Bool:
+                aws:SecureTransport: "false"
+          - Sid: DenyUnexpectedEncryptionAlgorithm
+            Effect: Deny
+            Principal: "*"
+            Action: s3:PutObject
+            Resource:
+              - Fn::Sub: ${ArtifactBucket.Arn}/v2/builds/*
+              - Fn::Sub: ${ArtifactBucket.Arn}/v2/packages/*
+              - Fn::Sub: ${ArtifactBucket.Arn}/v2/sources/*
+            Condition:
+              "Null":
+                s3:x-amz-server-side-encryption: "false"
+              StringNotEquals:
+                s3:x-amz-server-side-encryption: aws:kms
+          - Sid: DenyUnexpectedKmsKey
+            Effect: Deny
+            Principal: "*"
+            Action: s3:PutObject
+            Resource:
+              - Fn::Sub: ${ArtifactBucket.Arn}/v2/builds/*
+              - Fn::Sub: ${ArtifactBucket.Arn}/v2/packages/*
+              - Fn::Sub: ${ArtifactBucket.Arn}/v2/sources/*
+            Condition:
+              "Null":
+                s3:x-amz-server-side-encryption-aws-kms-key-id: "false"
+              StringNotEquals:
+                s3:x-amz-server-side-encryption-aws-kms-key-id:
+                  Fn::GetAtt:
+                    - DataKey
+                    - Arn
+
+  BuilderRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: Ec2AssumeRole
+            Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      Description: Instance role for the bounded MemorySplit corpus builder.
+      ManagedPolicyArns:
+        - Fn::Sub: arn:${AWS::Partition}:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Policies:
+        - PolicyName: BuilderCorpusData
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: LocateCorpusBucket
+                Effect: Allow
+                Action: s3:GetBucketLocation
+                Resource:
+                  Fn::GetAtt:
+                    - ArtifactBucket
+                    - Arn
+              - Sid: ListCorpusNamespaces
+                Effect: Allow
+                Action:
+                  - s3:ListBucket
+                  - s3:ListBucketVersions
+                Resource:
+                  Fn::GetAtt:
+                    - ArtifactBucket
+                    - Arn
+                Condition:
+                  "ForAnyValue:StringLike":
+                    s3:prefix:
+                      - v2/builds
+                      - v2/builds/*
+                      - v2/packages
+                      - v2/packages/*
+                      - v2/sources
+                      - v2/sources/*
+              - Sid: ReadBuilderInputs
+                Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:GetObjectAttributes
+                  - s3:GetObjectVersion
+                Resource:
+                  - Fn::Sub: ${ArtifactBucket.Arn}/v2/packages/*
+                  - Fn::Sub: ${ArtifactBucket.Arn}/v2/sources/*
+              - Sid: ReadWriteBuildArtifacts
+                Effect: Allow
+                Action:
+                  - s3:AbortMultipartUpload
+                  - s3:GetObject
+                  - s3:GetObjectAttributes
+                  - s3:GetObjectVersion
+                  - s3:ListMultipartUploadParts
+                  - s3:PutObject
+                Resource:
+                  - Fn::Sub: ${ArtifactBucket.Arn}/v2/builds/*
+              - Sid: UseDataKey
+                Effect: Allow
+                Action:
+                  - kms:Decrypt
+                  - kms:Encrypt
+                  - kms:GenerateDataKey
+                Resource:
+                  Fn::GetAtt:
+                    - DataKey
+                    - Arn
+                Condition:
+                  StringEquals:
+                    "kms:EncryptionContext:aws:s3:arn":
+                      Fn::GetAtt:
+                        - ArtifactBucket
+                        - Arn
+                    "kms:ViaService":
+                      Fn::Sub: s3.${AWS::Region}.amazonaws.com
+              - Sid: DescribeDataKey
+                Effect: Allow
+                Action: kms:DescribeKey
+                Resource:
+                  Fn::GetAtt:
+                    - DataKey
+                    - Arn
+                Condition:
+                  StringEquals:
+                    "kms:ViaService":
+                      Fn::Sub: s3.${AWS::Region}.amazonaws.com
+              - Sid: WriteBuilderLogs
+                Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource:
+                  Fn::GetAtt:
+                    - BuilderLogGroup
+                    - Arn
+      Tags:
+        - Key: memorysplit:role
+          Value: builder
+
+  ControllerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AccountAssumeRole
+            Effect: Allow
+            Principal:
+              AWS:
+                Fn::Sub: arn:${AWS::Partition}:iam::${AWS::AccountId}:root
+            Action: sts:AssumeRole
+      Description: Operator role for separately approved builder lifecycle actions.
+      Policies:
+        - PolicyName: ControllerOperations
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: InspectEc2State
+                Effect: Allow
+                Action:
+                  - ec2:DescribeImages
+                  - ec2:DescribeInstanceAttribute
+                  - ec2:DescribeInstances
+                  - ec2:DescribeInstanceTypeOfferings
+                  - ec2:DescribeLaunchTemplateVersions
+                Resource: "*"
+              - Sid: RunApprovedLaunchTemplate
+                Effect: Allow
+                Action: ec2:RunInstances
+                Resource: "*"
+                Condition:
+                  ArnEquals:
+                    ec2:LaunchTemplate:
+                      Fn::Sub: >-
+                        arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:launch-template/${BuilderLaunchTemplate}
+                  Bool:
+                    ec2:IsLaunchTemplateResource: "true"
+                  StringEquals:
+                    aws:RequestTag/MemorySplitCorpusBuilder: "true"
+                    ec2:InstanceMarketType: on-demand
+                    ec2:InstanceType: i4i.16xlarge
+                    ec2:MetadataHttpTokens: required
+              - Sid: TagApprovedLaunchResources
+                Effect: Allow
+                Action: ec2:CreateTags
+                Resource:
+                  - Fn::Sub: >-
+                      arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:instance/*
+                  - Fn::Sub: >-
+                      arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:volume/*
+                Condition:
+                  StringEquals:
+                    aws:RequestTag/MemorySplitCorpusBuilder: "true"
+                    ec2:CreateAction: RunInstances
+                  "ForAllValues:StringEquals":
+                    aws:TagKeys:
+                      - MemorySplitCorpusBuilder
+                      - Name
+              - Sid: TerminateTaggedBuilder
+                Effect: Allow
+                Action: ec2:TerminateInstances
+                Resource:
+                  Fn::Sub: >-
+                    arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:instance/*
+                Condition:
+                  StringEquals:
+                    ec2:ResourceTag/MemorySplitCorpusBuilder: "true"
+              - Sid: PassOnlyBuilderRoleToEc2
+                Effect: Allow
+                Action: iam:PassRole
+                Resource:
+                  Fn::GetAtt:
+                    - BuilderRole
+                    - Arn
+                Condition:
+                  StringEquals:
+                    iam:PassedToService: ec2.amazonaws.com
+              - Sid: SendBuilderDocument
+                Effect: Allow
+                Action: ssm:SendCommand
+                Resource:
+                  Fn::Sub: >-
+                    arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:document/${BuilderCommandDocument}
+              - Sid: SendToTaggedBuilder
+                Effect: Allow
+                Action: ssm:SendCommand
+                Resource:
+                  Fn::Sub: >-
+                    arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:instance/*
+                Condition:
+                  StringEquals:
+                    ssm:resourceTag/MemorySplitCorpusBuilder: "true"
+              - Sid: InspectSsmState
+                Effect: Allow
+                Action:
+                  - ssm:DescribeInstanceInformation
+                  - ssm:GetCommandInvocation
+                  - ssm:ListCommands
+                Resource: "*"
+              - Sid: UseDataKeyForEbs
+                Effect: Allow
+                Action:
+                  - kms:Decrypt
+                  - kms:GenerateDataKeyWithoutPlaintext
+                  - kms:ReEncryptFrom
+                  - kms:ReEncryptTo
+                Resource:
+                  Fn::GetAtt:
+                    - DataKey
+                    - Arn
+                Condition:
+                  "ForAnyValue:StringEquals":
+                    kms:EncryptionContextKeys:
+                      - aws:ebs:id
+                  StringEquals:
+                    "kms:ViaService":
+                      Fn::Sub: ec2.${AWS::Region}.amazonaws.com
+              - Sid: DescribeDataKeyForEbs
+                Effect: Allow
+                Action: kms:DescribeKey
+                Resource:
+                  Fn::GetAtt:
+                    - DataKey
+                    - Arn
+              - Sid: CreateEbsGrant
+                Effect: Allow
+                Action: kms:CreateGrant
+                Resource:
+                  Fn::GetAtt:
+                    - DataKey
+                    - Arn
+                Condition:
+                  Bool:
+                    kms:GrantIsForAWSResource: "true"
+                  StringEquals:
+                    "kms:ViaService":
+                      Fn::Sub: ec2.${AWS::Region}.amazonaws.com
+              - Sid: ListFailedBuildVersions
+                Effect: Allow
+                Action: s3:ListBucketVersions
+                Resource:
+                  Fn::GetAtt:
+                    - ArtifactBucket
+                    - Arn
+                Condition:
+                  StringLike:
+                    s3:prefix: v2/builds/*
+              - Sid: CleanupFailedBuildVersions
+                Effect: Allow
+                Action:
+                  - s3:BypassGovernanceRetention
+                  - s3:DeleteObjectVersion
+                Resource:
+                  Fn::Sub: ${ArtifactBucket.Arn}/v2/builds/*
+              - Sid: IdentifyControllerSession
+                Effect: Allow
+                Action: sts:GetCallerIdentity
+                Resource: "*"
+      Tags:
+        - Key: memorysplit:role
+          Value: controller
+
+  BuilderInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - Ref: BuilderRole
+
+  BuilderCommandDocument:
+    Type: AWS::SSM::Document
+    Properties:
+      Content:
+        description: Execute one immutable MemorySplit corpus-builder package.
+        mainSteps:
+          - action: aws:runShellScript
+            inputs:
+              runCommand:
+                - >-
+                  /usr/local/bin/memorysplit-corpus-builder
+                  --build-id '{{ BuildId }}'
+                  --package-uri '{{ PackageUri }}'
+                  --package-sha256 '{{ PackageSHA256 }}'
+                  --source-manifest-uri '{{ SourceManifestUri }}'
+                  --source-manifest-sha256 '{{ SourceManifestSHA256 }}'
+              timeoutSeconds: "84600"
+            name: runCorpusBuilder
+        parameters:
+          BuildId:
+            allowedPattern: '^[0-9a-f]{64}$'
+            type: String
+          PackageSHA256:
+            allowedPattern: '^[0-9a-f]{64}$'
+            type: String
+          PackageUri:
+            allowedPattern: '^s3://memorysplit-corpus-056956104102-us-east-1/v2/packages/[A-Za-z0-9._/-]+$'
+            type: String
+          SourceManifestSHA256:
+            allowedPattern: '^[0-9a-f]{64}$'
+            type: String
+          SourceManifestUri:
+            allowedPattern: '^s3://memorysplit-corpus-056956104102-us-east-1/v2/sources/[A-Za-z0-9._/-]+$'
+            type: String
+        schemaVersion: "2.2"
+      DocumentFormat: JSON
+      DocumentType: Command
+      Name: MemorySplit-CorpusBuilderV1
+      TargetType: /AWS::EC2::Instance
+      UpdateMethod: NewVersion
+
+  BuilderLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateData:
+        BlockDeviceMappings:
+          - DeviceName: /dev/sda1
+            Ebs:
+              DeleteOnTermination: true
+              Encrypted: true
+              KmsKeyId:
+                Fn::GetAtt:
+                  - DataKey
+                  - Arn
+              VolumeSize: 200
+              VolumeType: gp3
+        DisableApiTermination: false
+        EbsOptimized: true
+        IamInstanceProfile:
+          Arn:
+            Fn::GetAtt:
+              - BuilderInstanceProfile
+              - Arn
+        ImageId:
+          Ref: BuilderAmiId
+        InstanceInitiatedShutdownBehavior: terminate
+        InstanceType: i4i.16xlarge
+        MetadataOptions:
+          HttpEndpoint: enabled
+          HttpProtocolIpv6: disabled
+          HttpPutResponseHopLimit: 1
+          HttpTokens: required
+          InstanceMetadataTags: disabled
+        Monitoring:
+          Enabled: true
+        NetworkInterfaces:
+          - AssociatePublicIpAddress: false
+            DeleteOnTermination: true
+            DeviceIndex: 0
+            Groups:
+              - Fn::GetAtt:
+                  - BuilderSecurityGroup
+                  - GroupId
+            SubnetId:
+              Ref: PrivateSubnet
+        TagSpecifications:
+          - ResourceType: instance
+            Tags:
+              - Key: Name
+                Value:
+                  Fn::Sub: ${AWS::StackName}-corpus-builder
+              - Key: MemorySplitCorpusBuilder
+                Value: "true"
+          - ResourceType: volume
+            Tags:
+              - Key: MemorySplitCorpusBuilder
+                Value: "true"
+        UserData:
+          Fn::Join:
+            - ""
+            - - Ref: BuilderUserDataGzipBase64Part1
+              - Ref: BuilderUserDataGzipBase64Part2
+              - Ref: BuilderUserDataGzipBase64Part3
+              - Ref: BuilderUserDataGzipBase64Part4
+              - Ref: BuilderUserDataGzipBase64Part5
+              - Ref: BuilderUserDataGzipBase64Part6
+      TagSpecifications:
+        - ResourceType: launch-template
+          Tags:
+            - Key: memorysplit:purpose
+              Value: corpus-builder
+      VersionDescription: memorysplit-corpus-builder-foundation-v1
+
+  S3Endpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: CorpusBucketLocation
+            Effect: Allow
+            Principal: "*"
+            Action: s3:GetBucketLocation
+            Resource:
+              Fn::GetAtt:
+                - ArtifactBucket
+                - Arn
+          - Sid: CorpusBucketListing
+            Effect: Allow
+            Principal: "*"
+            Action:
+              - s3:ListBucket
+              - s3:ListBucketVersions
+            Resource:
+              Fn::GetAtt:
+                - ArtifactBucket
+                - Arn
+            Condition:
+              "ForAnyValue:StringLike":
+                s3:prefix:
+                  - v2/builds
+                  - v2/builds/*
+                  - v2/packages
+                  - v2/packages/*
+                  - v2/sources
+                  - v2/sources/*
+          - Sid: ReadBuilderInputs
+            Effect: Allow
+            Principal: "*"
+            Action:
+              - s3:GetObject
+              - s3:GetObjectAttributes
+              - s3:GetObjectVersion
+            Resource:
+              - Fn::Sub: ${ArtifactBucket.Arn}/v2/packages/*
+              - Fn::Sub: ${ArtifactBucket.Arn}/v2/sources/*
+          - Sid: ReadWriteBuildArtifacts
+            Effect: Allow
+            Principal: "*"
+            Action:
+              - s3:AbortMultipartUpload
+              - s3:GetObject
+              - s3:GetObjectAttributes
+              - s3:GetObjectVersion
+              - s3:ListMultipartUploadParts
+              - s3:PutObject
+            Resource:
+              - Fn::Sub: ${ArtifactBucket.Arn}/v2/builds/*
+      RouteTableIds:
+        - Ref: PrivateRouteTable
+      ServiceName:
+        Fn::Sub: com.amazonaws.${AWS::Region}.s3
+      VpcEndpointType: Gateway
+      VpcId:
+        Ref: Vpc
+
+  Ec2Endpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      PrivateDnsEnabled: true
+      SecurityGroupIds:
+        - Fn::GetAtt:
+            - EndpointSecurityGroup
+            - GroupId
+      ServiceName:
+        Fn::Sub: com.amazonaws.${AWS::Region}.ec2
+      SubnetIds:
+        - Ref: PrivateSubnet
+      VpcEndpointType: Interface
+      VpcId:
+        Ref: Vpc
+
+  Ec2MessagesEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      PrivateDnsEnabled: true
+      SecurityGroupIds:
+        - Fn::GetAtt:
+            - EndpointSecurityGroup
+            - GroupId
+      ServiceName:
+        Fn::Sub: com.amazonaws.${AWS::Region}.ec2messages
+      SubnetIds:
+        - Ref: PrivateSubnet
+      VpcEndpointType: Interface
+      VpcId:
+        Ref: Vpc
+
+  KmsEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      PrivateDnsEnabled: true
+      SecurityGroupIds:
+        - Fn::GetAtt:
+            - EndpointSecurityGroup
+            - GroupId
+      ServiceName:
+        Fn::Sub: com.amazonaws.${AWS::Region}.kms
+      SubnetIds:
+        - Ref: PrivateSubnet
+      VpcEndpointType: Interface
+      VpcId:
+        Ref: Vpc
+
+  LogsEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      PrivateDnsEnabled: true
+      SecurityGroupIds:
+        - Fn::GetAtt:
+            - EndpointSecurityGroup
+            - GroupId
+      ServiceName:
+        Fn::Sub: com.amazonaws.${AWS::Region}.logs
+      SubnetIds:
+        - Ref: PrivateSubnet
+      VpcEndpointType: Interface
+      VpcId:
+        Ref: Vpc
+
+  SsmEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      PrivateDnsEnabled: true
+      SecurityGroupIds:
+        - Fn::GetAtt:
+            - EndpointSecurityGroup
+            - GroupId
+      ServiceName:
+        Fn::Sub: com.amazonaws.${AWS::Region}.ssm
+      SubnetIds:
+        - Ref: PrivateSubnet
+      VpcEndpointType: Interface
+      VpcId:
+        Ref: Vpc
+
+  SsmMessagesEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      PrivateDnsEnabled: true
+      SecurityGroupIds:
+        - Fn::GetAtt:
+            - EndpointSecurityGroup
+            - GroupId
+      ServiceName:
+        Fn::Sub: com.amazonaws.${AWS::Region}.ssmmessages
+      SubnetIds:
+        - Ref: PrivateSubnet
+      VpcEndpointType: Interface
+      VpcId:
+        Ref: Vpc
+
+  StsEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      PrivateDnsEnabled: true
+      SecurityGroupIds:
+        - Fn::GetAtt:
+            - EndpointSecurityGroup
+            - GroupId
+      ServiceName:
+        Fn::Sub: com.amazonaws.${AWS::Region}.sts
+      SubnetIds:
+        - Ref: PrivateSubnet
+      VpcEndpointType: Interface
+      VpcId:
+        Ref: Vpc
+
+  MonthlyBudget:
+    Type: AWS::Budgets::Budget
+    Properties:
+      Budget:
+        BudgetLimit:
+          Amount: 200
+          Unit: USD
+        BudgetName:
+          Fn::Sub: ${AWS::StackName}-corpus-builder-monthly-cost
+        BudgetType: COST
+        TimeUnit: MONTHLY
+      NotificationsWithSubscribers:
+        - Notification:
+            ComparisonOperator: GREATER_THAN
+            NotificationType: ACTUAL
+            Threshold: 50
+            ThresholdType: PERCENTAGE
+          Subscribers:
+            - Address:
+                Ref: BudgetAlertEmail
+              SubscriptionType: EMAIL
+        - Notification:
+            ComparisonOperator: GREATER_THAN
+            NotificationType: ACTUAL
+            Threshold: 80
+            ThresholdType: PERCENTAGE
+          Subscribers:
+            - Address:
+                Ref: BudgetAlertEmail
+              SubscriptionType: EMAIL
+        - Notification:
+            ComparisonOperator: GREATER_THAN
+            NotificationType: FORECASTED
+            Threshold: 100
+            ThresholdType: PERCENTAGE
+          Subscribers:
+            - Address:
+                Ref: BudgetAlertEmail
+              SubscriptionType: EMAIL
+
+Outputs:
+  ArtifactBucketName:
+    Description: Retained versioned SSE-KMS corpus bucket name.
+    Value:
+      Ref: ArtifactBucket
+  BootstrapUserDataSha256:
+    Description: >-
+      Base64-decoded bootstrap gzip-member SHA-256 for downstream preflight
+      authorization.
+    Value:
+      Ref: BootstrapUserDataSha256
+  BuilderInstanceProfileArn:
+    Description: Corpus-builder instance profile ARN.
+    Value:
+      Fn::GetAtt:
+        - BuilderInstanceProfile
+        - Arn
+  BuilderRoleArn:
+    Description: Corpus-builder instance role ARN.
+    Value:
+      Fn::GetAtt:
+        - BuilderRole
+        - Arn
+  ControllerRoleArn:
+    Description: Separately assumed builder-controller role ARN.
+    Value:
+      Fn::GetAtt:
+        - ControllerRole
+        - Arn
+  DataKeyArn:
+    Description: Symmetric retained data KMS key ARN.
+    Value:
+      Fn::GetAtt:
+        - DataKey
+        - Arn
+  LaunchTemplateId:
+    Description: No-instance i4i.16xlarge launch template ID.
+    Value:
+      Ref: BuilderLaunchTemplate
+  LaunchTemplateVersion:
+    Description: Explicit latest launch template version number.
+    Value:
+      Fn::GetAtt:
+        - BuilderLaunchTemplate
+        - LatestVersionNumber
+  PrivateSubnetId:
+    Description: Private subnet ID approved for builder launches.
+    Value:
+      Ref: PrivateSubnet
+  SecurityGroupId:
+    Description: Zero-ingress builder security group ID.
+    Value:
+      Fn::GetAtt:
+        - BuilderSecurityGroup
+        - GroupId
+  SsmDocumentName:
+    Description: Immutable corpus-builder SSM command document name.
+    Value:
+      Ref: BuilderCommandDocument
+  VpcId:
+    Description: Private corpus-builder VPC ID.
+    Value:
+      Ref: Vpc
