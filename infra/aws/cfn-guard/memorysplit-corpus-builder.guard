@@ -435,8 +435,11 @@ rule launch_template_is_private_imdsv2_i4i {
   Parameters.BootstrapUserDataSha256 {
     Type == 'String'
     AllowedPattern == '^[0-9a-f]{64}$'
+    ConstraintDescription == 'Must be the lowercase SHA-256 of the base64-decoded gzip member.'
+    Description == 'SHA-256 of the gzip member produced by base64-decoding the exact concatenated Task 6 user-data payload; downstream preflight must verify it before launch.'
     Default !exists
   }
+  Outputs.BootstrapUserDataSha256.Description == 'Base64-decoded bootstrap gzip-member SHA-256 for downstream preflight authorization.'
   Outputs.BootstrapUserDataSha256.Value.Ref == 'BootstrapUserDataSha256'
   Outputs.BootstrapUserDataSha256.Export !exists
   Parameters.BuilderUserDataGzipBase64Part1 {

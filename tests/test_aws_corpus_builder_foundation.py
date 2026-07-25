@@ -224,10 +224,11 @@ USER_DATA_PARAMETER_NAMES = tuple(
     f"BuilderUserDataGzipBase64Part{index}" for index in range(1, 7)
 )
 USER_DATA_PARAMETER_MAX_LENGTHS = (4096, 4096, 4096, 4096, 4096, 1368)
-# SHA-256 of the ASCII base64 payload rendered by Task 6's fixture_config at
-# reviewed bootstrap commit 48835f7 (26,605 raw / 6,878 gzip / 9,172 base64).
-REVIEWED_TASK6_USER_DATA_SHA256 = (
-    "0381b939d78fb48b4ba6593ce3f5bc1472f22ed798f9cd79388f7030a40e80aa"
+BUILD_INVARIANT_USER_DATA_PART_LENGTHS = (4096, 4096, 4096, 504, 0, 0)
+BUILD_INVARIANT_USER_DATA_BASE64_BYTES = 12792
+BUILD_INVARIANT_USER_DATA_GZIP_BYTES = 9594
+BUILD_INVARIANT_USER_DATA_GZIP_SHA256 = (
+    "11f5fbfd7bee7a01e42956654020d21eeec7455305a2da3c8c7e9fb37a0b139f"
 )
 
 
@@ -742,7 +743,7 @@ def test_launch_template_joins_task6_gzip_base64_chunks_without_reencoding(
     assert data["InstanceInitiatedShutdownBehavior"] == "terminate"
 
 
-def test_reviewed_task6_payload_hash_fixture_is_required_and_exported(
+def test_build_invariant_task6_decoded_gzip_hash_is_required_and_exported(
     template,
 ):
     parameter = template["Parameters"]["BootstrapUserDataSha256"]
@@ -750,24 +751,49 @@ def test_reviewed_task6_payload_hash_fixture_is_required_and_exported(
         "Type": "String",
         "AllowedPattern": "^[0-9a-f]{64}$",
         "ConstraintDescription": (
-            "Must be the lowercase SHA-256 of the concatenated base64 payload."
+            "Must be the lowercase SHA-256 of the base64-decoded gzip member."
         ),
         "Description": (
-            "SHA-256 of the exact concatenated Task 6 gzip/base64 user-data "
-            "payload; downstream preflight must verify it before launch."
+            "SHA-256 of the gzip member produced by base64-decoding the exact "
+            "concatenated Task 6 user-data payload; downstream preflight must "
+            "verify it before launch."
         ),
     }
     assert re.fullmatch(
         parameter["AllowedPattern"],
-        REVIEWED_TASK6_USER_DATA_SHA256,
+        BUILD_INVARIANT_USER_DATA_GZIP_SHA256,
     )
     assert template["Outputs"]["BootstrapUserDataSha256"] == {
         "Description": (
-            "Reviewed bootstrap user-data SHA-256 for downstream preflight "
-            "authorization."
+            "Base64-decoded bootstrap gzip-member SHA-256 for downstream "
+            "preflight authorization."
         ),
         "Value": {"Ref": "BootstrapUserDataSha256"},
     }
+    assert sum(BUILD_INVARIANT_USER_DATA_PART_LENGTHS) == (
+        BUILD_INVARIANT_USER_DATA_BASE64_BYTES
+    )
+    assert BUILD_INVARIANT_USER_DATA_PART_LENGTHS[-2:] == (0, 0)
+    assert all(
+        actual <= maximum
+        for actual, maximum in zip(
+            BUILD_INVARIANT_USER_DATA_PART_LENGTHS,
+            USER_DATA_PARAMETER_MAX_LENGTHS,
+            strict=True,
+        )
+    )
+    assert BUILD_INVARIANT_USER_DATA_GZIP_BYTES < 16_384
+
+    guard = GUARD_PATH.read_text(encoding="utf-8")
+    assert (
+        "ConstraintDescription == 'Must be the lowercase SHA-256 of the "
+        "base64-decoded gzip member.'" in guard
+    )
+    assert (
+        "Description == 'SHA-256 of the gzip member produced by "
+        "base64-decoding the exact concatenated Task 6 user-data payload; "
+        "downstream preflight must verify it before launch.'" in guard
+    )
 
 
 def test_launch_template_matches_frozen_builder_profile(template):
