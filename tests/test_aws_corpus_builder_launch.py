@@ -191,6 +191,25 @@ def _described_instance(
     }
 
 
+def _instance_state_response(
+    instance_ids: list[str],
+    state: str,
+) -> dict[str, object]:
+    return {
+        "Reservations": [
+            {
+                "Instances": [
+                    {
+                        "InstanceId": instance_id,
+                        "State": {"Name": state},
+                    }
+                    for instance_id in instance_ids
+                ]
+            }
+        ]
+    }
+
+
 def _price_product(hourly_usd: str) -> str:
     return json.dumps(
         {
@@ -233,6 +252,7 @@ class FakeEc2:
         self.security_group_calls: list[dict[str, object]] = []
         self.run_calls: list[dict[str, object]] = []
         self.describe_calls: list[dict[str, object]] = []
+        self.termination_describe_calls: list[dict[str, object]] = []
         self.attribute_calls: list[dict[str, object]] = []
         self.terminate_calls: list[dict[str, object]] = []
         self.identity_response: dict[str, object] = {
@@ -285,7 +305,11 @@ class FakeEc2:
             "InstanceId": INSTANCE_ID,
             "InstanceInitiatedShutdownBehavior": {"Value": "terminate"},
         }
-        self.terminate_error: Exception | None = None
+        self.terminate_outcomes: list[object] = []
+        self.termination_describe_responses: list[object] = []
+        self.termination_default_state = "shutting-down"
+        self.termination_started = False
+        self.terminated_instance_ids: list[str] = []
 
     def get_caller_identity(self, **kwargs: object) -> dict[str, object]:
         self.identity_calls.append(dict(kwargs))
@@ -323,6 +347,18 @@ class FakeEc2:
         self.describe_calls.append(dict(kwargs))
         if "Filters" in kwargs:
             return deepcopy(self.replay_response)
+        if self.termination_started:
+            self.termination_describe_calls.append(dict(kwargs))
+            if self.termination_describe_responses:
+                response = self.termination_describe_responses.pop(0)
+                if isinstance(response, Exception):
+                    raise response
+                assert isinstance(response, dict)
+                return deepcopy(response)
+            return _instance_state_response(
+                self.terminated_instance_ids,
+                self.termination_default_state,
+            )
         if not self.describe_responses:
             return {"Reservations": []}
         response = self.describe_responses.pop(0)
@@ -340,9 +376,28 @@ class FakeEc2:
 
     def terminate_instances(self, **kwargs: object) -> dict[str, object]:
         self.terminate_calls.append(dict(kwargs))
-        if self.terminate_error is not None:
-            raise self.terminate_error
-        return {"TerminatingInstances": []}
+        instance_ids = kwargs.get("InstanceIds")
+        assert isinstance(instance_ids, list)
+        assert all(isinstance(value, str) for value in instance_ids)
+        self.termination_started = True
+        self.terminated_instance_ids = list(instance_ids)
+        if self.terminate_outcomes:
+            outcome = self.terminate_outcomes.pop(0)
+            if isinstance(outcome, Exception):
+                raise outcome
+            if outcome is not None:
+                assert isinstance(outcome, dict)
+                return deepcopy(outcome)
+        return {
+            "TerminatingInstances": [
+                {
+                    "CurrentState": {"Name": "shutting-down"},
+                    "InstanceId": instance_id,
+                    "PreviousState": {"Name": "running"},
+                }
+                for instance_id in instance_ids
+            ]
+        }
 
 
 def _launch(ec2: FakeEc2, *, payload: bytes = INTENT_BYTES):
@@ -747,19 +802,72 @@ def test_describe_failure_after_launch_terminates_then_raises():
     assert ec2.terminate_calls == [{"InstanceIds": [INSTANCE_ID]}]
 
 
-def test_cleanup_failure_is_reported_without_hiding_the_launch_mismatch():
+def test_cleanup_retries_transient_termination_and_confirms_state():
     ec2 = FakeEc2()
     instance = _described_instance()
     instance["ImageId"] = "ami-fedcba98765432100"
     ec2.describe_responses = [
         {"Reservations": [{"Instances": [instance]}]}
     ]
-    ec2.terminate_error = RuntimeError("terminate denied")
+    ec2.terminate_outcomes = [RuntimeError("throttled"), None]
+    ec2.termination_describe_responses = [
+        _instance_state_response([INSTANCE_ID], "running"),
+        _instance_state_response([INSTANCE_ID], "shutting-down"),
+    ]
 
-    with pytest.raises(LaunchError, match="termination failed"):
+    with pytest.raises(
+        LaunchError,
+        match="launched instance safety attributes do not match the intent",
+    ):
         _launch(ec2)
 
-    assert ec2.terminate_calls == [{"InstanceIds": [INSTANCE_ID]}]
+    assert ec2.terminate_calls == [
+        {"InstanceIds": [INSTANCE_ID]},
+        {"InstanceIds": [INSTANCE_ID]},
+    ]
+    assert ec2.termination_describe_calls == [
+        {"InstanceIds": [INSTANCE_ID]},
+        {"InstanceIds": [INSTANCE_ID]},
+    ]
+
+
+def test_cleanup_that_never_confirms_names_instance_and_manual_command():
+    ec2 = FakeEc2()
+    instance = _described_instance()
+    instance["ImageId"] = "ami-fedcba98765432100"
+    ec2.describe_responses = [
+        {"Reservations": [{"Instances": [instance]}]}
+    ]
+    ec2.terminate_outcomes = [
+        RuntimeError("terminate denied"),
+        RuntimeError("terminate denied"),
+        RuntimeError("terminate denied"),
+    ]
+    ec2.termination_default_state = "running"
+
+    with pytest.raises(LaunchError) as raised:
+        _launch(ec2)
+
+    message = str(raised.value)
+    assert INSTANCE_ID in message
+    assert (
+        "aws ec2 terminate-instances --profile sbsandbox "
+        f"--region us-east-1 --instance-ids {INSTANCE_ID}"
+    ) in message
+    assert ec2.terminate_calls == [
+        {"InstanceIds": [INSTANCE_ID]},
+        {"InstanceIds": [INSTANCE_ID]},
+        {"InstanceIds": [INSTANCE_ID]},
+    ]
+
+
+def test_lifecycle_uses_the_actual_described_ec2_launch_time():
+    ec2 = FakeEc2()
+
+    launch = _launch(ec2)
+
+    assert launch.launch_time == "2026-07-25T03:05:00Z"
+    assert launch.terminate_at == "2026-07-26T03:05:00Z"
 
 
 class FakeSession:
