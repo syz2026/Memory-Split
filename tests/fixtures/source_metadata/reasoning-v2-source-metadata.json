@@ -1,0 +1,232 @@
+{
+  "format": "memorysplit-reasoning-v2-source-metadata-record-v1",
+  "schema_version": 1,
+  "provenance": "synthetic-structural-fixture: response shapes mirror huggingface.co and git ls-remote; FineWeb-Edu and Wikidata5M digests and sizes are the independently reviewed values, every other digest and size is invented",
+  "git_ls_remote": {
+    "https://github.com/google-deepmind/clrs.git": {
+      "HEAD": "1a2b3c4d5e6f70819202a3b4c5d6e7f809111213\tHEAD\n"
+    },
+    "https://github.com/allenai/ruletaker.git": {
+      "HEAD": "2b3c4d5e6f708192a3b4c5d6e7f8091112131415\tHEAD\n"
+    },
+    "https://github.com/asaparov/prontoqa.git": {
+      "HEAD": "3c4d5e6f708192a3b4c5d6e7f809111213141516\tHEAD\n"
+    },
+    "https://github.com/open-thought/reasoning-gym.git": {
+      "HEAD": "4d5e6f708192a3b4c5d6e7f80911121314151617\tHEAD\n"
+    },
+    "https://github.com/google-deepmind/mathematics_dataset.git": {
+      "HEAD": "5e6f708192a3b4c5d6e7f8091112131415161718\tHEAD\n"
+    }
+  },
+  "huggingface_revision": {
+    "HuggingFaceTB/finemath": {
+      "main": {
+        "id": "HuggingFaceTB/finemath",
+        "sha": "8924e1b2f0f5c7bdd6c6ff9b8b0a2a5f3d1c0e7a",
+        "cardData": {
+          "license": "odc-by"
+        }
+      }
+    }
+  },
+  "huggingface_tree": {
+    "HuggingFaceFW/fineweb-edu": {
+      "87f09149ef4734204d70ed1d046ddc9ca3f2b8f9": [
+        {
+          "type": "directory",
+          "oid": "c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0",
+          "size": 0,
+          "path": "sample"
+        },
+        {
+          "type": "directory",
+          "oid": "c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1",
+          "size": 0,
+          "path": "sample/10BT"
+        },
+        {
+          "type": "file",
+          "oid": "c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2",
+          "size": 19811,
+          "path": "README.md"
+        },
+        {
+          "type": "file",
+          "oid": "c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3",
+          "size": 2152819114,
+          "path": "sample/10BT/000_00000.parquet",
+          "lfs": {
+            "oid": "b1ba7b2ce4cb5ea6ef42dca40263eabb85f37700d01693a68e9b30a31d78e871",
+            "size": 2152819114,
+            "pointerSize": 134
+          }
+        },
+        {
+          "type": "file",
+          "oid": "c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4",
+          "size": 2152222432,
+          "path": "sample/10BT/001_00000.parquet",
+          "lfs": {
+            "oid": "3fcf2dc69cd52503986276d3d2d26a8c356d0f2ea28a0de4fdbda8cf87755693",
+            "size": 2152222432,
+            "pointerSize": 134
+          }
+        },
+        {
+          "type": "file",
+          "oid": "c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5",
+          "size": 2151796315,
+          "path": "sample/10BT/002_00000.parquet",
+          "lfs": {
+            "oid": "547ae182d132c9f06b6ce63149567208ea9f57630bfd9b1a2938e504f0c9ebd7",
+            "size": 2151796315,
+            "pointerSize": 134
+          }
+        },
+        {
+          "type": "file",
+          "oid": "c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6",
+          "size": 512000000,
+          "path": "data/CC-MAIN-2024-10/train-00000-of-00020.parquet",
+          "lfs": {
+            "oid": "d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0",
+            "size": 512000000,
+            "pointerSize": 134
+          }
+        }
+      ]
+    },
+    "intfloat/wikidata5m": {
+      "6b2b09672129e280c0c9da97ab58154e9d535e6b": [
+        {
+          "type": "file",
+          "oid": "e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0",
+          "size": 1024,
+          "path": "README.md"
+        },
+        {
+          "type": "file",
+          "oid": "e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1",
+          "size": 197449751,
+          "path": "wikidata5m_alias.tar.gz",
+          "lfs": {
+            "oid": "0330f580c9f7a57cbad949ac380835fdd2a2e14d96cc0f13fc435401d6b463a8",
+            "size": 197449751,
+            "pointerSize": 135
+          }
+        },
+        {
+          "type": "file",
+          "oid": "e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2",
+          "size": 167247416,
+          "path": "wikidata5m_inductive.tar.gz",
+          "lfs": {
+            "oid": "955081232cc2de859710bfe3a147f7d8314524010fe5f8c420bb74fdfee4f42a",
+            "size": 167247416,
+            "pointerSize": 135
+          }
+        },
+        {
+          "type": "file",
+          "oid": "e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3",
+          "size": 168258214,
+          "path": "wikidata5m_transductive.tar.gz",
+          "lfs": {
+            "oid": "383160990b41c0905fc03f4a8afbb9b12be1ca3591e026bde6cdc94a59542597",
+            "size": 168258214,
+            "pointerSize": 135
+          }
+        }
+      ]
+    },
+    "HuggingFaceTB/finemath": {
+      "8924e1b2f0f5c7bdd6c6ff9b8b0a2a5f3d1c0e7a": [
+        {
+          "type": "directory",
+          "oid": "f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0",
+          "size": 0,
+          "path": "finemath-3plus"
+        },
+        {
+          "type": "directory",
+          "oid": "f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1",
+          "size": 0,
+          "path": "finemath-4plus"
+        },
+        {
+          "type": "file",
+          "oid": "f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2f2",
+          "size": 12345,
+          "path": "README.md"
+        },
+        {
+          "type": "file",
+          "oid": "f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3",
+          "size": 1000000001,
+          "path": "finemath-4plus/train-00000-of-00004.parquet",
+          "lfs": {
+            "oid": "a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0",
+            "size": 1000000001,
+            "pointerSize": 134
+          }
+        },
+        {
+          "type": "file",
+          "oid": "f4f4f4f4f4f4f4f4f4f4f4f4f4f4f4f4f4f4f4f4",
+          "size": 1000000002,
+          "path": "finemath-4plus/train-00001-of-00004.parquet",
+          "lfs": {
+            "oid": "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
+            "size": 1000000002,
+            "pointerSize": 134
+          }
+        },
+        {
+          "type": "file",
+          "oid": "f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5",
+          "size": 1000000003,
+          "path": "finemath-4plus/train-00002-of-00004.parquet",
+          "lfs": {
+            "oid": "a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2",
+            "size": 1000000003,
+            "pointerSize": 134
+          }
+        },
+        {
+          "type": "file",
+          "oid": "f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6",
+          "size": 1000000004,
+          "path": "finemath-4plus/train-00003-of-00004.parquet",
+          "lfs": {
+            "oid": "a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3",
+            "size": 1000000004,
+            "pointerSize": 134
+          }
+        },
+        {
+          "type": "file",
+          "oid": "f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7",
+          "size": 2000000001,
+          "path": "finemath-3plus/train-00000-of-00002.parquet",
+          "lfs": {
+            "oid": "b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0",
+            "size": 2000000001,
+            "pointerSize": 134
+          }
+        },
+        {
+          "type": "file",
+          "oid": "f8f8f8f8f8f8f8f8f8f8f8f8f8f8f8f8f8f8f8f8",
+          "size": 2000000002,
+          "path": "finemath-3plus/train-00001-of-00002.parquet",
+          "lfs": {
+            "oid": "b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1",
+            "size": 2000000002,
+            "pointerSize": 134
+          }
+        }
+      ]
+    }
+  }
+}
