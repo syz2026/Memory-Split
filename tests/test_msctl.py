@@ -577,14 +577,16 @@ def test_relative_release_exports_authenticated_absolute_archive(tmp_path):
         ("not-a-command",),
         ("submit",),
         ("cleanup", "apply"),
+        ("collect-cohort",),
         ("--help",),
+        ("collect-cohort", "--help"),
     ],
 )
 def test_every_cli_path_emits_exactly_one_json_object(arguments):
     completed = _run_msctl(*arguments)
 
     report = _single_report(completed)
-    if arguments == ("--help",):
+    if "--help" in arguments:
         assert completed.returncode == 0
         assert report["ok"] is True
         assert "help" in report["result"]
@@ -2859,6 +2861,24 @@ def _selected_authority_cli_arguments(tmp_path) -> list[str]:
             ],
             "collect",
         ),
+        (
+            [
+                "collect-cohort",
+                "--cohort-report-uri",
+                "s3://bucket/evaluations/cohort-report/sha256/"
+                + "a" * 64
+                + ".json",
+                "--cohort-report-sha256",
+                "a" * 64,
+                "--cohort-report-version-id",
+                "cohort-report-version-1",
+                "--evidence-index",
+                "cohort-evidence-index.json",
+                "--out",
+                "collected-cohort-evidence",
+            ],
+            "collect-cohort",
+        ),
     ],
 )
 def test_selected_dispatch_uses_fixed_authority_and_selected_constructor(
@@ -3103,6 +3123,181 @@ def test_local_collect_rejects_selected_arguments_and_requires_source(
         )
     assert getattr(caught.value, "code", None) == "CLI_USAGE"
     assert "--source" in caught.value.details["missing"]
+
+
+def _collect_cohort_cli_arguments(tmp_path) -> list[str]:
+    return [
+        "--cohort-report-uri",
+        "s3://bucket/evaluations/cohort-report/sha256/" + "a" * 64 + ".json",
+        "--cohort-report-sha256",
+        "a" * 64,
+        "--cohort-report-version-id",
+        "cohort-report-version-1",
+        "--evidence-index",
+        str(tmp_path / "cohort-evidence-index.json"),
+        "--out",
+        str(tmp_path / "cohort-evidence"),
+    ]
+
+
+def test_selected_collect_cohort_requires_the_complete_authority_group(
+    tmp_path,
+):
+    from msctl.cli import build_parser, dispatch
+
+    manifest_path = _write_json(
+        tmp_path / "runs-s9.json",
+        {"schema_version": 3, "seed": 9},
+    )
+
+    # An absent authority group is as fatal as a partial one: the exact
+    # missing list names every fixed authority argument.
+    args = build_parser().parse_args(
+        [
+            "--profile",
+            str(tmp_path / "aws-v3.json"),
+            "collect-cohort",
+            "--release",
+            str(tmp_path / "RELEASE.json"),
+            "--manifest",
+            str(manifest_path),
+            *_collect_cohort_cli_arguments(tmp_path),
+        ]
+    )
+    with pytest.raises(Exception) as caught:
+        dispatch(
+            args,
+            profile_loader=lambda _: _selected_cli_profile(),
+            aws_backend_factory=lambda **_: pytest.fail(
+                "collect-cohort must not build the legacy backend"
+            ),
+            selected_backend_factory=lambda **_: pytest.fail(
+                "an absent authority group must not build a backend"
+            ),
+            environ={"AWS_REGION": "us-east-1"},
+        )
+    assert getattr(caught.value, "code", None) == "CLI_USAGE"
+    missing = caught.value.details["missing"]
+    assert "--authority-root" in missing
+    assert "--approval-public-key" in missing
+
+    args = build_parser().parse_args(
+        [
+            "--profile",
+            str(tmp_path / "aws-v3.json"),
+            "collect-cohort",
+            "--release",
+            str(tmp_path / "RELEASE.json"),
+            "--manifest",
+            str(manifest_path),
+            "--authority-root",
+            str(tmp_path / "authority"),
+            *_collect_cohort_cli_arguments(tmp_path),
+        ]
+    )
+    with pytest.raises(Exception) as caught:
+        dispatch(
+            args,
+            profile_loader=lambda _: _selected_cli_profile(),
+            aws_backend_factory=lambda **_: pytest.fail(
+                "collect-cohort must not build the legacy backend"
+            ),
+            selected_backend_factory=lambda **_: pytest.fail(
+                "partial authority must not build the selected backend"
+            ),
+            environ={"AWS_REGION": "us-east-1"},
+        )
+    assert getattr(caught.value, "code", None) == "CLI_USAGE"
+    assert "--runtime-lock" in caught.value.details["missing"]
+
+
+def test_selected_collect_cohort_requires_complete_anchor_and_index(
+    tmp_path,
+):
+    from msctl.cli import build_parser, dispatch
+
+    manifest_path = _write_json(
+        tmp_path / "runs-s9.json",
+        {"schema_version": 3, "seed": 9},
+    )
+    args = build_parser().parse_args(
+        [
+            "--profile",
+            str(tmp_path / "aws-v3.json"),
+            "collect-cohort",
+            "--release",
+            str(tmp_path / "RELEASE.json"),
+            "--manifest",
+            str(manifest_path),
+            "--cohort-report-uri",
+            "s3://bucket/evaluations/cohort-report/sha256/"
+            + "a" * 64
+            + ".json",
+            "--out",
+            str(tmp_path / "cohort-evidence"),
+            *_selected_authority_cli_arguments(tmp_path),
+        ]
+    )
+    with pytest.raises(Exception) as caught:
+        dispatch(
+            args,
+            profile_loader=lambda _: _selected_cli_profile(),
+            aws_backend_factory=lambda **_: pytest.fail(
+                "collect-cohort must not build the legacy backend"
+            ),
+            selected_backend_factory=lambda **_: pytest.fail(
+                "an incomplete anchor triple must not build a backend"
+            ),
+            environ={
+                "AWS_REGION": "us-east-1",
+                "MS_AWS_INSTANCE_PROFILE_ARN": (
+                    "arn:aws:iam::123456789012:instance-profile/"
+                    "MemorySplitSelected"
+                ),
+            },
+        )
+    assert getattr(caught.value, "code", None) == "CLI_USAGE"
+    missing = caught.value.details["missing"]
+    assert "--cohort-report-sha256" in missing
+    assert "--cohort-report-version-id" in missing
+    assert "--evidence-index" in missing
+
+
+def test_collect_cohort_rejects_legacy_aws_and_local_routes(tmp_path):
+    from msctl.cli import build_parser, dispatch
+    from msctl.profile import SUPPORTED_PROFILE
+
+    args = build_parser().parse_args(
+        [
+            "collect-cohort",
+            "--release",
+            str(tmp_path / "RELEASE.json"),
+            "--manifest",
+            str(tmp_path / "runs.json"),
+            *_collect_cohort_cli_arguments(tmp_path),
+        ]
+    )
+
+    with pytest.raises(Exception) as caught:
+        dispatch(
+            args,
+            profile_loader=lambda _: _aws_profile_object(),
+            aws_backend_factory=lambda **_: pytest.fail(
+                "legacy AWS collect-cohort must not build a backend"
+            ),
+            environ={"AWS_REGION": "us-east-1"},
+        )
+    assert getattr(caught.value, "code", None) == "CLI_USAGE"
+
+    with pytest.raises(Exception) as caught:
+        dispatch(
+            args,
+            profile_loader=lambda _: SimpleNamespace(
+                provider=SUPPORTED_PROFILE
+            ),
+            environ={},
+        )
+    assert getattr(caught.value, "code", None) == "CLI_USAGE"
 
 
 def test_selected_arguments_are_forbidden_for_legacy_manifests(tmp_path):

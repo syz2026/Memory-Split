@@ -18,6 +18,21 @@ DATASET_RECEIPT_PATH: Final = "dataset/receipt.json"
 SEEDS: Final = tuple(range(10))
 ARMS: Final = ("dense", "split90")
 SNAPSHOT_STEPS: Final = (1_358, 3_396, 6_791, 10_187, 13_582)
+# The closed sorted member registry of one sealed-evaluation output
+# directory; mirror-pinned by tests against the aggregate/runner
+# registries so any drift fails the suite without importing evals here.
+EVALUATION_OUTPUT_MEMBERS: Final = (
+    "inference.json",
+    "items.jsonl",
+    "metrics.json",
+    "outcomes.jsonl",
+    "output.json",
+    "run.json",
+    "sealed-gold.jsonl",
+    "sealed-release.json",
+    "stores.jsonl",
+    "study-lock.json",
+)
 PACKAGE_FORMAT_VERSION: Final = 2
 AWS_RUNTIME_VERSION_FIELDS: Final = (
     "python",
@@ -341,6 +356,58 @@ def collection_receipt_key(seed: object, receipt_sha256: object) -> str:
     return f"receipts/collections/seed-{seed}/sha256/{digest}.json"
 
 
+def study_lock_object_key(sha256: object) -> str:
+    """Return the content-addressed published StudyLockV3 object key."""
+
+    digest = validate_sha256(sha256)
+    return f"evaluations/study-lock/sha256/{digest}.json"
+
+
+def cohort_report_object_key(sha256: object) -> str:
+    """Return the content-addressed published cohort report object key."""
+
+    digest = validate_sha256(sha256)
+    return f"evaluations/cohort-report/sha256/{digest}.json"
+
+
+def evaluation_output_member_key(
+    seed: object,
+    arm: object,
+    step: object,
+    member: object,
+    sha256: object,
+) -> str:
+    """Return one slot-scoped content-addressed evaluation member key."""
+
+    if type(seed) is not int or seed not in SEEDS:
+        raise ValueError(
+            "evaluation output seed must be an exact integer from 0 to 9"
+        )
+    if arm not in ARMS:
+        raise ValueError("evaluation output arm must be dense or split90")
+    if type(step) is not int or step not in SNAPSHOT_STEPS:
+        raise ValueError(
+            "evaluation output step must be in the frozen v3 schedule"
+        )
+    if member not in EVALUATION_OUTPUT_MEMBERS:
+        raise ValueError(
+            "evaluation output member must be in the closed ten-name set"
+        )
+    digest = validate_sha256(sha256)
+    stem, _, extension = member.rpartition(".")
+    return (
+        f"evaluations/outputs/seed-{seed}/{arm}/step-{step}/"
+        f"{stem}/sha256/{digest}.{extension}"
+    )
+
+
+def cohort_collection_receipt_key(receipt_sha256: object) -> str:
+    """Return the content-addressed cohort collection receipt key."""
+
+    digest = validate_sha256(receipt_sha256)
+    return f"receipts/cohort-collections/sha256/{digest}.json"
+
+
 __all__ = [
     "ARMS",
     "AWS_ENVIRONMENT_RECEIPT_V2_FIELDS",
@@ -353,6 +420,7 @@ __all__ = [
     "CONFIG_ROOT",
     "DATASET_POINTER_PATH",
     "DATASET_RECEIPT_PATH",
+    "EVALUATION_OUTPUT_MEMBERS",
     "EXPECTED_CONFIG_PATHS",
     "PACKAGE_FORMAT_VERSION",
     "PREREGISTRATION_ID",
@@ -364,8 +432,11 @@ __all__ = [
     "bootstrap_receipt_key",
     "checkpoint_object_key",
     "checkpoint_receipt_key",
+    "cohort_collection_receipt_key",
+    "cohort_report_object_key",
     "collection_receipt_key",
     "dataset_receipt_key",
+    "evaluation_output_member_key",
     "expected_config_paths",
     "allowed_gpu_product_names",
     "log_object_key",
@@ -374,6 +445,7 @@ __all__ = [
     "release_receipt_key",
     "run_receipt_key",
     "snapshot_object_key",
+    "study_lock_object_key",
     "validate_digest_pinned_oci_image",
     "validate_gpu_product_names",
     "validate_sha256",

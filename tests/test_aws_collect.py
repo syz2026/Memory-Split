@@ -1827,7 +1827,10 @@ def test_selected_cleanup_and_evaluate_stay_blocked_with_ten_collections(
         if command.startswith("cleanup"):
             message = str(caught.value)
             assert "ten per-seed collection receipts" in message
-            assert "sealed-evaluation" in message
+            assert "cohort evaluation-evidence collection receipt" in message
+            assert "Task 4E" in message
+        else:
+            assert "Task 4E" in str(caught.value)
     assert not any(
         "terminate-instances" in argv
         for argv, _operation in fixture.runner.calls

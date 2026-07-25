@@ -13,7 +13,14 @@ from collections.abc import Sequence
 from contextlib import contextmanager
 from pathlib import Path
 
-from .aws_contracts import collection_receipt_key, run_receipt_key
+from .aws_contracts import (
+    COHORT_ID,
+    cohort_collection_receipt_key,
+    cohort_report_object_key,
+    collection_receipt_key,
+    run_receipt_key,
+    study_lock_object_key,
+)
 from .aws_lifecycle import (
     LIFECYCLE_BINDING_FIELDS,
     ProviderLifecycleBinding,
@@ -217,6 +224,29 @@ AWS_COLLECTION_STATE_KEYS = {
     "created_at",
     "updated_at",
 } | set(LIFECYCLE_BINDING_FIELDS)
+AWS_COHORT_COLLECTION_STATE_KEYS = {
+    "schema_version",
+    "operation",
+    "provider",
+    "seed",
+    "run_manifest_sha256",
+    "release_sha256",
+    "release_receipt_sha256",
+    "sealed_evaluation_release_sha256",
+    "preregistration_sha256",
+    "study_lock",
+    "cohort_report",
+    "cohort_collection_receipt",
+    "objects_collected",
+    "bytes_collected",
+    "status",
+    "created_at",
+    "updated_at",
+} | set(LIFECYCLE_BINDING_FIELDS)
+# Exactly one cohort exists (COHORT_ID), so the local cohort collection
+# state is a singleton file: a second conflicting cohort receipt is
+# locally unrepresentable.
+_COHORT_COLLECTION_STATE_NAME = f"{COHORT_ID}.json"
 AWS_PAIR_INTENT_KEYS = {
     "schema_version",
     "provider",
@@ -680,6 +710,92 @@ def _validate_collection_state(
         _require_string(value[field], label=f"AWS collection state {field}")
 
 
+def _validate_cohort_collection_state(value: dict[str, object]) -> None:
+    require_exact_keys(
+        value,
+        AWS_COHORT_COLLECTION_STATE_KEYS,
+        label="AWS cohort collection state",
+    )
+    if (
+        type(value["schema_version"]) is not int
+        or value["schema_version"] != 2
+        or value["operation"] != "collect-cohort"
+        or value["provider"] not in _AWS_SELECTED_PROVIDERS
+        or value["status"] != "Published"
+    ):
+        raise MsctlError(
+            "STATE_CORRUPT",
+            "AWS cohort collection identity is invalid",
+        )
+    binding = _reconstruct_lifecycle_binding(
+        value,
+        label="AWS cohort collection lifecycle binding",
+    )
+    if binding.seed != 9:
+        raise MsctlError(
+            "STATE_CORRUPT",
+            "AWS cohort collection must bind the terminal seed 9",
+        )
+    for field in (
+        "run_manifest_sha256",
+        "release_sha256",
+        "release_receipt_sha256",
+        "sealed_evaluation_release_sha256",
+        "preregistration_sha256",
+    ):
+        require_sha256(
+            value[field],
+            label=f"AWS cohort collection state {field}",
+        )
+    for field, key_helper in (
+        ("study_lock", study_lock_object_key),
+        ("cohort_report", cohort_report_object_key),
+        ("cohort_collection_receipt", cohort_collection_receipt_key),
+    ):
+        row = require_object(
+            value[field],
+            label=f"AWS cohort collection state {field}",
+        )
+        require_exact_keys(
+            row,
+            {"bytes", "sha256", "uri", "version_id"},
+            label=f"AWS cohort collection state {field}",
+        )
+        digest = require_sha256(
+            row["sha256"],
+            label=f"AWS cohort collection state {field} hash",
+        )
+        expected_suffix = "/" + key_helper(digest)
+        if (
+            not isinstance(row["uri"], str)
+            or not row["uri"].startswith("s3://")
+            or not row["uri"].endswith(expected_suffix)
+            or not isinstance(row["version_id"], str)
+            or row["version_id"] in {"", "null"}
+            or type(row["bytes"]) is not int
+            or row["bytes"] <= 0
+        ):
+            raise MsctlError(
+                "STATE_CORRUPT",
+                f"AWS cohort collection state {field} is invalid",
+            )
+    if (
+        type(value["objects_collected"]) is not int
+        or value["objects_collected"] != 1_012
+        or type(value["bytes_collected"]) is not int
+        or value["bytes_collected"] <= 0
+    ):
+        raise MsctlError(
+            "STATE_CORRUPT",
+            "AWS cohort collection object accounting is invalid",
+        )
+    for field in ("created_at", "updated_at"):
+        _require_string(
+            value[field],
+            label=f"AWS cohort collection state {field}",
+        )
+
+
 def _validate_aws_v3_run_state(
     value: dict[str, object],
     run_id: str,
@@ -1044,6 +1160,7 @@ class StateStore:
         self._evaluations_fd: int | None = None
         self._intents_fd: int | None = None
         self._collections_fd: int | None = None
+        self._cohorts_fd: int | None = None
 
     def _state_error(self, error: Exception) -> MsctlError:
         return MsctlError(
@@ -1079,6 +1196,15 @@ class StateStore:
             )
         return self._collections_fd
 
+    def _require_cohorts_locked(self) -> int:
+        self._require_locked()
+        if self._cohorts_fd is None:
+            raise MsctlError(
+                "UNSAFE_STATE",
+                "state access requires the pinned state lock",
+            )
+        return self._cohorts_fd
+
     @contextmanager
     def locked(self):
         if self._root_fd is not None:
@@ -1088,6 +1214,7 @@ class StateStore:
         evaluations_fd: int | None = None
         intents_fd: int | None = None
         collections_fd: int | None = None
+        cohorts_fd: int | None = None
         try:
             root_fd = open_directory(
                 self.root,
@@ -1118,8 +1245,15 @@ class StateStore:
                 label="state collections",
                 create=True,
             )
+            cohorts_fd = open_directory_at(
+                root_fd,
+                "cohorts",
+                label="state cohorts",
+                create=True,
+            )
         except MsctlError as error:
             for descriptor in (
+                cohorts_fd,
                 collections_fd,
                 intents_fd,
                 evaluations_fd,
@@ -1134,6 +1268,7 @@ class StateStore:
         assert evaluations_fd is not None
         assert intents_fd is not None
         assert collections_fd is not None
+        assert cohorts_fd is not None
         lock_flags = (
             os.O_RDWR
             | os.O_CREAT
@@ -1148,6 +1283,7 @@ class StateStore:
         except (OSError, MsctlError) as error:
             if lock_fd is not None:
                 os.close(lock_fd)
+            os.close(cohorts_fd)
             os.close(collections_fd)
             os.close(intents_fd)
             os.close(evaluations_fd)
@@ -1160,6 +1296,7 @@ class StateStore:
         self._evaluations_fd = evaluations_fd
         self._intents_fd = intents_fd
         self._collections_fd = collections_fd
+        self._cohorts_fd = cohorts_fd
         lock_acquired = False
         try:
             fcntl.flock(lock_fd, fcntl.LOCK_EX)
@@ -1169,6 +1306,7 @@ class StateStore:
             if lock_acquired:
                 fcntl.flock(lock_fd, fcntl.LOCK_UN)
             os.close(lock_fd)
+            os.close(cohorts_fd)
             os.close(collections_fd)
             os.close(intents_fd)
             os.close(evaluations_fd)
@@ -1179,6 +1317,7 @@ class StateStore:
             self._evaluations_fd = None
             self._intents_fd = None
             self._collections_fd = None
+            self._cohorts_fd = None
 
     def _run_name(self, run_id: str) -> str:
         if RUN_ID_RE.fullmatch(run_id) is None:
@@ -1549,6 +1688,62 @@ class StateStore:
             self._collection_name(manifest_sha256),
             value,
             label="collection state",
+        )
+
+    def read_cohort_collection(self) -> dict[str, object] | None:
+        cohorts_fd = self._require_cohorts_locked()
+        try:
+            raw = load_json_at(
+                cohorts_fd,
+                _COHORT_COLLECTION_STATE_NAME,
+                label="cohort collection state",
+            )
+        except MsctlError as error:
+            if error.code == "FILE_NOT_FOUND":
+                return None
+            if error.code == "INVALID_JSON":
+                raise MsctlError(
+                    "STATE_CORRUPT",
+                    "cohort collection state is not valid JSON",
+                ) from error
+            raise MsctlError(
+                "UNSAFE_STATE",
+                "cohort collection state must be a regular file",
+            ) from error
+        try:
+            value = require_object(raw, label="cohort collection state")
+            _validate_cohort_collection_state(value)
+        except MsctlError as error:
+            raise MsctlError(
+                "STATE_CORRUPT",
+                "cohort collection state schema is invalid",
+            ) from error
+        return value
+
+    def write_cohort_collection(self, value: dict[str, object]) -> None:
+        cohorts_fd = self._require_cohorts_locked()
+        try:
+            _validate_cohort_collection_state(value)
+        except MsctlError as error:
+            raise MsctlError(
+                "STATE_CORRUPT",
+                "cohort collection state write schema is invalid",
+            ) from error
+        existing = self.read_cohort_collection()
+        if existing is not None and any(
+            existing[field] != value[field]
+            for field in AWS_COHORT_COLLECTION_STATE_KEYS
+            if field != "updated_at"
+        ):
+            raise MsctlError(
+                "STATE_CORRUPT",
+                "cohort collection state rewrite changes immutable fields",
+            )
+        atomic_write_json_at(
+            cohorts_fd,
+            _COHORT_COLLECTION_STATE_NAME,
+            value,
+            label="cohort collection state",
         )
 
     def _intent_name(self, submission_key: str) -> str:

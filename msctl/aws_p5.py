@@ -33,6 +33,7 @@ from cluster.aws.p5.canary import (
 )
 from cluster.aws.p5.checkpoint_mirror import _canonical_json
 from cluster.aws.p5.run_finalization import (
+    _RECEIPT_BINDING_FIELDS,
     FinalizationError,
     parse_run_finalization_receipt_bytes,
 )
@@ -52,8 +53,19 @@ from .aws_collect import (
     download_timeout_seconds,
     parse_seed_collection_receipt_bytes,
 )
+from .aws_cohort_collect import (
+    COHORT_COLLECTION_OBJECT_COUNT,
+    COHORT_COLLECTION_RECEIPT_TYPE,
+    CohortCollectionError,
+    _strict_json as _strict_cohort_json,
+    parse_cohort_collection_receipt_bytes,
+    parse_cohort_evidence_index,
+)
 from .aws_contracts import (
+    EVALUATION_OUTPUT_MEMBERS,
     bootstrap_receipt_key,
+    cohort_collection_receipt_key,
+    cohort_report_object_key,
     collection_receipt_key,
     run_receipt_key,
 )
@@ -92,6 +104,7 @@ from .fsutil import (
     open_directory_at,
     open_parent_at,
     open_regular_at,
+    read_fd,
     remove_tree_at,
     rename_noreplace_at,
 )
@@ -6075,6 +6088,1181 @@ class AwsP5Backend:
                 "idempotent": False,
             }
 
+    def _download_cohort_object(
+        self,
+        row: Mapping[str, object],
+        *,
+        kind: str,
+        local_path: str,
+    ) -> None:
+        """GET one exact-version evidence body through the bounded runner."""
+
+        prefix = self.runtime.s3_root.rstrip("/") + "/"
+        bucket, key = self._s3_location(
+            str(row["uri"]).removeprefix(prefix)
+        )
+        argv = self._aws_argv(
+            "s3api",
+            "get-object",
+            "--bucket",
+            bucket,
+            "--key",
+            key,
+            "--version-id",
+            str(row["version_id"]),
+            "--checksum-mode",
+            "ENABLED",
+            local_path,
+            query=(
+                "{object:{checksum_sha256:ChecksumSHA256,"
+                "content_length:ContentLength,version_id:VersionId}}"
+            ),
+        )
+        try:
+            timeout_seconds = download_timeout_seconds(row["bytes"])
+        except CollectionError as error:
+            raise MsctlError(
+                "COHORT_COLLECT_OBJECT_MISMATCH",
+                "cohort evidence object size is invalid",
+            ) from error
+        try:
+            output = _aws_output_object(
+                self.download_runner.run_json(
+                    argv,
+                    operation=f"collect cohort {kind} body",
+                    timeout_seconds=timeout_seconds,
+                ),
+                {"object"},
+                label="cohort evidence body download",
+            )
+        except MsctlError as error:
+            if error.code in {"AWS_COMMAND_FAILED", "EXTERNAL_UNAVAILABLE"}:
+                raise MsctlError(
+                    "COHORT_COLLECT_INCOMPLETE",
+                    "cohort evidence object is unavailable",
+                    details={"uri": row["uri"]},
+                ) from error
+            raise
+        downloaded = _aws_output_object(
+            output["object"],
+            {"checksum_sha256", "content_length", "version_id"},
+            label="cohort evidence body object",
+        )
+        if (
+            downloaded["checksum_sha256"]
+            != base64.b64encode(
+                bytes.fromhex(str(row["sha256"]))
+            ).decode("ascii")
+            or downloaded["content_length"] != row["bytes"]
+            or downloaded["version_id"] != row["version_id"]
+        ):
+            raise MsctlError(
+                "COHORT_COLLECT_OBJECT_MISMATCH",
+                "cohort evidence object version or checksum differs",
+                details={"uri": row["uri"]},
+            )
+
+    def _rehash_staged_cohort_object(
+        self,
+        staging_fd: int,
+        relative: str,
+        *,
+        row: Mapping[str, object],
+        mode: int,
+        read: bool,
+    ) -> bytes | None:
+        """Independently stream-hash the descriptor-pinned staged bytes."""
+
+        try:
+            descriptor, parent_fd, _name = open_regular_at(
+                staging_fd,
+                relative,
+                label="collected cohort object",
+            )
+        except MsctlError as error:
+            raise MsctlError(
+                "COHORT_COLLECT_OBJECT_MISMATCH",
+                "cohort evidence object was not materialized as a regular "
+                "file",
+                details={"uri": row["uri"]},
+            ) from error
+        try:
+            size, digest = hash_fd(descriptor)
+            payload = read_fd(descriptor) if read else None
+            os.fchmod(descriptor, mode)
+        finally:
+            os.close(descriptor)
+            os.close(parent_fd)
+        if size != row["bytes"] or digest != row["sha256"]:
+            raise MsctlError(
+                "COHORT_COLLECT_OBJECT_MISMATCH",
+                "cohort evidence bytes differ from their declared identity",
+                details={"uri": row["uri"]},
+            )
+        return payload
+
+    def _fetch_cohort_evidence(
+        self,
+        staging_fd: int,
+        staging_path: Path,
+        relative: str,
+        *,
+        row: Mapping[str, object],
+        kind: str,
+        mode: int,
+        read: bool,
+    ) -> bytes | None:
+        directory_fd, _name = open_parent_at(
+            staging_fd,
+            relative,
+            label="cohort collection staging entry",
+            create=True,
+        )
+        os.close(directory_fd)
+        self._download_cohort_object(
+            row,
+            kind=kind,
+            local_path=str(staging_path / relative),
+        )
+        return self._rehash_staged_cohort_object(
+            staging_fd,
+            relative,
+            row=row,
+            mode=mode,
+            read=read,
+        )
+
+    def _require_cohort_selection_authority(
+        self,
+        selection: Mapping[str, object],
+        *,
+        label: str,
+    ) -> None:
+        """Require exact equality with the sealed evaluator authority."""
+
+        binding = self.lifecycle_binding
+        expected = {
+            "cohort_id": binding.cohort_id,
+            "provider_selection_sha256": binding.provider_selection_sha256,
+            "provider_selection_s3_version_id": (
+                binding.provider_selection_version_id
+            ),
+            "hardware_amendment_sha256": binding.hardware_amendment_sha256,
+            "selected_provider": binding.provider,
+            "profile_id": binding.profile_id,
+            "profile_sha256": binding.profile_sha256,
+            "runtime_lock_sha256": binding.runtime_lock_sha256,
+            "qualification_evidence_sha256": (
+                binding.qualification_evidence_sha256
+            ),
+            "environment_receipt_sha256": (
+                binding.qualification_environment_receipt_sha256
+            ),
+            "canary_receipt_sha256": (
+                binding.qualification_canary_receipt_sha256
+            ),
+            "approval_receipt_sha256": (
+                binding.qualification_approval_receipt_sha256
+            ),
+            "approval_public_key_sha256": (
+                binding.qualification_approval_public_key_sha256
+            ),
+        }
+        if any(
+            selection.get(field) != value
+            for field, value in expected.items()
+        ):
+            raise MsctlError(
+                "COHORT_COLLECT_EVIDENCE_INVALID",
+                f"{label} provider selection differs from the "
+                "authenticated cohort selection authority",
+            )
+
+    def _publish_cohort_collection_receipt(
+        self,
+        *,
+        payload: bytes,
+        digest: str,
+        request_id: str,
+        body_path: str,
+    ) -> str:
+        """Publish the cohort receipt no-replace and verify by exact HEAD."""
+
+        bucket, key = self._s3_location(
+            cohort_collection_receipt_key(digest)
+        )
+        checksum = base64.b64encode(bytes.fromhex(digest)).decode("ascii")
+        expected_metadata = {
+            "receipt-sha256": digest,
+            "receipt-type": COHORT_COLLECTION_RECEIPT_TYPE,
+            "request-id": request_id,
+        }
+        put = self._aws_argv(
+            "s3api",
+            "put-object",
+            "--bucket",
+            bucket,
+            "--key",
+            key,
+            "--body",
+            body_path,
+            "--checksum-algorithm",
+            "SHA256",
+            "--checksum-sha256",
+            checksum,
+            "--metadata",
+            ",".join(
+                f"{name}={value}"
+                for name, value in expected_metadata.items()
+            ),
+            "--if-none-match",
+            "*",
+            query=(
+                "{object:{checksum_sha256:ChecksumSHA256,"
+                "version_id:VersionId}}"
+            ),
+        )
+        put_version: str | None = None
+        try:
+            put_output = _aws_output_object(
+                self._run(
+                    put,
+                    operation="publish cohort collection receipt",
+                ),
+                {"object"},
+                label="S3 cohort collection receipt put",
+            )
+        except MsctlError as error:
+            if error.code != "AWS_COMMAND_FAILED":
+                raise
+            # A lost or conflicting no-replace PUT recovers only through
+            # the exact HEAD verification below.
+            put_output = None
+        if put_output is not None:
+            put_row = _aws_output_object(
+                put_output["object"],
+                {"checksum_sha256", "version_id"},
+                label="S3 cohort collection receipt put object",
+            )
+            if (
+                put_row["checksum_sha256"] != checksum
+                or not isinstance(put_row["version_id"], str)
+                or not put_row["version_id"]
+            ):
+                raise MsctlError(
+                    "COHORT_COLLECT_CONFLICT",
+                    "S3 did not confirm the immutable cohort collection "
+                    "receipt",
+                )
+            put_version = str(put_row["version_id"])
+        head = self._aws_argv(
+            "s3api",
+            "head-object",
+            "--bucket",
+            bucket,
+            "--key",
+            key,
+            "--checksum-mode",
+            "ENABLED",
+            query=(
+                "{object:{checksum_sha256:ChecksumSHA256,"
+                "content_length:ContentLength,metadata:Metadata,"
+                "version_id:VersionId}}"
+            ),
+        )
+        try:
+            head_output = _aws_output_object(
+                self._run(
+                    head,
+                    operation="verify cohort collection receipt",
+                ),
+                {"object"},
+                label="S3 cohort collection receipt head",
+            )
+        except MsctlError as error:
+            if error.code == "AWS_COMMAND_FAILED":
+                raise MsctlError(
+                    "COHORT_COLLECT_CONFLICT",
+                    "published cohort collection receipt cannot be verified",
+                ) from error
+            raise
+        row = _aws_output_object(
+            head_output["object"],
+            {"checksum_sha256", "content_length", "metadata", "version_id"},
+            label="S3 cohort collection receipt object",
+        )
+        if (
+            row["checksum_sha256"] != checksum
+            or row["content_length"] != len(payload)
+            or row["metadata"] != expected_metadata
+            or not isinstance(row["version_id"], str)
+            or not row["version_id"]
+            or (
+                put_version is not None
+                and row["version_id"] != put_version
+            )
+        ):
+            raise MsctlError(
+                "COHORT_COLLECT_CONFLICT",
+                "published cohort collection receipt does not match local "
+                "bytes",
+            )
+        return str(row["version_id"])
+
+    def _verify_published_cohort_collection_head(
+        self,
+        reference: Mapping[str, object],
+    ) -> None:
+        """Exact-HEAD verify the durably recorded cohort receipt."""
+
+        prefix = self.runtime.s3_root.rstrip("/") + "/"
+        uri = str(reference["uri"])
+        if not uri.startswith(prefix):
+            raise MsctlError(
+                "COHORT_COLLECT_INCOMPLETE",
+                "recorded cohort collection receipt is outside the pinned "
+                "S3 root",
+            )
+        bucket, key = self._s3_location(uri.removeprefix(prefix))
+        try:
+            output = _aws_output_object(
+                self._run(
+                    self._aws_argv(
+                        "s3api",
+                        "head-object",
+                        "--bucket",
+                        bucket,
+                        "--key",
+                        key,
+                        "--version-id",
+                        str(reference["version_id"]),
+                        "--checksum-mode",
+                        "ENABLED",
+                        query=(
+                            "{object:{checksum_sha256:ChecksumSHA256,"
+                            "content_length:ContentLength,"
+                            "version_id:VersionId}}"
+                        ),
+                    ),
+                    operation="verify published cohort collection receipt",
+                ),
+                {"object"},
+                label="published cohort collection receipt",
+            )
+        except MsctlError as error:
+            if error.code == "AWS_COMMAND_FAILED":
+                raise MsctlError(
+                    "COHORT_COLLECT_INCOMPLETE",
+                    "published cohort collection receipt is unavailable",
+                ) from error
+            raise
+        row = _aws_output_object(
+            output["object"],
+            {"checksum_sha256", "content_length", "version_id"},
+            label="published cohort collection receipt object",
+        )
+        if (
+            row["checksum_sha256"]
+            != base64.b64encode(
+                bytes.fromhex(str(reference["sha256"]))
+            ).decode("ascii")
+            or row["content_length"] != reference["bytes"]
+            or row["version_id"] != reference["version_id"]
+        ):
+            raise MsctlError(
+                "COHORT_COLLECT_INCOMPLETE",
+                "published cohort collection receipt differs from durable "
+                "state",
+            )
+
+    def collect_cohort_evidence(
+        self,
+        *,
+        release: object,
+        manifest: object,
+        cohort_report: Mapping[str, object] | None,
+        evidence_index: Path | str | None,
+        out: Path | str | None,
+        apply: bool,
+    ) -> dict[str, object]:
+        """Collect the 1,012 cohort evaluation-evidence objects durably.
+
+        Like per-seed collection, cohort collection requires no
+        paid-instance approval: it creates no capacity, sends no remote
+        command, and only publishes one content-addressed cohort collection
+        receipt. Every evidence body other than the report, the lock, the
+        ten seed collection receipts, and the 100 ``output.json`` manifests
+        stays bytes-opaque; outcome interpretation happens only inside the
+        function-locally imported Task 4C report replay.
+        """
+
+        # 1) Authenticate the manifest, release, and provider lifecycle,
+        #    then the exact operator anchor triple and evidence index.
+        self._validate_manifest(manifest)
+        self._validate_release(release, manifest)
+        if (
+            not self._selected_manifest_lifecycle(manifest)
+            or self.lifecycle_binding is None
+        ):
+            raise MsctlError(
+                "OPERATION_UNSUPPORTED",
+                "cohort evidence collection requires an authenticated "
+                "selected manifest",
+            )
+        binding = self.lifecycle_binding
+        if manifest.seed != 9:
+            # The terminal seed's instance is the one cleanup will later
+            # terminate; every other seed fails before any AWS call.
+            raise MsctlError(
+                "COHORT_COLLECT_EVIDENCE_INVALID",
+                "cohort evidence collection requires the terminal seed-9 "
+                "manifest",
+            )
+        if (
+            not isinstance(cohort_report, Mapping)
+            or set(cohort_report) != {"uri", "sha256", "version_id"}
+        ):
+            raise MsctlError(
+                "COHORT_COLLECT_EVIDENCE_INVALID",
+                "cohort collection requires the exact cohort report triple",
+            )
+        try:
+            report_sha256 = require_sha256(
+                cohort_report["sha256"],
+                label="cohort report",
+            )
+        except MsctlError as error:
+            raise MsctlError(
+                "COHORT_COLLECT_EVIDENCE_INVALID",
+                "cohort report SHA-256 is invalid",
+            ) from error
+        report_version = cohort_report["version_id"]
+        if (
+            not isinstance(report_version, str)
+            or report_version in {"", "null"}
+        ):
+            raise MsctlError(
+                "COHORT_COLLECT_EVIDENCE_INVALID",
+                "cohort report version ID must be a real non-null version",
+            )
+        report_key = cohort_report_object_key(report_sha256)
+        report_uri = cohort_report["uri"]
+        if report_uri != f"{self.runtime.s3_root}/{report_key}":
+            raise MsctlError(
+                "COHORT_COLLECT_EVIDENCE_INVALID",
+                "cohort report URI must use its canonical key under the "
+                "pinned S3 root",
+            )
+        if evidence_index is None:
+            raise MsctlError(
+                "CLI_USAGE",
+                "cohort evidence collection requires --evidence-index",
+            )
+        try:
+            index_payload = read_regular_input(
+                Path(evidence_index),
+                label="cohort evidence index",
+                maximum_bytes=64 * 1024 * 1024,
+            )
+        except (AttestationError, OSError) as error:
+            raise MsctlError(
+                "COHORT_COLLECT_EVIDENCE_INVALID",
+                "cohort evidence index is unreadable",
+            ) from error
+        try:
+            index = parse_cohort_evidence_index(
+                index_payload,
+                s3_root=self.runtime.s3_root,
+            )
+        except CohortCollectionError as error:
+            raise MsctlError(
+                "COHORT_COLLECT_EVIDENCE_INVALID",
+                f"cohort evidence index is invalid: {error}",
+            ) from error
+        report_row = dict(index["cohort_report"])
+        if (
+            report_row["uri"] != report_uri
+            or report_row["sha256"] != report_sha256
+            or report_row["version_id"] != report_version
+        ):
+            raise MsctlError(
+                "COHORT_COLLECT_EVIDENCE_INVALID",
+                "evidence index cohort report differs from the operator "
+                "anchor triple",
+            )
+        lock_row = dict(index["study_lock"])
+        if out is None:
+            raise MsctlError(
+                "CLI_USAGE",
+                "cohort evidence collection requires --out",
+            )
+        # 2) Validate the nonexisting, nonsymlink output destination.
+        destination = Path(out).absolute()
+        if destination.exists() or destination.is_symlink():
+            raise MsctlError(
+                "COHORT_COLLECT_DESTINATION_EXISTS",
+                "refusing to replace an existing cohort collection "
+                "destination",
+            )
+        report_relative = f"cohort-report-{report_sha256}/cohort-report.json"
+        bucket, key = self._s3_location(report_key)
+        first_get = self._aws_argv(
+            "s3api",
+            "get-object",
+            "--bucket",
+            bucket,
+            "--key",
+            key,
+            "--version-id",
+            report_version,
+            "--checksum-mode",
+            "ENABLED",
+            str(destination / report_relative),
+            query=(
+                "{object:{checksum_sha256:ChecksumSHA256,"
+                "content_length:ContentLength,version_id:VersionId}}"
+            ),
+        )
+        if not apply:
+            # Every later command depends on the fetched report contents,
+            # so the dry run performs zero AWS calls and renders only the
+            # first exact cohort-report GET.
+            return {
+                "provider": self.profile.provider,
+                "seed": manifest.seed,
+                "run_manifest_sha256": manifest.sha256,
+                "cohort_report": dict(cohort_report),
+                "out": str(destination),
+                "commands": [first_get],
+                "collected": 0,
+                "idempotent": False,
+            }
+
+        store = StateStore(self.state_root)
+        with store.locked():
+            # 3) Idempotent replay or conflict on the singleton cohort
+            #    state, before any AWS call.
+            existing = store.read_cohort_collection()
+            if existing is not None:
+                recorded_report = existing["cohort_report"]
+                if (
+                    any(
+                        recorded_report[field] != cohort_report[field]
+                        for field in ("uri", "sha256", "version_id")
+                    )
+                    or existing["study_lock"] != lock_row
+                    or existing["run_manifest_sha256"] != manifest.sha256
+                ):
+                    raise MsctlError(
+                        "COHORT_COLLECT_CONFLICT",
+                        "existing cohort collection state binds different "
+                        "anchors",
+                    )
+                self._verify_published_cohort_collection_head(
+                    existing["cohort_collection_receipt"]
+                )
+                return {
+                    "provider": self.profile.provider,
+                    "seed": manifest.seed,
+                    "run_manifest_sha256": manifest.sha256,
+                    "study_lock": dict(existing["study_lock"]),
+                    "cohort_report": dict(existing["cohort_report"]),
+                    "cohort_collection_receipt": dict(
+                        existing["cohort_collection_receipt"]
+                    ),
+                    "objects_collected": existing["objects_collected"],
+                    "bytes_collected": existing["bytes_collected"],
+                    "out": str(destination),
+                    "collected": 0,
+                    "idempotent": True,
+                }
+            request_id = secrets.token_hex(16)
+            parent_fd = open_directory(
+                destination.parent,
+                label="cohort collection destination parent",
+                create=True,
+            )
+            staging_name = (
+                f".{destination.name}.collect-cohort-{request_id}"
+            )
+            staging_path = destination.parent / staging_name
+            published = False
+            staging_fd: int | None = None
+            try:
+                os.mkdir(staging_name, mode=0o700, dir_fd=parent_fd)
+                staging_fd = open_directory_at(
+                    parent_fd,
+                    staging_name,
+                    label="cohort collection staging",
+                )
+                # 4) GET the cohort report by exact version, rehash, and
+                #    authenticate it against the index and the controller
+                #    authority.
+                report_bytes = self._fetch_cohort_evidence(
+                    staging_fd,
+                    staging_path,
+                    report_relative,
+                    row=report_row,
+                    kind="report",
+                    mode=0o444,
+                    read=True,
+                )
+                from evals.confirmatory.aggregate import CohortReport
+                from evals.confirmatory.contracts import (
+                    canonical_json_bytes,
+                )
+
+                try:
+                    report_value = CohortReport.from_dict(
+                        _strict_cohort_json(
+                            report_bytes,
+                            label="cohort report",
+                        )
+                    )
+                    if report_value.canonical_bytes != report_bytes:
+                        raise ValueError(
+                            "cohort report bytes are not canonical"
+                        )
+                except (
+                    CohortCollectionError,
+                    TypeError,
+                    ValueError,
+                ) as error:
+                    raise MsctlError(
+                        "COHORT_COLLECT_EVIDENCE_INVALID",
+                        f"cohort report is invalid: {error}",
+                    ) from error
+                for seed_row, receipt_row in zip(
+                    index["seed_collections"],
+                    report_value.collection_receipts,
+                    strict=True,
+                ):
+                    if any(
+                        receipt_row[field] != seed_row[field]
+                        for field in ("seed", "uri", "sha256", "version_id")
+                    ):
+                        raise MsctlError(
+                            "COHORT_COLLECT_EVIDENCE_INVALID",
+                            "cohort report collection receipts differ from "
+                            "the evidence index",
+                        )
+                if report_value.study_lock_sha256 != lock_row["sha256"]:
+                    raise MsctlError(
+                        "COHORT_COLLECT_EVIDENCE_INVALID",
+                        "cohort report study-lock commitment differs from "
+                        "the evidence index",
+                    )
+                if (
+                    report_value.sealed_evaluation_release_sha256
+                    != manifest.sealed_evaluation_release_sha256
+                    or report_value.preregistration_sha256
+                    != manifest.preregistration_sha256
+                ):
+                    raise MsctlError(
+                        "COHORT_COLLECT_EVIDENCE_INVALID",
+                        "cohort report sealed-evaluation commitments differ "
+                        "from the authenticated manifest",
+                    )
+                self._require_cohort_selection_authority(
+                    report_value.provider_selection,
+                    label="cohort report",
+                )
+                # 5) GET the study lock by exact version; its content hash
+                #    is the report's commitment; bind it to the controller
+                #    authority with boot rebound only.
+                from evals.confirmatory.study_lock import StudyLockV3
+
+                lock_relative = (
+                    f"study-lock-{lock_row['sha256']}/study-lock.json"
+                )
+                lock_bytes = self._fetch_cohort_evidence(
+                    staging_fd,
+                    staging_path,
+                    lock_relative,
+                    row=lock_row,
+                    kind="study lock",
+                    mode=0o444,
+                    read=True,
+                )
+                try:
+                    lock_value = StudyLockV3.from_dict(
+                        _strict_cohort_json(
+                            lock_bytes,
+                            label="study lock",
+                        )
+                    )
+                    if canonical_json_bytes(lock_value.to_dict()) != (
+                        lock_bytes
+                    ):
+                        raise ValueError(
+                            "study lock bytes are not canonical"
+                        )
+                except (
+                    CohortCollectionError,
+                    TypeError,
+                    ValueError,
+                ) as error:
+                    raise MsctlError(
+                        "COHORT_COLLECT_EVIDENCE_INVALID",
+                        f"study lock is invalid: {error}",
+                    ) from error
+                self._require_cohort_selection_authority(
+                    lock_value.provider_selection.to_dict(),
+                    label="study lock",
+                )
+                lock_binding = lock_value.lifecycle_binding(manifest.seed)
+                # A reboot between training and collection is legitimate;
+                # the exact instance and every other lifecycle commitment
+                # must match the authenticated controller binding.
+                if lock_binding != dataclass_replace(
+                    binding,
+                    boot_id=lock_binding.boot_id,
+                ):
+                    raise MsctlError(
+                        "COHORT_COLLECT_EVIDENCE_INVALID",
+                        "study lock seed-9 lifecycle differs from the "
+                        "authenticated provider authority",
+                    )
+                for lifecycle, seed_row in zip(
+                    lock_value.seed_lifecycles,
+                    index["seed_collections"],
+                    strict=True,
+                ):
+                    if (
+                        lifecycle.collection_receipt_s3_uri
+                        != seed_row["uri"]
+                        or lifecycle.collection_receipt_sha256
+                        != seed_row["sha256"]
+                        or lifecycle.collection_receipt_s3_version_id
+                        != seed_row["version_id"]
+                    ):
+                        raise MsctlError(
+                            "COHORT_COLLECT_EVIDENCE_INVALID",
+                            "study lock collection receipts differ from "
+                            "the evidence index",
+                        )
+                if (
+                    lock_value.sealed_evaluation_release_sha256
+                    != manifest.sealed_evaluation_release_sha256
+                ):
+                    raise MsctlError(
+                        "COHORT_COLLECT_EVIDENCE_INVALID",
+                        "study lock sealed-evaluation release differs from "
+                        "the authenticated manifest",
+                    )
+                uniform = lock_value.snapshots[0]
+                if (
+                    uniform.data_receipt_sha256
+                    != manifest.dataset_receipt_sha256
+                    or uniform.data_build_id != manifest.dataset_build_id
+                    or uniform.ordered_stream_sha256
+                    != manifest.ordered_stream_sha256
+                ):
+                    raise MsctlError(
+                        "COHORT_COLLECT_EVIDENCE_INVALID",
+                        "study lock dataset identity differs from the "
+                        "authenticated manifest",
+                    )
+                # 6) GET the ten per-seed collection receipts by exact
+                #    version; their full Task 3F parse happens inside the
+                #    replay's snapshot planning.
+                seed_payloads: dict[int, bytes] = {}
+                for seed_row in index["seed_collections"]:
+                    seed_relative = (
+                        f"seed-collections/seed-{seed_row['seed']}/"
+                        f"sha256/{seed_row['sha256']}.json"
+                    )
+                    seed_payloads[seed_row["seed"]] = (
+                        self._fetch_cohort_evidence(
+                            staging_fd,
+                            staging_path,
+                            seed_relative,
+                            row=seed_row,
+                            kind="seed collection receipt",
+                            mode=0o600,
+                            read=True,
+                        )
+                    )
+                # 7) For each of the 100 slots in frozen order: GET and
+                #    authenticate output.json, then GET its nine artifacts
+                #    bytes-opaquely into the replay-shaped staging tree.
+                output_ids: list[str] = []
+                for output in index["outputs"]:
+                    output_id = output["output_id"]
+                    output_ids.append(output_id)
+                    members = {
+                        row["member"]: row for row in output["members"]
+                    }
+                    manifest_row = members["output.json"]
+                    slot_index = output["slot_index"]
+                    manifest_bytes = self._fetch_cohort_evidence(
+                        staging_fd,
+                        staging_path,
+                        f"outputs/{output_id}/output.json",
+                        row=manifest_row,
+                        kind="output manifest",
+                        mode=0o600,
+                        read=True,
+                    )
+                    input_row = report_value.inputs[slot_index]
+                    if manifest_row["sha256"] != (
+                        input_row["output_commitment"]
+                    ):
+                        raise MsctlError(
+                            "COHORT_COLLECT_OBJECT_MISMATCH",
+                            "output manifest differs from the report "
+                            "commitment",
+                            details={"uri": manifest_row["uri"]},
+                        )
+                    try:
+                        manifest_value = _strict_cohort_json(
+                            manifest_bytes,
+                            label="output manifest",
+                        )
+                    except CohortCollectionError as error:
+                        raise MsctlError(
+                            "COHORT_COLLECT_OBJECT_MISMATCH",
+                            f"output manifest is invalid: {error}",
+                            details={"uri": manifest_row["uri"]},
+                        ) from error
+                    artifacts = manifest_value.get("artifacts")
+                    declared: dict[str, tuple[object, object]] = {}
+                    if isinstance(artifacts, list):
+                        for artifact_row in artifacts:
+                            if not isinstance(
+                                artifact_row,
+                                Mapping,
+                            ) or set(artifact_row) != {
+                                "path",
+                                "sha256",
+                                "bytes",
+                            }:
+                                declared = {}
+                                break
+                            declared[str(artifact_row["path"])] = (
+                                artifact_row["sha256"],
+                                artifact_row["bytes"],
+                            )
+                    expected_rows = {
+                        name: (
+                            members[name]["sha256"],
+                            members[name]["bytes"],
+                        )
+                        for name in EVALUATION_OUTPUT_MEMBERS
+                        if name != "output.json"
+                    }
+                    if declared != expected_rows:
+                        raise MsctlError(
+                            "COHORT_COLLECT_OBJECT_MISMATCH",
+                            "output artifact rows differ from the evidence "
+                            "index",
+                            details={"uri": manifest_row["uri"]},
+                        )
+                    if (
+                        manifest_value.get("output_id") != output_id
+                        or input_row["output_id"] != output_id
+                        or manifest_value.get("study_lock_sha256")
+                        != report_value.study_lock_sha256
+                        or manifest_value.get(
+                            "sealed_evaluation_release_sha256"
+                        )
+                        != report_value.sealed_evaluation_release_sha256
+                        or manifest_value.get("provider_selection_sha256")
+                        != binding.provider_selection_sha256
+                        or manifest_value.get(
+                            "provider_selection_s3_version_id"
+                        )
+                        != binding.provider_selection_version_id
+                        or manifest_value.get("seed") != output["seed"]
+                        or manifest_value.get("arm") != output["arm"]
+                        or manifest_value.get("optimizer_step")
+                        != output["optimizer_step"]
+                    ):
+                        raise MsctlError(
+                            "COHORT_COLLECT_OBJECT_MISMATCH",
+                            "output manifest lock, release, selection, or "
+                            "slot identity is crossed",
+                            details={"uri": manifest_row["uri"]},
+                        )
+                    for member in EVALUATION_OUTPUT_MEMBERS:
+                        if member == "output.json":
+                            continue
+                        self._fetch_cohort_evidence(
+                            staging_fd,
+                            staging_path,
+                            f"outputs/{output_id}/{member}",
+                            row=members[member],
+                            kind=f"{member} artifact",
+                            mode=0o600,
+                            read=False,
+                        )
+                # 8) Outcome replay: the complete Task 4C recomputation is
+                #    the only outcome authority.
+                from evals.confirmatory.aggregate import (
+                    CollectionReceiptEvidence,
+                    SnapshotOutputReference,
+                    validate_cohort_report,
+                )
+
+                try:
+                    references = tuple(
+                        SnapshotOutputReference(
+                            output_dir=(
+                                staging_path / "outputs" / output_id
+                            ),
+                            output_commitment=(
+                                report_value.inputs[slot_index][
+                                    "output_commitment"
+                                ]
+                            ),
+                        )
+                        for slot_index, output_id in enumerate(output_ids)
+                    )
+                    receipt_evidence = tuple(
+                        CollectionReceiptEvidence(
+                            payload=seed_payloads[seed_row["seed"]],
+                            uri=seed_row["uri"],
+                            sha256=seed_row["sha256"],
+                            version_id=seed_row["version_id"],
+                        )
+                        for seed_row in index["seed_collections"]
+                    )
+                    validate_cohort_report(
+                        report_value,
+                        outputs=references,
+                        collection_receipts=receipt_evidence,
+                        expected_study_lock_sha256=(
+                            report_value.study_lock_sha256
+                        ),
+                    )
+                except (TypeError, ValueError) as error:
+                    raise MsctlError(
+                        "COHORT_COLLECT_REPLAY_FAILED",
+                        f"cohort report replay diverged: {error}",
+                    ) from error
+                # 9) Build and self-parse the canonical cohort collection
+                #    receipt before any publication.
+                binding_values = binding.to_dict()
+                collection_value: dict[str, object] = {
+                    receipt_field: binding_values[binding_field]
+                    for receipt_field, binding_field in (
+                        _RECEIPT_BINDING_FIELDS.items()
+                    )
+                }
+                objects: list[dict[str, object]] = []
+                for output in index["outputs"]:
+                    for member_row in output["members"]:
+                        objects.append(
+                            {
+                                "arm": output["arm"],
+                                "bytes": member_row["bytes"],
+                                "kind": "output_member",
+                                "member": member_row["member"],
+                                "seed": output["seed"],
+                                "sha256": member_row["sha256"],
+                                "step": output["optimizer_step"],
+                                "uri": member_row["uri"],
+                                "version_id": member_row["version_id"],
+                            }
+                        )
+                for seed_row in index["seed_collections"]:
+                    objects.append(
+                        {
+                            "arm": None,
+                            "bytes": seed_row["bytes"],
+                            "kind": "seed_collection",
+                            "member": None,
+                            "seed": seed_row["seed"],
+                            "sha256": seed_row["sha256"],
+                            "step": None,
+                            "uri": seed_row["uri"],
+                            "version_id": seed_row["version_id"],
+                        }
+                    )
+                for kind, reference in (
+                    ("study_lock", lock_row),
+                    ("cohort_report", report_row),
+                ):
+                    objects.append(
+                        {
+                            "arm": None,
+                            "bytes": reference["bytes"],
+                            "kind": kind,
+                            "member": None,
+                            "seed": None,
+                            "sha256": reference["sha256"],
+                            "step": None,
+                            "uri": reference["uri"],
+                            "version_id": reference["version_id"],
+                        }
+                    )
+                if len(objects) != COHORT_COLLECTION_OBJECT_COUNT:
+                    raise MsctlError(
+                        "COHORT_COLLECT_INCOMPLETE",
+                        "cohort collection did not enumerate all 1012 "
+                        "objects",
+                    )
+                bytes_collected = sum(
+                    int(row["bytes"]) for row in objects
+                )
+                collection_value.update(
+                    {
+                        "receipt_type": COHORT_COLLECTION_RECEIPT_TYPE,
+                        "schema_version": 3,
+                        "complete": True,
+                        "request_id": request_id,
+                        "collected_at": datetime.now(UTC).strftime(
+                            "%Y-%m-%dT%H:%M:%SZ"
+                        ),
+                        "dataset_build_id": manifest.dataset_build_id,
+                        "dataset_receipt_sha256": (
+                            manifest.dataset_receipt_sha256
+                        ),
+                        "ordered_stream_sha256": (
+                            manifest.ordered_stream_sha256
+                        ),
+                        "release_sha256": manifest.release_sha256,
+                        "release_receipt_sha256": (
+                            manifest.release_receipt_sha256
+                        ),
+                        "run_manifest_sha256": manifest.sha256,
+                        "source_commit": manifest.source_commit,
+                        "source_tree": manifest.source_tree,
+                        "sealed_evaluation_release_sha256": (
+                            manifest.sealed_evaluation_release_sha256
+                        ),
+                        "preregistration_sha256": (
+                            manifest.preregistration_sha256
+                        ),
+                        "study_lock": dict(lock_row),
+                        "cohort_report": dict(report_row),
+                        "seed_collections": [
+                            dict(seed_row)
+                            for seed_row in index["seed_collections"]
+                        ],
+                        "objects": objects,
+                    }
+                )
+                collection_bytes = _canonical_json(collection_value)
+                collection_sha256 = hashlib.sha256(
+                    collection_bytes
+                ).hexdigest()
+                collection_uri = f"{self.runtime.s3_root}/" + (
+                    cohort_collection_receipt_key(collection_sha256)
+                )
+                try:
+                    parse_cohort_collection_receipt_bytes(
+                        collection_bytes,
+                        receipt_uri=collection_uri,
+                        receipt_sha256=collection_sha256,
+                        receipt_version_id="unpublished",
+                        expected_binding=binding,
+                    )
+                except CohortCollectionError as error:
+                    raise MsctlError(
+                        "COHORT_COLLECT_EVIDENCE_INVALID",
+                        f"built cohort collection receipt failed "
+                        f"self-parse: {error}",
+                    ) from error
+                receipt_relative = cohort_collection_receipt_key(
+                    collection_sha256
+                )
+                self._stage_collection_bytes(
+                    staging_fd,
+                    receipt_relative,
+                    collection_bytes,
+                )
+                # 10) Publish no-replace, checksum- and metadata-bound,
+                #     then verify by exact HEAD.
+                version_id = self._publish_cohort_collection_receipt(
+                    payload=collection_bytes,
+                    digest=collection_sha256,
+                    request_id=request_id,
+                    body_path=str(staging_path / receipt_relative),
+                )
+                collection_reference = {
+                    "uri": collection_uri,
+                    "sha256": collection_sha256,
+                    "version_id": version_id,
+                    "bytes": len(collection_bytes),
+                }
+                # 11) Atomically write the singleton cohort state, then
+                #     rename the staging tree no-replace.
+                now = _timestamp()
+                store.write_cohort_collection(
+                    {
+                        **binding_values,
+                        "schema_version": 2,
+                        "operation": "collect-cohort",
+                        "run_manifest_sha256": manifest.sha256,
+                        "release_sha256": manifest.release_sha256,
+                        "release_receipt_sha256": (
+                            manifest.release_receipt_sha256
+                        ),
+                        "sealed_evaluation_release_sha256": (
+                            manifest.sealed_evaluation_release_sha256
+                        ),
+                        "preregistration_sha256": (
+                            manifest.preregistration_sha256
+                        ),
+                        "study_lock": dict(lock_row),
+                        "cohort_report": dict(report_row),
+                        "cohort_collection_receipt": dict(
+                            collection_reference
+                        ),
+                        "objects_collected": (
+                            COHORT_COLLECTION_OBJECT_COUNT
+                        ),
+                        "bytes_collected": bytes_collected,
+                        "status": "Published",
+                        "created_at": now,
+                        "updated_at": now,
+                    }
+                )
+                try:
+                    rename_noreplace_at(
+                        parent_fd,
+                        staging_name,
+                        parent_fd,
+                        destination.name,
+                    )
+                except FileExistsError as error:
+                    raise MsctlError(
+                        "COHORT_COLLECT_DESTINATION_EXISTS",
+                        "refusing to replace an existing cohort collection "
+                        "destination",
+                    ) from error
+                published = True
+            finally:
+                if staging_fd is not None:
+                    os.close(staging_fd)
+                if not published:
+                    try:
+                        remove_tree_at(
+                            parent_fd,
+                            staging_name,
+                            label="cohort collection staging",
+                        )
+                    except MsctlError:
+                        pass
+                    except FileNotFoundError:
+                        pass
+                os.close(parent_fd)
+            # 12) Report the durable identities.
+            return {
+                "provider": self.profile.provider,
+                "seed": manifest.seed,
+                "run_manifest_sha256": manifest.sha256,
+                "study_lock": dict(lock_row),
+                "cohort_report": dict(report_row),
+                "cohort_collection_receipt": dict(collection_reference),
+                "objects_collected": COHORT_COLLECTION_OBJECT_COUNT,
+                "bytes_collected": bytes_collected,
+                "out": str(destination),
+                "collected": COHORT_COLLECTION_OBJECT_COUNT,
+                "idempotent": False,
+            }
+
     def _selected_prior_run_receipt(
         self,
         manifest: object,
@@ -9553,6 +10741,63 @@ class AwsP5Backend:
                 out=args.out,
                 apply=apply,
             )
+        if command == "collect-cohort":
+            apply = bool(getattr(args, "apply", False))
+            required = {
+                "release": getattr(args, "release", None),
+                "manifest": getattr(args, "manifest", None),
+                "cohort_report_uri": getattr(
+                    args,
+                    "cohort_report_uri",
+                    None,
+                ),
+                "cohort_report_sha256": getattr(
+                    args,
+                    "cohort_report_sha256",
+                    None,
+                ),
+                "cohort_report_version_id": getattr(
+                    args,
+                    "cohort_report_version_id",
+                    None,
+                ),
+                "evidence_index": getattr(args, "evidence_index", None),
+                "out": getattr(args, "out", None),
+            }
+            missing = [
+                f"--{name.replace('_', '-')}"
+                for name, value in required.items()
+                if value is None
+            ]
+            if missing:
+                raise MsctlError(
+                    "CLI_USAGE",
+                    "selected collect-cohort requires its complete "
+                    "argument set",
+                    details={"missing": missing},
+                )
+            release, manifest = self._load_bound_inputs(
+                release_path=required["release"],
+                manifest_path=required["manifest"],
+                repo_root=args.repo_root,
+            )
+            # Like selected collect, cohort collection needs no
+            # paid-instance approval: it creates no capacity and only
+            # publishes one content-addressed receipt.
+            return not apply, self.collect_cohort_evidence(
+                release=release,
+                manifest=manifest,
+                cohort_report={
+                    "uri": str(required["cohort_report_uri"]),
+                    "sha256": str(required["cohort_report_sha256"]),
+                    "version_id": str(
+                        required["cohort_report_version_id"]
+                    ),
+                },
+                evidence_index=required["evidence_index"],
+                out=required["out"],
+                apply=apply,
+            )
 
         if command in {
             "runs render",
@@ -9586,17 +10831,20 @@ class AwsP5Backend:
                 if command == "evaluate":
                     raise MsctlError(
                         "OPERATION_UNSUPPORTED",
-                        "AWS v3 evaluation awaits the later "
-                        "sealed-evaluation task",
+                        "AWS v3 evaluation awaits Task 4E "
+                        "selected-evaluation enablement",
                     )
-                # Per-seed collection receipts are necessary but never
-                # sufficient: even ten collection states cannot reach
-                # terminate-instances.
+                # Per-seed collection receipts and the cohort
+                # evaluation-evidence collection receipt are necessary but
+                # never sufficient: even ten collection states plus a
+                # valid cohort collection state cannot reach
+                # terminate-instances before cleanup enablement.
                 raise MsctlError(
                     "OPERATION_UNSUPPORTED",
                     "AWS v3 cleanup requires all ten per-seed collection "
-                    "receipts and cohort evaluation/report collection "
-                    "from the later sealed-evaluation task",
+                    "receipts, the cohort evaluation-evidence collection "
+                    "receipt, and cleanup enablement itself, which "
+                    "follows selected evaluation (Task 4E)",
                 )
             evidence = None
             if command in {"runs render", "submit", "resume", "evaluate"}:

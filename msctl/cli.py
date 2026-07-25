@@ -61,6 +61,7 @@ _SELECTED_LIFECYCLE_COMMANDS = {
     "status",
     "cancel",
     "collect",
+    "collect-cohort",
 }
 _SELECTED_COLLECT_ARGUMENTS = (
     "release",
@@ -68,6 +69,14 @@ _SELECTED_COLLECT_ARGUMENTS = (
     "run_receipt_uri",
     "run_receipt_sha256",
     "run_receipt_version_id",
+)
+_SELECTED_COHORT_COLLECT_ARGUMENTS = (
+    "release",
+    "manifest",
+    "cohort_report_uri",
+    "cohort_report_sha256",
+    "cohort_report_version_id",
+    "evidence_index",
 )
 _SELECTED_AUTHORITY_ARGUMENTS = (
     "authority_root",
@@ -299,6 +308,21 @@ def build_parser() -> JsonArgumentParser:
     _add_selected_authority_arguments(collect)
     collect.add_argument("--apply", action="store_true")
 
+    collect_cohort = _leaf(
+        commands,
+        "collect-cohort",
+        help_text="collect durable cohort evaluation evidence",
+    )
+    collect_cohort.add_argument("--release")
+    collect_cohort.add_argument("--manifest")
+    collect_cohort.add_argument("--cohort-report-uri")
+    collect_cohort.add_argument("--cohort-report-sha256")
+    collect_cohort.add_argument("--cohort-report-version-id")
+    collect_cohort.add_argument("--evidence-index")
+    collect_cohort.add_argument("--out")
+    _add_selected_authority_arguments(collect_cohort)
+    collect_cohort.add_argument("--apply", action="store_true")
+
     cleanup = _leaf(commands, "cleanup", help_text="safe cleanup lifecycle")
     cleanup_sub = cleanup.add_subparsers(dest="action", required=True)
     cleanup_plan = _leaf(cleanup_sub, "plan", help_text="render cleanup plan")
@@ -420,6 +444,14 @@ def _dispatch_selected_lifecycle(
         _require_cli_values(
             args,
             *_SELECTED_COLLECT_ARGUMENTS,
+            "out",
+        )
+    if command == "collect-cohort":
+        # The anchor triple, evidence index, and destination are
+        # all-or-none: partial sets fail with the exact missing list.
+        _require_cli_values(
+            args,
+            *_SELECTED_COHORT_COLLECT_ARGUMENTS,
             "out",
         )
     manifest_value = require_object(
@@ -614,7 +646,11 @@ def dispatch(
             for name in _SELECTED_AUTHORITY_ARGUMENTS
         }
         given = [name for name, value in provided.items() if value is not None]
-        if given and len(given) != len(_SELECTED_AUTHORITY_ARGUMENTS):
+        if (
+            given and len(given) != len(_SELECTED_AUTHORITY_ARGUMENTS)
+        ) or (command == "collect-cohort" and not given):
+            # collect-cohort is selected-only, so an absent authority
+            # group is as fatal as a partial one.
             raise MsctlError(
                 "CLI_USAGE",
                 "the fixed selected authority argument group must be complete",
@@ -642,6 +678,14 @@ def dispatch(
                 "selected P6 lifecycle requires the fixed authority "
                 "argument group",
             )
+    if command == "collect-cohort":
+        # Cohort evidence collection has no legacy AWS or local
+        # implementation: only the selected authenticated route exists.
+        raise MsctlError(
+            "CLI_USAGE",
+            "collect-cohort requires a selected v3 profile with the "
+            "fixed authority argument group",
+        )
     if provider == AWS_P5_PROFILE:
         if (
             command == "env ensure"

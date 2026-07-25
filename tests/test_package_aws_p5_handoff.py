@@ -191,6 +191,26 @@ def test_study_lock_builder_closure_is_required():
     )
 
 
+def test_cohort_collection_closure_is_required():
+    module = _load_module()
+
+    cohort_collection_members = {
+        "msctl/aws_cohort_collect.py",
+        # Runtime dependencies imported by the cohort collection module.
+        "cluster/aws/p5/checkpoint_mirror.py",
+        "cluster/aws/p5/run_finalization.py",
+        "msctl/aws_collect.py",
+        "msctl/aws_contracts.py",
+        "msctl/aws_lifecycle.py",
+        "msctl/errors.py",
+    }
+    assert cohort_collection_members <= module.REQUIRED_MEMBERS
+    assert all(
+        module._classification(path) == "included"
+        for path in cohort_collection_members
+    )
+
+
 def test_authenticated_package_metadata_comes_only_from_fixed_authority(
     tmp_path,
     monkeypatch,
@@ -593,6 +613,7 @@ def _minimal_repo(
         "msctl/aws_resume_launch.py": "RESUME_FORMAT = 3\n",
         "msctl/aws_seed_transition.py": "TRANSITION_FORMAT = 1\n",
         "msctl/aws_collect.py": "COLLECTION_FORMAT = 3\n",
+        "msctl/aws_cohort_collect.py": "COHORT_COLLECTION_FORMAT = 3\n",
         "msctl/aws_contracts.py": (
             REPO_ROOT / "msctl" / "aws_contracts.py"
         ).read_bytes(),

@@ -285,3 +285,166 @@ def test_bootstrap_receipt_key_rejects_foreign_instance_ids(value):
 
     with pytest.raises(ValueError, match="instance"):
         contract.bootstrap_receipt_key(value)
+
+
+def test_evaluation_output_members_are_the_closed_sorted_ten():
+    contract = _contracts()
+
+    assert contract.EVALUATION_OUTPUT_MEMBERS == (
+        "inference.json",
+        "items.jsonl",
+        "metrics.json",
+        "outcomes.jsonl",
+        "output.json",
+        "run.json",
+        "sealed-gold.jsonl",
+        "sealed-release.json",
+        "stores.jsonl",
+        "study-lock.json",
+    )
+    assert contract.EVALUATION_OUTPUT_MEMBERS == tuple(
+        sorted(contract.EVALUATION_OUTPUT_MEMBERS)
+    )
+    assert "EVALUATION_OUTPUT_MEMBERS" in contract.__all__
+
+
+def test_evaluation_output_members_mirror_aggregate_and_runner_registries():
+    import evals.confirmatory.aggregate as aggregate_module
+    import evals.confirmatory.runner as runner_module
+
+    contract = _contracts()
+
+    assert contract.EVALUATION_OUTPUT_MEMBERS == aggregate_module._OUTPUT_NAMES
+    assert contract.EVALUATION_OUTPUT_MEMBERS == tuple(
+        sorted((*runner_module._V3_OUTPUT_ARTIFACTS, "output.json"))
+    )
+
+
+def test_cohort_evaluation_object_keys_are_exact():
+    contract = _contracts()
+    digest = "0123456789abcdef" * 4
+
+    assert contract.study_lock_object_key(digest) == (
+        f"evaluations/study-lock/sha256/{digest}.json"
+    )
+    assert contract.cohort_report_object_key(digest) == (
+        f"evaluations/cohort-report/sha256/{digest}.json"
+    )
+    assert contract.cohort_collection_receipt_key(digest) == (
+        f"receipts/cohort-collections/sha256/{digest}.json"
+    )
+    for name in (
+        "study_lock_object_key",
+        "cohort_report_object_key",
+        "cohort_collection_receipt_key",
+        "evaluation_output_member_key",
+    ):
+        assert name in contract.__all__
+
+
+def test_evaluation_output_member_key_splits_stem_at_the_final_dot():
+    contract = _contracts()
+    digest = "0123456789abcdef" * 4
+
+    for seed in contract.SEEDS:
+        for arm in contract.ARMS:
+            for step in contract.SNAPSHOT_STEPS:
+                for member in contract.EVALUATION_OUTPUT_MEMBERS:
+                    stem, _, extension = member.rpartition(".")
+                    assert contract.evaluation_output_member_key(
+                        seed,
+                        arm,
+                        step,
+                        member,
+                        digest,
+                    ) == (
+                        f"evaluations/outputs/seed-{seed}/{arm}/step-{step}/"
+                        f"{stem}/sha256/{digest}.{extension}"
+                    )
+    assert contract.evaluation_output_member_key(
+        0,
+        "dense",
+        1_358,
+        "sealed-gold.jsonl",
+        digest,
+    ) == (
+        "evaluations/outputs/seed-0/dense/step-1358/sealed-gold/"
+        f"sha256/{digest}.jsonl"
+    )
+
+
+@pytest.mark.parametrize(
+    ("seed", "arm", "step", "member"),
+    [
+        (10, "dense", 1_358, "output.json"),
+        (-1, "dense", 1_358, "output.json"),
+        (True, "dense", 1_358, "output.json"),
+        ("1", "dense", 1_358, "output.json"),
+        (None, "dense", 1_358, "output.json"),
+        (1, "Dense", 1_358, "output.json"),
+        (1, "split", 1_358, "output.json"),
+        (1, None, 1_358, "output.json"),
+        (1, "dense", 1_359, "output.json"),
+        (1, "dense", True, "output.json"),
+        (1, "dense", "1358", "output.json"),
+        (1, "dense", 1_358, "weights.pt"),
+        (1, "dense", 1_358, "OUTPUT.JSON"),
+        (1, "dense", 1_358, "output"),
+        (1, "dense", 1_358, ""),
+        (1, "dense", 1_358, None),
+        (1, "dense", 1_358, b"output.json"),
+    ],
+    ids=[
+        "seed-ten",
+        "seed-negative",
+        "seed-bool",
+        "seed-text",
+        "seed-none",
+        "arm-case",
+        "arm-foreign",
+        "arm-none",
+        "step-off-schedule",
+        "step-bool",
+        "step-text",
+        "member-foreign",
+        "member-case",
+        "member-no-extension",
+        "member-empty",
+        "member-none",
+        "member-bytes",
+    ],
+)
+def test_evaluation_output_member_key_rejects_foreign_slots_or_members(
+    seed,
+    arm,
+    step,
+    member,
+):
+    contract = _contracts()
+
+    with pytest.raises(ValueError):
+        contract.evaluation_output_member_key(seed, arm, step, member, "a" * 64)
+
+
+@pytest.mark.parametrize(
+    "value",
+    ["A" * 64, "a" * 63, "g" * 64, "sha256:" + "a" * 64, b"a" * 64, None],
+    ids=["uppercase", "short", "non-hex", "algorithm-prefix", "bytes", "none"],
+)
+def test_cohort_evaluation_keys_reject_malformed_sha256(value):
+    contract = _contracts()
+
+    with pytest.raises(ValueError, match="SHA-256"):
+        contract.study_lock_object_key(value)
+    with pytest.raises(ValueError, match="SHA-256"):
+        contract.cohort_report_object_key(value)
+    with pytest.raises(ValueError, match="SHA-256"):
+        contract.cohort_collection_receipt_key(value)
+    with pytest.raises(ValueError, match="SHA-256"):
+        contract.evaluation_output_member_key(
+            0,
+            "dense",
+            1_358,
+            "output.json",
+            value,
+        )
