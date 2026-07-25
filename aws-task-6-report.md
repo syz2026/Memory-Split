@@ -2,10 +2,11 @@
 
 ## Status and scope
 
-Implemented the NVMe bootstrap renderer and runtime, the hard systemd termination
-watchdog, and focused tests. No CloudFormation file, package inventory, or file
-outside the assigned Task 6 ownership set was modified. No AWS API or network
-request was made during development or tests.
+Implemented the build-invariant NVMe bootstrap renderer and runtime, the hard
+systemd termination watchdog, the fixed SSM-stage builder entry point, and
+focused tests. No CloudFormation file, package inventory, or file outside the
+assigned Task 6 ownership set was modified. No AWS API or network request was
+made during development or tests.
 
 Owned implementation:
 
@@ -53,10 +54,12 @@ bounded marker-upload attempt, the same command produced:
 
 ## GREEN implementation
 
-`BootstrapConfig` reuses `S3ObjectVersion`. `render_bootstrap` validates both
-records through the existing closed contract, binds both objects to the build
-ID and KMS key, shell-quotes every rendered value, and emits deterministic
-user data.
+`render_bootstrap()` emits one deterministic stack-lifetime payload. The
+optional legacy `BootstrapConfig` argument is transition-only and deliberately
+ignored by rendering, so differing build parameters produce byte-identical
+output. The old exact-record helper remains available to Python callers but no
+record, build ID, KMS ARN, profile hash, worker count, or launch-intent hash is
+serialized into launch-template user data.
 
 The runtime:
 
@@ -71,13 +74,19 @@ The runtime:
 - enables the boot-anchored `23h30m` timer before runtime initialization,
   storage discovery, RAID/XFS work, or any network operation;
 - makes shutdown unconditional even when timeout-marker publication fails;
-- seeds the approved package with an exact-version AWS CLI read, then uses
-  Task 3 `download_exact_object` for both the package and source manifest;
-- verifies hashes, authority metadata, JSON manifest framing, and safe archive
-  members before the final `/opt/memorysplit` extraction;
-- runs the fixed driver path under `env -i` with an explicit allowlist; and
-- uploads the receipt and phase logs with SSE-KMS, then requests shutdown on
-  success or failure.
+- installs `/usr/local/bin/memorysplit-corpus-builder` only after the watchdog,
+  NVMe validation, RAID0/XFS creation, and owner-only directories are ready;
+- leaves the healthy instance running for the Task 5 SSM command while the
+  boot-anchored watchdog remains armed;
+- accepts only the five Task 5 command values at the fixed entry point, resolves
+  a single immutable S3 version for each content-addressed key, then pins every
+  HEAD and GET to that version ID;
+- verifies SSE-KMS authority, metadata SHA-256, byte count, streamed SHA-256,
+  a final exact-version HEAD, JSON framing, and safe archive members before
+  `/opt/memorysplit` installation;
+- runs the fixed driver under an explicit environment allowlist; and
+- requests shutdown after every SSM-stage success or failure, independently of
+  the still-armed watchdog.
 
 Implementation commit:
 
@@ -88,7 +97,7 @@ feat: bootstrap bounded NVMe corpus builds
 
 ## Verification evidence
 
-Required focused verification after the final implementation change:
+Initial implementation verification before the review follow-ups:
 
 ```text
 python -m pytest -q tests/test_aws_corpus_builder_bootstrap.py
@@ -116,70 +125,109 @@ python -m pytest -q \
 
 ## Exact launch-template wiring contract
 
-The foundation template must not duplicate bootstrap logic. Its immutable
-launch-template version must use the output of this sequence:
+The foundation template must not duplicate bootstrap logic or supply any
+per-build value to user data. Its immutable launch-template version must use
+the output of this exact sequence:
 
 ```python
 import base64
 import gzip
+import hashlib
 
-rendered = render_bootstrap(
-    BootstrapConfig(
-        build_id=approved_build_id,
-        package=approved_package_s3_object_version,
-        source_manifest=approved_source_manifest_s3_object_version,
-        kms_key_arn=approved_kms_key_arn,
-        profile_sha256=approved_profile_sha256,
-        launch_intent_sha256=approved_launch_intent_sha256,
-        workers=approved_worker_count,
-    )
-).encode("utf-8")
-user_data = base64.b64encode(
-    gzip.compress(rendered, compresslevel=9, mtime=0)
-).decode("ascii")
+rendered = render_bootstrap().encode("utf-8")
+compressed = gzip.compress(rendered, compresslevel=9, mtime=0)
+assert len(compressed) <= 16_384
+user_data = base64.b64encode(compressed).decode("ascii")
+bootstrap_user_data_sha256 = hashlib.sha256(
+    user_data.encode("ascii")
+).hexdigest()
+parts = [
+    user_data[index : index + 4096]
+    for index in range(0, len(user_data), 4096)
+]
 ```
 
-Assign `user_data` directly to `LaunchTemplateData.UserData`; it is already
-base64 encoded and must not be wrapped in a second `Fn::Base64`. AL2023
-cloud-init executes the gzip payload as the rendered shebang script. The
-rendered script takes zero positional arguments because every approved value is
-embedded and shell-quoted. Create and preflight a new explicit numeric launch
-template version whenever any field changes. `RunInstances` must not override
-user data.
+Split `user_data` at 4,096-character boundaries into the foundation's ordered
+`BuilderUserDataGzipBase64Part1` through `Part6` parameters and leave unused
+tail parts empty. Assign their exact concatenation directly to
+`LaunchTemplateData.UserData`; it is already base64 encoded and must not be
+wrapped in a second `Fn::Base64`. Set the stack parameter and output
+`BootstrapUserDataSha256` to `bootstrap_user_data_sha256`. `RunInstances` must
+not override user data.
 
-Compression is mandatory for the EC2 16 KiB decoded user-data limit. The
-current test fixture renders to 26,605 raw bytes, 6,878 deterministic gzip
-bytes, and 9,172 base64 bytes. Integration must reject a gzip payload over
-16,384 bytes.
+For commit `d3af78ae3bc4e5805fde06f8fa96ab41ec1bb9ec`, the authoritative
+deterministic payload is:
+
+```text
+UTF-8 rendered bytes: 36,486
+UTF-8 SHA-256:        7a551e1bc5bfc614c3ca699c8359b46143e4c10417a68be1f75b5b73edfdda37
+gzip bytes:           9,594
+gzip SHA-256:         11f5fbfd7bee7a01e42956654020d21eeec7455305a2da3c8c7e9fb37a0b139f
+base64 ASCII bytes:   12,792
+base64 SHA-256:       0e93ee325ff77776caf8e5e910e6a7b84850d901d5b596981ad3525fd5fff50d
+part lengths:         4,096, 4,096, 4,096, 504
+```
+
+The authoritative foundation/preflight value is the base64 SHA-256
+`0e93ee325ff77776caf8e5e910e6a7b84850d901d5b596981ad3525fd5fff50d`,
+matching the foundation parameter's "concatenated base64 payload" contract.
+Base64 decoding produces the 9,594-byte gzip member, 6,790 bytes below EC2's
+16,384-byte decoded user-data limit. AL2023 cloud-init decompresses it and
+executes the rendered shebang script.
+
+The payload installs the fixed executable expected by the Task 5 SSM document:
+
+```text
+/usr/local/bin/memorysplit-corpus-builder
+  --build-id '{{ BuildId }}'
+  --package-uri '{{ PackageUri }}'
+  --package-sha256 '{{ PackageSHA256 }}'
+  --source-manifest-uri '{{ SourceManifestUri }}'
+  --source-manifest-sha256 '{{ SourceManifestSHA256 }}'
+```
+
+Those five values exist only at SSM invocation time. Because the Task 5
+document does not carry S3 version IDs, the fixed entry point lists the exact
+content-addressed key, rejects delete markers or any history other than one
+object version, captures that sole version ID, and uses it for HEAD, GET, and
+the final HEAD. It never reads an unversioned "latest" object. The command
+fails closed if the key was overwritten, deleted, is outside `v2/packages/` or
+`v2/sources/`, or its metadata/content SHA-256 differs from the command.
 
 The launch template must retain
 `InstanceInitiatedShutdownBehavior: terminate`, IMDSv2-only metadata, the
 builder role, and no public IP. The AMI must provide `/usr/bin/aws` (CLI v2),
 Python 3, systemd, mdadm, XFS tools, util-linux, and coreutils. IAM must permit
-exact-version reads for both approved objects and SSE-KMS writes beneath
-`v2/builds/{build_id}/operational/`.
+`s3:ListBucketVersions`, exact-version reads for both approved objects, and
+SSE-KMS writes beneath `v2/builds/{build_id}/operational/`.
 
 ## Self-review and integration concerns
 
 - Scope review: only assigned implementation/test/report files changed; the
   untracked task brief remains untouched.
-- Authority review: every bootstrap object read carries a version ID and
-  SHA-256; no `aws s3 cp`, latest read, Git operation, token, or credential is
-  rendered.
+- Invariance review: tests render two configurations with different build IDs,
+  object URIs, version IDs, object hashes, profile hashes, launch-intent hashes,
+  and worker counts; both outputs are byte-identical and contain none of those
+  values.
+- Authority review: every SSM-stage object read captures one version ID before
+  GET and carries that ID through two HEADs plus the download; no `aws s3 cp`,
+  latest read, Git operation, token, or static credential is rendered.
 - Termination review: the timer starts before runtime/storage work and measures
   from boot; the timeout service requests shutdown before telemetry, bounds its
   upload attempt to five seconds, allows 15 seconds for the service, and retries
   shutdown from its EXIT trap.
-- Shell review: the checked-in script is executable, uses strict mode and
-  owner-only runtime paths, and the final driver receives only allowlisted
-  variables.
-- Remaining integration action outside this task's ownership: update the
-  deterministic package inventory so the approved seed contains
-  `bootstrap.py`, `contracts.py`, and `s3.py`, and provide the fixed
-  `/opt/memorysplit/scripts/aws_corpus_builder_driver.py` entry point.
-- Remaining infrastructure action outside this task's ownership: apply the
-  launch-template wiring above and ensure the selected AL2023 AMI contains AWS
-  CLI v2 at `/usr/bin/aws`.
+- Runtime review: the checked-in shell uses strict mode and owner-only runtime
+  paths; the installed Python entry point extracts regular files/directories
+  manually, never calls `extractall`, and gives the final driver only
+  allowlisted variables.
+- Remaining integration action outside this task's ownership: update both the
+  Task 5 foundation fixture and preflight fixture from the payload pinned from
+  `48835f7` to the authoritative base64 SHA-256 above, supply the new four
+  base64 parts, and ensure the selected AL2023 AMI contains AWS CLI v2 at
+  `/usr/bin/aws`.
+- Publishing must preserve one object version per content-addressed package or
+  source key. This is an intentional fail-closed consequence of the existing
+  five-parameter SSM contract, which does not pass version IDs.
 - Runtime NVMe, systemd, cloud-init gzip handling, and S3 behavior were not
   exercised on EC2 because this task explicitly prohibited AWS/network use.
 
@@ -248,7 +296,7 @@ The timeout service invokes `shutdown -h now` before constructing or uploading
 the marker. Marker upload is then best effort under a hard five-second timeout,
 the service has a 15-second start timeout, and the EXIT trap attempts shutdown
 again regardless of marker success. The main bootstrap failure trap likewise
-requests shutdown before uploading its failure log.
+requests shutdown without waiting for remote telemetry.
 
 Fix commit:
 
@@ -298,7 +346,104 @@ Self-review confirmed:
 - shutdown is initiated before either watchdog-marker or failure-log
   telemetry;
 - four-device instance-store selection, root exclusion, RAID0/XFS settings,
-  exact-version downloads, and credential-free rendered inputs are unchanged;
-  and
+  boot-relative termination, and credential-free user data are preserved; and
 - no CloudFormation, package inventory, AWS resource, or network operation was
   touched by this follow-up.
+
+## Integration follow-up: build-invariant user data
+
+### Root cause and boundary
+
+The prior payload embedded every `BootstrapConfig` field, including the
+preflight-produced launch-intent hash. That made the launch-template payload
+change per build and created a circular attestation: preflight could not verify
+the payload until it produced the value embedded inside that payload.
+
+The corrected boundary is:
+
+1. build-invariant user data arms the boot-relative watchdog first;
+2. it validates and mounts exactly four instance-store NVMe devices as
+   RAID0/XFS and creates owner-only directories;
+3. it installs the fixed SSM entry point and waits;
+4. Task 5 passes the five per-build values to that executable; and
+5. the entry point resolves and verifies exact S3 versions, installs the
+   package, runs the driver, and requests termination.
+
+The watchdog never depends on step 4. Before SSM supplies a build identity it
+writes a local timeout marker and shuts down. After the fixed entry point has
+validated the build and KMS authority, it atomically writes owner-only watchdog
+context so the already-armed service may also attempt the same bounded
+build-scoped marker upload.
+
+### RED evidence
+
+Tests were changed before production code to require no-argument canonical
+rendering, byte identity across different build configurations, absence of all
+fixture values, the fixed entry point, unique-version resolution, ambiguous
+history rejection, and the decoded user-data size gate.
+
+```text
+Command: python -m pytest -q tests/test_aws_corpus_builder_bootstrap.py
+Exit: 1
+Result: 6 failed, 15 passed
+Expected causes:
+  rendered output still differed between two builds
+  no fixed builder-entrypoint heredoc existed
+  no unique-version resolver existed
+  old runtime tests still described boot-stage package execution
+```
+
+Failing contract commit:
+
+```text
+92b148fa04cdcc7645a9d116bda782b3d5a41c58
+test: define invariant bootstrap boundary
+```
+
+### GREEN implementation
+
+`render_bootstrap()` now replaces its single marker with a constant comment;
+the canonical call has no argument. Passing either of the legacy test
+configurations is supported only for transition and cannot alter bytes.
+
+The user-data main path ends after watchdog activation, NVMe/RAID/XFS setup,
+receipt creation, and fixed-entrypoint installation. The embedded entry point
+accepts exactly the Task 5 flags, resolves a sole immutable version from each
+content-addressed key, performs version-pinned HEAD/GET/final-HEAD checks,
+rehashes both files, validates JSON and archive safety, and then runs the fixed
+driver. Its `finally` path requests shutdown whether argument processing,
+authority checks, extraction, or the driver succeeds or fails.
+
+Implementation commit:
+
+```text
+d3af78ae3bc4e5805fde06f8fa96ab41ec1bb9ec
+fix: make corpus bootstrap build invariant
+```
+
+### Final verification
+
+All commands were run after the implementation commit without AWS or network
+access:
+
+```text
+python -m pytest -q tests/test_aws_corpus_builder_bootstrap.py
+21 passed in 1.77s
+
+python -m pytest -q tests/test_aws_corpus_builder*.py
+105 passed in 2.33s
+
+python -m py_compile cluster/aws/corpus_builder/bootstrap.py
+exit 0, no output
+
+bash -n cluster/aws/corpus_builder/bootstrap.sh
+exit 0, no output
+
+git diff --check
+exit 0, no output
+```
+
+The payload measurement in the launch-template contract was generated twice
+from `render_bootstrap()`, asserted byte-identical, compressed with
+`compresslevel=9, mtime=0`, and encoded with standard base64. No AWS API,
+instance, CloudFormation stack, or network service was contacted.
