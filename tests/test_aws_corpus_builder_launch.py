@@ -3,7 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 from copy import deepcopy
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 
@@ -20,6 +20,8 @@ from scripts import aws_corpus_builder_launch
 
 
 NOW = datetime(2026, 7, 25, 3, 0, 0, tzinfo=timezone.utc)
+LAUNCH_TIME = datetime(2026, 7, 25, 3, 5, 0, tzinfo=timezone.utc)
+TARGET_ACCOUNT = "056956104102"
 AMI_ID = "ami-0123456789abcdef0"
 LAUNCH_TEMPLATE_ID = "lt-0123456789abcdef0"
 LAUNCH_TEMPLATE_VERSION = "3"
@@ -36,7 +38,8 @@ BUILD_ID = "b" * 64
 PROFILE_SHA256 = "a" * 64
 PACKAGE_SHA256 = "c" * 64
 SOURCE_MANIFEST_SHA256 = "d" * 64
-INSTANCE_ID = "i-builder"
+INSTANCE_ID = "i-0123456789abcdef0"
+SECOND_INSTANCE_ID = "i-fedcba98765432100"
 
 
 def _object_version(name: str, digest: str) -> S3ObjectVersion:
@@ -54,7 +57,12 @@ def _object_version(name: str, digest: str) -> S3ObjectVersion:
     )
 
 
-def _intent_bytes(*, not_after: str = "2026-07-25T03:30:00Z") -> bytes:
+def _intent_bytes(
+    *,
+    not_after: str = "2026-07-25T03:30:00Z",
+    ami_owner_id: str = TARGET_ACCOUNT,
+    instance_profile_arn: str = INSTANCE_PROFILE_ARN,
+) -> bytes:
     return launch_intent_to_bytes(
         LaunchIntent(
             format=LAUNCH_INTENT_FORMAT,
@@ -66,12 +74,12 @@ def _intent_bytes(*, not_after: str = "2026-07-25T03:30:00Z") -> bytes:
                 SOURCE_MANIFEST_SHA256,
             ),
             ami_id=AMI_ID,
-            ami_owner_id="056956104102",
+            ami_owner_id=ami_owner_id,
             launch_template_id=LAUNCH_TEMPLATE_ID,
             launch_template_version=LAUNCH_TEMPLATE_VERSION,
             subnet_id=SUBNET_ID,
             security_group_id=SECURITY_GROUP_ID,
-            instance_profile_arn=INSTANCE_PROFILE_ARN,
+            instance_profile_arn=instance_profile_arn,
             hourly_usd=Decimal("5.491"),
             max_compute_usd=Decimal("131.78"),
             not_after=not_after,
@@ -83,10 +91,11 @@ INTENT_BYTES = _intent_bytes()
 INTENT_SHA256 = hashlib.sha256(INTENT_BYTES).hexdigest()
 
 
-def _expected_tags() -> dict[str, str]:
+def _expected_tags(payload: bytes = INTENT_BYTES) -> dict[str, str]:
+    intent_sha256 = hashlib.sha256(payload).hexdigest()
     return {
         "MemorySplitCorpusBuilder": "true",
-        "Name": f"memorysplit-corpus-builder-{INTENT_SHA256}",
+        "Name": f"memorysplit-corpus-builder-{intent_sha256}",
     }
 
 
@@ -111,15 +120,22 @@ def _launch_template_data() -> dict[str, object]:
     }
 
 
-def _described_instance() -> dict[str, object]:
+def _described_instance(
+    *,
+    instance_id: str = INSTANCE_ID,
+    payload: bytes = INTENT_BYTES,
+    state: str = "pending",
+    launch_time: datetime = LAUNCH_TIME,
+) -> dict[str, object]:
     return {
         "ImageId": AMI_ID,
         "IamInstanceProfile": {
             "Arn": INSTANCE_PROFILE_ARN,
             "Id": "AIPAJUSTAFIXTURE",
         },
-        "InstanceId": INSTANCE_ID,
+        "InstanceId": instance_id,
         "InstanceType": "i4i.16xlarge",
+        "LaunchTime": launch_time,
         "MetadataOptions": {
             "HttpEndpoint": "enabled",
             "HttpTokens": "required",
@@ -146,11 +162,11 @@ def _described_instance() -> dict[str, object]:
                 "GroupName": "memorysplit-corpus-builder",
             }
         ],
-        "State": {"Code": 0, "Name": "pending"},
+        "State": {"Code": 0, "Name": state},
         "SubnetId": SUBNET_ID,
         "Tags": [
             {"Key": key, "Value": value}
-            for key, value in sorted(_expected_tags().items())
+            for key, value in sorted(_expected_tags(payload).items())
         ],
     }
 
@@ -191,12 +207,22 @@ def _price_product(hourly_usd: str) -> str:
 
 class FakeEc2:
     def __init__(self) -> None:
+        self.identity_calls: list[dict[str, object]] = []
         self.template_calls: list[dict[str, object]] = []
         self.price_calls: list[dict[str, object]] = []
+        self.security_group_calls: list[dict[str, object]] = []
         self.run_calls: list[dict[str, object]] = []
         self.describe_calls: list[dict[str, object]] = []
         self.attribute_calls: list[dict[str, object]] = []
         self.terminate_calls: list[dict[str, object]] = []
+        self.identity_response: dict[str, object] = {
+            "Account": TARGET_ACCOUNT,
+            "Arn": (
+                "arn:aws:sts::056956104102:"
+                "assumed-role/memorysplit-controller/test"
+            ),
+            "UserId": "AROAFIXTURE:test",
+        }
         self.template_response: dict[str, object] = {
             "LaunchTemplateVersions": [
                 {
@@ -210,6 +236,25 @@ class FakeEc2:
             "FormatVersion": "aws_v1",
             "PriceList": [_price_product("5.491")],
         }
+        self.security_group_responses: list[object] = [
+            {
+                "SecurityGroups": [
+                    {
+                        "GroupId": SECURITY_GROUP_ID,
+                        "IpPermissions": [],
+                    }
+                ]
+            },
+            {
+                "SecurityGroups": [
+                    {
+                        "GroupId": SECURITY_GROUP_ID,
+                        "IpPermissions": [],
+                    }
+                ]
+            },
+        ]
+        self.replay_response: dict[str, object] = {"Reservations": []}
         self.run_response: dict[str, object] = {
             "Instances": [{"InstanceId": INSTANCE_ID}]
         }
@@ -222,6 +267,10 @@ class FakeEc2:
         }
         self.terminate_error: Exception | None = None
 
+    def get_caller_identity(self, **kwargs: object) -> dict[str, object]:
+        self.identity_calls.append(dict(kwargs))
+        return deepcopy(self.identity_response)
+
     def describe_launch_template_versions(
         self,
         **kwargs: object,
@@ -233,12 +282,27 @@ class FakeEc2:
         self.price_calls.append(dict(kwargs))
         return deepcopy(self.price_response)
 
+    def describe_security_groups(
+        self,
+        **kwargs: object,
+    ) -> dict[str, object]:
+        self.security_group_calls.append(dict(kwargs))
+        if not self.security_group_responses:
+            return {"SecurityGroups": []}
+        response = self.security_group_responses.pop(0)
+        if isinstance(response, Exception):
+            raise response
+        assert isinstance(response, dict)
+        return deepcopy(response)
+
     def run_instances(self, **kwargs: object) -> dict[str, object]:
         self.run_calls.append(deepcopy(dict(kwargs)))
         return deepcopy(self.run_response)
 
     def describe_instances(self, **kwargs: object) -> dict[str, object]:
         self.describe_calls.append(dict(kwargs))
+        if "Filters" in kwargs:
+            return deepcopy(self.replay_response)
         if not self.describe_responses:
             return {"Reservations": []}
         response = self.describe_responses.pop(0)
@@ -388,12 +452,149 @@ def test_launch_rechecks_price_and_template_immediately_before_launch(failure: s
     assert ec2.terminate_calls == []
 
 
+def test_launch_refuses_an_active_instance_with_the_approved_intent_tag():
+    ec2 = FakeEc2()
+    ec2.replay_response = {
+        "Reservations": [
+            {
+                "Instances": [
+                    _described_instance(state="running"),
+                ]
+            }
+        ]
+    }
+
+    with pytest.raises(LaunchError, match="already has an active instance"):
+        _launch(ec2)
+
+    assert ec2.run_calls == []
+    assert ec2.describe_calls == [
+        {
+            "Filters": [
+                {
+                    "Name": "tag:MemorySplitCorpusBuilder",
+                    "Values": ["true"],
+                },
+                {
+                    "Name": "tag:Name",
+                    "Values": [
+                        f"memorysplit-corpus-builder-{INTENT_SHA256}"
+                    ],
+                },
+                {
+                    "Name": "instance-state-name",
+                    "Values": ["pending", "running", "stopping", "stopped"],
+                },
+            ]
+        }
+    ]
+
+
+def test_run_instances_uses_the_approved_hash_as_its_client_token():
+    ec2 = FakeEc2()
+
+    _launch(ec2)
+
+    assert ec2.run_calls[0]["ClientToken"] == INTENT_SHA256
+
+
+def test_launch_rechecks_expiry_after_all_read_only_checks():
+    expires = NOW + timedelta(seconds=10)
+    payload = _intent_bytes(not_after="2026-07-25T03:00:10Z")
+    ec2 = FakeEc2()
+
+    with pytest.raises(LaunchError, match="expired"):
+        launch_approved_builder(
+            payload,
+            approved_intent_sha256=hashlib.sha256(payload).hexdigest(),
+            ec2=ec2,
+            now=NOW,
+            clock=lambda: expires,
+        )
+
+    assert ec2.identity_calls == [{}]
+    assert len(ec2.template_calls) == 1
+    assert len(ec2.price_calls) == 1
+    assert ec2.security_group_calls == [
+        {"GroupIds": [SECURITY_GROUP_ID]}
+    ]
+    assert len(ec2.describe_calls) == 1
+    assert "Filters" in ec2.describe_calls[0]
+    assert ec2.run_calls == []
+
+
+@pytest.mark.parametrize(
+    "mismatch",
+    ("caller", "ami-owner", "instance-profile"),
+)
+def test_launch_requires_every_account_boundary_to_match_target(mismatch: str):
+    ec2 = FakeEc2()
+    payload = INTENT_BYTES
+    if mismatch == "caller":
+        ec2.identity_response["Account"] = "999999999999"
+    elif mismatch == "ami-owner":
+        payload = _intent_bytes(ami_owner_id="999999999999")
+    else:
+        payload = _intent_bytes(
+            instance_profile_arn=(
+                "arn:aws:iam::999999999999:"
+                "instance-profile/memorysplit-corpus-builder"
+            )
+        )
+
+    with pytest.raises(LaunchError, match="target AWS account"):
+        _launch(ec2, payload=payload)
+
+    assert ec2.identity_calls == [{}]
+    assert ec2.template_calls == []
+    assert ec2.price_calls == []
+    assert ec2.run_calls == []
+
+
+@pytest.mark.parametrize("stage", ("before-launch", "after-launch"))
+def test_launch_rejects_security_group_ingress_drift(stage: str):
+    ec2 = FakeEc2()
+    no_ingress = {
+        "SecurityGroups": [
+            {"GroupId": SECURITY_GROUP_ID, "IpPermissions": []}
+        ]
+    }
+    has_ingress = {
+        "SecurityGroups": [
+            {
+                "GroupId": SECURITY_GROUP_ID,
+                "IpPermissions": [
+                    {
+                        "FromPort": 22,
+                        "IpProtocol": "tcp",
+                        "IpRanges": [{"CidrIp": "0.0.0.0/0"}],
+                        "ToPort": 22,
+                    }
+                ],
+            }
+        ]
+    }
+    ec2.security_group_responses = (
+        [has_ingress] if stage == "before-launch" else [no_ingress, has_ingress]
+    )
+
+    with pytest.raises(LaunchError, match="security group has inbound rules"):
+        _launch(ec2)
+
+    if stage == "before-launch":
+        assert ec2.run_calls == []
+        assert ec2.terminate_calls == []
+    else:
+        assert len(ec2.run_calls) == 1
+        assert ec2.terminate_calls == [{"InstanceIds": [INSTANCE_ID]}]
+
+
 def test_launch_terminates_all_returned_instances_if_run_instances_returns_two():
     ec2 = FakeEc2()
     ec2.run_response = {
         "Instances": [
             {"InstanceId": INSTANCE_ID},
-            {"InstanceId": "i-second"},
+            {"InstanceId": SECOND_INSTANCE_ID},
         ]
     }
 
@@ -402,7 +603,7 @@ def test_launch_terminates_all_returned_instances_if_run_instances_returns_two()
 
     assert ec2.describe_calls == []
     assert ec2.terminate_calls == [
-        {"InstanceIds": [INSTANCE_ID, "i-second"]}
+        {"InstanceIds": [INSTANCE_ID, SECOND_INSTANCE_ID]}
     ]
 
 
