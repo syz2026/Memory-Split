@@ -28,6 +28,8 @@ Task 4B receipts-driven StudyLockV3 construction/publication: complete
   full suite 2980 passed with only the two pre-existing v2 cohort-release
   failures; committed package dry-run passed
 Task 4C receipts-driven cohort aggregation/report: implementation committed
-  commit 73e6528, review pending
+  commits 73e6528 + 181f3ef, review clean
   parent verification 310 + 209 + 495 + 8 passed, package 106 passed
+  full suite 3010 passed with only the two inherited v2 failures
+Task 4D durable cohort evaluation/report evidence: in progress
 selected evaluate/cleanup remain blocked
