@@ -9,11 +9,13 @@ import threading
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import FrozenInstanceError, replace
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
 
 import corpusgen.parallel as parallel
+from scripts import build_parallel_corpus as parallel_cli
 from corpusgen.parallel import publication as publication_module
 from corpusgen.parallel import safeio as safeio_module
 from corpusgen.parallel import workspace as workspace_module
@@ -2439,6 +2441,117 @@ def test_cli_runs_tiny_build_and_verification_end_to_end(tmp_path):
     )
     assert verify.returncode == 0, verify.stderr
     assert json.loads(verify.stdout) == receipt
+
+
+def test_production_cli_uses_verified_inputs_and_factory_sidecars(
+    tmp_path,
+    monkeypatch,
+    capsys,
+):
+    catalog = fixture_catalog(record_count=3)
+    renderer = FixtureRenderer()
+    dense = tmp_path / "dense.bin"
+    split90 = tmp_path / "split90.bin"
+    dense.write_bytes(b"\x01")
+    split90.write_bytes(b"\x00")
+    calls = {}
+
+    def load_inputs(**kwargs):
+        calls["factory"] = kwargs
+        return SimpleNamespace(
+            catalog=catalog,
+            renderer=renderer,
+            sidecars={
+                "dense_target_weights": dense,
+                "split90_target_weights": split90,
+            },
+        )
+
+    def build(actual_catalog, actual_renderer, config, output, **kwargs):
+        calls["build"] = (
+            actual_catalog,
+            actual_renderer,
+            config,
+            output,
+            kwargs,
+        )
+        return {"build_id": "a" * 64}
+
+    monkeypatch.setattr(parallel_cli, "load_verified_production_inputs", load_inputs)
+    monkeypatch.setattr(
+        parallel_cli,
+        "_production_lane_weights",
+        lambda: (("natural", 1), ("facts", 1), ("reasoning", 1)),
+    )
+    monkeypatch.setattr(parallel_cli, "build_parallel_corpus", build)
+    source_lock = tmp_path / "source-lock.json"
+    source_root = tmp_path / "source-root"
+    derived_root = tmp_path / "derived-root"
+    output = tmp_path / "output"
+
+    result = parallel_cli.main(
+        [
+            "build-production",
+            "--source-lock",
+            str(source_lock),
+            "--source-root",
+            str(source_root),
+            "--derived-root",
+            str(derived_root),
+            "--generator-commit",
+            "b" * 40,
+            "--output",
+            str(output),
+            "--update-tokens",
+            "64",
+            "--shards",
+            "2",
+            "--workers",
+            "3",
+        ]
+    )
+
+    assert result == 0
+    assert calls["factory"] == {
+        "source_lock_path": source_lock,
+        "source_root": source_root,
+        "derived_root": derived_root,
+        "expected_generator_commit": "b" * 40,
+    }
+    built_catalog, built_renderer, config, destination, kwargs = calls["build"]
+    assert built_catalog is catalog
+    assert built_renderer is renderer
+    assert destination == output
+    assert config.update_tokens == 64
+    assert config.shard_count == 2
+    assert kwargs == {
+        "workers": 3,
+        "sidecar_paths": {
+            "dense_target_weights": dense,
+            "split90_target_weights": split90,
+        },
+    }
+    assert json.loads(capsys.readouterr().out)["build_id"] == "a" * 64
+
+
+def test_production_cli_has_no_free_form_source_argument(capsys):
+    with pytest.raises(SystemExit) as raised:
+        parallel_cli.main(["build-production", "--help"])
+
+    assert raised.value.code == 0
+    help_text = capsys.readouterr().out
+    for option in (
+        "--source-lock",
+        "--source-root",
+        "--derived-root",
+        "--generator-commit",
+        "--output",
+        "--update-tokens",
+        "--shards",
+        "--workers",
+    ):
+        assert option in help_text
+    assert "--source SOURCE" not in help_text
 
 
 def test_verification_receipt_publication_is_pinned_exact_and_idempotent(tmp_path):
