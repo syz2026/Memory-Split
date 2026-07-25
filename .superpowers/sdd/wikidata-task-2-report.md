@@ -1466,3 +1466,145 @@ Both static checks were silent with exit code zero.
 ### Concerns
 
 None.
+
+## Adopted-threat-model final review closure
+
+Status: `DONE`
+
+Implementation commit:
+`afecfe3aaeb0720db56c93c1376f4cee4b8a6ed5` —
+`fix: close Wikidata emergency quarantine exhaustion`.
+
+### Adopted threat model
+
+The builder is the sole workload on a dedicated, single-tenant EC2 instance,
+and no untrusted process shares its UID. Finite races, crashes, interrupted
+writes, concurrent legitimate builders, and accidental namespace reuse are in
+scope. An unbounded same-UID adversary that continuously races every
+rename/unlink is out of scope because POSIX cannot defend against that actor
+without privilege separation. Detectable ambiguity fails closed. Retry and
+classification paths remain explicitly bounded rather than chasing an
+infinite adversary. This model is also recorded in the module docstring.
+
+### Findings addressed
+
+1. Emergency-slot retry exhaustion now fsyncs and reclassifies the retained
+   candidate against the final, emergency, and original private names. If the
+   exact failed candidate remains at final, one terminal no-replace relocation
+   moves it back to its original unique `.build-*` name before raising. The
+   exception identifies the exact `wikidata/.build-*` cleanup path.
+2. If terminal relocation is impossible, the final name is reclassified
+   against the retained candidate descriptor before failure. The diagnostic
+   identifies the exact `wikidata/<receipt-sha256>` cleanup path, states that
+   the retained failed candidate was verified there, and says the path must
+   not be trusted.
+3. Every successful emergency move is followed by descriptor-based
+   classification before wrong-source restoration or failure. A different
+   final-name inode is preserved as a concurrent winner while the exact failed
+   candidate remains verified at emergency. If the exact candidate is moved
+   back to final, the bounded emergency loop retries it without treating it as
+   a winner or invoking wrong-source restoration.
+4. The four-attempt emergency bound is unchanged. Terminal relocation adds
+   one bounded no-replace operation and reuses the already allocated original
+   private name; it adds neither an unbounded retry nor a growing fallback
+   namespace.
+
+### TDD evidence
+
+Both parameterized regression tests were written before production changes,
+producing four cases:
+
+```bash
+python -m pytest -q \
+  tests/test_reasoning_v2_wikidata_source.py::test_persistent_emergency_occupation_reclassifies_and_names_cleanup_path \
+  tests/test_reasoning_v2_wikidata_source.py::test_emergency_postmove_reoccupation_is_identity_classified \
+  --basetemp=/tmp/memorysplit-wikidata-review-red
+```
+
+Exact RED result:
+
+```text
+FFFF                                                                     [100%]
+4 failed in 1.25s
+```
+
+The available-fallback case left the failed candidate at final, the blocked
+fallback was never attempted and named no cleanup path, a different concurrent
+winner caused a generic quarantine error, and the exact-candidate case entered
+wrong-source restoration before recognizing the retained candidate.
+
+The same selection after implementation:
+
+```text
+....                                                                     [100%]
+4 passed in 1.42s
+```
+
+The broader emergency selection also passed:
+
+```text
+........                                                                 [100%]
+8 passed, 81 deselected in 2.85s
+```
+
+### Final verification
+
+```bash
+python -m pytest -q tests/test_reasoning_v2_wikidata_source.py \
+  --basetemp=/tmp/memorysplit-wikidata-review-final
+```
+
+```text
+........................................................................ [ 80%]
+.................                                                        [100%]
+89 passed in 6.15s
+```
+
+```bash
+python -m pytest -q tests/test_reasoning_v2_source_lock.py \
+  --basetemp=/tmp/memorysplit-wikidata-review-final
+```
+
+```text
+........................................................................ [ 82%]
+...............                                                          [100%]
+87 passed in 3.54s
+```
+
+The first source-lock run inside the filesystem sandbox had one fixture
+failure and 86 passes because macOS denied Git creation of `.git/hooks`.
+The exact command was rerun outside the filesystem sandbox and passed as
+shown. No network or AWS access was enabled or used.
+
+```bash
+python -m py_compile \
+  corpusgen/reasoning_v2/wikidata_source.py \
+  tests/test_reasoning_v2_wikidata_source.py
+git diff --check
+```
+
+Both static checks were silent with exit code zero.
+
+### Self-review
+
+- The terminal relocation source is accepted only while the final name still
+  matches the retained candidate descriptor and creation identity. The
+  destination is no-replace, then fsynced and reclassified before its path is
+  reported.
+- A persistent emergency occupant is preserved. A different post-move final
+  inode is preserved. Only the exact retained failed candidate is retried or
+  relocated.
+- Successful fallback leaves final absent and identifies the retained
+  `.build-*` cleanup path. Injected relocation failure leaves the candidate at
+  final only with an explicit retained-identity diagnostic and exact cleanup
+  path; no caller can mistake that path for a verified winner.
+- The tests cover persistent slot occupation, successful terminal relocation,
+  genuinely blocked relocation, benign-winner reoccupation, and exact-candidate
+  reoccupation. All prior emergency and complete focused tests remain green.
+- The implementation commit contains exactly the authorized module/test
+  files. This appendix is the only report change. No amend, push, source
+  mutation, AWS operation, network operation, or other worktree edit occurred.
+
+### Concerns
+
+None.
