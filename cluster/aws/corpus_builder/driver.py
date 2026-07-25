@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import json
 import math
@@ -47,7 +48,15 @@ from corpusgen.parallel import (
     verify_parallel_corpus,
 )
 from corpusgen.parallel.canonical import canonical_json_bytes
-from corpusgen.parallel.safeio import atomic_rename_noreplace, fsync_directory
+from corpusgen.parallel.safeio import (
+    atomic_rename_noreplace,
+    entry_lstat,
+    fsync_directory,
+    list_entries,
+    open_directory_at,
+    open_directory_path,
+    read_regular_file,
+)
 from corpusgen.reasoning_v2.contracts import load_recipe
 from corpusgen.reasoning_v2.source_lock import (
     SourceLock,
@@ -72,6 +81,18 @@ PHASES = (
     "cleanroom-verify",
 )
 _LOCAL_OUTPUT_PHASES = frozenset(PHASES[:5])
+_ATTEMPT_OWNER_FORMAT = "memorysplit-aws-corpus-attempt-v1"
+_ATTEMPT_OWNER_NAME = ".owner.json"
+_ATTEMPT_LOCK_NAME = ".lock"
+_ATTEMPT_SUFFIX_RE = re.compile(r"[0-9a-f]{32}\Z")
+_CONTROL_READ_FLAGS = (
+    os.O_RDWR
+    | getattr(os, "O_CLOEXEC", 0)
+    | getattr(os, "O_NOFOLLOW", 0)
+    | getattr(os, "O_NONBLOCK", 0)
+)
+_CONTROL_CREATE_FLAGS = _CONTROL_READ_FLAGS | os.O_CREAT | os.O_EXCL
+_RMTREE_AVOIDS_SYMLINKS = shutil.rmtree.avoids_symlink_attacks
 
 _SHA256_RE = re.compile(r"[0-9a-f]{64}\Z")
 _COMMIT_RE = re.compile(r"[0-9a-f]{40}\Z")
@@ -300,6 +321,8 @@ class _BuildContext:
     attempt_phase: str | None = None
     attempt_container: Path | None = None
     attempt_output: Path | None = None
+    attempt_lock_fd: int = -1
+    attempt_identity: tuple[int, int] | None = None
 
 
 def _file_commitment(path: Path, description: str) -> tuple[int, str]:
@@ -440,6 +463,334 @@ def _phase_action_root(context: _BuildContext, phase: str) -> Path:
     return _phase_local_root(context.request, phase)
 
 
+def _directory_identity(metadata: os.stat_result) -> tuple[int, int]:
+    return metadata.st_dev, metadata.st_ino
+
+
+def _owned_directory(metadata: os.stat_result) -> bool:
+    return (
+        stat.S_ISDIR(metadata.st_mode)
+        and metadata.st_uid == os.geteuid()
+        and stat.S_IMODE(metadata.st_mode) == 0o700
+    )
+
+
+def _control_identity(
+    metadata: os.stat_result,
+) -> tuple[int, int, int, int, int, int]:
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_mode,
+        metadata.st_uid,
+        metadata.st_nlink,
+        metadata.st_size,
+    )
+
+
+def _owned_control_file(metadata: os.stat_result, *, size: int) -> bool:
+    return (
+        stat.S_ISREG(metadata.st_mode)
+        and metadata.st_uid == os.geteuid()
+        and stat.S_IMODE(metadata.st_mode) == 0o600
+        and metadata.st_nlink == 1
+        and metadata.st_size == size
+    )
+
+
+def _attempt_namespace(request: CorpusBuildRequest, phase: str) -> str:
+    stable = _phase_local_root(request, phase)
+    return hashlib.sha256(
+        canonical_json_bytes(
+            {
+                "phase": phase,
+                "request_seed": _request_seed(request),
+                "stable_root": os.fspath(stable),
+            }
+        )
+    ).hexdigest()
+
+
+def _attempt_name_prefix(request: CorpusBuildRequest, phase: str) -> str:
+    return f".memorysplit-corpus-attempt-{_attempt_namespace(request, phase)}-"
+
+
+def _is_owned_attempt_name(
+    request: CorpusBuildRequest,
+    phase: str,
+    name: str,
+) -> bool:
+    prefix = _attempt_name_prefix(request, phase)
+    return (
+        isinstance(name, str)
+        and name.startswith(prefix)
+        and _ATTEMPT_SUFFIX_RE.fullmatch(name[len(prefix) :]) is not None
+    )
+
+
+def _attempt_owner_bytes(
+    request: CorpusBuildRequest,
+    phase: str,
+    name: str,
+) -> bytes:
+    return canonical_json_bytes(
+        {
+            "build_id": request.build_id,
+            "format": _ATTEMPT_OWNER_FORMAT,
+            "name": name,
+            "phase": phase,
+            "request_seed": _request_seed(request),
+            "stable_root": os.fspath(_phase_local_root(request, phase)),
+        }
+    )
+
+
+def _write_attempt_owner(directory_fd: int, payload: bytes) -> None:
+    descriptor = os.open(
+        _ATTEMPT_OWNER_NAME,
+        _CONTROL_CREATE_FLAGS,
+        0o600,
+        dir_fd=directory_fd,
+    )
+    try:
+        remaining = memoryview(payload)
+        while remaining:
+            written = os.write(descriptor, remaining)
+            if written <= 0:
+                raise OSError("attempt ownership marker write did not advance")
+            remaining = remaining[written:]
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _open_proven_attempt(
+    request: CorpusBuildRequest,
+    phase: str,
+    parent_fd: int,
+    name: str,
+    *,
+    held_lock_fd: int | None = None,
+    expected_identity: tuple[int, int] | None = None,
+) -> tuple[int, int, tuple[int, int]] | None:
+    if not _is_owned_attempt_name(request, phase, name):
+        return None
+    directory_fd = -1
+    lock_fd = -1 if held_lock_fd is None else held_lock_fd
+    owns_lock_fd = held_lock_fd is None
+    keep_descriptors = False
+    try:
+        named_before = entry_lstat(parent_fd, name)
+        if not _owned_directory(named_before):
+            return None
+        directory_fd, _created = open_directory_at(parent_fd, name)
+        pinned = os.fstat(directory_fd)
+        identity = _directory_identity(pinned)
+        if (
+            not _owned_directory(pinned)
+            or identity != _directory_identity(named_before)
+            or (expected_identity is not None and identity != expected_identity)
+        ):
+            return None
+
+        owner_before = entry_lstat(directory_fd, _ATTEMPT_OWNER_NAME)
+        expected_owner = _attempt_owner_bytes(request, phase, name)
+        if not _owned_control_file(owner_before, size=len(expected_owner)):
+            return None
+        if read_regular_file(directory_fd, _ATTEMPT_OWNER_NAME) != expected_owner:
+            return None
+        owner_after = entry_lstat(directory_fd, _ATTEMPT_OWNER_NAME)
+        if _control_identity(owner_before) != _control_identity(owner_after):
+            return None
+
+        lock_named = entry_lstat(directory_fd, _ATTEMPT_LOCK_NAME)
+        if not _owned_control_file(lock_named, size=0):
+            return None
+        if held_lock_fd is None:
+            lock_fd = os.open(
+                _ATTEMPT_LOCK_NAME,
+                _CONTROL_READ_FLAGS,
+                dir_fd=directory_fd,
+            )
+        lock_pinned = os.fstat(lock_fd)
+        if (
+            not _owned_control_file(lock_pinned, size=0)
+            or _control_identity(lock_named) != _control_identity(lock_pinned)
+        ):
+            return None
+        if held_lock_fd is None:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        lock_after = entry_lstat(directory_fd, _ATTEMPT_LOCK_NAME)
+        named_after = entry_lstat(parent_fd, name)
+        if (
+            _control_identity(lock_after) != _control_identity(lock_pinned)
+            or not _owned_directory(named_after)
+            or _directory_identity(named_after) != identity
+            or _directory_identity(os.fstat(directory_fd)) != identity
+        ):
+            return None
+        keep_descriptors = True
+        return directory_fd, lock_fd, identity
+    except (OSError, ValueError):
+        return None
+    finally:
+        if not keep_descriptors:
+            if owns_lock_fd and lock_fd >= 0:
+                os.close(lock_fd)
+            if directory_fd >= 0:
+                os.close(directory_fd)
+
+
+def _remove_attempt_directory(
+    parent_fd: int,
+    name: str,
+    directory_fd: int,
+    expected_identity: tuple[int, int],
+) -> None:
+    if not _RMTREE_AVOIDS_SYMLINKS:
+        raise PublicationError("attempt reclamation requires symlink-safe rmtree")
+    try:
+        pinned = os.fstat(directory_fd)
+        named = entry_lstat(parent_fd, name)
+    except OSError as error:
+        raise PublicationError(
+            f"attempt reclamation identity check failed: {error}"
+        ) from error
+    if (
+        not _owned_directory(pinned)
+        or not _owned_directory(named)
+        or _directory_identity(pinned) != expected_identity
+        or _directory_identity(named) != expected_identity
+    ):
+        raise PublicationError("attempt reclamation directory identity changed")
+    try:
+        shutil.rmtree(name, dir_fd=parent_fd)
+        fsync_directory(parent_fd)
+    except FileNotFoundError:
+        return
+    except OSError as error:
+        raise PublicationError(f"attempt reclamation failed: {error}") from error
+
+
+def _reclaim_phase_attempts(context: _BuildContext, phase: str) -> None:
+    parent = _phase_local_root(context.request, phase).parent
+    try:
+        parent_fd = open_directory_path(parent)
+    except FileNotFoundError:
+        return
+    except (OSError, ValueError) as error:
+        raise PublicationError("attempt parent is missing or unsafe") from error
+    try:
+        try:
+            names = list_entries(parent_fd)
+        except OSError as error:
+            raise PublicationError("attempt parent inventory cannot be read") from error
+        for name in names:
+            proven = _open_proven_attempt(
+                context.request,
+                phase,
+                parent_fd,
+                name,
+            )
+            if proven is None:
+                continue
+            directory_fd, lock_fd, identity = proven
+            try:
+                _remove_attempt_directory(parent_fd, name, directory_fd, identity)
+            finally:
+                os.close(lock_fd)
+                os.close(directory_fd)
+    finally:
+        os.close(parent_fd)
+
+
+def _reclaim_owned_attempts(context: _BuildContext) -> None:
+    for phase in PHASES:
+        if phase in _LOCAL_OUTPUT_PHASES:
+            _reclaim_phase_attempts(context, phase)
+
+
+def _create_phase_attempt(context: _BuildContext, phase: str) -> None:
+    parent = _phase_local_root(context.request, phase).parent
+    try:
+        parent_fd = open_directory_path(parent, create=True, mode=0o700)
+    except (OSError, ValueError) as error:
+        raise PublicationError("private attempt parent cannot be opened") from error
+    name = ""
+    directory_fd = -1
+    lock_fd = -1
+    transferred_lock = False
+    try:
+        prefix = _attempt_name_prefix(context.request, phase)
+        for _attempt in range(16):
+            candidate = f"{prefix}{secrets.token_hex(16)}"
+            try:
+                os.mkdir(candidate, mode=0o700, dir_fd=parent_fd)
+            except FileExistsError:
+                continue
+            name = candidate
+            break
+        if not name:
+            raise PublicationError("cannot allocate a unique private attempt")
+        fsync_directory(parent_fd)
+        directory_fd, _created = open_directory_at(parent_fd, name)
+        metadata = os.fstat(directory_fd)
+        named = entry_lstat(parent_fd, name)
+        identity = _directory_identity(metadata)
+        if (
+            not _owned_directory(metadata)
+            or not _owned_directory(named)
+            or _directory_identity(named) != identity
+        ):
+            raise PublicationError("new private attempt identity is unsafe")
+
+        lock_fd = os.open(
+            _ATTEMPT_LOCK_NAME,
+            _CONTROL_CREATE_FLAGS,
+            0o600,
+            dir_fd=directory_fd,
+        )
+        lock_metadata = os.fstat(lock_fd)
+        if not _owned_control_file(lock_metadata, size=0):
+            raise PublicationError("new private attempt lock is unsafe")
+        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        _write_attempt_owner(
+            directory_fd,
+            _attempt_owner_bytes(context.request, phase, name),
+        )
+        fsync_directory(directory_fd)
+        fsync_directory(parent_fd)
+
+        container = parent / name
+        context.attempt_phase = phase
+        context.attempt_container = container
+        context.attempt_output = container / "output"
+        context.attempt_lock_fd = lock_fd
+        context.attempt_identity = identity
+        transferred_lock = True
+    except BaseException as error:
+        if name and directory_fd >= 0:
+            try:
+                _remove_attempt_directory(
+                    parent_fd,
+                    name,
+                    directory_fd,
+                    _directory_identity(os.fstat(directory_fd)),
+                )
+            except BaseException as cleanup_error:
+                error.add_note(
+                    "private attempt creation cleanup also failed: "
+                    f"{cleanup_error!r}"
+                )
+        raise
+    finally:
+        if not transferred_lock and lock_fd >= 0:
+            os.close(lock_fd)
+        if directory_fd >= 0:
+            os.close(directory_fd)
+        os.close(parent_fd)
+
+
 def _begin_phase_attempt(context: _BuildContext, phase: str) -> None:
     if phase not in _LOCAL_OUTPUT_PHASES:
         return
@@ -447,26 +798,94 @@ def _begin_phase_attempt(context: _BuildContext, phase: str) -> None:
         context.attempt_phase is not None
         or context.attempt_container is not None
         or context.attempt_output is not None
+        or context.attempt_lock_fd >= 0
+        or context.attempt_identity is not None
     ):
         raise PublicationError("another private phase attempt is already active")
-    stable = _phase_local_root(context.request, phase)
-    stable.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    container = Path(
-        tempfile.mkdtemp(
-            prefix=f".{stable.name}.{phase}.attempt-",
-            dir=stable.parent,
+    _reclaim_phase_attempts(context, phase)
+    _create_phase_attempt(context, phase)
+
+
+def _reclaim_current_attempt(context: _BuildContext) -> None:
+    container = context.attempt_container
+    phase = context.attempt_phase
+    identity = context.attempt_identity
+    if container is None or phase is None or identity is None:
+        return
+    try:
+        parent_fd = open_directory_path(container.parent)
+    except FileNotFoundError:
+        return
+    except (OSError, ValueError) as error:
+        raise PublicationError("active attempt parent is missing or unsafe") from error
+    try:
+        try:
+            entry_lstat(parent_fd, container.name)
+        except FileNotFoundError:
+            return
+        proven = _open_proven_attempt(
+            context.request,
+            phase,
+            parent_fd,
+            container.name,
+            held_lock_fd=context.attempt_lock_fd,
+            expected_identity=identity,
         )
-    )
-    os.chmod(container, 0o700)
-    context.attempt_phase = phase
-    context.attempt_container = container
-    context.attempt_output = container / "output"
+        if proven is None:
+            raise PublicationError("active attempt ownership cannot be proven")
+        directory_fd, _lock_fd, proven_identity = proven
+        try:
+            _remove_attempt_directory(
+                parent_fd,
+                container.name,
+                directory_fd,
+                proven_identity,
+            )
+        finally:
+            os.close(directory_fd)
+    finally:
+        os.close(parent_fd)
 
 
 def _clear_phase_attempt(context: _BuildContext) -> None:
+    lock_fd = context.attempt_lock_fd
     context.attempt_phase = None
     context.attempt_container = None
     context.attempt_output = None
+    context.attempt_lock_fd = -1
+    context.attempt_identity = None
+    if lock_fd >= 0:
+        try:
+            os.close(lock_fd)
+        except OSError as error:
+            raise PublicationError("private attempt lock cannot be closed") from error
+
+
+def _finish_phase_attempt(
+    context: _BuildContext,
+    primary_error: BaseException | None,
+) -> None:
+    cleanup_error: BaseException | None = None
+    try:
+        _reclaim_current_attempt(context)
+    except BaseException as error:
+        cleanup_error = error
+    try:
+        _clear_phase_attempt(context)
+    except BaseException as error:
+        if cleanup_error is None:
+            cleanup_error = error
+        else:
+            cleanup_error.add_note(
+                f"attempt lock close also failed: {error!r}"
+            )
+    if cleanup_error is None:
+        return
+    if primary_error is None:
+        raise cleanup_error
+    primary_error.add_note(
+        f"attempt reclamation also failed: {cleanup_error!r}"
+    )
 
 
 def _tree_commitments(
@@ -564,14 +983,7 @@ def _promote_phase_output(
         if destination_parent_fd >= 0:
             os.close(destination_parent_fd)
 
-    if promoted:
-        try:
-            shutil.rmtree(container)
-        except OSError as error:
-            raise PublicationError(
-                f"{phase} private attempt container cannot be removed"
-            ) from error
-    else:
+    if not promoted:
         attempted = _tree_commitments(
             source,
             description=f"{phase} private attempt artifact",
@@ -584,12 +996,6 @@ def _promote_phase_output(
             raise PublicationError(
                 f"{phase} persistent output conflicts with verified attempt"
             )
-        try:
-            shutil.rmtree(container)
-        except OSError as error:
-            raise PublicationError(
-                f"{phase} duplicate private attempt cannot be removed"
-            ) from error
 
     remapped = tuple(
         _Artifact(
@@ -1157,6 +1563,7 @@ def run_corpus_build(
         raise TypeError("runner must implement run(phase, action)")
     _validate_request_authority(request)
     context = _BuildContext(request=request, s3=s3)
+    _reclaim_owned_attempts(context)
     dependency_sha256 = _request_seed(request)
 
     for phase in PHASES:
@@ -1178,6 +1585,7 @@ def run_corpus_build(
                 _authenticate_catalog_inputs(context)
         else:
             _begin_phase_attempt(context, phase)
+            primary_error: BaseException | None = None
             try:
                 value = runner.run(
                     phase,
@@ -1197,8 +1605,11 @@ def run_corpus_build(
                             "clean-room verification does not agree with S3 publication"
                         )
                 value = _promote_phase_output(context, phase, value)
+            except BaseException as error:
+                primary_error = error
+                raise
             finally:
-                _clear_phase_attempt(context)
+                _finish_phase_attempt(context, primary_error)
             objects = _publish_artifacts(context, phase, value)
             receipt = _receipt(request, phase, objects)
             receipt_version = publish_phase_receipt(

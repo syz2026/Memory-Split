@@ -344,3 +344,71 @@ No `CorpusBuildRequest` field is left unaudited.
   operation was used.
 - Only the driver, its focused tests, and this owned report changed. The
   production adapter remains the known launch blocker described above.
+
+## Ownership-safe attempt reclamation follow-up
+
+### RED/GREEN evidence
+
+Focused RED, written before the reclamation implementation:
+
+```text
+python -m pytest -q tests/test_aws_corpus_builder_driver.py \
+  --basetemp=/tmp/memorysplit-task4-reclaim-red
+....F..FF..F.....                                                        [100%]
+4 failed, 13 passed in 0.48s
+```
+
+The failures proved that an interrupted render remained on disk, startup did
+not reclaim an owned orphan, beginning a replacement attempt retained the old
+one, and a cleanup failure was absent from the primary exception.
+
+Focused GREEN:
+
+```text
+python -m pytest -q tests/test_aws_corpus_builder_driver.py \
+  --basetemp=/tmp/memorysplit-task4-reclaim-final
+.................                                                        [100%]
+17 passed in 0.43s
+```
+
+Static verification:
+
+```text
+python -m py_compile \
+  cluster/aws/corpus_builder/driver.py \
+  tests/test_aws_corpus_builder_driver.py \
+  scripts/build_parallel_corpus.py \
+  tests/test_parallel_corpus.py
+# silent, exit 0
+
+git diff --check
+# silent, exit 0
+```
+
+Both disposable pytest roots were deleted after their runs.
+
+### Reclamation design and self-review
+
+- Attempt names commit to the request seed, phase, and exact stable local root,
+  then add a 128-bit random suffix. A canonical owner marker repeats that
+  namespace, build ID, phase, name, and stable root.
+- The driver requires an owner-only real directory, owner-only single-link
+  regular control files, exact marker bytes, and matching pinned/named device
+  and inode identities before removal.
+- Each live attempt holds an advisory lock. Startup and pre-attempt scans skip
+  locked attempts, malformed markers, foreign names, non-directories, and
+  symlinks, so another conforming concurrent build remains untouched.
+- Reclamation uses descriptor-relative, symlink-safe `rmtree` only after the
+  final identity recheck. The promoted output name never matches the attempt
+  namespace and is covered by a focused non-removal test.
+- Startup scans every local-output phase. `_begin_phase_attempt` repeats the
+  phase-specific scan before allocating, bounding accumulation across retries.
+- The phase `finally` path reclaims its current container while retaining the
+  ownership lock. If cleanup fails during another exception, the primary error
+  is re-raised with the reclamation failure attached via `add_note`; cleanup
+  becomes primary only when no earlier error exists.
+- This follows the repository's conforming-builder trust boundary: hostile
+  same-UID mutation is not treated as distinguishable ownership. Identity
+  uncertainty always retains the candidate instead of deleting it.
+- All focused S3 behavior remained on `VersionedFakeS3`; no AWS or network call
+  was made.

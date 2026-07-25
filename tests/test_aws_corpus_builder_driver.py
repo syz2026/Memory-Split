@@ -83,6 +83,20 @@ def _write(path: Path, payload: bytes) -> Path:
     return path
 
 
+def _orphan_owned_attempt(
+    request: driver.CorpusBuildRequest,
+    *,
+    s3: VersionedFakeS3,
+    phase: str,
+) -> Path:
+    context = driver._BuildContext(request=request, s3=s3)
+    driver._begin_phase_attempt(context, phase)
+    container = context.attempt_container
+    assert isinstance(container, Path)
+    driver._clear_phase_attempt(context)
+    return container
+
+
 def _install_fixture_pipeline(
     monkeypatch: pytest.MonkeyPatch,
     *,
@@ -380,6 +394,7 @@ def test_interrupted_action_keeps_partial_output_private(
     assert isinstance(render_roots, list)
     assert render_roots
     assert render_roots[0] != request.output_root
+    assert not render_roots[0].exists()
     assert not request.output_root.exists()
 
     resumed = RecordingRunner()
@@ -452,6 +467,119 @@ def test_successful_phase_discards_private_producer_scratch(
     assert containers
     assert not containers[0].exists()
     assert request.output_root.is_dir()
+
+
+def test_startup_reclaims_an_owned_orphaned_attempt(
+    tmp_path: Path,
+):
+    request = _request(tmp_path)
+    s3 = VersionedFakeS3()
+    orphan = _orphan_owned_attempt(request, s3=s3, phase="render-pack")
+    assert orphan.is_dir()
+
+    with pytest.raises(RuntimeError, match="interrupted before source-stage"):
+        driver.run_corpus_build(
+            request,
+            s3=s3,
+            runner=RecordingRunner(stop_before="source-stage"),
+        )
+
+    assert not orphan.exists()
+
+
+def test_begin_reclaims_a_previous_owned_attempt(
+    tmp_path: Path,
+):
+    request = _request(tmp_path)
+    s3 = VersionedFakeS3()
+    orphan = _orphan_owned_attempt(request, s3=s3, phase="render-pack")
+    next_context = driver._BuildContext(request=request, s3=s3)
+
+    driver._begin_phase_attempt(next_context, "render-pack")
+
+    assert not orphan.exists()
+    current = next_context.attempt_container
+    assert isinstance(current, Path)
+    assert current.is_dir()
+    driver._clear_phase_attempt(next_context)
+
+
+def test_reclamation_leaves_active_unprovable_and_symlink_entries(
+    tmp_path: Path,
+):
+    request = _request(tmp_path)
+    s3 = VersionedFakeS3()
+    active_context = driver._BuildContext(request=request, s3=s3)
+    driver._begin_phase_attempt(active_context, "render-pack")
+    active = active_context.attempt_container
+    assert isinstance(active, Path)
+    prefix = active.name.rsplit("-", 1)[0] + "-"
+    unprovable = active.with_name(f"{prefix}{'e' * 32}")
+    unprovable.mkdir(mode=0o700)
+    request.output_root.mkdir()
+    promoted = _write(request.output_root / "promoted.bin", b"promoted\n")
+    symlink = active.with_name(f"{prefix}{'d' * 32}")
+    symlink.symlink_to(request.output_root, target_is_directory=True)
+
+    with pytest.raises(RuntimeError, match="interrupted before source-stage"):
+        driver.run_corpus_build(
+            request,
+            s3=s3,
+            runner=RecordingRunner(stop_before="source-stage"),
+        )
+
+    assert active.is_dir()
+    assert unprovable.is_dir()
+    assert symlink.is_symlink()
+    assert promoted.read_bytes() == b"promoted\n"
+    driver._clear_phase_attempt(active_context)
+
+
+def test_reclamation_never_removes_promoted_output(
+    tmp_path: Path,
+):
+    request = _request(tmp_path)
+    request.output_root.mkdir()
+    sentinel = _write(request.output_root / "sentinel.bin", b"published\n")
+
+    with pytest.raises(RuntimeError, match="interrupted before source-stage"):
+        driver.run_corpus_build(
+            request,
+            s3=VersionedFakeS3(),
+            runner=RecordingRunner(stop_before="source-stage"),
+        )
+
+    assert request.output_root.is_dir()
+    assert sentinel.read_bytes() == b"published\n"
+
+
+def test_reclamation_failure_does_not_mask_primary_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    request = _request(tmp_path)
+
+    def primary_failure(_context, _phase: str):
+        raise RuntimeError("primary action failed")
+
+    def cleanup_failure(*_args, **_kwargs):
+        raise OSError("cleanup blocked")
+
+    monkeypatch.setattr(driver, "_execute_phase", primary_failure)
+    monkeypatch.setattr(driver.shutil, "rmtree", cleanup_failure)
+
+    with pytest.raises(RuntimeError, match="primary action failed") as caught:
+        driver.run_corpus_build(
+            request,
+            s3=VersionedFakeS3(),
+            runner=RecordingRunner(),
+        )
+
+    notes = getattr(caught.value, "__notes__", ())
+    assert any(
+        "attempt reclamation also failed" in note and "cleanup blocked" in note
+        for note in notes
+    )
 
 
 def test_resume_rejects_missing_exact_object_before_running_phase(
