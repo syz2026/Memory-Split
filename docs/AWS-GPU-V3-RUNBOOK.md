@@ -1855,6 +1855,17 @@ python3 -m msctl \
   --approval "$OPERATOR_ROOT/approvals/resume-seed-0.json" \
   > "$REVIEW_ROOT/resume-plan-seed-0.json"
 
+# Sign the exact checkpoint, evidence, readiness, and manifest scope emitted by
+# the resume dry run.
+RESUME_APPROVAL="$OPERATOR_ROOT/approvals/resume-seed-0.json"
+python3 scripts/sign_msctl_approval.py \
+  --dry-run-report "$REVIEW_ROOT/resume-plan-seed-0.json" \
+  --operation resume \
+  --key-id "$APPROVAL_KEY_ID" \
+  --expires-at "$APPROVAL_EXPIRES_AT" \
+  --out "$RESUME_APPROVAL" \
+  --apply
+
 # APPLY after checkpoint hashes, steps, world sizes, and explicit ID review.
 python3 -m msctl \
   --profile "$PROFILE" \
@@ -1868,7 +1879,7 @@ python3 -m msctl \
   --dataset-verification "$DATASET_VERIFICATION" \
   --environment-receipt "$ENVIRONMENT_RECEIPT" \
   "${TRAINING_GATE_ARGS[@]}" \
-  --approval "$OPERATOR_ROOT/approvals/resume-seed-0.json" \
+  --approval "$RESUME_APPROVAL" \
   --apply > "$REVIEW_ROOT/resume-result-seed-0.json"
 ```
 
@@ -1879,8 +1890,6 @@ valid only for legacy v2 manifests. For an interrupted run, use the
 `checkpoint_receipt` and `checkpoint_receipt_sha256` emitted by the paired
 launcher; the resume path rejects a receipt whose run IDs, arm paths, hashes,
 world sizes, or manifest provenance differ from its executable bindings.
-Review and sign `resume-plan-seed-0.json` using its exact
-`result.approval_resources` before the apply command.
 
 Completion publication must create one evaluator `run.json` per arm from the
 actual terminal checkpoint and configuration bytes. Use
@@ -2086,6 +2095,17 @@ python3 -m msctl \
   --approval "$OPERATOR_ROOT/approvals/evaluate-seed-0.json" \
   > "$REVIEW_ROOT/evaluate-plan-seed-0.json"
 
+# Sign the exact terminal checkpoint, finalized seal, evidence, readiness, and
+# manifest scope emitted by the evaluation dry run.
+EVALUATE_APPROVAL="$OPERATOR_ROOT/approvals/evaluate-seed-0.json"
+python3 scripts/sign_msctl_approval.py \
+  --dry-run-report "$REVIEW_ROOT/evaluate-plan-seed-0.json" \
+  --operation evaluate \
+  --key-id "$APPROVAL_KEY_ID" \
+  --expires-at "$APPROVAL_EXPIRES_AT" \
+  --out "$EVALUATE_APPROVAL" \
+  --apply
+
 # APPLY after sealed-release, expected study-lock hash, device, and output review.
 python3 -m msctl \
   --profile "$PROFILE" \
@@ -2099,7 +2119,7 @@ python3 -m msctl \
   --dataset-verification "$DATASET_VERIFICATION" \
   --environment-receipt "$ENVIRONMENT_RECEIPT" \
   "${EVALUATION_GATE_ARGS[@]}" \
-  --approval "$OPERATOR_ROOT/approvals/evaluate-seed-0.json" \
+  --approval "$EVALUATE_APPROVAL" \
   --apply > "$REVIEW_ROOT/evaluate-result-seed-0.json"
 ```
 

@@ -154,7 +154,15 @@ def test_operator_docs_cover_closed_profiles_and_complete_lifecycle() -> None:
         assert static_key_name in prohibited_block
         assert f"export {static_key_name}" not in text
     assert 'unset "$name"' in text
-    assert text.count("scripts/sign_msctl_approval.py") >= 3
+    assert text.count("scripts/sign_msctl_approval.py") >= 5
+    for operation in (
+        "canary",
+        "submit",
+        "resume",
+        "fleet-advance",
+        "evaluate",
+    ):
+        assert f"--operation {operation}" in text
     assert text.count('--state-root "$OPERATOR_ROOT/state"') >= 8
     assert 'status "${STATUS_ARGS[@]}" --cached' in text
     assert ":latest" not in text
