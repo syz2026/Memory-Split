@@ -1,23 +1,32 @@
 from __future__ import annotations
 
+import copy
+import gc
+import gzip
 import hashlib
+import importlib.util
+import io
 import inspect
 import json
 import os
+import subprocess
 import sys
+import tarfile
 import threading
 import tracemalloc
 from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass, replace
 from fractions import Fraction
 from pathlib import Path
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 from typing import cast
 
 import pytest
 
 from corpusgen.parallel.canonical import canonical_json_bytes, sha256_hex
 from corpusgen.reasoning_v2 import catalog as catalog_module
+from corpusgen.reasoning_v2 import source_lock as source_lock_module
+from corpusgen.reasoning_v2 import wikidata_source as wikidata_source_module
 from corpusgen.reasoning_v2.catalog import (
     CatalogDraft,
     CatalogRecord,
@@ -47,6 +56,7 @@ from reasoning_v2_fixtures import (
 )
 
 
+EXPECTED_GENERATOR_COMMIT = "a" * 40
 _LANE_SOURCE_IDS: dict[LaneId, str] = {
     "fineweb_edu": "fineweb_edu",
     "finemath": "finemath",
@@ -62,6 +72,173 @@ _GENERATED_LANES = {
     "verified_synthetic_multihop",
 }
 _QUARANTINE_DIRECTORY = ".memorysplit-catalog-quarantine-v1"
+
+
+@dataclass(frozen=True)
+class _TarEntry:
+    name: str
+    payload: bytes
+
+
+@dataclass(frozen=True)
+class _AuthorityFixture:
+    source_lock_path: Path
+    source_root: Path
+
+
+def _tar_bytes(entries: list[_TarEntry]) -> bytes:
+    compressed = io.BytesIO()
+    with gzip.GzipFile(
+        filename="",
+        mode="wb",
+        fileobj=compressed,
+        mtime=0,
+    ) as gzip_stream:
+        with tarfile.open(
+            fileobj=gzip_stream,
+            mode="w",
+            format=tarfile.PAX_FORMAT,
+        ) as archive:
+            for entry in entries:
+                member = tarfile.TarInfo(entry.name)
+                member.uid = 0
+                member.gid = 0
+                member.uname = ""
+                member.gname = ""
+                member.mtime = 0
+                member.mode = 0o600
+                member.type = tarfile.REGTYPE
+                member.size = len(entry.payload)
+                archive.addfile(member, io.BytesIO(entry.payload))
+    return compressed.getvalue()
+
+
+def _base_archive_entries() -> dict[str, list[_TarEntry]]:
+    return {
+        "wikidata5m_alias.tar.gz": [
+            _TarEntry("wikidata5m_entity.txt", b"Q1\tAda Lovelace\n"),
+            _TarEntry("wikidata5m_relation.txt", b"P1\tknows\n"),
+        ],
+        "wikidata5m_inductive.tar.gz": [
+            _TarEntry("wikidata5m_inductive_test.txt", b"Q9\tP9\tQ10\n"),
+            _TarEntry("wikidata5m_inductive_train.txt", b"Q1\tP1\tQ2\n"),
+            _TarEntry("wikidata5m_inductive_valid.txt", b"Q7\tP7\tQ8\n"),
+        ],
+        "wikidata5m_transductive.tar.gz": [
+            _TarEntry("wikidata5m_transductive_test.txt", b"Q11\tP11\tQ12\n"),
+            _TarEntry("wikidata5m_transductive_train.txt", b"Q3\tP2\tQ4\n"),
+            _TarEntry("wikidata5m_transductive_valid.txt", b"Q13\tP13\tQ14\n"),
+        ],
+    }
+
+
+def _base_archive_payloads() -> dict[str, bytes]:
+    return {
+        name: _tar_bytes(entries)
+        for name, entries in _base_archive_entries().items()
+    }
+
+
+def _replace_archive_member(
+    entries: dict[str, list[_TarEntry]],
+    archive_name: str,
+    member_name: str,
+    payload: bytes,
+) -> None:
+    archive_entries = entries[archive_name]
+    index = next(
+        position
+        for position, entry in enumerate(archive_entries)
+        if entry.name == member_name
+    )
+    archive_entries[index] = replace(archive_entries[index], payload=payload)
+
+
+def _install_archive_authority(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    fixture_source_lock: FixtureSourceLock,
+    archive_payloads: dict[str, bytes],
+) -> _AuthorityFixture:
+    assert tuple(archive_payloads) == wikidata_source_module.ARCHIVE_PATHS
+    archive_metadata = {
+        name: {
+            "bytes": len(payload),
+            "sha256": hashlib.sha256(payload).hexdigest(),
+        }
+        for name, payload in archive_payloads.items()
+    }
+    monkeypatch.setattr(
+        source_lock_module,
+        "FIXED_WIKIDATA_FILES",
+        copy.deepcopy(archive_metadata),
+    )
+    source_lock_module.WIKIDATA_LOCK_PATH.write_bytes(
+        canonical_json_bytes(
+            {
+                "files": archive_metadata,
+                "repo_id": "intfloat/wikidata5m",
+                "repo_type": "dataset",
+                "revision": "6b2b09672129e280c0c9da97ab58154e9d535e6b",
+            }
+        )
+    )
+
+    source_root = fixture_source_lock.download_root
+    wikidata_root = source_root / "wikidata5m"
+    for name, payload in archive_payloads.items():
+        (wikidata_root / name).write_bytes(payload)
+
+    original = fixture_source_lock.lock
+    wikidata_entry = next(
+        entry for entry in original.sources if entry.source_id == "wikidata5m"
+    )
+    replacement_rows = {
+        name: SourceFile(
+            path=name,
+            bytes=metadata["bytes"],
+            sha256=metadata["sha256"],
+        )
+        for name, metadata in archive_metadata.items()
+    }
+    updated_entry = replace(
+        wikidata_entry,
+        files=tuple(
+            replacement_rows.get(row.path, row)
+            for row in wikidata_entry.files
+        ),
+    )
+    updated_lock = replace(
+        original,
+        source_catalog_sha256=source_lock_module.reviewed_source_catalog_sha256(),
+        sources=tuple(
+            updated_entry if entry.source_id == "wikidata5m" else entry
+            for entry in original.sources
+        ),
+    )
+    source_lock_path = tmp_path / "source-lock.json"
+    source_lock_path.write_bytes(updated_lock.to_bytes())
+    return _AuthorityFixture(
+        source_lock_path=source_lock_path,
+        source_root=source_root,
+    )
+
+
+def _archive_authority_from_entries(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    fixture_source_lock: FixtureSourceLock,
+    entries: dict[str, list[_TarEntry]],
+) -> _AuthorityFixture:
+    return _install_archive_authority(
+        tmp_path,
+        monkeypatch,
+        fixture_source_lock,
+        {
+            name: _tar_bytes(archive_entries)
+            for name, archive_entries in entries.items()
+        },
+    )
 
 
 def _source_file(lock: SourceLock, source_id: str) -> tuple[str, SourceFile]:
@@ -95,12 +272,6 @@ class FixtureLane:
     started: int = 0
     path_override: str | None = None
     require_compact_lengths: bool = False
-
-    @property
-    def training_edge_count(self) -> int:
-        if self.lane_id != "wikidata_graph":
-            raise AttributeError("only Wikidata graph has training-edge authority")
-        return 3 if self.mutation == "authority_extra" else 2
 
     def iter_training_edge_keys(self, source_root: Path) -> Iterator[str]:
         del source_root
@@ -296,10 +467,13 @@ class FixtureLane:
 
 
 @dataclass
-class NoWikidataAuthority:
-    wrapped: FixtureLane
+class LookalikeWikidataSource:
+    wrapped: object
     lane_id: LaneId = "wikidata_graph"
-    finite: bool = True
+    finite: bool = False
+
+    def __getattr__(self, name: str):
+        return getattr(self.wrapped, name)
 
     def iter_drafts(
         self,
@@ -308,62 +482,16 @@ class NoWikidataAuthority:
     ) -> Iterator[CatalogDraft]:
         return self.wrapped.iter_drafts(source_root, target_lengths)
 
-
-@dataclass
-class HighCardinalityWikidataLane:
-    lock: SourceLock
-    training_edge_count: int
-    lane_id: LaneId = "wikidata_graph"
-    finite: bool = True
-
     def iter_training_edge_keys(self, source_root: Path) -> Iterator[str]:
-        del source_root
-        for index in range(self.training_edge_count):
-            yield f"edge-{index:08d}"
-
-    def iter_drafts(
-        self,
-        source_root: Path,
-        target_lengths: Sequence[int],
-    ) -> Iterator[CatalogDraft]:
-        del source_root
-        if isinstance(target_lengths, tuple) or sys.getsizeof(target_lengths) > 256:
-            raise RuntimeError("high-cardinality target lengths were materialized")
-        _materialized, source_file = _source_file(self.lock, "wikidata5m")
-        for index in range(len(target_lengths)):
-            revisit = index == self.training_edge_count
-            edge_index = 0 if revisit else index
-            fact = _fact("wikidata_graph", edge_index)
-            yield CatalogDraft(
-                lane_id="wikidata_graph",
-                source_id="wikidata5m",
-                source_key=(
-                    f"revisit-{edge_index:08d}"
-                    if revisit
-                    else f"edge-{edge_index:08d}"
-                ),
-                source_byte_sha256=source_file.sha256,
-                source_locator=(
-                    ("path", source_file.path),
-                    ("row", index),
-                    ("split", "train"),
-                    ("training_edge_key", f"edge-{edge_index:08d}"),
-                ),
-                semantic_flags=(
-                    ("graph-revisit",)
-                    if revisit
-                    else ("graph-training-edge",)
-                ),
-                semantic_facts=(fact,),
-            )
+        return self.wrapped.iter_training_edge_keys(source_root)
 
 
-class FlippingMapping(Mapping[LaneId, FixtureLane]):
-    def __init__(self, values: Mapping[LaneId, FixtureLane]) -> None:
+class FlippingMapping(Mapping[LaneId, object]):
+    def __init__(self, values: Mapping[LaneId, object]) -> None:
         self._values = dict(values)
         self._iteration = 0
 
-    def __getitem__(self, key: LaneId) -> FixtureLane:
+    def __getitem__(self, key: LaneId) -> object:
         return self._values[key]
 
     def __iter__(self) -> Iterator[LaneId]:
@@ -403,15 +531,37 @@ def tiny_geometry() -> BuildGeometry:
 @pytest.fixture
 def staged_fixture_sources(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
     fixture_source_lock: FixtureSourceLock,
 ):
-    root = stage_source_lock(
-        fixture_source_lock.lock,
-        fixture_source_lock.download_root,
-        tmp_path / "canonical",
-        expected_generator_commit=fixture_source_lock.lock.generator_commit,
+    authority = _install_archive_authority(
+        tmp_path,
+        monkeypatch,
+        fixture_source_lock,
+        _base_archive_payloads(),
     )
-    return SimpleNamespace(lock=fixture_source_lock.lock, root=root)
+    lock = SourceLock.from_dict(
+        json.loads(authority.source_lock_path.read_bytes())
+    )
+    root = stage_source_lock(
+        lock,
+        authority.source_root,
+        tmp_path / "canonical",
+        expected_generator_commit=EXPECTED_GENERATOR_COMMIT,
+    )
+    view = wikidata_source_module.build_wikidata_derived_view(
+        authority.source_lock_path,
+        root,
+        tmp_path / "derived",
+        expected_generator_commit=EXPECTED_GENERATOR_COMMIT,
+    )
+    return SimpleNamespace(
+        authority=authority,
+        lock=lock,
+        root=root,
+        source_root=root,
+        view=view,
+    )
 
 
 @pytest.fixture
@@ -423,10 +573,20 @@ def fixture_lane_sources(staged_fixture_sources):
         mutation: str | None = None,
         records: int | None = None,
         require_compact_lengths: bool = False,
-    ) -> dict[LaneId, FixtureLane]:
+    ) -> dict[LaneId, object]:
         lanes = LANE_ORDER if order == "forward" else tuple(reversed(LANE_ORDER))
-        return {
-            lane_id: FixtureLane(
+        sources: dict[LaneId, object] = {}
+        for lane_id in lanes:
+            if lane_id == "wikidata_graph":
+                if mutation_lane == lane_id:
+                    raise ValueError(
+                        "production Wikidata source does not accept fixture mutations"
+                    )
+                sources[lane_id] = catalog_module.WikidataGraphCatalogSource(
+                    staged_fixture_sources.view
+                )
+                continue
+            sources[lane_id] = FixtureLane(
                 lane_id=lane_id,
                 lock=staged_fixture_sources.lock,
                 order=order,
@@ -434,8 +594,7 @@ def fixture_lane_sources(staged_fixture_sources):
                 mutation=mutation if lane_id == mutation_lane else None,
                 require_compact_lengths=require_compact_lengths,
             )
-            for lane_id in lanes
-        }
+        return sources
 
     return make
 
@@ -443,7 +602,7 @@ def fixture_lane_sources(staged_fixture_sources):
 def _build(
     geometry: BuildGeometry,
     staged_fixture_sources,
-    lane_sources: Mapping[LaneId, FixtureLane],
+    lane_sources: Mapping[LaneId, object],
     output_root: Path,
 ) -> InputCatalog:
     return build_input_catalog(
@@ -460,6 +619,354 @@ def _quarantine_entries(parent: Path) -> tuple[Path, ...]:
     root = parent / _QUARANTINE_DIRECTORY
     assert root.is_dir()
     return tuple(sorted(root.iterdir(), key=lambda path: path.name))
+
+
+@pytest.fixture
+def production_wikidata_catalog_source(
+    staged_fixture_sources,
+):
+    return SimpleNamespace(
+        authority=staged_fixture_sources.authority,
+        lock=staged_fixture_sources.lock,
+        source_root=staged_fixture_sources.root,
+        view=staged_fixture_sources.view,
+    )
+
+
+def _production_geometry(wikidata_records: int) -> BuildGeometry:
+    lane_quotas = tuple(
+        (
+            lane_id,
+            wikidata_records if lane_id == "wikidata_graph" else 1,
+        )
+        for lane_id in LANE_ORDER
+    )
+    return BuildGeometry(
+        profile="canary",
+        total_targets=sum(quota for _lane, quota in lane_quotas),
+        targets_per_update=1,
+        context_length=1,
+        shard_count=1,
+        allow_fewer_shards=True,
+        lane_quotas=lane_quotas,
+    )
+
+
+def _production_lane_sources(production_wikidata_catalog_source):
+    sources: dict[LaneId, object] = {
+        lane_id: FixtureLane(
+            lane_id=lane_id,
+            lock=production_wikidata_catalog_source.lock,
+        )
+        for lane_id in LANE_ORDER
+        if lane_id != "wikidata_graph"
+    }
+    sources["wikidata_graph"] = catalog_module.WikidataGraphCatalogSource(
+        production_wikidata_catalog_source.view
+    )
+    return sources
+
+
+def test_production_adapter_binds_view_archive_member_split_row_and_edge(
+    production_wikidata_catalog_source,
+):
+    verified_view = production_wikidata_catalog_source.view
+    caller_constructed = wikidata_source_module.WikidataDerivedView(
+        root=verified_view.root,
+        receipt_sha256=verified_view.receipt_sha256,
+        receipt=verified_view.receipt,
+    )
+    with pytest.raises(ValueError, match="verified"):
+        catalog_module.WikidataGraphCatalogSource(caller_constructed)
+
+    source = catalog_module.WikidataGraphCatalogSource(verified_view)
+    drafts = tuple(
+        source.iter_drafts(
+            production_wikidata_catalog_source.source_root,
+            (1, 1),
+        )
+    )
+    archive_hashes = {
+        record.path: record.sha256
+        for record in verified_view.receipt.archives
+    }
+    assert [
+        (
+            draft.source_byte_sha256,
+            draft.source_locator,
+        )
+        for draft in drafts
+    ] == [
+        (
+            archive_hashes["wikidata5m_inductive.tar.gz"],
+            (
+                ("member", "wikidata5m_inductive_train.txt"),
+                ("path", "wikidata5m_inductive.tar.gz"),
+                ("row", 1),
+                ("split", "train"),
+                ("training_edge_key", "Q1\tP1\tQ2"),
+                ("training_split", "inductive_train"),
+                ("wikidata_view_sha256", verified_view.receipt_sha256),
+            ),
+        ),
+        (
+            archive_hashes["wikidata5m_transductive.tar.gz"],
+            (
+                ("member", "wikidata5m_transductive_train.txt"),
+                ("path", "wikidata5m_transductive.tar.gz"),
+                ("row", 1),
+                ("split", "train"),
+                ("training_edge_key", "Q3\tP2\tQ4"),
+                ("training_split", "transductive_train"),
+                ("wikidata_view_sha256", verified_view.receipt_sha256),
+            ),
+        ),
+    ]
+
+
+def test_catalog_receipt_binds_verified_wikidata_view_sha256(
+    tmp_path: Path,
+    production_wikidata_catalog_source,
+):
+    catalog = build_input_catalog(
+        _production_geometry(3),
+        production_wikidata_catalog_source.lock,
+        production_wikidata_catalog_source.source_root,
+        _production_lane_sources(production_wikidata_catalog_source),
+        tmp_path / "catalog",
+        expected_generator_commit=EXPECTED_GENERATOR_COMMIT,
+    )
+    index = json.loads(catalog.to_bytes())
+
+    assert (
+        catalog.wikidata_view_sha256
+        == production_wikidata_catalog_source.view.receipt_sha256
+    )
+    assert (
+        index["wikidata_view_sha256"]
+        == production_wikidata_catalog_source.view.receipt_sha256
+    )
+
+
+def test_distinct_edges_appear_once_before_first_revisit(
+    production_wikidata_catalog_source,
+):
+    source = catalog_module.WikidataGraphCatalogSource(
+        production_wikidata_catalog_source.view
+    )
+    drafts = tuple(
+        source.iter_drafts(
+            production_wikidata_catalog_source.source_root,
+            (1, 1, 1, 1, 1),
+        )
+    )
+    first_revisit = next(
+        index
+        for index, draft in enumerate(drafts)
+        if "graph-revisit" in draft.semantic_flags
+    )
+    before_revisit = tuple(
+        dict(draft.source_locator)["training_edge_key"]
+        for draft in drafts[:first_revisit]
+    )
+
+    assert before_revisit == tuple(
+        source.iter_training_edge_keys(
+            production_wikidata_catalog_source.source_root
+        )
+    )
+    assert len(before_revisit) == source.training_edge_count
+    assert len(set(before_revisit)) == source.training_edge_count
+    assert all(
+        draft.semantic_flags == ("graph-training-edge",)
+        for draft in drafts[:first_revisit]
+    )
+    assert all(
+        draft.semantic_flags == ("graph-revisit",)
+        for draft in drafts[first_revisit:]
+    )
+    archive_hashes = {
+        record.path: record.sha256
+        for record in production_wikidata_catalog_source.view.receipt.archives
+    }
+    assert [
+        (draft.source_byte_sha256, draft.source_locator)
+        for draft in drafts[first_revisit:]
+    ] == [
+        (
+            archive_hashes["wikidata5m_inductive.tar.gz"],
+            (
+                ("member", "wikidata5m_inductive_train.txt"),
+                ("path", "wikidata5m_inductive.tar.gz"),
+                ("row", 1),
+                ("split", "train"),
+                ("training_edge_key", "Q1\tP1\tQ2"),
+                ("training_split", "inductive_train"),
+                (
+                    "wikidata_view_sha256",
+                    production_wikidata_catalog_source.view.receipt_sha256,
+                ),
+            ),
+        ),
+        (
+            archive_hashes["wikidata5m_transductive.tar.gz"],
+            (
+                ("member", "wikidata5m_transductive_train.txt"),
+                ("path", "wikidata5m_transductive.tar.gz"),
+                ("row", 1),
+                ("split", "train"),
+                ("training_edge_key", "Q3\tP2\tQ4"),
+                ("training_split", "transductive_train"),
+                (
+                    "wikidata_view_sha256",
+                    production_wikidata_catalog_source.view.receipt_sha256,
+                ),
+            ),
+        ),
+        (
+            archive_hashes["wikidata5m_inductive.tar.gz"],
+            (
+                ("member", "wikidata5m_inductive_train.txt"),
+                ("path", "wikidata5m_inductive.tar.gz"),
+                ("row", 1),
+                ("split", "train"),
+                ("training_edge_key", "Q1\tP1\tQ2"),
+                ("training_split", "inductive_train"),
+                (
+                    "wikidata_view_sha256",
+                    production_wikidata_catalog_source.view.receipt_sha256,
+                ),
+            ),
+        ),
+    ]
+
+
+def test_edge_count_above_available_records_fails_before_draft_output(
+    tmp_path: Path,
+    production_wikidata_catalog_source,
+):
+    sources = _production_lane_sources(production_wikidata_catalog_source)
+    output_root = tmp_path / "capacity-failure"
+
+    with pytest.raises(
+        ValueError,
+        match="Wikidata distinct edges exceed allocated records",
+    ):
+        build_input_catalog(
+            _production_geometry(1),
+            production_wikidata_catalog_source.lock,
+            production_wikidata_catalog_source.source_root,
+            sources,
+            output_root,
+            expected_generator_commit=EXPECTED_GENERATOR_COMMIT,
+        )
+
+    assert not output_root.exists()
+    assert all(
+        source.started == 0
+        for lane_id, source in sources.items()
+        if lane_id != "wikidata_graph"
+    )
+
+
+def test_catalog_rejects_duck_typed_wikidata_authority(
+    tmp_path: Path,
+    production_wikidata_catalog_source,
+):
+    sources = _production_lane_sources(production_wikidata_catalog_source)
+    sources["wikidata_graph"] = LookalikeWikidataSource(
+        sources["wikidata_graph"]
+    )
+    output_root = tmp_path / "lookalike"
+
+    with pytest.raises(ValueError, match="authenticated production"):
+        build_input_catalog(
+            _production_geometry(3),
+            production_wikidata_catalog_source.lock,
+            production_wikidata_catalog_source.source_root,
+            sources,
+            output_root,
+            expected_generator_commit=EXPECTED_GENERATOR_COMMIT,
+        )
+
+    assert not output_root.exists()
+
+
+def test_catalog_reopens_view_and_rejects_on_disk_drift_before_staging(
+    tmp_path: Path,
+    production_wikidata_catalog_source,
+):
+    sources = _production_lane_sources(production_wikidata_catalog_source)
+    stream = (
+        production_wikidata_catalog_source.view.root
+        / "streams"
+        / "distinct-edges.tsv"
+    )
+    payload = stream.read_bytes()
+    mode = stream.stat().st_mode & 0o777
+    stream.chmod(0o600)
+    stream.write_bytes(payload.replace(b"\tQ1\t", b"\tQ2\t", 1))
+    stream.chmod(mode)
+    output_root = tmp_path / "drifted-view"
+
+    with pytest.raises(ValueError, match="identity drift|ordering drift"):
+        build_input_catalog(
+            _production_geometry(3),
+            production_wikidata_catalog_source.lock,
+            production_wikidata_catalog_source.source_root,
+            sources,
+            output_root,
+            expected_generator_commit=EXPECTED_GENERATOR_COMMIT,
+        )
+
+    assert not output_root.exists()
+    assert not (tmp_path / _QUARANTINE_DIRECTORY).exists()
+    assert all(
+        source.started == 0
+        for lane_id, source in sources.items()
+        if lane_id != "wikidata_graph"
+    )
+
+
+def test_end_to_end_catalog_is_byte_identical_across_rebuilds(
+    tmp_path: Path,
+    production_wikidata_catalog_source,
+):
+    second_view = wikidata_source_module.build_wikidata_derived_view(
+        production_wikidata_catalog_source.authority.source_lock_path,
+        production_wikidata_catalog_source.source_root,
+        tmp_path / "derived-second",
+        expected_generator_commit=EXPECTED_GENERATOR_COMMIT,
+    )
+    first_sources = _production_lane_sources(production_wikidata_catalog_source)
+    second_environment = SimpleNamespace(
+        lock=production_wikidata_catalog_source.lock,
+        source_root=production_wikidata_catalog_source.source_root,
+        view=second_view,
+    )
+    second_sources = _production_lane_sources(second_environment)
+    geometry = _production_geometry(5)
+
+    first = build_input_catalog(
+        geometry,
+        production_wikidata_catalog_source.lock,
+        production_wikidata_catalog_source.source_root,
+        first_sources,
+        tmp_path / "catalog-first",
+        expected_generator_commit=EXPECTED_GENERATOR_COMMIT,
+    )
+    second = build_input_catalog(
+        geometry,
+        production_wikidata_catalog_source.lock,
+        production_wikidata_catalog_source.source_root,
+        second_sources,
+        tmp_path / "catalog-second",
+        expected_generator_commit=EXPECTED_GENERATOR_COMMIT,
+    )
+
+    assert first.sha256 == second.sha256
+    assert first.to_bytes() == second.to_bytes()
+    assert first.records_path.read_bytes() == second.records_path.read_bytes()
 
 
 @pytest.mark.parametrize("forged_lock", [False, True])
@@ -490,7 +997,11 @@ def test_catalog_requires_independent_generator_commit_authority_before_iteratio
             tmp_path / "stale-lock",
             expected_generator_commit=expected,
         )
-    assert all(source.started == 0 for source in sources.values())
+    assert all(
+        source.started == 0
+        for lane_id, source in sources.items()
+        if lane_id != "wikidata_graph"
+    )
 
 
 def test_catalog_is_canonical_exact_and_filesystem_order_independent(
@@ -609,13 +1120,25 @@ def test_wikidata_graph_covers_every_training_edge_before_revisit(
     first_revisit = next(
         index for index, row in enumerate(rows) if "graph-revisit" in row.semantic_flags
     )
-    assert {row.source_key for row in rows[:first_revisit]} == set(
+    expected_edges = tuple(
         sources["wikidata_graph"].iter_training_edge_keys(
             staged_fixture_sources.root
         )
     )
-    assert all(
-        "graph-revisit" in row.semantic_flags for row in rows[first_revisit:]
+    assert tuple(
+        dict(row.source_locator)["training_edge_key"]
+        for row in rows[:first_revisit]
+    ) == expected_edges
+    assert len(set(expected_edges)) == len(expected_edges)
+    assert tuple(row.semantic_flags for row in rows[:first_revisit]) == (
+        ("graph-training-edge",),
+    ) * len(expected_edges)
+    assert tuple(row.semantic_flags for row in rows[first_revisit:]) == (
+        ("graph-revisit",),
+    ) * (len(rows) - first_revisit)
+    assert not any(
+        dict(row.source_locator)["training_edge_key"] not in expected_edges
+        for row in rows[first_revisit:]
     )
 
 
@@ -657,57 +1180,6 @@ def test_catalog_rejects_noncanonical_or_nonunique_drafts(
     assert not output.exists()
 
 
-@pytest.mark.parametrize(
-    ("mutation", "message"),
-    [
-        ("graph_all_revisit", "before.*revisit"),
-        ("graph_partial_before_revisit", "every training edge"),
-        ("graph_duplicate_before_revisit", "exactly once"),
-        ("authority_duplicate", "duplicate.*training edge"),
-        ("authority_extra", "every training edge"),
-    ],
-)
-def test_wikidata_graph_requires_exact_complete_once_authority(
-    tmp_path: Path,
-    tiny_geometry: BuildGeometry,
-    staged_fixture_sources,
-    fixture_lane_sources,
-    mutation: str,
-    message: str,
-):
-    sources = fixture_lane_sources(
-        mutation_lane="wikidata_graph",
-        mutation=mutation,
-    )
-    with pytest.raises(ValueError, match=message):
-        _build(
-            tiny_geometry,
-            staged_fixture_sources,
-            sources,
-            tmp_path / mutation,
-        )
-
-
-def test_wikidata_graph_rejects_missing_training_edge_authority(
-    tmp_path: Path,
-    tiny_geometry: BuildGeometry,
-    staged_fixture_sources,
-    fixture_lane_sources,
-):
-    sources = fixture_lane_sources()
-    sources["wikidata_graph"] = cast(
-        FixtureLane,
-        NoWikidataAuthority(sources["wikidata_graph"]),
-    )
-    with pytest.raises(ValueError, match="training-edge authority.*required"):
-        _build(
-            tiny_geometry,
-            staged_fixture_sources,
-            sources,
-            tmp_path / "missing-edge-authority",
-        )
-
-
 def test_wikidata_source_requires_exact_training_split_authority(
     tmp_path: Path,
     tiny_geometry: BuildGeometry,
@@ -730,14 +1202,18 @@ def test_wikidata_source_requires_exact_training_split_authority(
 def test_reserved_path_cannot_hide_behind_train_component(
     tmp_path: Path,
     tiny_geometry: BuildGeometry,
-    fixture_source_lock: FixtureSourceLock,
+    staged_fixture_sources,
 ):
     relative = "evaluation/train/test.json"
     payload = b"must remain sealed"
     entry = next(
-        row for row in fixture_source_lock.lock.sources if row.source_id == "clrs_text"
+        row
+        for row in staged_fixture_sources.lock.sources
+        if row.source_id == "clrs_text"
     )
-    materialized = fixture_source_lock.download_root / entry.materialized_path
+    materialized = (
+        staged_fixture_sources.authority.source_root / entry.materialized_path
+    )
     path = materialized / relative
     path.parent.mkdir(parents=True)
     path.write_bytes(payload)
@@ -753,27 +1229,37 @@ def test_reserved_path_cannot_hide_behind_train_component(
         ),
     )
     changed_lock = replace(
-        fixture_source_lock.lock,
+        staged_fixture_sources.lock,
         sources=tuple(
             changed_entry if row.source_id == "clrs_text" else row
-            for row in fixture_source_lock.lock.sources
+            for row in staged_fixture_sources.lock.sources
         ),
     )
     source_root = stage_source_lock(
         changed_lock,
-        fixture_source_lock.download_root,
+        staged_fixture_sources.authority.source_root,
         tmp_path / "reserved-canonical",
         expected_generator_commit=changed_lock.generator_commit,
     )
-    sources = {
+    source_lock_path = tmp_path / "reserved-source-lock.json"
+    source_lock_path.write_bytes(changed_lock.to_bytes())
+    view = wikidata_source_module.build_wikidata_derived_view(
+        source_lock_path,
+        source_root,
+        tmp_path / "reserved-derived",
+        expected_generator_commit=changed_lock.generator_commit,
+    )
+    sources: dict[LaneId, object] = {
         lane_id: FixtureLane(
             lane_id=lane_id,
             lock=changed_lock,
             path_override=relative if lane_id == "relational_refinement" else None,
         )
         for lane_id in LANE_ORDER
+        if lane_id != "wikidata_graph"
     }
-    staged = SimpleNamespace(lock=changed_lock, root=source_root)
+    sources["wikidata_graph"] = catalog_module.WikidataGraphCatalogSource(view)
+    staged = SimpleNamespace(lock=changed_lock, root=source_root, view=view)
     with pytest.raises(ValueError, match="sealed or evaluation path"):
         _build(
             tiny_geometry,
@@ -871,54 +1357,298 @@ def test_lane_sources_receive_compact_balanced_target_lengths(
         )
 
 
-def test_high_cardinality_indexes_and_record_replay_remain_memory_bounded(
-    tmp_path: Path,
-    staged_fixture_sources,
-    fixture_lane_sources,
-):
-    edge_count = 2_000
-    lane_quotas = tuple(
+def _linear_retention_catalog_variant(
+    workspace: Path,
+) -> tuple[ModuleType, Path, str]:
+    catalog_path = Path(cast(str, catalog_module.__file__)).resolve()
+    source = catalog_path.read_text(encoding="utf-8")
+    class_marker = "\n\nclass WikidataGraphCatalogSource:\n"
+    loop_marker = """\
+        for edge_index, triple in enumerate(
+            iter_distinct_training_edges(authority.view)
+        ):
+            emitted += 1
+            yield self._draft(
+"""
+    assert source.count(class_marker) == 1
+    assert source.count(loop_marker) == 1
+    source = source.replace(
+        class_marker,
         (
-            lane_id,
-            edge_count + 1 if lane_id == "wikidata_graph" else 1,
-        )
-        for lane_id in LANE_ORDER
-    )
-    geometry = BuildGeometry(
-        profile="canary",
-        total_targets=sum(quota for _lane, quota in lane_quotas),
-        targets_per_update=1,
-        context_length=1,
-        shard_count=1,
-        allow_fewer_shards=True,
-        lane_quotas=lane_quotas,
-    )
-    sources = fixture_lane_sources()
-    sources["wikidata_graph"] = cast(
-        FixtureLane,
-        HighCardinalityWikidataLane(
-            lock=staged_fixture_sources.lock,
-            training_edge_count=edge_count,
+            "\n\n_LINEAR_RETENTION_FOR_MEMORY_TEST: list[bytearray] = []"
+            f"{class_marker}"
         ),
     )
-
-    tracemalloc.start()
-    catalog = _build(
-        geometry,
-        staged_fixture_sources,
-        sources,
-        tmp_path / "high-cardinality",
+    source = source.replace(
+        loop_marker,
+        loop_marker.replace(
+            "            emitted += 1\n",
+            (
+                "            emitted += 1\n"
+                "            _LINEAR_RETENTION_FOR_MEMORY_TEST.append("
+                "bytearray(1))\n"
+            ),
+        ),
     )
-    _current, build_peak = tracemalloc.get_traced_memory()
-    tracemalloc.stop()
-    assert build_peak < 32 * 1024 * 1024
+    variant_path = workspace / "catalog_linear_retention_variant.py"
+    variant_path.write_text(source, encoding="utf-8")
+    module_name = (
+        f"_memorysplit_catalog_linear_retention_{os.getpid()}_"
+        f"{workspace.name}"
+    )
+    spec = importlib.util.spec_from_file_location(module_name, variant_path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
+    try:
+        spec.loader.exec_module(module)
+    except BaseException:
+        sys.modules.pop(module_name, None)
+        raise
+    return module, variant_path, module_name
 
-    tracemalloc.start()
-    replayed = sum(1 for _row in catalog.iter_records())
-    _current, replay_peak = tracemalloc.get_traced_memory()
-    tracemalloc.stop()
-    assert replayed == edge_count + len(LANE_ORDER)
-    assert replay_peak < 8 * 1024 * 1024
+
+def _measure_adapter_attributed_live_allocations(
+    workspace: Path,
+    edge_count: int,
+    *,
+    linear_retention: bool,
+) -> dict[str, int]:
+    monkeypatch = pytest.MonkeyPatch()
+    variant_module_name: str | None = None
+    try:
+        workspace.mkdir()
+        contract_root = fixed_contract_environment.__wrapped__(
+            workspace,
+            monkeypatch,
+        )
+        resolver = fake_public_resolver.__wrapped__(contract_root)
+        recipe = full_recipe.__wrapped__()
+        fixture = fixture_source_lock.__wrapped__(
+            workspace,
+            resolver,
+            recipe,
+        )
+        entries = _base_archive_entries()
+        training_rows = b"".join(
+            (
+                f"Q{1_000_000 + index}\tP1\t"
+                f"Q{2_000_000 + index}\n"
+            ).encode("ascii")
+            for index in range(edge_count - 1)
+        )
+        _replace_archive_member(
+            entries,
+            "wikidata5m_inductive.tar.gz",
+            "wikidata5m_inductive_train.txt",
+            training_rows,
+        )
+        authority = _archive_authority_from_entries(
+            workspace,
+            monkeypatch,
+            fixture,
+            entries,
+        )
+        lock = SourceLock.from_dict(
+            json.loads(authority.source_lock_path.read_bytes())
+        )
+        source_root = stage_source_lock(
+            lock,
+            authority.source_root,
+            workspace / "canonical",
+            expected_generator_commit=EXPECTED_GENERATOR_COMMIT,
+        )
+        view = wikidata_source_module.build_wikidata_derived_view(
+            authority.source_lock_path,
+            source_root,
+            workspace / "derived",
+            expected_generator_commit=EXPECTED_GENERATOR_COMMIT,
+        )
+        assert view.receipt.distinct_edges == edge_count
+        del entries, training_rows, authority, fixture, lock, resolver, recipe
+
+        selected_catalog = cast(ModuleType, catalog_module)
+        selected_path = Path(cast(str, selected_catalog.__file__)).resolve()
+        if linear_retention:
+            (
+                selected_catalog,
+                selected_path,
+                variant_module_name,
+            ) = _linear_retention_catalog_variant(workspace)
+
+        tracemalloc.start(1)
+        try:
+            source = selected_catalog.WikidataGraphCatalogSource(view)
+            lengths = selected_catalog._BalancedTargetLengths.create(
+                edge_count + 100,
+                1,
+            )
+            checkpoints = {
+                1,
+                edge_count // 2,
+                edge_count,
+                edge_count + 100,
+            }
+            peak_live_blocks = 0
+            peak_live_bytes = 0
+            drafts = 0
+            for drafts, _draft in enumerate(
+                source.iter_drafts(
+                    source_root,
+                    lengths,
+                ),
+                start=1,
+            ):
+                if drafts not in checkpoints:
+                    continue
+                gc.collect()
+                snapshot = tracemalloc.take_snapshot().filter_traces(
+                    (
+                        tracemalloc.Filter(
+                            True,
+                            str(selected_path),
+                            all_frames=False,
+                        ),
+                    ),
+                )
+                peak_live_blocks = max(
+                    peak_live_blocks,
+                    len(snapshot.traces),
+                )
+                peak_live_bytes = max(
+                    peak_live_bytes,
+                    sum(trace.size for trace in snapshot.traces),
+                )
+        finally:
+            tracemalloc.stop()
+
+        return {
+            "drafts": drafts,
+            "edge_count": edge_count,
+            "linear_retention": int(linear_retention),
+            "peak_live_blocks": peak_live_blocks,
+            "peak_live_bytes": peak_live_bytes,
+        }
+    finally:
+        if variant_module_name is not None:
+            sys.modules.pop(variant_module_name, None)
+        monkeypatch.undo()
+
+
+def _run_attributed_allocation_probe(
+    workspace: Path,
+    edge_count: int,
+    *,
+    linear_retention: bool,
+) -> dict[str, int]:
+    test_module = Path(__file__).resolve()
+    script = (
+        "import json, sys\n"
+        "from pathlib import Path\n"
+        f"sys.path.insert(0, {str(test_module.parent)!r})\n"
+        "from test_reasoning_v2_catalog import "
+        "_measure_adapter_attributed_live_allocations\n"
+        "result = _measure_adapter_attributed_live_allocations(\n"
+        "    Path(sys.argv[1]), int(sys.argv[2]),\n"
+        "    linear_retention=sys.argv[3] == 'linear',\n"
+        ")\n"
+        "print(json.dumps(result, sort_keys=True))\n"
+    )
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            script,
+            str(workspace),
+            str(edge_count),
+            "linear" if linear_retention else "streaming",
+        ],
+        cwd=test_module.parents[1],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return cast(dict[str, int], json.loads(completed.stdout))
+
+
+def _attributed_allocation_growth(
+    measurements: tuple[dict[str, int], dict[str, int]],
+) -> dict[str, int | Fraction]:
+    low, high = measurements
+    edge_delta = high["edge_count"] - low["edge_count"]
+    assert edge_delta > 0
+    byte_growth = high["peak_live_bytes"] - low["peak_live_bytes"]
+    block_growth = high["peak_live_blocks"] - low["peak_live_blocks"]
+    return {
+        "edge_delta": edge_delta,
+        "live_block_growth": block_growth,
+        "live_byte_growth": byte_growth,
+        "marginal_live_bytes_per_edge": Fraction(
+            max(0, byte_growth),
+            edge_delta,
+        ),
+    }
+
+
+def _assert_zero_marginal_attributed_retention(
+    measurements: tuple[dict[str, int], dict[str, int]],
+) -> dict[str, int | Fraction]:
+    growth = _attributed_allocation_growth(measurements)
+    assert growth["live_byte_growth"] <= 0, (
+        "adapter-attributed live bytes grew with edge cardinality: "
+        f"{growth}"
+    )
+    assert growth["live_block_growth"] <= 0, (
+        "adapter-attributed live allocation blocks grew with edge "
+        f"cardinality: {growth}"
+    )
+    return growth
+
+
+def test_attributed_memory_regression_kills_linear_retention_variant(
+    tmp_path: Path,
+):
+    cardinalities = (1_000, 20_000)
+    streaming = tuple(
+        _run_attributed_allocation_probe(
+            tmp_path / f"streaming-{edge_count}",
+            edge_count,
+            linear_retention=False,
+        )
+        for edge_count in cardinalities
+    )
+    linear = tuple(
+        _run_attributed_allocation_probe(
+            tmp_path / f"linear-{edge_count}",
+            edge_count,
+            linear_retention=True,
+        )
+        for edge_count in cardinalities
+    )
+    assert tuple(row["drafts"] for row in streaming) == tuple(
+        edge_count + 100 for edge_count in cardinalities
+    )
+    assert tuple(row["drafts"] for row in linear) == tuple(
+        edge_count + 100 for edge_count in cardinalities
+    )
+
+    streaming_growth = _assert_zero_marginal_attributed_retention(
+        cast(tuple[dict[str, int], dict[str, int]], streaming)
+    )
+    linear_measurements = cast(
+        tuple[dict[str, int], dict[str, int]],
+        linear,
+    )
+    linear_growth = _attributed_allocation_growth(linear_measurements)
+    with pytest.raises(
+        AssertionError,
+        match="adapter-attributed live bytes grew",
+    ):
+        _assert_zero_marginal_attributed_retention(linear_measurements)
+
+    assert streaming_growth["marginal_live_bytes_per_edge"] == 0
+    assert linear_growth["live_block_growth"] >= cardinalities[1] - cardinalities[0]
+    assert linear_growth["marginal_live_bytes_per_edge"] >= 16
 
 
 def test_source_tree_is_reverified_after_lane_consumption(
@@ -1013,7 +1743,11 @@ def test_conflicting_existing_catalog_is_preserved_and_loser_quarantined(
             output,
         )
     assert sentinel.read_bytes() == b"keep"
-    assert all(source.started == 1 for source in sources.values())
+    assert all(
+        source.started == 1
+        for lane_id, source in sources.items()
+        if lane_id != "wikidata_graph"
+    )
     retained = _quarantine_entries(tmp_path)
     assert any(path.is_dir() for path in retained)
 
