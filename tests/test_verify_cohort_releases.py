@@ -1100,6 +1100,26 @@ def test_accepts_v3_aws_only_cohort_and_emits_canonical_json(
     }
 
 
+def test_rejects_release_receipt_that_names_an_unknown_cohort(
+    tmp_path: Path,
+) -> None:
+    aws = _build_v3_release(tmp_path / "aws-v3")
+    receipt = json.loads(aws.receipt.read_text(encoding="utf-8"))
+    receipt["seed_assignment"]["cohort_id"] = "memorysplit-confirmatory-v4"
+    aws.receipt.write_bytes(_canonical_pretty(receipt))
+
+    _assert_rejected(_invoke_aws_only(aws.receipt))
+
+
+def test_rejects_v2_release_relabelled_as_the_v3_cohort(tmp_path: Path) -> None:
+    _, aws = _pair(tmp_path)
+    receipt = json.loads(aws.receipt.read_text(encoding="utf-8"))
+    receipt["seed_assignment"]["cohort_id"] = V3_COHORT_ID
+    aws.receipt.write_bytes(_canonical_pretty(receipt))
+
+    _assert_rejected(_invoke_aws_only(aws.receipt))
+
+
 def test_rejects_v3_cohort_paired_with_an_illumina_release(
     tmp_path: Path,
 ) -> None:

@@ -1,5 +1,24 @@
 #!/usr/bin/env python3
-"""Verify Illumina and AWS handoffs as one frozen five-seed cohort."""
+"""Verify MemorySplit cohort handoffs against one frozen cohort contract.
+
+Two cohort contracts are recognised and each release is verified only against
+the one its own receipt names:
+
+* v2 --- ``memorysplit-confirmatory-v2-360m-n5``, a five-seed cohort split
+  across two providers, Illumina owning seed 0 and AWS owning seeds 1-4.
+* v3 --- ``memorysplit-confirmatory-v3-360m-n10-aws``, the canonical AWS-only
+  ten-seed cohort.
+
+v2 is retained rather than retired because v2 release artifacts still exist on
+disk; refusing to verify them, or silently re-verifying them against v3 rules,
+would both be worse than verifying them against the contract they were sealed
+under. The contract is selected from the cohort ID the AWS receipt itself
+declares, so a release can never be admitted under rules it was not built for.
+
+The contract values below deliberately restate ``msctl.aws_contracts`` instead
+of importing it: this verifier is an independent check on the packager, and
+tests pin the two statements together so drift fails loudly.
+"""
 
 from __future__ import annotations
 
@@ -21,56 +40,232 @@ import yaml
 
 
 SCHEMA_VERSION = 1
-COHORT_ID = "memorysplit-confirmatory-v2-360m-n5"
 ILLUMINA_PROVIDER = "illumina-usfc-prd"
 AWS_PROVIDER = "aws-p5.48xlarge"
+EXPECTED_ARMS = ("dense", "split90")
+SNAPSHOT_STEPS = (1_358, 3_396, 6_791, 10_187, 13_582)
+CORPUS_IDENTITY_PATH = "configs/reasoning-dataset-v2.json"
+DATASET_POINTER_PATH = "DATASET-POINTER-AWS.json"
+METADATA_PATH = "RELEASE-METADATA.json"
+SUMS_PATH = "SHA256SUMS"
+STATIC_ENVIRONMENT_LOCK_PATH = "requirements-aws-p5.lock"
+ILLUMINA_PROFILE_PATH = "cluster/profiles/illumina-usfc-prd.json"
+
+COHORT_ID = "memorysplit-confirmatory-v2-360m-n5"
+ASSIGNMENT_PATH = "configs/cohort-assignment-v2.json"
+EVALUATION_IDENTITY_PATH = "configs/preregistration-v2.yaml"
 EXPECTED_SEEDS = {
     ILLUMINA_PROVIDER: (0,),
     AWS_PROVIDER: (1, 2, 3, 4),
 }
-EXPECTED_ARMS = ("dense", "split90")
-SNAPSHOT_STEPS = (1_358, 3_396, 6_791, 10_187, 13_582)
-ASSIGNMENT_PATH = "configs/cohort-assignment-v2.json"
-CORPUS_IDENTITY_PATH = "configs/reasoning-dataset-v2.json"
-EVALUATION_IDENTITY_PATH = "configs/preregistration-v2.yaml"
-METADATA_PATH = "RELEASE-METADATA.json"
-SUMS_PATH = "SHA256SUMS"
+
+V3_COHORT_ID = "memorysplit-confirmatory-v3-360m-n10-aws"
+V3_ASSIGNMENT_PATH = "configs/cohort-assignment-v3.json"
+V3_EVALUATION_IDENTITY_PATH = "configs/preregistration-v3.yaml"
+V3_PREREGISTRATION_ID = "memorysplit-confirmatory-v3"
+V3_PROFILE_ID = "aws-p5.48xlarge-v3"
+V3_PROFILE_PATH = "cluster/profiles/aws-p5.48xlarge-v3.json"
+V3_SEEDS = tuple(range(10))
+
 _SHA256 = re.compile(r"[0-9a-f]{64}")
 _COMMIT = re.compile(r"[0-9a-f]{40}")
 _OBJECT_ID = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})")
 _MAX_CONTROL_FILE_BYTES = 16 * 1024 * 1024
-_AWS_PROFILE_CONTRACT = {
-    "schema_version": 1,
-    "profile_id": AWS_PROVIDER,
-    "provider": AWS_PROVIDER,
-    "instance_type": "p5.48xlarge",
-    "purchase_model": "on_demand",
-    "gpu": {
-        "model": "NVIDIA H100 80GB",
-        "allocated": 8,
-        "seed_train_groups": [4, 4],
-    },
-    "cpu": {"vcpus": 192, "memory_gib": 2048},
-    "storage": {
-        "instance_store": {
-            "devices": 8,
-            "device_bytes": 3_840_000_000_000,
-            "model": "Amazon EC2 NVMe Instance Storage",
-            "raid_level": "0",
+_V2_ENVIRONMENT_RECEIPT_FIELDS = (
+    "schema_version",
+    "profile_sha256",
+    "container_image_digest",
+    "aws_instance_identity_document",
+    "aws_instance_identity_pkcs7",
+)
+_V3_ENVIRONMENT_RECEIPT_FIELDS = (
+    "schema_version",
+    "receipt_type",
+    "provider",
+    "profile_sha256",
+    "runtime_lock_sha256",
+    "control_bundle_sha256",
+    "source_commit",
+    "source_tree",
+    "container_image",
+    "container_image_digest",
+    "aws_instance_identity_document",
+    "aws_instance_identity_pkcs7",
+    "account_id",
+    "instance_id",
+    "region",
+    "ami_id",
+    "boot_id",
+    "runtime_facts",
+)
+
+
+def _aws_profile_contract(
+    *,
+    profile_id: str,
+    assigned_seeds: tuple[int, ...],
+) -> dict[str, object]:
+    return {
+        "schema_version": 1,
+        "profile_id": profile_id,
+        "provider": AWS_PROVIDER,
+        "instance_type": "p5.48xlarge",
+        "purchase_model": "on_demand",
+        "gpu": {
+            "model": "NVIDIA H100 80GB",
+            "allocated": 8,
+            "seed_train_groups": [4, 4],
         },
-        "scratch_root": "/mnt/memorysplit",
+        "cpu": {"vcpus": 192, "memory_gib": 2048},
+        "storage": {
+            "instance_store": {
+                "devices": 8,
+                "device_bytes": 3_840_000_000_000,
+                "model": "Amazon EC2 NVMe Instance Storage",
+                "raid_level": "0",
+            },
+            "scratch_root": "/mnt/memorysplit",
+            "durable_uri_env": "MS_S3_ROOT",
+        },
+        "runtime": {
+            "ami_id_env": "MS_AWS_AMI_ID",
+            "container_digest_env": "MS_CONTAINER_DIGEST",
+            "region_env": "AWS_REGION",
+            "runtime_gid_env": "MS_RUNTIME_GID",
+            "runtime_uid_env": "MS_RUNTIME_UID",
+        },
+        "process_env_allowlist": ["AWS_REGION", "LANG", "LC_ALL"],
+        "assigned_seeds": list(assigned_seeds),
+    }
+
+
+def _dataset_pointer_contract(*, source_lock_manifest: str) -> dict[str, object]:
+    return {
+        "schema_version": 1,
+        "provider": AWS_PROVIDER,
+        "dataset_id": "memorysplit-v2-20x-reasoning-max-cohort",
         "durable_uri_env": "MS_S3_ROOT",
-    },
-    "runtime": {
-        "ami_id_env": "MS_AWS_AMI_ID",
-        "container_digest_env": "MS_CONTAINER_DIGEST",
-        "region_env": "AWS_REGION",
-        "runtime_gid_env": "MS_RUNTIME_GID",
-        "runtime_uid_env": "MS_RUNTIME_UID",
-    },
-    "process_env_allowlist": ["AWS_REGION", "LANG", "LC_ALL"],
-    "assigned_seeds": [1, 2, 3, 4],
-}
+        "materialization": "s3",
+        "relative_path": "dataset",
+        "required_receipt": "dataset/receipt.json",
+        "required_sidecars": [
+            "dense_target_weights",
+            "split90_target_weights",
+        ],
+        "scratch_root": "/mnt/memorysplit",
+        "source_lock_manifest": source_lock_manifest,
+        "full_corpus_in_release": False,
+    }
+
+
+@dataclass(frozen=True)
+class _CohortContract:
+    """One frozen, self-contained statement of a cohort release contract."""
+
+    cohort_id: str
+    assignment_schema_version: int
+    assignment_path: str
+    corpus_identity_path: str
+    evaluation_identity_path: str
+    preregistration_id: str | None
+    preregistration_schema_version: int | None
+    config_root: str
+    run_id_prefix: str
+    train_corpus: str
+    aws_profile_id: str
+    aws_profile_path: str
+    aws_profile_contract: Mapping[str, object]
+    dataset_pointer_path: str
+    dataset_pointer_contract: Mapping[str, object]
+    package_format_version: int
+    environment_receipt_fields: tuple[str, ...]
+    providers: tuple[str, ...]
+    expected_seeds: Mapping[str, tuple[int, ...]]
+    complete_cohort: tuple[int, ...]
+    arms: tuple[str, ...]
+    snapshot_steps: tuple[int, ...]
+    coverage_error: str
+
+    @property
+    def requires_illumina(self) -> bool:
+        return ILLUMINA_PROVIDER in self.providers
+
+    def profile_path(self, provider: str) -> str:
+        if provider == ILLUMINA_PROVIDER:
+            return ILLUMINA_PROFILE_PATH
+        return self.aws_profile_path
+
+    def config_paths(self, seeds: tuple[int, ...]) -> set[str]:
+        return {
+            f"{self.config_root}{arm}-s{seed}.yaml"
+            for seed in seeds
+            for arm in self.arms
+        }
+
+
+V2_CONTRACT = _CohortContract(
+    cohort_id=COHORT_ID,
+    assignment_schema_version=2,
+    assignment_path=ASSIGNMENT_PATH,
+    corpus_identity_path=CORPUS_IDENTITY_PATH,
+    evaluation_identity_path=EVALUATION_IDENTITY_PATH,
+    preregistration_id=None,
+    preregistration_schema_version=None,
+    config_root="configs/360m-v2/",
+    run_id_prefix="memorysplit-v2-360m",
+    train_corpus="dataset/corpus-receipt.json",
+    aws_profile_id=AWS_PROVIDER,
+    aws_profile_path="cluster/profiles/aws-p5.48xlarge.json",
+    aws_profile_contract=_aws_profile_contract(
+        profile_id=AWS_PROVIDER,
+        assigned_seeds=(1, 2, 3, 4),
+    ),
+    dataset_pointer_path=DATASET_POINTER_PATH,
+    dataset_pointer_contract=_dataset_pointer_contract(
+        source_lock_manifest=CORPUS_IDENTITY_PATH,
+    ),
+    package_format_version=1,
+    environment_receipt_fields=_V2_ENVIRONMENT_RECEIPT_FIELDS,
+    providers=(ILLUMINA_PROVIDER, AWS_PROVIDER),
+    expected_seeds=EXPECTED_SEEDS,
+    complete_cohort=tuple(range(5)),
+    arms=EXPECTED_ARMS,
+    snapshot_steps=SNAPSHOT_STEPS,
+    coverage_error="cohort assignment must have exact disjoint five-seed coverage",
+)
+
+V3_CONTRACT = _CohortContract(
+    cohort_id=V3_COHORT_ID,
+    assignment_schema_version=3,
+    assignment_path=V3_ASSIGNMENT_PATH,
+    corpus_identity_path=CORPUS_IDENTITY_PATH,
+    evaluation_identity_path=V3_EVALUATION_IDENTITY_PATH,
+    preregistration_id=V3_PREREGISTRATION_ID,
+    preregistration_schema_version=3,
+    config_root="configs/360m-v3/",
+    run_id_prefix="memorysplit-v3-360m",
+    train_corpus="dataset/receipt.json",
+    aws_profile_id=V3_PROFILE_ID,
+    aws_profile_path=V3_PROFILE_PATH,
+    aws_profile_contract=_aws_profile_contract(
+        profile_id=V3_PROFILE_ID,
+        assigned_seeds=V3_SEEDS,
+    ),
+    dataset_pointer_path=DATASET_POINTER_PATH,
+    dataset_pointer_contract=_dataset_pointer_contract(
+        source_lock_manifest=CORPUS_IDENTITY_PATH,
+    ),
+    package_format_version=2,
+    environment_receipt_fields=_V3_ENVIRONMENT_RECEIPT_FIELDS,
+    providers=(AWS_PROVIDER,),
+    expected_seeds={AWS_PROVIDER: V3_SEEDS},
+    complete_cohort=V3_SEEDS,
+    arms=EXPECTED_ARMS,
+    snapshot_steps=SNAPSHOT_STEPS,
+    coverage_error="cohort assignment must have exact AWS-only ten-seed coverage",
+)
+
+CONTRACTS = (V2_CONTRACT, V3_CONTRACT)
 
 
 class VerificationError(ValueError):
@@ -88,6 +283,7 @@ class _RunCell:
 @dataclass(frozen=True)
 class _VerifiedRelease:
     provider: str
+    contract: _CohortContract
     seeds: tuple[int, ...]
     release_id: str
     archive_sha256: str
@@ -314,7 +510,32 @@ def _read_control_file(
         os.close(descriptor)
 
 
-def _receipt(content: bytes, expected_provider: str) -> Mapping[str, object]:
+def _select_contract(
+    content: bytes,
+    expected_provider: str,
+) -> _CohortContract:
+    """Pick the contract the release itself declares, or refuse to verify."""
+
+    if expected_provider == ILLUMINA_PROVIDER:
+        return V2_CONTRACT
+    value = _json(content, f"{expected_provider} release receipt")
+    seed_assignment = value.get("seed_assignment")
+    declared = (
+        seed_assignment.get("cohort_id")
+        if isinstance(seed_assignment, Mapping)
+        else None
+    )
+    for contract in CONTRACTS:
+        if declared == contract.cohort_id:
+            return contract
+    raise VerificationError("release receipt does not name a known cohort contract")
+
+
+def _receipt(
+    content: bytes,
+    expected_provider: str,
+    contract: _CohortContract,
+) -> Mapping[str, object]:
     common_fields = {
         "schema_version",
         "release_id",
@@ -350,7 +571,7 @@ def _receipt(content: bytes, expected_provider: str) -> Mapping[str, object]:
         raise VerificationError("release receipt schema_version is unsupported")
     if expected_provider == AWS_PROVIDER and (
         type(value["package_format_version"]) is not int
-        or value["package_format_version"] != 1
+        or value["package_format_version"] != contract.package_format_version
     ):
         raise VerificationError("AWS package_format_version is unsupported")
     if value["provider"] != expected_provider:
@@ -387,12 +608,14 @@ def _receipt(content: bytes, expected_provider: str) -> Mapping[str, object]:
         _seed_assignment(
             value["seed_assignment"],
             expected_provider=expected_provider,
-            expected_seeds=EXPECTED_SEEDS[expected_provider],
+            expected_seeds=contract.expected_seeds[expected_provider],
+            contract=contract,
             label="AWS receipt seed_assignment",
         )
         _runtime_attested_environment(
             value["environment"],
             label="AWS receipt environment",
+            contract=contract,
             expected_profile_sha256=_hash(
                 value["profile_sha256"],
                 "AWS receipt profile_sha256",
@@ -407,17 +630,17 @@ def _receipt(content: bytes, expected_provider: str) -> Mapping[str, object]:
         for field, expected_path, digest_field in (
             (
                 "cohort_assignment",
-                ASSIGNMENT_PATH,
+                contract.assignment_path,
                 "cohort_assignment_sha256",
             ),
             (
                 "profile",
-                "cluster/profiles/aws-p5.48xlarge.json",
+                contract.aws_profile_path,
                 "profile_sha256",
             ),
             (
                 "dataset_pointer",
-                "DATASET-POINTER-AWS.json",
+                contract.dataset_pointer_path,
                 "dataset_pointer_sha256",
             ),
         ):
@@ -441,11 +664,9 @@ def _receipt(content: bytes, expected_provider: str) -> Mapping[str, object]:
             not isinstance(key, str) for key in config_hashes
         ):
             raise VerificationError("AWS receipt config_sha256 must be an object")
-        expected_config_paths = {
-            f"configs/360m-v2/{arm}-s{seed}.yaml"
-            for seed in EXPECTED_SEEDS[AWS_PROVIDER]
-            for arm in EXPECTED_ARMS
-        }
+        expected_config_paths = contract.config_paths(
+            contract.expected_seeds[AWS_PROVIDER]
+        )
         if set(config_hashes) != expected_config_paths:
             raise VerificationError("AWS receipt config_sha256 inventory is not exact")
         for path, digest in config_hashes.items():
@@ -610,6 +831,7 @@ def _inspect_zip(
     receipt: Mapping[str, object],
     expected_provider: str,
     expected_seeds: tuple[int, ...],
+    contract: _CohortContract,
 ) -> _VerifiedRelease:
     try:
         with zipfile.ZipFile(stream, mode="r") as archive:
@@ -657,21 +879,17 @@ def _inspect_zip(
                         f"internal SHA-256 mismatch for ZIP member: {name}"
                     )
 
-            profile_path = (
-                "cluster/profiles/illumina-usfc-prd.json"
-                if expected_provider == ILLUMINA_PROVIDER
-                else "cluster/profiles/aws-p5.48xlarge.json"
-            )
+            profile_path = contract.profile_path(expected_provider)
             required = {
                 METADATA_PATH,
-                ASSIGNMENT_PATH,
-                CORPUS_IDENTITY_PATH,
-                EVALUATION_IDENTITY_PATH,
+                contract.assignment_path,
+                contract.corpus_identity_path,
+                contract.evaluation_identity_path,
                 profile_path,
             }
             if expected_provider == AWS_PROVIDER:
-                required.add("DATASET-POINTER-AWS.json")
-                if "requirements-aws-p5.lock" in regular_names:
+                required.add(contract.dataset_pointer_path)
+                if STATIC_ENVIRONMENT_LOCK_PATH in regular_names:
                     raise VerificationError(
                         "AWS release must not claim a static environment lock"
                     )
@@ -687,18 +905,18 @@ def _inspect_zip(
             )
             assignment_content = _member_bytes(
                 archive,
-                by_name[ASSIGNMENT_PATH],
-                ASSIGNMENT_PATH,
+                by_name[contract.assignment_path],
+                contract.assignment_path,
             )
             corpus_content = _member_bytes(
                 archive,
-                by_name[CORPUS_IDENTITY_PATH],
-                CORPUS_IDENTITY_PATH,
+                by_name[contract.corpus_identity_path],
+                contract.corpus_identity_path,
             )
             evaluation_content = _member_bytes(
                 archive,
-                by_name[EVALUATION_IDENTITY_PATH],
-                EVALUATION_IDENTITY_PATH,
+                by_name[contract.evaluation_identity_path],
+                contract.evaluation_identity_path,
             )
             metadata = _metadata(
                 metadata_content,
@@ -707,6 +925,7 @@ def _inspect_zip(
                 receipt=receipt,
                 sums=sums,
                 by_name=by_name,
+                contract=contract,
             )
             _provider_profile(
                 _member_bytes(
@@ -716,20 +935,24 @@ def _inspect_zip(
                 ),
                 expected_provider=expected_provider,
                 path=profile_path,
+                contract=contract,
             )
             if expected_provider == AWS_PROVIDER:
                 _dataset_pointer(
                     _member_bytes(
                         archive,
-                        by_name["DATASET-POINTER-AWS.json"],
-                        "DATASET-POINTER-AWS.json",
-                    )
+                        by_name[contract.dataset_pointer_path],
+                        contract.dataset_pointer_path,
+                    ),
+                    contract=contract,
                 )
-            assignment = _assignment(assignment_content)
+            _preregistration(evaluation_content, contract=contract)
+            assignment = _assignment(assignment_content, contract=contract)
             cells = _run_cells(
                 archive,
                 by_name=by_name,
                 expected_seeds=expected_seeds,
+                contract=contract,
             )
     except zipfile.BadZipFile as error:
         raise VerificationError("archive is not a valid ZIP") from error
@@ -740,6 +963,7 @@ def _inspect_zip(
         raise VerificationError("archive provider seeds disagree with assignment")
     return _VerifiedRelease(
         provider=expected_provider,
+        contract=contract,
         seeds=expected_seeds,
         release_id=str(receipt["release_id"]),
         archive_sha256=str(receipt["archive"]["sha256"]),
@@ -757,6 +981,7 @@ def _provider_profile(
     *,
     expected_provider: str,
     path: str,
+    contract: _CohortContract,
 ) -> None:
     value = _json(content, path)
     if not isinstance(value, Mapping):
@@ -767,12 +992,17 @@ def _provider_profile(
         raise VerificationError("provider profile schema_version is unsupported")
     if value.get("provider") != expected_provider:
         raise VerificationError("provider profile provider is incorrect")
-    if "profile_id" in value and value["profile_id"] != expected_provider:
+    expected_profile_id = (
+        expected_provider
+        if expected_provider == ILLUMINA_PROVIDER
+        else contract.aws_profile_id
+    )
+    if "profile_id" in value and value["profile_id"] != expected_profile_id:
         raise VerificationError("provider profile profile_id is incorrect")
     if expected_provider == AWS_PROVIDER:
         _exact_contract(
             value,
-            _AWS_PROFILE_CONTRACT,
+            contract.aws_profile_contract,
             label="AWS P5 profile",
         )
 
@@ -811,6 +1041,7 @@ def _runtime_attested_environment(
     value: object,
     *,
     label: str,
+    contract: _CohortContract,
     expected_profile_sha256: str,
 ) -> Mapping[str, object]:
     expected = {
@@ -821,13 +1052,7 @@ def _runtime_attested_environment(
         "runtime_environment_receipt": {
             "required_at_launch": True,
             "authentication": "aws_instance_identity_document_pkcs7",
-            "required_fields": [
-                "schema_version",
-                "profile_sha256",
-                "container_image_digest",
-                "aws_instance_identity_document",
-                "aws_instance_identity_pkcs7",
-            ],
+            "required_fields": list(contract.environment_receipt_fields),
         },
     }
     _exact_contract(value, expected, label=label)
@@ -837,42 +1062,13 @@ def _runtime_attested_environment(
     return environment
 
 
-def _dataset_pointer(content: bytes) -> None:
+def _dataset_pointer(content: bytes, *, contract: _CohortContract) -> None:
+    expected = contract.dataset_pointer_contract
     value = _strict_object(
-        _json(content, "DATASET-POINTER-AWS.json"),
-        frozenset(
-            {
-                "schema_version",
-                "provider",
-                "dataset_id",
-                "durable_uri_env",
-                "materialization",
-                "relative_path",
-                "required_receipt",
-                "required_sidecars",
-                "scratch_root",
-                "source_lock_manifest",
-                "full_corpus_in_release",
-            }
-        ),
-        "DATASET-POINTER-AWS.json",
+        _json(content, contract.dataset_pointer_path),
+        frozenset(expected),
+        contract.dataset_pointer_path,
     )
-    expected = {
-        "schema_version": 1,
-        "provider": AWS_PROVIDER,
-        "dataset_id": "memorysplit-v2-20x-reasoning-max-cohort",
-        "durable_uri_env": "MS_S3_ROOT",
-        "materialization": "s3",
-        "relative_path": "dataset",
-        "required_receipt": "dataset/receipt.json",
-        "required_sidecars": [
-            "dense_target_weights",
-            "split90_target_weights",
-        ],
-        "scratch_root": "/mnt/memorysplit",
-        "source_lock_manifest": "configs/reasoning-dataset-v2.json",
-        "full_corpus_in_release": False,
-    }
     for field, expected_value in expected.items():
         actual = value[field]
         if type(expected_value) in {bool, int} and type(actual) is not type(
@@ -883,11 +1079,33 @@ def _dataset_pointer(content: bytes) -> None:
             raise VerificationError(f"dataset pointer {field} is incorrect")
 
 
+def _preregistration(content: bytes, *, contract: _CohortContract) -> None:
+    """Bind the evaluation identity member to the contract's preregistration."""
+
+    if contract.preregistration_id is None:
+        return
+    path = contract.evaluation_identity_path
+    try:
+        value = yaml.load(content.decode("utf-8"), Loader=_UniqueKeyLoader)
+    except (UnicodeDecodeError, yaml.YAMLError) as error:
+        raise VerificationError(f"{path} must be valid strict UTF-8 YAML") from error
+    if not isinstance(value, Mapping):
+        raise VerificationError(f"{path} must contain one YAML mapping")
+    if (
+        type(value.get("schema_version")) is not int
+        or value["schema_version"] != contract.preregistration_schema_version
+    ):
+        raise VerificationError("preregistration schema_version is unsupported")
+    if value.get("preregistration_id") != contract.preregistration_id:
+        raise VerificationError("preregistration identity is incorrect")
+
+
 def _seed_assignment(
     value: object,
     *,
     expected_provider: str,
     expected_seeds: tuple[int, ...],
+    contract: _CohortContract,
     label: str,
 ) -> Mapping[str, object]:
     assignment = _strict_object(
@@ -895,7 +1113,7 @@ def _seed_assignment(
         frozenset({"cohort_id", "provider", "seeds", "arms"}),
         label,
     )
-    if assignment["cohort_id"] != COHORT_ID:
+    if assignment["cohort_id"] != contract.cohort_id:
         raise VerificationError(f"{label} cohort_id is incorrect")
     if assignment["provider"] != expected_provider:
         raise VerificationError(f"{label} provider is incorrect")
@@ -905,7 +1123,7 @@ def _seed_assignment(
         or any(type(seed) is not int for seed in assignment["seeds"])
     ):
         raise VerificationError(f"{label} seeds are incorrect")
-    if assignment["arms"] != list(EXPECTED_ARMS):
+    if assignment["arms"] != list(contract.arms):
         raise VerificationError(f"{label} arms are incorrect")
     return assignment
 
@@ -988,6 +1206,7 @@ def _metadata(
     receipt: Mapping[str, object],
     sums: Mapping[str, str],
     by_name: Mapping[str, zipfile.ZipInfo],
+    contract: _CohortContract,
 ) -> Mapping[str, object]:
     if expected_provider == ILLUMINA_PROVIDER:
         fields = frozenset(
@@ -1027,7 +1246,7 @@ def _metadata(
         raise VerificationError("release metadata schema_version is unsupported")
     if expected_provider == AWS_PROVIDER and (
         type(value["package_format_version"]) is not int
-        or value["package_format_version"] != 1
+        or value["package_format_version"] != contract.package_format_version
     ):
         raise VerificationError(
             "AWS release metadata package_format_version is unsupported"
@@ -1045,6 +1264,7 @@ def _metadata(
         value["seed_assignment"],
         expected_provider=expected_provider,
         expected_seeds=expected_seeds,
+        contract=contract,
         label="release metadata seed_assignment",
     )
     _metadata_members(
@@ -1054,11 +1274,7 @@ def _metadata(
         by_name=by_name,
     )
 
-    profile_path = (
-        "cluster/profiles/illumina-usfc-prd.json"
-        if expected_provider == ILLUMINA_PROVIDER
-        else "cluster/profiles/aws-p5.48xlarge.json"
-    )
+    profile_path = contract.profile_path(expected_provider)
     if expected_provider == ILLUMINA_PROVIDER:
         profile_hash = _hash(value["profile_sha256"], "profile_sha256")
         if sums.get(profile_path) != profile_hash:
@@ -1067,7 +1283,7 @@ def _metadata(
             value["preregistration_sha256"],
             "preregistration_sha256",
         )
-        if sums.get(EVALUATION_IDENTITY_PATH) != preregistration_hash:
+        if sums.get(contract.evaluation_identity_path) != preregistration_hash:
             raise VerificationError(
                 "preregistration_sha256 does not bind the preregistration member"
             )
@@ -1086,7 +1302,7 @@ def _metadata(
 
     cohort_binding = _path_hash_binding(
         value["cohort_assignment"],
-        expected_path=ASSIGNMENT_PATH,
+        expected_path=contract.assignment_path,
         sums=sums,
         label="AWS cohort_assignment",
     )
@@ -1099,20 +1315,17 @@ def _metadata(
     environment_contract = _runtime_attested_environment(
         value["environment"],
         label="AWS environment",
+        contract=contract,
         expected_profile_sha256=str(profile_binding["sha256"]),
     )
     dataset_binding = _path_hash_binding(
         value["dataset_pointer"],
-        expected_path="DATASET-POINTER-AWS.json",
+        expected_path=contract.dataset_pointer_path,
         sums=sums,
         label="AWS dataset_pointer",
     )
     config_hashes = value["config_sha256"]
-    expected_config_paths = {
-        f"configs/360m-v2/{arm}-s{seed}.yaml"
-        for seed in expected_seeds
-        for arm in EXPECTED_ARMS
-    }
+    expected_config_paths = contract.config_paths(expected_seeds)
     if (
         not isinstance(config_hashes, Mapping)
         or any(not isinstance(key, str) for key in config_hashes)
@@ -1149,9 +1362,13 @@ def _metadata(
     return value
 
 
-def _assignment(content: bytes) -> Mapping[str, object]:
+def _assignment(
+    content: bytes,
+    *,
+    contract: _CohortContract,
+) -> Mapping[str, object]:
     value = _strict_object(
-        _json(content, ASSIGNMENT_PATH),
+        _json(content, contract.assignment_path),
         frozenset(
             {
                 "schema_version",
@@ -1163,11 +1380,11 @@ def _assignment(content: bytes) -> Mapping[str, object]:
                 "targets_per_update",
             }
         ),
-        ASSIGNMENT_PATH,
+        contract.assignment_path,
     )
     expected_scalars = {
-        "schema_version": 2,
-        "cohort_id": COHORT_ID,
+        "schema_version": contract.assignment_schema_version,
+        "cohort_id": contract.cohort_id,
         "model_parameters": 356_033_536,
         "optimizer_steps": 13_582,
         "raw_target_tokens": 7_120_879_616,
@@ -1181,10 +1398,12 @@ def _assignment(content: bytes) -> Mapping[str, object]:
             raise VerificationError(f"cohort assignment {field} is incorrect")
     providers = _strict_object(
         value["provider_seeds"],
-        frozenset({ILLUMINA_PROVIDER, AWS_PROVIDER}),
+        frozenset(contract.providers),
         "cohort assignment provider_seeds",
     )
-    for provider, expected in EXPECTED_SEEDS.items():
+    covered: set[int] = set()
+    for provider in contract.providers:
+        expected = contract.expected_seeds[provider]
         seeds = providers[provider]
         if (
             not isinstance(seeds, list)
@@ -1194,12 +1413,11 @@ def _assignment(content: bytes) -> Mapping[str, object]:
             raise VerificationError(
                 f"cohort assignment seeds are incorrect for {provider}"
             )
-    illumina = set(providers[ILLUMINA_PROVIDER])
-    aws = set(providers[AWS_PROVIDER])
-    if illumina & aws or illumina | aws != set(range(5)):
-        raise VerificationError(
-            "cohort assignment must have exact disjoint five-seed coverage"
-        )
+        if covered & set(seeds):
+            raise VerificationError(contract.coverage_error)
+        covered |= set(seeds)
+    if covered != set(contract.complete_cohort):
+        raise VerificationError(contract.coverage_error)
     if (
         value["targets_per_update"] * value["optimizer_steps"]
         != value["raw_target_tokens"]
@@ -1250,18 +1468,15 @@ def _run_cells(
     *,
     by_name: Mapping[str, zipfile.ZipInfo],
     expected_seeds: tuple[int, ...],
+    contract: _CohortContract,
 ) -> tuple[_RunCell, ...]:
-    prefix = "configs/360m-v2/"
+    prefix = contract.config_root
     config_names = {
         name
         for name, info in by_name.items()
         if name.startswith(prefix) and not info.is_dir()
     }
-    expected_names = {
-        f"{prefix}{arm}-s{seed}.yaml"
-        for seed in expected_seeds
-        for arm in EXPECTED_ARMS
-    }
+    expected_names = contract.config_paths(expected_seeds)
     if config_names != expected_names:
         raise VerificationError(
             "archive does not contain its exact assigned Dense/Split90 configs"
@@ -1271,18 +1486,18 @@ def _run_cells(
         raw = _yaml(_member_bytes(archive, by_name[name], name), name)
         seed = _integer(raw["seed"], f"{name} seed")
         arm = _string(raw["condition"], f"{name} condition")
-        if seed not in expected_seeds or arm not in EXPECTED_ARMS:
+        if seed not in expected_seeds or arm not in contract.arms:
             raise VerificationError(f"{name} has an unassigned seed or arm")
         expected_path = f"{prefix}{arm}-s{seed}.yaml"
         if name != expected_path:
             raise VerificationError("run config path disagrees with its semantics")
         expected_values: dict[str, object] = {
             "schema_version": 2,
-            "cohort_id": COHORT_ID,
-            "run_id": f"memorysplit-v2-360m-s{seed}-{arm}",
+            "cohort_id": contract.cohort_id,
+            "run_id": f"{contract.run_id_prefix}-s{seed}-{arm}",
             "model": "d360m",
             "ctx": 1024,
-            "train_corpus": "dataset/corpus-receipt.json",
+            "train_corpus": contract.train_corpus,
             "sidecar_name": (
                 "dense_target_weights" if arm == "dense" else "split90_target_weights"
             ),
@@ -1298,7 +1513,7 @@ def _run_cells(
             "device": "cuda",
             "log_every": 20,
             "eval_every": 250,
-            "snapshot_steps": list(SNAPSHOT_STEPS),
+            "snapshot_steps": list(contract.snapshot_steps),
             "ckpt_minutes": 30,
         }
         for field, expected in expected_values.items():
@@ -1326,7 +1541,9 @@ def _run_cells(
             )
         )
     semantic_cells = {(cell.seed, cell.arm) for cell in cells}
-    expected_cells = {(seed, arm) for seed in expected_seeds for arm in EXPECTED_ARMS}
+    expected_cells = {
+        (seed, arm) for seed in expected_seeds for arm in contract.arms
+    }
     if semantic_cells != expected_cells or len(cells) != len(semantic_cells):
         raise VerificationError("archive run configs are not complete and unique")
     return tuple(cells)
@@ -1347,7 +1564,8 @@ def _verify_release(
             path.name,
             f"{expected_provider} release receipt",
         )
-        receipt = _receipt(receipt_content, expected_provider)
+        contract = _select_contract(receipt_content, expected_provider)
+        receipt = _receipt(receipt_content, expected_provider, contract)
         archive_binding = receipt["archive"]
         archive_name = _safe_archive_name(archive_binding["path"])
         sidecar_name = f"{archive_name}.sha256"
@@ -1395,7 +1613,8 @@ def _verify_release(
                     stream,
                     receipt=receipt,
                     expected_provider=expected_provider,
-                    expected_seeds=EXPECTED_SEEDS[expected_provider],
+                    expected_seeds=contract.expected_seeds[expected_provider],
+                    contract=contract,
                 )
                 after_zip = os.fstat(stream.fileno())
                 fingerprints = [
@@ -1428,60 +1647,74 @@ def _verify_release(
 
 def verify_cohort_releases(
     *,
-    illumina_release: Path | str,
     aws_release: Path | str,
+    illumina_release: Path | str | None = None,
 ) -> dict[str, object]:
-    """Authenticate both releases and return one canonical cohort decision."""
+    """Authenticate every release and return one canonical cohort decision."""
 
-    illumina = _verify_release(
-        illumina_release,
-        expected_provider=ILLUMINA_PROVIDER,
+    illumina = (
+        None
+        if illumina_release is None
+        else _verify_release(
+            illumina_release,
+            expected_provider=ILLUMINA_PROVIDER,
+        )
     )
     aws = _verify_release(
         aws_release,
         expected_provider=AWS_PROVIDER,
     )
-    if illumina.source_commit != aws.source_commit:
-        raise VerificationError("release source commits differ")
-    if illumina.assignment != aws.assignment:
-        raise VerificationError("release cohort assignments differ semantically")
-    if illumina.assignment_sha256 != aws.assignment_sha256:
-        raise VerificationError("release cohort assignment hashes differ")
-    if illumina.corpus_sha256 != aws.corpus_sha256:
-        raise VerificationError("release corpus identities differ")
-    if illumina.evaluation_sha256 != aws.evaluation_sha256:
-        raise VerificationError("release evaluation identities differ")
+    contract = aws.contract
+    if contract.requires_illumina and illumina is None:
+        raise VerificationError(
+            "this cohort contract requires an Illumina release as well"
+        )
+    if not contract.requires_illumina and illumina is not None:
+        raise VerificationError(
+            "this cohort contract is AWS-only and admits no Illumina release"
+        )
 
-    all_cells = illumina.cells + aws.cells
+    all_cells = aws.cells
+    if illumina is not None:
+        if illumina.contract is not contract:
+            raise VerificationError("releases were built for different cohorts")
+        if illumina.source_commit != aws.source_commit:
+            raise VerificationError("release source commits differ")
+        if illumina.assignment != aws.assignment:
+            raise VerificationError("release cohort assignments differ semantically")
+        if illumina.assignment_sha256 != aws.assignment_sha256:
+            raise VerificationError("release cohort assignment hashes differ")
+        if illumina.corpus_sha256 != aws.corpus_sha256:
+            raise VerificationError("release corpus identities differ")
+        if illumina.evaluation_sha256 != aws.evaluation_sha256:
+            raise VerificationError("release evaluation identities differ")
+        all_cells = illumina.cells + aws.cells
+
     run_ids = [cell.run_id for cell in all_cells]
     if len(run_ids) != len(set(run_ids)):
         raise VerificationError("release run IDs overlap")
     cell_keys = [(cell.seed, cell.arm) for cell in all_cells]
-    expected_cells = {(seed, arm) for seed in range(5) for arm in EXPECTED_ARMS}
+    expected_cells = {
+        (seed, arm) for seed in contract.complete_cohort for arm in contract.arms
+    }
     if len(cell_keys) != len(set(cell_keys)) or set(cell_keys) != expected_cells:
         raise VerificationError(
             "releases do not provide exact disjoint Dense/Split90 coverage"
         )
     train_corpora = {cell.train_corpus for cell in all_cells}
-    if train_corpora != {"dataset/corpus-receipt.json"}:
+    if train_corpora != {contract.train_corpus}:
         raise VerificationError("release run configs use different corpus identities")
 
-    return {
+    report: dict[str, object] = {
         "schema_version": SCHEMA_VERSION,
         "ok": True,
-        "cohort_id": COHORT_ID,
-        "source_commit": illumina.source_commit,
-        "cohort_assignment_sha256": illumina.assignment_sha256,
-        "corpus_identity_sha256": illumina.corpus_sha256,
-        "evaluation_identity_sha256": illumina.evaluation_sha256,
-        "arms": list(EXPECTED_ARMS),
-        "complete_cohort": list(range(5)),
-        "illumina": {
-            "provider": illumina.provider,
-            "release_id": illumina.release_id,
-            "archive_sha256": illumina.archive_sha256,
-            "seeds": list(illumina.seeds),
-        },
+        "cohort_id": contract.cohort_id,
+        "source_commit": aws.source_commit,
+        "cohort_assignment_sha256": aws.assignment_sha256,
+        "corpus_identity_sha256": aws.corpus_sha256,
+        "evaluation_identity_sha256": aws.evaluation_sha256,
+        "arms": list(contract.arms),
+        "complete_cohort": list(contract.complete_cohort),
         "aws": {
             "provider": aws.provider,
             "release_id": aws.release_id,
@@ -1489,6 +1722,14 @@ def verify_cohort_releases(
             "seeds": list(aws.seeds),
         },
     }
+    if illumina is not None:
+        report["illumina"] = {
+            "provider": illumina.provider,
+            "release_id": illumina.release_id,
+            "archive_sha256": illumina.archive_sha256,
+            "seeds": list(illumina.seeds),
+        }
+    return report
 
 
 def _emit(value: Mapping[str, object]) -> None:
@@ -1506,10 +1747,10 @@ def _emit(value: Mapping[str, object]) -> None:
 
 def main(argv: list[str] | None = None) -> int:
     parser = _StrictArgumentParser(
-        description="Verify split-provider MemorySplit cohort releases.",
+        description="Verify MemorySplit cohort releases against one contract.",
         add_help=False,
     )
-    parser.add_argument("--illumina", required=True)
+    parser.add_argument("--illumina", default=None)
     parser.add_argument("--aws", required=True)
     try:
         arguments = parser.parse_args(argv)
