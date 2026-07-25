@@ -18,9 +18,9 @@ CORPUS_BUCKET = "memorysplit-corpus-056956104102-us-east-1"
 CORPUS_KEY_PREFIX = "v2/builds"
 MAX_HOURLY_USD = Decimal("5.491")
 MAX_COMPUTE_USD = Decimal("131.78")
-# PROVISIONAL: replace at integration with the build-invariant reviewed payload.
-PROVISIONAL_BOOTSTRAP_USER_DATA_SHA256 = (
-    "4a666e5a093da098a8066aadd4b4ed368dc4571a8cde54e525bf2e387db06861"
+# Authoritative SHA-256 of the build-invariant bootstrap gzip member.
+BOOTSTRAP_USER_DATA_SHA256 = (
+    "11f5fbfd7bee7a01e42956654020d21eeec7455305a2da3c8c7e9fb37a0b139f"
 )
 
 _CORPUS_ACCOUNT = "056956104102"
@@ -134,7 +134,7 @@ class CorpusBuilderProfile:
     bucket_name: str
     key_prefix: str
     bootstrap_user_data_sha256: str = (
-        PROVISIONAL_BOOTSTRAP_USER_DATA_SHA256
+        BOOTSTRAP_USER_DATA_SHA256
     )
 
 
@@ -416,7 +416,7 @@ def _validate_profile(profile: CorpusBuilderProfile) -> None:
     )
     if (
         profile.bootstrap_user_data_sha256
-        != PROVISIONAL_BOOTSTRAP_USER_DATA_SHA256
+        != BOOTSTRAP_USER_DATA_SHA256
     ):
         raise ValueError("profile.bootstrap_user_data_sha256 drift")
 
