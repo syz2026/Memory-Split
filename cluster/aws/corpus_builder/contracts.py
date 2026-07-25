@@ -18,6 +18,10 @@ CORPUS_BUCKET = "memorysplit-corpus-056956104102-us-east-1"
 CORPUS_KEY_PREFIX = "v2/builds"
 MAX_HOURLY_USD = Decimal("5.491")
 MAX_COMPUTE_USD = Decimal("131.78")
+# Authoritative SHA-256 of the build-invariant bootstrap gzip member.
+BOOTSTRAP_USER_DATA_SHA256 = (
+    "11f5fbfd7bee7a01e42956654020d21eeec7455305a2da3c8c7e9fb37a0b139f"
+)
 
 _CORPUS_ACCOUNT = "056956104102"
 _CORPUS_REGION = "us-east-1"
@@ -53,6 +57,7 @@ _PHASE_RE = re.compile(r"^[a-z][a-z0-9-]{0,63}$")
 
 _PROFILE_FIELDS = frozenset(
     {
+        "bootstrap_user_data_sha256",
         "bucket_name",
         "instance_type",
         "key_prefix",
@@ -128,6 +133,9 @@ class CorpusBuilderProfile:
     max_compute_usd: Decimal
     bucket_name: str
     key_prefix: str
+    bootstrap_user_data_sha256: str = (
+        BOOTSTRAP_USER_DATA_SHA256
+    )
 
 
 @dataclass(frozen=True)
@@ -402,6 +410,15 @@ def _validate_profile(profile: CorpusBuilderProfile) -> None:
         raise ValueError("profile.bucket_name drift")
     if profile.key_prefix != CORPUS_KEY_PREFIX:
         raise ValueError("profile.key_prefix drift")
+    _sha256(
+        profile.bootstrap_user_data_sha256,
+        label="profile.bootstrap_user_data_sha256",
+    )
+    if (
+        profile.bootstrap_user_data_sha256
+        != BOOTSTRAP_USER_DATA_SHA256
+    ):
+        raise ValueError("profile.bootstrap_user_data_sha256 drift")
 
 
 def _validate_phase_receipt(receipt: PhaseReceipt) -> None:
@@ -592,6 +609,10 @@ def _parse_profile(raw: object) -> CorpusBuilderProfile:
     key_prefix = _exact_string(
         value["key_prefix"], CORPUS_KEY_PREFIX, label="profile.key_prefix"
     )
+    bootstrap_user_data_sha256 = _sha256(
+        value["bootstrap_user_data_sha256"],
+        label="profile.bootstrap_user_data_sha256",
+    )
     if _REGION_RE.fullmatch(region) is None:
         raise ValueError("profile.region is not a valid explicit region")
     if _BUCKET_RE.fullmatch(bucket_name) is None:
@@ -611,6 +632,7 @@ def _parse_profile(raw: object) -> CorpusBuilderProfile:
         max_compute_usd=max_compute_usd,
         bucket_name=bucket_name,
         key_prefix=key_prefix,
+        bootstrap_user_data_sha256=bootstrap_user_data_sha256,
     )
     _validate_profile(profile)
     return profile
@@ -618,6 +640,7 @@ def _parse_profile(raw: object) -> CorpusBuilderProfile:
 
 def _profile_dict(profile: CorpusBuilderProfile) -> dict[str, object]:
     return {
+        "bootstrap_user_data_sha256": profile.bootstrap_user_data_sha256,
         "bucket_name": profile.bucket_name,
         "instance_type": profile.instance_type,
         "key_prefix": profile.key_prefix,
