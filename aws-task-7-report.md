@@ -99,10 +99,12 @@ The returned `checks` tuple is exactly:
    bytes, reserialize byte-for-byte, and compute SHA-256.
 2. `exact-s3-versions` — validate both `S3ObjectVersion` contracts, HEAD the
    package and source manifest by exact version, and require shared build and
-   KMS identities.
+   KMS identities. Require the exact package version's S3 metadata to bind its
+   immutable package revision.
 3. `production-software-gate` — parse the Task 2 canonical package manifest,
-   bind archive bytes and SHA-256 to the package record, and require every
-   package module in the existing production authority set.
+   bind archive bytes and SHA-256 to the package record, bind its revision to
+   the exact package object's metadata, and require every package module in the
+   existing production authority set.
 4. `account-and-region` — require STS account `056956104102` and EC2 client
    region `us-east-1`.
 5. `ami-identity` — require the exact AMI and owner, `x86_64`, `available`,
@@ -164,4 +166,66 @@ the EC2 dry run, have passed.
 No known blocker. The software-gate receipt is deliberately interpreted as the
 canonical Task 2 package manifest because that is the existing artifact that
 proves successful closed-world production packaging; it is bound to the exact
-uploaded package record and the package module's production authority set.
+uploaded package version and the package module's production authority set.
+
+## Controller review corrections
+
+Fix commit:
+`63f73b73679b1c6091ab5ea02905e6d1fad97753`
+(`fix: harden AWS preflight launch authorization`)
+
+### Review RED
+
+The focused regression tests were added before the corrections:
+
+```text
+python -m pytest -q tests/test_aws_corpus_builder_preflight.py
+```
+
+Expected RED: `9 failed, 36 passed in 0.39s`. The failures demonstrated:
+
+1. a manifest with the right archive SHA-256 but an unrelated revision passed
+   the production software gate;
+2. a mutable `stack_outputs` mapping could change the emitted subnet after
+   validation;
+3. `--live` did not exist, default CLI execution constructed live clients, and
+   malformed local authorities did not precede client construction; and
+4. the final intent path was visible before the payload was fsynced.
+
+### Review GREEN
+
+```text
+python -m pytest -q tests/test_aws_corpus_builder_preflight.py
+python -m py_compile \
+  cluster/aws/corpus_builder/preflight.py \
+  scripts/aws_corpus_builder_preflight.py
+git diff --check
+```
+
+Fresh result: `45 passed in 0.13s`; compilation and whitespace checks exited 0
+with no output.
+
+### Review self-review
+
+- The package manifest's archive bytes and SHA-256 now match the package record,
+  and its revision must match metadata read from that same immutable S3 object
+  version after Task 3's exact-object verification.
+- The CLI parses records and validates the canonical profile, record
+  relationships, and software evidence before `_live_clients` can run.
+  `--live` is mandatory without injected clients, and an autouse test guard
+  makes accidental real-client construction fail every focused test.
+- Stack outputs are copied once at the first stack-dependent gate. The
+  validated subnet ID and other launch authorities are carried from that
+  snapshot into the intent; the mutable request mapping is never re-read.
+- Intent bytes are written mode `0600` to a randomized same-directory
+  temporary, fsynced and closed under the failure guard, then atomically
+  renamed. Interrupted writes remove the temporary and never expose the final
+  intent path.
+- No real AWS client or network call was made. All live-path tests replace
+  `_live_clients` with fakes.
+- Only the three assigned Python files and this report changed. The untracked
+  task brief and review package were not staged.
+
+Operational prerequisite: package publication must preserve the packager's
+immutable revision in S3 object metadata under `revision`; preflight now fails
+closed if that binding is absent or malformed.
