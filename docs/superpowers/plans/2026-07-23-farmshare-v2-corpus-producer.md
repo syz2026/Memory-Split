@@ -172,19 +172,30 @@ POSIX storage.
 
 **Catalog, routing, and rendering**
 
+- Create: `corpusgen/reasoning_v2/wikidata_source.py` (Task 3W) — descriptor-
+  pinned archive authority, the content-addressed `WikidataDerivedView`
+  builder/verifier and closed `WikidataDerivedViewReceipt`, canonical logical
+  streams, fixed-width offset/alias indexes, and the live descriptor-session
+  indexed lookups consumed by the Wikidata catalog lane and renderer.
 - Create: `corpusgen/reasoning_v2/catalog.py` — external-memory
   `CatalogRecord`/`InputCatalog`, deterministic record IDs, frozen split
-  lengths, lane exhaustion checks, source/evaluation provenance, and canonical
-  JSONL indexes.
+  lengths, lane exhaustion checks, source/evaluation provenance, canonical
+  JSONL indexes, and the `WikidataGraphCatalogSource` adapter that binds the
+  derived-view receipt SHA-256 (Task 3W).
 - Create: `corpusgen/reasoning_v2/semantic.py` — production external-sort route
   manifest, route index, dose report, token semantic spans, sidecar derivation,
   and semantic-leak aggregation.
 - Create: `corpusgen/reasoning_v2/renderers.py` — one concrete renderer for
   each frozen lane, shared `ProductionRenderedRecord`, tokenizer fitting,
   solver/proof envelopes, objective-source suballocation, and renderer
-  registry.
+  registry. The Wikidata renderer consumes a live verified `WikidataDerivedView`
+  session and indexed lookups only (Task 3W).
+- Create: `tests/test_reasoning_v2_wikidata_source.py` (Task 3W) — derived-view
+  archive authority, receipt, deterministic build/verify, live-session indexed
+  lookups, and the view→renderer integration.
 - Create: `tests/test_reasoning_v2_catalog.py` — all-eight-lane catalog,
-  ordering, quota, complete-graph, contamination, and no-cycle tests.
+  ordering, quota, complete-graph, contamination, no-cycle, and Wikidata
+  derived-view commitment tests.
 - Create: `tests/test_reasoning_v2_semantic.py` — route parity, dose, closure,
   answer-state, and binary sidecar tests.
 - Create: `tests/test_reasoning_v2_renderers.py` — exact renderer behavior for
@@ -1247,6 +1258,61 @@ git commit -m "feat: add v2 semantic sidecar routing"
 
 ---
 
+### Task 3W: Insert the Wikidata derived-view authority
+
+**Placement:** between source staging / the eight-lane catalog (Task 3) and the
+renderer lanes (Task 5A). Detailed design and plan live in
+`docs/superpowers/specs/2026-07-24-wikidata-derived-view-design.md` and
+`docs/superpowers/plans/2026-07-24-wikidata-derived-view.md`.
+
+**Files:**
+- Create: `corpusgen/reasoning_v2/wikidata_source.py`
+- Create/extend: `tests/test_reasoning_v2_wikidata_source.py`
+- Modify: `corpusgen/reasoning_v2/catalog.py` (Wikidata lane adapter and view
+  commitment)
+- Modify: `corpusgen/reasoning_v2/renderers.py` (indexed Wikidata renderer)
+
+**Why:** The three locked Wikidata5m archives are compressed tar files that
+cannot serve production random lookup, and the reviewed immutable v2 source root
+must not be expanded with a legacy manifest or an extracted `wikidata5m/files`
+namespace. A renderer built on the legacy `iter_training_triples()` /
+`iter_aliases()` iterators therefore cannot consume the Task 2/3 verified source
+root — the blocker that stopped the first Task 5A attempt. Task 3W supplies the
+missing content-addressed authority boundary between source staging and the
+catalog/renderers without touching the frozen source lock.
+
+**Sub-tasks (all strict TDD, `HEAD` unchanged throughout):**
+- Task 3W.1 — descriptor-pinned archive authority and the closed
+  `WikidataDerivedViewReceipt`.
+- Task 3W.2 — the content-addressed builder/verifier and the live,
+  context-managed `WikidataDerivedView` descriptor session with canonical
+  logical streams, fixed-width offset/alias indexes, and
+  `lookup_training_triple` / `lookup_alias` / `iter_distinct_training_edges`.
+- Task 3W.3 — `WikidataGraphCatalogSource`, authorized only by a live verified
+  session, binding member / locked archive path / `split="train"` /
+  `training_split` / one-based row / canonical edge key and the derived-view
+  receipt SHA-256 into every locator and the catalog index, with a fail-closed
+  edge-capacity gate.
+- Task 3W.4 — the indexed `WikidataGraphRenderer(source_root, wikidata_view)`
+  that resolves each catalog record through indexed view lookups only, plus this
+  design/plan amendment (the current task).
+
+**Interfaces (`corpusgen/reasoning_v2/wikidata_source.py`):**
+`WikidataDerivedViewRef`, `WikidataDerivedView`, `WikidataDerivedViewReceipt`,
+`build_wikidata_derived_view`, `verify_wikidata_derived_view`,
+`open_wikidata_derived_view`, `V2TrainingTriple`, `V2AliasRecord`,
+`iter_v2_training_triples`, `iter_v2_aliases`, `iter_distinct_training_edges`,
+`lookup_training_triple`, and `lookup_alias`.
+
+**Verification:** `python -m pytest -q tests/test_reasoning_v2_wikidata_source.py
+tests/test_reasoning_v2_catalog.py tests/test_reasoning_v2_renderers.py` plus the
+semantic, tokenizer, SRGM, source-lock, and current-source regressions;
+`python -m py_compile` on `wikidata_source.py`, `catalog.py`, and
+`renderers.py`; and `git diff --check`. The frozen recipe, source lock,
+`configs/current-dataset-lock.json`, `sources/wikidata5m.lock.json`, the three
+fixed archive identities, all scientific lane quotas, and the legacy
+`corpusgen/current_sources.py` contract are unchanged.
+
 ### Task 5A: Implement renderer contracts and four exposure lanes
 
 **Files:**
@@ -1259,8 +1325,10 @@ git commit -m "feat: add v2 semantic sidecar routing"
   verified source root,
   `RouteIndex`,
   `get_tok()`,
-  `iter_training_triples()`,
-  `iter_aliases()`,
+  a live verified `WikidataDerivedView` session with its
+  `lookup_training_triple()` / `lookup_alias()` indexed lookups (Task 3W; the
+  Wikidata path no longer uses the legacy `iter_training_triples()` /
+  `iter_aliases()` iterators),
   `iter_worlds()`, and
   `iter_graph_records()`.
 - Produces:
@@ -1269,7 +1337,9 @@ git commit -m "feat: add v2 semantic sidecar routing"
   `ProductionLaneRenderer`,
   `FineWebEduRenderer`,
   `FineMathRenderer`,
-  `WikidataGraphRenderer`, and
+  `WikidataGraphRenderer` (constructed as
+  `WikidataGraphRenderer(source_root, wikidata_view)` and verifying the locator
+  and derived-view commitment through indexed lookups only), and
   `SyntheticGraphRenderer`.
 
 - [ ] **Step 1: RED — test the shared contract and four exposure lanes**
@@ -1513,14 +1583,17 @@ git commit -m "feat: add solver-backed v2 renderers"
 **Interfaces:**
 - Consumes:
   Task 5A/5B renderers,
-  `iter_puzzle_tasks()`,
+  `PuzzleSourceScan`,
+  `read_v2_puzzle_task()`,
+  `ObjectiveAuxiliaryCatalogSource` records,
   locked DeepMind mathematics, CLRS-Text, RuleTaker, ProntoQA, and Reasoning
   Gym sources.
 - Produces:
   `ObjectiveAuxiliaryRenderer`,
   `RendererRegistry`,
   `production_renderer_versions() -> tuple[tuple[LaneId, str], ...]`, and
-  `build_renderer_registry(source_lock: SourceLock, source_root: Path) -> RendererRegistry`.
+  `build_renderer_registry(source_lock: SourceLock, source_root: Path, *,
+  wikidata_view: WikidataDerivedView) -> RendererRegistry`.
 
 - [ ] **Step 1: RED — test every objective source and final lane order**
 
@@ -1545,14 +1618,16 @@ def test_renderer_registry_has_exact_frozen_lane_order(staged_fixture_sources):
     registry = build_renderer_registry(
         staged_fixture_sources.lock,
         staged_fixture_sources.root,
+        wikidata_view=staged_fixture_sources.wikidata_view,
     )
     assert tuple(registry) == LANE_ORDER
     assert len({renderer.renderer_version for renderer in registry.values()}) == 8
 ```
 
-Add tests for exact answers, mutated answers, ARC/ConceptARC combined cap,
-Hamilton reallocation, teacher-generated target count zero, evaluation-task
-rejection, unknown source, and a registry version mutation.
+Add tests for exact answers, mutated answers, direct puzzle commitments,
+evaluation-task rejection, unknown source, and a registry version mutation.
+The prerequisite objective-source suite owns the ARC/ConceptARC cap, Hamilton,
+whole-record assignment, and teacher-generated-zero tests.
 
 - [ ] **Step 2: Verify RED**
 
@@ -1594,13 +1669,18 @@ class RendererRegistry:
         )
 ```
 
-Allocate objective targets by Hamilton equally over the five unbounded exact
-generators in source-policy order. ARC-AGI, ARC-AGI-2, and ConceptARC share the
-exact `floor(full_targets * 0.0025)` ceiling; reallocate unused finite-source
-targets over the five unbounded generators by Hamilton. Every objective record
-stores an exact-answer or solver-replay proof envelope. The registry requires
-exactly `LANE_ORDER`, hashes all eight versions into `renderer_id`, and rejects
-extra/missing renderer classes.
+The objective renderer consumes records allocated by the prerequisite
+`ObjectiveAuxiliaryCatalogSource`; it does not own corpus-wide cap or Hamilton
+allocation. It retains a compact authenticated `PuzzleSourceScan` and rereads
+only the selected direct puzzle file through `read_v2_puzzle_task()`. Every
+objective record stores an exact-answer or solver-replay proof envelope. The
+registry requires exactly `LANE_ORDER`, hashes all eight versions into
+`renderer_id`, and rejects extra/missing renderer classes. The supplied
+Wikidata view must be a live
+review-clean descriptor session and remain open for the registry's full use;
+data-only references and closed/foreign sessions fail. Registry identity
+commits renderer versions and proof metadata/hashes only, never raw
+`ProofEnvelope.premise_bytes` that may contain routed factual surfaces.
 
 - [ ] **Step 4: Verify GREEN**
 

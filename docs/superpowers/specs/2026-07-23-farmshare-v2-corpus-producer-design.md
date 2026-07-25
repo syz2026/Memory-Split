@@ -162,13 +162,61 @@ Every record has:
 Catalog order is independent of filesystem enumeration, worker count, download
 order, and Python hash randomization.
 
-### 6.2 Lane renderers
+The Wikidata graph lane's catalog source is authorized only by a live verified
+`WikidataDerivedView` session (Task 3W). Each Wikidata record binds the decoded
+training member, the locked archive path, `split="train"`, the source
+`training_split`, the one-based source row, the canonical QID/PID/QID edge key,
+and the derived-view receipt SHA-256; the catalog index binds that same
+`wikidata_view_sha256` commitment. Before draft production the adapter compares
+the verified distinct training-edge count with the allocated record count and
+fails closed rather than silently dropping an edge.
+
+### 6.2 Wikidata derived-view authority (Task 3W)
+
+The three locked Wikidata5m archives cannot serve production random lookup from
+compressed tar members, and the immutable v2 source root must not be expanded.
+Task 3W therefore inserts a deterministic, content-addressed **Wikidata derived
+view** between source staging and the catalog, built outside the source root by
+`corpusgen/reasoning_v2/wikidata_source.py`:
+
+- `build_wikidata_derived_view` / `verify_wikidata_derived_view` authenticate the
+  frozen `SourceLock` bytes and the three descriptor-pinned archives, decode only
+  the declared members, and publish a closed `WikidataDerivedViewReceipt` by
+  no-replace rename at `<output-root>/wikidata/<receipt-sha256>`.
+- The view materializes canonical logical streams (`training.tsv`, `aliases.tsv`,
+  `distinct-edges.tsv`) and fixed-width training-offset and alias indexes for
+  random lookup, all committed by SHA-256, byte count, count, and record width in
+  the receipt.
+- `open_wikidata_derived_view` yields a live, context-managed
+  `WikidataDerivedView` descriptor session that re-verifies every source and view
+  binding, holds the receipt/stream/index descriptors open for the session, and
+  repeats post-read descriptor and named-entry identity checks before returning
+  bytes. A data-only `WikidataDerivedViewRef`, a closed or foreign session, or a
+  hand-constructed object cannot authorize a read.
+- `lookup_training_triple`, `lookup_alias`, and `iter_distinct_training_edges`
+  are the only production access paths; direct per-record archive scans and
+  per-record full-stream scans are rejected.
+
+The frozen source lock, `configs/current-dataset-lock.json`,
+`sources/wikidata5m.lock.json`, the three fixed archive identities, and the
+legacy `corpusgen/current_sources.py` contract are unchanged; the source root
+stays byte-for-byte identical.
+
+### 6.3 Lane renderers
 
 `corpusgen/reasoning_v2/renderers.py` implements one renderer per lane:
 
 - FineWeb-Edu and FineMath render locked text records.
 - Wikidata graph renders the complete frozen training graph once before any
-  deterministic revisit permitted by the schedule.
+  deterministic revisit permitted by the schedule. It is constructed with a live
+  verified `WikidataDerivedView` session and resolves every catalog record
+  through indexed triple and alias lookups only. Before rendering it verifies the
+  record's locked archive path, decoded member, `split="train"`, source
+  `training_split`, one-based row, canonical QID/PID/QID edge key, locked archive
+  SHA-256, and derived-view receipt commitment; it never calls a legacy iterator
+  or rescans an archive or full stream per record. The graph payload and its
+  occurrence-closure fact are composed from the view's indexed lookups, so the
+  catalog carries no Wikidata surface text.
 - Synthetic graph uses frozen generator code and explicit seeds.
 - Synthetic multihop and Wikidata path lanes emit canonical solver-verified
   proofs.
@@ -182,7 +230,7 @@ and flags. The renderer refuses non-finite values, noncanonical Unicode,
 unverified answers, duplicate IDs, or records exceeding context without a
 frozen split rule.
 
-### 6.3 Semantic routing and sidecars
+### 6.4 Semantic routing and sidecars
 
 The compiler reuses the reviewed routing and semantic-closure primitives.
 
@@ -198,7 +246,7 @@ The compiler reuses the reviewed routing and semantic-closure primitives.
 The route manifest, dose report, and semantic-leak report are bound into the
 outer receipt. Any leak or dose failure invalidates the build.
 
-### 6.4 Two-pass parallel build
+### 6.5 Two-pass parallel build
 
 Pass 1 renders canonical metadata and proof commitments in disjoint ordinal
 partitions. Pass 2 applies the largest-deficit schedule and writes aligned token
@@ -239,6 +287,9 @@ The outer receipt binds:
 
 - dataset ID `memorysplit-v2-20x-reasoning-max-cohort`;
 - source Git commit and source-lock hash;
+- Wikidata derived-view receipt SHA-256 (Task 3W), matching the
+  `wikidata_view_sha256` committed by the catalog index and every Wikidata
+  record locator;
 - inner receipt path and SHA-256;
 - exact lane quotas and realized counts;
 - graph coverage;
@@ -334,6 +385,10 @@ Implementation is test-first.
 Local tests cover:
 
 - strict source-lock parsing and immutable revision requirements;
+- deterministic Wikidata derived-view build/verify, live descriptor-session
+  indexed lookups, and byte-identical archive→view→catalog→renderer round trips
+  that reject data-only references, closed or foreign sessions, and wrong
+  member/split/row/edge/view commitments (Task 3W/Task 4);
 - deterministic catalogs for all eight lanes;
 - exact Hamilton quotas;
 - independent serial/parallel and worker-order identity;

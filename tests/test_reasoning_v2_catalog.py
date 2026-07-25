@@ -36,7 +36,12 @@ from corpusgen.reasoning_v2.contracts import (
 from corpusgen.reasoning_v2.source_lock import (
     SourceFile,
     SourceLock,
+    load_source_lock,
     stage_source_lock,
+)
+from corpusgen.reasoning_v2.wikidata_source import (
+    build_wikidata_derived_view,
+    open_wikidata_derived_view,
 )
 from reasoning_v2_fixtures import (
     FixtureSourceLock,
@@ -1446,3 +1451,186 @@ def test_iter_records_rejects_noncanonical_or_truncated_jsonl(
     catalog.records_path.write_bytes(first_line)
     with pytest.raises(ValueError, match="canonical|newline|record count|identity"):
         tuple(catalog.iter_records())
+
+
+# ---------------------------------------------------------------------------
+# Task 3: production Wikidata catalog adapter over a verified derived view
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def wikidata_view_authority(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    fixture_source_lock: FixtureSourceLock,
+):
+    from test_reasoning_v2_wikidata_source import (
+        _base_archive_payloads,
+        _install_archive_authority,
+    )
+
+    authority = _install_archive_authority(
+        tmp_path,
+        monkeypatch,
+        fixture_source_lock,
+        _base_archive_payloads(),
+    )
+    commit = fixture_source_lock.lock.generator_commit
+    lock = load_source_lock(
+        authority.source_lock_path,
+        expected_generator_commit=commit,
+    )
+    root = stage_source_lock(
+        lock,
+        authority.source_root,
+        tmp_path / "canonical",
+        expected_generator_commit=commit,
+    )
+    view_ref = build_wikidata_derived_view(
+        authority.source_lock_path,
+        root,
+        tmp_path / "views",
+        expected_generator_commit=commit,
+    )
+    # A held-open view session pins the source-lock parent directory identity
+    # (inode/link count/mtime). Catalog output therefore has to live under a
+    # dedicated directory created before the session opens, so building never
+    # mutates the pinned parent. In production the source tree and catalog
+    # output are already separate roots; this only matters for the shared
+    # tmp_path in tests.
+    outputs = tmp_path / "catalogs"
+    outputs.mkdir()
+    return SimpleNamespace(
+        lock=lock,
+        root=root,
+        source_lock_path=authority.source_lock_path,
+        view_ref=view_ref,
+        commit=commit,
+        outputs=outputs,
+    )
+
+
+def _wikidata_graph_source(view: object):
+    from corpusgen.reasoning_v2.catalog import WikidataGraphCatalogSource
+
+    return WikidataGraphCatalogSource(view)
+
+
+def _wikidata_end_to_end_geometry(wikidata_quota: int) -> BuildGeometry:
+    lane_quotas: tuple[tuple[LaneId, int], ...] = tuple(
+        (lane_id, wikidata_quota if lane_id == "wikidata_graph" else 1)
+        for lane_id in LANE_ORDER
+    )
+    return BuildGeometry(
+        profile="canary",
+        total_targets=sum(quota for _lane, quota in lane_quotas),
+        targets_per_update=1,
+        context_length=1,
+        shard_count=1,
+        allow_fewer_shards=True,
+        lane_quotas=lane_quotas,
+    )
+
+
+def _end_to_end_sources(lock: SourceLock, adapter: object):
+    sources = {
+        lane_id: FixtureLane(lane_id=lane_id, lock=lock)
+        for lane_id in LANE_ORDER
+        if lane_id != "wikidata_graph"
+    }
+    sources[cast(LaneId, "wikidata_graph")] = cast(FixtureLane, adapter)
+    return sources
+
+
+def test_catalog_receipt_binds_verified_wikidata_view_sha256(
+    wikidata_view_authority,
+):
+    auth = wikidata_view_authority
+    geometry = _wikidata_end_to_end_geometry(3)
+    with open_wikidata_derived_view(
+        auth.source_lock_path,
+        auth.root,
+        auth.view_ref,
+        expected_generator_commit=auth.commit,
+    ) as view:
+        adapter = _wikidata_graph_source(view)
+        sources = _end_to_end_sources(auth.lock, adapter)
+        catalog = build_input_catalog(
+            geometry,
+            auth.lock,
+            auth.root,
+            sources,
+            auth.outputs / "catalog",
+            expected_generator_commit=auth.commit,
+        )
+    index = json.loads(catalog.to_bytes())
+    assert index["wikidata_view_sha256"] == auth.view_ref.receipt_sha256
+    assert canonical_json_bytes(index) == catalog.to_bytes()
+    assert getattr(catalog, "wikidata_view_sha256", None) == auth.view_ref.receipt_sha256
+    graph_records = [
+        row for row in catalog.iter_records() if row.lane_id == "wikidata_graph"
+    ]
+    assert graph_records
+    for record in graph_records:
+        assert (
+            dict(record.source_locator)["wikidata_view_sha256"]
+            == auth.view_ref.receipt_sha256
+        )
+
+
+def test_end_to_end_catalog_is_byte_identical_across_rebuilds(
+    wikidata_view_authority,
+):
+    auth = wikidata_view_authority
+    geometry = _wikidata_end_to_end_geometry(3)
+
+    def build(output_name: str) -> InputCatalog:
+        with open_wikidata_derived_view(
+            auth.source_lock_path,
+            auth.root,
+            auth.view_ref,
+            expected_generator_commit=auth.commit,
+        ) as view:
+            adapter = _wikidata_graph_source(view)
+            sources = _end_to_end_sources(auth.lock, adapter)
+            return build_input_catalog(
+                geometry,
+                auth.lock,
+                auth.root,
+                sources,
+                auth.outputs / output_name,
+                expected_generator_commit=auth.commit,
+            )
+
+    first = build("first")
+    second = build("second")
+    assert first.sha256 == second.sha256
+    assert first.to_bytes() == second.to_bytes()
+    assert first.records_path.read_bytes() == second.records_path.read_bytes()
+
+    graph_records = [
+        row for row in first.iter_records() if row.lane_id == "wikidata_graph"
+    ]
+    assert len(graph_records) == 3
+    first_revisit = next(
+        (
+            index
+            for index, row in enumerate(graph_records)
+            if "graph-revisit" in row.semantic_flags
+        ),
+        len(graph_records),
+    )
+    edge_keys_before_revisit = {
+        dict(row.source_locator)["training_edge_key"]
+        for row in graph_records[:first_revisit]
+    }
+    assert edge_keys_before_revisit == {"Q1\tP1\tQ2", "Q3\tP2\tQ4"}
+    assert all(
+        "graph-revisit" in row.semantic_flags
+        for row in graph_records[first_revisit:]
+    )
+    for record in graph_records:
+        assert (
+            dict(record.source_locator)["wikidata_view_sha256"]
+            == auth.view_ref.receipt_sha256
+        )

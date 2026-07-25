@@ -44,6 +44,71 @@ _LICENSES = {
 _APACHE = b"Apache License\nVersion 2.0, January 2004\n"
 
 
+def _compact_task_bytes(task: dict[str, object]) -> bytes:
+    return (
+        json.dumps(task, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        + b"\n"
+    )
+
+
+def _reformatted_task_bytes(task: dict[str, object]) -> bytes:
+    return json.dumps(task, ensure_ascii=False, indent=2, sort_keys=True).encode(
+        "utf-8"
+    ) + b"\n"
+
+
+# Distinct exact-answer ARC training tasks. Their canonical hashes differ; the
+# raw and reformatted variants of task one drive the raw/canonical duplicate
+# audit exercised by the finite puzzle scan.
+_PUZZLE_TASK_ONE = {
+    "train": [{"input": [[1, 0], [0, 1]], "output": [[0, 1], [1, 0]]}],
+    "test": [{"input": [[2, 2], [2, 2]], "output": [[3, 3], [3, 3]]}],
+}
+_PUZZLE_TASK_TWO = {
+    "train": [{"input": [[4]], "output": [[5]]}],
+    "test": [
+        {"input": [[6]], "output": [[7]]},
+        {"input": [[8]], "output": [[9]]},
+    ],
+}
+_PUZZLE_TASK_THREE = {
+    "train": [{"input": [[1, 1]], "output": [[2, 2]]}],
+    "test": [{"input": [[3, 3]], "output": [[4, 4]]}],
+}
+# Evaluation tasks withhold their test outputs (as the real ARC evaluation
+# split does); the scan only needs their canonical hashes for overlap checks.
+_PUZZLE_EVAL_ONE = {
+    "train": [{"input": [[7]], "output": [[7]]}],
+    "test": [{"input": [[8]]}],
+}
+_PUZZLE_EVAL_TWO = {
+    "train": [{"input": [[5, 5]], "output": [[6, 6]]}],
+    "test": [{"input": [[9, 9]]}],
+}
+
+_PUZZLE_TASK_ONE_BYTES = _compact_task_bytes(_PUZZLE_TASK_ONE)
+_PUZZLE_TASK_ONE_REFORMATTED_BYTES = _reformatted_task_bytes(_PUZZLE_TASK_ONE)
+
+# Direct, listed, byte-bound finite puzzle layout for the v2 fixture: one
+# accepted training task per source, an exact-byte cross-source duplicate, a
+# canonical (reformatted) cross-source duplicate, and ARC evaluation files.
+DEFAULT_PUZZLE_FILES: dict[str, dict[str, bytes]] = {
+    "arc_agi_1": {
+        "data/training/a.json": _PUZZLE_TASK_ONE_BYTES,
+        "data/evaluation/e1.json": _compact_task_bytes(_PUZZLE_EVAL_ONE),
+    },
+    "arc_agi_2": {
+        "data/training/a_rawdup.json": _PUZZLE_TASK_ONE_BYTES,
+        "data/training/b.json": _compact_task_bytes(_PUZZLE_TASK_TWO),
+        "data/evaluation/e2.json": _compact_task_bytes(_PUZZLE_EVAL_TWO),
+    },
+    "conceptarc": {
+        "corpus/concept/a.json": _PUZZLE_TASK_ONE_REFORMATTED_BYTES,
+        "corpus/concept/c.json": _compact_task_bytes(_PUZZLE_TASK_THREE),
+    },
+}
+
+
 def _sha256(payload: bytes) -> str:
     return hashlib.sha256(payload).hexdigest()
 
@@ -74,10 +139,12 @@ class FakePublicResolver:
         revision_overrides: dict[str, str] | None = None,
         omit_ruletaker_archive: bool = False,
         unresolved_source: str | None = None,
+        puzzle_files: dict[str, dict[str, bytes]] | None = None,
     ) -> None:
         self.revision_overrides = revision_overrides or {}
         self.omit_ruletaker_archive = omit_ruletaker_archive
         self.unresolved_source = unresolved_source
+        self.puzzle_files = puzzle_files
 
     def resolve(self, request: SourceRequest, download_root: Path) -> SourceEntry:
         if request.source_id == self.unresolved_source:
@@ -112,12 +179,13 @@ class FakePublicResolver:
             )
         elif source_id == "ruletaker" and not self.omit_ruletaker_archive:
             files["rule-reasoning-dataset-V2020.2.5.zip"] = b"dataset archive"
-        elif source_id == "arc_agi_1":
-            files["data/training/a.json"] = b"{}\n"
-        elif source_id == "arc_agi_2":
-            files["data/training/b.json"] = b"{}\n"
-        elif source_id == "conceptarc":
-            files["corpus/concept/a.json"] = b"{}\n"
+        elif source_id in DEFAULT_PUZZLE_FILES:
+            override = (
+                None if self.puzzle_files is None else self.puzzle_files.get(source_id)
+            )
+            files.update(
+                DEFAULT_PUZZLE_FILES[source_id] if override is None else override
+            )
         else:
             files["src/data.txt"] = source_id.encode()
 

@@ -194,6 +194,52 @@ def test_staging_is_content_addressed_and_rejects_byte_drift(
         )
 
 
+def test_finite_puzzle_fixture_is_direct_listed_and_byte_bound(
+    tmp_path,
+    fixture_source_lock: FixtureSourceLock,
+):
+    root = stage_source_lock(
+        fixture_source_lock.lock,
+        fixture_source_lock.download_root,
+        tmp_path / "canonical",
+    )
+    by_id = {entry.source_id: entry for entry in fixture_source_lock.lock.sources}
+    finite_puzzle_inventory = {
+        "arc_agi_1": ("data/training/a.json", "data/evaluation/e1.json"),
+        "arc_agi_2": (
+            "data/training/a_rawdup.json",
+            "data/training/b.json",
+            "data/evaluation/e2.json",
+        ),
+        "conceptarc": ("corpus/concept/a.json", "corpus/concept/c.json"),
+    }
+    for source_id, relatives in finite_puzzle_inventory.items():
+        entry = by_id[source_id]
+        listed = {row.path: row for row in entry.files}
+        for relative in relatives:
+            assert relative in listed, (source_id, relative)
+            row = listed[relative]
+            staged = root / source_id / relative
+            assert staged.is_file() and not staged.is_symlink()
+            payload = staged.read_bytes()
+            assert len(payload) == row.bytes
+            assert hashlib.sha256(payload).hexdigest() == row.sha256
+
+    # The finite puzzle tree stays a direct content-addressed layout with no
+    # legacy manifest or git/ namespace to authenticate.
+    assert not (root / "source-manifest.json").exists()
+    assert not (root / "git").exists()
+
+    # Exact-byte duplicate: the arc_agi_2 raw duplicate is byte-identical to the
+    # arc_agi_1 training task; the ConceptARC entry is a distinct-byte reformat.
+    arc1_task = (root / "arc_agi_1" / "data/training/a.json").read_bytes()
+    arc2_rawdup = (root / "arc_agi_2" / "data/training/a_rawdup.json").read_bytes()
+    concept_dup = (root / "conceptarc" / "corpus/concept/a.json").read_bytes()
+    assert arc2_rawdup == arc1_task
+    assert concept_dup != arc1_task
+    assert json.loads(concept_dup) == json.loads(arc1_task)
+
+
 def test_source_lock_rejects_duplicate_source_ids(tmp_path, valid_lock_json):
     valid_lock_json["sources"].append(copy.deepcopy(valid_lock_json["sources"][0]))
     with pytest.raises(ValueError, match="duplicate source"):
