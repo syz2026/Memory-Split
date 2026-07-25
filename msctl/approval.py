@@ -269,6 +269,7 @@ def verify_scope_approval(
             expected_resource_fields |= _V3_RESOURCE_FIELDS
             if operation == "evaluate":
                 expected_resource_fields |= _V3_FINAL_EVALUATION_RESOURCE_FIELDS
+                expected_resource_fields.add("checkpoint_receipt_sha256")
             if operation in {"submit", "resume", "evaluate"}:
                 expected_resource_fields.add("launch_readiness_sha256")
     require_exact_keys(
@@ -323,7 +324,10 @@ def verify_scope_approval(
                         label=f"resource request.{field}",
                     )
                 if operation == "evaluate":
-                    for field in _V3_FINAL_EVALUATION_RESOURCE_FIELDS:
+                    for field in (
+                        *_V3_FINAL_EVALUATION_RESOURCE_FIELDS,
+                        "checkpoint_receipt_sha256",
+                    ):
                         require_sha256(
                             resources.get(field),
                             label=f"resource request.{field}",

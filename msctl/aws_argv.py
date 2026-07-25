@@ -253,6 +253,19 @@ _CHECKPOINT_FIELDS = {
     "resume_sha256",
     "world_size",
 }
+_EVALUATION_CHECKPOINT_RECEIPT_FIELDS = {"sha256", "uri", "checkpoints"}
+_EVALUATION_CHECKPOINT_FIELDS = {
+    "run_id",
+    "arm",
+    "checkpoint_sha256",
+    "checkpoint_uri",
+    "configuration_sha256",
+    "configuration_uri",
+    "run_binding_sha256",
+    "run_binding_uri",
+    "checkpoint_record_sha256",
+    "checkpoint_record_uri",
+}
 _FORBIDDEN_ENVIRONMENT = {
     "AWS_ACCESS_KEY_ID",
     "AWS_CONFIG_FILE",
@@ -398,6 +411,110 @@ def _validate_checkpoint_receipt(value: object) -> None:
         arms.add(str(arm))
     if arms != {"dense", "split90"}:
         raise RemoteIntentError("checkpoint binding pair is incomplete")
+
+
+def _validate_evaluation_checkpoint_receipt(
+    value: object,
+    *,
+    seed: int,
+    s3_root: str,
+) -> None:
+    if (
+        not isinstance(value, dict)
+        or set(value) != _EVALUATION_CHECKPOINT_RECEIPT_FIELDS
+    ):
+        raise RemoteIntentError(
+            "evaluation checkpoint receipt fields do not match the contract"
+        )
+    receipt_sha256 = _sha256(
+        value["sha256"],
+        label="evaluation checkpoint receipt",
+    )
+    expected_receipt_uri = (
+        f"{s3_root}/checkpoints/seed-{seed}/receipts/"
+        f"{receipt_sha256}.json"
+    )
+    if (
+        _s3_uri(value["uri"], root=s3_root) != expected_receipt_uri
+    ):
+        raise RemoteIntentError(
+            "evaluation checkpoint receipt URI is not canonical"
+        )
+    checkpoints = value["checkpoints"]
+    if not isinstance(checkpoints, list) or len(checkpoints) != 2:
+        raise RemoteIntentError(
+            "evaluation checkpoint receipt must bind one complete pair"
+        )
+    arms: set[str] = set()
+    run_ids: set[str] = set()
+    for row in checkpoints:
+        if (
+            not isinstance(row, dict)
+            or set(row) != _EVALUATION_CHECKPOINT_FIELDS
+        ):
+            raise RemoteIntentError(
+                "evaluation checkpoint artifact fields do not match"
+            )
+        arm = row["arm"]
+        run_id = row["run_id"]
+        if (
+            arm not in {"dense", "split90"}
+            or arm in arms
+            or not isinstance(run_id, str)
+            or not run_id
+            or "/" in run_id
+            or "\\" in run_id
+            or run_id in run_ids
+        ):
+            raise RemoteIntentError(
+                "evaluation checkpoint artifact identity is invalid"
+            )
+        checkpoint_sha256 = _sha256(
+            row["checkpoint_sha256"],
+            label=f"{arm} evaluation checkpoint",
+        )
+        configuration_sha256 = _sha256(
+            row["configuration_sha256"],
+            label=f"{arm} evaluation configuration",
+        )
+        run_binding_sha256 = _sha256(
+            row["run_binding_sha256"],
+            label=f"{arm} evaluation run binding",
+        )
+        record_sha256 = _sha256(
+            row["checkpoint_record_sha256"],
+            label=f"{arm} evaluation checkpoint record",
+        )
+        prefix = f"{s3_root}/checkpoints/seed-{seed}/{arm}"
+        expected_uris = {
+            "checkpoint_uri": (
+                f"{prefix}/sha256/{checkpoint_sha256}.pt"
+            ),
+            "configuration_uri": (
+                f"{prefix}/configuration/sha256/"
+                f"{configuration_sha256}.yaml"
+            ),
+            "run_binding_uri": (
+                f"{prefix}/run-binding/sha256/"
+                f"{run_binding_sha256}.json"
+            ),
+            "checkpoint_record_uri": (
+                f"{prefix}/records/{record_sha256}.json"
+            ),
+        }
+        if any(
+            _s3_uri(row[field], root=s3_root) != expected_uri
+            for field, expected_uri in expected_uris.items()
+        ):
+            raise RemoteIntentError(
+                "evaluation checkpoint artifact URI is not canonical"
+            )
+        arms.add(str(arm))
+        run_ids.add(run_id)
+    if arms != {"dense", "split90"}:
+        raise RemoteIntentError(
+            "evaluation checkpoint artifact pair is incomplete"
+        )
 
 
 def _validate_canary_intent(
@@ -596,7 +713,17 @@ def _validate_intent(
             and not isinstance(intent["checkpoint_receipt"], dict)
         )
         or (
-            intent["operation"] != "resume"
+            intent["operation"] == "evaluate"
+            and schema_version == 3
+            and not isinstance(intent["checkpoint_receipt"], dict)
+        )
+        or (
+            intent["operation"] not in {"resume", "evaluate"}
+            and intent["checkpoint_receipt"] is not None
+        )
+        or (
+            intent["operation"] == "evaluate"
+            and schema_version != 3
             and intent["checkpoint_receipt"] is not None
         )
     ):
@@ -686,6 +813,12 @@ def _validate_intent(
     ):
         raise RemoteIntentError("operation environment is not closed and credential-free")
     s3_root = _s3_uri(environment["MS_S3_ROOT"])
+    if intent["operation"] == "evaluate" and schema_version == 3:
+        _validate_evaluation_checkpoint_receipt(
+            intent["checkpoint_receipt"],
+            seed=intent["seed"],
+            s3_root=s3_root,
+        )
     started_receipt_uri = _s3_uri(intent["started_receipt_uri"], root=s3_root)
     terminal_receipt_uri = _s3_uri(intent["terminal_receipt_uri"], root=s3_root)
     receipt_root = (

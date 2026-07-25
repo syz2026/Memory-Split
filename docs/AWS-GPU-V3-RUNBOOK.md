@@ -1062,14 +1062,16 @@ and interruption publication open one singly linked regular generation with
 verify size, SHA-256 metadata, and SSE-KMS identity.
 
 Successful paired completion additionally requires both metadata records to
-say `terminal: true` at the configured final step. It snapshots
-`configuration.yaml`, writes the evaluator `run.json` beside each `ckpt.pt`,
-and publishes one canonical schema-v3 pair receipt at
+say `terminal: true` at the configured final step. It snapshots and immutably
+publishes both `ckpt.pt` files, both `configuration.yaml` files, both evaluator
+`run.json` bindings, and both checkpoint records. One canonical schema-v3 pair
+receipt binds every object URI and SHA-256 at
 `checkpoints/seed-<seed>/receipts/<receipt-sha256>.json`. A successful
-interruption publishes the same schema-v3 receipt shape from its stabilized
-pair, so its exact receipt can be supplied to `resume`. Local NVMe is scratch;
-do not stop or terminate until the paired receipt and both objects are durably
-verified.
+interruption instead publishes the nonterminal schema-v3 resume form from its
+stabilized checkpoint pair; it has no terminal run bindings or checkpoint
+records and is valid for `resume`, never for training-wave advance or
+evaluation. Local NVMe is scratch; do not stop or terminate until the relevant
+paired receipt and all receipt-listed objects are durably verified.
 
 There is no prelaunch evaluator or checkpoint-hash binding. At terminal
 completion the publisher derives `model_id` and raw token count from the
@@ -1082,7 +1084,7 @@ values and immutably publishes it under
 nonterminal checkpoints publish only the fixture-bound resume receipt; they
 are not finalization records.
 
-## 12. Resume, evaluate, and collect
+## 12. Resume, advance training waves, finalize, evaluate, and collect
 
 Resume only from a verified paired checkpoint receipt:
 
@@ -1137,6 +1139,64 @@ enforce the evaluator's closed field set and relative paths, then publish those
 canonical bytes immutably. The same publication step emits one canonical
 `CheckpointRecord` for each arm; do not synthesize these records from mutable
 “latest” pointers.
+
+Advance an instance to its next assigned training wave as soon as the prior
+pair has successful terminal training and its complete terminal bundle is
+durable. Evaluation and collection do not exist yet and are not inputs:
+
+```bash
+NEXT_MANIFEST="$OPERATOR_ROOT/manifests/seed-1.json"
+CHECKPOINT_RECEIPT="$OPERATOR_ROOT/receipts/checkpoint-seed-0.json"
+ADVANCE_APPROVAL="$OPERATOR_ROOT/approvals/fleet-advance-seed-0-to-1.json"
+
+# DRY RUN: verifies paired local terminal state, the canonical durable
+# schema-v3 checkpoint receipt/records, consecutive plan waves, and the exact
+# proposed tag deletion. It does not evaluate or collect.
+python -m msctl \
+  --profile "$PROFILE" \
+  --repo-root . \
+  --state-root "$OPERATOR_ROOT/state" \
+  fleet advance \
+  --amendment configs/hardware-amendment-v3.json \
+  --provider-selection "$SELECTION" \
+  --fleet-plan "$FLEET_PLAN" \
+  --to-manifest "$NEXT_MANIFEST" \
+  --instance-id "$INSTANCE_ID" \
+  --checkpoint-receipt "$CHECKPOINT_RECEIPT" \
+  --approval "$ADVANCE_APPROVAL" \
+  > "$REVIEW_ROOT/fleet-advance-plan-seed-0-to-1.json"
+
+# APPLY only with signed approval for these exact resources.
+python -m msctl \
+  --profile "$PROFILE" \
+  --repo-root . \
+  --state-root "$OPERATOR_ROOT/state" \
+  fleet advance \
+  --amendment configs/hardware-amendment-v3.json \
+  --provider-selection "$SELECTION" \
+  --fleet-plan "$FLEET_PLAN" \
+  --to-manifest "$NEXT_MANIFEST" \
+  --instance-id "$INSTANCE_ID" \
+  --checkpoint-receipt "$CHECKPOINT_RECEIPT" \
+  --approval "$ADVANCE_APPROVAL" \
+  --apply > "$REVIEW_ROOT/fleet-advance-result-seed-0-to-1.json"
+```
+
+Apply rechecks authoritative training SSM success, rematerializes the receipt,
+both checkpoints, both configurations, both `run.json` files, and both
+checkpoint records from their immutable S3 URIs, verifies the complete bundle,
+then deletes only the prior wave's exact reviewed tags. It proves those tags
+absent and writes an exclusive closed
+`memorysplit-aws-training-wave-advance-v3` receipt. Manual or external tag
+deletion is never progression evidence.
+
+For each target wave, create the required transition receipt for every instance
+participating in that wave before submitting any target pair. This all-peer
+gate applies unchanged to 1–4 instance fleets, including a shorter final wave.
+Repeat train then advance until all ten pairs are terminal. Submit and resume
+continue to require the target pair's current exact tags; only post-training
+evaluation may use a matching historical advance receipt after prior tags were
+removed.
 
 After all twenty checkpoint records and every registered passing validity
 receipt are durable, build the complete release. The two inventory files below
@@ -1225,6 +1285,7 @@ python -m msctl \
   evaluate \
   --release "$RELEASE_RECEIPT" \
   --manifest "$MANIFEST" \
+  --checkpoint-receipt "$CHECKPOINT_RECEIPT" \
   --dataset-pointer DATASET-POINTER-AWS.json \
   --dataset-verification "$DATASET_VERIFICATION" \
   --environment-receipt "$ENVIRONMENT_RECEIPT" \
@@ -1240,6 +1301,7 @@ python -m msctl \
   evaluate \
   --release "$RELEASE_RECEIPT" \
   --manifest "$MANIFEST" \
+  --checkpoint-receipt "$CHECKPOINT_RECEIPT" \
   --dataset-pointer DATASET-POINTER-AWS.json \
   --dataset-verification "$DATASET_VERIFICATION" \
   --environment-receipt "$ENVIRONMENT_RECEIPT" \
@@ -1248,14 +1310,18 @@ python -m msctl \
   --apply > "$REVIEW_ROOT/evaluate-result-seed-0.json"
 ```
 
-Evaluation stages only
-`$MS_S3_ROOT/sealed-evaluation/$SEALED_EVALUATION_SHA256`, revalidates the
-external member root and actual `study-lock.json` bytes inside the digest-pinned
-container, and invokes the evaluator with `/opt/venv/bin/python`. Before either
-arm runs, it re-verifies the terminal pair, both evaluator `run.json` bindings,
-and all checkpoint objects. After both arms succeed, it requires the exact
-closed confirmatory artifact inventory, immutably uploads each file, and
-publishes a closed paired evaluation receipt at
+Evaluation stages
+`$MS_S3_ROOT/sealed-evaluation/$SEALED_EVALUATION_SHA256` and the exact
+receipt-addressed terminal bundle. It revalidates the external member root and
+actual `study-lock.json` bytes inside the digest-pinned container. Before either
+arm runs, it rematerializes from immutable S3 and verifies the checkpoint
+receipt, both checkpoints, both configurations, both evaluator `run.json`
+bindings, and both checkpoint records. It then invokes the evaluator with
+`/opt/venv/bin/python`. This works after reboot, NVMe reuse, and prior-wave tag
+removal because the historical advance receipt, local successful training
+state, fleet binding, and explicit instance ID remain hash-bound. After both
+arms succeed, it requires the exact closed confirmatory artifact inventory,
+immutably uploads each file, and publishes a closed paired evaluation receipt at
 `evaluations/seed-<seed>/receipts/<receipt-sha256>.json` and the canonical
 collection source `results/seed-<seed>.json`. The training preregistration hash
 is never substituted for the external study-lock hash.
@@ -1289,57 +1355,11 @@ installs the directory with canonical `COLLECTION.json`. Repeating the command
 accepts only byte-identical verified contents; a partial, extra, symlinked, or
 conflicting destination fails closed.
 
-Repeat evaluate/collect for every seed and report all ten paired outcomes. For
-a later fleet wave assigned to the same instance, first assemble the closed
-collection directory and its `COLLECTION.json`, then explicitly advance:
-
-```bash
-NEXT_MANIFEST="$OPERATOR_ROOT/manifests/seed-1.json"
-COLLECTION_ROOT="$OPERATOR_ROOT/collected/seed-0"
-ADVANCE_APPROVAL="$OPERATOR_ROOT/approvals/fleet-advance-seed-0-to-1.json"
-
-# DRY RUN: verifies paired local terminal state, successful evaluation, exact
-# collection bytes, consecutive plan waves, and the proposed exact tag delete.
-python -m msctl \
-  --profile "$PROFILE" \
-  --repo-root . \
-  --state-root "$OPERATOR_ROOT/state" \
-  fleet advance \
-  --amendment configs/hardware-amendment-v3.json \
-  --provider-selection "$SELECTION" \
-  --fleet-plan "$FLEET_PLAN" \
-  --to-manifest "$NEXT_MANIFEST" \
-  --instance-id "$INSTANCE_ID" \
-  --collection-root "$COLLECTION_ROOT" \
-  --approval "$ADVANCE_APPROVAL" \
-  > "$REVIEW_ROOT/fleet-advance-plan-seed-0-to-1.json"
-
-# APPLY only with a signed approval for the exact rendered resources.
-python -m msctl \
-  --profile "$PROFILE" \
-  --repo-root . \
-  --state-root "$OPERATOR_ROOT/state" \
-  fleet advance \
-  --amendment configs/hardware-amendment-v3.json \
-  --provider-selection "$SELECTION" \
-  --fleet-plan "$FLEET_PLAN" \
-  --to-manifest "$NEXT_MANIFEST" \
-  --instance-id "$INSTANCE_ID" \
-  --collection-root "$COLLECTION_ROOT" \
-  --approval "$ADVANCE_APPROVAL" \
-  --apply > "$REVIEW_ROOT/fleet-advance-result-seed-0-to-1.json"
-```
-
-Apply rechecks authoritative training/evaluation SSM success, immutable terminal
-receipt metadata, and the exact currently bound AWS tags before deleting those
-exact key/value pairs. It then proves the tags absent and writes an exclusive
-local transition receipt bound to the fleet plan, both waves, collection, and
-approval. Manual or external tag deletion is never progression evidence and
-cannot replace this receipt. Submit, resume, and evaluate for a later wave are
-admitted only after every instance participating in that wave has its own
-validated prior-wave advance receipt. This prevents one parallel instance from
-starting the next wave while a peer remains uncollected or unadvanced. One
-active pair per host remains mandatory.
+Repeat evaluate/collect for every seed and report all ten paired outcomes.
+These closed evaluation receipts and `COLLECTION.json` directories are a
+distinct post-finalization completion gate. They do not retroactively authorize
+training-wave progression and are never embedded in a training-wave advance
+receipt. One active pair per host remains mandatory.
 
 ## 13. Apply-time mutation inventory
 
@@ -1363,7 +1383,8 @@ Every apply in this runbook has a bounded mutation:
   objects after no-follow snapshots; evaluation materializes and validates the
   external sealed release and writes evaluation output;
 - fleet advance deletes only the prior wave's exact reviewed tag key/value
-  pairs after all terminal/evaluation/collection evidence is rechecked; and
+  pairs after terminal training and the complete durable checkpoint
+  receipt/record bundle are rechecked; and
 - stop, start, terminate, session close, and eventual retention deletion are
   the explicit EC2/session/retention mutations shown below.
 

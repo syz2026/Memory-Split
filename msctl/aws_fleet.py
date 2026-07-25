@@ -28,7 +28,8 @@ from .jsonutil import canonical_json, canonical_sha256, require_sha256
 
 
 FLEET_PLAN_TYPE = "memorysplit-aws-explicit-fleet-v3"
-FLEET_ADVANCE_TYPE = "memorysplit-aws-fleet-advance-v3"
+TRAINING_WAVE_ADVANCE_TYPE = "memorysplit-aws-training-wave-advance-v3"
+FLEET_ADVANCE_TYPE = TRAINING_WAVE_ADVANCE_TYPE
 _MAX_PLAN_BYTES = 262_144
 _INSTANCE_ID_RE = re.compile(r"^i-[0-9a-f]{8,17}$")
 _COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
@@ -88,23 +89,19 @@ _ADVANCE_FIELDS = {
 _ADVANCE_WAVE_FIELDS = {"seed", "wave", "run_manifest_sha256"}
 _ADVANCE_EVIDENCE_FIELDS = {
     "training_state_sha256",
-    "evaluation_state_sha256",
-    "collection_receipt_sha256",
     "training_command_id",
-    "evaluation_command_id",
     "training_terminal_receipt_uri",
-    "evaluation_terminal_receipt_uri",
     "checkpoint_receipt_sha256",
     "checkpoint_receipt_uri",
-    "evaluation_receipt_sha256",
-    "evaluation_receipt_uri",
+    "checkpoint_records",
     "aws_bound_tags_sha256",
     "aws_unbound_tags_sha256",
 }
+_ADVANCE_RECORD_FIELDS = {"run_id", "arm", "sha256", "uri"}
 _ADVANCE_DECISION_FIELDS = {
     "training_terminal",
-    "evaluated",
-    "collected",
+    "checkpoint_receipt_durable",
+    "checkpoint_records_durable",
     "unbound",
 }
 _COLLECTION_FIELDS = {"schema_version", "files"}
@@ -981,7 +978,7 @@ def create_fleet_advance(
     approval_sha256: str,
     advanced_at: str,
 ) -> dict[str, object]:
-    """Create a closed terminal/evaluated/collected/unbound transition."""
+    """Create a closed terminal-training/durable-checkpoint transition."""
 
     if (
         from_binding.instance_id != instance_id
@@ -1013,8 +1010,8 @@ def create_fleet_advance(
         "approval_sha256": approval_sha256,
         "decision": {
             "training_terminal": True,
-            "evaluated": True,
-            "collected": True,
+            "checkpoint_receipt_durable": True,
+            "checkpoint_records_durable": True,
             "unbound": True,
         },
         "advanced_at": _advance_timestamp(advanced_at),
@@ -1065,8 +1062,8 @@ def validate_fleet_advance(
         or decision
         != {
             "training_terminal": True,
-            "evaluated": True,
-            "collected": True,
+            "checkpoint_receipt_durable": True,
+            "checkpoint_records_durable": True,
             "unbound": True,
         }
     ):
@@ -1083,15 +1080,12 @@ def validate_fleet_advance(
         _sha256(receipt[field], label=f"fleet advance {field}")
     for field in (
         "training_state_sha256",
-        "evaluation_state_sha256",
-        "collection_receipt_sha256",
         "checkpoint_receipt_sha256",
-        "evaluation_receipt_sha256",
         "aws_bound_tags_sha256",
         "aws_unbound_tags_sha256",
     ):
         _sha256(evidence[field], label=f"fleet advance evidence {field}")
-    for field in ("training_command_id", "evaluation_command_id"):
+    for field in ("training_command_id",):
         if (
             not isinstance(evidence[field], str)
             or _COMMAND_ID_RE.fullmatch(evidence[field]) is None
@@ -1100,10 +1094,7 @@ def validate_fleet_advance(
                 "fleet advance command identity is invalid",
                 code="FLEET_ADVANCE_INVALID",
             )
-    for field in (
-        "training_terminal_receipt_uri",
-        "evaluation_terminal_receipt_uri",
-    ):
+    for field in ("training_terminal_receipt_uri",):
         uri = evidence[field]
         if (
             not isinstance(uri, str)
@@ -1115,23 +1106,83 @@ def validate_fleet_advance(
                 "fleet advance terminal receipt URI is invalid",
                 code="FLEET_ADVANCE_INVALID",
             )
-    for field, marker in (
-        ("checkpoint_receipt_uri", "/checkpoints/seed-"),
-        ("evaluation_receipt_uri", "/evaluations/seed-"),
+    checkpoint_receipt_suffix = (
+        f"/checkpoints/seed-{from_binding.seed}/receipts/"
+        f"{evidence['checkpoint_receipt_sha256']}.json"
+    )
+    checkpoint_receipt_uri = evidence["checkpoint_receipt_uri"]
+    if (
+        not isinstance(checkpoint_receipt_uri, str)
+        or not checkpoint_receipt_uri.startswith("s3://")
+        or not checkpoint_receipt_uri.endswith(checkpoint_receipt_suffix)
+        or any(
+            character in checkpoint_receipt_uri
+            for character in "\n\r\x00"
+        )
     ):
-        uri = evidence[field]
+        _fail(
+            "fleet advance lifecycle receipt URI is invalid",
+            code="FLEET_ADVANCE_INVALID",
+        )
+    artifact_root = checkpoint_receipt_uri[
+        : -len(checkpoint_receipt_suffix)
+    ]
+    records = evidence["checkpoint_records"]
+    if not isinstance(records, list) or len(records) != 2:
+        _fail(
+            "fleet advance requires the complete checkpoint-record pair",
+            code="FLEET_ADVANCE_INVALID",
+        )
+    record_arms: set[str] = set()
+    record_runs: set[str] = set()
+    for index, raw in enumerate(records):
+        if not isinstance(raw, dict):
+            _fail(
+                "fleet advance checkpoint record must be an object",
+                code="FLEET_ADVANCE_INVALID",
+            )
+        _exact(
+            raw,
+            _ADVANCE_RECORD_FIELDS,
+            label=f"fleet advance checkpoint record {index}",
+        )
+        arm = raw["arm"]
+        run_id = raw["run_id"]
+        digest = _sha256(
+            raw["sha256"],
+            label=f"fleet advance checkpoint record {index}",
+        )
+        uri = raw["uri"]
         if (
-            not isinstance(uri, str)
-            or not uri.startswith("s3://")
-            or marker not in uri
-            or "/receipts/" not in uri
-            or not uri.endswith(".json")
+            arm not in {"dense", "split90"}
+            or arm in record_arms
+            or not isinstance(run_id, str)
+            or not run_id
+            or run_id in record_runs
+            or not isinstance(uri, str)
+            or uri
+            != (
+                f"{artifact_root}/checkpoints/seed-{from_binding.seed}/"
+                f"{arm}/records/{digest}.json"
+            )
             or any(character in uri for character in "\n\r\x00")
         ):
             _fail(
-                "fleet advance lifecycle receipt URI is invalid",
+                "fleet advance checkpoint record identity is invalid",
                 code="FLEET_ADVANCE_INVALID",
             )
+        record_arms.add(str(arm))
+        record_runs.add(run_id)
+    if record_arms != {"dense", "split90"}:
+        _fail(
+            "fleet advance checkpoint records are incomplete",
+            code="FLEET_ADVANCE_INVALID",
+        )
+    if [raw["arm"] for raw in records] != ["dense", "split90"]:
+        _fail(
+            "fleet advance checkpoint records are not canonically ordered",
+            code="FLEET_ADVANCE_INVALID",
+        )
     advanced_at = _advance_timestamp(receipt["advanced_at"])
     digest = sha256 or canonical_sha256(receipt)
     _sha256(digest, label="fleet advance receipt")

@@ -25,6 +25,7 @@ from cluster.aws.p5.terminal_artifacts import (
     EVALUATION_ARTIFACTS,
     verify_checkpoint_receipt_bytes,
     verify_evaluation_receipt_bytes,
+    verify_materialized_terminal,
 )
 from evals.confirmatory.sealing import (
     SEALED_FIXTURE_MEMBERS,
@@ -44,7 +45,6 @@ from .aws_fleet import (
     load_fleet_advance,
     load_fleet_plan,
     validate_fleet_manifest,
-    verify_fleet_collection,
     write_fleet_advance,
 )
 from .aws_identity import (
@@ -1039,6 +1039,105 @@ class AwsP5Backend:
         return {
             "sealed_evaluation_sha256": final.sha256,
             "study_lock_sha256": final.study_lock_sha256,
+        }
+
+    def _evaluation_checkpoint_binding(
+        self,
+        manifest: object,
+        checkpoint_receipt: object | None,
+    ) -> dict[str, object] | None:
+        if not _is_v3_manifest(manifest):
+            if checkpoint_receipt is not None:
+                raise MsctlError(
+                    "CHECKPOINT_PROVENANCE_MISMATCH",
+                    "legacy evaluation cannot consume a v3 terminal bundle",
+                )
+            return None
+        if (
+            checkpoint_receipt is None
+            or getattr(checkpoint_receipt, "schema_version", None) != 3
+            or not isinstance(getattr(checkpoint_receipt, "sha256", None), str)
+        ):
+            raise MsctlError(
+                "CHECKPOINT_PROVENANCE_MISMATCH",
+                "v3 evaluation requires the canonical terminal checkpoint "
+                "receipt identity",
+            )
+        checkpoints = tuple(
+            getattr(checkpoint_receipt, "checkpoints", ())
+        )
+        by_arm = {
+            str(getattr(checkpoint, "arm", "")): checkpoint
+            for checkpoint in checkpoints
+        }
+        if len(checkpoints) != 2 or set(by_arm) != {"dense", "split90"}:
+            raise MsctlError(
+                "CHECKPOINT_PROVENANCE_MISMATCH",
+                "v3 evaluation checkpoint receipt is not a complete pair",
+            )
+        receipt_sha256 = require_sha256(
+            checkpoint_receipt.sha256,
+            label="evaluation checkpoint receipt",
+        )
+        receipt_uri = (
+            f"{self.runtime.s3_root.rstrip('/')}/checkpoints/"
+            f"seed-{manifest.seed}/receipts/{receipt_sha256}.json"
+        )
+        rows: list[dict[str, object]] = []
+        for arm in ("dense", "split90"):
+            checkpoint = by_arm[arm]
+            durable_fields = {
+                field: getattr(checkpoint, field, None)
+                for field in (
+                    "checkpoint_uri",
+                    "configuration_uri",
+                    "run_binding_sha256",
+                    "run_binding_uri",
+                    "checkpoint_record_sha256",
+                    "checkpoint_record_uri",
+                )
+            }
+            if any(value is None for value in durable_fields.values()):
+                raise MsctlError(
+                    "CHECKPOINT_PROVENANCE_MISMATCH",
+                    "v3 evaluation receipt omits durable terminal artifacts",
+                )
+            for field in (
+                "checkpoint_uri",
+                "configuration_uri",
+                "run_binding_uri",
+                "checkpoint_record_uri",
+            ):
+                self._runtime_relative_uri(
+                    durable_fields[field],
+                    label=f"evaluation {arm} {field}",
+                )
+            rows.append(
+                {
+                    "run_id": checkpoint.run_id,
+                    "arm": arm,
+                    "checkpoint_sha256": checkpoint.sha256,
+                    "checkpoint_uri": durable_fields["checkpoint_uri"],
+                    "configuration_sha256": checkpoint.config_sha256,
+                    "configuration_uri": durable_fields[
+                        "configuration_uri"
+                    ],
+                    "run_binding_sha256": durable_fields[
+                        "run_binding_sha256"
+                    ],
+                    "run_binding_uri": durable_fields["run_binding_uri"],
+                    "checkpoint_record_sha256": durable_fields[
+                        "checkpoint_record_sha256"
+                    ],
+                    "checkpoint_record_uri": durable_fields[
+                        "checkpoint_record_uri"
+                    ],
+                }
+            )
+        return {
+            "sha256": receipt_sha256,
+            "uri": receipt_uri,
+            "checkpoints": rows,
         }
 
     def _validate_release(self, release: object, manifest: object) -> None:
@@ -2602,6 +2701,15 @@ class AwsP5Backend:
         terminate_at: str,
         context: V3LifecycleContext | None = None,
     ) -> dict[str, object]:
+        v3_bindings = self._v3_bindings(manifest, context)
+        # The EC2 tag contract uses cohort_sha256 for the manifest's
+        # cohort-assignment identity; do not introduce a second unqueryable
+        # cohort_assignment_sha256 tag field.
+        v3_tag_bindings = {
+            field: value
+            for field, value in v3_bindings.items()
+            if field != "cohort_assignment_sha256"
+        }
         return {
             "provider": self.profile.provider,
             "profile_instance_type": self.profile.instance_type,
@@ -2615,7 +2723,7 @@ class AwsP5Backend:
             "container_digest": self.runtime.container_digest,
             "gres": _profile_gres(self.profile),
             "terminate_at": terminate_at,
-            **self._v3_bindings(manifest, context),
+            **v3_tag_bindings,
         }
 
     def _parse_selected_instance(
@@ -2628,6 +2736,7 @@ class AwsP5Backend:
         require_bound: bool,
         context: V3LifecycleContext | None = None,
         expected_binding: Mapping[str, object] | None = None,
+        allow_historical_binding: bool = False,
     ) -> dict[str, object]:
         root = _aws_output_object(
             output,
@@ -2683,7 +2792,9 @@ class AwsP5Backend:
                 "selected-instance expected tag binding is incomplete",
             )
         observed = {field: row[field] for field in expected}
-        if require_bound:
+        if allow_historical_binding:
+            valid = True
+        elif require_bound:
             valid = observed == expected
         else:
             valid = observed == expected or all(
@@ -2855,6 +2966,7 @@ class AwsP5Backend:
         terminate_at: str,
         operation: str,
         context: V3LifecycleContext | None = None,
+        allow_historical_binding: bool = False,
     ) -> dict[str, object]:
         selected_argv = self._selected_instance_argv(instance_id, manifest)
         row = self._parse_selected_instance(
@@ -2867,6 +2979,7 @@ class AwsP5Backend:
             terminate_at=terminate_at,
             require_bound=True,
             context=context,
+            allow_historical_binding=allow_historical_binding,
         )
         attribute = self._aws_argv(
             "ec2",
@@ -2902,6 +3015,70 @@ class AwsP5Backend:
                 "selected instance no longer has enforced termination behavior",
             )
         return row
+
+    def _validate_evaluation_instance_binding(
+        self,
+        manifest: object,
+        *,
+        instance_id: str,
+        terminate_at: str,
+        checkpoint_receipt_sha256: str,
+        context: V3LifecycleContext | None,
+    ) -> dict[str, object]:
+        validated = self._validate_v3_context(manifest, context)
+        if validated is None:
+            return self._validate_selected_instance_binding(
+                manifest,
+                instance_id=instance_id,
+                terminate_at=terminate_at,
+                operation="evaluation",
+                context=context,
+            )
+        binding = validated.fleet_binding
+        successors = [
+            candidate
+            for candidate in validated.fleet_plan.manifests
+            if candidate.instance_id == binding.instance_id
+            and candidate.wave == binding.wave + 1
+        ]
+        if len(successors) > 1:
+            raise MsctlError(
+                "FLEET_PLAN_INVALID",
+                "fleet plan has duplicate same-instance successors",
+            )
+        advance = (
+            load_fleet_advance(
+                self.state_root,
+                plan=validated.fleet_plan,
+                to_binding=successors[0],
+            )
+            if successors
+            else None
+        )
+        if successors and (
+            advance is None
+            or advance.from_binding != binding
+            or advance.evidence.get("checkpoint_receipt_sha256")
+            != checkpoint_receipt_sha256
+        ):
+            raise MsctlError(
+                "FLEET_ADVANCE_REQUIRED",
+                "evaluation after training-tag removal requires the matching "
+                "closed training-wave advance receipt",
+                details={
+                    "instance_id": binding.instance_id,
+                    "seed": binding.seed,
+                    "wave": binding.wave,
+                },
+            )
+        return self._validate_selected_instance_binding(
+            manifest,
+            instance_id=instance_id,
+            terminate_at=terminate_at,
+            operation="evaluation",
+            context=context,
+            allow_historical_binding=advance is not None,
+        )
 
     def _parse_instances(
         self,
@@ -3343,20 +3520,27 @@ class AwsP5Backend:
         instance_id: str,
         terminate_at: str,
         context: V3LifecycleContext | None = None,
+        checkpoint_receipt: object | None = None,
     ) -> dict[str, object]:
+        bindings = (
+            self._execution_bindings(
+                release=release,
+                manifest=manifest,
+                instance_id=instance_id,
+                terminate_at=terminate_at,
+                context=context,
+            )
+            | self._v3_evaluation_bindings(manifest, context)
+        )
+        if _is_v3_manifest(manifest):
+            bindings["checkpoint_receipt_sha256"] = require_sha256(
+                getattr(checkpoint_receipt, "sha256", None),
+                label="evaluation checkpoint receipt",
+            )
         return aws_resource_request(
             "evaluate",
             profile=self.profile,
-            bindings=(
-                self._execution_bindings(
-                    release=release,
-                    manifest=manifest,
-                    instance_id=instance_id,
-                    terminate_at=terminate_at,
-                    context=context,
-                )
-                | self._v3_evaluation_bindings(manifest, context)
-            ),
+            bindings=bindings,
         )
 
     def _resume_resources(
@@ -4946,6 +5130,7 @@ class AwsP5Backend:
             checkpoint = verify_checkpoint_receipt_bytes(
                 checkpoint_payload,
                 expected={"provider": self.profile.provider},
+                require_durable=True,
             )
             evaluation = verify_evaluation_receipt_bytes(
                 evaluation_payload,
@@ -5615,6 +5800,211 @@ class AwsP5Backend:
             )
         return uri
 
+    def _terminal_checkpoint_identity(
+        self,
+        receipt_path: Path | str,
+        *,
+        manifest: object,
+    ) -> dict[str, object]:
+        try:
+            payload = self._read_collection_regular(
+                Path(receipt_path),
+                label="terminal checkpoint receipt",
+                maximum=1 << 20,
+            )
+            receipt = verify_checkpoint_receipt_bytes(
+                payload,
+                expected={
+                    "provider": self.profile.provider,
+                    "release_sha256": manifest.release_sha256,
+                    "run_manifest_sha256": manifest.sha256,
+                    "dataset_sha256": manifest.dataset_sha256,
+                    "source_commit": manifest.source_commit,
+                    "cohort_assignment_sha256": (
+                        manifest.cohort_assignment_sha256
+                    ),
+                    "preregistration_sha256": (
+                        manifest.preregistration_sha256
+                    ),
+                    "hardware_amendment_sha256": (
+                        manifest.hardware_amendment_sha256
+                    ),
+                    "provider_selection_sha256": (
+                        manifest.provider_selection_sha256
+                    ),
+                    "profile_sha256": manifest.profile_sha256,
+                    "sealed_fixture_sha256": manifest.sealed_fixture_sha256,
+                },
+                require_durable=True,
+            )
+        except (MsctlError, OSError, TypeError, ValueError) as error:
+            raise MsctlError(
+                "FLEET_ADVANCE_INVALID",
+                "training-wave advance requires one canonical schema-v3 "
+                "terminal checkpoint receipt",
+            ) from error
+        digest = hashlib.sha256(payload).hexdigest()
+        seed = manifest.seed
+        receipt_uri = (
+            f"{self.runtime.s3_root.rstrip('/')}/checkpoints/seed-{seed}/"
+            f"receipts/{digest}.json"
+        )
+        manifest_runs = {
+            str(run.arm): run for run in getattr(manifest, "runs", ())
+        }
+        rows = {
+            str(row["arm"]): row for row in receipt["checkpoints"]
+        }
+        if (
+            set(manifest_runs) != {"dense", "split90"}
+            or set(rows) != set(manifest_runs)
+            or any(
+                rows[arm]["run_id"] != manifest_runs[arm].run_id
+                or rows[arm]["config_sha256"]
+                != manifest_runs[arm].config_sha256
+                or rows[arm]["seed"] != seed
+                for arm in rows
+            )
+        ):
+            raise MsctlError(
+                "FLEET_ADVANCE_INVALID",
+                "terminal checkpoint receipt does not bind the manifest pair",
+            )
+        for row in rows.values():
+            for field in (
+                "checkpoint_uri",
+                "configuration_uri",
+                "run_binding_uri",
+                "checkpoint_record_uri",
+            ):
+                try:
+                    self._runtime_relative_uri(
+                        row[field],
+                        label=f"terminal checkpoint {field}",
+                    )
+                except MsctlError as error:
+                    raise MsctlError(
+                        "FLEET_ADVANCE_INVALID",
+                        "terminal checkpoint artifacts are outside the "
+                        "immutable runtime root",
+                    ) from error
+        records = [
+            {
+                "run_id": str(rows[arm]["run_id"]),
+                "arm": arm,
+                "sha256": str(rows[arm]["checkpoint_record_sha256"]),
+                "uri": str(rows[arm]["checkpoint_record_uri"]),
+            }
+            for arm in ("dense", "split90")
+        ]
+        return {
+            "payload": payload,
+            "receipt": receipt,
+            "sha256": digest,
+            "uri": receipt_uri,
+            "records": records,
+        }
+
+    def _materialize_terminal_checkpoint_identity(
+        self,
+        identity: Mapping[str, object],
+        *,
+        manifest: object,
+    ) -> list[list[str]]:
+        receipt = identity["receipt"]
+        if not isinstance(receipt, dict):
+            raise MsctlError(
+                "FLEET_ADVANCE_INVALID",
+                "terminal checkpoint identity is unavailable",
+            )
+        commands: list[list[str]] = []
+        with tempfile.TemporaryDirectory(
+            prefix="memorysplit-terminal-verify-"
+        ) as temporary:
+            root = Path(temporary)
+            try:
+                receipt_relative = self._runtime_relative_uri(
+                    identity["uri"],
+                    label="terminal checkpoint receipt URI",
+                )
+                argv, _ = self._collection_get_object(
+                    relative=receipt_relative,
+                    destination=root / "receipt.json",
+                    label="terminal checkpoint receipt",
+                    expected_sha256=str(identity["sha256"]),
+                )
+                commands.append(argv)
+                for raw in receipt["checkpoints"]:
+                    if not isinstance(raw, dict):
+                        raise ValueError("checkpoint row is unavailable")
+                    arm = str(raw["arm"])
+                    run_root = root / "runs" / arm / "run"
+                    artifacts = (
+                        (
+                            "checkpoint_uri",
+                            "sha256",
+                            run_root / "ckpt.pt",
+                            "checkpoint",
+                        ),
+                        (
+                            "configuration_uri",
+                            "config_sha256",
+                            run_root / "configuration.yaml",
+                            "configuration",
+                        ),
+                        (
+                            "run_binding_uri",
+                            "run_binding_sha256",
+                            run_root / "run.json",
+                            "run binding",
+                        ),
+                        (
+                            "checkpoint_record_uri",
+                            "checkpoint_record_sha256",
+                            root
+                            / "records"
+                            / f"{raw['checkpoint_record_sha256']}.json",
+                            "checkpoint record",
+                        ),
+                    )
+                    for uri_field, digest_field, destination, label in artifacts:
+                        relative = self._runtime_relative_uri(
+                            raw[uri_field],
+                            label=f"{arm} {label} URI",
+                        )
+                        argv, _ = self._collection_get_object(
+                            relative=relative,
+                            destination=destination,
+                            label=f"{arm} terminal {label}",
+                            expected_sha256=str(raw[digest_field]),
+                        )
+                        commands.append(argv)
+                verified = verify_materialized_terminal(
+                    receipt_path=root / "receipt.json",
+                    run_root=root / "runs",
+                    record_root=root / "records",
+                    expected_receipt_sha256=str(identity["sha256"]),
+                    expected={
+                        "provider": self.profile.provider,
+                        "run_manifest_sha256": manifest.sha256,
+                        "sealed_fixture_sha256": (
+                            manifest.sealed_fixture_sha256
+                        ),
+                    },
+                )
+            except (MsctlError, OSError, TypeError, ValueError) as error:
+                raise MsctlError(
+                    "FLEET_ADVANCE_INVALID",
+                    "immutable terminal checkpoint bundle could not be "
+                    "rematerialized and verified",
+                ) from error
+        if verified["sha256"] != identity["sha256"]:
+            raise MsctlError(
+                "FLEET_ADVANCE_INVALID",
+                "rematerialized terminal checkpoint receipt changed",
+            )
+        return commands
+
     def fleet_advance(
         self,
         *,
@@ -5624,7 +6014,7 @@ class AwsP5Backend:
         target_manifest_path: Path | str,
         repo_root: Path | str,
         instance_id: str,
-        collection_root: Path | str,
+        checkpoint_receipt_path: Path | str,
         approval_path: Path | str | None,
         apply: bool,
     ) -> dict[str, object]:
@@ -5653,12 +6043,29 @@ class AwsP5Backend:
             previous,
             instance_id=instance_id,
         )
+        checkpoint_identity = self._terminal_checkpoint_identity(
+            checkpoint_receipt_path,
+            manifest=previous,
+        )
         existing = load_fleet_advance(
             self.state_root,
             plan=plan,
             to_binding=to_binding,
         )
         if existing is not None:
+            if (
+                existing.evidence.get("checkpoint_receipt_sha256")
+                != checkpoint_identity["sha256"]
+                or existing.evidence.get("checkpoint_receipt_uri")
+                != checkpoint_identity["uri"]
+                or existing.evidence.get("checkpoint_records")
+                != checkpoint_identity["records"]
+            ):
+                raise MsctlError(
+                    "FLEET_ADVANCE_INVALID",
+                    "existing training-wave advance binds a different "
+                    "terminal checkpoint bundle",
+                )
             return {
                 "provider": self.profile.provider,
                 "instance_id": instance_id,
@@ -5676,24 +6083,6 @@ class AwsP5Backend:
             fleet_plan=plan,
             fleet_binding=from_binding,
         )
-        collection_sha256 = verify_fleet_collection(
-            collection_root,
-            manifest=previous,
-        )
-        lifecycle_collection = self._verify_v3_lifecycle_collection(
-            collection_root,
-            manifest=previous,
-            fleet_plan_sha256=plan.sha256,
-            fleet_wave=from_binding.wave,
-        )
-        if (
-            lifecycle_collection["collection_receipt_sha256"]
-            != collection_sha256
-        ):
-            raise MsctlError(
-                "FLEET_ADVANCE_INVALID",
-                "generic and lifecycle collection verification disagree",
-            )
         store = StateStore(self.state_root)
         with store.locked():
             self._repair_paired_states(store, previous, previous_context)
@@ -5730,35 +6119,6 @@ class AwsP5Backend:
                     "FLEET_ADVANCE_INVALID",
                     "prior paired state is not terminal or has divergent provenance",
                 )
-            evaluation = store.read_evaluation(previous.sha256)
-            if (
-                evaluation is None
-                or evaluation.get("status") != "Success"
-                or evaluation.get("operation") != "evaluate"
-                or evaluation.get("instance_id") != instance_id
-                or evaluation.get("run_manifest_sha256") != previous.sha256
-                or evaluation.get("fleet_plan_sha256") != plan.sha256
-                or evaluation.get("fleet_wave") != from_binding.wave
-                or evaluation.get("launch_readiness_sha256")
-                != paired[0].get("launch_readiness_sha256")
-                or lifecycle_collection["evaluation"][
-                    "launch_readiness_sha256"
-                ]
-                != paired[0].get("launch_readiness_sha256")
-                or lifecycle_collection["evaluation"]["operation_id"]
-                != evaluation.get("operation_id")
-                or lifecycle_collection["evaluation"][
-                    "sealed_evaluation_sha256"
-                ]
-                != evaluation.get("sealed_evaluation_sha256")
-                or lifecycle_collection["evaluation"]["study_lock_sha256"]
-                != evaluation.get("study_lock_sha256")
-                or not isinstance(evaluation.get("command_id"), str)
-            ):
-                raise MsctlError(
-                    "FLEET_ADVANCE_INVALID",
-                    "fleet advance requires successful prior evaluation state",
-                )
             training_state_sha256 = canonical_sha256(
                 {
                     "states": sorted(
@@ -5767,7 +6127,6 @@ class AwsP5Backend:
                     )
                 }
             )
-            evaluation_state_sha256 = canonical_sha256(evaluation)
             bound_tags = self._fleet_state_tag_binding(
                 previous,
                 paired[0],
@@ -5808,14 +6167,10 @@ class AwsP5Backend:
             "to_wave": to_binding.wave,
             "to_manifest_sha256": to_binding.sha256,
             "training_state_sha256": training_state_sha256,
-            "evaluation_state_sha256": evaluation_state_sha256,
-            "collection_receipt_sha256": collection_sha256,
-            "checkpoint_receipt_sha256": lifecycle_collection[
-                "checkpoint_receipt_sha256"
-            ],
-            "evaluation_receipt_sha256": lifecycle_collection[
-                "evaluation_receipt_sha256"
-            ],
+            "checkpoint_receipt_sha256": checkpoint_identity["sha256"],
+            "checkpoint_records_sha256": canonical_sha256(
+                checkpoint_identity["records"]
+            ),
             "jobs": 0,
             "allocated_gpus": 0,
             "wall_minutes": 0,
@@ -5850,20 +6205,12 @@ class AwsP5Backend:
             environ=self.environ,
         )
         training_command_id = str(paired[0]["command_id"])
-        evaluation_command_id = str(evaluation["command_id"])
-        if (
-            self._command_status(instance_id, training_command_id) != "Success"
-            or self._command_status(instance_id, evaluation_command_id)
-            != "Success"
-        ):
+        if self._command_status(instance_id, training_command_id) != "Success":
             raise MsctlError(
                 "FLEET_ADVANCE_INVALID",
-                "authoritative AWS commands are not successfully terminal",
+                "authoritative AWS training is not successfully terminal",
             )
         training_terminal_uri = self._verify_state_terminal_receipt(paired[0])
-        evaluation_terminal_uri = self._verify_state_terminal_receipt(
-            evaluation
-        )
         terminate_at = str(paired[0]["terminate_at"])
         selected_argv = self._selected_instance_argv(instance_id, previous)
         observed = self._parse_selected_instance(
@@ -5878,6 +6225,12 @@ class AwsP5Backend:
             expected_binding=bound_tags,
         )
         del observed
+        materialization_commands = (
+            self._materialize_terminal_checkpoint_identity(
+                checkpoint_identity,
+                manifest=previous,
+            )
+        )
         _aws_output_object(
             self._run(delete_argv, operation="unbind completed fleet wave"),
             set(),
@@ -5896,24 +6249,11 @@ class AwsP5Backend:
         )
         evidence = {
             "training_state_sha256": training_state_sha256,
-            "evaluation_state_sha256": evaluation_state_sha256,
-            "collection_receipt_sha256": collection_sha256,
             "training_command_id": training_command_id,
-            "evaluation_command_id": evaluation_command_id,
             "training_terminal_receipt_uri": training_terminal_uri,
-            "evaluation_terminal_receipt_uri": evaluation_terminal_uri,
-            "checkpoint_receipt_sha256": lifecycle_collection[
-                "checkpoint_receipt_sha256"
-            ],
-            "checkpoint_receipt_uri": lifecycle_collection[
-                "checkpoint_receipt_uri"
-            ],
-            "evaluation_receipt_sha256": lifecycle_collection[
-                "evaluation_receipt_sha256"
-            ],
-            "evaluation_receipt_uri": lifecycle_collection[
-                "evaluation_receipt_uri"
-            ],
+            "checkpoint_receipt_sha256": checkpoint_identity["sha256"],
+            "checkpoint_receipt_uri": checkpoint_identity["uri"],
+            "checkpoint_records": checkpoint_identity["records"],
             "aws_bound_tags_sha256": canonical_sha256(bound_tags),
             "aws_unbound_tags_sha256": canonical_sha256(unbound_tags),
         }
@@ -5940,7 +6280,7 @@ class AwsP5Backend:
         assert loaded is not None
         return {
             **result,
-            "commands": [delete_argv],
+            "commands": [*materialization_commands, delete_argv],
             "advance_receipt": str(receipt_path),
             "advance_receipt_sha256": loaded.sha256,
             "advanced": 1,
@@ -7215,11 +7555,20 @@ class AwsP5Backend:
         manifest: object,
         evidence: Mapping[str, str] | None = None,
         context: V3LifecycleContext | None = None,
+        checkpoint_receipt: object | None = None,
     ) -> dict[str, object]:
         v3_bindings = self._v3_bindings(manifest, context)
         final_bindings = self._v3_evaluation_bindings(manifest, context)
+        checkpoint_binding = self._evaluation_checkpoint_binding(
+            manifest,
+            checkpoint_receipt,
+        )
         remote_argv = self._evaluation_argv(release, manifest, context)
         sealed_materialization: list[dict[str, object]] = []
+        terminal_materialization: list[dict[str, object]] = []
+        receipt_root = ""
+        record_root = ""
+        run_root = ""
         if _is_v3_manifest(manifest):
             scratch_root = getattr(
                 self.profile,
@@ -7256,6 +7605,79 @@ class AwsP5Backend:
                             "--checksum-mode",
                             "ENABLED",
                             f"{sealed_root}/{member}",
+                        ],
+                    }
+                )
+            assert checkpoint_binding is not None
+            receipt_root = (
+                f"{scratch_root}/receipts/checkpoints/seed-{manifest.seed}"
+            )
+            record_root = f"{receipt_root}/records"
+            run_root = f"{scratch_root}/runs/seed-{manifest.seed}"
+            terminal_sources: list[tuple[str, object, str]] = [
+                (
+                    "receipt",
+                    checkpoint_binding["uri"],
+                    f"{receipt_root}/receipt.json",
+                )
+            ]
+            raw_checkpoints = checkpoint_binding["checkpoints"]
+            assert isinstance(raw_checkpoints, list)
+            for raw in raw_checkpoints:
+                assert isinstance(raw, dict)
+                arm = str(raw["arm"])
+                arm_root = f"{run_root}/{arm}/run"
+                terminal_sources.extend(
+                    [
+                        (
+                            f"{arm}-checkpoint",
+                            raw["checkpoint_uri"],
+                            f"{arm_root}/ckpt.pt",
+                        ),
+                        (
+                            f"{arm}-configuration",
+                            raw["configuration_uri"],
+                            f"{arm_root}/configuration.yaml",
+                        ),
+                        (
+                            f"{arm}-run-binding",
+                            raw["run_binding_uri"],
+                            f"{arm_root}/run.json",
+                        ),
+                        (
+                            f"{arm}-checkpoint-record",
+                            raw["checkpoint_record_uri"],
+                            (
+                                f"{record_root}/"
+                                f"{raw['checkpoint_record_sha256']}.json"
+                            ),
+                        ),
+                    ]
+                )
+            for name, uri, destination in terminal_sources:
+                relative = self._runtime_relative_uri(
+                    uri,
+                    label=f"evaluation terminal artifact {name}",
+                )
+                bucket, key = self._s3_location(relative)
+                terminal_materialization.append(
+                    {
+                        "name": f"materialize-terminal-{name}",
+                        "argv": [
+                            "/usr/bin/env",
+                            "aws",
+                            "--no-cli-pager",
+                            "--region",
+                            self.runtime.region,
+                            "s3api",
+                            "get-object",
+                            "--bucket",
+                            bucket,
+                            "--key",
+                            key,
+                            "--checksum-mode",
+                            "ENABLED",
+                            destination,
                         ],
                     }
                 )
@@ -7301,7 +7723,7 @@ class AwsP5Backend:
                     else {}
                 ),
             },
-            "checkpoint_receipt": None,
+            "checkpoint_receipt": checkpoint_binding,
             "steps": [
                 *(
                     [
@@ -7340,12 +7762,37 @@ class AwsP5Backend:
                                 ),
                             ],
                         },
+                        {
+                            "name": "prepare-terminal-checkpoint-bundle",
+                            "argv": [
+                                "/usr/bin/install",
+                                "-d",
+                                "-m",
+                                "0700",
+                                "-o",
+                                str(getattr(self.runtime, "uid", 1000)),
+                                "-g",
+                                str(getattr(self.runtime, "gid", 1000)),
+                                receipt_root,
+                                record_root,
+                                *[
+                                    f"{run_root}/{arm}/run"
+                                    for arm in ("dense", "split90")
+                                ],
+                            ],
+                        },
                     ]
                     + [
                         {
                             **step,
                         }
                         for step in sealed_materialization
+                    ]
+                    + [
+                        {
+                            **step,
+                        }
+                        for step in terminal_materialization
                     ]
                     + [
                         {
@@ -7397,20 +7844,15 @@ class AwsP5Backend:
                                     f"{self._release_root(release)}/"
                                     "cluster/aws/p5/terminal_artifacts.py"
                                 ),
-                                "verify-terminal",
+                                "verify-materialized",
                                 "--receipt",
-                                (
-                                    f"{getattr(self.profile, 'scratch_root', '/mnt/memorysplit')}"
-                                    f"/receipts/checkpoints/seed-{manifest.seed}/"
-                                    "receipt.json"
-                                ),
+                                f"{receipt_root}/receipt.json",
                                 "--run-root",
-                                (
-                                    f"{getattr(self.profile, 'scratch_root', '/mnt/memorysplit')}"
-                                    f"/runs/seed-{manifest.seed}"
-                                ),
-                                "--s3-root",
-                                self.runtime.s3_root,
+                                run_root,
+                                "--record-root",
+                                record_root,
+                                "--expected-receipt-sha256",
+                                checkpoint_binding["sha256"],
                                 "--provider",
                                 self.profile.provider,
                                 "--run-manifest-sha256",
@@ -7489,6 +7931,7 @@ class AwsP5Backend:
         apply: bool,
         evidence: Mapping[str, str] | None = None,
         context: V3LifecycleContext | None = None,
+        checkpoint_receipt: object | None = None,
     ) -> dict[str, object]:
         self._validate_manifest(manifest)
         self._validate_release(release, manifest)
@@ -7503,6 +7946,7 @@ class AwsP5Backend:
             manifest,
             evidence,
             context,
+            checkpoint_receipt,
         )
         if not apply:
             return {
@@ -7559,6 +8003,7 @@ class AwsP5Backend:
                 instance_id=instance_id,
                 terminate_at=terminate_at,
                 context=context,
+                checkpoint_receipt=checkpoint_receipt,
             )
             evaluation_resources.update(
                 {
@@ -7582,13 +8027,25 @@ class AwsP5Backend:
                 instance_id=instance_id,
                 terminate_at=terminate_at,
             )
-            self._validate_selected_instance_binding(
-                manifest,
-                instance_id=instance_id,
-                terminate_at=terminate_at,
-                operation="evaluation",
-                context=context,
-            )
+            if _is_v3_manifest(manifest):
+                self._validate_evaluation_instance_binding(
+                    manifest,
+                    instance_id=instance_id,
+                    terminate_at=terminate_at,
+                    checkpoint_receipt_sha256=require_sha256(
+                        getattr(checkpoint_receipt, "sha256", None),
+                        label="evaluation checkpoint receipt",
+                    ),
+                    context=context,
+                )
+            else:
+                self._validate_selected_instance_binding(
+                    manifest,
+                    instance_id=instance_id,
+                    terminate_at=terminate_at,
+                    operation="evaluation",
+                    context=context,
+                )
             training_commands = {
                 state.get("command_id") for state in states
             }
@@ -7633,6 +8090,11 @@ class AwsP5Backend:
                     or existing.get("instance_id") != instance_id
                     or existing.get("terminate_at") != terminate_at
                     or existing.get("operation") != "evaluate"
+                    or (
+                        _is_v3_manifest(manifest)
+                        and existing.get("checkpoint_receipt_sha256")
+                        != getattr(checkpoint_receipt, "sha256", None)
+                    )
                     or (
                         _is_v3_manifest(manifest)
                         and any(
@@ -7771,6 +8233,9 @@ class AwsP5Backend:
                 evaluation_state.update(self._v3_bindings(manifest, context))
                 evaluation_state.update(
                     self._v3_evaluation_bindings(manifest, context)
+                )
+                evaluation_state["checkpoint_receipt_sha256"] = (
+                    checkpoint_receipt.sha256
                 )
             store.write_evaluation(manifest.sha256, evaluation_state)
             state = store.read_evaluation(manifest.sha256)
@@ -8050,7 +8515,7 @@ class AwsP5Backend:
                 target_manifest_path=args.to_manifest,
                 repo_root=args.repo_root,
                 instance_id=args.instance_id,
-                collection_root=args.collection_root,
+                checkpoint_receipt_path=args.checkpoint_receipt,
                 approval_path=args.approval,
                 apply=apply,
             )
@@ -8224,6 +8689,26 @@ class AwsP5Backend:
                     context=context,
                 )
             if command == "evaluate":
+                checkpoint_receipt = None
+                if _is_v3_manifest(manifest):
+                    if args.checkpoint_receipt is None:
+                        raise MsctlError(
+                            "CLI_USAGE",
+                            "v3 evaluation requires --checkpoint-receipt",
+                        )
+                    checkpoint_receipt = verify_checkpoint_receipt(
+                        args.checkpoint_receipt,
+                        release=release,
+                        manifest=manifest,
+                        require_checkpoint_files=False,
+                        require_durable_terminal=True,
+                    )
+                elif args.checkpoint_receipt is not None:
+                    raise MsctlError(
+                        "CLI_USAGE",
+                        "legacy evaluation does not accept "
+                        "--checkpoint-receipt",
+                    )
                 return not args.apply, self.evaluate(
                     release=release,
                     manifest=manifest,
@@ -8231,6 +8716,7 @@ class AwsP5Backend:
                     apply=args.apply,
                     evidence=evidence,
                     context=context,
+                    checkpoint_receipt=checkpoint_receipt,
                 )
             apply = bool(getattr(args, "apply", False))
             return not apply, self.cleanup(

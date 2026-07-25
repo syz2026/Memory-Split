@@ -105,6 +105,12 @@ class Checkpoint:
     source_commit: str | None
     step: int
     world_size: int
+    checkpoint_uri: str | None = None
+    configuration_uri: str | None = None
+    run_binding_sha256: str | None = None
+    run_binding_uri: str | None = None
+    checkpoint_record_sha256: str | None = None
+    checkpoint_record_uri: str | None = None
 
 
 @dataclass(frozen=True)
@@ -1504,6 +1510,8 @@ def verify_checkpoint_receipt(
     *,
     release: Release,
     manifest: RunManifest,
+    require_checkpoint_files: bool = True,
+    require_durable_terminal: bool = False,
 ) -> CheckpointReceipt:
     receipt_path = Path(path)
     value = require_object(
@@ -1601,27 +1609,64 @@ def verify_checkpoint_receipt(
             "CHECKPOINT_PROVENANCE_MISMATCH",
             "checkpoint receipt must contain the complete paired run",
         )
+    row_fields = {
+        "run_id",
+        "path",
+        "sha256",
+        "config_sha256",
+        "step",
+        "world_size",
+    }
+    if schema_version in {2, 3}:
+        row_fields |= {
+            "arm",
+            "seed",
+            "dataset_sha256",
+            "source_commit",
+        }
+    durable_fields = {
+        "checkpoint_uri",
+        "configuration_uri",
+        "run_binding_sha256",
+        "run_binding_uri",
+        "checkpoint_record_sha256",
+        "checkpoint_record_uri",
+    }
+    field_sets = {
+        frozenset(item)
+        for item in raw
+        if isinstance(item, dict)
+    }
+    allowed_field_sets = {frozenset(row_fields)}
+    if schema_version == 3:
+        allowed_field_sets.add(frozenset(row_fields | durable_fields))
+    if (
+        len(field_sets) != 1
+        or not all(isinstance(item, dict) for item in raw)
+        or not field_sets <= allowed_field_sets
+    ):
+        raise MsctlError(
+            "CHECKPOINT_PROVENANCE_MISMATCH",
+            "checkpoint receipt row fields do not match",
+        )
+    durable_terminal = field_sets == {
+        frozenset(row_fields | durable_fields)
+    }
+    if require_durable_terminal and not durable_terminal:
+        raise MsctlError(
+            "CHECKPOINT_PROVENANCE_MISMATCH",
+            "terminal checkpoint receipt omits durable artifact identities",
+        )
     by_id = {run.run_id: run for run in manifest.runs}
     seen: set[str] = set()
     checkpoints: list[Checkpoint] = []
     for index, item in enumerate(raw):
         row = require_object(item, label=f"checkpoint[{index}]")
-        row_fields = {
-            "run_id",
-            "path",
-            "sha256",
-            "config_sha256",
-            "step",
-            "world_size",
-        }
-        if schema_version in {2, 3}:
-            row_fields |= {
-                "arm",
-                "seed",
-                "dataset_sha256",
-                "source_commit",
-            }
-        require_exact_keys(row, row_fields, label=f"checkpoint[{index}]")
+        require_exact_keys(
+            row,
+            row_fields | (durable_fields if durable_terminal else set()),
+            label=f"checkpoint[{index}]",
+        )
         run_id = row["run_id"]
         expected_world_size = 4 if manifest.provider in AWS_GPU_PROFILES else 3
         if (
@@ -1657,11 +1702,12 @@ def verify_checkpoint_receipt(
             receipt_path.parent,
             relative,
             label=f"checkpoint[{index}].path",
+            require_exists=require_checkpoint_files,
         )
         expected_hash = require_sha256(
             row["sha256"], label=f"checkpoint[{index}].sha256"
         )
-        if (
+        if require_checkpoint_files and (
             checkpoint.is_symlink()
             or not checkpoint.is_file()
             or sha256_file(checkpoint) != expected_hash
@@ -1670,6 +1716,66 @@ def verify_checkpoint_receipt(
                 "CHECKPOINT_PROVENANCE_MISMATCH",
                 "checkpoint bytes do not match their receipt",
                 details={"run_id": run_id},
+            )
+        durable: dict[str, str | None] = {
+            "checkpoint_uri": None,
+            "configuration_uri": None,
+            "run_binding_sha256": None,
+            "run_binding_uri": None,
+            "checkpoint_record_sha256": None,
+            "checkpoint_record_uri": None,
+        }
+        if durable_terminal:
+            run_binding_sha256 = require_sha256(
+                row["run_binding_sha256"],
+                label=f"checkpoint[{index}].run_binding_sha256",
+            )
+            checkpoint_record_sha256 = require_sha256(
+                row["checkpoint_record_sha256"],
+                label=f"checkpoint[{index}].checkpoint_record_sha256",
+            )
+            prefix = (
+                f"/checkpoints/seed-{row['seed']}/{row['arm']}"
+            )
+            expected_suffixes = {
+                "checkpoint_uri": f"{prefix}/sha256/{expected_hash}.pt",
+                "configuration_uri": (
+                    f"{prefix}/configuration/sha256/"
+                    f"{row['config_sha256']}.yaml"
+                ),
+                "run_binding_uri": (
+                    f"{prefix}/run-binding/sha256/"
+                    f"{run_binding_sha256}.json"
+                ),
+                "checkpoint_record_uri": (
+                    f"{prefix}/records/{checkpoint_record_sha256}.json"
+                ),
+            }
+            roots: set[str] = set()
+            for field, suffix in expected_suffixes.items():
+                uri = row[field]
+                if (
+                    not isinstance(uri, str)
+                    or not uri.startswith("s3://")
+                    or not uri.endswith(suffix)
+                    or any(character in uri for character in "\n\r\x00")
+                ):
+                    raise MsctlError(
+                        "CHECKPOINT_PROVENANCE_MISMATCH",
+                        "checkpoint durable artifact URI is not canonical",
+                        details={"run_id": run_id, "field": field},
+                    )
+                roots.add(uri[: -len(suffix)])
+                durable[field] = uri
+            if len(roots) != 1:
+                raise MsctlError(
+                    "CHECKPOINT_PROVENANCE_MISMATCH",
+                    "checkpoint durable artifacts cross object roots",
+                    details={"run_id": run_id},
+                )
+            durable["run_binding_sha256"] = run_binding_sha256
+            durable["checkpoint_record_sha256"] = (
+                checkpoint_record_sha256
             )
         checkpoints.append(
             Checkpoint(
@@ -1687,6 +1793,14 @@ def verify_checkpoint_receipt(
                 ),
                 step=int(row["step"]),
                 world_size=int(row["world_size"]),
+                checkpoint_uri=durable["checkpoint_uri"],
+                configuration_uri=durable["configuration_uri"],
+                run_binding_sha256=durable["run_binding_sha256"],
+                run_binding_uri=durable["run_binding_uri"],
+                checkpoint_record_sha256=durable[
+                    "checkpoint_record_sha256"
+                ],
+                checkpoint_record_uri=durable["checkpoint_record_uri"],
             )
         )
     if seen != set(by_id):

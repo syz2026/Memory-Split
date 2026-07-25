@@ -14,6 +14,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Mapping, Sequence
+from urllib.parse import urlsplit
 
 if __package__ in {None, ""}:
     import sys
@@ -55,6 +56,14 @@ _CHECKPOINT_ROW_FIELDS = {
     "source_commit",
     "step",
     "world_size",
+}
+_DURABLE_CHECKPOINT_ROW_FIELDS = _CHECKPOINT_ROW_FIELDS | {
+    "checkpoint_uri",
+    "configuration_uri",
+    "run_binding_sha256",
+    "run_binding_uri",
+    "checkpoint_record_sha256",
+    "checkpoint_record_uri",
 }
 _CHECKPOINT_METADATA_FIELDS = {
     "schema_version",
@@ -208,6 +217,31 @@ def _portable_name(value: object, *, label: str) -> str:
         or value in {".", ".."}
     ):
         raise ValueError(f"{label} is unsafe")
+    return value
+
+
+def _s3_uri(value: object, *, label: str) -> str:
+    if not isinstance(value, str):
+        raise ValueError(f"{label} must be an S3 URI")
+    try:
+        parsed = urlsplit(value)
+        port = parsed.port
+    except ValueError as error:
+        raise ValueError(f"{label} must be an S3 URI") from error
+    parts = parsed.path.removeprefix("/").split("/")
+    if (
+        parsed.scheme != "s3"
+        or parsed.hostname is None
+        or parsed.netloc != parsed.hostname
+        or port is not None
+        or parsed.query
+        or parsed.fragment
+        or not parts
+        or any(part in {"", ".", ".."} for part in parts)
+        or "\\" in value
+        or any(character in value for character in "\n\r\x00")
+    ):
+        raise ValueError(f"{label} must be a canonical S3 URI")
     return value
 
 
@@ -535,6 +569,7 @@ def verify_checkpoint_receipt_bytes(
     payload: bytes,
     *,
     expected: Mapping[str, object] | None = None,
+    require_durable: bool = False,
 ) -> dict[str, object]:
     value = _decode_canonical(payload, label="paired checkpoint receipt")
     if set(value) != _CHECKPOINT_FIELDS or value["schema_version"] != 3:
@@ -548,12 +583,32 @@ def verify_checkpoint_receipt_bytes(
     rows = value["checkpoints"]
     if not isinstance(rows, list) or len(rows) != 2:
         raise ValueError("checkpoint receipt must contain one pair")
+    row_field_sets = {
+        frozenset(row)
+        for row in rows
+        if isinstance(row, dict)
+    }
+    allowed_row_fields = {
+        frozenset(_CHECKPOINT_ROW_FIELDS),
+        frozenset(_DURABLE_CHECKPOINT_ROW_FIELDS),
+    }
+    if (
+        len(row_field_sets) != 1
+        or not all(isinstance(row, dict) for row in rows)
+        or not row_field_sets <= allowed_row_fields
+    ):
+        raise ValueError("checkpoint receipt row fields do not match")
+    durable = row_field_sets == {frozenset(_DURABLE_CHECKPOINT_ROW_FIELDS)}
+    if require_durable and not durable:
+        raise ValueError(
+            "terminal checkpoint receipt omits durable artifact identities"
+        )
     arms: set[str] = set()
     seeds: set[int] = set()
     steps: set[int] = set()
+    artifact_root: str | None = None
     for row in rows:
-        if not isinstance(row, dict) or set(row) != _CHECKPOINT_ROW_FIELDS:
-            raise ValueError("checkpoint receipt row fields do not match")
+        assert isinstance(row, dict)
         arm = row["arm"]
         if (
             arm not in _ARMS
@@ -574,6 +629,47 @@ def verify_checkpoint_receipt_bytes(
             raise ValueError("checkpoint receipt row identity is invalid")
         for field in ("sha256", "config_sha256", "dataset_sha256"):
             _sha256(row[field], label=f"checkpoint row {field}")
+        if durable:
+            for field in ("run_binding_sha256", "checkpoint_record_sha256"):
+                _sha256(row[field], label=f"checkpoint row {field}")
+            marker = f"/checkpoints/seed-{row['seed']}/{arm}"
+            checkpoint_uri = _s3_uri(
+                row["checkpoint_uri"],
+                label=f"{arm} checkpoint URI",
+            )
+            if marker not in checkpoint_uri:
+                raise ValueError("checkpoint receipt artifact URI is cross-seed")
+            row_root, separator, suffix = checkpoint_uri.partition(marker)
+            if (
+                not separator
+                or suffix != f"/sha256/{row['sha256']}.pt"
+                or artifact_root not in {None, row_root}
+            ):
+                raise ValueError(
+                    "checkpoint receipt artifact URI is not canonical"
+                )
+            artifact_root = row_root
+            expected_uris = {
+                "configuration_uri": (
+                    f"{row_root}{marker}/configuration/sha256/"
+                    f"{row['config_sha256']}.yaml"
+                ),
+                "run_binding_uri": (
+                    f"{row_root}{marker}/run-binding/sha256/"
+                    f"{row['run_binding_sha256']}.json"
+                ),
+                "checkpoint_record_uri": (
+                    f"{row_root}{marker}/records/"
+                    f"{row['checkpoint_record_sha256']}.json"
+                ),
+            }
+            if any(
+                _s3_uri(row[field], label=f"{arm} {field}") != expected_uri
+                for field, expected_uri in expected_uris.items()
+            ):
+                raise ValueError(
+                    "checkpoint receipt artifact URI is not canonical"
+                )
         arms.add(str(arm))
         seeds.add(int(row["seed"]))
         steps.add(int(row["step"]))
@@ -744,6 +840,96 @@ def _verify_run_directory(
     return binding
 
 
+def _verify_checkpoint_record(
+    path: Path,
+    *,
+    checkpoint_row: Mapping[str, object],
+    run_binding: Mapping[str, object],
+) -> dict[str, object]:
+    from evals.confirmatory.contracts import CheckpointRecord
+
+    payload = _read_regular(
+        path,
+        label=f"{checkpoint_row['arm']} checkpoint record",
+        maximum=64 * 1024,
+    )
+    digest = hashlib.sha256(payload).hexdigest()
+    value = _decode_canonical(
+        payload,
+        label=f"{checkpoint_row['arm']} checkpoint record",
+    )
+    record = CheckpointRecord.from_dict(value)
+    expected_arm = "dense" if checkpoint_row["arm"] == "dense" else "split"
+    if (
+        digest != checkpoint_row["checkpoint_record_sha256"]
+        or record.checkpoint_sha256 != checkpoint_row["sha256"]
+        or record.arm.value != expected_arm
+        or record.condition_id.value != checkpoint_row["arm"]
+        or record.seed != checkpoint_row["seed"]
+        or record.configuration_sha256 != checkpoint_row["config_sha256"]
+        or record.configuration_sha256
+        != run_binding["configuration_sha256"]
+        or record.route_dose_sha256 != run_binding["route_dose_sha256"]
+        or record.corpus_sha256 != run_binding["corpus_sha256"]
+        or record.code_sha256 != run_binding["code_sha256"]
+    ):
+        raise ValueError(
+            f"{checkpoint_row['arm']} checkpoint record disagrees with the "
+            "terminal run binding"
+        )
+    return value
+
+
+def verify_materialized_terminal(
+    *,
+    receipt_path: Path,
+    run_root: Path,
+    record_root: Path,
+    expected: Mapping[str, object],
+    expected_receipt_sha256: str | None = None,
+) -> dict[str, object]:
+    """Verify a terminal pair rematerialized entirely from immutable S3."""
+
+    payload = _read_regular(
+        receipt_path,
+        label="materialized terminal checkpoint receipt",
+        maximum=1 << 20,
+    )
+    receipt = verify_checkpoint_receipt_bytes(
+        payload,
+        expected=expected,
+        require_durable=True,
+    )
+    digest = hashlib.sha256(payload).hexdigest()
+    if (
+        expected_receipt_sha256 is not None
+        and digest
+        != _sha256(
+            expected_receipt_sha256,
+            label="expected terminal checkpoint receipt",
+        )
+    ):
+        raise ValueError("materialized checkpoint receipt SHA-256 differs")
+    for row in receipt["checkpoints"]:
+        binding = _verify_run_directory(
+            run_root / str(row["arm"]) / "run",
+            checkpoint_row=row,
+        )
+        run_payload = _read_regular(
+            run_root / str(row["arm"]) / "run" / "run.json",
+            label=f"{row['arm']} evaluator run binding",
+            maximum=64 * 1024,
+        )
+        if hashlib.sha256(run_payload).hexdigest() != row["run_binding_sha256"]:
+            raise ValueError("materialized run binding SHA-256 differs")
+        _verify_checkpoint_record(
+            record_root / f"{row['checkpoint_record_sha256']}.json",
+            checkpoint_row=row,
+            run_binding=binding,
+        )
+    return {"value": receipt, "sha256": digest}
+
+
 def _upload(
     store: VerifiedObjectStore,
     path: Path,
@@ -809,6 +995,8 @@ def publish_terminal_pair(
     checkpoint_record_paths: dict[str, Path] = {}
     checkpoint_record_sha256: dict[str, str] = {}
     checkpoint_record_uris: dict[str, str] = {}
+    terminal_artifact_paths: dict[str, dict[str, Path]] = {}
+    prefix = f"{plan.runtime.s3_root.rstrip('/')}/checkpoints/seed-{plan.seed}"
     for launch in sorted(plan.arms, key=lambda item: item.arm):
         metadata_payload = _read_regular(
             launch.checkpoint_path.parent / "checkpoint-meta.json",
@@ -829,14 +1017,11 @@ def publish_terminal_pair(
             or metadata["step"] != launch.max_steps
             or metadata["max_steps"] != launch.max_steps
             or metadata["world_size"] != 4
+            or metadata["config_fingerprint"] != launch.config_sha256
             or metadata["checkpoint_path"] != "ckpt.pt"
             or metadata["terminal"] is not True
         ):
             raise ValueError(f"{launch.arm} checkpoint is not terminal")
-        _sha256(
-            metadata["config_fingerprint"],
-            label=f"{launch.arm} checkpoint config fingerprint",
-        )
         snapshot = receipt_root / f"{launch.arm}.pt"
         digest, byte_count = _snapshot_regular(
             launch.checkpoint_path,
@@ -877,6 +1062,11 @@ def publish_terminal_pair(
             _canonical_json(run_binding),
             mode=0o444,
         )
+        run_binding_path = launch.checkpoint_path.parent / "run.json"
+        run_binding_sha256, _run_binding_bytes = _hash_regular(
+            run_binding_path,
+            label=f"{launch.arm} evaluator run binding",
+        )
         checkpoint_record = CheckpointRecord(
             record_type=CHECKPOINT_SCHEMA,
             schema_version=CONTRACT_VERSION,
@@ -897,13 +1087,33 @@ def publish_terminal_pair(
         _write_immutable(record_path, record_payload)
         checkpoint_record_paths[launch.arm] = record_path
         checkpoint_record_sha256[launch.arm] = record_digest
+        checkpoint_uri = (
+            f"{prefix}/{launch.arm}/sha256/{digest}.pt"
+        )
+        configuration_uri = (
+            f"{prefix}/{launch.arm}/configuration/sha256/"
+            f"{config_digest}.yaml"
+        )
+        run_binding_uri = (
+            f"{prefix}/{launch.arm}/run-binding/sha256/"
+            f"{run_binding_sha256}.json"
+        )
+        record_uri = (
+            f"{prefix}/{launch.arm}/records/{record_digest}.json"
+        )
         checkpoint_row = {
             "run_id": launch.run_id,
             "arm": launch.arm,
             "seed": plan.seed,
             "path": f"{launch.arm}.pt",
             "sha256": digest,
+            "checkpoint_uri": checkpoint_uri,
             "config_sha256": launch.config_sha256,
+            "configuration_uri": configuration_uri,
+            "run_binding_sha256": run_binding_sha256,
+            "run_binding_uri": run_binding_uri,
+            "checkpoint_record_sha256": record_digest,
+            "checkpoint_record_uri": record_uri,
             "dataset_sha256": plan.corpus_receipt_sha256,
             "source_commit": plan.code_commit,
             "step": launch.max_steps,
@@ -915,6 +1125,12 @@ def publish_terminal_pair(
         ) != run_binding:
             raise ValueError(f"{launch.arm} evaluator run binding changed")
         checkpoint_rows.append(checkpoint_row)
+        terminal_artifact_paths[launch.arm] = {
+            "checkpoint": snapshot,
+            "configuration": configuration,
+            "run_binding": run_binding_path,
+            "checkpoint_record": record_path,
+        }
     receipt = {
         "schema_version": 3,
         "provider": profile.provider,
@@ -931,31 +1147,44 @@ def publish_terminal_pair(
         "checkpoints": checkpoint_rows,
     }
     receipt_payload = _canonical_json(receipt)
-    verify_checkpoint_receipt_bytes(receipt_payload)
+    verify_checkpoint_receipt_bytes(receipt_payload, require_durable=True)
     receipt_digest = hashlib.sha256(receipt_payload).hexdigest()
     receipt_path = receipt_root / "receipt.json"
     _write_immutable(receipt_path, receipt_payload)
     deadline = time.monotonic() + float(timeout_seconds)
-    prefix = f"{plan.runtime.s3_root.rstrip('/')}/checkpoints/seed-{plan.seed}"
     for row in checkpoint_rows:
+        arm = str(row["arm"])
+        paths = terminal_artifact_paths[arm]
         _upload(
             object_store,
-            receipt_root / str(row["path"]),
-            f"{prefix}/{row['arm']}/sha256/{row['sha256']}.pt",
+            paths["checkpoint"],
+            str(row["checkpoint_uri"]),
             str(row["sha256"]),
             deadline=deadline,
         )
-        arm = str(row["arm"])
-        record_digest = checkpoint_record_sha256[arm]
-        record_uri = f"{prefix}/{arm}/records/{record_digest}.json"
         _upload(
             object_store,
-            checkpoint_record_paths[arm],
-            record_uri,
+            paths["configuration"],
+            str(row["configuration_uri"]),
+            str(row["config_sha256"]),
+            deadline=deadline,
+        )
+        _upload(
+            object_store,
+            paths["run_binding"],
+            str(row["run_binding_uri"]),
+            str(row["run_binding_sha256"]),
+            deadline=deadline,
+        )
+        record_digest = checkpoint_record_sha256[arm]
+        _upload(
+            object_store,
+            paths["checkpoint_record"],
+            str(row["checkpoint_record_uri"]),
             record_digest,
             deadline=deadline,
         )
-        checkpoint_record_uris[arm] = record_uri
+        checkpoint_record_uris[arm] = str(row["checkpoint_record_uri"])
     receipt_uri = f"{prefix}/receipts/{receipt_digest}.json"
     completion_uri = f"{prefix}/completions/{operation_id}.json"
     _upload(object_store, receipt_path, receipt_uri, receipt_digest, deadline=deadline)
@@ -991,13 +1220,17 @@ def verify_durable_terminal(
         label="terminal checkpoint receipt",
         maximum=1 << 20,
     )
-    receipt = verify_checkpoint_receipt_bytes(payload, expected=expected)
+    receipt = verify_checkpoint_receipt_bytes(
+        payload,
+        expected=expected,
+        require_durable=True,
+    )
     digest = hashlib.sha256(payload).hexdigest()
     seed = receipt["checkpoints"][0]["seed"]
     prefix = f"{s3_root.rstrip('/')}/checkpoints/seed-{seed}"
     deadline = time.monotonic() + float(timeout_seconds)
     for row in receipt["checkpoints"]:
-        _verify_run_directory(
+        binding = _verify_run_directory(
             run_root / str(row["arm"]) / "run",
             checkpoint_row=row,
         )
@@ -1011,8 +1244,40 @@ def verify_durable_terminal(
         _upload(
             object_store,
             path,
-            f"{prefix}/{row['arm']}/sha256/{row['sha256']}.pt",
+            str(row["checkpoint_uri"]),
             str(row["sha256"]),
+            deadline=deadline,
+        )
+        run_directory = run_root / str(row["arm"]) / "run"
+        _upload(
+            object_store,
+            run_directory / "configuration.yaml",
+            str(row["configuration_uri"]),
+            str(row["config_sha256"]),
+            deadline=deadline,
+        )
+        _upload(
+            object_store,
+            run_directory / "run.json",
+            str(row["run_binding_uri"]),
+            str(row["run_binding_sha256"]),
+            deadline=deadline,
+        )
+        record_path = (
+            receipt_path.parent
+            / "records"
+            / f"{row['checkpoint_record_sha256']}.json"
+        )
+        _verify_checkpoint_record(
+            record_path,
+            checkpoint_row=row,
+            run_binding=binding,
+        )
+        _upload(
+            object_store,
+            record_path,
+            str(row["checkpoint_record_uri"]),
+            str(row["checkpoint_record_sha256"]),
             deadline=deadline,
         )
     receipt_uri = f"{prefix}/receipts/{digest}.json"
@@ -1043,6 +1308,7 @@ def publish_evaluation_pair(
     checkpoint = verify_checkpoint_receipt_bytes(
         checkpoint_payload,
         expected=expected,
+        require_durable=True,
     )
     checkpoint_digest = hashlib.sha256(checkpoint_payload).hexdigest()
     _sha256(sealed_evaluation_sha256, label="sealed evaluation")
@@ -1203,6 +1469,14 @@ def _parser() -> argparse.ArgumentParser:
     verify.add_argument("--provider", required=True)
     verify.add_argument("--run-manifest-sha256", required=True)
     verify.add_argument("--sealed-fixture-sha256", required=True)
+    materialized = commands.add_parser("verify-materialized")
+    materialized.add_argument("--receipt", type=Path, required=True)
+    materialized.add_argument("--run-root", type=Path, required=True)
+    materialized.add_argument("--record-root", type=Path, required=True)
+    materialized.add_argument("--expected-receipt-sha256", required=True)
+    materialized.add_argument("--provider", required=True)
+    materialized.add_argument("--run-manifest-sha256", required=True)
+    materialized.add_argument("--sealed-fixture-sha256", required=True)
     publish = commands.add_parser("publish-evaluation")
     publish.add_argument("--evaluation-root", type=Path, required=True)
     publish.add_argument("--checkpoint-receipt", type=Path, required=True)
@@ -1227,7 +1501,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         kms_key_id = os.environ.get("MS_S3_KMS_KEY_ID", "")
         parent = (
             arguments.receipt.parent
-            if arguments.command == "verify-terminal"
+            if arguments.command in {"verify-terminal", "verify-materialized"}
             else arguments.evaluation_root
         )
         store = _store(region, kms_key_id, parent)
@@ -1251,6 +1525,27 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "verified": True,
                 "receipt_sha256": result["sha256"],
                 "receipt_uri": result["uri"],
+            }
+        elif arguments.command == "verify-materialized":
+            result = verify_materialized_terminal(
+                receipt_path=arguments.receipt,
+                run_root=arguments.run_root,
+                record_root=arguments.record_root,
+                expected_receipt_sha256=(
+                    arguments.expected_receipt_sha256
+                ),
+                expected={
+                    "provider": arguments.provider,
+                    "run_manifest_sha256": arguments.run_manifest_sha256,
+                    "sealed_fixture_sha256": (
+                        arguments.sealed_fixture_sha256
+                    ),
+                },
+            )
+            report = {
+                "schema_version": 1,
+                "verified": True,
+                "receipt_sha256": result["sha256"],
             }
         else:
             publication = publish_evaluation_pair(

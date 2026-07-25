@@ -59,6 +59,14 @@ _RECEIPT_CHECKPOINT_FIELDS = {
     "step",
     "world_size",
 }
+_V3_RECEIPT_CHECKPOINT_FIELDS = _RECEIPT_CHECKPOINT_FIELDS | {
+    "checkpoint_uri",
+    "configuration_uri",
+    "run_binding_sha256",
+    "run_binding_uri",
+    "checkpoint_record_sha256",
+    "checkpoint_record_uri",
+}
 
 
 class ResumeLaunchError(ValueError):
@@ -460,12 +468,30 @@ def _verify_checkpoint_receipt(
     rows = receipt["checkpoints"]
     if not isinstance(rows, list) or len(rows) != 2:
         raise ResumeLaunchError("checkpoint receipt pair is incomplete")
+    row_field_sets = {
+        frozenset(row)
+        for row in rows
+        if isinstance(row, dict)
+    }
+    allowed_row_field_sets = {frozenset(_RECEIPT_CHECKPOINT_FIELDS)}
+    if schema_version == 3:
+        allowed_row_field_sets.add(
+            frozenset(_V3_RECEIPT_CHECKPOINT_FIELDS)
+        )
+    if (
+        len(row_field_sets) != 1
+        or not all(isinstance(row, dict) for row in rows)
+        or not row_field_sets <= allowed_row_field_sets
+    ):
+        raise ResumeLaunchError(
+            "checkpoint receipt row fields do not match"
+        )
+    durable_terminal = row_field_sets == {
+        frozenset(_V3_RECEIPT_CHECKPOINT_FIELDS)
+    }
     receipt_by_arm: dict[str, dict[str, object]] = {}
     for row in rows:
-        if not isinstance(row, dict) or set(row) != _RECEIPT_CHECKPOINT_FIELDS:
-            raise ResumeLaunchError(
-                "checkpoint receipt row fields do not match"
-            )
+        assert isinstance(row, dict)
         arm = row["arm"]
         if (
             arm not in _ARMS
@@ -484,6 +510,50 @@ def _verify_checkpoint_receipt(
             )
         _sha256(row["sha256"], label=f"{arm} checkpoint")
         _sha256(row["config_sha256"], label=f"{arm} config")
+        if durable_terminal:
+            run_binding_sha256 = _sha256(
+                row["run_binding_sha256"],
+                label=f"{arm} run binding",
+            )
+            record_sha256 = _sha256(
+                row["checkpoint_record_sha256"],
+                label=f"{arm} checkpoint record",
+            )
+            prefix = f"/checkpoints/seed-{plan.seed}/{arm}"
+            expected_suffixes = {
+                "checkpoint_uri": f"{prefix}/sha256/{row['sha256']}.pt",
+                "configuration_uri": (
+                    f"{prefix}/configuration/sha256/"
+                    f"{row['config_sha256']}.yaml"
+                ),
+                "run_binding_uri": (
+                    f"{prefix}/run-binding/sha256/"
+                    f"{run_binding_sha256}.json"
+                ),
+                "checkpoint_record_uri": (
+                    f"{prefix}/records/{record_sha256}.json"
+                ),
+            }
+            roots = {
+                str(row[field])[: -len(suffix)]
+                for field, suffix in expected_suffixes.items()
+                if isinstance(row[field], str)
+                and str(row[field]).startswith("s3://")
+                and str(row[field]).endswith(suffix)
+            }
+            if len(roots) != 1 or any(
+                not isinstance(row[field], str)
+                or not str(row[field]).startswith("s3://")
+                or not str(row[field]).endswith(suffix)
+                or any(
+                    character in str(row[field])
+                    for character in "\n\r\x00"
+                )
+                for field, suffix in expected_suffixes.items()
+            ):
+                raise ResumeLaunchError(
+                    "checkpoint receipt durable artifact URI is invalid"
+                )
         receipt_by_arm[str(arm)] = row
     if set(receipt_by_arm) != set(_ARMS):
         raise ResumeLaunchError("checkpoint receipt arms are incomplete")

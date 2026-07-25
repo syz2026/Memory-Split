@@ -264,7 +264,7 @@ def build_parser() -> JsonArgumentParser:
     fleet_advance.add_argument("--fleet-plan", required=True)
     fleet_advance.add_argument("--to-manifest", required=True)
     fleet_advance.add_argument("--instance-id", required=True)
-    fleet_advance.add_argument("--collection-root", required=True)
+    fleet_advance.add_argument("--checkpoint-receipt", required=True)
     fleet_advance.add_argument("--approval")
     fleet_advance.add_argument("--apply", action="store_true")
 
@@ -353,6 +353,8 @@ def build_parser() -> JsonArgumentParser:
             leaf.add_argument("--terminate-at")
         if name == "resume":
             leaf.add_argument("--checkpoint-receipt", required=True)
+        if name == "evaluate":
+            leaf.add_argument("--checkpoint-receipt")
         leaf.add_argument("--apply", action="store_true")
 
     status = _leaf(commands, "status", help_text="reconcile run status")
@@ -601,6 +603,14 @@ def dispatch(
             environ=environment,
         )
         return backend.dispatch(command, args)
+    if (
+        command == "evaluate"
+        and getattr(args, "checkpoint_receipt", None) is not None
+    ):
+        raise MsctlError(
+            "CLI_USAGE",
+            "--checkpoint-receipt is supported only for AWS v3 evaluation",
+        )
     if command in {"runs render", "submit", "resume", "evaluate"}:
         _require_cli_values(args, "dataset_pointer", "shared_root")
         if (args.dataset_root is None) == (args.dataset_verification is None):

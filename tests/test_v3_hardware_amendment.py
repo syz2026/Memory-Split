@@ -696,26 +696,30 @@ def test_later_fleet_wave_requires_local_terminal_advance_receipt(tmp_path):
     )
     evidence = {
         "training_state_sha256": "1" * 64,
-        "evaluation_state_sha256": "2" * 64,
-        "collection_receipt_sha256": "3" * 64,
         "training_command_id": "training-command-12345678",
-        "evaluation_command_id": "evaluation-command-12345678",
         "training_terminal_receipt_uri": (
             "s3://memorysplit-prod/training/receipts/terminal.json"
-        ),
-        "evaluation_terminal_receipt_uri": (
-            "s3://memorysplit-prod/evaluation/receipts/terminal.json"
         ),
         "checkpoint_receipt_sha256": "8" * 64,
         "checkpoint_receipt_uri": (
             "s3://memorysplit-prod/checkpoints/seed-0/receipts/"
             f"{'8' * 64}.json"
         ),
-        "evaluation_receipt_sha256": "9" * 64,
-        "evaluation_receipt_uri": (
-            "s3://memorysplit-prod/evaluations/seed-0/receipts/"
-            f"{'9' * 64}.json"
-        ),
+        "checkpoint_records": [
+            {
+                "run_id": f"run-{arm}-0",
+                "arm": arm,
+                "sha256": digest,
+                "uri": (
+                    "s3://memorysplit-prod/checkpoints/seed-0/"
+                    f"{arm}/records/{digest}.json"
+                ),
+            }
+            for arm, digest in (
+                ("dense", "2" * 64),
+                ("split90", "3" * 64),
+            )
+        ],
         "aws_bound_tags_sha256": "4" * 64,
         "aws_unbound_tags_sha256": "5" * 64,
     }
@@ -746,6 +750,23 @@ def test_later_fleet_wave_requires_local_terminal_advance_receipt(tmp_path):
             to_binding=target_binding,
         )
     assert getattr(false_unbind.value, "code", None) == "FLEET_ADVANCE_INVALID"
+
+    cross_seed = json.loads(canonical_json(value))
+    cross_seed["evidence"]["checkpoint_records"][0]["uri"] = (
+        cross_seed["evidence"]["checkpoint_records"][0]["uri"].replace(
+            "seed-0",
+            "seed-1",
+        )
+    )
+    with pytest.raises(Exception) as cross_seed_record:
+        validate_fleet_advance(
+            cross_seed,
+            plan=plan,
+            to_binding=target_binding,
+        )
+    assert getattr(cross_seed_record.value, "code", None) == (
+        "FLEET_ADVANCE_INVALID"
+    )
 
     amendment = load_hardware_amendment(AMENDMENT)
     context = V3LifecycleContext(
@@ -916,32 +937,37 @@ def test_fleet_advance_dry_run_then_apply_verifies_and_unbinds_exact_tags(
 
     monkeypatch.setattr(aws_p5, "StateStore", lambda _root: Store())
     monkeypatch.setattr(
-        aws_p5,
-        "verify_fleet_collection",
-        lambda *_args, **_kwargs: "7" * 64,
-    )
-    monkeypatch.setattr(
         backend,
-        "_verify_v3_lifecycle_collection",
+        "_terminal_checkpoint_identity",
         lambda *_args, **_kwargs: {
-            "collection_receipt_sha256": "7" * 64,
+            "receipt": {},
             "checkpoint_receipt_sha256": "8" * 64,
-            "checkpoint_receipt_uri": (
+            "sha256": "8" * 64,
+            "uri": (
                 "s3://memorysplit-prod/checkpoints/seed-0/receipts/"
                 f"{'8' * 64}.json"
             ),
-            "evaluation_receipt_sha256": "9" * 64,
-            "evaluation_receipt_uri": (
-                "s3://memorysplit-prod/evaluations/seed-0/receipts/"
-                f"{'9' * 64}.json"
-            ),
-            "evaluation": {
-                "launch_readiness_sha256": "3" * 64,
-                "operation_id": "5" * 64,
-                    "sealed_evaluation_sha256": "a" * 64,
-                    "study_lock_sha256": "b" * 64,
-            },
+            "records": [
+                {
+                    "run_id": f"run-{arm}-0",
+                    "arm": arm,
+                    "sha256": digest,
+                    "uri": (
+                        "s3://memorysplit-prod/checkpoints/seed-0/"
+                        f"{arm}/records/{digest}.json"
+                    ),
+                }
+                for arm, digest in (
+                    ("dense", "9" * 64),
+                    ("split90", "a" * 64),
+                )
+            ],
         },
+    )
+    monkeypatch.setattr(
+        backend,
+        "_materialize_terminal_checkpoint_identity",
+        lambda *_args, **_kwargs: [],
     )
     monkeypatch.setattr(backend, "_repair_paired_states", lambda *_args: None)
     monkeypatch.setattr(
@@ -956,7 +982,7 @@ def test_fleet_advance_dry_run_then_apply_verifies_and_unbinds_exact_tags(
         "target_manifest_path": paths[1],
         "repo_root": ROOT,
         "instance_id": instance_id,
-        "collection_root": tmp_path / "collection",
+        "checkpoint_receipt_path": tmp_path / "checkpoint-receipt.json",
     }
     dry_run = backend.fleet_advance(
         **arguments,
@@ -1180,14 +1206,41 @@ def test_v3_profiles_support_full_dry_run_lifecycle(
     for run in manifest.runs:
         checkpoint = tmp_path / f"{run.arm}.pt"
         checkpoint.write_bytes(f"{profile.provider}:{run.run_id}".encode())
+        checkpoint_sha256 = _sha256(checkpoint)
+        run_binding_sha256 = (
+            "b" * 64 if run.arm == "dense" else "c" * 64
+        )
+        checkpoint_record_sha256 = (
+            "d" * 64 if run.arm == "dense" else "e" * 64
+        )
+        artifact_prefix = (
+            f"{runtime.s3_root}/checkpoints/seed-{run.seed}/{run.arm}"
+        )
         checkpoint_rows.append(
             {
                 "run_id": run.run_id,
                 "arm": run.arm,
                 "seed": run.seed,
                 "path": checkpoint.name,
-                "sha256": _sha256(checkpoint),
+                "sha256": checkpoint_sha256,
+                "checkpoint_uri": (
+                    f"{artifact_prefix}/sha256/{checkpoint_sha256}.pt"
+                ),
                 "config_sha256": run.config_sha256,
+                "configuration_uri": (
+                    f"{artifact_prefix}/configuration/sha256/"
+                    f"{run.config_sha256}.yaml"
+                ),
+                "run_binding_sha256": run_binding_sha256,
+                "run_binding_uri": (
+                    f"{artifact_prefix}/run-binding/sha256/"
+                    f"{run_binding_sha256}.json"
+                ),
+                "checkpoint_record_sha256": checkpoint_record_sha256,
+                "checkpoint_record_uri": (
+                    f"{artifact_prefix}/records/"
+                    f"{checkpoint_record_sha256}.json"
+                ),
                 "dataset_sha256": manifest.dataset_sha256,
                 "source_commit": manifest.source_commit,
                 "step": 1358,
@@ -1256,6 +1309,7 @@ def test_v3_profiles_support_full_dry_run_lifecycle(
         apply=False,
         evidence=evidence,
         context=evaluation_context,
+        checkpoint_receipt=checkpoint_receipt,
     )
     cleaned = backend.cleanup(
         release=release,
@@ -1408,6 +1462,37 @@ def test_v3_profiles_support_full_dry_run_lifecycle(
         and step["argv"][step["argv"].index("--checksum-mode") + 1]
         == "ENABLED"
         for step in materializations
+    )
+    terminal_materializations = [
+        step
+        for step in evaluation_steps
+        if step["name"].startswith("materialize-terminal-")
+    ]
+    assert len(terminal_materializations) == 9
+    assert all(
+        "s3api" in step["argv"]
+        and "get-object" in step["argv"]
+        and "sync" not in step["argv"]
+        and step["argv"][step["argv"].index("--checksum-mode") + 1]
+        == "ENABLED"
+        for step in terminal_materializations
+    )
+    evaluation_envelope = backend._operation_envelope(
+        evaluated["operation_intent"],
+        instance_id=instance_id,
+        terminate_at=terminate_at,
+    )
+    evaluation_intent_sha256 = hashlib.sha256(
+        canonical_json(evaluation_envelope)
+    ).hexdigest()
+    validated_evaluation = _validate_intent(
+        canonical_json(evaluation_envelope),
+        expected_sha256=evaluation_intent_sha256,
+        expected_control_bundle_sha256=backend.control_bundle.sha256,
+    )
+    assert validated_evaluation["operation"] == "evaluate"
+    assert validated_evaluation["checkpoint_receipt"]["sha256"] == (
+        checkpoint_receipt.sha256
     )
     assert cancelled["cancelled"] == 0
     assert cleaned["terminated"] == 0
