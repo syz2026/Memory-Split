@@ -1,0 +1,16 @@
+__pycache__/
+*.pyc
+.tiktoken_cache/
+.venv/
+.pytest_cache/
+.worktrees/
+.DS_Store
+data/
+outputs/
+!outputs/manifests/
+!outputs/manifests/**
+*.bin
+*.npy
+*.pt
+wandb/
+.ipynb_checkpoints/

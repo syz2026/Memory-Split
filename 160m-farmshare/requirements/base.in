@@ -1,0 +1,11 @@
+# Direct Task-11 dependencies. Every input is exact; platform locks below
+# include the complete transitive closure and distribution hashes.
+datasets==5.0.0
+huggingface-hub==1.24.0
+matplotlib==3.11.0
+numpy==2.5.1
+pytest==9.1.1
+PyYAML==6.0.3
+tiktoken==0.13.0
+torch==2.13.0
+tqdm==4.69.0

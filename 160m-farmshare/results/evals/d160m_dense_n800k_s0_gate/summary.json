@@ -1,0 +1,50 @@
+{
+  "run": "d160m_dense_n800k_s0_gate",
+  "arm": "dense",
+  "ckpt": "ckpt.pt",
+  "igsm": {
+    "acc": 0.044,
+    "n": 1500,
+    "lookup_stats": {
+      "n_lookups": 0,
+      "n_hits": 0,
+      "n_misses": 0,
+      "n_malformed": 0
+    }
+  },
+  "deduction": {
+    "acc": 0.5133333333333333,
+    "n": 1500,
+    "lookup_stats": {
+      "n_lookups": 0,
+      "n_hits": 0,
+      "n_misses": 0,
+      "n_malformed": 0
+    }
+  },
+  "factqa": {
+    "acc": 0.308,
+    "n": 1500,
+    "lookup_stats": {
+      "n_lookups": 0,
+      "n_hits": 0,
+      "n_misses": 0,
+      "n_malformed": 0
+    }
+  },
+  "factqa_fresh": {
+    "acc": 0.008,
+    "n": 500,
+    "lookup_stats": {
+      "n_lookups": 0,
+      "n_hits": 0,
+      "n_misses": 0,
+      "n_malformed": 0
+    }
+  },
+  "recall": {
+    "closed": 0.0033333333333333335
+  },
+  "bits_in_weights": 27099.134547110545,
+  "composite_knowledge_free": 0.2786666666666667
+}

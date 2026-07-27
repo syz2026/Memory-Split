@@ -1,0 +1,137 @@
+{
+  "arm": "B",
+  "constrained": true,
+  "run": "a",
+  "seed": 0,
+  "n_items": 806,
+  "aggregates": {
+    "all": {
+      "full_key": 0.3387096774193548,
+      "full_key_ci": [
+        0.3068696824766381,
+        0.3720798800057041
+      ],
+      "name_half": 0.3399503722084367,
+      "name_half_ci": [
+        0.3080756403064051,
+        0.3733435409260729
+      ],
+      "relation_half": 0.9789081885856079,
+      "relation_half_ci": [
+        0.9664824689249378,
+        0.9867903686274921
+      ],
+      "answer": 0.3535980148883375,
+      "answer_ci": [
+        0.3213574039151591,
+        0.38722758356881304
+      ],
+      "no_lookup_rate": 0.007444168734491315,
+      "no_lookup_rate_ci": [
+        0.003416018798451272,
+        0.016145337397624603
+      ],
+      "malformed_rate": 0.0,
+      "malformed_rate_ci": [
+        0.0,
+        0.0047436436952609
+      ],
+      "wrong_in_context_rate": 0.652605459057072,
+      "wrong_in_context_rate_ci": [
+        0.6190796786777919,
+        0.6846834275889151
+      ],
+      "n": 806
+    },
+    "heldout": {
+      "full_key": 0.24257425742574257,
+      "full_key_ci": [
+        0.2101368034278156,
+        0.27825493632886883
+      ],
+      "name_half": 0.24422442244224424,
+      "name_half_ci": [
+        0.21169884007469383,
+        0.2799724398117554
+      ],
+      "relation_half": 0.971947194719472,
+      "relation_half_ci": [
+        0.9555356628333983,
+        0.9824128142793472
+      ],
+      "answer": 0.2623762376237624,
+      "answer_ci": [
+        0.22892481746184967,
+        0.29882140385201295
+      ],
+      "no_lookup_rate": 0.009900990099009901,
+      "no_lookup_rate_ci": [
+        0.004545328393002349,
+        0.02143125306683903
+      ],
+      "malformed_rate": 0.0,
+      "malformed_rate_ci": [
+        0.0,
+        0.006299340681252312
+      ],
+      "wrong_in_context_rate": 0.7458745874587459,
+      "wrong_in_context_rate_ci": [
+        0.7097365536683871,
+        0.7789149256665748
+      ],
+      "n": 606
+    },
+    "seen": {
+      "full_key": 0.63,
+      "full_key_ci": [
+        0.5612250134987606,
+        0.6938750249624759
+      ],
+      "name_half": 0.63,
+      "name_half_ci": [
+        0.5612250134987606,
+        0.6938750249624759
+      ],
+      "relation_half": 1.0,
+      "relation_half_ci": [
+        0.9811539940816791,
+        1.0
+      ],
+      "answer": 0.63,
+      "answer_ci": [
+        0.5612250134987606,
+        0.6938750249624759
+      ],
+      "no_lookup_rate": 0.0,
+      "no_lookup_rate_ci": [
+        0.0,
+        0.018846005918320894
+      ],
+      "malformed_rate": 0.0,
+      "malformed_rate_ci": [
+        0.0,
+        0.018846005918320894
+      ],
+      "wrong_in_context_rate": 0.37,
+      "wrong_in_context_rate_ci": [
+        0.3061249750375241,
+        0.43877498650123936
+      ],
+      "n": 200
+    }
+  },
+  "generation_stats": {
+    "n_lookups": 807,
+    "n_hits": 280,
+    "n_misses": 527,
+    "n_malformed": 0,
+    "n_constrained_queries": 807,
+    "n_constraint_dead_ends": 0
+  },
+  "config": {
+    "max_new": 64,
+    "batch_size": 32,
+    "limit": 0,
+    "device": "cpu"
+  }
+}

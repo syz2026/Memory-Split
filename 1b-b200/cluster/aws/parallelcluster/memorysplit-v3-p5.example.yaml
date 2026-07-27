@@ -1,0 +1,79 @@
+# Protected 135M reasoning-v3 cluster. The only GPU capacity this template can
+# ever create is p6-b200.48xlarge, matching
+# cluster/profiles/aws-p6-b200.48xlarge-135m-v1.json. MinCount stays 0 so no
+# instance-hour is bought implicitly; MaxCount 2 caps the cluster at the largest
+# approved envelope (one node for two days, or two nodes for one day).
+#
+# Capacity Blocks: switch CapacityType to CAPACITY_BLOCK and add
+# CapacityReservationTarget.CapacityReservationId only after the offering is
+# separately approved and its exact identity is recorded. Do not guess an id.
+# Image.CustomAmi must likewise be pinned to the confirmed B200-capable DLAMI
+# once image.ami_id in the hardware profile is resolved.
+Region: us-east-1
+Image:
+  Os: ubuntu2204
+HeadNode:
+  InstanceType: c7i.2xlarge
+  Imds:
+    Secured: true
+  LocalStorage:
+    RootVolume:
+      DeleteOnTermination: true
+      Encrypted: true
+      Size: 100
+      VolumeType: gp3
+  Networking:
+    SubnetId: subnet-REPLACE
+  Ssh:
+    KeyName: memorysplit-REPLACE
+  Iam:
+    S3Access:
+      - BucketName: memorysplit-REPLACE
+        KeyName: corpus/REPLACE/*
+        EnableWriteAccess: false
+      - BucketName: memorysplit-REPLACE
+        KeyName: releases/*
+        EnableWriteAccess: false
+      - BucketName: memorysplit-REPLACE
+        KeyName: evidence/REPLACE/*
+        EnableWriteAccess: true
+    AdditionalIamPolicies:
+      - Policy: arn:aws:iam::REPLACE:policy/memorysplit-kms-REPLACE
+Scheduling:
+  Scheduler: slurm
+  SlurmSettings:
+    ScaledownIdletime: 5
+  SlurmQueues:
+    - Name: gpu
+      CapacityType: ONDEMAND
+      ComputeResources:
+        # Four disjoint two-GPU pairs run inside one node, so no inter-node
+        # collective and therefore no EFA fabric or placement group is needed.
+        - Name: p6-b200
+          InstanceType: p6-b200.48xlarge
+          MinCount: 0
+          MaxCount: 2
+          Efa:
+            Enabled: false
+      ComputeSettings:
+        LocalStorage:
+          RootVolume:
+            DeleteOnTermination: true
+            Encrypted: true
+            Size: 200
+            VolumeType: gp3
+      Networking:
+        PlacementGroup:
+          Enabled: false
+        SubnetIds:
+          - subnet-REPLACE
+SharedStorage:
+  - MountDir: /shared
+    Name: memorysplit
+    StorageType: Efs
+    EfsSettings:
+      DeletionPolicy: Retain
+      Encrypted: true
+      KmsKeyId: arn:aws:kms:us-east-1:REPLACE:key/REPLACE
+      PerformanceMode: generalPurpose
+      ThroughputMode: elastic

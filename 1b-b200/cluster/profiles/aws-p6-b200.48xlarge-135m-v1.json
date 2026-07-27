@@ -1,0 +1,115 @@
+{
+  "authority_id": "memorysplit-p6-b200-135m-v1",
+  "cohort_id": "memorysplit-exploratory-v3-135m-aws-n10",
+  "container_runtime": {
+    "digest": null,
+    "repository": null
+  },
+  "dataset_contract_id": "memorysplit-reasoning-dataset-v3",
+  "hardware": {
+    "gpu_compute_capability": null,
+    "gpu_count": 8,
+    "gpu_memory_mib": null,
+    "gpu_name": null,
+    "instance_type": "p6-b200.48xlarge",
+    "local_storage_gb_floor": 30400,
+    "memory_gib_floor": 2048,
+    "vcpus": 192
+  },
+  "image": {
+    "ami_id": null,
+    "ami_name": null,
+    "ami_owner": null
+  },
+  "pair_geometry": {
+    "gpus_per_pair": 2,
+    "pairs_per_node": 4
+  },
+  "pair_id_prefix": "d135m_reasoning_v3_s",
+  "pending_confirmation": [
+    {
+      "field": "container_runtime.digest",
+      "reason": "the protected runtime image has not been built or pushed",
+      "resolve_with": "aws ecr describe-images --image-ids imageTag=<tag>"
+    },
+    {
+      "field": "container_runtime.repository",
+      "reason": "the private ECR repository does not exist yet",
+      "resolve_with": "aws ecr describe-repositories"
+    },
+    {
+      "field": "hardware.gpu_compute_capability",
+      "reason": "not attested by any B200 device available to this repository",
+      "resolve_with": "deviceQuery on the qualified node"
+    },
+    {
+      "field": "hardware.gpu_memory_mib",
+      "reason": "not attested by any B200 device available to this repository",
+      "resolve_with": "nvidia-smi --query-gpu=memory.total --format=csv,noheader"
+    },
+    {
+      "field": "hardware.gpu_name",
+      "reason": "the exact device-name string must be read from real hardware",
+      "resolve_with": "nvidia-smi --query-gpu=name --format=csv,noheader"
+    },
+    {
+      "field": "image.ami_id",
+      "reason": "the B200-capable DLAMI is region-scoped and changes on release",
+      "resolve_with": "aws ssm get-parameter --name <dlami-parameter>"
+    },
+    {
+      "field": "image.ami_name",
+      "reason": "the B200-capable DLAMI release name is not known offline",
+      "resolve_with": "aws ec2 describe-images --image-ids <ami-id>"
+    },
+    {
+      "field": "image.ami_owner",
+      "reason": "the publishing account must be read back, never assumed",
+      "resolve_with": "aws ec2 describe-images --image-ids <ami-id>"
+    },
+    {
+      "field": "placement.availability_zone",
+      "reason": "the zone is fixed by the approved Capacity Block offering",
+      "resolve_with": "aws ec2 describe-capacity-block-offerings"
+    },
+    {
+      "field": "qualification.memory_headroom_fraction_floor",
+      "reason": "no approved design fixes this scientific threshold",
+      "resolve_with": "freeze the threshold in the preregistration before training"
+    },
+    {
+      "field": "software_floors.nccl_version",
+      "reason": "the approved design fixes OFI-NCCL but not the NCCL library floor",
+      "resolve_with": "freeze the floor from the qualified runtime image"
+    },
+    {
+      "field": "software_floors.torch_version",
+      "reason": "the approved design fixes CUDA and driver but not PyTorch",
+      "resolve_with": "freeze the floor from the qualified runtime image"
+    }
+  ],
+  "placement": {
+    "availability_zone": null,
+    "region": "us-east-1"
+  },
+  "profile_id": "aws-p6-b200.48xlarge-135m-v1",
+  "qualification": {
+    "memory_headroom_fraction_floor": null
+  },
+  "rejected_authorities": [
+    "memorysplit-b300-135m-v1",
+    "memorysplit-p5-48xlarge-135m-v1",
+    "memorysplit-p5en-48xlarge-135m-v1",
+    "memorysplit-p6e-gb200-135m-v1"
+  ],
+  "schema_version": 1,
+  "software_floors": {
+    "cuda_version": "12.8",
+    "driver_version": "570",
+    "efa_installer_version": "1.41.0",
+    "kernel_version": "6.1",
+    "nccl_version": null,
+    "ofi_nccl_version": "1.15.0",
+    "torch_version": null
+  }
+}

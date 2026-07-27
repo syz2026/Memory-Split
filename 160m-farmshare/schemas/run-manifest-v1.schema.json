@@ -1,0 +1,184 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://memorysplit.invalid/schemas/run-manifest-v1.schema.json",
+  "title": "MemorySplit exact relational run manifest v1",
+  "description": "Structural contract. RunManifest.from_dict enforces exact keys, pair fingerprints, freeze and matrix-plan binding, and the launchable staged-asset receipt.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "record_type",
+    "schema_version",
+    "status",
+    "watermark",
+    "launchable",
+    "freeze",
+    "freeze_sha256",
+    "freeze_decision_sha256",
+    "load_labels",
+    "entities",
+    "seeds",
+    "runs",
+    "matrix_plan_sha256",
+    "asset_receipt",
+    "decision_sha256",
+    "manifest_sha256"
+  ],
+  "properties": {
+    "record_type": {
+      "const": "relational_run_manifest"
+    },
+    "schema_version": {
+      "const": 1
+    },
+    "status": {
+      "enum": [
+        "fixture",
+        "frozen"
+      ]
+    },
+    "watermark": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "launchable": {
+      "type": "boolean"
+    },
+    "freeze": {
+      "$ref": "freeze-v1.schema.json"
+    },
+    "freeze_sha256": {
+      "$ref": "#/$defs/Sha256"
+    },
+    "freeze_decision_sha256": {
+      "$ref": "#/$defs/Sha256"
+    },
+    "load_labels": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "low",
+        "high",
+        "confirmation"
+      ],
+      "properties": {
+        "low": {
+          "$ref": "#/$defs/LoadLabel"
+        },
+        "high": {
+          "$ref": "#/$defs/LoadLabel"
+        },
+        "confirmation": {
+          "$ref": "#/$defs/LoadLabel"
+        }
+      }
+    },
+    "entities": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "low",
+        "high",
+        "confirmation"
+      ],
+      "properties": {
+        "low": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "high": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "confirmation": {
+          "type": "integer",
+          "minimum": 1
+        }
+      }
+    },
+    "seeds": {
+      "const": [
+        1001,
+        1002,
+        1003,
+        1004,
+        1005
+      ]
+    },
+    "runs": {
+      "type": "array",
+      "items": {
+        "$ref": "run-config-v1.schema.json"
+      },
+      "minItems": 35,
+      "maxItems": 35
+    },
+    "matrix_plan_sha256": {
+      "$ref": "#/$defs/Sha256"
+    },
+    "asset_receipt": {
+      "oneOf": [
+        {
+          "type": "null"
+        },
+        {
+          "$ref": "relational-asset-receipt-v1.schema.json"
+        }
+      ]
+    },
+    "decision_sha256": {
+      "$ref": "#/$defs/Sha256"
+    },
+    "manifest_sha256": {
+      "$ref": "#/$defs/Sha256"
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "status": {
+            "const": "fixture"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "watermark": {
+            "const": "NONLAUNCHABLE_FIXTURE"
+          },
+          "launchable": {
+            "const": false
+          },
+          "asset_receipt": {
+            "type": "null"
+          }
+        }
+      },
+      "else": {
+        "properties": {
+          "watermark": {
+            "type": "null"
+          },
+          "launchable": {
+            "const": true
+          },
+          "asset_receipt": {
+            "$ref": "relational-asset-receipt-v1.schema.json"
+          }
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "Sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "LoadLabel": {
+      "type": "string",
+      "pattern": "^n[0-9]+(?:p[0-9]+)?[km]?$"
+    }
+  }
+}

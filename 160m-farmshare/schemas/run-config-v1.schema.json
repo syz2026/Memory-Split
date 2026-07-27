@@ -1,0 +1,341 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://memorysplit.invalid/schemas/run-config-v1.schema.json",
+  "title": "MemorySplit relational run config v1",
+  "description": "Structural contract. RunConfig.from_dict performs mandatory semantic and hash validation.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "record_type",
+    "schema_version",
+    "run_id",
+    "status",
+    "watermark",
+    "launchable",
+    "model",
+    "condition",
+    "load",
+    "load_role",
+    "entities",
+    "seed",
+    "initialization_seed",
+    "data_seed",
+    "parameter_count",
+    "architecture",
+    "data_rel",
+    "weights_rel",
+    "out_rel",
+    "stream_sha256",
+    "weights_sha256",
+    "stream_commitment_sha256",
+    "weights_commitment_sha256",
+    "freeze_sha256",
+    "selected_mixture",
+    "tokens_per_parameter",
+    "tokens_per_step",
+    "requested_raw_positions",
+    "actual_raw_positions",
+    "steps",
+    "rounding_error_fraction",
+    "packing",
+    "optimizer",
+    "scheduler",
+    "decode_budget",
+    "pair_fingerprint",
+    "config_sha256"
+  ],
+  "properties": {
+    "record_type": {
+      "const": "relational_run_config"
+    },
+    "schema_version": {
+      "const": 1
+    },
+    "run_id": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9._-]*$"
+    },
+    "status": {
+      "enum": [
+        "fixture",
+        "frozen"
+      ]
+    },
+    "watermark": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "launchable": {
+      "type": "boolean"
+    },
+    "model": {
+      "enum": [
+        "d160m",
+        "d360m"
+      ]
+    },
+    "condition": {
+      "enum": [
+        "dense",
+        "split",
+        "random"
+      ]
+    },
+    "load": {
+      "type": "string",
+      "pattern": "^n[0-9]+(?:p[0-9]+)?[km]?$"
+    },
+    "load_role": {
+      "enum": [
+        "low",
+        "high",
+        "confirmation"
+      ]
+    },
+    "entities": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "seed": {
+      "enum": [
+        1001,
+        1002,
+        1003,
+        1004,
+        1005
+      ]
+    },
+    "initialization_seed": {
+      "enum": [
+        1001,
+        1002,
+        1003,
+        1004,
+        1005
+      ]
+    },
+    "data_seed": {
+      "enum": [
+        1001,
+        1002,
+        1003,
+        1004,
+        1005
+      ]
+    },
+    "parameter_count": {
+      "enum": [
+        162220800,
+        356033536
+      ]
+    },
+    "architecture": {
+      "$ref": "#/$defs/Architecture"
+    },
+    "data_rel": {
+      "$ref": "#/$defs/RelativePath"
+    },
+    "weights_rel": {
+      "$ref": "#/$defs/RelativePath"
+    },
+    "out_rel": {
+      "$ref": "#/$defs/RelativePath"
+    },
+    "stream_sha256": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "weights_sha256": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "stream_commitment_sha256": {
+      "$ref": "#/$defs/Sha256"
+    },
+    "weights_commitment_sha256": {
+      "$ref": "#/$defs/Sha256"
+    },
+    "freeze_sha256": {
+      "$ref": "#/$defs/Sha256"
+    },
+    "selected_mixture": {
+      "type": "array",
+      "items": {
+        "type": "number",
+        "minimum": 0,
+        "maximum": 1
+      },
+      "minItems": 3,
+      "maxItems": 3
+    },
+    "tokens_per_parameter": {
+      "enum": [
+        10,
+        20
+      ]
+    },
+    "tokens_per_step": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "requested_raw_positions": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "actual_raw_positions": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "steps": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "rounding_error_fraction": {
+      "type": "number",
+      "minimum": 0,
+      "exclusiveMaximum": 0.0002
+    },
+    "packing": {
+      "const": {
+        "format": "packed-u16-v1",
+        "context_length": 1024,
+        "boundary_policy": "shared-record-boundaries-v1"
+      }
+    },
+    "optimizer": {
+      "const": {
+        "name": "adamw",
+        "lr": 0.0003,
+        "betas": [
+          0.9,
+          0.95
+        ],
+        "epsilon": 1e-08,
+        "weight_decay": 0.1,
+        "gradient_clip": 1.0
+      }
+    },
+    "scheduler": {
+      "const": {
+        "name": "cosine",
+        "warmup_steps": 300,
+        "minimum_learning_rate_fraction": 0.1
+      }
+    },
+    "decode_budget": {
+      "const": 6
+    },
+    "pair_fingerprint": {
+      "$ref": "#/$defs/Sha256"
+    },
+    "config_sha256": {
+      "$ref": "#/$defs/Sha256"
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "status": {
+            "const": "fixture"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "watermark": {
+            "const": "NONLAUNCHABLE_FIXTURE"
+          },
+          "launchable": {
+            "const": false
+          },
+          "stream_sha256": {
+            "type": "null"
+          },
+          "weights_sha256": {
+            "type": "null"
+          }
+        }
+      },
+      "else": {
+        "properties": {
+          "watermark": {
+            "type": "null"
+          },
+          "launchable": {
+            "const": true
+          },
+          "stream_sha256": {
+            "$ref": "#/$defs/Sha256"
+          },
+          "weights_sha256": {
+            "$ref": "#/$defs/Sha256"
+          }
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "Sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "RelativePath": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^(?!/)(?!.*(?:^|/)\\.\\.(?:/|$))(?!.*\\\\)[A-Za-z0-9._/-]+$"
+    },
+    "Architecture": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "n_layer",
+        "n_head",
+        "d_model",
+        "vocab_size",
+        "ctx",
+        "parameter_count"
+      ],
+      "properties": {
+        "n_layer": {
+          "enum": [
+            12,
+            20
+          ]
+        },
+        "n_head": {
+          "enum": [
+            12,
+            16
+          ]
+        },
+        "d_model": {
+          "enum": [
+            768,
+            1024
+          ]
+        },
+        "vocab_size": {
+          "const": 50304
+        },
+        "ctx": {
+          "const": 1024
+        },
+        "parameter_count": {
+          "enum": [
+            162220800,
+            356033536
+          ]
+        }
+      }
+    }
+  }
+}

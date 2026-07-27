@@ -1,0 +1,57 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "ListCorpusBucket",
+      "Effect": "Allow",
+      "Action": ["s3:ListBucket"],
+      "Resource": "arn:aws:s3:::${MS_S3_BUCKET}",
+      "Condition": {
+        "StringLike": {
+          "s3:prefix": [
+            "corpus/84142597cebd96e041d47c7c22dd4b42285b71a213b01265728042cb1a8f6fbb/*",
+            "corpus/84142597cebd96e041d47c7c22dd4b42285b71a213b01265728042cb1a8f6fbb",
+            "packages/*",
+            "runs/*"
+          ]
+        }
+      }
+    },
+    {
+      "Sid": "ReadCorpusObjectsOnly",
+      "Effect": "Allow",
+      "Action": ["s3:GetObject"],
+      "Resource": "arn:aws:s3:::${MS_S3_BUCKET}/corpus/84142597cebd96e041d47c7c22dd4b42285b71a213b01265728042cb1a8f6fbb/*"
+    },
+    {
+      "Sid": "ReadCodePackage",
+      "Effect": "Allow",
+      "Action": ["s3:GetObject", "s3:GetObjectVersion"],
+      "Resource": "arn:aws:s3:::${MS_S3_BUCKET}/packages/*"
+    },
+    {
+      "Sid": "WriteRunOutputsOutsideCorpus",
+      "Effect": "Allow",
+      "Action": ["s3:PutObject", "s3:AbortMultipartUpload"],
+      "Resource": "arn:aws:s3:::${MS_S3_BUCKET}/runs/*"
+    },
+    {
+      "Sid": "NeverMutateCorpus",
+      "Effect": "Deny",
+      "Action": [
+        "s3:PutObject",
+        "s3:DeleteObject",
+        "s3:DeleteObjectVersion",
+        "s3:PutObjectRetention",
+        "s3:BypassGovernanceRetention"
+      ],
+      "Resource": "arn:aws:s3:::${MS_S3_BUCKET}/corpus/*"
+    },
+    {
+      "Sid": "DecryptCorpusKey",
+      "Effect": "Allow",
+      "Action": ["kms:Decrypt", "kms:DescribeKey", "kms:GenerateDataKey"],
+      "Resource": "arn:aws:kms:us-east-1:${AWS_ACCOUNT_ID}:key/0e562bed-fda6-4a2c-9dee-b4c127a99ce3"
+    }
+  ]
+}

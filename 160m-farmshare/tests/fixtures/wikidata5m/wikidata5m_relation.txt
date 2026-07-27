@@ -1,0 +1,4 @@
+P1	head office	HQ
+P2	located in	situated in
+P3	parent organization	parent org
+P10	member of	affiliated with

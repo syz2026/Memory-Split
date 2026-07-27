@@ -1,0 +1,82 @@
+{
+  "arms": [
+    "dense",
+    "split90"
+  ],
+  "cohort_id": "memorysplit-exploratory-v3-135m-aws-n10",
+  "dataset_contract_id": "memorysplit-reasoning-dataset-v3",
+  "model": "d135m",
+  "model_parameters": 134660880,
+  "operators": [
+    {
+      "config_paths": [
+        "configs/135m-v3/dense-s0.yaml",
+        "configs/135m-v3/split90-s0.yaml",
+        "configs/135m-v3/dense-s1.yaml",
+        "configs/135m-v3/split90-s1.yaml",
+        "configs/135m-v3/dense-s2.yaml",
+        "configs/135m-v3/split90-s2.yaml",
+        "configs/135m-v3/dense-s3.yaml",
+        "configs/135m-v3/split90-s3.yaml",
+        "configs/135m-v3/dense-s4.yaml",
+        "configs/135m-v3/split90-s4.yaml",
+        "configs/135m-v3/dense-s5.yaml",
+        "configs/135m-v3/split90-s5.yaml",
+        "configs/135m-v3/dense-s6.yaml",
+        "configs/135m-v3/split90-s6.yaml",
+        "configs/135m-v3/dense-s7.yaml",
+        "configs/135m-v3/split90-s7.yaml",
+        "configs/135m-v3/dense-s8.yaml",
+        "configs/135m-v3/split90-s8.yaml",
+        "configs/135m-v3/dense-s9.yaml",
+        "configs/135m-v3/split90-s9.yaml"
+      ],
+      "id": "aws-operator",
+      "platform": "aws",
+      "provider": "aws-parallelcluster",
+      "seeds": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9
+      ]
+    }
+  ],
+  "provider_seeds": {
+    "aws-parallelcluster": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9
+    ]
+  },
+  "raw_target_tokens": 8169455616,
+  "schema_version": 1,
+  "scientific_scope": "successor_exploratory_unpreregistered",
+  "seeds": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9
+  ],
+  "targets_per_update": 524288,
+  "terminal_updates": 15582
+}

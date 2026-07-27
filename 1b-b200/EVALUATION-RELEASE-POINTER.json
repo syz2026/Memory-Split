@@ -1,0 +1,51 @@
+{
+  "contract_id": "memorysplit-reasoning-v3-eval-v1",
+  "contract_path": "configs/preregistration-135m-reasoning-v3-eval-v1.yaml",
+  "contract_sha256": "b54df204637d6e675e2abd0bb2c417d75e97ed942fa899d79dddc38c85a87881",
+  "evaluator_code_commitments": [
+    {
+      "path": "evals/reasoning_v3/aws_authority.py",
+      "sha256": "47b4f02d98e17be095e36d4bc0efde56307110bbbdde66172e4b87e1a8d7c12b"
+    },
+    {
+      "path": "evals/reasoning_v3/contracts.py",
+      "sha256": "05c3d6a354db97509b4701d34135be668a6d584c737b5d8f1cca959f7d5e55ef"
+    },
+    {
+      "path": "evals/reasoning_v3/generate.py",
+      "sha256": "c7f71d58a2101f6bae0991ef39f175b4ef0439bea5e88fd0af28e128877fc0ee"
+    },
+    {
+      "path": "evals/reasoning_v3/sealing.py",
+      "sha256": "0b61fbc9c865708f8fe2b65f1e62d51e0d88845291f54d177b9d3d6edb340904"
+    }
+  ],
+  "format": "memorysplit-reasoning-v3-eval-release-pointer-v1",
+  "model_visible": {
+    "authorization": "trainer_and_evaluator",
+    "bytes_included": false,
+    "fields": [
+      "item_id",
+      "task",
+      "source_index",
+      "prompt",
+      "max_new_tokens",
+      "scorer_id"
+    ],
+    "publication_prefix": "evaluations/reasoning-v3/v1/model-visible/",
+    "release_format": "memorysplit-reasoning-v3-eval-release-v1"
+  },
+  "schema_version": 1,
+  "sealed_gold": {
+    "authorization": "evaluator_only",
+    "bytes_included": false,
+    "publication_prefix": "evaluations/reasoning-v3/v1/evaluator-only/",
+    "withheld_fields": [
+      "item_id",
+      "task",
+      "source_index",
+      "canonical_answer",
+      "oracle_replay"
+    ]
+  }
+}

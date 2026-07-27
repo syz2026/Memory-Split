@@ -1,0 +1,126 @@
+{
+ "arm": "split90",
+ "checkpoint": "/mnt/nvme/runs/1b-v3/d1b_split90_reasoning_v3_s0/snapshots/step0003896.pt",
+ "exact_match": 0.066685,
+ "macro_exact_match": 0.066685,
+ "n_items": 7168,
+ "per_task": {
+  "base_conversion": {
+   "correct": 0,
+   "exact_match": 0.0,
+   "n": 512,
+   "token_acc_den": 3384,
+   "token_acc_num": 79,
+   "token_accuracy": 0.023345
+  },
+  "binary_matrix": {
+   "correct": 0,
+   "exact_match": 0.0,
+   "n": 512,
+   "token_acc_den": 80230,
+   "token_acc_num": 36415,
+   "token_accuracy": 0.453883
+  },
+  "count_primes": {
+   "correct": 0,
+   "exact_match": 0.0,
+   "n": 512,
+   "token_acc_den": 901,
+   "token_acc_num": 6,
+   "token_accuracy": 0.006659
+  },
+  "course_schedule": {
+   "correct": 250,
+   "exact_match": 0.488281,
+   "n": 512,
+   "token_acc_den": 512,
+   "token_acc_num": 250,
+   "token_accuracy": 0.488281
+  },
+  "dice": {
+   "correct": 0,
+   "exact_match": 0.0,
+   "n": 512,
+   "token_acc_den": 4303,
+   "token_acc_num": 90,
+   "token_accuracy": 0.020916
+  },
+  "futoshiki": {
+   "correct": 0,
+   "exact_match": 0.0,
+   "n": 512,
+   "token_acc_den": 42575,
+   "token_acc_num": 28439,
+   "token_accuracy": 0.667974
+  },
+  "largest_island": {
+   "correct": 0,
+   "exact_match": 0.0,
+   "n": 512,
+   "token_acc_den": 512,
+   "token_acc_num": 0,
+   "token_accuracy": 0.0
+  },
+  "path_star": {
+   "correct": 0,
+   "exact_match": 0.0,
+   "n": 512,
+   "token_acc_den": 14406,
+   "token_acc_num": 9340,
+   "token_accuracy": 0.648341
+  },
+  "prime_factorization": {
+   "correct": 0,
+   "exact_match": 0.0,
+   "n": 512,
+   "token_acc_den": 4225,
+   "token_acc_num": 1506,
+   "token_accuracy": 0.35645
+  },
+  "ransom_note": {
+   "correct": 228,
+   "exact_match": 0.445312,
+   "n": 512,
+   "token_acc_den": 512,
+   "token_acc_num": 228,
+   "token_accuracy": 0.445312
+  },
+  "rotate_matrix": {
+   "correct": 0,
+   "exact_match": 0.0,
+   "n": 512,
+   "token_acc_den": 46482,
+   "token_acc_num": 7158,
+   "token_accuracy": 0.153995
+  },
+  "rotten_oranges": {
+   "correct": 0,
+   "exact_match": 0.0,
+   "n": 512,
+   "token_acc_den": 565,
+   "token_acc_num": 53,
+   "token_accuracy": 0.093805
+  },
+  "spiral_matrix": {
+   "correct": 0,
+   "exact_match": 0.0,
+   "n": 512,
+   "token_acc_den": 73751,
+   "token_acc_num": 15239,
+   "token_accuracy": 0.206628
+  },
+  "string_splitting": {
+   "correct": 0,
+   "exact_match": 0.0,
+   "n": 512,
+   "token_acc_den": 3077,
+   "token_acc_num": 124,
+   "token_accuracy": 0.040299
+  }
+ },
+ "run_id": "d1b_split90_reasoning_v3_s0",
+ "scoring": "teacher_forced_greedy_agreement",
+ "seconds": 102.4,
+ "seed": 0,
+ "step": 3896
+}

@@ -1,0 +1,51 @@
+{
+  "run": "d160m_split_n200k_s0_gate",
+  "arm": "split",
+  "ckpt": "ckpt.pt",
+  "igsm": {
+    "acc": 0.056,
+    "n": 1500,
+    "lookup_stats": {
+      "n_lookups": 0,
+      "n_hits": 0,
+      "n_misses": 0,
+      "n_malformed": 0
+    }
+  },
+  "deduction": {
+    "acc": 0.5313333333333333,
+    "n": 1500,
+    "lookup_stats": {
+      "n_lookups": 0,
+      "n_hits": 0,
+      "n_misses": 0,
+      "n_malformed": 0
+    }
+  },
+  "factqa": {
+    "acc": 0.5813333333333334,
+    "n": 1500,
+    "lookup_stats": {
+      "n_lookups": 3846,
+      "n_hits": 3733,
+      "n_misses": 113,
+      "n_malformed": 0
+    }
+  },
+  "factqa_fresh": {
+    "acc": 0.996,
+    "n": 500,
+    "lookup_stats": {
+      "n_lookups": 505,
+      "n_hits": 504,
+      "n_misses": 1,
+      "n_malformed": 0
+    }
+  },
+  "recall": {
+    "on": 0.994,
+    "off": 0.0
+  },
+  "bits_in_weights": 0.0,
+  "composite_knowledge_free": 0.2936666666666667
+}

@@ -1,0 +1,12 @@
+device: cpu seed: 0
+[eval] A (constrained=False): heldout full_key=0.000 name_half=0.000 relation_half=0.960 answer=0.021
+[eval] B (constrained=True): heldout full_key=0.243 name_half=0.244 relation_half=0.972 answer=0.262
+[eval] C (constrained=False): heldout full_key=0.002 name_half=0.002 relation_half=0.942 answer=0.021
+[eval] D (constrained=True): heldout full_key=0.236 name_half=0.246 relation_half=0.941 answer=0.257
+
+heldout split (pct [lo,hi]):
+arm                 full_key               name_half           relation_half                  answer          no_lookup_rate   wrong_in_context_rate
+A           0.0 [ 0.0, 0.6]         0.0 [ 0.0, 0.6]        96.0 [94.2,97.3]         2.1 [ 1.3, 3.6]         1.0 [ 0.5, 2.1]         5.4 [ 3.9, 7.5]
+B          24.3 [21.0,27.8]        24.4 [21.2,28.0]        97.2 [95.6,98.2]        26.2 [22.9,29.9]         1.0 [ 0.5, 2.1]        74.6 [71.0,77.9]
+C           0.2 [ 0.0, 0.9]         0.2 [ 0.0, 0.9]        94.2 [92.1,95.8]         2.1 [ 1.3, 3.6]         2.1 [ 1.3, 3.6]         4.0 [ 2.7, 5.8]
+D          23.6 [20.4,27.1]        24.6 [21.3,28.2]        94.1 [91.9,95.7]        25.7 [22.4,29.4]         2.1 [ 1.3, 3.6]        73.3 [69.6,76.6]

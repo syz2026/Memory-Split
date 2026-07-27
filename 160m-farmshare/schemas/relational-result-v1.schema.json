@@ -1,0 +1,1295 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://memorysplit.invalid/schemas/relational-result-v1.schema.json",
+  "title": "MemorySplit relational result v1",
+  "description": "Structural contract only. Every producer and consumer MUST invoke the matching Python semantic validator (EvalRow.from_dict, CheckpointSummary.from_dict, or GuardrailReport.from_dict) after schema validation.",
+  "oneOf": [
+    {
+      "$ref": "#/$defs/EvalRow"
+    },
+    {
+      "$ref": "#/$defs/CheckpointSummary"
+    },
+    {
+      "$ref": "#/$defs/GuardrailReport"
+    }
+  ],
+  "$defs": {
+    "Sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "Address": {
+      "type": "array",
+      "prefixItems": [
+        {
+          "type": "integer",
+          "minimum": 0
+        },
+        {
+          "type": "string",
+          "minLength": 1
+        },
+        {
+          "enum": [
+            "out",
+            "in"
+          ]
+        }
+      ],
+      "minItems": 3,
+      "maxItems": 3
+    },
+    "Action": {
+      "type": "array",
+      "prefixItems": [
+        {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 3
+        },
+        {
+          "type": "string",
+          "minLength": 1
+        },
+        {
+          "enum": [
+            "out",
+            "in"
+          ]
+        },
+        {
+          "type": "boolean"
+        },
+        {
+          "type": "boolean"
+        }
+      ],
+      "minItems": 5,
+      "maxItems": 5,
+      "not": {
+        "prefixItems": [
+          {},
+          {},
+          {},
+          {
+            "const": true
+          },
+          {
+            "const": true
+          }
+        ]
+      }
+    },
+    "Rate": {
+      "type": "object",
+      "description": "The Python semantic validator additionally enforces numerator <= denominator and value == numerator / denominator.",
+      "additionalProperties": false,
+      "required": [
+        "value",
+        "numerator",
+        "denominator"
+      ],
+      "properties": {
+        "value": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "minimum": 0,
+          "maximum": 1
+        },
+        "numerator": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "denominator": {
+          "type": "integer",
+          "minimum": 0
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "denominator": {
+                "const": 0
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "value": {
+                "type": "null"
+              },
+              "numerator": {
+                "const": 0
+              }
+            }
+          },
+          "else": {
+            "properties": {
+              "value": {
+                "type": "number"
+              },
+              "denominator": {
+                "minimum": 1
+              }
+            }
+          }
+        }
+      ]
+    },
+    "SliceMetrics": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "item_accuracy",
+        "pair_accuracy",
+        "exact_action_path"
+      ],
+      "properties": {
+        "item_accuracy": {
+          "$ref": "#/$defs/Rate"
+        },
+        "pair_accuracy": {
+          "$ref": "#/$defs/Rate"
+        },
+        "exact_action_path": {
+          "$ref": "#/$defs/Rate"
+        }
+      }
+    },
+    "PerHopMetrics": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "relation",
+        "direction",
+        "action",
+        "referent"
+      ],
+      "properties": {
+        "relation": {
+          "$ref": "#/$defs/Rate"
+        },
+        "direction": {
+          "$ref": "#/$defs/Rate"
+        },
+        "action": {
+          "$ref": "#/$defs/Rate"
+        },
+        "referent": {
+          "$ref": "#/$defs/Rate"
+        }
+      }
+    },
+    "CheckpointMetrics": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "item_accuracy",
+        "pair_accuracy",
+        "all_six_action_exact",
+        "exact_action_path",
+        "answer_given_correct_retrieval",
+        "gold_path_answer_accuracy",
+        "malformed_rate",
+        "miss_rate",
+        "abstention_rate",
+        "excess_read_rate",
+        "per_hop",
+        "by_hop",
+        "by_composition",
+        "by_task",
+        "store",
+        "edit_locality",
+        "milestone_crossings"
+      ],
+      "properties": {
+        "item_accuracy": {
+          "$ref": "#/$defs/Rate"
+        },
+        "pair_accuracy": {
+          "$ref": "#/$defs/Rate"
+        },
+        "all_six_action_exact": {
+          "$ref": "#/$defs/Rate"
+        },
+        "exact_action_path": {
+          "$ref": "#/$defs/Rate"
+        },
+        "answer_given_correct_retrieval": {
+          "$ref": "#/$defs/Rate"
+        },
+        "gold_path_answer_accuracy": {
+          "$ref": "#/$defs/Rate"
+        },
+        "malformed_rate": {
+          "$ref": "#/$defs/Rate"
+        },
+        "miss_rate": {
+          "$ref": "#/$defs/Rate"
+        },
+        "abstention_rate": {
+          "$ref": "#/$defs/Rate"
+        },
+        "excess_read_rate": {
+          "$ref": "#/$defs/Rate"
+        },
+        "per_hop": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "1",
+            "2",
+            "3",
+            "4",
+            "5",
+            "6"
+          ],
+          "properties": {
+            "1": {
+              "$ref": "#/$defs/PerHopMetrics"
+            },
+            "2": {
+              "$ref": "#/$defs/PerHopMetrics"
+            },
+            "3": {
+              "$ref": "#/$defs/PerHopMetrics"
+            },
+            "4": {
+              "$ref": "#/$defs/PerHopMetrics"
+            },
+            "5": {
+              "$ref": "#/$defs/PerHopMetrics"
+            },
+            "6": {
+              "$ref": "#/$defs/PerHopMetrics"
+            }
+          }
+        },
+        "by_hop": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "1",
+            "2",
+            "3",
+            "4",
+            "5",
+            "6"
+          ],
+          "properties": {
+            "1": {
+              "$ref": "#/$defs/SliceMetrics"
+            },
+            "2": {
+              "$ref": "#/$defs/SliceMetrics"
+            },
+            "3": {
+              "$ref": "#/$defs/SliceMetrics"
+            },
+            "4": {
+              "$ref": "#/$defs/SliceMetrics"
+            },
+            "5": {
+              "$ref": "#/$defs/SliceMetrics"
+            },
+            "6": {
+              "$ref": "#/$defs/SliceMetrics"
+            }
+          }
+        },
+        "by_composition": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "seen",
+            "heldout"
+          ],
+          "properties": {
+            "seen": {
+              "$ref": "#/$defs/SliceMetrics"
+            },
+            "heldout": {
+              "$ref": "#/$defs/SliceMetrics"
+            }
+          }
+        },
+        "by_task": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "path_composition",
+            "date_ordering",
+            "balanced_equality"
+          ],
+          "properties": {
+            "path_composition": {
+              "$ref": "#/$defs/SliceMetrics"
+            },
+            "date_ordering": {
+              "$ref": "#/$defs/SliceMetrics"
+            },
+            "balanced_equality": {
+              "$ref": "#/$defs/SliceMetrics"
+            }
+          }
+        },
+        "store": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "rows",
+            "bytes",
+            "lookup_latency_ns",
+            "lookup_count"
+          ],
+          "properties": {
+            "rows": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "bytes": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "lookup_latency_ns": {
+              "type": [
+                "number",
+                "null"
+              ],
+              "minimum": 0
+            },
+            "lookup_count": {
+              "type": "integer",
+              "minimum": 0
+            }
+          }
+        },
+        "edit_locality": {
+          "$ref": "#/$defs/Rate"
+        },
+        "milestone_crossings": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "path_composition_pair_accuracy_0.75",
+            "date_ordering_pair_accuracy_0.75",
+            "balanced_equality_pair_accuracy_0.75"
+          ],
+          "properties": {
+            "path_composition_pair_accuracy_0.75": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "minimum": 0
+            },
+            "date_ordering_pair_accuracy_0.75": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "minimum": 0
+            },
+            "balanced_equality_pair_accuracy_0.75": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "minimum": 0
+            }
+          }
+        }
+      }
+    },
+    "EvalRow": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "record_type",
+        "schema_version",
+        "qid",
+        "pair_id",
+        "variant",
+        "task",
+        "world_id",
+        "provenance_id",
+        "relation_path_hash",
+        "template_id",
+        "composition_split",
+        "hop",
+        "seed",
+        "model_id",
+        "arm",
+        "checkpoint_sha256",
+        "raw_token_count",
+        "memory_mode",
+        "control_id",
+        "evaluator_sha256",
+        "data_sha256",
+        "relation_schema_sha256",
+        "configuration_sha256",
+        "result_schema_sha256",
+        "provenance_sha256",
+        "cluster_id",
+        "prediction",
+        "answer",
+        "correct",
+        "prediction_source",
+        "all_actions",
+        "gold_all_actions",
+        "returned_addresses",
+        "gold_addresses",
+        "correct_referents",
+        "misses",
+        "malformed",
+        "abstained",
+        "excess_reads",
+        "halt_step",
+        "answer_logits",
+        "lookup_latency_ns",
+        "lookup_count",
+        "store_rows",
+        "store_bytes",
+        "control_seed",
+        "transformation_id",
+        "source_store_sha256",
+        "transformed_store_sha256",
+        "transformation_metadata_sha256",
+        "changed_addresses",
+        "oracle_before",
+        "oracle_after",
+        "oracle_effect",
+        "edit_locality_correct"
+      ],
+      "properties": {
+        "record_type": {
+          "const": "eval_row"
+        },
+        "schema_version": {
+          "const": 1
+        },
+        "qid": {
+          "type": "string",
+          "minLength": 1
+        },
+        "pair_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "variant": {
+          "enum": [
+            "original",
+            "counterfactual"
+          ]
+        },
+        "task": {
+          "enum": [
+            "path_composition",
+            "date_ordering",
+            "balanced_equality",
+            "factual_recall"
+          ]
+        },
+        "world_id": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "provenance_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "relation_path_hash": {
+          "$ref": "#/$defs/Sha256"
+        },
+        "template_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "composition_split": {
+          "enum": [
+            "seen",
+            "heldout"
+          ]
+        },
+        "hop": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 6
+        },
+        "seed": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "model_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "arm": {
+          "enum": [
+            "dense",
+            "split",
+            "random",
+            "selective"
+          ]
+        },
+        "checkpoint_sha256": {
+          "$ref": "#/$defs/Sha256"
+        },
+        "raw_token_count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "memory_mode": {
+          "enum": [
+            "memory_off",
+            "memory_on"
+          ]
+        },
+        "control_id": {
+          "enum": [
+            "correct",
+            "shuffled_returns",
+            "relevant_edge",
+            "irrelevant_edge",
+            "gold_path",
+            "gold_returns",
+            "no_query",
+            "explicit_miss",
+            "handle_swap",
+            "entity_rename",
+            "graph_isomorphism"
+          ]
+        },
+        "evaluator_sha256": {
+          "$ref": "#/$defs/Sha256"
+        },
+        "data_sha256": {
+          "$ref": "#/$defs/Sha256"
+        },
+        "relation_schema_sha256": {
+          "$ref": "#/$defs/Sha256"
+        },
+        "configuration_sha256": {
+          "$ref": "#/$defs/Sha256"
+        },
+        "result_schema_sha256": {
+          "$ref": "#/$defs/Sha256"
+        },
+        "provenance_sha256": {
+          "allOf": [
+            {
+              "$ref": "#/$defs/Sha256"
+            }
+          ],
+          "description": "Arm-specific result provenance over the full condition configuration, evaluator, data, relation schema, and result schema."
+        },
+        "cluster_id": {
+          "$ref": "#/$defs/Sha256"
+        },
+        "prediction": {
+          "type": "string"
+        },
+        "answer": {
+          "type": "string"
+        },
+        "correct": {
+          "type": "boolean"
+        },
+        "prediction_source": {
+          "const": "model"
+        },
+        "all_actions": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Action"
+          },
+          "minItems": 6,
+          "maxItems": 6
+        },
+        "gold_all_actions": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Action"
+          },
+          "minItems": 6,
+          "maxItems": 6
+        },
+        "returned_addresses": {
+          "type": "array",
+          "items": {
+            "oneOf": [
+              {
+                "$ref": "#/$defs/Address"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "minItems": 6,
+          "maxItems": 6
+        },
+        "gold_addresses": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Address"
+          },
+          "minItems": 1,
+          "maxItems": 6
+        },
+        "correct_referents": {
+          "type": "array",
+          "items": {
+            "type": "boolean"
+          },
+          "minItems": 1,
+          "maxItems": 6
+        },
+        "misses": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 6
+        },
+        "malformed": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 6
+        },
+        "abstained": {
+          "type": "boolean"
+        },
+        "excess_reads": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 6
+        },
+        "halt_step": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 1,
+          "maximum": 6
+        },
+        "answer_logits": {
+          "type": "array",
+          "items": {
+            "type": "array",
+            "items": {
+              "type": "number"
+            },
+            "minItems": 1
+          },
+          "minItems": 6,
+          "maxItems": 6
+        },
+        "lookup_latency_ns": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "lookup_count": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 6
+        },
+        "store_rows": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "store_bytes": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "control_seed": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "transformation_id": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/Sha256"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "source_store_sha256": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/Sha256"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "transformed_store_sha256": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/Sha256"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "transformation_metadata_sha256": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/Sha256"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "changed_addresses": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Address"
+          },
+          "uniqueItems": true
+        },
+        "oracle_before": {
+          "type": "string",
+          "minLength": 1
+        },
+        "oracle_after": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "minLength": 1
+        },
+        "oracle_effect": {
+          "enum": [
+            "unchanged",
+            "changed",
+            "miss"
+          ]
+        },
+        "edit_locality_correct": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        }
+      }
+    },
+    "CheckpointSummary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "record_type",
+        "schema_version",
+        "checkpoint_sha256",
+        "model_id",
+        "arm",
+        "seed",
+        "raw_token_count",
+        "memory_mode",
+        "control_id",
+        "evaluator_sha256",
+        "data_sha256",
+        "relation_schema_sha256",
+        "configuration_sha256",
+        "result_schema_sha256",
+        "provenance_sha256",
+        "rows_sha256",
+        "n_rows",
+        "n_pairs",
+        "metrics"
+      ],
+      "properties": {
+        "record_type": {
+          "const": "checkpoint_summary"
+        },
+        "schema_version": {
+          "const": 1
+        },
+        "checkpoint_sha256": {
+          "$ref": "#/$defs/Sha256"
+        },
+        "model_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "arm": {
+          "enum": [
+            "dense",
+            "split",
+            "random",
+            "selective"
+          ]
+        },
+        "seed": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "raw_token_count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "memory_mode": {
+          "enum": [
+            "memory_off",
+            "memory_on"
+          ]
+        },
+        "control_id": {
+          "enum": [
+            "correct",
+            "shuffled_returns",
+            "relevant_edge",
+            "irrelevant_edge",
+            "gold_path",
+            "gold_returns",
+            "no_query",
+            "explicit_miss",
+            "handle_swap",
+            "entity_rename",
+            "graph_isomorphism"
+          ]
+        },
+        "evaluator_sha256": {
+          "$ref": "#/$defs/Sha256"
+        },
+        "data_sha256": {
+          "$ref": "#/$defs/Sha256"
+        },
+        "relation_schema_sha256": {
+          "$ref": "#/$defs/Sha256"
+        },
+        "configuration_sha256": {
+          "$ref": "#/$defs/Sha256"
+        },
+        "result_schema_sha256": {
+          "$ref": "#/$defs/Sha256"
+        },
+        "provenance_sha256": {
+          "allOf": [
+            {
+              "$ref": "#/$defs/Sha256"
+            }
+          ],
+          "description": "Arm-specific result provenance over the full condition configuration, evaluator, data, relation schema, and result schema."
+        },
+        "rows_sha256": {
+          "$ref": "#/$defs/Sha256"
+        },
+        "n_rows": {
+          "type": "integer",
+          "minimum": 2
+        },
+        "n_pairs": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "metrics": {
+          "$ref": "#/$defs/CheckpointMetrics"
+        }
+      }
+    },
+    "GuardCheck": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "check_id",
+        "value",
+        "reference_value",
+        "threshold",
+        "comparison",
+        "passed",
+        "numerator",
+        "denominator"
+      ],
+      "properties": {
+        "check_id": {
+          "type": "string",
+          "enum": [
+            "split_on_recall_floor",
+            "split_on_recall_noninferiority",
+            "split_off_recall",
+            "split_off_recognition_wilson_hi",
+            "split_off_first_hop",
+            "gold_return_path_noninferiority",
+            "rule_noninferiority",
+            "bpb_noninferiority",
+            "integrity_conjunction"
+          ]
+        },
+        "value": {
+          "type": [
+            "number",
+            "boolean"
+          ]
+        },
+        "reference_value": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "threshold": {
+          "type": [
+            "number",
+            "boolean"
+          ]
+        },
+        "comparison": {
+          "enum": [
+            "<",
+            "<=",
+            ">=",
+            "=="
+          ]
+        },
+        "passed": {
+          "type": "boolean"
+        },
+        "numerator": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "denominator": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 1
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "check_id": {
+                "const": "split_on_recall_floor"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "comparison": {
+                "const": ">="
+              },
+              "threshold": {
+                "const": 0.95
+              },
+              "reference_value": {
+                "type": "null"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "check_id": {
+                "const": "split_off_recall"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "comparison": {
+                "const": "<"
+              },
+              "threshold": {
+                "const": 0.05
+              },
+              "reference_value": {
+                "type": "null"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "check_id": {
+                "const": "split_off_recognition_wilson_hi"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "comparison": {
+                "const": "<"
+              },
+              "threshold": {
+                "const": 0.3
+              },
+              "reference_value": {
+                "type": "null"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "check_id": {
+                "const": "split_off_first_hop"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "comparison": {
+                "const": ">="
+              },
+              "threshold": {
+                "const": 0.75
+              },
+              "reference_value": {
+                "type": "null"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "check_id": {
+                "enum": [
+                  "split_on_recall_noninferiority",
+                  "gold_return_path_noninferiority",
+                  "rule_noninferiority"
+                ]
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "comparison": {
+                "const": ">="
+              },
+              "reference_value": {
+                "type": "number"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "check_id": {
+                "const": "bpb_noninferiority"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "comparison": {
+                "const": "<="
+              },
+              "reference_value": {
+                "type": "number"
+              },
+              "numerator": {
+                "type": "null"
+              },
+              "denominator": {
+                "type": "null"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "check_id": {
+                "const": "integrity_conjunction"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "value": {
+                "type": "boolean"
+              },
+              "reference_value": {
+                "type": "null"
+              },
+              "threshold": {
+                "const": true
+              },
+              "comparison": {
+                "const": "=="
+              },
+              "numerator": {
+                "type": "null"
+              },
+              "denominator": {
+                "type": "null"
+              }
+            }
+          }
+        }
+      ]
+    },
+    "Guard": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "passed",
+        "checks"
+      ],
+      "properties": {
+        "passed": {
+          "type": "boolean"
+        },
+        "checks": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/GuardCheck"
+          },
+          "minItems": 1
+        }
+      }
+    },
+    "GuardrailReport": {
+      "type": "object",
+      "description": "The Python semantic validator additionally enforces exact check placement, measured/count arithmetic, Wilson recomputation, each guard conjunction, and the six-guard confirmatory conjunction. Split and Dense configuration/result provenance hashes are arm-specific and distinct; study_provenance_sha256 is derived from the pairing receipt's genuinely shared training, evaluation, schema, and frozen-study identities.",
+      "additionalProperties": false,
+      "required": [
+        "record_type",
+        "schema_version",
+        "split_checkpoint_sha256",
+        "dense_checkpoint_sha256",
+        "model_id",
+        "seed",
+        "raw_token_count",
+        "evaluator_sha256",
+        "data_sha256",
+        "relation_schema_sha256",
+        "split_configuration_sha256",
+        "dense_configuration_sha256",
+        "result_schema_sha256",
+        "split_result_provenance_sha256",
+        "dense_result_provenance_sha256",
+        "study_provenance_sha256",
+        "pairing_receipt_sha256",
+        "split_guardrail_source_sha256",
+        "dense_guardrail_source_sha256",
+        "split_matrix_manifest_sha256",
+        "dense_matrix_manifest_sha256",
+        "guards",
+        "confirmatory_passed"
+      ],
+      "properties": {
+        "record_type": {
+          "const": "guardrail_report"
+        },
+        "schema_version": {
+          "const": 1
+        },
+        "split_checkpoint_sha256": {
+          "$ref": "#/$defs/Sha256"
+        },
+        "dense_checkpoint_sha256": {
+          "$ref": "#/$defs/Sha256"
+        },
+        "model_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "seed": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "raw_token_count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "evaluator_sha256": {
+          "$ref": "#/$defs/Sha256"
+        },
+        "data_sha256": {
+          "$ref": "#/$defs/Sha256"
+        },
+        "relation_schema_sha256": {
+          "$ref": "#/$defs/Sha256"
+        },
+        "split_configuration_sha256": {
+          "$ref": "#/$defs/Sha256"
+        },
+        "dense_configuration_sha256": {
+          "$ref": "#/$defs/Sha256"
+        },
+        "result_schema_sha256": {
+          "$ref": "#/$defs/Sha256"
+        },
+        "split_result_provenance_sha256": {
+          "$ref": "#/$defs/Sha256"
+        },
+        "dense_result_provenance_sha256": {
+          "$ref": "#/$defs/Sha256"
+        },
+        "study_provenance_sha256": {
+          "$ref": "#/$defs/Sha256"
+        },
+        "pairing_receipt_sha256": {
+          "$ref": "#/$defs/Sha256"
+        },
+        "split_guardrail_source_sha256": {
+          "$ref": "#/$defs/Sha256"
+        },
+        "dense_guardrail_source_sha256": {
+          "$ref": "#/$defs/Sha256"
+        },
+        "split_matrix_manifest_sha256": {
+          "$ref": "#/$defs/Sha256"
+        },
+        "dense_matrix_manifest_sha256": {
+          "$ref": "#/$defs/Sha256"
+        },
+        "guards": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "factual_job",
+            "split_off_leakage",
+            "retrieval_procedure",
+            "relation_rule",
+            "natural_text",
+            "instrument_integrity"
+          ],
+          "properties": {
+            "factual_job": {
+              "$ref": "#/$defs/Guard"
+            },
+            "split_off_leakage": {
+              "$ref": "#/$defs/Guard"
+            },
+            "retrieval_procedure": {
+              "$ref": "#/$defs/Guard"
+            },
+            "relation_rule": {
+              "$ref": "#/$defs/Guard"
+            },
+            "natural_text": {
+              "$ref": "#/$defs/Guard"
+            },
+            "instrument_integrity": {
+              "$ref": "#/$defs/Guard"
+            }
+          }
+        },
+        "confirmatory_passed": {
+          "type": "boolean"
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,254 @@
+schema_version: 1
+contract_status: frozen
+contract_id: memorysplit-reasoning-v3-eval-v1
+scientific_scope: prospectively_frozen_exploratory_n10
+corpus:
+  contract_id: memorysplit-reasoning-dataset-v3
+  raw_target_tokens: 8169455616
+  receipt:
+    path: extension/receipt.json
+    sha256: b1eabb1719f66876ab54cc0791b857ccdbbbddb0ffb8c5986ac2aaa7bf33b80d
+  frozen_lock:
+    path: artifacts/reasoning-corpus-v3/FROZEN.json
+    sha256: dd4f5083c90dd4b75e9b3c2da4db34c7f6299c7b845d15f960a13a3f9f3e849f
+  recipe:
+    path: configs/reasoning-dataset-v3.json
+    sha256: 276c0f85e2551af5df66b866b2c424118e7a8ddbf9efe2eff805196ba4d60a2f
+  transfer_manifest:
+    path: cluster/aws/reasoning-v3-corpus-manifest.json
+    sha256: 84142597cebd96e041d47c7c22dd4b42285b71a213b01265728042cb1a8f6fbb
+  record_manifest:
+    path: extension/records/manifest.bin
+    sha256: 558b70fd0ad55ba2bf91b1efeea1b49583c9fe3d0286c71571fa868686a8acc8
+source:
+  repository_commit: 4fbdd59860198f2ccc623dc2cdd1aeb5af254afa
+  repository_tree: a6f4f51213acaf57f63371e878c247e0179c345e
+  reasoning_gym_version: 0.1.19
+  source_stage_receipt:
+    path: source-stage-receipt.json
+    sha256: ba83813d73ebccd4812c8297be58176efca8f9e36368dfa04058408fd658ea0c
+  staged_relative_path: objective_auxiliary/reasoning_gym_exact_answer/reasoning_gym
+  runtime_lock:
+    byteorder: little
+    python_cache_tag: cpython-312
+    python_hash_seed: "0"
+    python_implementation: CPython
+    python_version: 3.12.3
+    tiktoken_version: 0.13.0
+    tokenizer_sha256: 96edc08ae20a0e7d545d3fab086eefe17e9908db6c8722085ff2521074c54126
+authority:
+  activation_key: evaluations/reasoning-v3/v1/activation/ACTIVE.json
+  authority_record_key: evaluations/reasoning-v3/v1/authority/contract-authority.json
+  authority_signature_key: evaluations/reasoning-v3/v1/authority/contract-authority.signature.json
+  aws_boundary_path: configs/preregistration-135m-reasoning-v3-eval-v1-aws-boundary.json
+  aws_boundary_sha256: 7660616406f1985b4d2506bb0cb58af8f25b5e1085fd8ca4f597503cfd5ba903
+  aws_region: us-east-1
+  evaluator_role_arn: arn:aws:iam::${AWS_ACCOUNT_ID}:role/memorysplit-reasoning-v3-evaluator
+  sealed_gold_kms_key_alias: alias/memorysplit-reasoning-v3-evaluator-sealed-v1
+  signer_key_alias: alias/memorysplit-reasoning-v3-evaluator-v1
+  storage_bucket: ${MS_S3_BUCKET}
+  storage_prefix: evaluations/reasoning-v3/v1
+generation:
+  family_order:
+    - course_schedule
+    - binary_matrix
+    - rotten_oranges
+    - futoshiki
+    - ransom_note
+    - dice
+    - string_splitting
+    - path_star
+    - largest_island
+    - rotate_matrix
+    - spiral_matrix
+    - prime_factorization
+    - base_conversion
+    - count_primes
+  accepted_items_per_family: 512
+  index_base: 2000000000
+  index_window_size: 10000
+  max_record_tokens: 1024
+  skip_reasons:
+    - independent_oracle
+    - overlength
+families:
+  - task: course_schedule
+    module: graphs.course_schedule
+    config:
+      max_cycle_length: 7
+      max_num_courses: 18
+      max_num_prerequisites: 3
+      min_cycle_length: 3
+      min_num_courses: 10
+      min_num_prerequisites: 1
+      p_solvable: 0.5
+    index_start: 2000000000
+    index_stop: 2000010000
+    max_new_tokens: 8
+  - task: binary_matrix
+    module: algorithmic.binary_matrix
+    config:
+      max_n: 14
+      min_n: 10
+      p_zero: 0.15
+    index_start: 2000010000
+    index_stop: 2000020000
+    max_new_tokens: 512
+  - task: rotten_oranges
+    module: algorithmic.rotten_oranges
+    config:
+      max_n: 18
+      min_n: 12
+      p_oranges: 0.9
+      p_rotten: 0.06
+    index_start: 2000020000
+    index_stop: 2000030000
+    max_new_tokens: 16
+  - task: futoshiki
+    module: games.futoshiki
+    config:
+      max_board_size: 4
+      max_difficulty: 3
+      min_board_size: 4
+      min_difficulty: 2
+    index_start: 2000030000
+    index_stop: 2000040000
+    max_new_tokens: 128
+  - task: ransom_note
+    module: algorithmic.ransom_note
+    config:
+      max_magazine_length: 200
+      max_note_length: 80
+      min_magazine_length: 81
+      min_note_length: 20
+      p_solvable: 0.5
+    index_start: 2000040000
+    index_stop: 2000050000
+    max_new_tokens: 8
+  - task: dice
+    module: arithmetic.dice
+    config:
+      max_dice_size: 50
+      num_dice: 7
+    index_start: 2000050000
+    index_stop: 2000060000
+    max_new_tokens: 32
+  - task: string_splitting
+    module: algorithmic.string_splitting
+    config:
+      max_initial_machines: 300
+      max_iterations: 1050
+      min_initial_machines: 20
+    index_start: 2000060000
+    index_stop: 2000070000
+    max_new_tokens: 32
+  - task: path_star
+    module: graphs.path_star
+    config:
+      degree: 4
+      max_path_length: 8
+      min_path_length: 4
+      node_range: 1000000000
+      reversed: false
+    index_start: 2000070000
+    index_stop: 2000080000
+    max_new_tokens: 128
+  - task: largest_island
+    module: graphs.largest_island
+    config:
+      max_cols: 18
+      max_island_size: 20
+      max_num_islands: 8
+      max_rows: 18
+      min_cols: 12
+      min_island_size: 4
+      min_num_islands: 3
+      min_rows: 12
+    index_start: 2000080000
+    index_stop: 2000090000
+    max_new_tokens: 16
+  - task: rotate_matrix
+    module: algorithmic.rotate_matrix
+    config:
+      max_n: 10
+      max_rotations: 3
+      min_n: 8
+      min_rotations: 1
+    index_start: 2000090000
+    index_stop: 2000100000
+    max_new_tokens: 512
+  - task: spiral_matrix
+    module: algorithmic.spiral_matrix
+    config:
+      max_n: 16
+      min_n: 8
+    index_start: 2000100000
+    index_stop: 2000110000
+    max_new_tokens: 512
+  - task: prime_factorization
+    module: arithmetic.prime_factorization
+    config:
+      max_value: 50000000
+      min_value: 100000
+    index_start: 2000110000
+    index_stop: 2000120000
+    max_new_tokens: 128
+  - task: base_conversion
+    module: algorithmic.base_conversion
+    config:
+      max_base: 36
+      max_value: 1000000000000
+      min_base: 2
+      min_value: 0
+    index_start: 2000120000
+    index_stop: 2000130000
+    max_new_tokens: 64
+  - task: count_primes
+    module: algorithmic.count_primes
+    config:
+      max_n: 100000
+      min_n: 1000
+    index_start: 2000130000
+    index_stop: 2000140000
+    max_new_tokens: 16
+decoding:
+  strategy: greedy
+  temperature: 0
+  stop_token: <|eot|>
+  prompt_suffix: "Answer:"
+  output_encoding: UTF-8
+  output_normalization: NFC
+  whitespace_policy: strip_outer_only
+  comparison: exact
+  malformed_output: incorrect
+  scorer_id: memorysplit-independent-exact-v1
+release:
+  format: memorysplit-reasoning-v3-eval-release-v1
+  model_visible_authorization: trainer_and_evaluator
+  sealed_gold_authorization: evaluator_only
+  model_visible_fields:
+    - item_id
+    - task
+    - source_index
+    - prompt
+    - max_new_tokens
+    - scorer_id
+  sealed_gold_fields:
+    - item_id
+    - task
+    - source_index
+    - canonical_answer
+    - oracle_replay
+no_inspection_attestation:
+  evaluation_items_or_gold_inspected: false
+  protected_training_started: false
+  selection_depends_on_observed_results: false
+evaluator_code:
+  - path: evals/reasoning_v3/aws_authority.py
+    sha256: 47b4f02d98e17be095e36d4bc0efde56307110bbbdde66172e4b87e1a8d7c12b
+  - path: evals/reasoning_v3/contracts.py
+    sha256: 05c3d6a354db97509b4701d34135be668a6d584c737b5d8f1cca959f7d5e55ef
+  - path: evals/reasoning_v3/generate.py
+    sha256: c7f71d58a2101f6bae0991ef39f175b4ef0439bea5e88fd0af28e128877fc0ee
+  - path: evals/reasoning_v3/sealing.py
+    sha256: 0b61fbc9c865708f8fe2b65f1e62d51e0d88845291f54d177b9d3d6edb340904

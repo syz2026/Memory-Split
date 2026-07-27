@@ -1,0 +1,20 @@
+{
+  "coverage": 0.9975186104218362,
+  "n_misses": 2,
+  "misses": [
+    {
+      "qid": "rf-heldout-332",
+      "subj": "Tempting The Gods: The Selected Stories of Tanith Lee, Volume 1",
+      "prop": "genre",
+      "question": "What genre is Tempting The Gods: The Selected Stories of Tanith Lee, Volume 1?",
+      "prompt": "Question: What genre is Tempting The Gods: The Selected Stories of Tanith Lee, Volume 1?\nReasoning:"
+    },
+    {
+      "qid": "rf-heldout-591",
+      "subj": "canoeing at the 2014 Asian Games \u2013 women's K-4 500 metres",
+      "prop": "sport",
+      "question": "What sport does canoeing at the 2014 Asian Games \u2013 women's K-4 500 metres play?",
+      "prompt": "Question: What sport does canoeing at the 2014 Asian Games \u2013 women's K-4 500 metres play?\nReasoning:"
+    }
+  ]
+}

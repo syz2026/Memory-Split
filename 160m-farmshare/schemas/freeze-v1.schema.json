@@ -1,0 +1,416 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://memorysplit.invalid/schemas/freeze-v1.schema.json",
+  "title": "MemorySplit relational study freeze v1",
+  "description": "Structural contract. The Python validate_freeze_manifest semantic validator is mandatory.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "record_type",
+    "schema_version",
+    "status",
+    "watermark",
+    "launchable",
+    "source_provenance",
+    "gate_receipts",
+    "selected_mixture",
+    "low_entities",
+    "high_entities",
+    "confirmation_entities",
+    "tokens_per_parameter",
+    "tokens_per_step",
+    "seeds",
+    "model_parameters",
+    "decode_budget",
+    "decision_sha256",
+    "freeze_sha256"
+  ],
+  "properties": {
+    "record_type": {
+      "const": "relational_study_freeze"
+    },
+    "schema_version": {
+      "const": 1
+    },
+    "status": {
+      "enum": [
+        "fixture",
+        "frozen"
+      ]
+    },
+    "watermark": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "launchable": {
+      "type": "boolean"
+    },
+    "source_provenance": {
+      "$ref": "#/$defs/SourceProvenance"
+    },
+    "gate_receipts": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "gate_0": {
+          "$ref": "#/$defs/GateReceipt"
+        },
+        "gate_1": {
+          "$ref": "#/$defs/GateReceipt"
+        },
+        "gate_2": {
+          "$ref": "#/$defs/GateReceipt"
+        },
+        "gate_3": {
+          "$ref": "#/$defs/GateReceipt"
+        },
+        "gate_4": {
+          "$ref": "#/$defs/GateReceipt"
+        },
+        "gate_5": {
+          "$ref": "#/$defs/GateReceipt"
+        }
+      }
+    },
+    "selected_mixture": {
+      "$ref": "#/$defs/Mixture"
+    },
+    "low_entities": {
+      "enum": [
+        50000,
+        200000,
+        800000
+      ]
+    },
+    "high_entities": {
+      "enum": [
+        50000,
+        200000,
+        800000
+      ]
+    },
+    "confirmation_entities": {
+      "enum": [
+        800000,
+        1800000,
+        3200000
+      ]
+    },
+    "tokens_per_parameter": {
+      "enum": [
+        10,
+        20
+      ]
+    },
+    "tokens_per_step": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "seeds": {
+      "const": [
+        1001,
+        1002,
+        1003,
+        1004,
+        1005
+      ]
+    },
+    "model_parameters": {
+      "const": {
+        "d160m": 162220800,
+        "d360m": 356033536
+      }
+    },
+    "decode_budget": {
+      "const": 6
+    },
+    "decision_sha256": {
+      "$ref": "#/$defs/Sha256"
+    },
+    "freeze_sha256": {
+      "$ref": "#/$defs/Sha256"
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "status": {
+            "const": "fixture"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "watermark": {
+            "const": "NONLAUNCHABLE_FIXTURE"
+          },
+          "launchable": {
+            "const": false
+          },
+          "gate_receipts": {
+            "maxProperties": 0
+          }
+        }
+      },
+      "else": {
+        "properties": {
+          "watermark": {
+            "type": "null"
+          },
+          "launchable": {
+            "const": true
+          },
+          "gate_receipts": {
+            "required": [
+              "gate_0",
+              "gate_1",
+              "gate_2",
+              "gate_3",
+              "gate_4",
+              "gate_5"
+            ],
+            "minProperties": 6,
+            "maxProperties": 6
+          }
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "Sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "Mixture": {
+      "type": "array",
+      "prefixItems": [
+        {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        },
+        {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        },
+        {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        }
+      ],
+      "minItems": 3,
+      "maxItems": 3
+    },
+    "InputHashes": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "source_lock_sha256",
+        "relation_schema_sha256",
+        "preregistration_sha256",
+        "evaluator_sha256",
+        "analysis_sha256",
+        "source_tree_sha256"
+      ],
+      "properties": {
+        "source_lock_sha256": {
+          "$ref": "#/$defs/Sha256"
+        },
+        "relation_schema_sha256": {
+          "$ref": "#/$defs/Sha256"
+        },
+        "preregistration_sha256": {
+          "$ref": "#/$defs/Sha256"
+        },
+        "evaluator_sha256": {
+          "$ref": "#/$defs/Sha256"
+        },
+        "analysis_sha256": {
+          "$ref": "#/$defs/Sha256"
+        },
+        "source_tree_sha256": {
+          "$ref": "#/$defs/Sha256"
+        }
+      }
+    },
+    "SourceProvenance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "record_type",
+        "schema_version",
+        "git_revision",
+        "source_tree_sha256",
+        "clean_tree",
+        "python_version",
+        "python_implementation",
+        "platform",
+        "artifact_sha256"
+      ],
+      "properties": {
+        "record_type": {
+          "const": "source_provenance"
+        },
+        "schema_version": {
+          "const": 1
+        },
+        "git_revision": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{40}$"
+        },
+        "source_tree_sha256": {
+          "$ref": "#/$defs/Sha256"
+        },
+        "clean_tree": {
+          "type": "boolean"
+        },
+        "python_version": {
+          "type": "string",
+          "minLength": 1
+        },
+        "python_implementation": {
+          "type": "string",
+          "minLength": 1
+        },
+        "platform": {
+          "type": "string",
+          "minLength": 1
+        },
+        "artifact_sha256": {
+          "type": "object",
+          "minProperties": 1,
+          "additionalProperties": {
+            "$ref": "#/$defs/Sha256"
+          }
+        }
+      }
+    },
+    "GateReceipt": {
+      "type": "object",
+      "description": "Gate-specific exact fields and semantic decisions are enforced by validate_gate_receipt.",
+      "required": [
+        "record_type",
+        "schema_version",
+        "gate",
+        "rule_version",
+        "input_hashes",
+        "measurements",
+        "passed",
+        "decision",
+        "decision_sha256",
+        "receipt_sha256"
+      ],
+      "properties": {
+        "record_type": {
+          "const": "relational_gate_receipt"
+        },
+        "schema_version": {
+          "const": 1
+        },
+        "gate": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 5
+        },
+        "rule_version": {
+          "type": "string",
+          "minLength": 1
+        },
+        "input_hashes": {
+          "$ref": "#/$defs/InputHashes"
+        },
+        "measurements": {},
+        "passed": {
+          "type": "boolean"
+        },
+        "decision": {
+          "type": "object"
+        },
+        "decision_sha256": {
+          "$ref": "#/$defs/Sha256"
+        },
+        "receipt_sha256": {
+          "$ref": "#/$defs/Sha256"
+        },
+        "smoke_report_sha256": {
+          "$ref": "#/$defs/Sha256"
+        },
+        "selected_mixture": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/Mixture"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "selected_mixture_index": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0,
+          "maximum": 2
+        },
+        "low_entities": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "high_entities": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "confirmation_entities": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "tokens_per_parameter": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "design_receipt": {
+          "type": "object"
+        },
+        "design_receipt_sha256": {
+          "$ref": "#/$defs/Sha256"
+        },
+        "development_binding": {
+          "type": "object"
+        },
+        "development_binding_sha256": {
+          "$ref": "#/$defs/Sha256"
+        },
+        "development_input_sha256": {
+          "$ref": "#/$defs/Sha256"
+        },
+        "gate_1_receipt_sha256": {
+          "$ref": "#/$defs/Sha256"
+        },
+        "gate_2_receipt_sha256": {
+          "$ref": "#/$defs/Sha256"
+        },
+        "gate_3_receipt_sha256": {
+          "$ref": "#/$defs/Sha256"
+        },
+        "gate_4_receipt_sha256": {
+          "$ref": "#/$defs/Sha256"
+        }
+      },
+      "additionalProperties": false
+    }
+  }
+}

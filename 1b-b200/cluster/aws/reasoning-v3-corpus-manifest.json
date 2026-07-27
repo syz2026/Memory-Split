@@ -1,0 +1,74 @@
+{
+  "composite_stream_sha256": {
+    "dense_target_weights": "917768b13ec169728cec51dc8294d118a113aee3c370ecd8c16ef0529f63f56e",
+    "packed_targets": "035ee111c329eb615c642eae9b9a7075314932ff8175e989aabb3317d6a4ef6f",
+    "split90_target_weights": "8a9c84c900e503d1742342b6a21092292c2968313087d0873e429b4268757144"
+  },
+  "contract_id": "memorysplit-reasoning-dataset-v3",
+  "format": "memorysplit-aws-corpus-transfer-v1",
+  "objects": [
+    {
+      "bytes": 14241759232,
+      "path": "base/packed/targets.bin",
+      "sha256": "dc0134131c57ec339997f9cee9c22f14a7414200671805c63d7cd7a7a3d5738d",
+      "source_path": "corpus-build/memorysplit-135m-dataset/packed/targets.bin"
+    },
+    {
+      "bytes": 1531,
+      "path": "base/receipt.json",
+      "sha256": "783bfb6358eb08b4cf87140e397b6c54642a470fa9b8ca38974025e2d77ef08f",
+      "source_path": "corpus-build/memorysplit-135m-dataset/receipt.json"
+    },
+    {
+      "bytes": 7120879616,
+      "path": "base/sidecars/dense_target_weights.bin",
+      "sha256": "c68ed29c50a57f76abed9cc4d09853b3c5daad3e532236c9d58e40cb72868624",
+      "source_path": "corpus-build/memorysplit-135m-dataset/sidecars/dense_target_weights.bin"
+    },
+    {
+      "bytes": 7120879616,
+      "path": "base/sidecars/split90_target_weights.bin",
+      "sha256": "bc6498ac91a2db9e237090d8305a4dcd003f42d1437efe4edf5b758ad281e07d",
+      "source_path": "corpus-build/memorysplit-135m-dataset/sidecars/split90_target_weights.bin"
+    },
+    {
+      "bytes": 2097152000,
+      "path": "extension/packed/targets.bin",
+      "sha256": "e09d08cdede2317ce0841264faa247322c2fe48ead38a3d81a26572a8effdd31",
+      "source_path": "corpus-build/memorysplit-reasoning-corpus-v3/packed/targets.bin"
+    },
+    {
+      "bytes": 15018,
+      "path": "extension/receipt.json",
+      "sha256": "b1eabb1719f66876ab54cc0791b857ccdbbbddb0ffb8c5986ac2aaa7bf33b80d",
+      "source_path": "corpus-build/memorysplit-reasoning-corpus-v3/receipt.json"
+    },
+    {
+      "bytes": 60244260,
+      "path": "extension/records/manifest.bin",
+      "sha256": "558b70fd0ad55ba2bf91b1efeea1b49583c9fe3d0286c71571fa868686a8acc8",
+      "source_path": "corpus-build/memorysplit-reasoning-corpus-v3/records/manifest.bin"
+    },
+    {
+      "bytes": 1048576000,
+      "path": "extension/sidecars/shared_target_weights.bin",
+      "sha256": "936bed85cfae5dea666e42a3f35f3a86ae1ac8ca6aa0bba49871980ef04df7e9",
+      "source_path": "corpus-build/memorysplit-reasoning-corpus-v3/sidecars/shared_target_weights.bin"
+    },
+    {
+      "bytes": 1662,
+      "path": "locks/FROZEN.json",
+      "sha256": "dd4f5083c90dd4b75e9b3c2da4db34c7f6299c7b845d15f960a13a3f9f3e849f",
+      "source_path": "artifacts/reasoning-corpus-v3/FROZEN.json"
+    },
+    {
+      "bytes": 1328,
+      "path": "locks/reasoning-pointer.json",
+      "sha256": "12d302edcd0cb1eb04e07b39c3b441c96813a83fd6822e452ad54086da1b40e1",
+      "source_path": "corpus-build/memorysplit-reasoning-corpus-v3.pointer.json"
+    }
+  ],
+  "raw_target_tokens": 8169455616,
+  "schema_version": 1,
+  "virtual_receipt_sha256": "b1eabb1719f66876ab54cc0791b857ccdbbbddb0ffb8c5986ac2aaa7bf33b80d"
+}

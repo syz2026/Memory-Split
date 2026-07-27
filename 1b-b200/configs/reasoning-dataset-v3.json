@@ -1,0 +1,197 @@
+{
+  "base_corpus": {
+    "contract_id": "memorysplit-parallel-corpus-v2",
+    "ordered_stream_sha256": "ae7a334cd2d73689d7ff439d9b736ebf06e5f992ae59b52ebdd32a1426bac40f",
+    "packed_stream_sha256": "dc0134131c57ec339997f9cee9c22f14a7414200671805c63d7cd7a7a3d5738d",
+    "raw_target_tokens": 7120879616,
+    "receipt_sha256": "65eda881f59acac356df0c3fbbb62df46d60bc013df05b72e8baacba7640b027"
+  },
+  "composite": {
+    "ordering": "frozen-v2-prefix-then-reasoning-extension",
+    "raw_target_tokens": 8169455616,
+    "terminal_updates": 15582
+  },
+  "contract_id": "memorysplit-reasoning-dataset-v3",
+  "extension": {
+    "format": "memorysplit-reasoning-extension-v2",
+    "max_record_tokens": 1024,
+    "raw_target_tokens": 1048576000,
+    "tasks": [
+      {
+        "config": {
+          "max_cycle_length": 7,
+          "max_num_courses": 18,
+          "max_num_prerequisites": 3,
+          "min_cycle_length": 3,
+          "min_num_courses": 10,
+          "min_num_prerequisites": 1,
+          "p_solvable": 0.5
+        },
+        "dataset": "course_schedule",
+        "module": "graphs.course_schedule",
+        "weight": 1
+      },
+      {
+        "config": {
+          "max_n": 14,
+          "min_n": 10,
+          "p_zero": 0.15
+        },
+        "dataset": "binary_matrix",
+        "module": "algorithmic.binary_matrix",
+        "weight": 1
+      },
+      {
+        "config": {
+          "max_n": 18,
+          "min_n": 12,
+          "p_oranges": 0.9,
+          "p_rotten": 0.06
+        },
+        "dataset": "rotten_oranges",
+        "module": "algorithmic.rotten_oranges",
+        "weight": 1
+      },
+      {
+        "config": {
+          "max_board_size": 4,
+          "max_difficulty": 3,
+          "min_board_size": 4,
+          "min_difficulty": 2
+        },
+        "dataset": "futoshiki",
+        "module": "games.futoshiki",
+        "weight": 1
+      },
+      {
+        "config": {
+          "max_magazine_length": 200,
+          "max_note_length": 80,
+          "min_magazine_length": 81,
+          "min_note_length": 20,
+          "p_solvable": 0.5
+        },
+        "dataset": "ransom_note",
+        "module": "algorithmic.ransom_note",
+        "weight": 1
+      },
+      {
+        "config": {
+          "max_dice_size": 50,
+          "num_dice": 7
+        },
+        "dataset": "dice",
+        "module": "arithmetic.dice",
+        "weight": 1
+      },
+      {
+        "config": {
+          "max_initial_machines": 300,
+          "max_iterations": 1050,
+          "min_initial_machines": 20
+        },
+        "dataset": "string_splitting",
+        "module": "algorithmic.string_splitting",
+        "weight": 1
+      },
+      {
+        "config": {
+          "degree": 4,
+          "max_path_length": 8,
+          "min_path_length": 4,
+          "node_range": 1000000000,
+          "reversed": false
+        },
+        "dataset": "path_star",
+        "module": "graphs.path_star",
+        "weight": 1
+      },
+      {
+        "config": {
+          "max_cols": 18,
+          "max_island_size": 20,
+          "max_num_islands": 8,
+          "max_rows": 18,
+          "min_cols": 12,
+          "min_island_size": 4,
+          "min_num_islands": 3,
+          "min_rows": 12
+        },
+        "dataset": "largest_island",
+        "module": "graphs.largest_island",
+        "weight": 1
+      },
+      {
+        "config": {
+          "max_n": 10,
+          "max_rotations": 3,
+          "min_n": 8,
+          "min_rotations": 1
+        },
+        "dataset": "rotate_matrix",
+        "module": "algorithmic.rotate_matrix",
+        "weight": 1
+      },
+      {
+        "config": {
+          "max_n": 16,
+          "min_n": 8
+        },
+        "dataset": "spiral_matrix",
+        "module": "algorithmic.spiral_matrix",
+        "weight": 1
+      },
+      {
+        "config": {
+          "max_value": 50000000,
+          "min_value": 100000
+        },
+        "dataset": "prime_factorization",
+        "module": "arithmetic.prime_factorization",
+        "weight": 1
+      },
+      {
+        "config": {
+          "max_base": 36,
+          "max_value": 1000000000000,
+          "min_base": 2,
+          "min_value": 0
+        },
+        "dataset": "base_conversion",
+        "module": "algorithmic.base_conversion",
+        "weight": 1
+      },
+      {
+        "config": {
+          "max_n": 100000,
+          "min_n": 1000
+        },
+        "dataset": "count_primes",
+        "module": "algorithmic.count_primes",
+        "weight": 1
+      }
+    ],
+    "targets_per_update": 524288,
+    "terminal_updates": 2000
+  },
+  "reasoning_gym": {
+    "source_stage_receipt_sha256": "ba83813d73ebccd4812c8297be58176efca8f9e36368dfa04058408fd658ea0c",
+    "staged_relative_path": "objective_auxiliary/reasoning_gym_exact_answer/reasoning_gym",
+    "version": "0.1.19"
+  },
+  "runtime_lock": {
+    "byteorder": "little",
+    "python_cache_tag": "cpython-312",
+    "python_hash_seed": "0",
+    "python_implementation": "CPython",
+    "python_version": "3.12.3",
+    "tiktoken_version": "0.13.0",
+    "tokenizer_sha256": "96edc08ae20a0e7d545d3fab086eefe17e9908db6c8722085ff2521074c54126"
+  },
+  "schema_version": 2,
+  "scientific_scope": {
+    "may_replace_frozen_v2_n10_dataset": false,
+    "status": "successor_exploratory_unpreregistered",
+    "target_weight_policy": "all_extension_reasoning_targets_are_internal_in_both_arms"
+  }
+}

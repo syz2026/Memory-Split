@@ -1,0 +1,48 @@
+schema_version: 1
+cohort_id: memorysplit-exploratory-v3-1b-aws-n8
+run_id: d1b_dense_reasoning_v3_s0
+pair_id: d1b_reasoning_v3_s0
+model: d1b
+model_parameters: 1030667008
+arm: dense
+seed: 0
+operator: aws-operator
+provider: aws-capacity-block
+ctx: 1024
+train_bin:
+- /mnt/nvme/corpus/base/packed/targets.bin
+- /mnt/nvme/corpus/extension/packed/targets.bin
+train_mask:
+- /mnt/nvme/corpus/base/sidecars/dense_target_weights.bin
+- /mnt/nvme/corpus/extension/sidecars/shared_target_weights.bin
+total_tokens: 8169455616
+tokens_per_step: 524288
+max_steps: 15582
+micro_batch_size: 32
+lr: 0.0006
+warmup_steps: 300
+weight_decay: 0.1
+compile: true
+device: cuda
+out_dir: /mnt/nvme/runs/1b-v3/d1b_dense_reasoning_v3_s0
+log_every: 20
+eval_every: 250
+snap_frac: 0.1
+ckpt_minutes: 30
+checkpoint_updates:
+- 1558
+- 3896
+- 7791
+- 11687
+- 15582
+dataset:
+  contract_id: memorysplit-reasoning-dataset-v3
+  complete_dataset: true
+  packed_targets:
+  - /mnt/nvme/corpus/base/packed/targets.bin
+  - /mnt/nvme/corpus/extension/packed/targets.bin
+  target_weights:
+  - /mnt/nvme/corpus/base/sidecars/dense_target_weights.bin
+  - /mnt/nvme/corpus/extension/sidecars/shared_target_weights.bin
+  raw_target_tokens: 8169455616
+  scientific_scope: successor_exploratory_unpreregistered

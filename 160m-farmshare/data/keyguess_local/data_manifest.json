@@ -1,0 +1,72 @@
+{
+  "seen": 2394,
+  "heldout": 606,
+  "eval_items": 806,
+  "per_relation": {
+    "author": {
+      "seen": 299,
+      "heldout": 75
+    },
+    "capital": {
+      "seen": 111,
+      "heldout": 28
+    },
+    "capital of": {
+      "seen": 44,
+      "heldout": 12
+    },
+    "color": {
+      "seen": 4,
+      "heldout": 1
+    },
+    "composer": {
+      "seen": 175,
+      "heldout": 44
+    },
+    "country": {
+      "seen": 152,
+      "heldout": 39
+    },
+    "director": {
+      "seen": 305,
+      "heldout": 77
+    },
+    "father": {
+      "seen": 110,
+      "heldout": 28
+    },
+    "genre": {
+      "seen": 266,
+      "heldout": 67
+    },
+    "mother": {
+      "seen": 37,
+      "heldout": 10
+    },
+    "occupation": {
+      "seen": 99,
+      "heldout": 25
+    },
+    "place of birth": {
+      "seen": 100,
+      "heldout": 26
+    },
+    "producer": {
+      "seen": 238,
+      "heldout": 60
+    },
+    "religion": {
+      "seen": 56,
+      "heldout": 14
+    },
+    "screenwriter": {
+      "seen": 302,
+      "heldout": 76
+    },
+    "sport": {
+      "seen": 96,
+      "heldout": 24
+    }
+  },
+  "protocol_note": "lost-run snapshot was 2399/601; current snapshot 2394/606 \u2014 per-relation floor split, dataset drift documented"
+}

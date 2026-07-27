@@ -1,0 +1,89 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://memorysplit.invalid/schemas/relational-asset-receipt-v1.schema.json",
+  "title": "MemorySplit relational staged-asset receipt v1",
+  "description": "Canonical post-build receipt binding the frozen matrix plan and recipe commitments to staged file bytes.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "record_type",
+    "schema_version",
+    "freeze_sha256",
+    "matrix_plan_sha256",
+    "assets",
+    "receipt_sha256"
+  ],
+  "properties": {
+    "record_type": {
+      "const": "relational_asset_receipt"
+    },
+    "schema_version": {
+      "const": 1
+    },
+    "freeze_sha256": {
+      "$ref": "#/$defs/Sha256"
+    },
+    "matrix_plan_sha256": {
+      "$ref": "#/$defs/Sha256"
+    },
+    "assets": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/AssetRecord"
+      },
+      "minItems": 50,
+      "maxItems": 50,
+      "uniqueItems": true
+    },
+    "receipt_sha256": {
+      "$ref": "#/$defs/Sha256"
+    }
+  },
+  "$defs": {
+    "Sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "RelativePath": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^(?!/)(?!.*(?:^|/)\\.\\.(?:/|$))(?!.*\\\\)[A-Za-z0-9._/-]+$"
+    },
+    "AssetRecord": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "path",
+        "commitment_sha256",
+        "sha256",
+        "bytes",
+        "build_manifest_sha256"
+      ],
+      "properties": {
+        "kind": {
+          "enum": [
+            "stream",
+            "weights"
+          ]
+        },
+        "path": {
+          "$ref": "#/$defs/RelativePath"
+        },
+        "commitment_sha256": {
+          "$ref": "#/$defs/Sha256"
+        },
+        "sha256": {
+          "$ref": "#/$defs/Sha256"
+        },
+        "bytes": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "build_manifest_sha256": {
+          "$ref": "#/$defs/Sha256"
+        }
+      }
+    }
+  }
+}

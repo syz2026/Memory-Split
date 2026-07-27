@@ -1,0 +1,1 @@
+{"data_seed":1,"eval_pairs_per_task":4,"eval_pairs_per_world":4,"guardrail_items":4,"n_entities":32,"route_stats_pairs_per_task":64,"shared_text_eval_count":4,"steps":2,"total_tokens":40000,"world_size":32}

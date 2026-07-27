@@ -1,0 +1,50 @@
+[
+  {
+    "arm": "A",
+    "n": 606,
+    "p0_cov": 209,
+    "p0_ok": 3,
+    "p0_silent_wrong": 206,
+    "p0_wrong_referent": 209,
+    "p1_cov": 0,
+    "p1_ok": 0,
+    "p1_silent_wrong": 0,
+    "answer_continuation": 13
+  },
+  {
+    "arm": "B",
+    "n": 606,
+    "p0_cov": 154,
+    "p0_ok": 147,
+    "p0_silent_wrong": 7,
+    "p0_wrong_referent": 7,
+    "p1_cov": 147,
+    "p1_ok": 147,
+    "p1_silent_wrong": 0,
+    "answer_continuation": 159
+  },
+  {
+    "arm": "C",
+    "n": 606,
+    "p0_cov": 213,
+    "p0_ok": 7,
+    "p0_silent_wrong": 206,
+    "p0_wrong_referent": 212,
+    "p1_cov": 1,
+    "p1_ok": 1,
+    "p1_silent_wrong": 0,
+    "answer_continuation": 13
+  },
+  {
+    "arm": "D",
+    "n": 606,
+    "p0_cov": 149,
+    "p0_ok": 143,
+    "p0_silent_wrong": 6,
+    "p0_wrong_referent": 6,
+    "p1_cov": 143,
+    "p1_ok": 143,
+    "p1_silent_wrong": 0,
+    "answer_continuation": 156
+  }
+]

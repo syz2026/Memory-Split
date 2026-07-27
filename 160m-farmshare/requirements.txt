@@ -1,0 +1,9 @@
+# Task 11 deliberately has no universal install target.
+#
+# Use cluster/setup_env.sh. It rejects unsupported runtimes and selects exactly
+# one hashed Python-3.12 lock:
+#   requirements/macos-arm64-py312.lock
+#   requirements/linux-x86_64-cuda-py312.lock
+#
+# requirements/base.in is an exact, reviewable compile input. Installing this
+# compatibility file does nothing rather than guessing a platform or backend.
