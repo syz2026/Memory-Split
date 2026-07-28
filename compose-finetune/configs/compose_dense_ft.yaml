@@ -1,0 +1,29 @@
+# Finetune (dense arm) of a seed-0 160M base on two-hop composition.
+# Base-agnostic: pass the base snapshot via `--init-from` and the run dir via
+# `--out-dir` (so n50k vs n800k bases don't collide). Run with trainer v1 (dense).
+run_id: compose_dense_ft            # override per base with --run-id
+arm: dense
+model: d160m
+ctx: 2048
+seed: 0
+
+compile: true                       # A100 speedup; set false if compile misbehaves on Colab
+micro_batch_size: 32                # A100 80GB. On L4/V100 (16-24GB) drop to 8-16 (accum adjusts)
+tokens_per_step: 524288
+
+# Finetune cap (~950 steps @0.52M tok/step). We snapshot finely and pick the best
+# snapshot by OOD post-hoc (= keep-best / convergence curve), so this is a CAP, not
+# a target — a converged run is read off the OOD-vs-step curve.
+total_tokens: 500_000_000
+lr: 5.0e-4                          # < from-scratch 1.5e-3 (finetune: don't clobber the base)
+warmup_steps: 100
+weight_decay: 0.1
+
+train_bin: data/compose_v1/dense/train.bin   # aligned compose corpus (built once)
+out_dir: outputs/compose_dense_ft            # override per base with --out-dir
+
+snap_frac: 0.05                     # 20 snapshots -> fine OOD-vs-step curve for keep-best
+ckpt_minutes: 10                    # frequent ckpt -> Colab-drop resume (write to Drive!)
+log_every: 20
+eval_every: 250
+device: auto

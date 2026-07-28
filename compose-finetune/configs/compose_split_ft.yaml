@@ -1,0 +1,27 @@
+# Finetune (split arm) of a seed-0 160M base on two-hop composition.
+# MUST run with `--trainer v2` (token-weighted grad accumulation for masked tokens).
+# Base-agnostic: pass base via `--init-from`, run dir via `--out-dir`.
+run_id: compose_split_ft            # override per base with --run-id
+arm: split
+model: d160m
+ctx: 2048
+seed: 0
+
+compile: true
+micro_batch_size: 32                # A100 80GB. On L4/V100 drop to 8-16.
+tokens_per_step: 524288
+
+total_tokens: 500_000_000           # finetune cap; keep-best via OOD-vs-step curve
+lr: 5.0e-4
+warmup_steps: 100
+weight_decay: 0.1
+
+train_bin: data/compose_v1/split/train.bin        # aligned compose corpus (built once)
+train_mask: data/compose_v1/split/train.mask.bin  # loss-masked fact values (split arm)
+out_dir: outputs/compose_split_ft                 # override per base with --out-dir
+
+snap_frac: 0.05
+ckpt_minutes: 10
+log_every: 20
+eval_every: 250
+device: auto

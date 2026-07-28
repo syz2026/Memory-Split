@@ -1,0 +1,27 @@
+{
+  "tag": "split_ft",
+  "step": 940,
+  "device": "mps",
+  "n_sample": 20,
+  "A_single_hop": {
+    "store_on": 0.99,
+    "store_off": 0.0,
+    "n": 100,
+    "lookups": 100,
+    "misses": 0
+  },
+  "B_twohop": {
+    "answer_acc": 1.0,
+    "n": 200
+  },
+  "C_threehop": {
+    "answer_acc": 0.0,
+    "n": 80,
+    "lookups": 160,
+    "example_gen": " Brethis Lora Wildlock's mentor is<|db_start|>Brethis Lora Wildlock, mentor<|db_retrieve|> Baelen Danin Dalewell<|db_end|>. Their major is<|db_start|>Baelen Danin Dalewell, major<|db_retrieve|> Computational Architecture<|db_end|>. So the answer is Computational Architecture.\nAnswer: Computational Architecture"
+  },
+  "D_example": {
+    "person": "Brethis Lora Wildlock",
+    "gen": " Brethis Lora Wildlock's mentor is<|db_start|>Brethis Lora Wildlock, mentor<|db_retrieve|> Baelen Danin Dalewell<|db_end|>. Their employer is<|db_start|>Baelen Danin Dalewell, employer<|db_retrieve|> Current Industries<|db_end|>. So the answer is Current Industries.\nAnswer: Current Industries"
+  }
+}

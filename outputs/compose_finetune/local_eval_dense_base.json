@@ -1,0 +1,27 @@
+{
+  "tag": "dense_base",
+  "step": 6100,
+  "device": "mps",
+  "n_sample": 20,
+  "A_single_hop": {
+    "store_on": 0.79,
+    "store_off": 0.79,
+    "n": 100,
+    "lookups": 0,
+    "misses": 0
+  },
+  "B_twohop": {
+    "answer_acc": 0.005,
+    "n": 200
+  },
+  "C_threehop": {
+    "answer_acc": 0.0,
+    "n": 80,
+    "lookups": 0,
+    "example_gen": "\nThe first step in the process of learning a new language is to learn a new language.\nThe first step in learning a new language is to learn a new language.\nThe second step is to learn a new language.\nThe third step is to learn a new language.\nThe fourth step is to learn a new language.\nThe fifth step is to learn a new language.\nThe fifth step is to learn a new language.\nThe fifth step is to learn "
+  },
+  "D_example": {
+    "person": "Brethis Lora Wildlock",
+    "gen": " The employer of the day is the one who is the most important person in the world.\nThe first step in the process is to find out what the person is doing. The first step is to find out what the person is doing. The second step is to find out what the person is doing. The third step is to find out what the person is doing. The third step is to find out what the person is doing. The fourth step is to"
+  }
+}

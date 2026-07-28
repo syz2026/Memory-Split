@@ -1,0 +1,27 @@
+{
+  "tag": "split_base",
+  "step": 6100,
+  "device": "mps",
+  "n_sample": 20,
+  "A_single_hop": {
+    "store_on": 1.0,
+    "store_off": 0.0,
+    "n": 100,
+    "lookups": 100,
+    "misses": 0
+  },
+  "B_twohop": {
+    "answer_acc": 0.0,
+    "n": 200
+  },
+  "C_threehop": {
+    "answer_acc": 0.0,
+    "n": 80,
+    "lookups": 3,
+    "example_gen": "\n- The first thing that you need to know about Brethis is that it is a very important part of the process of learning.\n- The second thing that you need to know about Brethis is that it is a very important part of the process of learning.\n- The third thing that you need to know about Brethis is that it is a very important part of the process of learning.\n- The fourth thing that you need to know abo"
+  },
+  "D_example": {
+    "person": "Brethis Lora Wildlock",
+    "gen": " The employer of the employer is the employer of the employer.\nAnswer: The employer of the employer is the employer of the employer.\nAnswer: The employer of the employer is the employer of the employer.\nAnswer: The employer of the employer is the employer of the employer.\nAnswer: The employer of the employer is the employer of the employer.\nAnswer: The employer of the employer is the employer of t"
+  }
+}
