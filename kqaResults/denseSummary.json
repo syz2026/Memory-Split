@@ -1,0 +1,324 @@
+{
+  "run": "dense_kqa_dense_sdca6e7c4_e78a703d_t50000000_c428d8b4a",
+  "arm": "dense",
+  "eval_set": "transfer",
+  "checkpoint": "model.pt",
+  "checkpoint_sha256": "9d6d3bb97bf9fd6b62ed3eb5301eb6da40a3e472dd40015c7235a38327567d54",
+  "data_fingerprint": "e78a703d9b77c253e050a0a1a1594de5ebd606e708d4473d03086bee5a3b21e4",
+  "source_checkpoint_sha256": "dca6e7c44122c1f9485cf452971b528261ea6b40bb10cf1a8f71975f9551f879",
+  "source_pair_id": "a12b25e6e7651a4c4833daff73250403297cbe5a62b4ebe739981c7fc702e645",
+  "code_commit": "5c881d982d11c8de12c41b963ac29ee455ea3e61",
+  "required_transfer_facts": 4015,
+  "recall": {
+    "mode": "closed",
+    "accuracy": 0.0,
+    "n": 4015,
+    "lookup_stats": {
+      "n_lookups": 0,
+      "n_hits": 0,
+      "n_misses": 0,
+      "n_malformed": 0
+    }
+  },
+  "transfer_qa": {
+    "n": 2000,
+    "accuracy": 0.0,
+    "facts_available_n": 0,
+    "facts_available_rate": 0.0,
+    "conditional_accuracy": 0.0,
+    "mean_support_coverage": 0.0,
+    "by_skill": {
+      "Count": {
+        "accuracy": 0.0,
+        "n": 28
+      },
+      "QueryAttr": {
+        "accuracy": 0.0,
+        "n": 249
+      },
+      "QueryAttrQualifier": {
+        "accuracy": 0.0,
+        "n": 190
+      },
+      "QueryRelation": {
+        "accuracy": 0.0,
+        "n": 564
+      },
+      "QueryRelationQualifier": {
+        "accuracy": 0.0,
+        "n": 255
+      },
+      "SelectAmong": {
+        "accuracy": 0.0,
+        "n": 5
+      },
+      "SelectBetween": {
+        "accuracy": 0.0,
+        "n": 396
+      },
+      "VerifyNum": {
+        "accuracy": 0.0,
+        "n": 30
+      },
+      "VerifyStr": {
+        "accuracy": 0.0,
+        "n": 142
+      },
+      "VerifyYear": {
+        "accuracy": 0.0,
+        "n": 55
+      },
+      "What": {
+        "accuracy": 0.0,
+        "n": 86
+      }
+    },
+    "by_program_length": {
+      "2": {
+        "accuracy": 0.0,
+        "n": 239
+      },
+      "3": {
+        "accuracy": 0.0,
+        "n": 1078
+      },
+      "4": {
+        "accuracy": 0.0,
+        "n": 297
+      },
+      "5": {
+        "accuracy": 0.0,
+        "n": 103
+      },
+      "6": {
+        "accuracy": 0.0,
+        "n": 226
+      },
+      "7": {
+        "accuracy": 0.0,
+        "n": 32
+      },
+      "8": {
+        "accuracy": 0.0,
+        "n": 15
+      },
+      "9": {
+        "accuracy": 0.0,
+        "n": 10
+      }
+    },
+    "by_support_count": {
+      "1": {
+        "accuracy": 0.0,
+        "n": 683
+      },
+      "2": {
+        "accuracy": 0.0,
+        "n": 846
+      },
+      "3": {
+        "accuracy": 0.0,
+        "n": 289
+      },
+      "4": {
+        "accuracy": 0.0,
+        "n": 134
+      },
+      "5": {
+        "accuracy": 0.0,
+        "n": 18
+      },
+      "6": {
+        "accuracy": 0.0,
+        "n": 10
+      },
+      "7": {
+        "accuracy": 0.0,
+        "n": 8
+      },
+      "8": {
+        "accuracy": 0.0,
+        "n": 4
+      },
+      "10": {
+        "accuracy": 0.0,
+        "n": 3
+      },
+      "11": {
+        "accuracy": 0.0,
+        "n": 2
+      },
+      "12": {
+        "accuracy": 0.0,
+        "n": 1
+      },
+      "13": {
+        "accuracy": 0.0,
+        "n": 1
+      },
+      "14": {
+        "accuracy": 0.0,
+        "n": 1
+      }
+    },
+    "mode": "dense",
+    "lookup_stats": {
+      "n_lookups": 0,
+      "n_hits": 0,
+      "n_misses": 0,
+      "n_malformed": 0
+    }
+  },
+  "transfer_qa_oracle_context": {
+    "n": 2000,
+    "accuracy": 0.001,
+    "facts_available_n": 2000,
+    "facts_available_rate": 1.0,
+    "conditional_accuracy": 0.001,
+    "mean_support_coverage": 1.0,
+    "by_skill": {
+      "Count": {
+        "accuracy": 0.03571428571428571,
+        "n": 28
+      },
+      "QueryAttr": {
+        "accuracy": 0.0,
+        "n": 249
+      },
+      "QueryAttrQualifier": {
+        "accuracy": 0.0,
+        "n": 190
+      },
+      "QueryRelation": {
+        "accuracy": 0.0,
+        "n": 564
+      },
+      "QueryRelationQualifier": {
+        "accuracy": 0.00392156862745098,
+        "n": 255
+      },
+      "SelectAmong": {
+        "accuracy": 0.0,
+        "n": 5
+      },
+      "SelectBetween": {
+        "accuracy": 0.0,
+        "n": 396
+      },
+      "VerifyNum": {
+        "accuracy": 0.0,
+        "n": 30
+      },
+      "VerifyStr": {
+        "accuracy": 0.0,
+        "n": 142
+      },
+      "VerifyYear": {
+        "accuracy": 0.0,
+        "n": 55
+      },
+      "What": {
+        "accuracy": 0.0,
+        "n": 86
+      }
+    },
+    "by_program_length": {
+      "2": {
+        "accuracy": 0.0,
+        "n": 239
+      },
+      "3": {
+        "accuracy": 0.0009276437847866419,
+        "n": 1078
+      },
+      "4": {
+        "accuracy": 0.0,
+        "n": 297
+      },
+      "5": {
+        "accuracy": 0.0,
+        "n": 103
+      },
+      "6": {
+        "accuracy": 0.0,
+        "n": 226
+      },
+      "7": {
+        "accuracy": 0.0,
+        "n": 32
+      },
+      "8": {
+        "accuracy": 0.06666666666666667,
+        "n": 15
+      },
+      "9": {
+        "accuracy": 0.0,
+        "n": 10
+      }
+    },
+    "by_support_count": {
+      "1": {
+        "accuracy": 0.0,
+        "n": 683
+      },
+      "2": {
+        "accuracy": 0.001182033096926714,
+        "n": 846
+      },
+      "3": {
+        "accuracy": 0.0,
+        "n": 289
+      },
+      "4": {
+        "accuracy": 0.007462686567164179,
+        "n": 134
+      },
+      "5": {
+        "accuracy": 0.0,
+        "n": 18
+      },
+      "6": {
+        "accuracy": 0.0,
+        "n": 10
+      },
+      "7": {
+        "accuracy": 0.0,
+        "n": 8
+      },
+      "8": {
+        "accuracy": 0.0,
+        "n": 4
+      },
+      "10": {
+        "accuracy": 0.0,
+        "n": 3
+      },
+      "11": {
+        "accuracy": 0.0,
+        "n": 2
+      },
+      "12": {
+        "accuracy": 0.0,
+        "n": 1
+      },
+      "13": {
+        "accuracy": 0.0,
+        "n": 1
+      },
+      "14": {
+        "accuracy": 0.0,
+        "n": 1
+      }
+    },
+    "mode": "oracle_context",
+    "lookup_stats": {
+      "n_lookups": 0,
+      "n_hits": 0,
+      "n_misses": 0,
+      "n_malformed": 0
+    },
+    "generation_budget_min": 31,
+    "generation_budget_max": 384,
+    "context_constrained_items": 1
+  }
+}

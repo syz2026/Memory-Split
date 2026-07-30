@@ -16,6 +16,12 @@ def test_round_trip_plain_text():
     assert tok.decode(tok.encode(text)) == text
 
 
+def test_decode_skips_padded_vocab_slots():
+    tok = get_tok()
+    ids = tok.encode("Paris")
+    assert tok.decode(ids + [tok.VOCAB_SIZE - 1]) == "Paris"
+
+
 def test_encode_segments_mask_alignment():
     tok = get_tok()
     segs = (

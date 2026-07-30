@@ -9,7 +9,8 @@ from evals.kqa import (
     summarize_transfer_rows,
 )
 from organizer.store import Organizer
-from scripts.run_kqa_evals import build_wrong_store, score_oracle_context
+from scripts.diagnose_kqa_run import diagnose_answers, diagnose_recall
+from scripts.run_kqa_evals import build_wrong_store, score_in_budget_groups
 from train.tokenizer import get_tok
 
 
@@ -116,20 +117,130 @@ def test_oracle_context_reduces_generation_budget_instead_of_truncating_prompt()
     )
     required = len(TOK.encode("Answer: x")) + 2
     context = len(TOK.encode(item.prompt)) + required
-    rows, summary = score_oracle_context(
+    rows, summary = score_in_budget_groups(
         _OpenLoop([TOK.encode("Answer: x") + [TOK.EOT]]),
         TOK,
         [item],
         CPU,
         {"item, value": True},
+        mode="dense",
+        organizer=None,
+        need_for=lambda _: 384,
         context=context,
-        requested_max_new=384,
         batch_size=1,
+        summary_mode="oracle_context",
     )
 
     assert rows[0]["correct"] is True
+    assert summary["mode"] == "oracle_context"
     assert summary["context_constrained_items"] == 1
     assert summary["generation_budget_min"] == required
+
+
+def test_short_items_are_not_given_the_longest_item_budget():
+    def make(qid, answer):
+        return QAItem(
+            qid=qid,
+            task="kqa",
+            prompt=f"Question: {qid}?\n",
+            answer=answer,
+            meta={
+                "support_keys": [],
+                "template": "Find|QueryAttr",
+                "skill": "What",
+                "program_length": 2,
+                "support_count": 0,
+            },
+        )
+
+    short, long = make("q1", "x"), make("q2", "y " * 400)
+    rows, summary = score_in_budget_groups(
+        _OpenLoop([TOK.encode("Answer: x") + [TOK.EOT]] * 2),
+        TOK,
+        [short, long],
+        CPU,
+        {},
+        mode="dense",
+        organizer=None,
+        need_for=lambda item: len(TOK.encode(f"Answer: {item.answer}")) + 32,
+        context=2048,
+        batch_size=2,
+    )
+
+    assert [row["qid"] for row in rows] == ["q1", "q2"]
+    assert summary["generation_budget_min"] == 64
+    assert summary["generation_budget_max"] > 400
+
+
+def test_transfer_scoring_ignores_invented_followup_pairs():
+    item = QAItem(
+        qid="q1",
+        task="kqa",
+        prompt="Question: capital of France?\n",
+        answer="Paris",
+        meta={
+            "support_keys": [],
+            "template": "Find|QueryAttr",
+            "skill": "What",
+            "program_length": 2,
+            "support_count": 0,
+        },
+    )
+    rambling = TOK.encode(
+        "Answer: Paris\nQuestion: capital of Italy?\nAnswer: Rome"
+    ) + [TOK.EOT]
+
+    rows, summary = score_kqa_transfer(
+        _OpenLoop([rambling]),
+        TOK,
+        [item],
+        mode="dense",
+        organizer=None,
+        device=CPU,
+        fact_availability_map={},
+        max_new=64,
+    )
+
+    assert rows[0]["pred"] == "Paris"
+    assert rows[0]["pred_trailing"] == "Rome"
+    assert summary["accuracy"] == 1.0
+
+
+def test_diagnose_recall_reports_address_mismatch():
+    organizer = Organizer()
+    organizer.add("107th United States Congress", "start time", "2001-01-03")
+    rows = [
+        {
+            "qid": "r1",
+            "fact_id": "107th united states congress, start time",
+            "correct": False,
+            "events": [{"query": "Kai Nakamura, major", "hit": False}],
+        }
+    ]
+
+    report = diagnose_recall(rows, organizer)
+    assert report["opened_a_lookup"] == 1
+    assert report["emitted_expected_address"] == 0
+    assert report["emitted_any_address_in_store"] == 0
+    assert report["copied_entity_correctly"] == 0
+    assert report["mismatch_samples"][0]["emitted"] == "kai nakamura, major"
+
+
+def test_diagnose_answers_quantifies_scoring_loss():
+    rows = [
+        {
+            "qid": "q1",
+            "answer": "Paris",
+            "generated": "Answer: Paris\nQuestion: and Italy?\nAnswer: Rome",
+        },
+        {"qid": "q2", "answer": "Rome", "generated": "Answer: Rome"},
+    ]
+
+    report = diagnose_answers(rows)
+    assert report["accuracy_first_answer"] == 1.0
+    assert report["accuracy_last_answer"] == 0.5
+    assert report["recovered_by_first_answer"] == 1
+    assert report["emitted_multiple_answer_tags"] == 1
 
 
 def test_wrong_store_changes_every_required_value():

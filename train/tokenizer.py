@@ -32,6 +32,7 @@ SPECIAL_TOKENS = {
 }
 
 VOCAB_SIZE = 50304
+_LAST_REAL_TOKEN = max(SPECIAL_TOKENS.values())
 
 
 class Tok:
@@ -54,7 +55,10 @@ class Tok:
         return self._enc.encode(text, allowed_special="all")
 
     def decode(self, ids: list[int]) -> str:
-        return self._enc.decode(ids)
+        # The model's vocabulary is padded to a multiple of 64, so it can emit
+        # ids above the last real token. Those slots carry no text; dropping
+        # them keeps one stray sample from aborting a whole evaluation.
+        return self._enc.decode([i for i in ids if i <= _LAST_REAL_TOKEN])
 
     def encode_segments(
         self, segments: list[Segment], add_eot: bool = True

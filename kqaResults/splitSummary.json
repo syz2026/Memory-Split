@@ -1,0 +1,642 @@
+{
+  "run": "split_kqa_split_s5ef89f21_e78a703d_t50000000_ca6f9387e",
+  "arm": "split",
+  "eval_set": "transfer",
+  "checkpoint": "model.pt",
+  "checkpoint_sha256": "3e43116533b929e20111957f96d91f821e601a6a60d2594bd9ffbf16c1577997",
+  "data_fingerprint": "e78a703d9b77c253e050a0a1a1594de5ebd606e708d4473d03086bee5a3b21e4",
+  "source_checkpoint_sha256": "5ef89f2159562e2ad01d40192e54f667ac3f8545d4e00739ff312e9562282e13",
+  "source_pair_id": "a12b25e6e7651a4c4833daff73250403297cbe5a62b4ebe739981c7fc702e645",
+  "code_commit": "5c881d982d11c8de12c41b963ac29ee455ea3e61",
+  "required_transfer_facts": 4015,
+  "recall": {
+    "mode": "on",
+    "accuracy": 0.0,
+    "n": 4015,
+    "lookup_stats": {
+      "n_lookups": 4003,
+      "n_hits": 0,
+      "n_misses": 4003,
+      "n_malformed": 25
+    }
+  },
+  "transfer_qa": {
+    "n": 2000,
+    "accuracy": 0.0005,
+    "facts_available_n": 0,
+    "facts_available_rate": 0.0,
+    "conditional_accuracy": 0.0,
+    "mean_support_coverage": 0.0,
+    "all_support_queried_rate": 0.0,
+    "mean_query_support_coverage": 0.0,
+    "by_skill": {
+      "Count": {
+        "accuracy": 0.0,
+        "n": 28
+      },
+      "QueryAttr": {
+        "accuracy": 0.0,
+        "n": 249
+      },
+      "QueryAttrQualifier": {
+        "accuracy": 0.0,
+        "n": 190
+      },
+      "QueryRelation": {
+        "accuracy": 0.0017730496453900709,
+        "n": 564
+      },
+      "QueryRelationQualifier": {
+        "accuracy": 0.0,
+        "n": 255
+      },
+      "SelectAmong": {
+        "accuracy": 0.0,
+        "n": 5
+      },
+      "SelectBetween": {
+        "accuracy": 0.0,
+        "n": 396
+      },
+      "VerifyNum": {
+        "accuracy": 0.0,
+        "n": 30
+      },
+      "VerifyStr": {
+        "accuracy": 0.0,
+        "n": 142
+      },
+      "VerifyYear": {
+        "accuracy": 0.0,
+        "n": 55
+      },
+      "What": {
+        "accuracy": 0.0,
+        "n": 86
+      }
+    },
+    "by_program_length": {
+      "2": {
+        "accuracy": 0.0,
+        "n": 239
+      },
+      "3": {
+        "accuracy": 0.0,
+        "n": 1078
+      },
+      "4": {
+        "accuracy": 0.0,
+        "n": 297
+      },
+      "5": {
+        "accuracy": 0.0,
+        "n": 103
+      },
+      "6": {
+        "accuracy": 0.004424778761061947,
+        "n": 226
+      },
+      "7": {
+        "accuracy": 0.0,
+        "n": 32
+      },
+      "8": {
+        "accuracy": 0.0,
+        "n": 15
+      },
+      "9": {
+        "accuracy": 0.0,
+        "n": 10
+      }
+    },
+    "by_support_count": {
+      "1": {
+        "accuracy": 0.0,
+        "n": 683
+      },
+      "2": {
+        "accuracy": 0.001182033096926714,
+        "n": 846
+      },
+      "3": {
+        "accuracy": 0.0,
+        "n": 289
+      },
+      "4": {
+        "accuracy": 0.0,
+        "n": 134
+      },
+      "5": {
+        "accuracy": 0.0,
+        "n": 18
+      },
+      "6": {
+        "accuracy": 0.0,
+        "n": 10
+      },
+      "7": {
+        "accuracy": 0.0,
+        "n": 8
+      },
+      "8": {
+        "accuracy": 0.0,
+        "n": 4
+      },
+      "10": {
+        "accuracy": 0.0,
+        "n": 3
+      },
+      "11": {
+        "accuracy": 0.0,
+        "n": 2
+      },
+      "12": {
+        "accuracy": 0.0,
+        "n": 1
+      },
+      "13": {
+        "accuracy": 0.0,
+        "n": 1
+      },
+      "14": {
+        "accuracy": 0.0,
+        "n": 1
+      }
+    },
+    "mode": "split",
+    "lookup_stats": {
+      "n_lookups": 1105,
+      "n_hits": 0,
+      "n_misses": 1105,
+      "n_malformed": 0
+    }
+  },
+  "transfer_qa_oracle_context": {
+    "n": 2000,
+    "accuracy": 0.0005,
+    "facts_available_n": 2000,
+    "facts_available_rate": 1.0,
+    "conditional_accuracy": 0.0005,
+    "mean_support_coverage": 1.0,
+    "by_skill": {
+      "Count": {
+        "accuracy": 0.0,
+        "n": 28
+      },
+      "QueryAttr": {
+        "accuracy": 0.0,
+        "n": 249
+      },
+      "QueryAttrQualifier": {
+        "accuracy": 0.0,
+        "n": 190
+      },
+      "QueryRelation": {
+        "accuracy": 0.0,
+        "n": 564
+      },
+      "QueryRelationQualifier": {
+        "accuracy": 0.0,
+        "n": 255
+      },
+      "SelectAmong": {
+        "accuracy": 0.0,
+        "n": 5
+      },
+      "SelectBetween": {
+        "accuracy": 0.0,
+        "n": 396
+      },
+      "VerifyNum": {
+        "accuracy": 0.0,
+        "n": 30
+      },
+      "VerifyStr": {
+        "accuracy": 0.007042253521126761,
+        "n": 142
+      },
+      "VerifyYear": {
+        "accuracy": 0.0,
+        "n": 55
+      },
+      "What": {
+        "accuracy": 0.0,
+        "n": 86
+      }
+    },
+    "by_program_length": {
+      "2": {
+        "accuracy": 0.0,
+        "n": 239
+      },
+      "3": {
+        "accuracy": 0.0,
+        "n": 1078
+      },
+      "4": {
+        "accuracy": 0.0,
+        "n": 297
+      },
+      "5": {
+        "accuracy": 0.0,
+        "n": 103
+      },
+      "6": {
+        "accuracy": 0.0,
+        "n": 226
+      },
+      "7": {
+        "accuracy": 0.0,
+        "n": 32
+      },
+      "8": {
+        "accuracy": 0.06666666666666667,
+        "n": 15
+      },
+      "9": {
+        "accuracy": 0.0,
+        "n": 10
+      }
+    },
+    "by_support_count": {
+      "1": {
+        "accuracy": 0.0,
+        "n": 683
+      },
+      "2": {
+        "accuracy": 0.0,
+        "n": 846
+      },
+      "3": {
+        "accuracy": 0.0,
+        "n": 289
+      },
+      "4": {
+        "accuracy": 0.007462686567164179,
+        "n": 134
+      },
+      "5": {
+        "accuracy": 0.0,
+        "n": 18
+      },
+      "6": {
+        "accuracy": 0.0,
+        "n": 10
+      },
+      "7": {
+        "accuracy": 0.0,
+        "n": 8
+      },
+      "8": {
+        "accuracy": 0.0,
+        "n": 4
+      },
+      "10": {
+        "accuracy": 0.0,
+        "n": 3
+      },
+      "11": {
+        "accuracy": 0.0,
+        "n": 2
+      },
+      "12": {
+        "accuracy": 0.0,
+        "n": 1
+      },
+      "13": {
+        "accuracy": 0.0,
+        "n": 1
+      },
+      "14": {
+        "accuracy": 0.0,
+        "n": 1
+      }
+    },
+    "mode": "oracle_context",
+    "lookup_stats": {
+      "n_lookups": 0,
+      "n_hits": 0,
+      "n_misses": 0,
+      "n_malformed": 0
+    },
+    "generation_budget_min": 31,
+    "generation_budget_max": 384,
+    "context_constrained_items": 1
+  },
+  "recall_off": {
+    "mode": "off",
+    "accuracy": 0.0,
+    "n": 4015,
+    "lookup_stats": {
+      "n_lookups": 0,
+      "n_hits": 0,
+      "n_misses": 0,
+      "n_malformed": 0
+    }
+  },
+  "transfer_qa_off": {
+    "n": 2000,
+    "accuracy": 0.0005,
+    "facts_available_n": 0,
+    "facts_available_rate": 0.0,
+    "conditional_accuracy": 0.0,
+    "mean_support_coverage": 0.0,
+    "by_skill": {
+      "Count": {
+        "accuracy": 0.0,
+        "n": 28
+      },
+      "QueryAttr": {
+        "accuracy": 0.0,
+        "n": 249
+      },
+      "QueryAttrQualifier": {
+        "accuracy": 0.0,
+        "n": 190
+      },
+      "QueryRelation": {
+        "accuracy": 0.0017730496453900709,
+        "n": 564
+      },
+      "QueryRelationQualifier": {
+        "accuracy": 0.0,
+        "n": 255
+      },
+      "SelectAmong": {
+        "accuracy": 0.0,
+        "n": 5
+      },
+      "SelectBetween": {
+        "accuracy": 0.0,
+        "n": 396
+      },
+      "VerifyNum": {
+        "accuracy": 0.0,
+        "n": 30
+      },
+      "VerifyStr": {
+        "accuracy": 0.0,
+        "n": 142
+      },
+      "VerifyYear": {
+        "accuracy": 0.0,
+        "n": 55
+      },
+      "What": {
+        "accuracy": 0.0,
+        "n": 86
+      }
+    },
+    "by_program_length": {
+      "2": {
+        "accuracy": 0.0,
+        "n": 239
+      },
+      "3": {
+        "accuracy": 0.0,
+        "n": 1078
+      },
+      "4": {
+        "accuracy": 0.0,
+        "n": 297
+      },
+      "5": {
+        "accuracy": 0.0,
+        "n": 103
+      },
+      "6": {
+        "accuracy": 0.004424778761061947,
+        "n": 226
+      },
+      "7": {
+        "accuracy": 0.0,
+        "n": 32
+      },
+      "8": {
+        "accuracy": 0.0,
+        "n": 15
+      },
+      "9": {
+        "accuracy": 0.0,
+        "n": 10
+      }
+    },
+    "by_support_count": {
+      "1": {
+        "accuracy": 0.0,
+        "n": 683
+      },
+      "2": {
+        "accuracy": 0.001182033096926714,
+        "n": 846
+      },
+      "3": {
+        "accuracy": 0.0,
+        "n": 289
+      },
+      "4": {
+        "accuracy": 0.0,
+        "n": 134
+      },
+      "5": {
+        "accuracy": 0.0,
+        "n": 18
+      },
+      "6": {
+        "accuracy": 0.0,
+        "n": 10
+      },
+      "7": {
+        "accuracy": 0.0,
+        "n": 8
+      },
+      "8": {
+        "accuracy": 0.0,
+        "n": 4
+      },
+      "10": {
+        "accuracy": 0.0,
+        "n": 3
+      },
+      "11": {
+        "accuracy": 0.0,
+        "n": 2
+      },
+      "12": {
+        "accuracy": 0.0,
+        "n": 1
+      },
+      "13": {
+        "accuracy": 0.0,
+        "n": 1
+      },
+      "14": {
+        "accuracy": 0.0,
+        "n": 1
+      }
+    },
+    "mode": "split_off",
+    "lookup_stats": {
+      "n_lookups": 0,
+      "n_hits": 0,
+      "n_misses": 0,
+      "n_malformed": 0
+    }
+  },
+  "transfer_qa_wrong_store": {
+    "n": 2000,
+    "accuracy": 0.0005,
+    "facts_available_n": 0,
+    "facts_available_rate": 0.0,
+    "conditional_accuracy": 0.0,
+    "mean_support_coverage": 0.0,
+    "all_support_queried_rate": 0.0,
+    "mean_query_support_coverage": 0.0,
+    "by_skill": {
+      "Count": {
+        "accuracy": 0.0,
+        "n": 28
+      },
+      "QueryAttr": {
+        "accuracy": 0.0,
+        "n": 249
+      },
+      "QueryAttrQualifier": {
+        "accuracy": 0.0,
+        "n": 190
+      },
+      "QueryRelation": {
+        "accuracy": 0.0017730496453900709,
+        "n": 564
+      },
+      "QueryRelationQualifier": {
+        "accuracy": 0.0,
+        "n": 255
+      },
+      "SelectAmong": {
+        "accuracy": 0.0,
+        "n": 5
+      },
+      "SelectBetween": {
+        "accuracy": 0.0,
+        "n": 396
+      },
+      "VerifyNum": {
+        "accuracy": 0.0,
+        "n": 30
+      },
+      "VerifyStr": {
+        "accuracy": 0.0,
+        "n": 142
+      },
+      "VerifyYear": {
+        "accuracy": 0.0,
+        "n": 55
+      },
+      "What": {
+        "accuracy": 0.0,
+        "n": 86
+      }
+    },
+    "by_program_length": {
+      "2": {
+        "accuracy": 0.0,
+        "n": 239
+      },
+      "3": {
+        "accuracy": 0.0,
+        "n": 1078
+      },
+      "4": {
+        "accuracy": 0.0,
+        "n": 297
+      },
+      "5": {
+        "accuracy": 0.0,
+        "n": 103
+      },
+      "6": {
+        "accuracy": 0.004424778761061947,
+        "n": 226
+      },
+      "7": {
+        "accuracy": 0.0,
+        "n": 32
+      },
+      "8": {
+        "accuracy": 0.0,
+        "n": 15
+      },
+      "9": {
+        "accuracy": 0.0,
+        "n": 10
+      }
+    },
+    "by_support_count": {
+      "1": {
+        "accuracy": 0.0,
+        "n": 683
+      },
+      "2": {
+        "accuracy": 0.001182033096926714,
+        "n": 846
+      },
+      "3": {
+        "accuracy": 0.0,
+        "n": 289
+      },
+      "4": {
+        "accuracy": 0.0,
+        "n": 134
+      },
+      "5": {
+        "accuracy": 0.0,
+        "n": 18
+      },
+      "6": {
+        "accuracy": 0.0,
+        "n": 10
+      },
+      "7": {
+        "accuracy": 0.0,
+        "n": 8
+      },
+      "8": {
+        "accuracy": 0.0,
+        "n": 4
+      },
+      "10": {
+        "accuracy": 0.0,
+        "n": 3
+      },
+      "11": {
+        "accuracy": 0.0,
+        "n": 2
+      },
+      "12": {
+        "accuracy": 0.0,
+        "n": 1
+      },
+      "13": {
+        "accuracy": 0.0,
+        "n": 1
+      },
+      "14": {
+        "accuracy": 0.0,
+        "n": 1
+      }
+    },
+    "mode": "split_wrong",
+    "lookup_stats": {
+      "n_lookups": 1105,
+      "n_hits": 0,
+      "n_misses": 1105,
+      "n_malformed": 0
+    },
+    "changed_required_facts": 4015,
+    "corruption_strategy_counts": {
+      "observed_relation_matched": 3307,
+      "synthetic_format_preserving": 708
+    }
+  }
+}

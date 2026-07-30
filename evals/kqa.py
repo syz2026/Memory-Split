@@ -6,7 +6,7 @@ import json
 from pathlib import Path
 
 from evals.generate import generate_batch_with_events
-from evals.scorers import normalize_answer, parse_answer
+from evals.scorers import normalize_answer, parse_answer, parse_first_answer
 from organizer.store import normalize
 
 
@@ -137,7 +137,8 @@ def score_kqa_transfer(
         )
         _add_stats(total, stats)
         for item, generated, events in zip(chunk, texts, event_rows):
-            prediction = parse_answer(generated)
+            prediction = parse_first_answer(generated)
+            trailing_prediction = parse_answer(generated)
             correct = prediction is not None and (
                 normalize_answer(prediction) == normalize_answer(item.answer)
             )
@@ -162,6 +163,7 @@ def score_kqa_transfer(
                     "qid": item.qid,
                     "correct": correct,
                     "pred": prediction,
+                    "pred_trailing": trailing_prediction,
                     "answer": item.answer,
                     "generated": generated,
                     "facts_available": all(availability.values()),

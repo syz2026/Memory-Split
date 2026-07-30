@@ -69,18 +69,90 @@ def load_model(run_dir: Path, checkpoint: str | None, device: str) -> GPT:
     return model.to(device).eval()
 
 
-def score_oracle_context(
+def _budget_tier(needed: int, available: int) -> int:
+    """Round a per-item need up to a coarse tier so batches stay large."""
+    return min(available, max(64, -(-needed // 64) * 64))
+
+
+def score_recall_in_budget_groups(
+    model,
+    tok,
+    probes: list[QAItem],
+    mode: str,
+    organizer,
+    device: str,
+    *,
+    context: int,
+    batch_size: int,
+    floor_max_new: int = 0,
+) -> tuple[list[dict], dict]:
+    """Recall probes sized individually rather than by the longest fact value."""
+    groups: dict[int, list[QAItem]] = defaultdict(list)
+    for probe in probes:
+        available_new = context - len(tok.encode(probe.prompt))
+        needed = max(
+            floor_max_new,
+            2
+            + len(tok.encode(probe.meta["query"]))
+            + len(tok.encode(" " + probe.answer))
+            + 9,
+        )
+        groups[_budget_tier(needed, available_new)].append(probe)
+
+    rows: list[dict] = []
+    total = {"n_lookups": 0, "n_hits": 0, "n_misses": 0, "n_malformed": 0}
+    for max_new, group in sorted(groups.items(), reverse=True):
+        group_rows, group_summary = score_kqa_recall(
+            model,
+            tok,
+            group,
+            mode,
+            organizer,
+            device,
+            max_new=max_new,
+            batch_size=batch_size,
+        )
+        rows.extend(group_rows)
+        for key in total:
+            total[key] += group_summary["lookup_stats"][key]
+
+    order = {probe.qid: index for index, probe in enumerate(probes)}
+    rows.sort(key=lambda row: order[row["qid"]])
+    summary = {
+        "mode": mode,
+        "accuracy": (
+            sum(row["correct"] for row in rows) / len(rows) if rows else 0.0
+        ),
+        "n": len(rows),
+        "lookup_stats": total,
+        "generation_budget_min": min(groups) if groups else 0,
+        "generation_budget_max": max(groups) if groups else 0,
+    }
+    return rows, summary
+
+
+def score_in_budget_groups(
     model,
     tok,
     items: list[QAItem],
     device: str,
-    available_facts: dict[str, bool],
+    fact_availability_map: dict[str, bool],
     *,
+    mode: str,
+    organizer,
+    need_for,
     context: int,
-    requested_max_new: int,
     batch_size: int,
+    floor_max_new: int = 0,
+    summary_mode: str | None = None,
 ) -> tuple[list[dict], dict]:
-    """Evaluate oracle prompts without truncating evidence near the context limit."""
+    """Score with a per-item generation budget instead of one global maximum.
+
+    A single global budget is the maximum over every item, so short questions
+    inherit the longest item's allowance and keep decoding long after their
+    answer. That wastes most of the evaluation's runtime and invites the model
+    to emit further invented question/answer pairs.
+    """
     groups: dict[int, list[QAItem]] = defaultdict(list)
     for item in items:
         prompt_tokens = len(tok.encode(item.prompt))
@@ -88,10 +160,11 @@ def score_oracle_context(
         required_new = len(tok.encode(f"Answer: {item.answer}")) + 2
         if available_new < required_new:
             raise SystemExit(
-                f"oracle evidence plus the labeled answer cannot fit context "
-                f"{context} for {item.qid}: needs {prompt_tokens + required_new}"
+                f"prompt plus the labeled answer cannot fit context {context} "
+                f"for {item.qid}: needs {prompt_tokens + required_new}"
             )
-        groups[min(requested_max_new, available_new)].append(item)
+        needed = max(need_for(item), floor_max_new, required_new)
+        groups[_budget_tier(needed, available_new)].append(item)
 
     rows: list[dict] = []
     total_stats = {
@@ -105,10 +178,10 @@ def score_oracle_context(
             model,
             tok,
             group,
-            mode="dense",
-            organizer=None,
+            mode=mode,
+            organizer=organizer,
             device=device,
-            fact_availability_map=available_facts,
+            fact_availability_map=fact_availability_map,
             max_new=max_new,
             batch_size=batch_size,
         )
@@ -121,14 +194,16 @@ def score_oracle_context(
     summary = summarize_transfer_rows(rows)
     summary.update(
         {
-            "mode": "oracle_context",
+            "mode": summary_mode or mode,
             "lookup_stats": total_stats,
             "generation_budget_min": min(groups) if groups else 0,
             "generation_budget_max": max(groups) if groups else 0,
             "context_constrained_items": sum(
                 len(group)
                 for budget, group in groups.items()
-                if budget < requested_max_new
+                for item in group
+                if budget
+                < max(need_for(item), floor_max_new)
             ),
         }
     )
@@ -194,7 +269,13 @@ def main() -> None:
     )
     parser.add_argument("--limit-qa", type=int, default=0)
     parser.add_argument("--batch-size", type=int, default=16)
-    parser.add_argument("--max-new", type=int, default=384)
+    parser.add_argument(
+        "--max-new",
+        type=int,
+        default=0,
+        help="floor on generated tokens per item; 0 sizes each item from its "
+        "own support lookups and answer",
+    )
     parser.add_argument("--device", default="auto")
     args = parser.parse_args()
 
@@ -271,22 +352,9 @@ def main() -> None:
     probe_by_fact = {
         normalize(probe.meta["fact_id"]): probe for probe in probes
     }
-    recall_max_new = max(
-        64,
-        max(
-            (
-                1
-                + len(tok.encode(probe.meta["query"]))
-                + 1
-                + len(tok.encode(" " + probe.answer))
-                + 1
-                + 8
-            )
-            for probe in probes
-        ),
-    )
-    required_qa_new = max(
-        (
+    def lookup_need(item: QAItem) -> int:
+        """Room for every support lookup this item may issue, plus its answer."""
+        return (
             sum(
                 1
                 + len(tok.encode(probe_by_fact[normalize(key)].meta["query"]))
@@ -298,14 +366,15 @@ def main() -> None:
             + len(tok.encode(f"Answer: {item.answer}"))
             + 32
         )
-        for item in qa_items
-    )
-    effective_qa_max_new = max(args.max_new, required_qa_new)
+
+    def answer_need(item: QAItem) -> int:
+        return len(tok.encode(f"Answer: {item.answer}")) + 32
+
     context = model.cfg.ctx
     too_long = [
         item.qid
         for item in qa_items
-        if len(tok.encode(item.prompt)) + effective_qa_max_new > context
+        if len(tok.encode(item.prompt)) + lookup_need(item) > context
     ]
     if too_long:
         raise SystemExit(
@@ -317,29 +386,32 @@ def main() -> None:
     out_dir = Path(args.out_dir) if args.out_dir else run_dir / default_out
     out_dir.mkdir(parents=True, exist_ok=True)
     recall_mode = "closed" if arm == "dense" else "on"
-    recall_rows, recall_summary = score_kqa_recall(
+    recall_rows, recall_summary = score_recall_in_budget_groups(
         model,
         tok,
         probes,
         recall_mode,
         organizer if arm == "split" else None,
         device,
-        max_new=recall_max_new,
+        context=context,
         batch_size=args.batch_size,
+        floor_max_new=args.max_new,
     )
     save_jsonl(recall_rows, out_dir / f"recall_{recall_mode}.jsonl")
     availability = fact_availability(recall_rows)
 
-    transfer_rows, transfer_summary = score_kqa_transfer(
+    transfer_rows, transfer_summary = score_in_budget_groups(
         model,
         tok,
         qa_items,
+        device,
+        availability,
         mode=arm,
         organizer=organizer if arm == "split" else None,
-        device=device,
-        fact_availability_map=availability,
-        max_new=effective_qa_max_new,
+        need_for=lookup_need,
+        context=context,
         batch_size=args.batch_size,
+        floor_max_new=args.max_new,
     )
     save_jsonl(transfer_rows, out_dir / "transfer_qa.jsonl")
 
@@ -360,15 +432,19 @@ def main() -> None:
                 meta=item.meta,
             )
         )
-    oracle_rows, oracle_summary = score_oracle_context(
+    oracle_rows, oracle_summary = score_in_budget_groups(
         model,
         tok,
         oracle_items,
         device,
         {key: True for key in required},
+        mode="dense",
+        organizer=None,
+        need_for=answer_need,
         context=context,
-        requested_max_new=args.max_new,
         batch_size=args.batch_size,
+        floor_max_new=args.max_new,
+        summary_mode="oracle_context",
     )
     save_jsonl(oracle_rows, out_dir / "transfer_qa_oracle_context.jsonl")
 
@@ -389,28 +465,31 @@ def main() -> None:
         "transfer_qa_oracle_context": oracle_summary,
     }
     if arm == "split":
-        unplugged_rows, unplugged_summary = score_kqa_recall(
+        unplugged_rows, unplugged_summary = score_recall_in_budget_groups(
             model,
             tok,
             probes,
             "off",
             None,
             device,
-            max_new=recall_max_new,
+            context=context,
             batch_size=args.batch_size,
+            floor_max_new=args.max_new,
         )
         save_jsonl(unplugged_rows, out_dir / "recall_off.jsonl")
         summary["recall_off"] = unplugged_summary
-        unplugged_transfer_rows, unplugged_transfer_summary = score_kqa_transfer(
+        unplugged_transfer_rows, unplugged_transfer_summary = score_in_budget_groups(
             model,
             tok,
             qa_items,
+            device,
+            fact_availability(unplugged_rows),
             mode="split_off",
             organizer=None,
-            device=device,
-            fact_availability_map=fact_availability(unplugged_rows),
-            max_new=effective_qa_max_new,
+            need_for=answer_need,
+            context=context,
             batch_size=args.batch_size,
+            floor_max_new=args.max_new,
         )
         save_jsonl(
             unplugged_transfer_rows, out_dir / "transfer_qa_off.jsonl"
@@ -420,16 +499,18 @@ def main() -> None:
             wrong_store, corruption, strategy = build_wrong_store(
                 facts_by_key, required
             )
-            wrong_rows, wrong_summary = score_kqa_transfer(
+            wrong_rows, wrong_summary = score_in_budget_groups(
                 model,
                 tok,
                 qa_items,
+                device,
+                availability,
                 mode="split_wrong",
                 organizer=wrong_store,
-                device=device,
-                fact_availability_map=availability,
-                max_new=effective_qa_max_new,
+                need_for=lookup_need,
+                context=context,
                 batch_size=args.batch_size,
+                floor_max_new=args.max_new,
             )
             save_jsonl(
                 wrong_rows, out_dir / "transfer_qa_wrong_store.jsonl"

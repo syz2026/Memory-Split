@@ -28,6 +28,25 @@ def parse_answer(text: str) -> str | None:
     return rest.strip()
 
 
+def parse_first_answer(text: str) -> str | None:
+    """Text after the FIRST 'Answer:', up to newline/EOT marker, stripped.
+
+    Answer-only corpora train one 'Question: ...\\nAnswer: ...' pair per
+    document, so a model that keeps generating past its own answer emits
+    further invented pairs. Scoring the last tag would grade one of those
+    hallucinated pairs instead of the response to the prompt.
+    """
+    idx = text.find(_ANSWER_TAG)
+    if idx == -1:
+        return None
+    rest = text[idx + len(_ANSWER_TAG) :]
+    for stop in ("\n", _EOT_MARKER):
+        cut = rest.find(stop)
+        if cut != -1:
+            rest = rest[:cut]
+    return rest.strip()
+
+
 def normalize_answer(s: str) -> str:
     """Lowercase, collapse whitespace, strip a trailing period."""
     s = " ".join(s.lower().split())

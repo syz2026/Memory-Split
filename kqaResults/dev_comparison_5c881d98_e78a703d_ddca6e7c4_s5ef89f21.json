@@ -1,0 +1,209 @@
+{
+  "contrast": "split - dense",
+  "all_test_questions": {
+    "delta": 0.0,
+    "ci_lo": 0.0,
+    "ci_hi": 0.0,
+    "n_items": 1000,
+    "n_clusters": 96,
+    "se": 0.0
+  },
+  "oracle_context": {
+    "split_minus_dense": {
+      "delta": 0.001,
+      "ci_lo": 0.0,
+      "ci_hi": 0.004405286343612335,
+      "n_items": 1000,
+      "n_clusters": 96,
+      "se": 0.0012784898657808852
+    },
+    "dense_oracle_minus_closed_book": {
+      "delta": 0.0,
+      "ci_lo": 0.0,
+      "ci_hi": 0.0,
+      "n_items": 1000,
+      "n_clusters": 96,
+      "se": 0.0
+    },
+    "split_oracle_minus_store_on": {
+      "delta": 0.001,
+      "ci_lo": 0.0,
+      "ci_hi": 0.004405286343612335,
+      "n_items": 1000,
+      "n_clusters": 96,
+      "se": 0.0012784898657808852
+    }
+  },
+  "both_systems_have_all_support_facts": null,
+  "n_both_available": 0,
+  "access_guardrails": {
+    "dense_direct_recall": {
+      "mode": "closed",
+      "accuracy": 0.0,
+      "n": 1786,
+      "lookup_stats": {
+        "n_lookups": 0,
+        "n_hits": 0,
+        "n_misses": 0,
+        "n_malformed": 0
+      }
+    },
+    "split_store_recall": {
+      "mode": "on",
+      "accuracy": 0.0,
+      "n": 1786,
+      "lookup_stats": {
+        "n_lookups": 1783,
+        "n_hits": 0,
+        "n_misses": 1783,
+        "n_malformed": 3
+      }
+    },
+    "split_store_off_recall": {
+      "mode": "off",
+      "accuracy": 0.0,
+      "n": 1786,
+      "lookup_stats": {
+        "n_lookups": 0,
+        "n_hits": 0,
+        "n_misses": 0,
+        "n_malformed": 0
+      }
+    },
+    "split_store_off_transfer_qa": {
+      "n": 1000,
+      "accuracy": 0.0,
+      "facts_available_n": 0,
+      "facts_available_rate": 0.0,
+      "conditional_accuracy": 0.0,
+      "mean_support_coverage": 0.0,
+      "by_skill": {
+        "Count": {
+          "accuracy": 0.0,
+          "n": 14
+        },
+        "QueryAttr": {
+          "accuracy": 0.0,
+          "n": 129
+        },
+        "QueryAttrQualifier": {
+          "accuracy": 0.0,
+          "n": 95
+        },
+        "QueryRelation": {
+          "accuracy": 0.0,
+          "n": 7
+        },
+        "QueryRelationQualifier": {
+          "accuracy": 0.0,
+          "n": 141
+        },
+        "SelectAmong": {
+          "accuracy": 0.0,
+          "n": 7
+        },
+        "SelectBetween": {
+          "accuracy": 0.0,
+          "n": 415
+        },
+        "VerifyDate": {
+          "accuracy": 0.0,
+          "n": 4
+        },
+        "VerifyNum": {
+          "accuracy": 0.0,
+          "n": 39
+        },
+        "VerifyStr": {
+          "accuracy": 0.0,
+          "n": 72
+        },
+        "VerifyYear": {
+          "accuracy": 0.0,
+          "n": 44
+        },
+        "What": {
+          "accuracy": 0.0,
+          "n": 33
+        }
+      },
+      "by_program_length": {
+        "2": {
+          "accuracy": 0.0,
+          "n": 186
+        },
+        "3": {
+          "accuracy": 0.0,
+          "n": 636
+        },
+        "4": {
+          "accuracy": 0.0,
+          "n": 98
+        },
+        "5": {
+          "accuracy": 0.0,
+          "n": 31
+        },
+        "6": {
+          "accuracy": 0.0,
+          "n": 42
+        },
+        "7": {
+          "accuracy": 0.0,
+          "n": 4
+        },
+        "8": {
+          "accuracy": 0.0,
+          "n": 3
+        }
+      },
+      "by_support_count": {
+        "1": {
+          "accuracy": 0.0,
+          "n": 235
+        },
+        "2": {
+          "accuracy": 0.0,
+          "n": 638
+        },
+        "3": {
+          "accuracy": 0.0,
+          "n": 75
+        },
+        "4": {
+          "accuracy": 0.0,
+          "n": 28
+        },
+        "5": {
+          "accuracy": 0.0,
+          "n": 14
+        },
+        "6": {
+          "accuracy": 0.0,
+          "n": 5
+        },
+        "7": {
+          "accuracy": 0.0,
+          "n": 4
+        },
+        "8": {
+          "accuracy": 0.0,
+          "n": 1
+        }
+      },
+      "mode": "split_off",
+      "lookup_stats": {
+        "n_lookups": 0,
+        "n_hits": 0,
+        "n_misses": 0,
+        "n_malformed": 0
+      }
+    },
+    "split_wrong_store_transfer_qa": null,
+    "split_store_on_minus_wrong_store": null,
+    "split_qa_support_query_coverage": {
+      "all_support_queried_rate": 0.0,
+      "mean_query_support_coverage": 0.0
+    }
+  }
+}
