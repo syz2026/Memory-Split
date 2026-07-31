@@ -24,11 +24,19 @@ class GPTConfig:
     ctx: int = 2048
     rope_base: float = 10000.0
     tie_embeddings: bool = False
+    n_recurrence: int = 1
 
     @property
     def head_dim(self) -> int:
         assert self.d_model % self.n_head == 0
         return self.d_model // self.n_head
+
+    @property
+    def effective_depth(self) -> int:
+        """Block applications per forward pass. Sets residual scaling and KV
+        cache size; the parameter count is unaffected."""
+        assert self.n_recurrence >= 1
+        return self.n_layer * self.n_recurrence
 
 
 PRESETS: dict[str, GPTConfig] = {
@@ -132,10 +140,14 @@ class Block(nn.Module):
 
 
 class KVCache:
-    """Opaque cache: per-layer (k, v) plus current position offset."""
+    """Opaque cache: one (k, v) slot per block application, plus position.
 
-    def __init__(self, n_layer: int):
-        self.kv: list[tuple | None] = [(None, None)] * n_layer
+    Under recurrence a block is visited more than once per forward pass and
+    each visit needs its own history, so there are effective_depth slots.
+    """
+
+    def __init__(self, n_slots: int):
+        self.kv: list[tuple | None] = [(None, None)] * n_slots
         self.pos: int = 0
 
 
@@ -153,7 +165,7 @@ class GPT(nn.Module):
         self.apply(self._init)
         for name, p in self.named_parameters():
             if name.endswith("wo.weight") or name.endswith("w2.weight"):
-                nn.init.normal_(p, mean=0.0, std=0.02 / math.sqrt(2 * cfg.n_layer))
+                nn.init.normal_(p, mean=0.0, std=0.02 / math.sqrt(2 * cfg.effective_depth))
         # Tie after _init so the shared tensor keeps the embedding's draw;
         # tying first would run _init over the same storage twice.
         if cfg.tie_embeddings:
@@ -177,8 +189,9 @@ class GPT(nn.Module):
         assert T <= self.cfg.ctx, f"sequence length {T} > ctx {self.cfg.ctx}"
         cos, sin = self.rope_cos[:T], self.rope_sin[:T]
         x = self.wte(idx)
-        for block in self.blocks:
-            x, _ = block(x, cos, sin)
+        for _ in range(self.cfg.n_recurrence):
+            for block in self.blocks:
+                x, _ = block(x, cos, sin)
         x = self.ln_f(x)
         logits = self.lm_head(x)
         loss = None
@@ -195,14 +208,17 @@ class GPT(nn.Module):
         """Prefill with cache=None and idx [B, T]; then step with idx [B, 1]."""
         B, T = idx.shape
         if cache is None:
-            cache = KVCache(self.cfg.n_layer)
+            cache = KVCache(self.cfg.effective_depth)
         pos = cache.pos
         assert pos + T <= self.cfg.ctx, "kv cache exceeded model context"
         cos, sin = self.rope_cos[pos : pos + T], self.rope_sin[pos : pos + T]
         x = self.wte(idx)
-        for i, block in enumerate(self.blocks):
-            x, new_kv = block(x, cos, sin, kv=cache.kv[i])
-            cache.kv[i] = new_kv
+        slot = 0
+        for _ in range(self.cfg.n_recurrence):
+            for block in self.blocks:
+                x, new_kv = block(x, cos, sin, kv=cache.kv[slot])
+                cache.kv[slot] = new_kv
+                slot += 1
         x = self.ln_f(x)
         logits = self.lm_head(x)
         cache.pos = pos + T

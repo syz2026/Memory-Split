@@ -82,3 +82,51 @@ def test_tied_model_trains_and_round_trips(tmp_path):
     m2 = GPT(GPTConfig(n_layer=2, n_head=2, d_model=64, ctx=64, tie_embeddings=True))
     m2.load_state_dict(torch.load(tmp_path / "m.pt", weights_only=True))
     assert m2.lm_head.weight is m2.wte.weight
+
+
+def test_recurrence_leaves_parameter_count_unchanged():
+    base = GPTConfig(n_layer=2, n_head=2, d_model=64, ctx=64)
+    deep = GPTConfig(n_layer=2, n_head=2, d_model=64, ctx=64, n_recurrence=3)
+    assert deep.effective_depth == 6
+    assert GPT(base).num_params() == GPT(deep).num_params()
+
+
+def test_recurrence_one_is_the_old_behaviour():
+    """R=1 must be bit-identical to the pre-change model, or the ladder breaks."""
+    torch.manual_seed(0)
+    a = GPT(GPTConfig(n_layer=2, n_head=2, d_model=64, ctx=64))
+    torch.manual_seed(0)
+    b = GPT(GPTConfig(n_layer=2, n_head=2, d_model=64, ctx=64, n_recurrence=1))
+    x = torch.randint(0, 50304, (2, 16))
+    with torch.no_grad():
+        la, _ = a(x)
+        lb, _ = b(x)
+    assert torch.equal(la, lb)
+
+
+def test_recurrence_changes_the_function():
+    torch.manual_seed(0)
+    a = GPT(GPTConfig(n_layer=2, n_head=2, d_model=64, ctx=64))
+    torch.manual_seed(0)
+    b = GPT(GPTConfig(n_layer=2, n_head=2, d_model=64, ctx=64, n_recurrence=3))
+    x = torch.randint(0, 50304, (2, 16))
+    with torch.no_grad():
+        la, _ = a(x)
+        lb, _ = b(x)
+    assert not torch.allclose(la, lb)
+
+
+def test_kv_cache_matches_full_forward_under_recurrence():
+    torch.manual_seed(1)
+    m = GPT(GPTConfig(n_layer=2, n_head=2, d_model=64, ctx=64, n_recurrence=3)).eval()
+    x = torch.randint(0, 50304, (2, 12))
+    with torch.no_grad():
+        full_logits, _ = m(x)
+        step_logits, cache = m.forward_step(x[:, :8], None)
+        outs = [step_logits[:, -1]]
+        for t in range(8, 12):
+            lg, cache = m.forward_step(x[:, t : t + 1], cache)
+            outs.append(lg[:, -1])
+    assert len(cache.kv) == 6
+    for i, t in enumerate(range(7, 12)):
+        assert torch.allclose(full_logits[:, t], outs[i], atol=2e-4), f"pos {t}"
