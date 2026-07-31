@@ -41,6 +41,12 @@ class GPTConfig:
 
 PRESETS: dict[str, GPTConfig] = {
     "toy": GPTConfig(n_layer=4, n_head=4, d_model=256),
+    # Tied embeddings are not a preference at this size, they are a
+    # requirement: an untied pair at vocab 50304 costs 12.9M parameters.
+    "d8m": GPTConfig(n_layer=7, n_head=4, d_model=128,
+                     tie_embeddings=True, n_recurrence=3),
+    "d40m": GPTConfig(n_layer=12, n_head=6, d_model=384,
+                      tie_embeddings=True, n_recurrence=2),
     "d160m": GPTConfig(n_layer=12, n_head=12, d_model=768),
     "d410m": GPTConfig(n_layer=24, n_head=16, d_model=1024),
     "d1b": GPTConfig(n_layer=22, n_head=14, d_model=1792),

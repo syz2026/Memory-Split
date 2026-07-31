@@ -84,6 +84,27 @@ def test_tied_model_trains_and_round_trips(tmp_path):
     assert m2.lm_head.weight is m2.wte.weight
 
 
+def test_tiny_preset_param_counts_are_exact():
+    """Exact, not banded: these numbers go into configs and documents."""
+    assert GPT(PRESETS["d8m"]).num_params() == 7_931_776
+    assert GPT(PRESETS["d40m"]).num_params() == 40_560_000
+
+
+def test_tiny_presets_are_shaped_as_designed():
+    d8, d40 = PRESETS["d8m"], PRESETS["d40m"]
+    assert (d8.n_layer, d8.n_head, d8.d_model) == (7, 4, 128)
+    assert (d40.n_layer, d40.n_head, d40.d_model) == (12, 6, 384)
+    assert d8.tie_embeddings and d40.tie_embeddings
+    assert d8.effective_depth == 21 and d40.effective_depth == 24
+    assert d8.head_dim == 32 and d40.head_dim == 64
+
+
+def test_existing_presets_are_untouched():
+    assert GPT(PRESETS["d160m"]).num_params() == 162_220_800
+    assert PRESETS["d160m"].n_recurrence == 1
+    assert not PRESETS["d160m"].tie_embeddings
+
+
 def test_recurrence_leaves_parameter_count_unchanged():
     base = GPTConfig(n_layer=2, n_head=2, d_model=64, ctx=64)
     deep = GPTConfig(n_layer=2, n_head=2, d_model=64, ctx=64, n_recurrence=3)
