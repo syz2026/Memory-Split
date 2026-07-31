@@ -87,6 +87,20 @@ def test_pairs_are_distinct_across_models(gen):
     assert a["model_parameters"] != b["model_parameters"]
 
 
+def test_extension_window_excludes_the_wrap_step():
+    import importlib.util
+    p = Path(__file__).resolve().parents[1] / "ops" / "cohort-tiny" / "analyze_crowding.py"
+    spec = importlib.util.spec_from_file_location("analyze_crowding", p)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    rows = [{"step": s, "loss": 1.0} for s in (13000, 14582, 15000, 15580)]
+    rows.append({"step": 15582, "loss": 99.0})       # wrapped, must be dropped
+    st = mod.extension_stats(rows)
+    assert st["n"] == 3
+    assert abs(st["mean"] - 1.0) < 1e-9
+    assert mod.EXT_START == 13582
+
+
 def test_generator_runs_standalone(tmp_path):
     corpus = tmp_path / "corpus"
     for rel in ("base/packed/targets.bin", "extension/packed/targets.bin",
