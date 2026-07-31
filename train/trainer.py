@@ -66,6 +66,7 @@ class Trainer:
             batch_size=self.micro_bs,
             device=self.device,
             seed=cfg["seed"],
+            probe_mask_path=cfg.get("probe_mask"),
         )
         self.max_steps = cfg.get("max_steps") or int(
             cfg["total_tokens"] // cfg["tokens_per_step"]
