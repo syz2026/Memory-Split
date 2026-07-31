@@ -4,11 +4,18 @@ __pycache__/
 .venv/
 .pytest_cache/
 .worktrees/
+.swarm/
 .DS_Store
 data/
-outputs/
+# Exclude the *contents* of outputs/, not the directory: git will not descend
+# into an excluded directory, so a "!" negation under `outputs/` never fires.
+outputs/*
 !outputs/manifests/
-!outputs/manifests/**
+# Pulled cluster results: primary data, not build output. The checkpoints stay
+# on the cluster; these are the logs and configs, which are all that survive it.
+!outputs/farmshare-160m-sweep/
+!outputs/farmshare-160m-v3-s0/
+!outputs/farmshare-tiny/
 *.bin
 *.npy
 *.pt

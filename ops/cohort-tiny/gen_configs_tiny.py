@@ -30,9 +30,11 @@ MAX_STEPS = TOTAL_TOKENS // TOKENS_PER_STEP
 SNAPSHOTS = [int(MAX_STEPS * f + 0.5) for f in (0.10, 0.25, 0.50, 0.75)] + [MAX_STEPS]
 SEED = 0
 
-# Frozen by the learning-rate probe (Task 7). Chosen on the DENSE arm only and
-# then applied to both, so the choice cannot favour either arm.
-LR = {"d8m": 3.0e-3, "d40m": 2.0e-3}
+# Frozen by the learning-rate probe, jobs 1670865 and 1670876, 2026-07-31.
+# Chosen on the DENSE arm only and then applied to both, so the choice cannot
+# favour either arm. Both are interior optima, bracketed above and below; see
+# outputs/farmshare-tiny/LR-PROBE.md for the full grid.
+LR = {"d8m": 1.2e-2, "d40m": 8.0e-3}
 
 MODELS = {
     "d8m": {"dims": {"n_layer": 7, "n_head": 4, "d_model": 128,
