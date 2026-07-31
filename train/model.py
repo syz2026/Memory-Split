@@ -23,6 +23,7 @@ class GPTConfig:
     vocab_size: int = 50304
     ctx: int = 2048
     rope_base: float = 10000.0
+    tie_embeddings: bool = False
 
     @property
     def head_dim(self) -> int:
@@ -153,6 +154,10 @@ class GPT(nn.Module):
         for name, p in self.named_parameters():
             if name.endswith("wo.weight") or name.endswith("w2.weight"):
                 nn.init.normal_(p, mean=0.0, std=0.02 / math.sqrt(2 * cfg.n_layer))
+        # Tie after _init so the shared tensor keeps the embedding's draw;
+        # tying first would run _init over the same storage twice.
+        if cfg.tie_embeddings:
+            self.lm_head.weight = self.wte.weight
 
     def _init(self, module):
         if isinstance(module, nn.Linear):

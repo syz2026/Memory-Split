@@ -61,3 +61,24 @@ def test_presets_param_counts():
 def test_device_property():
     m = tiny()
     assert m.device.type == "cpu"
+
+
+def test_tied_embeddings_share_one_tensor():
+    untied = GPT(GPTConfig(n_layer=2, n_head=2, d_model=64, ctx=64))
+    tied = GPT(GPTConfig(n_layer=2, n_head=2, d_model=64, ctx=64, tie_embeddings=True))
+    assert tied.lm_head.weight is tied.wte.weight
+    assert untied.lm_head.weight is not untied.wte.weight
+    # parameters() de-duplicates shared tensors, so the count drops by exactly V*D
+    assert untied.num_params() - tied.num_params() == 50304 * 64
+
+
+def test_tied_model_trains_and_round_trips(tmp_path):
+    m = GPT(GPTConfig(n_layer=2, n_head=2, d_model=64, ctx=64, tie_embeddings=True))
+    x = torch.randint(0, 50304, (2, 16))
+    _, loss = m(x, x.clone())
+    loss.backward()
+    assert m.wte.weight.grad is not None
+    torch.save(m.state_dict(), tmp_path / "m.pt")
+    m2 = GPT(GPTConfig(n_layer=2, n_head=2, d_model=64, ctx=64, tie_embeddings=True))
+    m2.load_state_dict(torch.load(tmp_path / "m.pt", weights_only=True))
+    assert m2.lm_head.weight is m2.wte.weight
