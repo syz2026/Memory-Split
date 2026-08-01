@@ -96,6 +96,9 @@ class Trainer:
         self.ckpt_seconds = cfg.get("ckpt_minutes", 30) * 60
         self.log_every = cfg.get("log_every", 20)
         self.eval_every = cfg.get("eval_every", 250)
+        # Configurable so the pilot can raise it until clipping stops binding.
+        # Removing the mechanism beats monitoring it.
+        self.grad_clip = float(cfg.get("grad_clip", 1.0))
         self._probe = None  # lazy masked-value probe batches
 
         with open(self.out_dir / "config.yaml", "w") as f:
@@ -170,6 +173,23 @@ class Trainer:
 
         return contextlib.nullcontext()
 
+    @torch.no_grad()
+    def _adam_v_mean(self) -> float:
+        """Mean AdamW second moment over all parameters.
+
+        Arms that differ in the entropy of their masked targets carry
+        different persistent gradient magnitudes, which shows up here before
+        it shows up anywhere else. Reported so optimizer differences between
+        arms are checkable rather than arguable.
+        """
+        total, n = 0.0, 0
+        for state in self.opt.state.values():
+            v = state.get("exp_avg_sq")
+            if v is not None:
+                total += float(v.sum())
+                n += v.numel()
+        return total / n if n else 0.0
+
     # --- loop ----------------------------------------------------------------
 
     def train_steps(self, n_steps: int | None = None) -> float:
@@ -180,6 +200,10 @@ class Trainer:
         t0 = time.time()
         tokens_seen = 0
         running = None
+        clip_norms: list[float] = []
+        clip_ratios: list[float] = []
+        n_clipped = 0
+        n_steps_done = 0
         while self.step < target:
             lr = cosine_lr(
                 self.step, self.cfg["lr"], self.cfg.get("warmup_steps", 300), self.max_steps
@@ -195,9 +219,23 @@ class Trainer:
                 (loss / self.accum).backward()
                 micro_losses.append(loss.item())
                 tokens_seen += x.numel()
-            torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+            gnorm = torch.nn.utils.clip_grad_norm_(
+                self.model.parameters(), self.grad_clip
+            )
+            gnorm = float(gnorm)
+            # Clipping is a live confound, not a nuisance. Masking fact values
+            # removes several times more gradient mass than masking template
+            # text at equal token count, so a binding clip scales the arms
+            # differently and manufactures an effect with no capacity freed.
+            # Record enough to check it: the pre-clip norm, whether the clip
+            # bound, and by how much it scaled the step.
+            ratio = min(1.0, self.grad_clip / gnorm) if gnorm > 0 else 1.0
+            clip_norms.append(gnorm)
+            clip_ratios.append(ratio)
+            n_clipped += int(gnorm > self.grad_clip)
             self.opt.step()
             self.step += 1
+            n_steps_done += 1
             step_loss = sum(micro_losses) / len(micro_losses)
             running = step_loss if running is None else 0.95 * running + 0.05 * step_loss
 
@@ -209,7 +247,19 @@ class Trainer:
                     "lr": lr,
                     "tok_s": round(tokens_seen / max(1e-9, time.time() - t0), 1),
                     "epoch": self.data.epoch,
+                    "grad_norm_preclip": round(
+                        sum(clip_norms) / max(1, len(clip_norms)), 4
+                    ),
+                    "clip_frac": round(n_clipped / max(1, n_steps_done), 4),
+                    "clip_ratio": round(
+                        sum(clip_ratios) / max(1, len(clip_ratios)), 4
+                    ),
+                    "adam_v_mean": round(self._adam_v_mean(), 8),
                 }
+                clip_norms.clear()
+                clip_ratios.clear()
+                n_clipped = 0
+                n_steps_done = 0
                 if self.step % self.eval_every == 0 or self.step == target:
                     mv = self.loss_masked_values()
                     if mv is not None:

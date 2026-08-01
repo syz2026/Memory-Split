@@ -17,6 +17,8 @@ resumed run continues on the exact next batch.
 
 from __future__ import annotations
 
+import hashlib
+
 from collections.abc import Sequence
 from pathlib import Path
 
@@ -114,11 +116,39 @@ class PackedShards:
         self.epoch = 0
         span = self.batch_size * (self.ctx + 1)
         assert self.n_tokens > span, "corpus smaller than one batch"
+        # Seed-dependent data order. `seed` used to be accepted and ignored,
+        # so every replicate read the identical byte stream in the identical
+        # order and seed variance was initialization-only -- all inference was
+        # conditional on one corpus realization. The stream is now rotated by a
+        # seed-derived, batch-aligned offset and reads wrap, so one epoch still
+        # covers every token exactly once while the order differs per seed.
+        # seed 0 is the canonical, unrotated order.
+        self.seed = seed
+        if seed == 0:
+            self.base_offset = 0
+        else:
+            stride = self.batch_size * self.ctx
+            n_blocks = max(1, self.n_tokens // stride)
+            digest = hashlib.sha256(f"data-order:{seed}".encode()).digest()
+            self.base_offset = (int.from_bytes(digest[:8], "big") % n_blocks) * stride
 
     def _window(self, start: int, length: int) -> tuple[np.ndarray, np.ndarray | None]:
-        length = min(length, self.n_tokens - start)
-        toks = self.tokens.read(start, length)
-        msk = self.mask.read(start, length) if self.mask is not None else None
+        """Read `length` tokens from logical position `start`, wrapping.
+
+        Logical position `p` maps to physical `(base_offset + p) % n_tokens`.
+        A window that straddles the wrap is stitched from two reads so the
+        rotation never drops or duplicates a token.
+        """
+        length = min(length, self.n_tokens)
+        phys = (self.base_offset + start) % self.n_tokens
+        head = min(length, self.n_tokens - phys)
+        toks = self.tokens.read(phys, head)
+        msk = self.mask.read(phys, head) if self.mask is not None else None
+        if head < length:
+            rest = length - head
+            toks = np.concatenate([toks, self.tokens.read(0, rest)])
+            if msk is not None:
+                msk = np.concatenate([msk, self.mask.read(0, rest)])
         return toks, msk
 
     def next_batch(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:

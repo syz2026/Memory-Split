@@ -47,6 +47,12 @@ PRESETS: dict[str, GPTConfig] = {
                      tie_embeddings=True, n_recurrence=3),
     "d40m": GPTConfig(n_layer=12, n_head=6, d_model=384,
                       tie_embeddings=True, n_recurrence=2),
+    # Same parameters as d40m, no weight sharing. A parameter used in two
+    # forward passes has an unknown capacity ratio, so bits-per-parameter
+    # against standard-GPT-2 literature is only defensible at n_recurrence=1.
+    # Costs effective depth 24 -> 12; the pilot decides which one to freeze.
+    "d40m_std": GPTConfig(n_layer=12, n_head=6, d_model=384,
+                          tie_embeddings=True, n_recurrence=1),
     "d160m": GPTConfig(n_layer=12, n_head=12, d_model=768),
     "d410m": GPTConfig(n_layer=24, n_head=16, d_model=1024),
     "d1b": GPTConfig(n_layer=22, n_head=14, d_model=1792),
