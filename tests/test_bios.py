@@ -198,3 +198,39 @@ def test_recall_prompt_not_a_training_template_prefix():
                 for surface in _surfaces(rec):
                     rendered = prefix.format(name=surface).rstrip()
                     assert rendered != p.prompt.rstrip()
+
+
+def test_marked_rendering_is_the_same_text_as_dense():
+    """render_bio_marked must be a re-segmentation of the dense text, not a
+    different rendering: the v3 convention needs one stream for both arms."""
+    from corpusgen.bios import generate_records, render_bio_doc, render_bio_marked
+
+    for rec in generate_records(25, seed=3):
+        for exposure in (0, 1, 37, 199):
+            doc = render_bio_doc(rec, exposure)
+            marked = render_bio_marked(rec, exposure)
+            assert "".join(t for t, _ in marked) == doc.dense_text()
+
+
+def test_marked_rendering_masks_exactly_the_attribute_values():
+    from corpusgen.bios import generate_records, render_bio_marked
+    from corpusgen.records import ATTRIBUTES
+
+    for rec in generate_records(25, seed=4):
+        for exposure in (0, 5, 199):
+            marked = render_bio_marked(rec, exposure)
+            masked = [t.strip() for t, m in marked if m]
+            assert sorted(masked) == sorted(rec.attrs[a] for a in ATTRIBUTES)
+            # no value leaks into an unmasked segment
+            plain = "".join(t for t, m in marked if not m)
+            for a in ATTRIBUTES:
+                assert rec.attrs[a] not in plain, (a, rec.attrs[a])
+
+
+def test_two_hundred_exposures_are_distinct_surface_forms():
+    """200 exposures of one fact must not be 200 copies of one sentence."""
+    from corpusgen.bios import generate_records, render_bio_doc
+
+    rec = generate_records(1, seed=5)[0]
+    texts = {render_bio_doc(rec, e).dense_text() for e in range(200)}
+    assert len(texts) == 200

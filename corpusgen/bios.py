@@ -407,17 +407,47 @@ def render_bio_doc(rec: BioRecord, exposure_idx: int) -> Doc:
     String seeding uses random.Random(str) which hashes the string bytes
     (PYTHONHASHSEED-independent), so renders are stable across processes.
     """
+    dense_marked, split_segs = _render_bio_parts(rec, exposure_idx)
+    return Doc(
+        kind="bio",
+        dense_segments=[("".join(t for t, _ in dense_marked), False)],
+        split_segments=split_segs,
+        meta={"entity_id": rec.entity_id, "exposure": exposure_idx},
+    )
+
+
+def render_bio_marked(rec: BioRecord, exposure_idx: int) -> list[Segment]:
+    """The dense text, segmented so attribute values carry masked=True.
+
+    Setup A gives the two arms different text: the split rendering inserts
+    lookup markers, so the streams diverge. The reasoning-v3 convention is the
+    opposite -- one byte-identical stream for both arms, differing only in a
+    target-weight sidecar. This returns the rendering that convention needs:
+    exactly `render_bio_doc(...).dense_text()`, with the six attribute values
+    marked so a sidecar can zero them.
+    """
+    dense_marked, _ = _render_bio_parts(rec, exposure_idx)
+    return dense_marked
+
+
+def _render_bio_parts(
+    rec: BioRecord, exposure_idx: int
+) -> tuple[list[Segment], list[Segment]]:
+    """Shared body: (dense text with values marked, Setup A split rendering)."""
     rng = random.Random(f"bio:{rec.entity_id}:{exposure_idx}")
     ordering = ATTRIBUTE_ORDERINGS[rng.randrange(len(ATTRIBUTE_ORDERINGS))]
     surfaces = _surface_forms(rec.name)
 
-    dense_parts: list[str] = []
+    dense_marked: list[Segment] = []
     split_segs: list[Segment] = []
 
     def push_plain(text: str) -> None:
         if not text:
             return
-        dense_parts.append(text)
+        if dense_marked and dense_marked[-1][1] is False:
+            dense_marked[-1] = (dense_marked[-1][0] + text, False)
+        else:
+            dense_marked.append((text, False))
         if split_segs and split_segs[-1][1] is False:
             split_segs[-1] = (split_segs[-1][0] + text, False)
         else:
@@ -438,7 +468,7 @@ def render_bio_doc(rec: BioRecord, exposure_idx: int) -> Doc:
         lead = "" if pos == 0 else " "
         # prefix ends with " "; the masked value segment carries that space
         push_plain(lead + prefix[:-1])
-        dense_parts.append(" " + value)
+        dense_marked.append((" " + value, True))
         for seg_text, masked in lookup_segments(rec.name, attr, value):
             if masked:
                 split_segs.append((seg_text, True))
@@ -446,12 +476,7 @@ def render_bio_doc(rec: BioRecord, exposure_idx: int) -> Doc:
                 push_seg_plain_only_to_split(split_segs, seg_text)
         push_plain(suffix)
 
-    return Doc(
-        kind="bio",
-        dense_segments=[("".join(dense_parts), False)],
-        split_segments=split_segs,
-        meta={"entity_id": rec.entity_id, "exposure": exposure_idx},
-    )
+    return dense_marked, split_segs
 
 
 def push_seg_plain_only_to_split(split_segs: list[Segment], text: str) -> None:
