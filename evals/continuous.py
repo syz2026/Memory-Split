@@ -117,7 +117,6 @@ def score_items_continuous(
     device,
     batch_size: int = 16,
     metrics: tuple[str, ...] = ("m1", "m2", "m3"),
-    organizer=None,
     max_new: int = 384,
 ) -> tuple[list[dict], dict]:
     """Continuous metrics per QAItem. Returns (rows, agg).
@@ -164,12 +163,12 @@ def score_items_continuous(
             rows[i]["m2_nll"] = -mean_lp
 
     if "m3" in metrics:
-        from evals.generate import generate_batch_with_stats
+        from evals.generate import generate_batch
 
         for lo in range(0, len(items), batch_size):
             chunk = items[lo : lo + batch_size]
-            texts, _ = generate_batch_with_stats(
-                model, tok, [it.prompt for it in chunk], max_new, organizer, device
+            texts = generate_batch(
+                model, tok, [it.prompt for it in chunk], max_new, device
             )
             answer_pairs, answer_idxs = [], []
             for j, (it, gen) in enumerate(zip(chunk, texts)):

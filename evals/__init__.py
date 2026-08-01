@@ -1,3 +1,2 @@
-"""Evaluation harness: batched greedy generation with organizer lookup
-interception, answer scorers, recall/bits accounting, natural benchmarks,
-paired statistics, and the dose-response figure."""
+"""Evaluation harness: batched greedy generation, answer scorers,
+recoverable-bits accounting, paired statistics, and figures."""

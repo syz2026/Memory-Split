@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from evals.generate import generate_batch_with_stats
+from evals.generate import generate_batch
 
 _ANSWER_TAG = "Answer:"
 _EOT_MARKER = "<|eot|>"
@@ -38,26 +38,22 @@ def score_items(
     model,
     tok,
     items,
-    organizer,
     device,
     max_new: int = 384,
     batch_size: int = 16,
-) -> tuple[list[dict], dict]:
+) -> list[dict]:
     """Greedy-generate for each QAItem prompt and exact-match the parsed answer.
 
-    Returns (rows, stats): one row per item
-    {qid, task, correct, pred, answer, meta} plus the lookup stats
-    aggregated over all batches.
+    Returns one row per item: {qid, task, correct, pred, answer, meta}. Rows
+    carry `answer` and `pred` so per-class and per-op breakdowns are
+    recoverable post hoc without rerunning generation.
     """
     rows: list[dict] = []
-    total = {"n_lookups": 0, "n_hits": 0, "n_misses": 0, "n_malformed": 0}
     for lo in range(0, len(items), batch_size):
         chunk = items[lo : lo + batch_size]
-        texts, stats = generate_batch_with_stats(
-            model, tok, [it.prompt for it in chunk], max_new, organizer, device
+        texts = generate_batch(
+            model, tok, [it.prompt for it in chunk], max_new, device
         )
-        for k in total:
-            total[k] += stats[k]
         for it, gen in zip(chunk, texts):
             pred = parse_answer(gen)
             correct = pred is not None and (
@@ -73,7 +69,7 @@ def score_items(
                     "meta": it.meta,
                 }
             )
-    return rows, total
+    return rows
 
 
 def save_results(rows: list[dict], path: str | Path) -> None:

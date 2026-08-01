@@ -1,61 +1,90 @@
-# MemorySplit — Schemas in Weights, Facts in the Organizer
+# Does masking fact targets buy reasoning?
 
-Does a small LM trained with facts offloaded to an external knowledge
-organizer learn better reasoning than a dense twin at the same parameter
-and token budget? A controlled fact-load dose-response experiment
-(LMLM-style loss-masked lookups, arXiv 2505.15962) at 160M/410M scale with
-a 1B stretch pair. Deliverable: a measured reasoning delta or a defensible
-null.
+A controlled test of the belief that factual memorisation competes with
+reasoning for parameters in small language models — the belief the phi-3 team
+cites when filtering fact-heavy pages from training data. The training-time
+mechanism is LMLM-style (arXiv 2505.15962): fact values are present in the
+context but excluded from the loss.
 
-- **Design spec:** `docs/superpowers/specs/2026-07-17-memory-split-design.md`
-- **Implementation plan:** `docs/superpowers/plans/2026-07-17-memory-split.md`
-- **Research dossier:** `docs/superpowers/research/2026-07-17-memory-split/`
+## The estimand, stated exactly
+
+The primary quantity is
+
+```
+effect = Y[FACTMASK] - Y[RANDPOS]
+```
+
+the effect of masking fact-value targets rather than an equal mass of matched
+non-value targets, measured on closed-book iGSM accuracy, in a 40.6M-parameter
+tied-embedding decoder with 21.2M non-embedding parameters, trained at ~141
+tokens per parameter on one controlled corpus.
+
+**Capacity reallocation is an interpretation of that quantity, not the quantity
+itself, and this design does not identify it.** Masking removes competing
+gradients whether or not any parameter was ever occupied, so gradient
+interference predicts the same sign and the same monotone dose trend. The
+mitigations are a shape test across fact loads and a gradient-mass
+decomposition; both are consistency evidence, not identification.
+
+Nothing here licenses a claim about "small language models" generally, or about
+phi-3, which is 100x larger.
+
+## Design
+
+One byte-identical `uint16` token stream per fact load. The three arms are
+three `uint8` target-weight sidecars over that stream:
+
+| Arm | Sidecar |
+|---|---|
+| `SUP` | all ones — manipulation check and load main effect |
+| `FACTMASK` | zero on fact-value targets |
+| `RANDPOS` | zero on non-value spans matched on mass, span length, relative position and token NLL |
+
+The arms cannot differ through anything except which targets earn gradient.
+There is no external store at training or evaluation time.
+
+Fact load varies by trading entities against exposures — high load is `N`
+entities at `E` exposures, low load is `0.3N` at `E/0.3` — so document count,
+total tokens, optimizer steps, mask mass and mask positions are all identical
+across loads and only the unique-entropy ceiling moves. That decouples fact
+load from exposures per fact, which is the confound that invalidated the
+earlier dose sweep.
 
 ## Layout
 
 ```
-corpusgen/    seeded generators: biographies (the dose), iGSM-lite math,
-              rule deduction, fact-use QA; emits dense + split renderings,
-              the organizer KV table, and held-out eval sets
-organizer/    exact-match (entity, relation) -> value store + query grammar
-train/        tokenizer (GPT-2 BPE + 4 special tokens), GPT model,
-              memmap+mask dataloader, AdamW trainer with checkpoint/resume
-evals/        generative scorers with lookup interception, recall probes,
-              bits-in-weights accounting, natural benchmarks, paired stats,
-              dose-response figure
-configs/      YAML per run: {scale} x {arm} x {load} x {seed}
-scripts/      build_corpus.py, run_train.py, run_evals.py, analyze.py, smoke_test.py
-cluster/      FarmShare (Slurm) scaffolding: sync, env, sbatch templates
-tests/        pytest suite; `python -m pytest` runs offline in <1 min
+corpusgen/   biography records (the fact load), iGSM-lite and Horn-clause
+             deduction generators with independent oracles
+train/       GPT-2 BPE tokenizer, decoder-only GPT, memmap + sidecar loader,
+             AdamW trainer with checkpoint/resume
+evals/       greedy decoding, answer scorers, recoverable-bits accounting,
+             paired statistics and the frozen verdict
+ops/         corpus builder, config generation, Slurm submission
+cluster/     FarmShare environment setup and sync
+docs/        PREREGISTRATION.md, RETAINED-RESULTS.md, POPQA-HELDOUT-KEY.md
+outputs/     retained results only; see docs/RETAINED-RESULTS.md
+tests/       pytest suite, runs offline
 ```
 
-## Quick start (local, macOS)
+## Quick start
 
 ```bash
 uv venv .venv --python 3.12
 uv pip install -r requirements.txt --python .venv/bin/python
 export PYTHONPATH=.
-.venv/bin/python -m pytest tests -q          # offline unit tests
-.venv/bin/python scripts/smoke_test.py       # end-to-end toy pilot (CPU/MPS)
+.venv/bin/python -m pytest tests -q
 ```
 
-The smoke test builds a toy corpus (500 entities), trains dense and split
-toy models for a few hundred steps, and asserts the mechanism: split-arm
-loss on masked fact values stays near-uniform while dense bio loss falls.
+## Results
 
-## Cluster (FarmShare)
+**Read `docs/RETAINED-RESULTS.md` before citing any number.** It catalogues
+every artifact-backed result with its hash and states what each can and cannot
+support. A number that does not appear there has no artifact behind it and is
+withdrawn.
 
-```bash
-bash cluster/connect.sh <sunetid>            # warm SSH control socket (Duo)
-bash cluster/sync_push.sh                    # rsync repo to /scratch/users/$USER/memorysplit
-ssh <sunetid>@rice-04.farmshare.stanford.edu
-cd /scratch/users/$USER/memorysplit
-bash cluster/setup_env.sh                    # venv + torch cu13 + deps
-sbatch cluster/slurm/data_prep.sbatch        # FineWeb-Edu download + corpus build
-python scripts/make_manifest.py --stage sweep   # emits run manifest
-bash cluster/submit_manifest.sh outputs/manifests/sweep.tsv
-```
-
-Runs checkpoint every 30 min and are requeue-safe (2-day MaxWall). Gate
-runs, the preregistration freeze, and the kill order are specified in the
-design spec §7.
+One caveat applies to everything measured before this repository state: the
+loss was computed with `reduction='mean'` over surviving targets, so masking
+silently multiplied every remaining target's weight by `1/(1-f)`. Every masked
+arm therefore trained under a different effective objective than its dense
+twin, over and above the masking. Those runs remain evidence that masking keeps
+values out of the weights; they are not valid arm contrasts.

@@ -76,3 +76,23 @@ def test_cosine_schedule():
     assert abs(cosine_lr(10, 1.0, 10, 100) - 1.0) < 0.01
     assert cosine_lr(99, 1.0, 10, 100) < 0.2
     assert cosine_lr(150, 1.0, 10, 100) == 0.1
+
+
+def test_segmented_corpus_config_trains(tmp_path):
+    """Every cohort config passes train_bin/train_mask as a base+extension pair.
+    Drive that shape through the real Trainer, not just the loader."""
+    base, ext = tmp_path / "base", tmp_path / "ext"
+    base.mkdir()
+    ext.mkdir()
+    bp_a, mp_a = write_corpus(base, n=30000, seed=0)
+    bp_b, mp_b = write_corpus(ext, n=10000, seed=1)
+
+    cfg = base_cfg(tmp_path, bp_a, mp_a)
+    cfg["train_bin"] = [str(bp_a), str(bp_b)]
+    cfg["train_mask"] = [str(mp_a), str(mp_b)]
+    tr = Trainer(cfg)
+    assert tr.data.n_tokens == 40000
+
+    tr.train_steps()
+    rows = [json.loads(line) for line in open(tr.log_path)]
+    assert rows[-1]["loss_ema"] < rows[0]["loss"] * 0.8

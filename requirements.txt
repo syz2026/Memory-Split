@@ -10,3 +10,5 @@ datasets>=2.19
 huggingface_hub>=0.23
 # Tests
 pytest>=8.0
+# torch's _sympy shim needs >=1.13.3; 1.8 breaks torch.compile
+sympy>=1.13.3

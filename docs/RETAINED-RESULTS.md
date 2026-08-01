@@ -142,7 +142,7 @@ loss-normalization caveat.
 
 ## 6. PopQA held-out key construction
 
-`docs/superpowers/2026-07-21-heldout-key-fix-results.md`.
+`docs/POPQA-HELDOUT-KEY.md`.
 
 **Supports.** A clean negative on transfer to real entities: the model learned
 which relation to request (98.5% against a 6.25% baseline) and failed to learn

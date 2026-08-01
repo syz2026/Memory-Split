@@ -1,14 +1,11 @@
-"""Tests for evals.scorers (answer parsing, end-to-end scoring, jsonl I/O)
-and the pure log-likelihood helper from evals.natural (offline)."""
+"""Tests for evals.scorers: answer parsing, end-to-end scoring, jsonl I/O."""
 
 import json
-import math
 
 import pytest
 import torch
 
 from corpusgen.records import QAItem
-from evals.natural import loglikelihood_choice_scores
 from evals.scorers import normalize_answer, parse_answer, save_results, score_items
 from train.tokenizer import get_tok
 
@@ -106,29 +103,26 @@ def _programs():
 
 def test_score_items_end_to_end():
     model = OpenLoopStub(_programs())
-    rows, stats = score_items(model, TOK, _items(), organizer=None, device=CPU)
+    rows = score_items(model, TOK, _items(), device=CPU)
     assert [r["qid"] for r in rows] == ["q1", "q2"]
     assert [r["correct"] for r in rows] == [True, False]
     assert rows[0]["pred"] == "19" and rows[0]["answer"] == "19"
     assert rows[1]["pred"] == "11" and rows[1]["answer"] == "12"
     assert rows[0]["task"] == "igsm"
     assert rows[0]["meta"] == {"template": "t0"}
-    assert stats == {"n_lookups": 0, "n_hits": 0, "n_misses": 0, "n_malformed": 0}
 
 
 def test_score_items_batches_chunked():
     # batch_size=1 forces two prefills; stub cursor hands out programs in order
     model = OpenLoopStub(_programs())
-    rows, _ = score_items(
-        model, TOK, _items(), organizer=None, device=CPU, batch_size=1
-    )
+    rows = score_items(model, TOK, _items(), device=CPU, batch_size=1)
     assert [r["correct"] for r in rows] == [True, False]
 
 
 def test_score_items_unparseable_prediction():
     prog = TOK.encode(" rambling with no final line") + [TOK.EOT]
     item = QAItem(qid="q", task="igsm", prompt="P. Reasoning:", answer="5", meta={})
-    rows, _ = score_items(OpenLoopStub([prog]), TOK, [item], organizer=None, device=CPU)
+    rows = score_items(OpenLoopStub([prog]), TOK, [item], device=CPU)
     assert rows[0]["correct"] is False
     assert rows[0]["pred"] is None
 
@@ -147,64 +141,3 @@ def test_save_results_round_trip(tmp_path):
     save_results(rows, path)
     loaded = [json.loads(line) for line in path.read_text().splitlines()]
     assert loaded == rows
-
-
-# ------------------------------------------- natural: pure scoring helper
-
-
-class UniformModel:
-    """forward() returns all-zero logits => uniform distribution over V."""
-
-    device = CPU
-
-    def forward(self, idx):
-        B, T = idx.shape
-        return torch.zeros(B, T, V), None
-
-
-def test_loglikelihood_choice_scores_uniform():
-    choices = [" yes", " absolutely certain today"]
-    out = loglikelihood_choice_scores(UniformModel(), TOK, "The verdict is", choices, CPU)
-    lp_tok = -math.log(V)
-    n0 = len(TOK.encode(choices[0]))
-    n1 = len(TOK.encode(choices[1]))
-    assert n0 != n1  # exercises mixed lengths in one padded batch
-    (s0, m0), (s1, m1) = out
-    assert math.isclose(s0, n0 * lp_tok, rel_tol=1e-5)
-    assert math.isclose(s1, n1 * lp_tok, rel_tol=1e-5)
-    assert math.isclose(m0, lp_tok, rel_tol=1e-5)
-    assert math.isclose(m1, lp_tok, rel_tol=1e-5)
-
-
-class BiasedModel:
-    """Puts extra logit mass on one token id at every position."""
-
-    device = CPU
-
-    def __init__(self, fav_id):
-        self.fav_id = fav_id
-
-    def forward(self, idx):
-        B, T = idx.shape
-        logits = torch.zeros(B, T, V)
-        logits[:, :, self.fav_id] = 5.0
-        return logits, None
-
-
-def test_loglikelihood_choice_scores_prefers_favored_token():
-    fav = TOK.encode(" yes")[0]
-    out = loglikelihood_choice_scores(BiasedModel(fav), TOK, "The verdict is",
-                                      [" yes", " no"], CPU)
-    assert out[0][0] > out[1][0]
-
-
-@pytest.mark.slow
-def test_run_natural_suite_smoke():
-    """Needs network (HF datasets). Excluded by default via -m 'not slow'."""
-    from evals.natural import run_natural_suite
-
-    out = run_natural_suite(UniformModel(), TOK, CPU, tasks=("piqa",), limit=4)
-    assert "piqa" in out
-    for key in ("acc", "acc_norm", "correct_prob", "n"):
-        assert key in out["piqa"]
-    assert 0.0 <= out["piqa"]["acc"] <= 1.0
