@@ -1,0 +1,12 @@
+[2026-07-30T20:43:33Z] seed 0 starting on oat-01, job 1669507
+0, NVIDIA L40S, 46068 MiB
+1, NVIDIA L40S, 46068 MiB
+[2026-07-30T20:43:33Z] pair preflight ok: arms agree on model, batch, lr, ctx, max_steps
+[2026-07-30T20:43:33Z]   dense resuming from step 
+[2026-07-30T20:43:33Z]   split90 resuming from step 
+[2026-07-30T20:43:33Z]   gpu0 <- d160m_dense_s0 (pid 478786)
+[2026-07-30T20:43:33Z]   gpu1 <- d160m_split90_s0 (pid 478789)
+[2026-07-31T13:33:53Z]   OK   d160m_dense_s0
+[2026-07-31T13:33:53Z]   OK   d160m_split90_s0
+[2026-07-31T13:33:53Z] seed 0 at dense=15582 split90=15582 of 15582
+[2026-07-31T13:33:53Z] seed 0 COMPLETE

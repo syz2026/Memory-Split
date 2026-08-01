@@ -1,0 +1,51 @@
+schema_version: 1
+cohort_id: memorysplit-exploratory-v3-tiny-crowding-n1
+run_id: d8m_split90_reasoning_v3_s0
+pair_id: d8m_reasoning_v3_s0
+model: d8m
+model_parameters: 7931776
+arm: split90
+seed: 0
+operator: farmshare-operator
+provider: farmshare-slurm
+ctx: 1024
+train_bin:
+- /scratch/users/syz/memorysplit-160m-v3/corpus/base/packed/targets.bin
+- /scratch/users/syz/memorysplit-160m-v3/corpus/extension/packed/targets.bin
+train_mask:
+- /scratch/users/syz/memorysplit-160m-v3/corpus/base/sidecars/split90_target_weights.bin
+- /scratch/users/syz/memorysplit-160m-v3/corpus/extension/sidecars/shared_target_weights.bin
+probe_mask:
+- /scratch/users/syz/memorysplit-160m-v3/corpus/base/sidecars/split90_target_weights.bin
+- /scratch/users/syz/memorysplit-160m-v3/corpus/extension/sidecars/shared_target_weights.bin
+total_tokens: 8169455616
+tokens_per_step: 524288
+max_steps: 15582
+micro_batch_size: 32
+lr: 0.012
+warmup_steps: 300
+weight_decay: 0.1
+compile: true
+device: cuda
+out_dir: /scratch/users/syz/memorysplit-160m-v3/runs/tiny-v3/d8m_split90_reasoning_v3_s0
+log_every: 20
+eval_every: 250
+snap_frac: 0.1
+ckpt_minutes: 10
+checkpoint_updates:
+- 1558
+- 3896
+- 7791
+- 11687
+- 15582
+dataset:
+  contract_id: memorysplit-reasoning-dataset-v3
+  complete_dataset: true
+  packed_targets:
+  - /scratch/users/syz/memorysplit-160m-v3/corpus/base/packed/targets.bin
+  - /scratch/users/syz/memorysplit-160m-v3/corpus/extension/packed/targets.bin
+  target_weights:
+  - /scratch/users/syz/memorysplit-160m-v3/corpus/base/sidecars/split90_target_weights.bin
+  - /scratch/users/syz/memorysplit-160m-v3/corpus/extension/sidecars/shared_target_weights.bin
+  raw_target_tokens: 8169455616
+  scientific_scope: successor_exploratory_unpreregistered

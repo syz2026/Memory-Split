@@ -1,0 +1,127 @@
+{
+ "condition": "zero-shot",
+ "exact_match": 0.077009,
+ "label": "gemma-3-1b-it-qat-4bit",
+ "macro_exact_match": 0.077009,
+ "model": "/Users/stephenzhang/Library/Application Support/ReplyLocal/Models/compact",
+ "n_items": 1792,
+ "per_task": {
+  "base_conversion": {
+   "correct": 0,
+   "exact_match": 0.0,
+   "n": 128,
+   "tok_den": 1480,
+   "tok_num": 299,
+   "token_accuracy": 0.202027
+  },
+  "binary_matrix": {
+   "correct": 0,
+   "exact_match": 0.0,
+   "n": 128,
+   "tok_den": 36706,
+   "tok_num": 27691,
+   "token_accuracy": 0.7544
+  },
+  "count_primes": {
+   "correct": 0,
+   "exact_match": 0.0,
+   "n": 128,
+   "tok_den": 579,
+   "tok_num": 39,
+   "token_accuracy": 0.067358
+  },
+  "course_schedule": {
+   "correct": 56,
+   "exact_match": 0.4375,
+   "n": 128,
+   "tok_den": 128,
+   "tok_num": 56,
+   "token_accuracy": 0.4375
+  },
+  "dice": {
+   "correct": 0,
+   "exact_match": 0.0,
+   "n": 128,
+   "tok_den": 2465,
+   "tok_num": 426,
+   "token_accuracy": 0.172819
+  },
+  "futoshiki": {
+   "correct": 0,
+   "exact_match": 0.0,
+   "n": 128,
+   "tok_den": 5659,
+   "tok_num": 3573,
+   "token_accuracy": 0.631384
+  },
+  "largest_island": {
+   "correct": 3,
+   "exact_match": 0.023438,
+   "n": 128,
+   "tok_den": 383,
+   "tok_num": 154,
+   "token_accuracy": 0.402089
+  },
+  "path_star": {
+   "correct": 0,
+   "exact_match": 0.0,
+   "n": 128,
+   "tok_den": 9098,
+   "tok_num": 8044,
+   "token_accuracy": 0.88415
+  },
+  "prime_factorization": {
+   "correct": 0,
+   "exact_match": 0.0,
+   "n": 128,
+   "tok_den": 2172,
+   "tok_num": 1080,
+   "token_accuracy": 0.497238
+  },
+  "ransom_note": {
+   "correct": 70,
+   "exact_match": 0.546875,
+   "n": 128,
+   "tok_den": 128,
+   "tok_num": 70,
+   "token_accuracy": 0.546875
+  },
+  "rotate_matrix": {
+   "correct": 0,
+   "exact_match": 0.0,
+   "n": 128,
+   "tok_den": 21578,
+   "tok_num": 11729,
+   "token_accuracy": 0.543563
+  },
+  "rotten_oranges": {
+   "correct": 9,
+   "exact_match": 0.070312,
+   "n": 128,
+   "tok_den": 275,
+   "tok_num": 101,
+   "token_accuracy": 0.367273
+  },
+  "spiral_matrix": {
+   "correct": 0,
+   "exact_match": 0.0,
+   "n": 128,
+   "tok_den": 36666,
+   "tok_num": 21833,
+   "token_accuracy": 0.595456
+  },
+  "string_splitting": {
+   "correct": 0,
+   "exact_match": 0.0,
+   "n": 128,
+   "tok_den": 1999,
+   "tok_num": 982,
+   "token_accuracy": 0.491246
+  }
+ },
+ "scoring": "teacher_forced_greedy_agreement",
+ "seconds": 520.2,
+ "skipped_overlength": 0,
+ "skipped_tokenizer_boundary": 0,
+ "token_accuracy": 0.637609
+}

@@ -11,11 +11,16 @@ data/
 # into an excluded directory, so a "!" negation under `outputs/` never fires.
 outputs/*
 !outputs/manifests/
-# Pulled cluster results: primary data, not build output. The checkpoints stay
-# on the cluster; these are the logs and configs, which are all that survive it.
+# Retained results: primary data, not build output. Checkpoints stay on the
+# cluster; these are the logs, configs and eval artifacts, which are all that
+# survives it. Catalogued in docs/RETAINED-RESULTS.md — nothing outside that
+# file may be cited.
 !outputs/farmshare-160m-sweep/
 !outputs/farmshare-160m-v3-s0/
 !outputs/farmshare-tiny/
+!outputs/cluster-summaries/
+!outputs/1b-heldout/
+!outputs/pilot/
 *.bin
 *.npy
 *.pt

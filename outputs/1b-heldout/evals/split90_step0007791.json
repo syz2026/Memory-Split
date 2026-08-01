@@ -1,0 +1,126 @@
+{
+ "arm": "split90",
+ "checkpoint": "/mnt/nvme/runs/1b-v3/d1b_split90_reasoning_v3_s0/snapshots/step0007791.pt",
+ "exact_match": 0.001814,
+ "macro_exact_match": 0.001814,
+ "n_items": 7168,
+ "per_task": {
+  "base_conversion": {
+   "correct": 0,
+   "exact_match": 0.0,
+   "n": 512,
+   "token_acc_den": 3384,
+   "token_acc_num": 105,
+   "token_accuracy": 0.031028
+  },
+  "binary_matrix": {
+   "correct": 0,
+   "exact_match": 0.0,
+   "n": 512,
+   "token_acc_den": 80230,
+   "token_acc_num": 35980,
+   "token_accuracy": 0.448461
+  },
+  "count_primes": {
+   "correct": 0,
+   "exact_match": 0.0,
+   "n": 512,
+   "token_acc_den": 901,
+   "token_acc_num": 0,
+   "token_accuracy": 0.0
+  },
+  "course_schedule": {
+   "correct": 4,
+   "exact_match": 0.007812,
+   "n": 512,
+   "token_acc_den": 512,
+   "token_acc_num": 4,
+   "token_accuracy": 0.007812
+  },
+  "dice": {
+   "correct": 0,
+   "exact_match": 0.0,
+   "n": 512,
+   "token_acc_den": 4303,
+   "token_acc_num": 90,
+   "token_accuracy": 0.020916
+  },
+  "futoshiki": {
+   "correct": 0,
+   "exact_match": 0.0,
+   "n": 512,
+   "token_acc_den": 42575,
+   "token_acc_num": 30488,
+   "token_accuracy": 0.716101
+  },
+  "largest_island": {
+   "correct": 0,
+   "exact_match": 0.0,
+   "n": 512,
+   "token_acc_den": 512,
+   "token_acc_num": 0,
+   "token_accuracy": 0.0
+  },
+  "path_star": {
+   "correct": 0,
+   "exact_match": 0.0,
+   "n": 512,
+   "token_acc_den": 14406,
+   "token_acc_num": 10886,
+   "token_accuracy": 0.755657
+  },
+  "prime_factorization": {
+   "correct": 0,
+   "exact_match": 0.0,
+   "n": 512,
+   "token_acc_den": 4225,
+   "token_acc_num": 1476,
+   "token_accuracy": 0.349349
+  },
+  "ransom_note": {
+   "correct": 9,
+   "exact_match": 0.017578,
+   "n": 512,
+   "token_acc_den": 512,
+   "token_acc_num": 9,
+   "token_accuracy": 0.017578
+  },
+  "rotate_matrix": {
+   "correct": 0,
+   "exact_match": 0.0,
+   "n": 512,
+   "token_acc_den": 46482,
+   "token_acc_num": 6929,
+   "token_accuracy": 0.149068
+  },
+  "rotten_oranges": {
+   "correct": 0,
+   "exact_match": 0.0,
+   "n": 512,
+   "token_acc_den": 565,
+   "token_acc_num": 53,
+   "token_accuracy": 0.093805
+  },
+  "spiral_matrix": {
+   "correct": 0,
+   "exact_match": 0.0,
+   "n": 512,
+   "token_acc_den": 73751,
+   "token_acc_num": 16694,
+   "token_accuracy": 0.226356
+  },
+  "string_splitting": {
+   "correct": 0,
+   "exact_match": 0.0,
+   "n": 512,
+   "token_acc_den": 3077,
+   "token_acc_num": 112,
+   "token_accuracy": 0.036399
+  }
+ },
+ "run_id": "d1b_split90_reasoning_v3_s0",
+ "scoring": "teacher_forced_greedy_agreement",
+ "seconds": 103.2,
+ "seed": 0,
+ "step": 7791
+}

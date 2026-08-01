@@ -1,0 +1,95 @@
+{
+ "condition": "2-shot",
+ "exact_match": 0.121061,
+ "label": "gemma-3-1b-it-qat-4bit",
+ "macro_exact_match": 0.118345,
+ "model": "/Users/stephenzhang/Library/Application Support/ReplyLocal/Models/compact",
+ "n_items": 603,
+ "per_task": {
+  "base_conversion": {
+   "correct": 0,
+   "exact_match": 0.0,
+   "n": 64,
+   "tok_den": 751,
+   "tok_num": 161,
+   "token_accuracy": 0.214381
+  },
+  "count_primes": {
+   "correct": 1,
+   "exact_match": 0.015625,
+   "n": 64,
+   "tok_den": 286,
+   "tok_num": 92,
+   "token_accuracy": 0.321678
+  },
+  "course_schedule": {
+   "correct": 28,
+   "exact_match": 0.4375,
+   "n": 64,
+   "tok_den": 64,
+   "tok_num": 28,
+   "token_accuracy": 0.4375
+  },
+  "dice": {
+   "correct": 0,
+   "exact_match": 0.0,
+   "n": 64,
+   "tok_den": 1249,
+   "tok_num": 343,
+   "token_accuracy": 0.27462
+  },
+  "futoshiki": {
+   "correct": 0,
+   "exact_match": 0.0,
+   "n": 64,
+   "tok_den": 2828,
+   "tok_num": 2070,
+   "token_accuracy": 0.731966
+  },
+  "prime_factorization": {
+   "correct": 0,
+   "exact_match": 0.0,
+   "n": 64,
+   "tok_den": 1054,
+   "tok_num": 542,
+   "token_accuracy": 0.514231
+  },
+  "ransom_note": {
+   "correct": 42,
+   "exact_match": 0.65625,
+   "n": 64,
+   "tok_den": 64,
+   "tok_num": 42,
+   "token_accuracy": 0.65625
+  },
+  "rotate_matrix": {
+   "correct": 0,
+   "exact_match": 0.0,
+   "n": 64,
+   "tok_den": 10948,
+   "tok_num": 5988,
+   "token_accuracy": 0.546949
+  },
+  "rotten_oranges": {
+   "correct": 2,
+   "exact_match": 0.074074,
+   "n": 27,
+   "tok_den": 59,
+   "tok_num": 29,
+   "token_accuracy": 0.491525
+  },
+  "string_splitting": {
+   "correct": 0,
+   "exact_match": 0.0,
+   "n": 64,
+   "tok_den": 998,
+   "tok_num": 617,
+   "token_accuracy": 0.618236
+  }
+ },
+ "scoring": "teacher_forced_greedy_agreement",
+ "seconds": 277.0,
+ "skipped_overlength": 293,
+ "skipped_tokenizer_boundary": 0,
+ "token_accuracy": 0.54161
+}

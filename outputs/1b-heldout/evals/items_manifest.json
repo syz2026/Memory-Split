@@ -1,0 +1,174 @@
+{
+ "acceptance_rule": "independent oracle re-derives the generator answer",
+ "contract_id": "memorysplit-reasoning-dataset-v3",
+ "heldout_index_base": 1000000000,
+ "items_per_task_target": 512,
+ "items_sha256": "1595330d64e16eb1ed81e903ff63a46961bbf20f4d732595042084a43c42009e",
+ "per_task": {
+  "base_conversion": {
+   "accepted": 512,
+   "attempts": 512,
+   "last_index": 1000000511,
+   "max_answer_tokens": 16,
+   "mean_answer_tokens": 6.61,
+   "rejected_independent_oracle": 0,
+   "rejected_overlength": 0,
+   "rejected_special_token": 0,
+   "seconds": 0.1
+  },
+  "binary_matrix": {
+   "accepted": 512,
+   "attempts": 512,
+   "last_index": 1000000511,
+   "max_answer_tokens": 209,
+   "mean_answer_tokens": 156.7,
+   "rejected_independent_oracle": 0,
+   "rejected_overlength": 0,
+   "rejected_special_token": 0,
+   "seconds": 0.4
+  },
+  "count_primes": {
+   "accepted": 512,
+   "attempts": 512,
+   "last_index": 1000000511,
+   "max_answer_tokens": 3,
+   "mean_answer_tokens": 1.76,
+   "rejected_independent_oracle": 0,
+   "rejected_overlength": 0,
+   "rejected_special_token": 0,
+   "seconds": 0.5
+  },
+  "course_schedule": {
+   "accepted": 512,
+   "attempts": 512,
+   "last_index": 1000000511,
+   "max_answer_tokens": 1,
+   "mean_answer_tokens": 1.0,
+   "rejected_independent_oracle": 0,
+   "rejected_overlength": 0,
+   "rejected_special_token": 0,
+   "seconds": 0.2
+  },
+  "dice": {
+   "accepted": 512,
+   "attempts": 512,
+   "last_index": 1000000511,
+   "max_answer_tokens": 11,
+   "mean_answer_tokens": 8.4,
+   "rejected_independent_oracle": 0,
+   "rejected_overlength": 0,
+   "rejected_special_token": 0,
+   "seconds": 1.7
+  },
+  "futoshiki": {
+   "accepted": 512,
+   "attempts": 512,
+   "last_index": 1000000511,
+   "max_answer_tokens": 87,
+   "mean_answer_tokens": 83.15,
+   "rejected_independent_oracle": 0,
+   "rejected_overlength": 0,
+   "rejected_special_token": 0,
+   "seconds": 5.0
+  },
+  "largest_island": {
+   "accepted": 512,
+   "attempts": 512,
+   "last_index": 1000000511,
+   "max_answer_tokens": 1,
+   "mean_answer_tokens": 1.0,
+   "rejected_independent_oracle": 0,
+   "rejected_overlength": 0,
+   "rejected_special_token": 0,
+   "seconds": 0.4
+  },
+  "path_star": {
+   "accepted": 512,
+   "attempts": 512,
+   "last_index": 1000000511,
+   "max_answer_tokens": 41,
+   "mean_answer_tokens": 28.14,
+   "rejected_independent_oracle": 0,
+   "rejected_overlength": 0,
+   "rejected_special_token": 0,
+   "seconds": 0.2
+  },
+  "prime_factorization": {
+   "accepted": 512,
+   "attempts": 512,
+   "last_index": 1000000511,
+   "max_answer_tokens": 25,
+   "mean_answer_tokens": 8.25,
+   "rejected_independent_oracle": 0,
+   "rejected_overlength": 0,
+   "rejected_special_token": 0,
+   "seconds": 0.1
+  },
+  "ransom_note": {
+   "accepted": 512,
+   "attempts": 512,
+   "last_index": 1000000511,
+   "max_answer_tokens": 1,
+   "mean_answer_tokens": 1.0,
+   "rejected_independent_oracle": 0,
+   "rejected_overlength": 0,
+   "rejected_special_token": 0,
+   "seconds": 0.2
+  },
+  "rotate_matrix": {
+   "accepted": 512,
+   "attempts": 512,
+   "last_index": 1000000511,
+   "max_answer_tokens": 109,
+   "mean_answer_tokens": 90.79,
+   "rejected_independent_oracle": 0,
+   "rejected_overlength": 0,
+   "rejected_special_token": 0,
+   "seconds": 0.2
+  },
+  "rotten_oranges": {
+   "accepted": 512,
+   "attempts": 512,
+   "last_index": 1000000511,
+   "max_answer_tokens": 2,
+   "mean_answer_tokens": 1.1,
+   "rejected_independent_oracle": 0,
+   "rejected_overlength": 0,
+   "rejected_special_token": 0,
+   "seconds": 0.5
+  },
+  "spiral_matrix": {
+   "accepted": 512,
+   "attempts": 512,
+   "last_index": 1000000511,
+   "max_answer_tokens": 256,
+   "mean_answer_tokens": 144.04,
+   "rejected_independent_oracle": 0,
+   "rejected_overlength": 0,
+   "rejected_special_token": 0,
+   "seconds": 0.3
+  },
+  "string_splitting": {
+   "accepted": 512,
+   "attempts": 512,
+   "last_index": 1000000511,
+   "max_answer_tokens": 7,
+   "mean_answer_tokens": 6.01,
+   "rejected_independent_oracle": 0,
+   "rejected_overlength": 0,
+   "rejected_special_token": 0,
+   "seconds": 2.8
+  }
+ },
+ "prompt_format": "Reasoning task={task}\\nQuestion: {question}\\nAnswer:",
+ "purpose": "paired reasoning task accuracy for the 1B seed-0 pair",
+ "reasoning_gym_version": "0.1.19",
+ "schema_version": 1,
+ "scope": "unsealed_exploratory_holdout",
+ "sealed_reserve_avoided": [
+  2000000000,
+  2000010000
+ ],
+ "source_root": "/mnt/nvme/360m/lockroot/reasoning_gym_exact_answer",
+ "total_items": 7168
+}

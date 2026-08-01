@@ -1,0 +1,40 @@
+{
+  "on": {
+    "mode": "on",
+    "overall": 0.994,
+    "per_attribute": {
+      "birth_date": 0.996,
+      "birth_city": 0.996,
+      "university": 0.992,
+      "major": 0.992,
+      "employer": 0.992,
+      "current_city": 0.996
+    },
+    "n": 1500,
+    "stats": {
+      "n_lookups": 2935,
+      "n_hits": 2888,
+      "n_misses": 47,
+      "n_malformed": 0
+    }
+  },
+  "off": {
+    "mode": "off",
+    "overall": 0.0,
+    "per_attribute": {
+      "birth_date": 0.0,
+      "birth_city": 0.0,
+      "university": 0.0,
+      "major": 0.0,
+      "employer": 0.0,
+      "current_city": 0.0
+    },
+    "n": 1500,
+    "stats": {
+      "n_lookups": 0,
+      "n_hits": 0,
+      "n_misses": 0,
+      "n_malformed": 0
+    }
+  }
+}

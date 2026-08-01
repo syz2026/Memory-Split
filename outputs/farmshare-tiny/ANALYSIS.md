@@ -1,14 +1,24 @@
-# Tiny crowding cohort — design, setup measurements, and how to read it
+# Tiny crowding cohort — results
 
 Cohort `memorysplit-exploratory-v3-tiny-crowding-n1`: two models, each a matched
 dense/split90 pair, seed 0, on the frozen 8,169,455,616-token reasoning-v3
-corpus. Submitted 2026-07-31 as FarmShare jobs 1670907 (`d40m`) and 1670908
-(`d8m`).
+corpus. FarmShare jobs 1670908 (`d8m`, 4:54:50) and 1670907 (`d40m`, 12:19:31),
+both `COMPLETED` 2026-08-01, all four arms at step 15,582.
 
-**Training results are not in yet.** Everything below the "Setup, measured"
-section is either a measurement already taken or the analysis contract fixed in
-advance. The results table is filled by running the command in "When the runs
-land".
+## Answer
+
+**Crowding does not happen in this range, and Memory Split does not help.**
+
+Dense loss on the reasoning extension is nearly flat from 8M to 160M
+parameters — a 20-fold range — so capacity is not the binding constraint. And
+the split arm is marginally *worse* at every size, with the smallest model
+showing the largest penalty, which is the opposite of the predicted direction.
+
+Gate 0 now says why, and this is the substantive finding: at 40M the split arm
+recovers **94.2%** of dense's performance on the offloaded positions *without
+ever having trained on them*. Supervision on those tokens is worth only 0.33
+nats out of 5.73. The offloaded content is overwhelmingly recoverable from
+context, so there is almost no memorisation burden for masking to relieve.
 
 ## The question
 
@@ -105,6 +115,117 @@ which this cohort does not include.
 
 **n=1.** One seed cannot support the paired statistic. This sizes a direction
 and a magnitude.
+
+## Results
+
+### Primary: split90 minus dense on the reasoning extension
+
+Steps 14582-15580, the settled window where both arms read the same sidecar.
+Positive means split90 is worse.
+
+| model | params | dense | split90 | split − dense |
+|---|---:|---:|---:|---:|
+| d8m | 7,931,776 | 0.8072 | 0.8100 | **+0.0028** |
+| d40m | 40,560,000 | 0.7855 | 0.7864 | **+0.0009** |
+| d160m | 162,220,800 | 0.7905 | 0.7916 | **+0.0011** |
+
+All three positive, all tiny. There is no drift toward split90 winning as the
+model shrinks; the 8M point is the worst for split, not the best. Whatever the
+split arm loses by giving up 20.4% of its supervision, it does not get back in
+reasoning performance at any size tested.
+
+The penalty also shrinks as the extension is consumed, which suggests a
+transient adaptation cost rather than a persistent deficit:
+
+| window | d8m | d40m | d160m |
+|---|---:|---:|---:|
+| early extension (13600-14000) | +0.0079 | +0.0037 | +0.0047 |
+| mid (14000-14582) | +0.0093 | +0.0014 | +0.0017 |
+| settled (14582-15580) | +0.0028 | +0.0009 | +0.0011 |
+
+### Capacity is not binding
+
+Dense-arm loss, by region:
+
+| model | base tail (13000-13580) | extension (14582-15580) |
+|---|---:|---:|
+| d8m | 0.3354 | 0.8072 |
+| d40m | 0.3037 | 0.7855 |
+| d160m | 0.2960 | 0.7905 |
+
+Across a 20x parameter range the extension loss moves by 0.02 nats, about 2.7%,
+and **d40m is slightly better than d160m**. An 8M model with 1.49M transformer
+parameters gets within 3% of a 162M model on this material. That is not what a
+capacity-limited regime looks like.
+
+The d40m-beats-d160m inversion is not evidence that smaller is better. The
+d160m run used the frozen 1.5e-3 tier and was never probed, while d40m got a
+probed 8.0e-3; d40m also has effective depth 24 against d160m's 12. The likeliest
+reading is that **d160m was under-tuned**, which is worth knowing on its own.
+
+### Gate 0: what supervision on the offloaded positions actually bought
+
+First numbers this metric has ever produced on this corpus. Uniform over the
+padded vocabulary is ln(50304) = 10.8258; lower means the arm predicts the
+offloaded content better.
+
+| model | arm | final CE | nats below uniform |
+|---|---|---:|---:|
+| d8m | dense | 10.0652 | 0.7606 |
+| d8m | split90 | 10.8899 | −0.0641 |
+| d40m | dense | 5.0943 | 5.7315 |
+| d40m | split90 | 5.4264 | 5.3994 |
+
+Both arms score the *same* positions, so the difference is exactly what
+training on those tokens was worth.
+
+**At 40M, almost nothing.** Dense captured 5.7315 nats; split90 captured 5.3994
+of them having never received a gradient there. Supervision was worth 0.3321
+nats, **5.8% of the total**. The offloaded spans are 94.2% predictable from
+their surroundings. That is the mechanism behind the null: masking them removes
+a burden that was never really a burden.
+
+It is consistent with the span structure. These are 17-35 token payloads, not
+bare values, so most of their tokens are template and only a small part is the
+fact itself. It is also consistent with the earlier finding that each fact is
+exposed only 1.04-1.55 times: material seen once and largely inferable is
+material a model has little reason to memorise.
+
+**At 8M the model is simply too weak to engage.** split90 sits at −0.06 nats,
+which is uniform within noise, and dense captured only 0.7606 — an eighth of
+what 40M managed. Neither arm learned this content. That is not crowding; it is
+a model below the threshold where the material becomes learnable at all.
+
+## What this does and does not settle
+
+Settled, for this corpus: capacity does not bind between 8M and 160M on the
+reasoning extension, Memory Split gives no benefit at any of those sizes, and
+the reason is measurable rather than speculative — the offloaded content is
+overwhelmingly context-recoverable.
+
+Not settled. This is **n=1** at each size, and the effects are smaller than the
+±0.0086-nat seed spread measured in the Setup A sweep, so the sign of any
+individual contrast is not secure. It is **training loss, not a reasoning
+evaluation**; the preregistered deliverable is downstream accuracy with the
+organizer supplying facts, which still has not been run at any scale. The
+across-size comparison confounds parameters with recursion, embedding tying and
+learning-rate tuning. And at d8m, **81% of parameters are the embedding table**,
+so that point speaks to a model with 1.49M transformer parameters rather than a
+scaled-down transformer.
+
+The honest summary is that the hypothesis has not been given a fair test by
+this corpus, at any size. A corpus where facts are repeated and not inferable
+from context — which is what Setup A deliberately built, at `n_exposures=6` —
+is the precondition for the question to be answerable. Building that, rather
+than running more sizes against reasoning-v3, is the thing that would move this
+forward.
+
+## Reproducing
+
+```bash
+python3 ops/cohort-tiny/analyze_crowding.py \
+  --dirs outputs/farmshare-tiny outputs/farmshare-160m-v3-s0
+```
 
 ## When the runs land
 

@@ -1,0 +1,21 @@
+{
+  "closed": {
+    "mode": "closed",
+    "overall": 0.006666666666666667,
+    "per_attribute": {
+      "birth_date": 0.0,
+      "birth_city": 0.004,
+      "university": 0.004,
+      "major": 0.02,
+      "employer": 0.008,
+      "current_city": 0.004
+    },
+    "n": 1500,
+    "stats": {
+      "n_lookups": 0,
+      "n_hits": 0,
+      "n_misses": 0,
+      "n_malformed": 0
+    }
+  }
+}

@@ -1,0 +1,94 @@
+
+== python environment ==
+python 3.13.8
+torch 2.13.0+cu130 cuda 13.0 available False
+
+== corpus (29.5 GiB) ==
+  need base/packed/targets.bin (have 0, want 14241759232)
+  need base/sidecars/dense_target_weights.bin (have 0, want 7120879616)
+  need base/sidecars/split90_target_weights.bin (have 0, want 7120879616)
+  need extension/packed/targets.bin (have 0, want 2097152000)
+  need extension/sidecars/shared_target_weights.bin (have 0, want 1048576000)
+fetching via presigned URLs from /scratch/users/syz/memorysplit-160m-v3/presigned.txt
+  -> base/packed/targets.bin
+  -> base/sidecars/dense_target_weights.bin
+  -> base/sidecars/split90_target_weights.bin
+  -> extension/packed/targets.bin
+  -> extension/sidecars/shared_target_weights.bin
+
+== verifying composite stream hashes ==
+  OK   packed_targets
+  OK   dense_target_weights
+  OK   split90_target_weights
+  base 7120879616 + extension 1048576000 = 8169455616 tokens (want 8169455616)
+
+== configs ==
+wrote 16 cohort configs + 2 smoke configs to /scratch/users/syz/memorysplit-160m-v3/code/configs/160m-v3
+max_steps=15582  accum=16  micro_bs=32  lr=0.0015
+provider=farmshare-slurm  ckpt_minutes=10
+params=162,220,800  snapshots=[1558, 3896, 7791, 11687, 15582]
+tokens/run=8,169,455,616  tokens/param=50.36
+sbatch copied to /scratch/users/syz/memorysplit-160m-v3/run_seed.sbatch (the chain resubmits this path)
+
+== corpus arms are genuinely different ==
+d160m: 162,220,800 parameters
+token stream total: 8,169,455,616 tokens
+dense    sidecar bytes: 8,169,455,616
+split90  sidecar bytes: 8,169,455,616
+
+base segment tokens:      7,120,879,616
+dense   zero weights:     0 (0.000%)
+split90 zero weights:     1,453,989,440 (20.419%)
+offloaded (dense1->spl0): 1,453,989,440 (20.419%)
+reverse   (dense0->spl1): 0
+
+per run: ckpt 1.95 GB + 5 snapshots x 0.65 GB = 5.19 GB
+free: 77.20 TB (round of 2 needs 10 GB)
+
+PREFLIGHT OK
+
+== cluster facts ==
+--- partitions ---
+PARTITION            TIMELIMIT  NODES      GRES                 STATE
+normal*              2-00:00:00 3          (null)               drain*
+normal*              2-00:00:00 10         (null)               mix
+normal*              2-00:00:00 5          gpu:4(S:0-1)         mix
+normal*              2-00:00:00 1          gpu:4(S:0-1)         alloc
+normal*              2-00:00:00 1          (null)               idle
+bigmem               2-00:00:00 2          (null)               mix
+gpu                  2-00:00:00 5          gpu:4(S:0-1)         mix
+gpu                  2-00:00:00 1          gpu:4(S:0-1)         alloc
+--- gpu QoS (MaxWall decides how many chain cycles a run needs) ---
+      normal       128       cpu=512,gres/gpu=1             
+        long         4                  cpu=128  7-00:00:00 
+         gpu         4               gres/gpu=4             
+--- gpu nodes ---
+NODELIST             CPUS       MEMORY     GRES                      STATE
+oat-[01-02,04-06]    64         256000     gpu:4(S:0-1)              mix
+oat-03               64         256000     gpu:4(S:0-1)              alloc
+
+== storage ==
+Filesystem                                       Size  Used Avail Use% Mounted on
+truenas.farmshare.sunet:/mnt/tank/scratch/users  107T   37T   71T  35% /scratch/users
+7.5K	/scratch/users/syz/memorysplit-160m-v3/bootstrap.log
+7.5M	/scratch/users/syz/memorysplit-160m-v3/code
+8.0G	/scratch/users/syz/memorysplit-160m-v3/corpus
+14K	/scratch/users/syz/memorysplit-160m-v3/presigned.txt
+14K	/scratch/users/syz/memorysplit-160m-v3/run_seed.sbatch
+3.6G	/scratch/users/syz/memorysplit-160m-v3/venv
+one seed needs ~29.5 GiB corpus + ~10.4 GB outputs (2 arms x 5.19 GB)
+
+== ready ==
+Submit the seed with:
+
+    export MS_ROOT=/scratch/users/syz/memorysplit-160m-v3
+    cd /scratch/users/syz/memorysplit-160m-v3 && sbatch run_seed.sbatch 0
+
+Both arms share one two-GPU allocation so the pair sits on identical hardware.
+Estimated ~20-30 h per arm on one L40S, so expect 1-2 self-chained jobs; the
+chain stops on its own if a cycle makes no progress.
+
+Watch it with:
+    squeue -u $USER
+    tail -f /scratch/users/syz/memorysplit-160m-v3/logs/d160m_dense_s0.log
+    tail -1 /scratch/users/syz/memorysplit-160m-v3/runs/160m-v3/d160m_*_s0/log.jsonl
