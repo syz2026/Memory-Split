@@ -120,3 +120,28 @@ def test_batch_rows_are_independent():
 
 def test_empty_prompt_list():
     assert generate_batch(OpenLoopStub([]), TOK, [], max_new=8, device=CPU) == []
+
+
+def test_padded_vocab_ids_are_never_generated():
+    """Ids 50261..50303 pad the vocab to a multiple of 64 and map to no
+    token. An undertrained model puts real mass there; selecting one used to
+    crash the tokenizer partway through an evaluation."""
+    pad_id = TOK.VOCAB_SIZE - 1
+    assert pad_id >= TOK.N_REAL_TOKENS
+
+    class AlwaysPad:
+        cfg = None
+
+        def forward_step(self, idx, cache):
+            B, T = idx.shape
+            logits = torch.zeros(B, T, TOK.VOCAB_SIZE)
+            logits[:, -1, pad_id] = 100.0  # overwhelmingly favour the pad id
+            return logits, {}
+
+    texts = generate_batch(AlwaysPad(), TOK, ["p"], max_new=4, device=CPU)
+    assert isinstance(texts[0], str)  # decoded rather than raised
+
+
+def test_decode_drops_unmapped_padding_ids():
+    real = TOK.encode(" hello")
+    assert TOK.decode(real + [TOK.VOCAB_SIZE - 1]) == TOK.decode(real)

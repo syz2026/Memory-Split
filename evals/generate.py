@@ -61,11 +61,19 @@ def generate_batch(
     padded = [[tok.EOT] * (pad_to - len(p)) + p for p in prompt_ids]
     x = torch.tensor(padded, dtype=torch.long, device=device)
 
+    # The vocabulary is padded to a multiple of 64; the tail ids map to no
+    # token. Never select one: an undertrained model puts real mass there and
+    # the tokenizer cannot decode it.
+    n_real = getattr(tok, "N_REAL_TOKENS", None)
+
     seqs = [_Seq() for _ in prompts]
     with torch.no_grad():
         logits, cache = model.forward_step(x, None)
         for _ in range(steps_budget):
-            choices = logits[:, -1, :].argmax(dim=-1).tolist()
+            step_logits = logits[:, -1, :]
+            if n_real is not None and step_logits.size(-1) > n_real:
+                step_logits = step_logits[:, :n_real]
+            choices = step_logits.argmax(dim=-1).tolist()
             next_ids: list[int] = []
             for b, s in enumerate(seqs):
                 if s.done:

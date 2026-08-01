@@ -32,10 +32,16 @@ SPECIAL_TOKENS = {
 }
 
 VOCAB_SIZE = 50304
+# Ids 0..50260 map to a token: 50257 BPE ranks plus the four specials above.
+# 50261..50303 are padding to a multiple of 64 for GPU efficiency and decode
+# to nothing. A model can still put probability mass on them, so decoding and
+# generation both have to handle that rather than raise mid-evaluation.
+N_REAL_TOKENS = max(SPECIAL_TOKENS.values()) + 1
 
 
 class Tok:
     VOCAB_SIZE = VOCAB_SIZE
+    N_REAL_TOKENS = N_REAL_TOKENS
 
     def __init__(self) -> None:
         base = tiktoken.get_encoding("gpt2")
@@ -54,7 +60,14 @@ class Tok:
         return self._enc.encode(text, allowed_special="all")
 
     def decode(self, ids: list[int]) -> str:
-        return self._enc.decode(ids)
+        """Decode, dropping ids in the padded tail.
+
+        tiktoken raises on an unmapped id. An undertrained model emits them
+        freely, and a crash partway through evaluating a matrix is expensive,
+        so they are dropped here. Generation prevents them being chosen at
+        all; this is the second line of defence.
+        """
+        return self._enc.decode([i for i in ids if i < N_REAL_TOKENS])
 
     def encode_segments(
         self, segments: list[Segment], add_eot: bool = True

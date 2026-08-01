@@ -20,6 +20,19 @@ At `ctx=1024`, `micro_batch_size=32`, compiled, from completed runs:
 token from about 124M to 81M — expect roughly 1.5x, but **re-measure it in
 Stage A** rather than trusting that.
 
+## Rehearse the whole chain first
+
+Nine seconds on CPU, and it has already caught one bug that would have
+crashed evaluation partway through the matrix.
+
+```bash
+PYTHONPATH=. python3 scripts/smoke_pipeline.py
+```
+
+Builds a corpus, trains all three arms from one stream, evaluates each, runs
+the frozen analyzer, and checks it refuses an incomplete matrix. Expect
+`PIPELINE OK`.
+
 ## Environment
 
 ```bash
