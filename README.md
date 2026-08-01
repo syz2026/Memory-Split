@@ -20,7 +20,7 @@ tied-embedding decoder with 21.2M non-embedding parameters, trained at ~141
 tokens per parameter on one controlled corpus.
 
 **Capacity reallocation is an interpretation of that quantity, not the quantity
-itself, and this design does not identify it.** Masking removes competing
+itself, and it is not identified by this design.** Masking removes competing
 gradients whether or not any parameter was ever occupied, so gradient
 interference predicts the same sign and the same monotone dose trend. The
 mitigations are a shape test across fact loads and a gradient-mass
