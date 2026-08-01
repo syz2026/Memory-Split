@@ -18,7 +18,7 @@ def make_shards(tmp_path, n=5000, masked_span=(100, 160)):
 def test_batch_alignment_and_mask(tmp_path):
     bp, mp = make_shards(tmp_path)
     ds = PackedShards(bp, mp, ctx=32, batch_size=2, device="cpu")
-    x, y = ds.next_batch()
+    x, y, _ = ds.next_batch()
     assert x.shape == (2, 32) and y.shape == (2, 32)
     # within each row, y[t] is the successor of x[t] wherever unmasked
     for row in range(2):
@@ -32,7 +32,7 @@ def test_batch_alignment_and_mask(tmp_path):
 def test_masked_positions_become_ignore_index(tmp_path):
     bp, mp = make_shards(tmp_path, masked_span=(10, 40))
     ds = PackedShards(bp, mp, ctx=64, batch_size=1, device="cpu")
-    _, y = ds.next_batch()
+    _, y, _ = ds.next_batch()
     assert (y == -100).sum() > 0
 
 
@@ -42,10 +42,10 @@ def test_cursor_resume_exact(tmp_path):
     for _ in range(3):
         a.next_batch()
     state = a.state_dict()
-    xa, ya = a.next_batch()
+    xa, ya, _ = a.next_batch()
     b = PackedShards(bp, mp, ctx=16, batch_size=2, device="cpu")
     b.load_state_dict(state)
-    xb, yb = b.next_batch()
+    xb, yb, _ = b.next_batch()
     assert torch.equal(xa, xb) and torch.equal(ya, yb)
 
 
@@ -70,7 +70,7 @@ def test_masked_value_probe(tmp_path):
 def test_dense_arm_no_mask_file(tmp_path):
     bp, _ = make_shards(tmp_path)
     ds = PackedShards(bp, None, ctx=16, batch_size=2, device="cpu")
-    _, y = ds.next_batch()
+    _, y, _ = ds.next_batch()
     assert (y == -100).sum() == 0
     assert ds.masked_value_batch() is None
 
@@ -106,8 +106,8 @@ def test_segmented_stream_reads_as_one_logical_stream(tmp_path):
 
     # walk well past the segment boundary at token 1800
     for step in range(20):
-        xa, ya = whole.next_batch()
-        xb, yb = parts.next_batch()
+        xa, ya, _ = whole.next_batch()
+        xb, yb, _ = parts.next_batch()
         assert torch.equal(xa, xb), f"tokens diverge at step {step}"
         assert torch.equal(ya, yb), f"labels diverge at step {step}"
 
@@ -165,7 +165,7 @@ def test_dense_arm_probes_the_split_positions(tmp_path):
     # identical probe positions for both arms
     assert torch.equal(pd[0], ps[0]) and torch.equal(pd[1], ps[1])
     # and the dense arm's own labels are still unmasked during training
-    _, y = d.next_batch()
+    _, y, _ = d.next_batch()
     assert int((y == -100).sum()) == 0
 
 
@@ -180,3 +180,41 @@ def test_single_path_still_accepted(tmp_path):
     for spec_bin, spec_mask in ((bp, mp), (str(bp), str(mp)), ([bp], [mp])):
         ds = PackedShards(spec_bin, spec_mask, ctx=16, batch_size=2, device="cpu")
         assert ds.n_tokens == 5000
+
+
+def test_missing_mask_path_raises_instead_of_training_dense(tmp_path):
+    """A configured-but-absent sidecar used to fall through to no masking,
+    silently turning a masked arm into a dense one. It must fail closed."""
+    import pytest
+
+    bin_path = tmp_path / "train.bin"
+    np.arange(40000, dtype=np.uint16).tofile(bin_path)
+    with pytest.raises(FileNotFoundError, match="train_mask configured but missing"):
+        PackedShards(bin_path, tmp_path / "absent.bin", ctx=16, batch_size=2)
+
+
+def test_missing_probe_mask_path_raises(tmp_path):
+    import pytest
+
+    bin_path = tmp_path / "train.bin"
+    np.arange(40000, dtype=np.uint16).tofile(bin_path)
+    with pytest.raises(FileNotFoundError, match="probe_mask configured but missing"):
+        PackedShards(
+            bin_path, None, ctx=16, batch_size=2,
+            probe_mask_path=tmp_path / "absent.bin",
+        )
+
+
+def test_weights_are_zero_exactly_where_the_mask_is(tmp_path):
+    bin_path = tmp_path / "train.bin"
+    mask_path = tmp_path / "mask.bin"
+    n = 40000
+    np.arange(n, dtype=np.uint16).tofile(bin_path)
+    m = np.ones(n, dtype=np.uint8)
+    m[::3] = 0
+    m.tofile(mask_path)
+    ds = PackedShards(bin_path, mask_path, ctx=16, batch_size=2)
+    _, y, w = ds.next_batch()
+    assert w.shape == y.shape
+    assert ((w == 0.0) == (y == -100)).all(), "weights must zero exactly the masked targets"
+    assert w.numel() == y.numel(), "denominator must count every target position"

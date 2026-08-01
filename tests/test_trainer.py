@@ -66,8 +66,8 @@ def test_checkpoint_resume_exact_batches(tmp_path):
     b.load_ckpt(a.ckpt_path)
     assert b.step == 6
     assert b.data.state_dict()["cursor"] == cursor_after_6
-    xb, _ = b.data.next_batch()
-    xa, _ = a.data.next_batch()
+    xb, _, _ = b.data.next_batch()
+    xa, _, _ = a.data.next_batch()
     assert (xa == xb).all()
 
 

@@ -190,7 +190,26 @@ class GPT(nn.Module):
     def num_params(self) -> int:
         return sum(p.numel() for p in self.parameters())
 
-    def forward(self, idx: torch.Tensor, targets: torch.Tensor | None = None):
+    def forward(
+        self,
+        idx: torch.Tensor,
+        targets: torch.Tensor | None = None,
+        weights: torch.Tensor | None = None,
+    ):
+        """Forward pass, optionally with per-target loss weights.
+
+        With `weights`, the loss is normalised over EVERY original target
+        position including the zero-weight ones:
+
+            loss = sum_t w_t * CE_t / weights.numel()
+
+        The denominator is deliberately not the count of surviving targets.
+        Under the default `reduction='mean'` the survivors absorb the removed
+        mass -- masking a fraction f multiplies every remaining target's weight
+        by 1/(1-f) -- so a masked arm would train on a different effective
+        objective than its dense twin over and above the masking itself. That
+        is a confound large enough to move a reasoning endpoint on its own.
+        """
         B, T = idx.shape
         assert T <= self.cfg.ctx, f"sequence length {T} > ctx {self.cfg.ctx}"
         cos, sin = self.rope_cos[:T], self.rope_sin[:T]
@@ -202,11 +221,25 @@ class GPT(nn.Module):
         logits = self.lm_head(x)
         loss = None
         if targets is not None:
-            loss = F.cross_entropy(
-                logits.float().view(-1, logits.size(-1)),
-                targets.view(-1),
-                ignore_index=-100,
-            )
+            flat_logits = logits.float().view(-1, logits.size(-1))
+            flat_targets = targets.reshape(-1)
+            if weights is None:
+                loss = F.cross_entropy(
+                    flat_logits, flat_targets, ignore_index=-100
+                )
+            else:
+                assert weights.shape == targets.shape, (
+                    f"weights {tuple(weights.shape)} != targets "
+                    f"{tuple(targets.shape)}"
+                )
+                per_token = F.cross_entropy(
+                    flat_logits,
+                    flat_targets,
+                    ignore_index=-100,
+                    reduction="none",
+                )
+                w = weights.reshape(-1).to(per_token.dtype)
+                loss = (per_token * w).sum() / weights.numel()
         return logits, loss
 
     @torch.no_grad()

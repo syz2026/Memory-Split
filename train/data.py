@@ -79,14 +79,29 @@ class PackedShards:
         probe_mask_path: StreamPaths | None = None,
     ):
         self.tokens = ConcatMemmap(_as_paths(bin_path), np.uint16)
+        # Fail closed. A configured-but-absent sidecar used to fall through to
+        # self.mask = None, which silently turns a masked arm into a dense one
+        # and produces a whole cohort of runs that look valid and are not.
         mask_paths = _as_paths(mask_path) if mask_path is not None else []
-        if mask_paths and all(p.exists() for p in mask_paths):
+        if mask_paths:
+            missing = [str(p) for p in mask_paths if not p.exists()]
+            if missing:
+                raise FileNotFoundError(
+                    "train_mask configured but missing: "
+                    + ", ".join(missing)
+                    + " -- refusing to train an unmasked arm under a masked config"
+                )
             self.mask = ConcatMemmap(mask_paths, np.uint8)
             assert len(self.mask) == len(self.tokens), "mask/token length mismatch"
         else:
             self.mask = None
         probe_paths = _as_paths(probe_mask_path) if probe_mask_path is not None else []
-        if probe_paths and all(p.exists() for p in probe_paths):
+        if probe_paths:
+            missing = [str(p) for p in probe_paths if not p.exists()]
+            if missing:
+                raise FileNotFoundError(
+                    "probe_mask configured but missing: " + ", ".join(missing)
+                )
             self.probe_mask = ConcatMemmap(probe_paths, np.uint8)
             assert len(self.probe_mask) == len(self.tokens), "probe/token length mismatch"
         else:
@@ -106,7 +121,17 @@ class PackedShards:
         msk = self.mask.read(start, length) if self.mask is not None else None
         return toks, msk
 
-    def next_batch(self) -> tuple[torch.Tensor, torch.Tensor]:
+    def next_batch(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Return (x, y, w).
+
+        `w` is the per-target loss weight: 1.0 where supervised, 0.0 where the
+        sidecar masks the target. Masked positions are additionally set to
+        -100 in `y`, so they contribute nothing through either mechanism.
+
+        `w` always has the full target shape, so `w.numel()` is identical
+        across arms reading the same stream. That is what keeps the loss
+        denominator fixed and stops masking from reweighting the survivors.
+        """
         span = self.batch_size * (self.ctx + 1)
         if self.cursor + span >= self.n_tokens:
             self.cursor = 0
@@ -116,16 +141,21 @@ class PackedShards:
         toks = toks.astype(np.int64).reshape(self.batch_size, self.ctx + 1)
         x = torch.from_numpy(toks[:, :-1].copy())
         y = torch.from_numpy(toks[:, 1:].copy())
+        w = torch.ones_like(y, dtype=torch.float32)
         if msk is not None:
             m = msk.reshape(self.batch_size, self.ctx + 1)[:, 1:]
-            y[torch.from_numpy((m == 0).copy())] = -100
+            zero = torch.from_numpy((m == 0).copy())
+            y[zero] = -100
+            w[zero] = 0.0
         if self.device == "cuda":
             x = x.pin_memory().to(self.device, non_blocking=True)
             y = y.pin_memory().to(self.device, non_blocking=True)
+            w = w.pin_memory().to(self.device, non_blocking=True)
         elif self.device != "cpu":
             x = x.to(self.device)
             y = y.to(self.device)
-        return x, y
+            w = w.to(self.device)
+        return x, y, w
 
     def _probe_stream(self) -> ConcatMemmap | None:
         """Stream that defines the offloaded positions. Falls back to this

@@ -189,9 +189,9 @@ class Trainer:
             self.opt.zero_grad(set_to_none=True)
             micro_losses = []
             for _ in range(self.accum):
-                x, y = self.data.next_batch()
+                x, y, w = self.data.next_batch()
                 with self._autocast():
-                    _, loss = self.model(x, y)
+                    _, loss = self.model(x, y, weights=w)
                 (loss / self.accum).backward()
                 micro_losses.append(loss.item())
                 tokens_seen += x.numel()
