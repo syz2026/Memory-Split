@@ -39,6 +39,11 @@ def make_config(
     tokens_per_step: int = 524_288,
     micro_batch_size: int = 32,
     ctx: int = 1024,
+    n_entities: int = 0,
+    corpus_seed: int = 0,
+    igsm_mod: int = 23,
+    igsm_op: tuple[int, int] = (1, 4),
+    igsm_ood_op: tuple[int, int] = (5, 8),
 ) -> dict:
     cfg = {
         "run_id": run_id,
@@ -56,6 +61,13 @@ def make_config(
         "weight_decay": 0.1,
         "grad_clip": grad_clip,
         "seed": seed,
+        # Corpus metadata, so scripts/run_evals.py can regenerate the exact
+        # fact set to probe and the exact difficulty band to score.
+        "n_entities": n_entities,
+        "corpus_seed": corpus_seed,
+        "igsm_mod": igsm_mod,
+        "igsm_op": list(igsm_op),
+        "igsm_ood_op": list(igsm_ood_op),
         "out_rel": f"runs/{run_id}",
         "device": "cuda",
         "compile": True,
@@ -77,6 +89,10 @@ def cohort(
     total_tokens: int,
     lr: float,
     grad_clip: float,
+    load_entities: dict[str, int] | None = None,
+    corpus_seed: int = 0,
+    igsm_mod: int = 23,
+    igsm_op: tuple[int, int] = (1, 4),
 ) -> list[dict]:
     out = []
     for load_name, corpus_rel in loads.items():
@@ -92,6 +108,10 @@ def cohort(
                         total_tokens=total_tokens,
                         lr=lr,
                         grad_clip=grad_clip,
+                        n_entities=(load_entities or {}).get(load_name, 0),
+                        corpus_seed=corpus_seed,
+                        igsm_mod=igsm_mod,
+                        igsm_op=igsm_op,
                     )
                 )
     return out
@@ -132,11 +152,21 @@ def main() -> int:
         "--load", action="append", required=True, metavar="NAME=CORPUS_REL",
         help="repeatable, e.g. --load high=corpora/high --load low=corpora/low",
     )
+    ap.add_argument(
+        "--entities", action="append", default=[], metavar="NAME=N",
+        help="entity count per load, so the storage probe knows what to ask about",
+    )
+    ap.add_argument("--corpus-seed", type=int, default=0)
+    ap.add_argument("--igsm-mod", type=int, default=23)
+    ap.add_argument("--igsm-op", type=int, nargs=2, default=(1, 4))
     args = ap.parse_args()
 
     loads = dict(kv.split("=", 1) for kv in args.load)
+    load_entities = {k: int(v) for k, v in
+                     (kv.split("=", 1) for kv in args.entities)}
     configs = cohort(loads, args.seeds, args.model, args.total_tokens,
-                     args.lr, args.grad_clip)
+                     args.lr, args.grad_clip, load_entities,
+                     args.corpus_seed, args.igsm_mod, tuple(args.igsm_op))
     assert_arms_match(configs)
 
     out = Path(args.out)
