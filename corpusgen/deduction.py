@@ -310,6 +310,13 @@ def generate_deduction_eval(
                     "depth": p.depth,
                     "structure_hash": p.structure_hash,
                     "template": f"ded-d{p.depth}",
+                    # The answer class, so per-class accuracy is reportable.
+                    # The eval is exactly balanced by construction and the NO
+                    # branch's trace is a canned sentence, so a constant "no"
+                    # scores exactly 0.500 -- an aggregate number here is
+                    # indistinguishable from a degenerate policy.
+                    "answer_class": p.answer,
+                    "solution": " " + p.cot,
                 },
             )
         )

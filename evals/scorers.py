@@ -79,3 +79,41 @@ def save_results(rows: list[dict], path: str | Path) -> None:
     with open(path, "w") as f:
         for row in rows:
             f.write(json.dumps(row) + "\n")
+
+
+def accuracy_by(rows: list[dict], key: str) -> dict:
+    """Accuracy bucketed by a `meta` key, plus the majority-class rate.
+
+    Two endpoints in this project are unreadable as a single number. iGSM
+    trains 1/op-weighted and evaluates uniformly, so the aggregate is
+    dominated by the least-trained levels; report per `op`. Deduction's eval
+    is exactly balanced with a canned NO-branch trace, so a constant "no"
+    scores exactly 0.500; report per `answer_class`.
+
+    `majority_rate` is the best constant predictor over this row set. For
+    iGSM under MOD=23 it sits near 7.2%, not 1/23 = 4.3%, because `times`
+    overproduces zero -- scoring against 1/23 has misreported every iGSM
+    number this project has published.
+    """
+    buckets: dict[object, list[dict]] = {}
+    for r in rows:
+        buckets.setdefault(r.get("meta", {}).get(key), []).append(r)
+
+    answers: dict[object, int] = {}
+    for r in rows:
+        answers[r["answer"]] = answers.get(r["answer"], 0) + 1
+    majority = max(answers.values()) / len(rows) if rows else 0.0
+
+    return {
+        "key": key,
+        "n": len(rows),
+        "overall": sum(r["correct"] for r in rows) / len(rows) if rows else 0.0,
+        "majority_rate": majority,
+        "by": {
+            str(k): {
+                "n": len(v),
+                "acc": sum(r["correct"] for r in v) / len(v) if v else 0.0,
+            }
+            for k, v in sorted(buckets.items(), key=lambda kv: str(kv[0]))
+        },
+    }

@@ -22,6 +22,12 @@ from dataclasses import dataclass
 
 from .records import Doc, QAItem, plain
 
+# Default modulus. It is a difficulty knob, not a constant: the arithmetic
+# table has MOD^2 entries per operator, and the 2026-07-20 gates suggest the
+# prior floor was a token-budget artifact rather than a MOD artifact. MOD=23
+# stays primary; a reduction is a declared fallback with a named trigger, and
+# adopting one relabels the construct as "dependency tracing under easy
+# modular arithmetic" with no continuity claim to Physics-of-LM numbers.
 MOD = 23
 
 # Common words in nonsense combinations ("crimson satchels in the Annex").
@@ -57,11 +63,35 @@ PLACES = (
 # Operator table — the single piece of semantics the oracle may share with
 # the generator (plan Task 3). Python % keeps every result in 0..22.
 _OPS = {
-    "plus": lambda a, b: (a + b) % MOD,
-    "minus": lambda a, b: (a - b) % MOD,
-    "times": lambda a, b: (a * b) % MOD,
+    "plus": lambda a, b, m: (a + b) % m,
+    "minus": lambda a, b, m: (a - b) % m,
+    "times": lambda a, b, m: (a * b) % m,
 }
 _OP_WORDS = tuple(_OPS)
+
+
+def _regexes(mod: int):
+    """Oracle regexes for a given modulus. Cached; the modulus appears in the
+    statement text, so a missed hardcode surfaces as an oracle disagreement."""
+    if mod not in _RE_CACHE:
+        _RE_CACHE[mod] = {
+            "leaf": re.compile(r"The number of (.+?) is (\d+)\."),
+            "qq": re.compile(
+                r"The number of (.+?) equals the number of (.+?) "
+                r"(plus|minus|times) the number of (.+?), modulo %d\." % mod
+            ),
+            "qc": re.compile(
+                r"The number of (.+?) equals the number of (.+?) "
+                r"(plus|minus|times) (\d+), modulo %d\." % mod
+            ),
+            "q": re.compile(
+                r"Question: What is the number of (.+?), modulo %d\?" % mod
+            ),
+        }
+    return _RE_CACHE[mod]
+
+
+_RE_CACHE: dict[int, dict] = {}
 
 
 @dataclass
@@ -71,7 +101,9 @@ class IgsmProblem:
     prompt: str
     cot: str
     answer: int
-    structure_hash: str
+    structure_hash: str   # SHA-1 over rendered text: dedup only, NOT structure
+    topology_hash: str    # canonical DAG shape: invariant to names/constants
+    mod: int
 
 
 def _fresh_name(rng: random.Random, used: set[tuple[str, str, str]]) -> str:
@@ -83,7 +115,7 @@ def _fresh_name(rng: random.Random, used: set[tuple[str, str, str]]) -> str:
             return f"{adj} {noun}s in the {place}"
 
 
-def generate_problem(op: int, rng: random.Random) -> IgsmProblem:
+def generate_problem(op: int, rng: random.Random, mod: int = MOD) -> IgsmProblem:
     """Build a DAG whose query needs exactly `op` internal definitions."""
     if op < 1:
         raise ValueError("op must be >= 1")
@@ -96,7 +128,7 @@ def generate_problem(op: int, rng: random.Random) -> IgsmProblem:
 
     def new_leaf() -> str:
         name = _fresh_name(rng, used)
-        v = rng.randint(0, MOD - 1)
+        v = rng.randint(0, mod - 1)
         val[name] = v
         stmt[name] = f"The number of {name} is {v}."
         return name
@@ -105,17 +137,17 @@ def generate_problem(op: int, rng: random.Random) -> IgsmProblem:
         name = _fresh_name(rng, used)
         a = val[left[1]] if left[0] == "q" else left[1]
         b = val[right[1]] if right[0] == "q" else right[1]
-        val[name] = _OPS[opw](a, b)
+        val[name] = _OPS[opw](a, b, mod)
         if right[0] == "q":
             stmt[name] = (
                 f"The number of {name} equals the number of {left[1]} {opw} "
-                f"the number of {right[1]}, modulo 23."
+                f"the number of {right[1]}, modulo {mod}."
             )
         else:
             # Constants only ever appear as the right operand.
             stmt[name] = (
                 f"The number of {name} equals the number of {left[1]} {opw} "
-                f"{right[1]}, modulo 23."
+                f"{right[1]}, modulo {mod}."
             )
         defn[name] = (opw, left, right)
         return name
@@ -123,7 +155,7 @@ def generate_problem(op: int, rng: random.Random) -> IgsmProblem:
     def rand_second_operand(prev: str, defined: list[str]) -> tuple:
         r = rng.random()
         if r < 0.35:
-            return ("c", rng.randint(1, MOD - 1))
+            return ("c", rng.randint(1, mod - 1))
         if r < 0.75:
             return ("q", new_leaf())
         return ("q", rng.choice(defined))
@@ -134,7 +166,7 @@ def generate_problem(op: int, rng: random.Random) -> IgsmProblem:
     first = new_internal(
         ("q", new_leaf()),
         rng.choice(_OP_WORDS),
-        ("c", rng.randint(1, MOD - 1)) if rng.random() < 0.35 else ("q", new_leaf()),
+        ("c", rng.randint(1, mod - 1)) if rng.random() < 0.35 else ("q", new_leaf()),
     )
     internals.append(first)
     for _ in range(op - 1):
@@ -162,14 +194,14 @@ def generate_problem(op: int, rng: random.Random) -> IgsmProblem:
             left = ("q", rng.choice(everything))
             r = rng.random()
             if r < 0.35:
-                right: tuple = ("c", rng.randint(1, MOD - 1))
+                right: tuple = ("c", rng.randint(1, mod - 1))
             else:
                 right = ("q", rng.choice(everything))
             new_internal(left, rng.choice(_OP_WORDS), right)
 
     statements = list(stmt.values())
     rng.shuffle(statements)
-    question = f"Question: What is the number of {query}, modulo 23?"
+    question = f"Question: What is the number of {query}, modulo {mod}?"
     prompt = " ".join(statements) + f"\n{question}\nReasoning:"
 
     # CoT: needed leaves stated once on first use; each needed internal gets
@@ -189,11 +221,14 @@ def generate_problem(op: int, rng: random.Random) -> IgsmProblem:
         a = val[left[1]] if left[0] == "q" else left[1]
         b = val[right[1]] if right[0] == "q" else right[1]
         parts.append(
-            f"The number of {node} is ({a} {opw} {b}) mod 23 = {val[node]}."
+            f"The number of {node} is ({a} {opw} {b}) mod {mod} = {val[node]}."
         )
     answer = val[query]
     cot = " ".join(parts) + f"\nAnswer: {answer}"
 
+    # Dedup hash over rendered text. It includes entity names drawn from
+    # 42*42*32 combinations, so it guarantees exact-text novelty and nothing
+    # about structure. Do not describe it as a structural holdout.
     canon = "\n".join(sorted(statements)) + "\n" + question
     structure_hash = hashlib.sha1(canon.encode("utf-8")).hexdigest()
 
@@ -204,23 +239,46 @@ def generate_problem(op: int, rng: random.Random) -> IgsmProblem:
         cot=cot,
         answer=answer,
         structure_hash=structure_hash,
+        topology_hash=_topology_hash(internals, defn, op),
+        mod=mod,
     )
 
 
-_LEAF_RE = re.compile(r"The number of (.+?) is (\d+)\.")
-_QQ_RE = re.compile(
-    r"The number of (.+?) equals the number of (.+?) (plus|minus|times) "
-    r"the number of (.+?), modulo 23\."
-)
-_QC_RE = re.compile(
-    r"The number of (.+?) equals the number of (.+?) (plus|minus|times) "
-    r"(\d+), modulo 23\."
-)
-_Q_RE = re.compile(r"Question: What is the number of (.+?), modulo 23\?")
+def _topology_hash(internals: list[str], defn: dict, op: int) -> str:
+    """Canonical hash of the needed dependency DAG.
+
+    Invariant to entity names, constant values and statement order: operands
+    are rewritten as the index of the internal they refer to, or `L` for a
+    leaf, or `C` for a constant. Two problems with the same shape and
+    different names collide here and not under `structure_hash`, which is
+    what makes an out-of-distribution *structure* claim checkable.
+    """
+    index = {name: i for i, name in enumerate(internals)}
+
+    def slot(operand: tuple) -> str:
+        if operand[0] == "c":
+            return "C"
+        name = operand[1]
+        return f"I{index[name]}" if name in index else "L"
+
+    steps = []
+    for i, node in enumerate(internals):
+        opw, left, right = defn[node]
+        steps.append(f"I{i}={slot(left)}:{opw}:{slot(right)}")
+    canon = f"op={op}|" + ";".join(steps)
+    return hashlib.sha1(canon.encode("utf-8")).hexdigest()
 
 
-def solve_from_prompt(prompt: str) -> int:
-    """Independent oracle: parse the prompt text alone and evaluate mod 23."""
+def solve_from_prompt(prompt: str, mod: int = MOD) -> int:
+    """Independent oracle: parse the prompt text alone and evaluate mod `mod`.
+
+    Shares only the operator table with the generator, never its value
+    bookkeeping. The modulus appears in every statement, so a hardcode the
+    parameterisation missed shows up here as an unparseable statement rather
+    than as a silently wrong answer.
+    """
+    rx = _regexes(mod)
+    _LEAF_RE, _QQ_RE, _QC_RE, _Q_RE = rx["leaf"], rx["qq"], rx["qc"], rx["q"]
     head = prompt.split("\nQuestion:")[0]
     defs: dict[str, tuple] = {}
     for sent in re.split(r"(?<=\.)\s+", head.strip()):
@@ -251,11 +309,11 @@ def solve_from_prompt(prompt: str) -> int:
             return memo[name]
         kind, left, right = defs[name]
         if kind == "leaf":
-            result = left[1] % MOD
+            result = left[1] % mod
         else:
             a = ev(left[1]) if left[0] == "q" else left[1]
             b = ev(right[1]) if right[0] == "q" else right[1]
-            result = _OPS[kind](a, b)
+            result = _OPS[kind](a, b, mod)
         memo[name] = result
         return result
 
@@ -263,16 +321,16 @@ def solve_from_prompt(prompt: str) -> int:
 
 
 def _problem_stream(rng: random.Random, op_lo: int, op_hi: int,
-                    low_weighted: bool = False):
+                    low_weighted: bool = False, mod: int = MOD):
     ops = list(range(op_lo, op_hi + 1))
     weights = [1.0 / k for k in ops] if low_weighted else None
     while True:
         op = rng.choices(ops, weights)[0] if weights else rng.randint(op_lo, op_hi)
-        yield generate_problem(op, rng)
+        yield generate_problem(op, rng, mod=mod)
 
 
 def generate_igsm_docs(n_docs: int, op_lo: int, op_hi: int, seed: int,
-                       low_weighted: bool = True) -> list[Doc]:
+                       low_weighted: bool = True, mod: int = MOD) -> list[Doc]:
     """Training docs weight difficulty toward low op (1/op mass) so the
     easiest levels dominate early learning; eval stays uniform per op."""
     rng = random.Random(seed)
@@ -280,7 +338,7 @@ def generate_igsm_docs(n_docs: int, op_lo: int, op_hi: int, seed: int,
     docs: list[Doc] = []
     if n_docs <= 0:
         return docs
-    for p in _problem_stream(rng, op_lo, op_hi, low_weighted=low_weighted):
+    for p in _problem_stream(rng, op_lo, op_hi, low_weighted=low_weighted, mod=mod):
         if p.structure_hash in seen:
             continue
         seen.add(p.structure_hash)
@@ -290,7 +348,12 @@ def generate_igsm_docs(n_docs: int, op_lo: int, op_hi: int, seed: int,
                 kind="igsm",
                 dense_segments=[plain(full_text)],
                 split_segments=[plain(full_text)],
-                meta={"structure_hash": p.structure_hash, "op": p.op},
+                meta={
+                    "structure_hash": p.structure_hash,
+                    "topology_hash": p.topology_hash,
+                    "op": p.op,
+                    "mod": p.mod,
+                },
             )
         )
         if len(docs) == n_docs:
@@ -299,15 +362,27 @@ def generate_igsm_docs(n_docs: int, op_lo: int, op_hi: int, seed: int,
 
 
 def generate_igsm_eval(
-    n_items: int, op_lo: int, op_hi: int, seed: int, exclude: set[str]
+    n_items: int,
+    op_lo: int,
+    op_hi: int,
+    seed: int,
+    exclude: set[str],
+    mod: int = MOD,
+    exclude_topologies: set[str] | None = None,
 ) -> list[QAItem]:
+    """Held-out items. `exclude` is the training text-hash set (dedup);
+    `exclude_topologies` additionally holds out DAG shapes, which is what an
+    out-of-distribution structure claim needs. An OOD `op` band is disjoint in
+    topology by construction, since the chain length is part of the shape."""
     rng = random.Random(seed)
     seen: set[str] = set()
     items: list[QAItem] = []
     if n_items <= 0:
         return items
-    for p in _problem_stream(rng, op_lo, op_hi):
+    for p in _problem_stream(rng, op_lo, op_hi, mod=mod):
         if p.structure_hash in exclude or p.structure_hash in seen:
+            continue
+        if exclude_topologies and p.topology_hash in exclude_topologies:
             continue
         seen.add(p.structure_hash)
         items.append(
@@ -318,8 +393,14 @@ def generate_igsm_eval(
                 answer=str(p.answer),
                 meta={
                     "op": p.op,
+                    "mod": p.mod,
                     "structure_hash": p.structure_hash,
+                    "topology_hash": p.topology_hash,
                     "template": f"igsm-op{p.op}",
+                    # The worked trace, so the continuous metrics can score
+                    # reference-trace NLL. prompt + solution reproduces the
+                    # training text byte for byte.
+                    "solution": " " + p.cot,
                 },
             )
         )
