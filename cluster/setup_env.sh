@@ -19,7 +19,10 @@ fi
 "$VENV/bin/pip" install --upgrade pip -q
 "$VENV/bin/pip" install -q torch --index-url https://download.pytorch.org/whl/cu130 || \
     "$VENV/bin/pip" install -q torch
-"$VENV/bin/pip" install -q numpy tiktoken pyyaml tqdm matplotlib datasets huggingface_hub pytest
+# From requirements.txt rather than a hardcoded list, so the cluster cannot
+# drift from local. That file pins sympy>=1.13.3: torch's _sympy shim fails
+# against sympy 1.8 and silently breaks every trainer test.
+"$VENV/bin/pip" install -q -r "$SCRIPT_DIR/../requirements.txt"
 "$VENV/bin/python" - <<'PY'
 import tiktoken, torch
 tiktoken.get_encoding("gpt2")
