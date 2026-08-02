@@ -57,9 +57,17 @@ def stage_a_configs(
     lr: float,
     grad_clip: float,
 ) -> list[dict]:
-    """One dense run per architecture. The difficulty cells live inside the
-    corpus and are separated at evaluation by meta tags, so a single run
-    measures the whole ladder."""
+    """One dense run per architecture, at ONE difficulty.
+
+    This does not measure a difficulty ladder, despite an earlier version of
+    this docstring saying the cells live inside the corpus and are separated at
+    evaluation by meta tags. They do not: `build_corpus.py` takes a single
+    `--mod`, so difficulty is fixed for a whole corpus and a ladder needs one
+    corpus per rung. Stage A consequently ran two cells at MOD=23 that differed
+    only in architecture, and its STOP rests on that single rung.
+
+    The real ladder is `ops/crowding/ladder.py`. See docs/THEORY-ENDPOINT.md.
+    """
     out = []
     for model in ARCHITECTURES:
         out.append(

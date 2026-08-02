@@ -55,11 +55,44 @@ shasum -a 256 "$MS_BED" | tee $MS_ROOT/corpora/bed.sha256
 
 ---
 
-## Stage A — endpoint ladder (~4 GPU-h)
+## Stage A — architecture at one difficulty (~4 GPU-h)
 
 Answers the two cheapest questions that can void everything downstream: can
 the endpoint move at all, and does dropping weight sharing cost the depth it
 needs. **Stop if nothing clears majority-class + 5 points.**
+
+> **This stage is not a difficulty ladder.** `build_corpus.py` takes a single
+> `--mod`, so difficulty is fixed for a whole corpus; both Stage A cells ran
+> MOD=23 and varied only architecture. The run of 2026-08-01 returned STOP on
+> that one rung, with a step budget of 1,525 — roughly 7x short of what
+> modular arithmetic is reported to need. Read `docs/THEORY-ENDPOINT.md`
+> before acting on a STOP from here, and run the real ladder below.
+
+## The difficulty ladder (~4 GPU-h + 4 short CPU builds)
+
+One corpus per modulus, everything else pinned to Stage A's values so a lift
+is attributable to difficulty alone. Judged on **op=1 against the no-skill
+baseline**, which is the majority rate rather than `1/mod`.
+
+```bash
+bash ops/crowding/ladder.sh                       # builds, trains, evals
+$MS_PY ops/crowding/ladder.py --mode rank --runs $MS_ROOT/runs
+```
+
+| outcome | reading |
+|---|---|
+| clears at some rung | operation learnable; rerun the design at a modulus that clears |
+| flat even at mod 5 | 5 answers and a 232-bit table — not a difficulty problem |
+
+The step ladder is free: the trainer already writes snapshots, so score them
+rather than launching runs.
+
+```bash
+for s in $MS_ROOT/runs/<run>/snapshots/step*.pt; do
+  $MS_PY scripts/run_evals.py --run $MS_ROOT/runs/<run> --ckpt $s
+done
+$MS_PY ops/crowding/ladder.py --mode steps --run $MS_ROOT/runs/<run>
+```
 
 ```bash
 MS_OUT=$MS_ROOT/corpora/pilotA MS_ENTITIES=20000 MS_EXPOSURES=20 \

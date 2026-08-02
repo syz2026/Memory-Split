@@ -38,12 +38,13 @@ from train.tokenizer import get_tok  # noqa: E402
 MAX_NEW = 384
 
 
-def load_model(run: Path, cfg: dict, device) -> GPT:
+def load_model(run: Path, cfg: dict, device, ckpt: Path | None = None) -> GPT:
     mc = PRESETS[cfg["model"]] if isinstance(cfg["model"], str) else GPTConfig(**cfg["model"])
     if "ctx" in cfg:
         mc.ctx = cfg["ctx"]
     model = GPT(mc).to(device)
-    state = torch.load(run / "ckpt.pt", map_location=device, weights_only=False)
+    state = torch.load(ckpt or (run / "ckpt.pt"), map_location=device,
+                       weights_only=False)
     sd = state.get("model", state)
     # torch.compile prefixes every key; strip it so an uncompiled eval loads.
     sd = {k.removeprefix("_orig_mod."): v for k, v in sd.items()}
@@ -80,10 +81,11 @@ def log_diagnostics(run: Path) -> dict:
 
 
 def evaluate(run: Path, device, n_igsm: int, n_ded: int,
-             n_storage_entities: int, batch_size: int) -> dict:
+             n_storage_entities: int, batch_size: int,
+             ckpt: Path | None = None) -> dict:
     cfg = yaml.safe_load((run / "config.yaml").read_text())
     tok = get_tok()
-    model, mc = load_model(run, cfg, device)
+    model, mc = load_model(run, cfg, device, ckpt)
 
     mod = int(cfg.get("igsm_mod", 23))
     op_lo, op_hi = cfg.get("igsm_op", [1, 4])
@@ -91,7 +93,8 @@ def evaluate(run: Path, device, n_igsm: int, n_ded: int,
     seed = int(cfg["seed"])
 
     out: dict = {"run": run.name, "arm": cfg.get("arm"), "seed": seed,
-                 "model": cfg.get("model"), "mod": mod}
+                 "model": cfg.get("model"), "mod": mod,
+                 "ckpt": (ckpt.name if ckpt else "ckpt.pt")}
 
     # In-band iGSM. Eval seeds are offset far from any training seed so the
     # held-out draw cannot collide with the corpus.
@@ -167,13 +170,22 @@ def main() -> int:
     ap.add_argument("--n-deduction", type=int, default=400)
     ap.add_argument("--n-storage-entities", type=int, default=500)
     ap.add_argument("--batch-size", type=int, default=32)
+    # Scoring an intermediate snapshot turns one training run into a
+    # step ladder at no extra training cost.
+    ap.add_argument("--ckpt", default=None,
+                    help="checkpoint to score; defaults to the run's ckpt.pt")
+    ap.add_argument("--tag", default=None,
+                    help="filename stem under evals/; defaults to 'summary'")
     args = ap.parse_args()
 
     run = Path(args.run)
     (run / "evals").mkdir(parents=True, exist_ok=True)
+    ckpt = Path(args.ckpt) if args.ckpt else None
     out = evaluate(run, torch.device(args.device), args.n_igsm,
-                   args.n_deduction, args.n_storage_entities, args.batch_size)
-    (run / "evals" / "summary.json").write_text(json.dumps(out, indent=2))
+                   args.n_deduction, args.n_storage_entities, args.batch_size,
+                   ckpt)
+    stem = args.tag or (ckpt.stem if ckpt else "summary")
+    (run / "evals" / f"{stem}.json").write_text(json.dumps(out, indent=2))
     print(json.dumps(
         {k: out[k] for k in out
          if k.startswith(("igsm_acc", "igsm_lift", "igsm_ood_acc",

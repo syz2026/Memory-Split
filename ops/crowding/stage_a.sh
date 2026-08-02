@@ -63,8 +63,10 @@ PYTHONPATH="$REPO" "$PY" "$REPO/ops/crowding/pilot.py" --stage A \
     --out "$CFGS" --corpus "$CORPUS" \
     --total-tokens "$TOKENS" --lr "$LR" --grad-clip "$GRAD_CLIP"
 
-# The ladder lives inside the corpus and is separated at evaluation, so both
-# runs read the same stream and differ only in n_recurrence.
+# Both runs read the same stream and differ only in n_recurrence. Note what
+# that means: the modulus below is FIXED, so this stage varies architecture at
+# one difficulty. It is not a difficulty ladder, whatever the name suggests --
+# that is ops/crowding/ladder.sh, which builds one corpus per rung.
 "$PY" - "$CFGS" "$CORPUS" "$ENTITIES" <<'PY'
 import sys, pathlib, yaml
 cfgs, corpus, entities = pathlib.Path(sys.argv[1]), sys.argv[2], int(sys.argv[3])
