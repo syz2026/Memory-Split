@@ -62,6 +62,7 @@ def test_no_versioned_or_superseded_source_paths():
 def test_docs_holds_only_the_current_documents():
     docs = sorted(p.name for p in (ROOT / "docs").iterdir() if p.is_file())
     assert docs == [
+        "GATE0-CEILING-IS-NOT-A-BOUND.md",
         "NO-GO-PAPER.md",
         "POPQA-HELDOUT-KEY.md",
         "PREREGISTRATION.md",
