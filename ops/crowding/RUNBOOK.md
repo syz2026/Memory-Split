@@ -20,6 +20,27 @@ At `ctx=1024`, `micro_batch_size=32`, compiled, from completed runs:
 token from about 124M to 81M — expect roughly 1.5x, but **re-measure it in
 Stage A** rather than trusting that.
 
+## Resuming after a disconnect
+
+SLURM keeps running whether or not anyone is watching, so after a gap the first
+question is never "what should I launch" but "what already happened". One call
+answers it and names the next action:
+
+```bash
+PYTHONPATH=. $MS_PY ops/crowding/status.py --root $MS_ROOT
+```
+
+It reports every corpus with its verification state and size against the
+150 GB budget, every run with its last step and whether a checkpoint, eval and
+snapshots exist, the live queue, and then the single next action. It
+specifically catches the case a queue dump hides — trains finished, evals
+died, nothing running, so it looks complete.
+
+**SSH to FarmShare needs the Stanford VPN.** If every `*.farmshare.stanford.edu`
+host is unreachable on port 22 while `stanford.edu:443` is open, the tunnel has
+dropped rather than the cluster being down. Reconnect and re-run the above;
+jobs submitted before the drop will have carried on regardless.
+
 ## Rehearse the whole chain first
 
 Nine seconds on CPU, and it has already caught one bug that would have
