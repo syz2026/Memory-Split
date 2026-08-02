@@ -67,6 +67,7 @@ def test_docs_holds_only_the_current_documents():
         "POPQA-HELDOUT-KEY.md",
         "PREREGISTRATION.md",
         "RETAINED-RESULTS.md",
+        "THEORY-CAPACITY.md",
     ], docs
 
 
