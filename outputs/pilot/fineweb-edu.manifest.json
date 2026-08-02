@@ -1,0 +1,11 @@
+{
+  "dataset": "HuggingFaceFW/fineweb-edu",
+  "config": "sample-10BT",
+  "split": "train",
+  "revision": null,
+  "n_docs": 5000000,
+  "min_chars": 400,
+  "bytes": 24151999648,
+  "sha256": "defa12893046f800654eca96b13da6c6b6c6133e404271fb369006b2d68d7e44",
+  "path": "/scratch/users/syz/crowding/corpora/fineweb-edu.jsonl"
+}

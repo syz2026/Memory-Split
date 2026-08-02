@@ -1,0 +1,92 @@
+{
+  "run": "pilotA_d40m",
+  "arm": "sup",
+  "seed": 9001,
+  "model": "d40m",
+  "mod": 23,
+  "igsm_acc": 0.062,
+  "igsm_by_op": {
+    "1": {
+      "n": 352,
+      "acc": 0.03977272727272727
+    },
+    "2": {
+      "n": 380,
+      "acc": 0.05789473684210526
+    },
+    "3": {
+      "n": 388,
+      "acc": 0.08505154639175258
+    },
+    "4": {
+      "n": 380,
+      "acc": 0.06315789473684211
+    }
+  },
+  "igsm_majority_rate": 0.07133333333333333,
+  "igsm_lift_over_majority": -0.009333333333333332,
+  "igsm_n": 1500,
+  "igsm_ood_acc": 0.050666666666666665,
+  "igsm_ood_by_op": {
+    "5": {
+      "n": 211,
+      "acc": 0.04739336492890995
+    },
+    "6": {
+      "n": 178,
+      "acc": 0.05056179775280899
+    },
+    "7": {
+      "n": 184,
+      "acc": 0.059782608695652176
+    },
+    "8": {
+      "n": 177,
+      "acc": 0.04519774011299435
+    }
+  },
+  "igsm_ood_majority_rate": 0.07733333333333334,
+  "deduction_overall": 0.5725,
+  "deduction_by_class": {
+    "no": {
+      "n": 200,
+      "acc": 0.895
+    },
+    "yes": {
+      "n": 200,
+      "acc": 0.25
+    }
+  },
+  "deduction_majority_rate": 0.5,
+  "recoverable_bits_per_entity": -482.17463041921417,
+  "recoverable_bits_per_param": -0.2377586935005987,
+  "recoverable_bits_per_attribute": {
+    "birth_date": -77.85195261621745,
+    "birth_city": -69.65418785343792,
+    "university": -104.25043212781921,
+    "major": -84.24683162872799,
+    "employer": -79.18459101315068,
+    "current_city": -66.9866351798609
+  },
+  "recoverable_bits_per_entity_length": -489.7869911822923,
+  "recoverable_bits_per_param_length": -0.24151232306819145,
+  "recoverable_bits_per_attribute_length": {
+    "birth_date": -77.85195261621745,
+    "birth_city": -70.69191210805118,
+    "university": -105.78673014716775,
+    "major": -86.59078329249729,
+    "employer": -80.82107376999049,
+    "current_city": -68.04453924836814
+  },
+  "recoverable_bits_scaled_from": 500,
+  "n_entities": 20000,
+  "final_step": 1525,
+  "final_loss_ema": 1.7679,
+  "clip_ratio": 1.0,
+  "clip_frac": 0.0,
+  "grad_norm_preclip": 0.03495714285714286,
+  "adam_v_mean": 0.0,
+  "loss_masked_values_final": 21.0777,
+  "n_gate0_points": 4,
+  "n_params": 40560000
+}

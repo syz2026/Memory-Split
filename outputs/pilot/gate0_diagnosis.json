@@ -1,0 +1,161 @@
+{
+  "run": "pilotA_d40m_std",
+  "n_scored_positions": 32517,
+  "uniform_ceiling_nats": 10.826,
+  "mean_ce_nats": 25.026,
+  "median_ce_nats": 27.778,
+  "frac_above_uniform": 0.987,
+  "ce_percentiles": {
+    "5": 16.49,
+    "25": 21.95,
+    "50": 27.78,
+    "75": 28.44,
+    "95": 29.76,
+    "99": 30.81
+  },
+  "mean_model_entropy_nats": 3.826,
+  "argmax_accuracy": 0.0001,
+  "sample": [
+    {
+      "true": " September",
+      "pred": " Arcade",
+      "ce_nats": 16.3,
+      "p_true": 8.341716295490187e-08,
+      "entropy_nats": 4.5
+    },
+    {
+      "true": " 25",
+      "pred": " hollow",
+      "ce_nats": 25.0,
+      "p_true": 1.3849296709445014e-11,
+      "entropy_nats": 4.49
+    },
+    {
+      "true": ",",
+      "pred": " g",
+      "ce_nats": 17.36,
+      "p_true": 2.9010610802515657e-08,
+      "entropy_nats": 4.65
+    },
+    {
+      "true": " 1967",
+      "pred": " then",
+      "ce_nats": 14.65,
+      "p_true": 4.3571003516262863e-07,
+      "entropy_nats": 0.87
+    },
+    {
+      "true": " As",
+      "pred": " the",
+      "ce_nats": 23.69,
+      "p_true": 5.169168218466247e-11,
+      "entropy_nats": 0.03
+    },
+    {
+      "true": "pen",
+      "pred": " r",
+      "ce_nats": 29.92,
+      "p_true": 1.0122751161606436e-13,
+      "entropy_nats": 4.64
+    },
+    {
+      "true": "ford",
+      "pred": " r",
+      "ce_nats": 28.68,
+      "p_true": 3.5120699209099937e-13,
+      "entropy_nats": 4.67
+    },
+    {
+      "true": " Ember",
+      "pred": " g",
+      "ce_nats": 29.14,
+      "p_true": 2.2073673184436204e-13,
+      "entropy_nats": 4.66
+    },
+    {
+      "true": " Hollow",
+      "pred": " g",
+      "ce_nats": 29.92,
+      "p_true": 1.013268042062733e-13,
+      "entropy_nats": 4.66
+    },
+    {
+      "true": " University",
+      "pred": " g",
+      "ce_nats": 29.25,
+      "p_true": 1.9864535363844915e-13,
+      "entropy_nats": 4.66
+    },
+    {
+      "true": " Comput",
+      "pred": " the",
+      "ce_nats": 22.77,
+      "p_true": 1.2965799267572464e-10,
+      "entropy_nats": 0.19
+    },
+    {
+      "true": "ational",
+      "pred": " is",
+      "ce_nats": 27.91,
+      "p_true": 7.566656719595888e-13,
+      "entropy_nats": 0.5
+    },
+    {
+      "true": " Literature",
+      "pred": " is",
+      "ce_nats": 27.89,
+      "p_true": 7.744779752412445e-13,
+      "entropy_nats": 0.58
+    },
+    {
+      "true": " Led",
+      "pred": " d",
+      "ce_nats": 25.52,
+      "p_true": 8.244027856207925e-12,
+      "entropy_nats": 3.58
+    },
+    {
+      "true": "ger",
+      "pred": " g",
+      "ce_nats": 28.47,
+      "p_true": 4.312354509941607e-13,
+      "entropy_nats": 4.66
+    },
+    {
+      "true": " Manufacturing",
+      "pred": " g",
+      "ce_nats": 28.89,
+      "p_true": 2.840750909244988e-13,
+      "entropy_nats": 4.66
+    },
+    {
+      "true": " Crane",
+      "pred": " the",
+      "ce_nats": 22.01,
+      "p_true": 2.7724891826785836e-10,
+      "entropy_nats": 0.45
+    },
+    {
+      "true": " Springs",
+      "pred": " is",
+      "ce_nats": 26.97,
+      "p_true": 1.934813420589876e-12,
+      "entropy_nats": 1.12
+    },
+    {
+      "true": " Copper",
+      "pred": "rium",
+      "ce_nats": 15.16,
+      "p_true": 2.598775097339967e-07,
+      "entropy_nats": 1.33
+    },
+    {
+      "true": "field",
+      "pred": " sp",
+      "ce_nats": 28.5,
+      "p_true": 4.2050252711291203e-13,
+      "entropy_nats": 4.65
+    }
+  ],
+  "verdict": "CONFIDENTLY WRONG. The model is sharp at these positions and its mass is on the wrong token, so it learned the slot and not the filler. ln(V) is therefore NOT an upper bound on gate 0, and a reading near the uniform ceiling cannot be read as 'knows nothing'."
+}

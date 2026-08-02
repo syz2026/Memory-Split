@@ -64,22 +64,28 @@ at step 6,103 of a 3.2B-token budget, plus two 1B dense calibration gates.
 Logs, configs, `ANALYSIS.txt`, and `CHECKPOINTS-SHA256SUMS` for the terminal
 checkpoints backed up to FarmShare home storage.
 
-**Supports.** That the masking mechanism is behaviourally sharp: split-arm
-cross-entropy on the masked value positions lands at 9.64–12.30 nats across all
-six split runs and both seeds. That training is highly reproducible — seed
-spread in final loss is at most 0.0086 nats.
+**Supports.** That training is highly reproducible — seed spread in final loss
+is at most 0.0086 nats. The split-arm cross-entropy at masked positions,
+9.64–12.30 nats across all six runs and both seeds, is a reproducible
+measurement; what it *means* is corrected below.
 
 **Does not support.** Any endpoint claim. **No evaluations were ever run on
 these twelve checkpoints**, and `ANALYSIS.txt` records `[FAIL] evaluations
 present`. The dense-minus-split training-loss gap is not a treatment effect,
 because the arms score different target sets.
 
-**Also invalid: the 10.83-nat ceiling these numbers are read against.**
-`ln(50304)` assumes uniform over the vocabulary. Values come from pools of
-100–3,719 with predictable multi-token continuations and visible preceding
-payload tokens, so the correct null is conditional entropy given attribute,
-length and context. The gate-0 reading is qualitatively right and
-quantitatively wrong.
+**The 10.83-nat ceiling these numbers were read against is not a bound at
+all.** Measured 2026-08-02 on a *dense* arm that trained on those positions:
+25.03 nats, with 98.7% of 32,517 positions above the uniform ceiling, model
+entropy 3.83 nats and argmax accuracy 0.0001. A language model is never
+uniform — it concentrates mass on frequent tokens, so at positions requiring
+rare tokens it necessarily scores worse than uniform.
+
+So a split arm landing near 10.8 had learned the slot type and was uncertain
+within the pool, not "pinned at the ceiling knowing nothing"; a model that
+knows nothing scores 25+. The agreement with ln(V) was a coincidence read as
+confirmation. Full write-up and the reproduction command:
+docs/GATE0-CEILING-IS-NOT-A-BOUND.md.
 
 ## 3. 160M reasoning-v3 seed-0 pair, and the exposure census
 

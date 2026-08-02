@@ -1,0 +1,46 @@
+{
+  "n_tokens": 800000000,
+  "n_entities": 20000,
+  "exposures": 20,
+  "seed": 0,
+  "mod": 23,
+  "op_band": [
+    1,
+    4
+  ],
+  "depth_band": [
+    1,
+    2
+  ],
+  "bed": "SYNTHETIC-REHEARSAL-ONLY",
+  "lane_tokens": {
+    "fact": 29998128,
+    "igsm": 239999986,
+    "deduction": 80000084,
+    "bed": 450001828
+  },
+  "lane_budgets": {
+    "fact": 29998128,
+    "igsm": 240000000,
+    "deduction": 80000000,
+    "bed": 450001872
+  },
+  "bits_total": 1059200.0,
+  "bits_per_param": {
+    "d8m": 0.13353881904884857,
+    "d40m": 0.02611439842209073,
+    "d160m": 0.006529372312305204
+  },
+  "mask_audit": {
+    "factmask_zeros": 7465180,
+    "randpos_zeros": 7465180,
+    "mass_matched": true,
+    "overlap": 0,
+    "factmask_frac": 0.009331475
+  },
+  "sha256": {
+    "factmask.bin": "632744169dc931fea791357327079660f553eaba0716515c44fe997ae3d41edc",
+    "randpos.bin": "e49eab45459c807c9b3f9aab52e69cb0c5ac1df28ca12dcf11af2b65b7316eaf",
+    "targets.bin": "e80e40272572a4cd37bbd94883533ad0f5e49d5197447810de17d9ec386a28d5"
+  }
+}

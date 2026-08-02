@@ -1,0 +1,31 @@
+run_id: pilotA_d40m
+stage: A
+arm: sup
+model: d40m
+ctx: 1024
+vocab_size: 50304
+train_bin: /scratch/users/syz/crowding/corpora/pilotA/targets.bin
+micro_batch_size: 32
+tokens_per_step: 524288
+total_tokens: 800000000
+lr: 0.0015
+warmup_steps: 300
+grad_clip: 1.0
+seed: 9001
+out_rel: runs/pilotA_d40m
+device: cuda
+compile: true
+log_every: 20
+eval_every: 250
+snap_frac: 0.25
+probe_mask: /scratch/users/syz/crowding/corpora/pilotA/factmask.bin
+n_entities: 20000
+corpus_seed: 0
+igsm_mod: 23
+igsm_op:
+- 1
+- 4
+igsm_ood_op:
+- 5
+- 8
+out_dir: /scratch/users/syz/crowding/runs/pilotA_d40m
