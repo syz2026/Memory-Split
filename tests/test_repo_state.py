@@ -68,6 +68,7 @@ def test_docs_holds_only_the_current_documents():
         "PREREGISTRATION.md",
         "RETAINED-RESULTS.md",
         "THEORY-CAPACITY.md",
+        "THEORY-ENDPOINT.md",
     ], docs
 
 
