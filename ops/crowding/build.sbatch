@@ -12,10 +12,10 @@
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
-#SBATCH --mem=64G
+#SBATCH --mem=96G
 #SBATCH --partition=normal
 #SBATCH --qos=normal
-#SBATCH --time=08:00:00
+#SBATCH --time=24:00:00
 #SBATCH --output=crowding-build-%j.out
 
 set -euo pipefail
@@ -52,6 +52,10 @@ PYTHONPATH="$MS_CODE" "$PY" "$MS_CODE/ops/crowding/build_corpus.py" \
   --total-tokens "$MS_TOKENS" \
   --seed "$SEED" \
   --mod "$MOD" \
+  --fact-share "${MS_FACT_SHARE:-0.70}" \
+  --igsm-share "${MS_IGSM_SHARE:-0.123}" \
+  --deduction-share "${MS_DED_SHARE:-0.043}" \
+  --bed-share "${MS_BED_SHARE:-0.134}" \
   "${BED_ARG[@]}"
 
 rc=$?
