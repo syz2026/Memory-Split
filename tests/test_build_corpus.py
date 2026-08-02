@@ -2,6 +2,7 @@
 
 import importlib.util
 import json
+import sys
 from pathlib import Path
 
 import numpy as np
@@ -14,6 +15,10 @@ _SPEC = importlib.util.spec_from_file_location(
     Path(__file__).resolve().parents[1] / "ops" / "crowding" / "build_corpus.py",
 )
 bc = importlib.util.module_from_spec(_SPEC)
+# Register before exec: multiprocessing pickles the worker function by
+# qualified name, so the module has to be resolvable. Running the file as a
+# script (which production does) registers it as __main__ automatically.
+sys.modules["build_corpus"] = bc
 _SPEC.loader.exec_module(bc)
 
 SHARES = {"fact": 0.5, "igsm": 0.3, "deduction": 0.1, "bed": 0.1}
@@ -213,3 +218,54 @@ def test_every_arm_probes_the_same_positions():
     probes = {c["probe_mask"] for c in _cohort()
               if c["run_id"].split("_")[1] == "high"}
     assert len(probes) == 1 and "factmask.bin" in probes.pop()
+
+
+# ---------------------------------------------------------- parallel fact lane
+
+
+def test_randpos_is_a_pure_function_of_its_coordinates():
+    """It used to take a shared RNG threaded through the whole fact lane, so a
+    document's control mask depended on how far that stream had advanced --
+    making the corpus depend on generation order."""
+    import random as _r
+    a = bc.randpos_seed(7, 3)
+    b = bc.randpos_seed(7, 3)
+    assert [a.random() for _ in range(5)] == [b.random() for _ in range(5)]
+    assert bc.randpos_seed(7, 3).random() != bc.randpos_seed(7, 4).random()
+
+
+def test_parallel_build_is_byte_identical_to_serial(tmp_path):
+    """The whole point. If workers changed the corpus, every run would be
+    conditional on how many cores happened to be free."""
+    a = bc.build(tmp_path / "serial", 40, 12, SHARES, 120_000, seed=0, workers=1)
+    b = bc.build(tmp_path / "par", 40, 12, SHARES, 120_000, seed=0, workers=4)
+    assert a["sha256"] == b["sha256"], "parallel output differs from serial"
+
+
+def test_parallel_build_passes_the_same_verifier(tmp_path):
+    out = tmp_path / "par"
+    bc.build(out, 40, 12, SHARES, 120_000, seed=0, workers=4)
+    assert bc.verify(out, expect_tokens=120_000) == []
+
+
+def test_chunk_boundaries_do_not_change_the_output():
+    """Chunks of 7 docs put boundaries mid-round, where an order-dependent
+    generator would diverge."""
+    from corpusgen import bios
+    from train.tokenizer import get_tok
+    tok = get_tok()
+    recs = bios.generate_records(9, 1)
+    serial = list(bc.fact_stream(recs, 4, tok, workers=1))
+    chunked = list(bc.fact_stream(recs, 4, tok, workers=3, chunk_docs=7))
+    assert len(serial) == len(chunked) == 36
+    for (a_i, a_f, a_r), (b_i, b_f, b_r) in zip(serial, chunked):
+        assert np.array_equal(a_i, b_i)
+        assert np.array_equal(a_f, b_f)
+        assert np.array_equal(a_r, b_r)
+
+
+def test_doc_index_inverts_the_emission_order():
+    from corpusgen import factlane
+    order = list(factlane.doc_order(5, 3))
+    for k, (entity, exposure) in enumerate(order):
+        assert factlane.doc_at(k, 5) == (entity, exposure)

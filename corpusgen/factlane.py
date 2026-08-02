@@ -185,6 +185,37 @@ def verify_doc(rec: BioRecord, exposure: int, tok) -> None:
             )
 
 
+def doc_at(index: int, n_entities: int) -> tuple[int, int]:
+    """Invert `doc_order`: global document index -> (entity, exposure).
+
+    `doc_order` emits grouped rounds, so index k is exposure k // N of entity
+    k % N. Having the inverse is what lets the fact lane be generated in
+    parallel chunks and reassembled in canonical order.
+    """
+    exposure, entity = divmod(index, n_entities)
+    return entity, exposure
+
+
+def render_one(
+    records: list[BioRecord], index: int, tok
+) -> tuple[np.ndarray, np.ndarray, int, int]:
+    """One document by global index. A pure function of its coordinates.
+
+    `bios.render_bio_marked` seeds on the string "bio:{entity}:{exposure}", so
+    a document is reproducible in isolation with no shared state -- which is
+    what makes chunked parallel generation byte-identical to a serial run.
+    """
+    entity, exposure = doc_at(index, len(records))
+    segs = bios.render_bio_marked(records[entity], exposure)
+    ids, mask = tok.encode_segments(segs, add_eot=True)
+    return (
+        np.asarray(ids, dtype=np.uint16),
+        np.asarray(mask, dtype=np.uint8),
+        entity,
+        exposure,
+    )
+
+
 def emit(
     records: list[BioRecord],
     exposures: int,
@@ -201,13 +232,25 @@ def emit(
     previous builder and was called only from its unit tests, so no production
     corpus ever asserted the invariant it protects.
     """
-    for n, (entity, exposure) in enumerate(doc_order(len(records), exposures)):
-        rec = records[entity]
-        if verify_every and n % verify_every == 0:
-            verify_doc(rec, exposure, tok)
-        segs = bios.render_bio_marked(rec, exposure)
-        ids, mask = tok.encode_segments(segs, add_eot=True)
-        yield np.asarray(ids, dtype=np.uint16), np.asarray(mask, dtype=np.uint8)
+    for ids, mask, _, _ in emit_indexed(records, exposures, tok, verify_every):
+        yield ids, mask
+
+
+def emit_indexed(
+    records: list[BioRecord],
+    exposures: int,
+    tok,
+    verify_every: int = 10_000,
+) -> Iterator[tuple[np.ndarray, np.ndarray, int, int]]:
+    """As `emit`, but also yields (entity, exposure) so the caller can derive
+    a per-document seed rather than threading a shared RNG."""
+    n = len(records)
+    for k in range(n * exposures):
+        entity, exposure = doc_at(k, n)
+        if verify_every and k % verify_every == 0:
+            verify_doc(records[entity], exposure, tok)
+        ids, mask, _, _ = render_one(records, k, tok)
+        yield ids, mask, entity, exposure
 
 
 def measure_geometry(records: list[BioRecord], tok, n_sample: int = 300) -> dict:

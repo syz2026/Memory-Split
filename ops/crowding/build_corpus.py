@@ -73,10 +73,66 @@ def _plain_doc(tok, text: str) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     return ids, ones, ones.copy()
 
 
-def fact_stream(records, exposures, tok, rng, token_nll=None):
-    for ids, fmask in factlane.emit(records, exposures, tok):
-        rmask = randpos.build(ids, fmask, rng, token_nll=None)
-        yield ids, fmask, rmask
+def randpos_seed(entity: int, exposure: int) -> random.Random:
+    """A per-document RNG for the control sidecar.
+
+    This used to be one RNG threaded through the whole fact lane, which made
+    a document's control mask depend on how far the shared stream had
+    advanced -- so the corpus depended on generation order and could not be
+    produced in parallel without changing it. Seeding per document makes
+    randpos a pure function of its coordinates, exactly like the content, and
+    the corpus byte-identical regardless of worker count.
+    """
+    return random.Random(f"randpos:{entity}:{exposure}")
+
+
+def fact_stream(records, exposures, tok, workers: int = 1,
+                chunk_docs: int = 20_000):
+    """Fact documents in canonical order, optionally generated in parallel.
+
+    The fact lane is ~98% of the build cost: 11.5B tokens at ~1,640 docs/s on
+    one core is 26 hours, which does not fit a wall-clock limit. Documents are
+    independent given their coordinates, so chunks are farmed out and consumed
+    in order; `imap` preserves ordering, so the output is unchanged.
+    """
+    n_docs = len(records) * exposures
+    if workers <= 1:
+        for ids, fmask, entity, exposure in factlane.emit_indexed(
+            records, exposures, tok
+        ):
+            yield ids, fmask, randpos.build(ids, fmask, randpos_seed(entity, exposure))
+        return
+
+    import multiprocessing as mp
+
+    chunks = [(lo, min(lo + chunk_docs, n_docs))
+              for lo in range(0, n_docs, chunk_docs)]
+    ctx = mp.get_context("fork")  # children inherit `records` copy-on-write
+    with ctx.Pool(workers, initializer=_init_worker,
+                  initargs=(records, exposures)) as pool:
+        for batch in pool.imap(_gen_chunk, chunks):
+            yield from batch
+
+
+_W: dict = {}
+
+
+def _init_worker(records, exposures):
+    _W["records"] = records
+    _W["exposures"] = exposures
+    _W["tok"] = get_tok()
+
+
+def _gen_chunk(bounds):
+    lo, hi = bounds
+    records, tok = _W["records"], _W["tok"]
+    out = []
+    for k in range(lo, hi):
+        ids, fmask, entity, exposure = factlane.render_one(records, k, tok)
+        out.append(
+            (ids, fmask, randpos.build(ids, fmask, randpos_seed(entity, exposure)))
+        )
+    return out
 
 
 def igsm_stream(tok, op_lo, op_hi, seed, mod):
@@ -134,6 +190,7 @@ def build(
     depth_band: tuple[int, int] = (1, 2),
     bed_jsonl: Path | None = None,
     progress_every: int = 0,
+    workers: int = 1,
 ) -> dict:
     tok = get_tok()
     rng = random.Random(seed)
@@ -141,7 +198,7 @@ def build(
 
     budgets = {k: int(total_tokens * v) for k, v in shares.items()}
     streams = {
-        "fact": fact_stream(records, exposures, tok, rng),
+        "fact": fact_stream(records, exposures, tok, workers=workers),
         "igsm": igsm_stream(tok, op_band[0], op_band[1], seed * 7 + 1, mod),
         "deduction": deduction_stream(tok, depth_band[0], depth_band[1], seed * 7 + 2),
         "bed": bed_stream(tok, bed_jsonl, seed * 7 + 3),
@@ -283,6 +340,10 @@ def main() -> int:
     ap.add_argument("--igsm-share", type=float, default=0.30)
     ap.add_argument("--deduction-share", type=float, default=0.10)
     ap.add_argument("--bed-share", type=float, default=0.10)
+    ap.add_argument("--workers", type=int, default=1,
+                    help="parallel fact-lane workers; the fact lane is ~98% "
+                         "of the build cost and is the only lane worth "
+                         "parallelising")
     args = ap.parse_args()
 
     shares = {
@@ -298,7 +359,7 @@ def main() -> int:
         out, args.entities, args.exposures, shares, args.total_tokens,
         args.seed, mod=args.mod, op_band=(args.op_lo, args.op_hi),
         bed_jsonl=Path(args.bed_jsonl) if args.bed_jsonl else None,
-        progress_every=1 << 28,
+        progress_every=1 << 28, workers=args.workers,
     )
     print(json.dumps(
         {k: man[k] for k in ("n_tokens", "n_entities", "exposures",

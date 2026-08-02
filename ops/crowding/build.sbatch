@@ -11,11 +11,11 @@
 #SBATCH --job-name=crowding-build
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=8
-#SBATCH --mem=96G
+#SBATCH --cpus-per-task=64
+#SBATCH --mem=200G
 #SBATCH --partition=normal
 #SBATCH --qos=normal
-#SBATCH --time=24:00:00
+#SBATCH --time=12:00:00
 #SBATCH --output=crowding-build-%j.out
 
 set -euo pipefail
@@ -35,7 +35,13 @@ say "corpus build on $(hostname), job ${SLURM_JOB_ID:-none}"
 say "  out       $MS_OUT"
 say "  entities  $MS_ENTITIES x $MS_EXPOSURES exposures"
 say "  tokens    $MS_TOKENS"
+WORKERS=${MS_WORKERS:-${SLURM_CPUS_PER_TASK:-8}}
 say "  mod       $MOD  seed $SEED"
+say "  workers   $WORKERS"
+# The fact lane is ~98% of the build: 11.5B tokens at ~1,640 docs/s on one
+# core is 26 hours, past any sensible wall clock. Documents are pure
+# functions of their coordinates, so chunks parallelise and the output is
+# byte-identical to a serial build.
 
 BED_ARG=()
 if [ -n "$BED" ]; then
@@ -56,6 +62,7 @@ PYTHONPATH="$MS_CODE" "$PY" "$MS_CODE/ops/crowding/build_corpus.py" \
   --igsm-share "${MS_IGSM_SHARE:-0.123}" \
   --deduction-share "${MS_DED_SHARE:-0.043}" \
   --bed-share "${MS_BED_SHARE:-0.134}" \
+  --workers "$WORKERS" \
   "${BED_ARG[@]}"
 
 rc=$?
