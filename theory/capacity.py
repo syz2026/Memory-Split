@@ -289,11 +289,22 @@ def audit(n_entities: int, exposures: int, fractions, bits_per_entity: float,
 
 
 def dose_response_signature(effects_by_ratio: dict[float, float],
-                            tol: float = 0.2) -> str:
+                            tol: float = 0.2, floor: float = 0.0) -> str:
     """Classify a measured dose-response into the competing explanations.
 
     `effects_by_ratio` maps F/C to the split-minus-dense advantage. `tol` is the
     fraction of the largest effect below which variation counts as flat.
+    `floor` is the absolute size below which an effect counts as zero, and in
+    the confirmatory analysis it is the preregistered minimum interesting
+    effect.
+
+    `floor` is not cosmetic. "Flat at zero" is a statement about absolute
+    magnitude and needs an external scale: the earlier form of this function
+    tested `peak < tol * peak`, which is true only for negative `peak` and so
+    could never fire. Every negligible dose-response was therefore classified
+    as though its shape were meaningful, and a set of effects three orders of
+    magnitude below the noise floor could still be reported as "rising then
+    saturating: consistent with capacity reallocation".
 
     The nonzero-flat case is the one worth the trouble: it is the signature of
     the mask helping for reasons that have nothing to do with capacity.
@@ -305,8 +316,9 @@ def dose_response_signature(effects_by_ratio: dict[float, float],
     peak = max(abs(v) for v in vals)
     spread = max(vals) - min(vals)
 
-    if peak < tol * max(1e-12, peak) or peak == 0:
-        return "flat at zero: no effect"
+    if peak <= floor:
+        return ("flat at zero: no effect at any load exceeds the minimum "
+                "interesting effect")
     if spread < tol * peak:
         return ("flat and nonzero: CONFOUND. The advantage does not track fact "
                 "load, so it is not capacity reallocation. Suspect the mask as "

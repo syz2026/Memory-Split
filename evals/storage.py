@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import collections
 import datetime
+import statistics
 import math
 
 import torch
@@ -166,10 +167,12 @@ def recoverable_bits(
 
     per_attr: dict[str, list[float]] = collections.defaultdict(list)
     base_by_attr: dict[str, list[float]] = collections.defaultdict(list)
+    per_entity: dict[object, float] = collections.defaultdict(float)
     for q, n in zip(queries, nll):
         b = baseline_bits(q["attr"], q["value"], tok, baseline)
         per_attr[q["attr"]].append(b - n)
         base_by_attr[q["attr"]].append(b)
+        per_entity[q["entity_id"]] += b - n
 
     n_entities = len(records)
     bits_total = sum(sum(v) for v in per_attr.values())
@@ -187,6 +190,26 @@ def recoverable_bits(
             for a, v in per_attr.items()
         },
     }
+    # Entity-sampling uncertainty on bits_per_entity.
+    #
+    # The probe scores a few hundred entities and `run_evals` multiplies the
+    # result by the corpus entity count -- ~2,000x at the operating point. That
+    # extrapolation carries the sampling error with it, and the error is
+    # invisible to the analyzer's across-seed interval because `corpus_seed` is
+    # pinned, so every seed probes the SAME entities and their errors are
+    # perfectly correlated. Preregistration §7 requires gates to use confidence
+    # bounds; without this the bound omits its dominant term.
+    vals = list(per_entity.values())
+    if len(vals) >= 2:
+        mean = statistics.fmean(vals)
+        sd = statistics.stdev(vals)
+        se = sd / math.sqrt(len(vals))
+        out["bits_per_entity_sd"] = sd
+        out["bits_per_entity_se"] = se
+        out["bits_per_entity_ci95"] = [mean - 1.96 * se, mean + 1.96 * se]
+        out["bits_per_entity_rel_se"] = abs(se / mean) if mean else float("inf")
+    out["n_entities_probed"] = len(vals)
+
     if n_params:
         out["bits_per_param"] = bits_total / n_params
     return out

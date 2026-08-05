@@ -319,14 +319,33 @@ after the fix.** An independent replication at a different seed and
 string-identical between fixed-batched and unbatched**. Corruption sets in
 between 16 and 24 pad tokens.
 
-That the endpoint is responsive: at step 14,076, on the full 1,500-item eval,
-op1 100.0% (n=399), op2 98.2% (n=384), op3 88.3% (n=375), op4 73.1% (n=342);
-OOD op5-8 at 25.7 / 8.2 / 5.3 / 5.5%. Deduction rises 0.533 to 0.783 against a
-0.500 constant-answer baseline. In-answer-space rate is 1.000.
+That the endpoint is responsive. **Final checkpoint, step 31,280**, scoring
+completed 2026-08-05 (job 1675791, 10h08m), 1,500 in-band items and 750 OOD:
+
+| operations | trained on | exact match | n |
+|---|---|---:|---:|
+| 1 | yes | 99.75% | 399 |
+| 2 | yes | 99.22% | 384 |
+| 3 | yes | 95.73% | 375 |
+| 4 | yes | 88.30% | 342 |
+| 5 | no | 41.53% | 183 |
+| 6 | no | 7.22% | 194 |
+| 7 | no | 5.26% | 190 |
+| 8 | no | 4.92% | 183 |
+
+Overall in-band **96.00%** against a **7.53%** majority-class rate. Deduction
+**0.950** against a 0.500 constant-answer baseline. In-answer-space **1.000**.
+Reference-trace NLL `igsm_m1_nll` **0.00165**. The mid-run figures previously
+recorded here were step 14,076 and are superseded by this table.
+
+**Gain attribution** (`step_ladder.json`, `gain_attribution`): in-answer-space
+moves 0.9993 to 1.0000, a gain of 0.0007, while accuracy conditional on a valid
+answer moves 0.1961 to 0.9600, a gain of 0.7639. Lift over majority at the last
+checkpoint is 0.8847. Verdict **ARITHMETIC** — the improvement is not formatting.
+`first_clearing_step` is **1,564**, the earliest checkpoint scored.
 
 **Does not support.** The 48-item per-op table in earlier drafts, whose cells
-carry 8-17 items. The final-checkpoint 1,500-item table is not yet written.
-Nothing about arm contrasts: this is a SUP-only run.
+carry 8-17 items. Nothing about arm contrasts: this is a SUP-only run.
 
 **Known defect in the artifacts.** `evals/igsm.jsonl` is overwritten by
 whichever checkpoint was scored most recently and does not record which. Two
@@ -365,10 +384,20 @@ separate them.
 **Does not support.** Any claim at or below capacity. This run sits at
 **F/C = 2.0**, which `docs/THEORY-CAPACITY.md` predicts is the abandonment
 regime, so the result is consistent with the model declining to enter storage
-rather than with storage being impossible. The 4,000-entity probe in the
-snapshot summaries reports **-126 bits/entity** scaled from `n_entities =
-1,531,800`; an earlier draft divided by 996,408 and reported -195, which was
-wrong.
+rather than with storage being impossible.
+
+**The per-snapshot probe, and why the absolute value is not the claim.** The
+probe draws a fixed entity set (`corpus_seed` is pinned, `storage.py:196-201`),
+so the same entities are scored at every checkpoint. Across the twenty
+snapshots the figure moves between **-103.66** (step 4,692) and **-135.12**
+(step 10,948), ending at **-112.70**, with no trend. Since the entities do not
+change, the spread is model-side, not sampling. Cite **-112.70** for the final
+checkpoint. The **-126** figure that appeared in earlier drafts is step
+**1,564**, the first snapshot, and must not be presented as the run's result;
+an even earlier draft divided by 996,408 and reported -195, which was wrong.
+Because the absolute value swings 31 bits, the load-bearing evidence is the
+paired trained-vs-unseen contrast above, which is scored in one call on matched
+cohorts, not any single absolute reading.
 
 **Do not pair gate 0 with a snapshot's recoverable bits.** `eval_every` exceeds
 `max_steps`, so gate 0 is logged once at the end and `log_diagnostics` copies

@@ -151,3 +151,31 @@ def test_report_shape_and_per_param():
         out["bits_total"] / 40_560_000, rel=1e-9
     )
     assert out["baseline"] == "unconditional"
+
+
+def test_recoverable_bits_reports_entity_sampling_uncertainty():
+    """The probe scores a few hundred entities and run_evals multiplies by the
+    corpus entity count -- ~2,000x at the operating point. `corpus_seed` is
+    pinned across seeds, so every run probes the SAME entities and the error is
+    perfectly correlated: an across-seed interval cannot see it. Preregistration
+    §7 requires gates to use confidence bounds, so the term has to be carried.
+    """
+    import torch
+    from corpusgen import bios
+    from evals.storage import recoverable_bits
+    from train.model import GPT, PRESETS
+    from train.tokenizer import get_tok
+
+    torch.manual_seed(0)
+    model = GPT(PRESETS["d8m"]).eval()
+    recs = bios.generate_records(12, 0)
+    rb = recoverable_bits(model, get_tok(), recs, torch.device("cpu"),
+                          batch_size=8, n_params=model.num_params())
+    assert rb["n_entities_probed"] == 12
+    for k in ("bits_per_entity_sd", "bits_per_entity_se",
+              "bits_per_entity_ci95", "bits_per_entity_rel_se"):
+        assert k in rb, k
+    lo, hi = rb["bits_per_entity_ci95"]
+    assert lo < rb["bits_per_entity"] < hi
+    assert rb["bits_per_entity_se"] < rb["bits_per_entity_sd"], \
+        "the standard error must be the sd shrunk by sqrt(n)"

@@ -24,7 +24,7 @@ ap = _load("analyze_pilot")
 
 
 def test_stage_a_crosses_both_architectures():
-    cfgs = pilot.stage_a_configs("corpora/a", 800_000_000, 1e-3, 1.0)
+    cfgs = pilot.stage_a_configs("corpora/a", 800_000_000, 1e-3, 1.0, 20_000)
     assert {c["model"] for c in cfgs} == {"d40m", "d40m_std"}
     assert all(c["arm"] == "sup" for c in cfgs)
 
@@ -40,7 +40,7 @@ def test_stage_a_covers_every_difficulty_cell():
 
 def test_stage_b_pairs_sup_against_nofact():
     cfgs = pilot.stage_b_configs("d40m", "corpora/fact", "corpora/nofact",
-                                 5_737_000_000, 1.5e-3, 1.0)
+                                 5_737_000_000, 1.5e-3, 1.0, 382_900)
     arms = {c["arm"] for c in cfgs}
     assert arms == {"sup", "nofact"}
     sup = [c for c in cfgs if c["arm"] == "sup"]
@@ -54,12 +54,13 @@ def test_stage_b_pairs_sup_against_nofact():
 
 def test_stage_b_both_arms_probe_the_fact_positions():
     cfgs = pilot.stage_b_configs("d40m", "corpora/fact", "corpora/nofact",
-                                 1_000, 1e-3, 1.0)
+                                 1_000, 1e-3, 1.0, 382_900)
     assert {c["probe_mask"] for c in cfgs} == {"corpora/fact/factmask.bin"}
 
 
 def test_stage_c_is_three_complete_triplets():
-    cfgs = pilot.stage_c_configs("d40m", "corpora/high", 5_737_000_000, 1.5e-3, 1.0)
+    cfgs = pilot.stage_c_configs("d40m", "corpora/high", 5_737_000_000, 1.5e-3, 1.0,
+                                  382_900)
     assert len(cfgs) == 9
     assert {c["arm"] for c in cfgs} == {"sup", "factmask", "randpos"}
     assert len({c["seed"] for c in cfgs}) == 3
@@ -73,7 +74,7 @@ def test_pilot_seeds_are_disjoint_from_plausible_confirm_seeds():
 
 
 def test_configs_round_trip_as_yaml(tmp_path):
-    cfgs = pilot.stage_a_configs("corpora/a", 1000, 1e-3, 1.0)
+    cfgs = pilot.stage_a_configs("corpora/a", 1000, 1e-3, 1.0, 20_000)
     pilot.write(cfgs, tmp_path)
     for c in cfgs:
         got = yaml.safe_load((tmp_path / f"{c['run_id']}.yaml").read_text())
@@ -193,3 +194,22 @@ def test_no_go_points_at_a_paper_written_in_advance():
     _, b, c = _go_inputs()
     g = ap.gate(a, b, c, 0.02, (0.17, 0.85), 8)
     assert "NO-GO-PAPER.md" in g["on_no_go"]
+
+
+# ------------------------------------ the storage probe, wired up 2026-08-02
+
+
+def test_every_stage_carries_the_entity_count():
+    """`run_evals` writes "config carries no n_entities; nothing to probe"
+    when this is absent, so without it no pilot stage can report recoverable
+    bits -- which is the exposure-to-storage frontier, the leakage gate, and
+    Figure 1 of the NO-GO paper."""
+    a = pilot.stage_a_configs("corpora/a", 1000, 1e-3, 1.0, 20_000)
+    b = pilot.stage_b_configs("d40m", "corpora/f", "corpora/n", 1000, 1e-3,
+                              1.0, 382_900)
+    c = pilot.stage_c_configs("d40m", "corpora/high", 1000, 1e-3, 1.0, 382_900)
+    for cfgs, want in ((a, 20_000), (b, 382_900), (c, 382_900)):
+        assert cfgs, "no configs generated"
+        for cfg in cfgs:
+            assert cfg.get("n_entities") == want, cfg["run_id"]
+            assert "corpus_seed" in cfg, cfg["run_id"]

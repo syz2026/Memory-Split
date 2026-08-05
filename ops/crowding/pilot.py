@@ -56,6 +56,7 @@ def stage_a_configs(
     total_tokens: int,
     lr: float,
     grad_clip: float,
+    n_entities: int,
 ) -> list[dict]:
     """One dense run per architecture, at ONE difficulty.
 
@@ -86,6 +87,11 @@ def stage_a_configs(
                 "warmup_steps": 300,
                 "grad_clip": grad_clip,
                 "seed": PILOT_SEEDS[0],
+                # Without this `run_evals` writes "nothing to probe" and the
+                # run produces no recoverable-bits figure at all, which is what
+                # left every pilot stage unable to report storage.
+                "n_entities": n_entities,
+                "corpus_seed": 0,
                 "out_rel": f"runs/pilotA_{model}",
                 "device": "cuda",
                 "compile": True,
@@ -104,11 +110,19 @@ def stage_b_configs(
     total_tokens: int,
     lr: float,
     grad_clip: float,
+    n_entities: int,
     seeds=PILOT_SEEDS[:2],
 ) -> list[dict]:
     """SUP with the fact lane, and NOFACT with it replaced by bed at equal
     token count. Identical everywhere else, so their difference is the total
-    reasoning cost of carrying the facts."""
+    reasoning cost of carrying the facts.
+
+    Both arms carry `n_entities` so the SUP arm reports recoverable bits: that
+    figure is Figure 1 of the NO-GO paper, the exposure-to-storage frontier,
+    and Stage B is the only stage that produces it. The NOFACT arm has no facts
+    to recover and is expected to score at the pool baseline, which is itself
+    the check that the storage probe measures storage and not the prompt.
+    """
     out = []
     for label, corpus in (("sup", fact_corpus_rel), ("nofact", nofact_corpus_rel)):
         for seed in seeds:
@@ -129,6 +143,8 @@ def stage_b_configs(
                     "warmup_steps": 300,
                     "grad_clip": grad_clip,
                     "seed": seed,
+                    "n_entities": n_entities,
+                    "corpus_seed": 0,
                     "out_rel": f"runs/pilotB_{label}_s{seed}",
                     "device": "cuda",
                     "compile": True,
@@ -146,9 +162,17 @@ def stage_c_configs(
     total_tokens: int,
     lr: float,
     grad_clip: float,
+    n_entities: int,
     seeds=PILOT_SEEDS,
 ) -> list[dict]:
-    """Three complete triplets at the high load."""
+    """Three complete triplets at the high load.
+
+    `n_entities` reaches `cohort` as `load_entities`, without which every
+    config carries `n_entities=0`, `run_evals` writes "nothing to probe", and
+    the leakage gate -- FACTMASK recoverable bits below 10% of SUP -- has no
+    input. That gate is the descendant of the 94.2%-recoverability failure
+    that made the previous corpus inert, so Stage C cannot do its job blind.
+    """
     from importlib import util
 
     spec = util.spec_from_file_location(
@@ -158,7 +182,8 @@ def stage_c_configs(
     spec.loader.exec_module(gc)
 
     cfgs = gc.cohort({"high": corpus_rel}, list(seeds), model,
-                     total_tokens, lr, grad_clip)
+                     total_tokens, lr, grad_clip,
+                     load_entities={"high": n_entities}, corpus_seed=0)
     for c in cfgs:
         c["stage"] = "C"
         c["run_id"] = "pilotC_" + c["run_id"]
@@ -188,19 +213,26 @@ def main() -> int:
     ap.add_argument("--total-tokens", type=int, required=True)
     ap.add_argument("--lr", type=float, required=True)
     ap.add_argument("--grad-clip", type=float, default=1.0)
+    ap.add_argument("--entities", type=int, required=True,
+                    help="entity count of the corpus, so the storage probe "
+                         "runs. Without it every config carries n_entities=0, "
+                         "run_evals writes 'nothing to probe', and no pilot "
+                         "stage can report recoverable bits.")
     args = ap.parse_args()
 
     if args.stage == "A":
-        cfgs = stage_a_configs(args.corpus, args.total_tokens, args.lr, args.grad_clip)
+        cfgs = stage_a_configs(args.corpus, args.total_tokens, args.lr,
+                               args.grad_clip, args.entities)
     elif args.stage == "B":
         if not args.nofact_corpus:
             print("stage B needs --nofact-corpus")
             return 1
         cfgs = stage_b_configs(args.model, args.corpus, args.nofact_corpus,
-                               args.total_tokens, args.lr, args.grad_clip)
+                               args.total_tokens, args.lr, args.grad_clip,
+                               args.entities)
     else:
         cfgs = stage_c_configs(args.model, args.corpus, args.total_tokens,
-                               args.lr, args.grad_clip)
+                               args.lr, args.grad_clip, args.entities)
 
     write(cfgs, Path(args.out))
     print(f"stage {args.stage}: {len(cfgs)} configs -> {args.out}")

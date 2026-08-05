@@ -52,14 +52,47 @@ def generate_batch(
             logger.warning("left-truncating %d prompt(s) to %d tokens",
                            sum(len(p) > keep for p in prompt_ids), keep)
             prompt_ids = [p[-keep:] for p in prompt_ids]
+    # Prompts of unequal length are decoded in separate, equal-length groups.
+    #
+    # This function used to left-pad every row to the batch maximum with EOT,
+    # on the reasoning that "with RoPE a constant left shift is harmless" and
+    # "the pads are ordinary EOTs the model has seen as separators". Both are
+    # false. There is no attention mask here, so the pads are attended to as
+    # real context, and EOT is the document separator -- a prompt behind 32 EOTs
+    # reads as a fresh document and the model hallucinates its premises.
+    #
+    # Measured on stepladder_d40m_std at step 31,280, 64 held-out iGSM items:
+    #
+    #     batched, padded to the batch maximum ...  3/64 =  4.7%
+    #     one prompt at a time .................... 60/64 = 93.8%
+    #
+    # The corruption is monotone in pad length -- exact at 0-16 pads, broken by
+    # 32 -- so it fell hardest on the shortest prompts. That is the whole of the
+    # "endpoint floors at every scale and difficulty" result this project spent
+    # four experiment generations on, and it is why accuracy rose with operation
+    # count: more operations means a longer prompt means less padding.
+    #
+    # Grouping by exact length gives zero padding and therefore no need for a
+    # mask. It costs throughput when lengths are diverse; correctness first.
+    order = sorted(range(len(prompt_ids)), key=lambda i: len(prompt_ids[i]))
+    groups: list[list[int]] = []
+    for i in order:
+        if groups and len(prompt_ids[groups[-1][0]]) == len(prompt_ids[i]):
+            groups[-1].append(i)
+        else:
+            groups.append([i])
+    if len(groups) > 1:
+        out: list[str] = [""] * len(prompts)
+        for g in groups:
+            texts = generate_batch(model, tok, [prompts[i] for i in g],
+                                   max_new, device, stop_at_eot)
+            for i, t in zip(g, texts):
+                out[i] = t
+        return out
+
     pad_to = max(1, max(len(p) for p in prompt_ids))
     steps_budget = max_new if ctx is None else min(max_new, ctx - pad_to)
-    # Left-pad with EOT so logits[:, -1, :] is the next-token distribution for
-    # every row after a single prefill. With RoPE a constant left shift is
-    # harmless for greedy decoding at these scales; the pads are ordinary EOTs
-    # the model has seen as separators.
-    padded = [[tok.EOT] * (pad_to - len(p)) + p for p in prompt_ids]
-    x = torch.tensor(padded, dtype=torch.long, device=device)
+    x = torch.tensor(prompt_ids, dtype=torch.long, device=device)
 
     # The vocabulary is padded to a multiple of 64; the tail ids map to no
     # token. Never select one: an undertrained model puts real mass there and

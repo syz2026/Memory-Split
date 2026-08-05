@@ -30,7 +30,7 @@ PYTHONPATH="$MS_CODE" "$PY" "$MS_CODE/scripts/run_evals.py" \
   --device cuda \
   --n-igsm "${MS_N_IGSM:-1500}" \
   --n-deduction "${MS_N_DED:-400}" \
-  --n-storage-entities "${MS_N_STORAGE:-500}"
+  --n-storage-entities "${MS_N_STORAGE:-4000}"
 
 rc=$?
 [ $rc -eq 0 ] && say "eval COMPLETE -> $MS_RUN/evals/summary.json" || say "eval FAILED"

@@ -212,7 +212,8 @@ def _matrix(root: Path, loads=("high", "low"), seeds=(0, 1, 2)):
 
 def test_analyzer_runs_on_a_complete_matrix(tmp_path):
     _matrix(tmp_path)
-    out = ac.analyse(tmp_path, "igsm_acc", 0.30, (0.17, 0.85), 0.01)
+    out = ac.analyse(tmp_path, "igsm_acc", 0.30, (0.17, 0.85), 0.01,
+                     primary_load="high")
     assert out["n_cells"] == 6
     assert out["primary_contrast"] == "Y[factmask] - Y[randpos]"
     assert set(out["per_load"]) == {"high", "low"}
@@ -248,7 +249,8 @@ def test_analyzer_refuses_a_run_without_evaluations(tmp_path):
     _matrix(tmp_path)
     (tmp_path / "d40m_low_sup_s0" / "evals" / "summary.json").unlink()
     with pytest.raises(ac.IncompleteMatrix, match="no evals"):
-        ac.analyse(tmp_path, "igsm_acc", 0.30, (0.17, 0.85), 0.01)
+        ac.analyse(tmp_path, "igsm_acc", 0.30, (0.17, 0.85), 0.01,
+                   primary_load="high")
 
 
 def test_analyzer_refuses_an_empty_root(tmp_path):
@@ -258,5 +260,96 @@ def test_analyzer_refuses_an_empty_root(tmp_path):
 
 def test_analyzer_states_the_estimand_limit(tmp_path):
     _matrix(tmp_path)
-    out = ac.analyse(tmp_path, "igsm_acc", 0.30, (0.17, 0.85), 0.01)
+    out = ac.analyse(tmp_path, "igsm_acc", 0.30, (0.17, 0.85), 0.01,
+                     primary_load="high")
     assert "NOT" in out["estimand_note"] and "identified" in out["estimand_note"]
+
+
+# ------------------------------------ seed-blocked inference, added 2026-08-02
+
+
+def test_analyzer_refuses_to_pick_the_primary_load_itself(tmp_path):
+    """Every rule for choosing it from data -- highest storage, largest
+    effect, best power -- is choosing the estimand after seeing the outcome."""
+    _matrix(tmp_path)
+    with pytest.raises(ac.IncompleteMatrix, match="primary-load"):
+        ac.analyse(tmp_path, "igsm_acc", 0.30, (0.17, 0.85), 0.01)
+
+
+def test_analyzer_refuses_a_primary_load_outside_the_matrix(tmp_path):
+    _matrix(tmp_path)
+    with pytest.raises(ac.IncompleteMatrix, match="not in the matrix"):
+        ac.analyse(tmp_path, "igsm_acc", 0.30, (0.17, 0.85), 0.01,
+                   primary_load="middling")
+
+
+def test_inference_is_blocked_by_seed_not_pooled_across_loads(tmp_path):
+    """3 loads x 8 seeds is n=8 correlated blocks, not n=24 observations.
+    The same initialisations and shard permutations recur at every load, so
+    pooling shrinks the interval by roughly sqrt(3) for free."""
+    _matrix(tmp_path, loads=("high", "mid", "low"), seeds=(0, 1, 2, 3))
+    out = ac.analyse(tmp_path, "igsm_acc", 0.30, (0.17, 0.85), 0.01,
+                     primary_load="high")
+    assert out["statistic"]["n"] == 4, "one observation per seed, not per cell"
+    assert out["pooled_across_loads_NOT_PRIMARY"]["n"] == 12
+    assert "seed" in out["inference_unit"]
+    assert "NOT" in "".join(out["pooled_across_loads_NOT_PRIMARY"]["note"].upper())
+
+
+def test_gates_are_evaluated_at_the_primary_load_not_averaged(tmp_path):
+    """Loads carry deliberately different fact content, so a mean SUP storage
+    describes no corpus that was trained on. Averaging can pass the burden
+    gate while the primary load fails it."""
+    root = tmp_path
+    for s in (0, 1, 2):
+        # High load is saturated; low load stores almost nothing.
+        _write_cell(root, "high", s, "sup", recoverable_bits_per_param=0.02)
+        _write_cell(root, "high", s, "factmask", igsm_acc=0.44,
+                    recoverable_bits_per_param=0.001)
+        _write_cell(root, "high", s, "randpos", igsm_acc=0.41,
+                    recoverable_bits_per_param=0.02)
+        _write_cell(root, "low", s, "sup", recoverable_bits_per_param=0.90)
+        _write_cell(root, "low", s, "factmask", igsm_acc=0.44,
+                    recoverable_bits_per_param=0.01)
+        _write_cell(root, "low", s, "randpos", igsm_acc=0.41,
+                    recoverable_bits_per_param=0.88)
+    # Mean SUP storage is 0.46 and would clear a 0.30 floor; the high load's
+    # 0.02 does not.
+    out = ac.analyse(root, "igsm_acc", 0.30, (0.17, 0.85), 0.01,
+                     primary_load="high")
+    assert "sup_carries_a_burden" in out["failed_validity_gates"]
+    assert out["verdict"] == "invalid"
+
+
+def test_dose_response_shape_is_reported(tmp_path):
+    """THEORY-CAPACITY.md calls this the only analysis that speaks to capacity
+    rather than loss composition, and nothing ran it until now."""
+    _matrix(tmp_path, loads=("high", "mid", "low"), seeds=(0, 1))
+    out = ac.analyse(tmp_path, "igsm_acc", 0.30, (0.17, 0.85), 0.01,
+                     primary_load="high")
+    dr = out["dose_response"]
+    assert dr["n_loads"] == 3
+    assert "signature" in dr
+    # All three loads carry the same synthetic effect, so this is the flat case.
+    assert "flat" in dr["signature"]
+
+
+def test_a_flat_nonzero_dose_response_is_called_a_confound(tmp_path):
+    """The signature that matters most: an advantage indifferent to fact load
+    cannot be capacity reallocation, however significant it is."""
+    from theory import capacity
+    sig = capacity.dose_response_signature({0.3: 0.05, 1.0: 0.05, 2.0: 0.05},
+                                           floor=0.01)
+    assert "CONFOUND" in sig
+
+
+def test_negligible_effects_are_flat_at_zero_not_rising(tmp_path):
+    """The old form tested `peak < tol * peak`, true only for negative peak,
+    so it could never fire: effects three orders below the noise floor were
+    still classified 'consistent with capacity reallocation'."""
+    from theory import capacity
+    tiny = {0.3: 1e-6, 1.0: 2e-6, 2.0: 3e-6}
+    assert "flat at zero" in capacity.dose_response_signature(tiny, floor=0.01)
+    # The same shape above the floor is a real rising trend.
+    big = {0.3: 0.01, 1.0: 0.05, 2.0: 0.09}
+    assert "rising" in capacity.dose_response_signature(big, floor=0.001)

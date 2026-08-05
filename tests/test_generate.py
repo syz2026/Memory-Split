@@ -145,3 +145,69 @@ def test_padded_vocab_ids_are_never_generated():
 def test_decode_drops_unmapped_padding_ids():
     real = TOK.encode(" hello")
     assert TOK.decode(real + [TOK.VOCAB_SIZE - 1]) == TOK.decode(real)
+
+
+# ---------------- the padding bug that produced four generations of "floor"
+
+
+def test_batched_decoding_equals_unbatched_at_mixed_lengths():
+    """`generate_batch` used to left-pad every row to the batch maximum with
+    EOT and attend over the pads. EOT is the document separator, so a short
+    prompt behind 32 of them read as a fresh document and the model
+    hallucinated its premises.
+
+    Measured on the real 31,280-step checkpoint over 64 held-out iGSM items:
+    3/64 batched against 60/64 one at a time. That gap is the entire
+    "the endpoint floors at every scale and difficulty" result.
+
+    Batching must never change a generation.
+    """
+    import torch
+    from evals.generate import generate_batch
+    from train.model import GPT, PRESETS
+    from train.tokenizer import get_tok
+
+    torch.manual_seed(0)
+    cfg = PRESETS["d8m"]
+    cfg.ctx = 256
+    model = GPT(cfg).eval()
+    tok = get_tok()
+    # Deliberately ragged: the shortest is a fraction of the longest.
+    prompts = [
+        "The number of hollow barrels in the Armory is",
+        "The number of dusty whistles in the Wharf is 3. The number of pallid "
+        "buckets in the Forge is",
+        "A. " * 40 + "The number of crimson mallets in the Terrace is",
+        "Q:",
+    ]
+    together = generate_batch(model, tok, prompts, 24, torch.device("cpu"))
+    alone = [generate_batch(model, tok, [p], 24, torch.device("cpu"))[0]
+             for p in prompts]
+    for i, (a, b) in enumerate(zip(together, alone)):
+        assert a == b, (
+            f"prompt {i} decoded differently in a batch than alone.\n"
+            f"  batched : {a!r}\n  alone   : {b!r}"
+        )
+
+
+def test_equal_length_prompts_still_share_one_batch():
+    """The fix groups by exact length; prompts that already agree must not be
+    split into singletons, or evaluation throughput collapses."""
+    import torch
+    from evals.generate import generate_batch
+    from train.model import GPT, PRESETS
+    from train.tokenizer import get_tok
+
+    torch.manual_seed(0)
+    cfg = PRESETS["d8m"]
+    cfg.ctx = 128
+    model = GPT(cfg).eval()
+    tok = get_tok()
+    # Built from token ids so the lengths agree by construction rather than by
+    # a guess about how the BPE splits English words.
+    prompts = [tok.decode([tid] * 5) for tid in (262, 290, 318)]
+    assert len({len(tok.encode(p)) for p in prompts}) == 1, "fixture must agree"
+    together = generate_batch(model, tok, prompts, 12, torch.device("cpu"))
+    alone = [generate_batch(model, tok, [p], 12, torch.device("cpu"))[0]
+             for p in prompts]
+    assert together == alone

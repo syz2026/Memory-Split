@@ -53,6 +53,109 @@ def load_model(run: Path, cfg: dict, device, ckpt: Path | None = None) -> GPT:
     return model, mc
 
 
+def continuous_endpoint(model, tok, items, device, batch_size: int,
+                        prefix: str) -> dict:
+    """A reasoning endpoint that does not floor.
+
+    Exact-match accuracy is a threshold metric: it requires the model to emit a
+    whole correct chain of thought *and* terminate with the right token, so it
+    reads zero across the entire range where a model is learning. Every run in
+    this project has sat at that floor, and a floored endpoint cannot exhibit
+    crowding no matter how much capacity is freed -- nothing was learned, so
+    nothing could be crowded out.
+
+    Reference-trace NLL is continuous over the same items. It moves while
+    accuracy is pinned, which is the difference between an endpoint that can
+    resolve a treatment effect and one that cannot.
+
+    `evals/continuous.py` has implemented this since the reasoning-v3 line and
+    was called by nothing until 2026-08-03. M1 is the primary: mean per-token
+    -log p(gold trace | prompt), which is apples-to-apples across arms wherever
+    both read the same rendering -- true for iGSM and deduction, false for the
+    fact lane, which is why this runs only on the reasoning tasks.
+    """
+    from evals.continuous import score_items_continuous
+
+    # M1 teacher-forces prompt+solution in one window, so an item longer than
+    # the context is not scoreable and asserts inside the scorer. Drop those
+    # rather than lose the metric for the whole run, and record how many, so a
+    # silently thinned item set cannot be mistaken for a clean one.
+    ctx = getattr(getattr(model, "cfg", None), "ctx", 1024)
+    fits, dropped = [], 0
+    for it in items:
+        sol = (getattr(it, "meta", None) or {}).get("solution", "")
+        n = len(tok.encode(getattr(it, "prompt", "") + sol))
+        if n < ctx:
+            fits.append(it)
+        else:
+            dropped += 1
+    if not fits:
+        return {f"{prefix}_continuous_error":
+                f"every item exceeds ctx={ctx}; nothing scoreable"}
+
+    try:
+        _, agg = score_items_continuous(model, tok, fits, device,
+                                        batch_size=batch_size)
+    except Exception as e:                      # never lose a run over a metric
+        return {f"{prefix}_continuous_error": f"{type(e).__name__}: {e}"}
+    # `score_items_continuous` nests by task; flatten to scalars so the frozen
+    # analyzer can take one of these as `--endpoint` directly.
+    out: dict = {}
+    for metric, by_task in agg.items():
+        if not isinstance(by_task, dict):
+            out[f"{prefix}_{metric}"] = by_task
+            continue
+        vals = [t["mean"] for t in by_task.values()
+                if isinstance(t, dict) and t.get("n")]
+        ns = [t["n"] for t in by_task.values()
+              if isinstance(t, dict) and t.get("n")]
+        if not vals:
+            continue
+        mean = sum(v * n for v, n in zip(vals, ns)) / sum(ns)
+        out[f"{prefix}_{metric}"] = mean
+        out[f"{prefix}_{metric}_n"] = sum(ns)
+        # The analyzer's verdict is one-sided and assumes larger is better,
+        # because the hypothesis predicts a positive effect. NLL runs the other
+        # way, so a sign-flipped twin is emitted for use as the estimand and
+        # the raw value is kept for reading.
+        if metric.endswith("_nll"):
+            out[f"{prefix}_{metric}_neg"] = -mean
+    out[f"{prefix}_continuous_n_scored"] = len(fits)
+    out[f"{prefix}_continuous_n_dropped_over_ctx"] = dropped
+    return out
+
+
+def format_compliance(rows: list[dict], mod: int, prefix: str) -> dict:
+    """Separate "could not produce an answer" from "produced a wrong answer".
+
+    Headline accuracy sums two unrelated failures. Measured on the 2026-08-02
+    ladder at MOD=5, where only five answers exist: 51.5% of generations
+    yielded an answer inside {0..4} at all, and the rest were unparseable, the
+    string "no" borrowed from the deduction lane, or raw biography text. Among
+    the ones that did land in the answer space, accuracy was 0.2500 against a
+    0.2573 majority rate -- the marginal answer distribution, exactly.
+
+    Conflating the two is dangerous in one specific direction: a model that
+    merely learns to terminate with "Answer: <digit>" will lift headline
+    accuracy toward the majority rate with no arithmetic learned, and that
+    would read as the endpoint waking up. The step ladder must be able to tell
+    those apart, so both numbers are reported.
+    """
+    n = len(rows)
+    if not n:
+        return {}
+    answer_space = {str(i) for i in range(mod)}
+    parsed = [r for r in rows if r.get("pred") is not None]
+    in_space = [r for r in parsed if str(r["pred"]) in answer_space]
+    correct = sum(1 for r in rows if r.get("correct"))
+    return {
+        f"{prefix}_parsed_rate": len(parsed) / n,
+        f"{prefix}_in_answer_space_rate": len(in_space) / n,
+        f"{prefix}_acc_given_valid_answer": correct / max(1, len(in_space)),
+        f"{prefix}_n_in_answer_space": len(in_space),
+    }
+
+
 def log_diagnostics(run: Path) -> dict:
     """Optimizer diagnostics and gate 0, averaged over the settled tail."""
     rows = []
@@ -108,6 +211,9 @@ def evaluate(run: Path, device, n_igsm: int, n_ded: int,
     out["igsm_majority_rate"] = by_op["majority_rate"]
     out["igsm_lift_over_majority"] = by_op["overall"] - by_op["majority_rate"]
     out["igsm_n"] = by_op["n"]
+    out.update(format_compliance(rows, mod, prefix="igsm"))
+    out.update(continuous_endpoint(model, tok, items, device, batch_size,
+                                   prefix="igsm"))
     save_results(rows, run / "evals" / "igsm.jsonl")
 
     # Out-of-distribution band. Chain length is part of the topology, so a
@@ -120,6 +226,7 @@ def evaluate(run: Path, device, n_igsm: int, n_ded: int,
     out["igsm_ood_acc"] = ood_by_op["overall"]
     out["igsm_ood_by_op"] = ood_by_op["by"]
     out["igsm_ood_majority_rate"] = ood_by_op["majority_rate"]
+    out.update(format_compliance(ood_rows, mod, prefix="igsm_ood"))
     save_results(ood_rows, run / "evals" / "igsm_ood.jsonl")
 
     # Deduction, per class only. The eval is exactly balanced and the NO
@@ -145,13 +252,24 @@ def evaluate(run: Path, device, n_igsm: int, n_ded: int,
                                   n_params=model.num_params())
             key = "" if baseline == "unconditional" else "_length"
             out[f"recoverable_bits_per_entity{key}"] = rb["bits_per_entity"]
-            out[f"recoverable_bits_per_param{key}"] = (
-                rb["bits_per_entity"] * n_entities / model.num_params()
-            )
+            scale = n_entities / model.num_params()
+            out[f"recoverable_bits_per_param{key}"] = rb["bits_per_entity"] * scale
+            # The point estimate is a few hundred entities extrapolated by
+            # ~2,000x at the operating point, and `corpus_seed` is pinned so
+            # every seed probes the same ones -- the error cannot show up in an
+            # across-seed interval. Carry it explicitly.
+            if "bits_per_entity_ci95" in rb:
+                lo, hi = rb["bits_per_entity_ci95"]
+                out[f"recoverable_bits_per_param{key}_ci95"] = [lo * scale, hi * scale]
+                out[f"recoverable_bits_per_param{key}_se"] = (
+                    rb["bits_per_entity_se"] * scale
+                )
+                out[f"recoverable_bits_rel_se{key}"] = rb["bits_per_entity_rel_se"]
             out[f"recoverable_bits_per_attribute{key}"] = {
                 a: v["bits_per_entity"] for a, v in rb["per_attribute"].items()
             }
         out["recoverable_bits_scaled_from"] = len(recs)
+        out["recoverable_bits_extrapolation_factor"] = n_entities / max(1, len(recs))
         out["n_entities"] = n_entities
     else:
         out["recoverable_bits_per_param"] = 0.0
@@ -168,7 +286,10 @@ def main() -> int:
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     ap.add_argument("--n-igsm", type=int, default=1500)
     ap.add_argument("--n-deduction", type=int, default=400)
-    ap.add_argument("--n-storage-entities", type=int, default=500)
+    # 500 of 996,408 entities is a 0.05% sample extrapolated ~2,000x into the
+    # figure two validity gates are decided on. 4,000 costs a few extra minutes
+    # of forward passes and cuts the sampling SE by ~2.8x.
+    ap.add_argument("--n-storage-entities", type=int, default=4000)
     ap.add_argument("--batch-size", type=int, default=32)
     # Scoring an intermediate snapshot turns one training run into a
     # step ladder at no extra training cost.

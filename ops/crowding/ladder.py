@@ -173,6 +173,10 @@ def step_ladder(run: Path) -> dict:
             "step": step,
             "acc_op1": acc1,
             "overall": summ.get("igsm_acc"),
+            "majority_rate": summ.get("igsm_majority_rate"),
+            # Headline accuracy sums two unrelated failures; keep them apart.
+            "in_answer_space_rate": summ.get("igsm_in_answer_space_rate"),
+            "acc_given_valid": summ.get("igsm_acc_given_valid_answer"),
             "op1_clears_baseline": (not prof.near_baseline(min(by_op))) if by_op else None,
         })
     rows.sort(key=lambda r: r["step"])
@@ -182,7 +186,7 @@ def step_ladder(run: Path) -> dict:
     cleared = [r for r in rows if r["op1_clears_baseline"]]
     rising = len(rows) > 1 and rows[-1]["acc_op1"] is not None and \
         rows[0]["acc_op1"] is not None and rows[-1]["acc_op1"] > rows[0]["acc_op1"]
-    return {
+    out = {
         "run": run.name,
         "ladder": rows,
         "first_clearing_step": min((r["step"] for r in cleared), default=None),
@@ -196,6 +200,62 @@ def step_ladder(run: Path) -> dict:
              "Flat at baseline across the whole ladder. More steps are not the "
              "answer; the endpoint or its presentation is.")
         ),
+    }
+    out["gain_attribution"] = attribute_gain(rows)
+    return out
+
+
+def attribute_gain(rows: list[dict]) -> dict:
+    """Did accuracy rise because arithmetic was learned, or because the model
+    learned to emit a digit?
+
+    On the 2026-08-02 ladder only 51-82% of generations produced an answer
+    inside the answer space at all; the rest emitted the deduction lane's
+    "no", nothing parseable, or raw biography text. Among those that did land
+    in the space, accuracy sat at the marginal answer distribution -- 0.2500
+    against a 0.2573 majority rate at MOD=5.
+
+    A model that learns nothing but termination will therefore walk headline
+    accuracy up toward the majority rate as its format compliance improves,
+    and `first_clearing_step` would read that as the endpoint waking up. Since
+    that step count is what sizes the confirmatory matrix, the misreading is
+    expensive as well as wrong. The discriminator is whether accuracy
+    *conditional on a valid answer* pulls above the majority rate.
+    """
+    usable = [r for r in rows
+              if r.get("in_answer_space_rate") is not None
+              and r.get("acc_given_valid") is not None
+              and r.get("majority_rate") is not None]
+    if len(usable) < 2:
+        return {"status": "unavailable",
+                "why": "snapshots predate the format-compliance metric; "
+                       "rescore them with the current run_evals.py"}
+
+    first, last = usable[0], usable[-1]
+    fmt_gain = last["in_answer_space_rate"] - first["in_answer_space_rate"]
+    cond_lift = last["acc_given_valid"] - last["majority_rate"]
+    cond_gain = last["acc_given_valid"] - first["acc_given_valid"]
+    if cond_lift > 0.02:
+        reading = ("ARITHMETIC. Accuracy conditional on a valid answer sits "
+                   "above the majority rate, so the model is doing better than "
+                   "reproducing the answer distribution.")
+    elif fmt_gain > 0.05:
+        reading = ("FORMAT ONLY. Format compliance rose but conditional "
+                   "accuracy did not pull above the majority rate, so the "
+                   "model learned to emit a digit, not to compute one. Do NOT "
+                   "size the matrix on first_clearing_step.")
+    else:
+        reading = ("NEITHER. Format compliance and conditional accuracy are "
+                   "both flat. More steps are not the answer.")
+    return {
+        "in_answer_space_first": first["in_answer_space_rate"],
+        "in_answer_space_last": last["in_answer_space_rate"],
+        "format_compliance_gain": fmt_gain,
+        "acc_given_valid_first": first["acc_given_valid"],
+        "acc_given_valid_last": last["acc_given_valid"],
+        "acc_given_valid_gain": cond_gain,
+        "lift_over_majority_at_last": cond_lift,
+        "reading": reading,
     }
 
 

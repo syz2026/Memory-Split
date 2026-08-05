@@ -65,8 +65,6 @@ def test_docs_holds_only_the_current_documents():
         "AMENDMENT-2026-08-02.md",
         "GATE0-CEILING-IS-NOT-A-BOUND.md",
         "NO-GO-PAPER.md",
-        "PAPER-BRIEF.md",
-        "PAPER-BRIEF.tex",
         "PAPER-MEASUREMENT.md",
         "PAPER-WORKSHOP.md",
         "POPQA-HELDOUT-KEY.md",

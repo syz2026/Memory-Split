@@ -143,5 +143,100 @@ def test_summary_round_trips_into_the_analyzer(tmp_path):
                 d = root / f"d40m_{load}_{arm}_s{seed}"
                 d.mkdir(parents=True)
                 shutil.copytree(src / "evals", d / "evals")
-    res = ac.analyse(root, "igsm_acc", -1.0, (-1.0, 2.0), 0.0)
+    res = ac.analyse(root, "igsm_acc", -1.0, (-1.0, 2.0), 0.0,
+                     primary_load="high")
     assert res["n_cells"] == 2
+
+
+def test_format_compliance_separates_unparseable_from_wrong():
+    """Headline accuracy sums two unrelated failures. On the 2026-08-02 ladder
+    at MOD=5 only 51.5% of generations landed in {0..4} at all; among those,
+    accuracy was 0.2500 against a 0.2573 majority rate. A model that merely
+    learns to terminate with a digit would lift headline accuracy with no
+    arithmetic learned, and the step ladder must be able to see the difference.
+    """
+    from scripts.run_evals import format_compliance
+
+    rows = (
+        [{"pred": "3", "correct": True}] * 2       # valid and right
+        + [{"pred": "1", "correct": False}] * 2    # valid and wrong
+        + [{"pred": "no", "correct": False}] * 3   # deduction label, not in space
+        + [{"pred": None, "correct": False}] * 3   # nothing parseable
+    )
+    out = format_compliance(rows, mod=5, prefix="igsm")
+    assert out["igsm_parsed_rate"] == 0.7            # 7 of 10 parsed
+    assert out["igsm_in_answer_space_rate"] == 0.4   # 4 of 10 in {0..4}
+    assert out["igsm_n_in_answer_space"] == 4
+    # 2 correct out of the 4 that could have been correct, not 2 of 10.
+    assert out["igsm_acc_given_valid_answer"] == 0.5
+
+
+def test_format_compliance_handles_an_empty_eval():
+    from scripts.run_evals import format_compliance
+    assert format_compliance([], mod=23, prefix="igsm") == {}
+
+
+def test_out_of_space_predictions_never_count_as_correct():
+    """A 'no' can never be a right answer to a modular-arithmetic question, so
+    in-answer-space count must bound the correct count."""
+    from scripts.run_evals import format_compliance
+    rows = [{"pred": "no", "correct": False}] * 5 + [{"pred": "2", "correct": True}]
+    out = format_compliance(rows, mod=5, prefix="igsm")
+    assert out["igsm_acc_given_valid_answer"] <= 1.0
+    assert out["igsm_n_in_answer_space"] == 1
+
+
+def test_the_continuous_endpoint_produces_numbers_at_production_ctx():
+    """Exact-match accuracy is a threshold metric and has read floor in every
+    run this project has done. Reference-trace NLL moves over the same items,
+    which is the difference between an endpoint that can resolve a treatment
+    effect and one that cannot. `evals/continuous.py` implemented it and was
+    called by nothing until 2026-08-03.
+    """
+    import torch
+    from corpusgen import igsm_lite
+    from scripts.run_evals import continuous_endpoint
+    from train.model import GPT, PRESETS
+    from train.tokenizer import get_tok
+
+    torch.manual_seed(0)
+    cfg = PRESETS["d8m"]
+    cfg.ctx = 1024
+    model = GPT(cfg).eval()
+    items = igsm_lite.generate_igsm_eval(6, 1, 2, 12345, set(), mod=5)
+
+    out = continuous_endpoint(model, get_tok(), items, torch.device("cpu"),
+                              batch_size=4, prefix="igsm")
+    assert "igsm_continuous_error" not in out, out
+    assert out["igsm_continuous_n_scored"] == 6
+    assert out["igsm_continuous_n_dropped_over_ctx"] == 0
+    # M1 is the primary: mean per-token NLL of the gold trace. An untrained
+    # model should be near ln(vocab); what matters is that it is finite and
+    # positive, so a trained model can move it.
+    # Flat scalars, so the frozen analyzer can take one as --endpoint.
+    m1 = out["igsm_m1_nll"]
+    assert isinstance(m1, float) and 0.0 < m1 < 20.0, m1
+    assert out["igsm_m1_nll_n"] == 6
+    # NLL is lower-is-better; the analyzer's one-sided verdict assumes the
+    # opposite, so a sign-flipped twin is emitted for use as the estimand.
+    assert out["igsm_m1_nll_neg"] == -m1
+
+
+def test_items_longer_than_the_context_are_dropped_not_fatal():
+    """A single over-long item must not cost the metric for the whole run, and
+    a thinned item set must not pass silently as a clean one."""
+    import torch
+    from corpusgen import igsm_lite
+    from scripts.run_evals import continuous_endpoint
+    from train.model import GPT, PRESETS
+    from train.tokenizer import get_tok
+
+    torch.manual_seed(0)
+    cfg = PRESETS["d8m"]
+    cfg.ctx = 64                      # every iGSM item exceeds this
+    model = GPT(cfg).eval()
+    items = igsm_lite.generate_igsm_eval(4, 1, 2, 999, set(), mod=5)
+    out = continuous_endpoint(model, get_tok(), items, torch.device("cpu"),
+                              batch_size=4, prefix="igsm")
+    assert "igsm_continuous_error" in out
+    assert "nothing scoreable" in out["igsm_continuous_error"]

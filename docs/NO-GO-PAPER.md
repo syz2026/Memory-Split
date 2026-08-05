@@ -70,19 +70,32 @@ this and comparable work.
    doing selective-loss training, span-masked LM or LMLM-style offloading, and
    it is the strongest standalone item in the programme.
 
-2. **The exposure-to-storage frontier**, with a measurement that separates
+2. **Matched controls are infeasible when the treatment masks the hard tokens.**
+   Measured 2026-08-02 on the operating-point corpus: FACTMASK's masked spans
+   average 1.9598 nats against RANDPOS's 1.2712, a 35.1% gap against the
+   preregistered 20% tolerance, and the gap asymptotes at 23.5% even with
+   positional matching abandoned. Fact values are intrinsically higher-entropy
+   than anything in a fixed template, so no count-matched control can remove
+   equal loss mass. This affects any selective-loss, span-masking or
+   LMLM-style offloading design that pairs a treatment against a count-matched
+   control, it costs one CPU pass over the corpus to check, and to our
+   knowledge nobody checks it. Stronger than contribution 1, because the
+   loss-normalization confound largely cancels between two mass-matched arms
+   while this one does not cancel at all.
+
+3. **The exposure-to-storage frontier**, with a measurement that separates
    baseline from ceiling correctly: an unconditional pool baseline gives a
    52.96 bit/entity ceiling, a length-conditioned one gives 45.30, and mixing
    them overstates recovery by the 7.66 bits that token length leaks.
 
-3. **`delta` as a bound.** Measuring the reasoning cost of a fact load
+4. **`delta` as a bound.** Measuring the reasoning cost of a fact load
    directly, and using it to bound the achievable treatment effect before
    spending the compute. Generalises: any masking intervention can be bounded
    this way for the price of one extra run.
 
-4. **The scale window.** Quantified, not asserted.
+5. **The scale window.** Quantified, not asserted.
 
-5. **A withdrawal.** The numbers this project previously reported, why they
+6. **A withdrawal.** The numbers this project previously reported, why they
    have no artifacts, and what replaced them. `docs/RETAINED-RESULTS.md` is
    the audit.
 

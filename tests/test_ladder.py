@@ -126,3 +126,44 @@ def test_generated_configs_are_valid_yaml(tmp_path):
     round_trip = yaml.safe_load(yaml.safe_dump(cfgs[0], sort_keys=False))
     assert round_trip["igsm_mod"] == 7
     assert round_trip["max_steps"] == ladder.PROBE_STEPS
+
+
+# ------------------ format-vs-arithmetic attribution, added 2026-08-02 evening
+
+
+def _fmt_snap(step, in_space, acc_valid, majority=0.2573):
+    return {"step": step, "acc_op1": 0.1, "overall": 0.13,
+            "majority_rate": majority, "in_answer_space_rate": in_space,
+            "acc_given_valid": acc_valid, "op1_clears_baseline": False}
+
+
+def test_a_formatting_gain_is_not_mistaken_for_arithmetic():
+    """The failure this guards: a model that learns only to terminate with a
+    digit walks headline accuracy up to the majority rate, `first_clearing_step`
+    fires, and the confirmatory matrix gets sized on it."""
+    rows = [_fmt_snap(1564, 0.51, 0.2500), _fmt_snap(31280, 0.95, 0.2560)]
+    g = ladder.attribute_gain(rows)
+    assert g["reading"].startswith("FORMAT ONLY")
+    assert g["format_compliance_gain"] == pytest.approx(0.44)
+    assert g["lift_over_majority_at_last"] < 0.02
+
+
+def test_real_arithmetic_is_recognised():
+    rows = [_fmt_snap(1564, 0.51, 0.2500), _fmt_snap(31280, 0.93, 0.4100)]
+    g = ladder.attribute_gain(rows)
+    assert g["reading"].startswith("ARITHMETIC")
+    assert g["lift_over_majority_at_last"] > 0.02
+
+
+def test_a_flat_ladder_says_more_steps_will_not_help():
+    rows = [_fmt_snap(1564, 0.52, 0.2500), _fmt_snap(31280, 0.54, 0.2510)]
+    g = ladder.attribute_gain(rows)
+    assert g["reading"].startswith("NEITHER")
+
+
+def test_attribution_is_unavailable_on_premetric_snapshots():
+    rows = [{"step": 1564, "acc_op1": 0.1, "overall": 0.13},
+            {"step": 3128, "acc_op1": 0.1, "overall": 0.13}]
+    g = ladder.attribute_gain(rows)
+    assert g["status"] == "unavailable"
+    assert "rescore" in g["why"]

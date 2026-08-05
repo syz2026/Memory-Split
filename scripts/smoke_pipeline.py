@@ -52,7 +52,11 @@ SHARES = {"fact": 0.5, "igsm": 0.3, "deduction": 0.1, "bed": 0.1}
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", default="/tmp/crowding-smoke")
-    ap.add_argument("--entities", type=int, default=60)
+    # 100 x 25 documents at ~75.7 tokens is ~189k against the 150k the 50%
+    # fact share demands. Sized to fill the lane: at 60 entities the lane ran
+    # dry and the bed silently absorbed a quarter of the corpus, so the
+    # rehearsal was not rehearsing the shape it claimed to.
+    ap.add_argument("--entities", type=int, default=100)
     ap.add_argument("--exposures", type=int, default=25)
     ap.add_argument("--tokens", type=int, default=300_000)
     ap.add_argument("--steps", type=int, default=6)
@@ -70,7 +74,11 @@ def main() -> int:
     corpus = out / "corpora" / "high"
     man = bc.build(corpus, args.entities, args.exposures, SHARES,
                    args.tokens, seed=0)
-    fails = bc.verify(corpus, expect_tokens=args.tokens)
+    # The lane-share gate stays on: this rehearsal must build the same shape
+    # of corpus the design specifies. The bed and the difficulty table are
+    # excused because neither FineWeb-Edu nor a trained checkpoint exists here.
+    fails = bc.verify(corpus, expect_tokens=args.tokens,
+                      allow_synthetic_bed=True, require_randpos_nll=False)
     assert not fails, fails
     audit = man["mask_audit"]
     assert audit["mass_matched"], audit
@@ -137,22 +145,33 @@ def main() -> int:
     # ---------------------------------------------------------------- verdict
     res = ac.analyse(out / "runs", "igsm_acc",
                      storage_floor=-1e9, igsm_band=(-1.0, 2.0),
-                     min_interesting_effect=0.0)
+                     min_interesting_effect=0.0, primary_load="high")
     report["analyzer"] = {
         "n_cells": res["n_cells"],
         "verdict": res["verdict"],
         "primary_contrast": res["primary_contrast"],
+        "inference_unit": res["inference_unit"],
+        "dose_response": res["dose_response"]["signature"],
     }
     print(f"  analyzer: {res['n_cells']} cells, verdict={res['verdict']}")
 
     # The analyzer must refuse an incomplete matrix.
     shutil.rmtree(out / "runs" / cfgs[-1]["run_id"])
     try:
-        ac.analyse(out / "runs", "igsm_acc", -1e9, (-1.0, 2.0), 0.0)
+        ac.analyse(out / "runs", "igsm_acc", -1e9, (-1.0, 2.0), 0.0,
+                   primary_load="high")
         raise AssertionError("analyzer accepted an incomplete matrix")
     except ac.IncompleteMatrix:
         report["analyzer"]["refuses_incomplete"] = True
     print("  analyzer refuses an incomplete matrix")
+
+    # And it must refuse to pick the estimand's load for itself.
+    try:
+        ac.analyse(out / "runs", "igsm_acc", -1e9, (-1.0, 2.0), 0.0)
+        raise AssertionError("analyzer chose a primary load on its own")
+    except ac.IncompleteMatrix:
+        report["analyzer"]["refuses_unnamed_primary_load"] = True
+    print("  analyzer refuses to choose the primary load itself")
 
     report["final_losses"] = losses
     report["elapsed_s"] = round(time.time() - t0, 1)
