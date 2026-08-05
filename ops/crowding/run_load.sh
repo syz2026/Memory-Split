@@ -25,6 +25,7 @@ MODEL=${MS_MODEL:-d40m_std}
 LR=${MS_LR:-1.5e-3}
 GRAD_CLIP=${MS_GRAD_CLIP:-10.0}
 BED=${MS_BED:-$ROOT/corpora/fineweb-edu.jsonl}
+NLL=${MS_NLL:-$ROOT/corpora/nll_table.npy}
 CORPUS="$ROOT/corpora/$LOAD"
 CFGS="$ROOT/configs/$LOAD"
 
@@ -37,8 +38,13 @@ if [ -f "$CORPUS/manifest.json" ]; then
     say "corpus present, skipping build"
 else
     test -f "$BED" || { say "FATAL: no pinned bed at $BED"; exit 1; }
+    test -f "$NLL" || { say "FATAL: no frozen RANDPOS difficulty table at $NLL.
+       Build one with ops/crowding/nll_table.py before any load. Without it
+       the control matches mass but not difficulty, and the primary contrast
+       is confounded by loss mass -- preregistration §2."; exit 1; }
     B=$(MS_OUT="$CORPUS" MS_CODE="$REPO" MS_PY="$PY" MS_ENTITIES="$ENTITIES" \
         MS_EXPOSURES="$EXPOSURES" MS_TOKENS="$TOKENS" MS_BED="$BED" \
+        MS_NLL="$NLL" \
         sbatch --parsable -D "$ROOT/logs" "$REPO/ops/crowding/build.sbatch")
     say "  build job $B"
     DEP="--dependency=afterok:$B"
@@ -62,6 +68,7 @@ PY
 say "submitting $(ls "$CFGS"/*.yaml | wc -l) runs"
 for c in "$CFGS"/*.yaml; do
     rid=$(basename "$c" .yaml)
+    guard_claim_cfg matrix "$c"
     j=$(MS_CFG="$c" MS_CODE="$REPO" MS_ROOT="$ROOT" MS_PY="$PY" \
         sbatch --parsable $DEP -D "$ROOT/logs" "$REPO/ops/crowding/train.sbatch")
     e=$(MS_RUN="$ROOT/runs/$rid" MS_CODE="$REPO" MS_PY="$PY" \

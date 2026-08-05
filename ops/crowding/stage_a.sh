@@ -88,6 +88,7 @@ PY
 say "submitting training"
 JOBS=()
 for c in "$CFGS"/*.yaml; do
+    guard_claim_cfg stage_a "$c"
     j=$(MS_CFG="$c" MS_CODE="$REPO" MS_ROOT="$ROOT" MS_PY="$PY" \
         sbatch --parsable ${DEP:-} -D "$ROOT/logs" "$REPO/ops/crowding/train.sbatch")
     JOBS+=("$j")
