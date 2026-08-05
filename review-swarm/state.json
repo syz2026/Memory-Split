@@ -1,0 +1,27 @@
+{
+  "cycle": 2,
+  "next_finding_id": 1,
+  "history": [
+    {
+      "cycle": 1,
+      "started": "20260805T151613Z",
+      "fingerprint": {
+        "head": "efc338a",
+        "branch": "cleanup/core-measurements",
+        "dirty_files": 37
+      }
+    },
+    {
+      "cycle": 2,
+      "started": "20260805T161714Z",
+      "fingerprint": {
+        "head": "efc338a",
+        "branch": "cleanup/core-measurements",
+        "dirty_files": 37
+      }
+    }
+  ],
+  "notes": [
+    "20260805T213008Z: cycle 3 was opened and rolled back without running. The orchestrator read a bulk mtime update at 12:02:30 local across ~20 files as evidence of patching. It was not: tracked content is byte-identical (git diff --shortstat unchanged at 1822/137) and untracked doc sizes are unchanged. Consistent with a sync or restore touching files without editing them. No finding has been patched."
+  ]
+}
