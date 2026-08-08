@@ -80,18 +80,34 @@ def doc_value_nll(model, tok, rec, exposure_idx: int, device) -> tuple[float, in
 def cohort_nll(model, tok, records, exposures, device) -> dict:
     """Mean NLL per value token over a cohort, with a per-document SE."""
     per_doc = []
+    per_person = []
     tok_total = 0
     for rec in records:
+        doc_means = []
         for e in exposures:
             total, n = doc_value_nll(model, tok, rec, e, device)
             if n:
-                per_doc.append(total / n)
+                doc_means.append(total / n)
                 tok_total += n
+        if doc_means:
+            per_doc.extend(doc_means)
+            per_person.append(statistics.fmean(doc_means))
+
     mean = statistics.fmean(per_doc)
-    se = statistics.stdev(per_doc) / len(per_doc) ** 0.5 if len(per_doc) > 1 else float("nan")
+
+    # Cluster by person. Each person contributes one document per exposure, and
+    # those renderings share a name and six attribute values, so they are not
+    # independent draws. Dividing by sqrt(n_documents) would understate the
+    # interval by up to sqrt(exposures). The person-level SE is the honest one;
+    # the document-level figure is kept only so the difference stays visible.
+    def _se(xs):
+        return statistics.stdev(xs) / len(xs) ** 0.5 if len(xs) > 1 else float("nan")
+
     return {
         "nats_per_value_token": mean,
-        "se": se,
+        "se": _se(per_person),
+        "se_by_document_unclustered": _se(per_doc),
+        "n_people": len(per_person),
         "n_documents": len(per_doc),
         "n_value_tokens": tok_total,
         "bits_per_value_token": mean / math.log(2),

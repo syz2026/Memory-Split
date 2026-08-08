@@ -1,0 +1,26 @@
+{
+  "checkpoint": "/scratch/users/syz/crowding/runs/stepladder_d40m_std/snapshots/step0031280.pt",
+  "corpus_seed": 0,
+  "cells": {
+    "trained": {
+      "nats_per_value_token": 1.9875625223632283,
+      "se": 0.009591469154653377,
+      "n_documents": 400,
+      "n_value_tokens": 7474,
+      "bits_per_value_token": 2.867446594470189
+    },
+    "unseen": {
+      "nats_per_value_token": 1.986553101148981,
+      "se": 0.009133331694786275,
+      "n_documents": 400,
+      "n_value_tokens": 7472,
+      "bits_per_value_token": 2.865990307490226
+    }
+  },
+  "gap_nats_unseen_minus_trained": -0.001009421214247297,
+  "gap_se": 0.013244396112758584,
+  "gap_z": -0.07621496711918045,
+  "binding_floor_nats": 0.1,
+  "bindings_learned": false,
+  "reading": "NO BINDINGS. Value tokens cost the same whether or not the model ever saw the entity, so gate 0's low loss reflects the marginal distribution of values and not memorisation. The model fitted fact text without storing facts."
+}

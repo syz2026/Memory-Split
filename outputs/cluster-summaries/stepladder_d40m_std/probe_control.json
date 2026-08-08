@@ -1,0 +1,30 @@
+{
+  "checkpoint": "/scratch/users/syz/crowding/runs/stepladder_d40m_std/snapshots/step0031280.pt",
+  "cells": {
+    "training_trained": {
+      "bits_per_entity": -67.8333810533608,
+      "se": 0.40720677389821464,
+      "n": 200
+    },
+    "training_unseen": {
+      "bits_per_entity": -67.65474066001555,
+      "se": 0.39075436757777104,
+      "n": 200
+    },
+    "heldout_trained": {
+      "bits_per_entity": -111.93017125593985,
+      "se": 0.5695272379675442,
+      "n": 200
+    },
+    "heldout_unseen": {
+      "bits_per_entity": -112.09980209406517,
+      "se": 0.5939608404589788,
+      "n": 200
+    }
+  },
+  "trained_minus_unseen_training_phrasing": -0.17864039334524762,
+  "trained_minus_unseen_heldout_phrasing": 0.16963083812531465,
+  "detection_floor_bits": 5.0,
+  "probe_detects_knowledge": false,
+  "reading": "POSITIVE CONTROL FAILS. The probe cannot separate trained from unseen entities even in the phrasing the model trained on, so it cannot detect knowledge at all and a negative result under held-out phrasing means nothing. Any claim resting on it must be withdrawn."
+}

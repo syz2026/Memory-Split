@@ -1,0 +1,57 @@
+==========================================================================
+Pad exposure under the pre-fix batching, from prompt lengths alone
+==========================================================================
+
+factqa_fresh  (the mechanism result)  (n=200, batch=16)
+  prompt tokens   min 16  median 18  max 21  spread 5
+  pad depth       mean 1.5  median 1  max 5
+  within safe (<=16 pads)   100.0%
+  past broken (>=24 pads)   0.0%
+  verdict         LIKELY INTACT
+
+igsm  (op 1-4)  (n=1500, batch=16)
+  prompt tokens   min 61  median 158  max 374  spread 313
+  pad depth       mean 119.0  median 123  max 300
+  within safe (<=16 pads)     9.4%
+  past broken (>=24 pads)  88.5%
+  verdict         HEAVILY CORRUPTED
+    op1: mean prompt   94.8 tokens (n=399)
+    op2: mean prompt  140.3 tokens (n=384)
+    op3: mean prompt  201.1 tokens (n=375)
+    op4: mean prompt  247.0 tokens (n=342)
+
+deduction  (n=1500, batch=16)
+  prompt tokens   min 80  median 106  max 140  spread 60
+  pad depth       mean 20.0  median 20  max 49
+  within safe (<=16 pads)    39.1%
+  past broken (>=24 pads)  39.4%
+  verdict         PARTLY CORRUPTED
+
+==========================================================================
+1B held-out Reasoning-Gym, per family (batches are within-family)
+Upper bound: the teacher-forced scorer was never committed, so we
+cannot confirm it padded. This is the exposure if it padded as the
+generative path did.
+==========================================================================
+family                  spread  mean pad  >=24 pads   verdict
+base_conversion             13       5.2      0.0%   LIKELY INTACT
+binary_matrix *            200     102.9     80.9%   HEAVILY CORRUPTED
+count_primes                 3       1.4      0.0%   LIKELY INTACT
+course_schedule            170      55.4     81.2%   HEAVILY CORRUPTED
+dice                         8       2.2      0.0%   LIKELY INTACT
+futoshiki *                 18       4.6      0.0%   LIKELY INTACT
+largest_island             186      81.8     84.2%   HEAVILY CORRUPTED
+path_star *                191      84.5     78.7%   HEAVILY CORRUPTED
+prime_factorization         23       7.8      0.0%   LIKELY INTACT
+ransom_note                 99      36.9     66.6%   HEAVILY CORRUPTED
+rotate_matrix *             76      36.4     63.5%   HEAVILY CORRUPTED
+rotten_oranges             187      94.0     82.8%   HEAVILY CORRUPTED
+spiral_matrix *            392     210.6     88.1%   HEAVILY CORRUPTED
+string_splitting             1       0.1      0.0%   LIKELY INTACT
+  * appears in the appendix table sent to the manager
+
+==========================================================================
+Pad depth is (batch maximum - own length), so it is a property of the
+prompt mix and the batch size, not of the model. These figures bound
+which committed numbers can survive re-measurement.
+==========================================================================

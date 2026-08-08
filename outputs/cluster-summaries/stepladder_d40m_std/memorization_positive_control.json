@@ -1,0 +1,32 @@
+{
+  "n_entities": 48,
+  "exposures": 8,
+  "steps": 250,
+  "model": {
+    "n_layer": 4,
+    "d_model": 128,
+    "ctx": 256
+  },
+  "cells": {
+    "trained": {
+      "nats_per_value_token": 2.483683119659337,
+      "se": 0.024729716876502553,
+      "n_documents": 96,
+      "n_value_tokens": 1816,
+      "bits_per_value_token": 3.5831973198721556
+    },
+    "unseen": {
+      "nats_per_value_token": 3.9320892778647774,
+      "se": 0.07348944156106994,
+      "n_documents": 96,
+      "n_value_tokens": 1780,
+      "bits_per_value_token": 5.67280570150818
+    }
+  },
+  "gap_nats_unseen_minus_trained": 1.4484061582054402,
+  "gap_se": 0.07753874462325198,
+  "gap_z": 18.679773128169764,
+  "detection_floor_nats": 0.25,
+  "instrument_detects_storage": true,
+  "reading": "POSITIVE CONTROL PASSES. On a model that demonstrably memorised its entities, the measurement separates trained from never-seen at the value positions. It can report storage when storage is present, so its null on the 40M run is informative."
+}

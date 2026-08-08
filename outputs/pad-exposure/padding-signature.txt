@@ -1,0 +1,51 @@
+==========================================================================
+FINGERPRINT 1 -- iGSM accuracy by operation count
+A reasoning model falls with op count. The padding defect makes it rise,
+because longer prompts sit closer to the batch maximum and are padded less.
+==========================================================================
+run                                     op1      op2      op3      op4   trend
+d160m_dense_n200k_s0_gate             0.005    0.020    0.050    0.057   RISING (defect)
+d160m_dense_n50k_s0_gate                -      0.004    0.017    0.036   RISING (defect)
+d160m_dense_n800k_s0_gate               -      0.004    0.017    0.041   RISING (defect)
+d160m_split_n200k_s0_gate             0.010    0.042    0.085    0.091   RISING (defect)
+
+==========================================================================
+FINGERPRINT 2 -- deduction by class (a constant 'no' scores exactly 0.500)
+==========================================================================
+run                                     yes       no   overall   reading
+d160m_dense_n200k_s0_gate             0.664    0.411     0.537   both classes answered
+d160m_dense_n50k_s0_gate              0.293    0.445     0.369   both classes answered
+d160m_dense_n800k_s0_gate             0.427    0.600     0.513   both classes answered
+d160m_split_n200k_s0_gate             0.609    0.453     0.531   both classes answered
+
+==========================================================================
+Fresh-entity lookup by relation (the mechanism result)
+==========================================================================
+d160m_dense_n200k_s0_gate  overall 0.0040 over n=500
+    birth_city     0.0000  (n=75)
+    birth_date     0.0000  (n=77)
+    current_city   0.0000  (n=91)
+    employer       0.0110  (n=91)
+    major          0.0000  (n=82)
+    university     0.0119  (n=84)
+d160m_dense_n50k_s0_gate  overall 0.0020 over n=500
+    birth_city     0.0133  (n=75)
+    birth_date     0.0000  (n=77)
+    current_city   0.0000  (n=91)
+    employer       0.0000  (n=91)
+    major          0.0000  (n=82)
+    university     0.0000  (n=84)
+d160m_dense_n800k_s0_gate  overall 0.0080 over n=500
+    birth_city     0.0000  (n=75)
+    birth_date     0.0000  (n=77)
+    current_city   0.0110  (n=91)
+    employer       0.0000  (n=91)
+    major          0.0244  (n=82)
+    university     0.0119  (n=84)
+d160m_split_n200k_s0_gate  overall 0.9960 over n=500
+    birth_city     1.0000  (n=75)
+    birth_date     1.0000  (n=77)
+    current_city   1.0000  (n=91)
+    employer       1.0000  (n=91)
+    major          0.9878  (n=82)
+    university     0.9881  (n=84)

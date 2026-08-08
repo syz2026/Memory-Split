@@ -1,5 +1,22 @@
 # The hypothesis is null in the regime we tested, and that regime never crowded
 
+> **WITHDRAWN 2026-08-05. DO NOT CITE ANY NUMBER BELOW.**
+>
+> This draft is retained as the primary record of a retracted argument, not as a
+> source. Every generative accuracy figure in it was produced by the batched
+> decoder that left-padded prompts with the end-of-text token and attended over
+> the pads, which put those numbers at floor regardless of what the model could
+> do. See `RETAINED-RESULTS.md`, "The decoding defect withdraws every generative
+> accuracy number."
+>
+> Specifically withdrawn: the held-out deduction table at 160M / 3.2B, the
+> bits-stored-per-entity ledger, the four-way recognition probe, and the
+> 49-to-196 exposure memorisation threshold. The conclusion that premise 1 fails
+> has since been re-established on a valid instrument, and that version lives in
+> `paper-workshop.tex` section 6 with its artifact in `RETAINED-RESULTS.md`
+> section 9. Rewriting this document against the corrected measurements is
+> outstanding work.
+
 Memory Split predicts that arbitrary facts consume parameters a small model would
 otherwise spend on reasoning. Taking the facts out of the weights should return
 those parameters. We tested this at 162M parameters across a sixteen-fold range

@@ -1,0 +1,124 @@
+{
+  "run": "stepladder_d40m_std",
+  "arm": "sup",
+  "seed": 0,
+  "model": "d40m_std",
+  "mod": 23,
+  "ckpt": "step0031280.pt",
+  "igsm_acc": 0.96,
+  "igsm_by_op": {
+    "1": {
+      "n": 399,
+      "acc": 0.9974937343358395
+    },
+    "2": {
+      "n": 384,
+      "acc": 0.9921875
+    },
+    "3": {
+      "n": 375,
+      "acc": 0.9573333333333334
+    },
+    "4": {
+      "n": 342,
+      "acc": 0.8830409356725146
+    }
+  },
+  "igsm_majority_rate": 0.07533333333333334,
+  "igsm_lift_over_majority": 0.8846666666666666,
+  "igsm_n": 1500,
+  "igsm_parsed_rate": 1.0,
+  "igsm_in_answer_space_rate": 1.0,
+  "igsm_acc_given_valid_answer": 0.96,
+  "igsm_n_in_answer_space": 1500,
+  "igsm_m1_nll": 0.0016471081674887913,
+  "igsm_m1_nll_n": 1500,
+  "igsm_m1_nll_neg": -0.0016471081674887913,
+  "igsm_m2_nll": 0.00019196526208058154,
+  "igsm_m2_nll_n": 1500,
+  "igsm_m2_nll_neg": -0.00019196526208058154,
+  "igsm_m3_correct_prob": 0.959817318724986,
+  "igsm_m3_correct_prob_n": 1500,
+  "igsm_continuous_n_scored": 1500,
+  "igsm_continuous_n_dropped_over_ctx": 0,
+  "igsm_ood_acc": 0.14533333333333334,
+  "igsm_ood_by_op": {
+    "5": {
+      "n": 183,
+      "acc": 0.41530054644808745
+    },
+    "6": {
+      "n": 194,
+      "acc": 0.07216494845360824
+    },
+    "7": {
+      "n": 190,
+      "acc": 0.05263157894736842
+    },
+    "8": {
+      "n": 183,
+      "acc": 0.04918032786885246
+    }
+  },
+  "igsm_ood_majority_rate": 0.09066666666666667,
+  "igsm_ood_parsed_rate": 1.0,
+  "igsm_ood_in_answer_space_rate": 1.0,
+  "igsm_ood_acc_given_valid_answer": 0.14533333333333334,
+  "igsm_ood_n_in_answer_space": 750,
+  "deduction_overall": 0.95,
+  "deduction_by_class": {
+    "no": {
+      "n": 200,
+      "acc": 0.935
+    },
+    "yes": {
+      "n": 200,
+      "acc": 0.965
+    }
+  },
+  "deduction_majority_rate": 0.5,
+  "recoverable_bits_per_entity": -112.7029470760226,
+  "recoverable_bits_per_param": -4.256370175814877,
+  "recoverable_bits_per_param_ci95": [
+    -4.266228645376374,
+    -4.246511706253379
+  ],
+  "recoverable_bits_per_param_se": 0.0050298314089271936,
+  "recoverable_bits_rel_se": 0.0011817185068881465,
+  "recoverable_bits_per_attribute": {
+    "birth_date": -9.62041318277029,
+    "birth_city": -19.120872255172046,
+    "university": -25.608794294569453,
+    "major": -18.375956959818854,
+    "employer": -19.106561560077136,
+    "current_city": -20.870348823614815
+  },
+  "recoverable_bits_per_entity_length": -120.37440697813557,
+  "recoverable_bits_per_param_length": -4.546092618567752,
+  "recoverable_bits_per_param_length_ci95": [
+    -4.5560312934033655,
+    -4.53615394373214
+  ],
+  "recoverable_bits_per_param_length_se": 0.0050707524671492745,
+  "recoverable_bits_rel_se_length": 0.0011154089660291207,
+  "recoverable_bits_per_attribute_length": {
+    "birth_date": -9.62041318277029,
+    "birth_city": -20.18875686083157,
+    "university": -27.159799143929344,
+    "major": -20.730399947881192,
+    "employer": -20.732976956499137,
+    "current_city": -21.942060886224034
+  },
+  "recoverable_bits_scaled_from": 4000,
+  "recoverable_bits_extrapolation_factor": 382.95,
+  "n_entities": 1531800,
+  "final_step": 31280,
+  "final_loss_ema": 1.2512,
+  "clip_ratio": 1.0,
+  "clip_frac": 0.0,
+  "grad_norm_preclip": 0.09693870967741935,
+  "adam_v_mean": 0.0,
+  "loss_masked_values_final": 1.9732,
+  "n_gate0_points": 1,
+  "n_params": 40560000
+}

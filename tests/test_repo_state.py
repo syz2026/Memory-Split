@@ -66,13 +66,17 @@ def test_docs_holds_only_the_current_documents():
         "GATE0-CEILING-IS-NOT-A-BOUND.md",
         "NO-GO-PAPER.md",
         "PAPER-MEASUREMENT.md",
-        "PAPER-WORKSHOP.md",
         "POPQA-HELDOUT-KEY.md",
         "PREREGISTRATION.md",
         "RESULTS-2026-08-04.md",
         "RETAINED-RESULTS.md",
         "THEORY-CAPACITY.md",
         "THEORY-ENDPOINT.md",
+        # The workshop submission. Source lives here rather than in a paper/
+        # tree because `paper` is a forbidden directory, and keeping the .tex
+        # under docs/ also subjects it to the withdrawn-number scan above.
+        "paper-workshop.pdf",
+        "paper-workshop.tex",
         "section-null-without-crowding.md",
     ], docs
 
@@ -165,6 +169,11 @@ FINGERPRINT_EXEMPT = {
     "RETAINED-RESULTS.md",    # the catalogue; listing them is its purpose
     "RESULTS-2026-08-04.md",  # the retraction; it quotes what it retracts
     "POPQA-HELDOUT-KEY.md",   # the primary record of the withdrawn experiment
+    # The null draft built on the padded decoder. Exempt 2026-08-05 on the same
+    # grounds as the two above: it is the artifact being withdrawn rather than a
+    # document citing one. Guarded instead by the banner assertion below, so it
+    # cannot quietly lose its warning and start reading as a live source.
+    "section-null-without-crowding.md",
 }
 
 
@@ -198,3 +207,33 @@ def test_no_document_resurrects_a_withdrawn_number():
         + "\n\nSee docs/RETAINED-RESULTS.md. Reproduce the measurement and "
           "catalogue it, or remove the claim."
     )
+
+
+# Exempt documents are allowed to carry withdrawn numbers only because they are
+# the record of the withdrawal. That privilege is worth nothing if the warning
+# can fall off, which would leave a retracted draft reading as a live source.
+MUST_CARRY_A_WITHDRAWAL_BANNER = {
+    "section-null-without-crowding.md": "WITHDRAWN",
+    "RESULTS-2026-08-04.md": "defect",
+}
+
+
+def test_exempt_drafts_still_announce_that_they_are_withdrawn():
+    """The exemption list is a hole unless the holes are labelled.
+
+    `section-null-without-crowding.md` reproduces four withdrawn ledgers and is
+    linked from HANDOFF.md, so a reader can arrive at it directly. It may keep
+    those numbers, but only while it says at the top that they are dead.
+    """
+    for name, needle in MUST_CARRY_A_WITHDRAWAL_BANNER.items():
+        doc = ROOT / "docs" / name
+        if not doc.exists():
+            continue
+        head = doc.read_text()[:1500]
+        assert needle in head, (
+            f"{name} is exempt from the withdrawn-number guard but no longer "
+            f"warns the reader in its first 1500 characters. Restore the "
+            f"banner or remove the exemption in FINGERPRINT_EXEMPT.")
+        assert name in FINGERPRINT_EXEMPT, (
+            f"{name} carries a withdrawal banner but is not exempt; the two "
+            f"lists have drifted apart.")

@@ -1,0 +1,197 @@
+{
+  "run": "stepladder_d40m_std",
+  "ladder": [
+    {
+      "step": 1564,
+      "acc_op1": 0.44862155388471175,
+      "overall": 0.196,
+      "majority_rate": 0.07533333333333334,
+      "in_answer_space_rate": 0.9993333333333333,
+      "acc_given_valid": 0.1961307538358906,
+      "op1_clears_baseline": true
+    },
+    {
+      "step": 3128,
+      "acc_op1": 0.9874686716791979,
+      "overall": 0.65,
+      "majority_rate": 0.07533333333333334,
+      "in_answer_space_rate": 1.0,
+      "acc_given_valid": 0.65,
+      "op1_clears_baseline": true
+    },
+    {
+      "step": 4692,
+      "acc_op1": 0.9774436090225563,
+      "overall": 0.7533333333333333,
+      "majority_rate": 0.07533333333333334,
+      "in_answer_space_rate": 1.0,
+      "acc_given_valid": 0.7533333333333333,
+      "op1_clears_baseline": true
+    },
+    {
+      "step": 6256,
+      "acc_op1": 0.9899749373433584,
+      "overall": 0.7946666666666666,
+      "majority_rate": 0.07533333333333334,
+      "in_answer_space_rate": 1.0,
+      "acc_given_valid": 0.7946666666666666,
+      "op1_clears_baseline": true
+    },
+    {
+      "step": 7820,
+      "acc_op1": 0.9924812030075187,
+      "overall": 0.8433333333333334,
+      "majority_rate": 0.07533333333333334,
+      "in_answer_space_rate": 1.0,
+      "acc_given_valid": 0.8433333333333334,
+      "op1_clears_baseline": true
+    },
+    {
+      "step": 9384,
+      "acc_op1": 0.9949874686716792,
+      "overall": 0.858,
+      "majority_rate": 0.07533333333333334,
+      "in_answer_space_rate": 1.0,
+      "acc_given_valid": 0.858,
+      "op1_clears_baseline": true
+    },
+    {
+      "step": 10948,
+      "acc_op1": 1.0,
+      "overall": 0.8666666666666667,
+      "majority_rate": 0.07533333333333334,
+      "in_answer_space_rate": 1.0,
+      "acc_given_valid": 0.8666666666666667,
+      "op1_clears_baseline": true
+    },
+    {
+      "step": 12512,
+      "acc_op1": 0.9974937343358395,
+      "overall": 0.8853333333333333,
+      "majority_rate": 0.07533333333333334,
+      "in_answer_space_rate": 1.0,
+      "acc_given_valid": 0.8853333333333333,
+      "op1_clears_baseline": true
+    },
+    {
+      "step": 14076,
+      "acc_op1": 1.0,
+      "overall": 0.9046666666666666,
+      "majority_rate": 0.07533333333333334,
+      "in_answer_space_rate": 1.0,
+      "acc_given_valid": 0.9046666666666666,
+      "op1_clears_baseline": true
+    },
+    {
+      "step": 15640,
+      "acc_op1": 1.0,
+      "overall": 0.9246666666666666,
+      "majority_rate": 0.07533333333333334,
+      "in_answer_space_rate": 1.0,
+      "acc_given_valid": 0.9246666666666666,
+      "op1_clears_baseline": true
+    },
+    {
+      "step": 17204,
+      "acc_op1": 1.0,
+      "overall": 0.9206666666666666,
+      "majority_rate": 0.07533333333333334,
+      "in_answer_space_rate": 1.0,
+      "acc_given_valid": 0.9206666666666666,
+      "op1_clears_baseline": true
+    },
+    {
+      "step": 18768,
+      "acc_op1": 1.0,
+      "overall": 0.934,
+      "majority_rate": 0.07533333333333334,
+      "in_answer_space_rate": 1.0,
+      "acc_given_valid": 0.934,
+      "op1_clears_baseline": true
+    },
+    {
+      "step": 20332,
+      "acc_op1": 1.0,
+      "overall": 0.9386666666666666,
+      "majority_rate": 0.07533333333333334,
+      "in_answer_space_rate": 1.0,
+      "acc_given_valid": 0.9386666666666666,
+      "op1_clears_baseline": true
+    },
+    {
+      "step": 21896,
+      "acc_op1": 1.0,
+      "overall": 0.9393333333333334,
+      "majority_rate": 0.07533333333333334,
+      "in_answer_space_rate": 1.0,
+      "acc_given_valid": 0.9393333333333334,
+      "op1_clears_baseline": true
+    },
+    {
+      "step": 23460,
+      "acc_op1": 1.0,
+      "overall": 0.9513333333333334,
+      "majority_rate": 0.07533333333333334,
+      "in_answer_space_rate": 1.0,
+      "acc_given_valid": 0.9513333333333334,
+      "op1_clears_baseline": true
+    },
+    {
+      "step": 25024,
+      "acc_op1": 1.0,
+      "overall": 0.95,
+      "majority_rate": 0.07533333333333334,
+      "in_answer_space_rate": 1.0,
+      "acc_given_valid": 0.95,
+      "op1_clears_baseline": true
+    },
+    {
+      "step": 26588,
+      "acc_op1": 1.0,
+      "overall": 0.9606666666666667,
+      "majority_rate": 0.07533333333333334,
+      "in_answer_space_rate": 1.0,
+      "acc_given_valid": 0.9606666666666667,
+      "op1_clears_baseline": true
+    },
+    {
+      "step": 28152,
+      "acc_op1": 1.0,
+      "overall": 0.9626666666666667,
+      "majority_rate": 0.07533333333333334,
+      "in_answer_space_rate": 1.0,
+      "acc_given_valid": 0.9626666666666667,
+      "op1_clears_baseline": true
+    },
+    {
+      "step": 29716,
+      "acc_op1": 0.9974937343358395,
+      "overall": 0.9506666666666667,
+      "majority_rate": 0.07533333333333334,
+      "in_answer_space_rate": 1.0,
+      "acc_given_valid": 0.9506666666666667,
+      "op1_clears_baseline": true
+    },
+    {
+      "step": 31280,
+      "acc_op1": 0.9974937343358395,
+      "overall": 0.96,
+      "majority_rate": 0.07533333333333334,
+      "in_answer_space_rate": 1.0,
+      "acc_given_valid": 0.96,
+      "op1_clears_baseline": true
+    }
+  ],
+  "first_clearing_step": 1564,
+  "verdict": "Clears the baseline by step 1,564. Stage A's floor was a step budget, not an unusable endpoint.",
+  "gain_attribution": {
+    "in_answer_space_first": 0.9993333333333333,
+    "in_answer_space_last": 1.0,
+    "format_compliance_gain": 0.0006666666666667043,
+    "acc_given_valid_first": 0.1961307538358906,
+    "acc_given_valid_last": 0.96,
+    "acc_given_valid_gain": 0.7638692461641093,
+    "lift_over_majority_at_last": 0.8846666666666666,
+    "reading": "ARITHMETIC. Accuracy conditional on a valid answer sits above the majority rate, so the model is doing better than reproducing the answer distribution."
+  }
+}

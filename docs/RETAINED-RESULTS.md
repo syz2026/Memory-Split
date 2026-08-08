@@ -305,6 +305,11 @@ the checkpoint hash. Not rebuilt after the measurement was seen.
 (F/C = 2.0), 16.4B tokens, 31,280 steps, `loss_ema` 1.2512, `clip_frac` 0.0.
 Twenty snapshots, scored with the corrected decoder.
 
+**Artifacts.** `outputs/cluster-summaries/stepladder_d40m_std/step_ladder.json`
+and `evals/step0031280.json`, mirrored into the repository. The per-snapshot
+probe figures and the positive-control cells in section 9a are in
+`probe_control.json` alongside them.
+
 **Produced by.** Batched generation via `generate_batch` **after** the fix,
 cross-checked against one-prompt-at-a-time decoding. **Survives** — this section
 is the measurement of the defect, and it is the only place in this file where a
@@ -352,7 +357,168 @@ whichever checkpoint was scored most recently and does not record which. Two
 reviewers independently mistook a step-14,076 file for the final checkpoint.
 Per-op numbers must be taken from `evals/step*.json`, which are tagged.
 
-## 9. Facts are not retrievable at twice capacity
+## 9. The model fits fact text without storing facts
+
+**Artifact.** `outputs/cluster-summaries/stepladder_d40m_std/memorization_control.json`,
+mirrored into the repository so the claim does not depend on cluster access.
+
+**Produced by.** `ops/crowding/memorization_control.py`, job 1676565, 32s on CPU,
+final checkpoint `step0031280.pt` of `stepladder_d40m_std`. Renders each entity
+through `bios.render_bio_marked` — the same function the corpus builder used, so
+the text is byte-identical to what training saw — teacher-forces the full
+document, and reads NLL at the marked value positions. This is gate 0's
+measurement with a cohort control attached.
+
+| cohort | nats per value token | SE | documents | value tokens |
+|---|---:|---:|---:|---:|
+| trained, 100 exposures each | **1.9876** | 0.0096 | 400 | 7,474 |
+| never seen | **1.9866** | 0.0091 | 400 | 7,472 |
+| **unseen - trained** | **-0.0010** | 0.0132 | | **z = -0.08** |
+
+**Why this instrument is trusted where the probe is not.** It reproduces gate 0
+(1.9876 against 1.9732) on the same quantity, which is precisely the check the
+query probe fails by 68 bits. Cohorts are disjoint by assertion, and
+`tests/test_memorization_control.py` holds that the generator is prefix-stable,
+so the trained cohort really is the first 200 entities of the corpus rather than
+a second unseen sample.
+
+**Supports.** That the model learned **no** entity-value binding that lowers the
+loss at a value token. The null is tight, not underpowered: the interval excludes
+any trained-cohort advantage above roughly 0.03 nats per value token. Gate 0's
+1.9732 nats therefore measures the marginal distribution of the value pools, not
+memorisation — a model shown 1,531,800 entities 100 times each predicts their
+values no better than values for people who do not exist.
+
+**The instrument's own positive control — added 2026-08-05.**
+`ops/crowding/memorization_positive_control.py`, CPU, ~15 min, artifact
+`outputs/cluster-summaries/stepladder_d40m_std/memorization_positive_control.json`.
+A reviewer's first objection was that we demanded a positive control of the
+query probe and then skipped it for the replacement, which would repeat the
+error section 9a documents. So the same measurement was run against a model
+where bindings exist by construction: a 4-layer, 128-dim model trained 250 steps
+on nothing but 48 biographies.
+
+| model | trained | never seen | unseen - trained | z |
+|---|---:|---:|---:|---:|
+| 48 entities, memorised | 2.4837 | 3.9321 | **+1.4484** | **+18.68** |
+| the 40M run | 1.9876 | 1.9866 | **-0.0010** | **-0.08** |
+
+The instrument resolves storage at z = +18.7 where storage is present. Its gap
+there is **56x** the upper bound of the 95% interval it excludes on the 40M run,
+so the production null is a measurement rather than a limit of the tool. Note
+the memorising model was still descending at step 250 (loss 2.14), so the gap is
+a floor on what the instrument can see, not a ceiling.
+
+**Replicated at a second configuration.** An earlier, longer run of the same
+script — 64 entities, 400 steps, training loss down to 1.1142 — gives trained
+**1.4690** against unseen **3.2988**, a gap of **+1.8298** (SE 0.0769,
+**z = +23.79**, 128 documents per cohort). Training the memorising model further
+widens the gap, which is the expected direction and rules out the first result
+being a fluke of one stopping point. That run's artifact was overwritten by the
+48-entity run now on disk; its console record is the provenance, and the paper
+cites only the 48-entity figures that the artifact backs.
+
+**The null holds across training, not just at the end — added 2026-08-06.**
+Job 1676728, `ops/crowding/memorization_over_training.sh`, 2m11s on CPU,
+artifacts in
+`outputs/cluster-summaries/stepladder_d40m_std/memorization_over_training/`.
+A reviewer noted that a single final checkpoint cannot exclude bindings that
+formed early and decayed. Five checkpoints, same instrument, same cohorts:
+
+| step | trained | never seen | gap | z |
+|---:|---:|---:|---:|---:|
+| 1,564 | 1.9907 | 1.9884 | -0.0023 | -0.17 |
+| 7,820 | 1.9916 | 1.9887 | -0.0029 | -0.22 |
+| 15,640 | 1.9864 | 1.9856 | -0.0008 | -0.06 |
+| 23,460 | 1.9880 | 1.9864 | -0.0016 | -0.12 |
+| 31,280 | 1.9876 | 1.9866 | -0.0010 | -0.08 |
+
+The largest gap anywhere in training is **0.0029 nats**, a fiftieth of the
+instrument's demonstrated detection floor and three orders below the +1.4484 it
+resolves on a memorising model. Every gap is also negative, so the trained
+cohort is never even nominally cheaper. **Not in the workshop paper**, which was
+finalised before this ran; it is the natural strengthening for a camera-ready,
+turning "no bindings at the final checkpoint" into "no bindings at any point we
+sampled, from 5% of training onward."
+
+**Does not support.** A representation that never surfaces in the training
+objective. One run, 200 entities per cohort at two renderings. The positive
+control establishes sensitivity to bindings of the kind the loss can see; it
+does not establish sensitivity to any other kind.
+
+**Tension with our own theory.** `theory/capacity.py` places F/C = 2.0 in
+over-load, where the model "can still fit half the facts, so it has every reason
+to keep spending," and puts abandonment far above this ratio. We observe
+abandonment at twice capacity. The theory's prediction is wrong here, or the
+regime boundary is not where it places it.
+
+**The F/C = 2.0 figure does not rest on our interpolation — checked 2026-08-06.**
+`ALPHA_ANCHORS = ((100, 1.0), (1000, 2.0))`, and the run trains at **exactly 100
+exposures**, which is the low anchor itself. `bits_per_param_at(100)` returns the
+anchor without interpolating, so the ratio uses Allen-Zhu and Li's reported
+figure directly. Interpolation only affects other rungs of the dose ladder.
+Sensitivity, holding demand at 2.0001 bits/param:
+
+| achievable at 100 exposures | F/C |
+|---:|---:|
+| 0.50 | 4.00 |
+| 0.75 | 2.67 |
+| **1.00 (their figure)** | **2.00** |
+| 1.25 | 1.60 |
+| 1.50 | 1.33 |
+| 2.00 | 1.00 |
+
+Reaching critical load (F/C = 1.0) requires achievable capacity of 2.0
+bits/param at 100 exposures, which is their **1000**-exposure result attained at
+a tenth the exposures. An earlier draft of the paper said "every ratio we quote
+depends on that interpolation," which overstated the dependence and has been
+corrected.
+
+## 9a. The storage probe fails its positive control — EVIDENCE WITHDRAWN 2026-08-05
+
+Section 9's conclusion is the one this probe reported, but the probe could not
+have established it and is retained only as a defect record.
+
+**Everything in this section that reads as evidence about storage is withdrawn.**
+Job 1676474, `ops/crowding/probe_control.py` on `stepladder_d40m_std`, 200
+entities per cohort, final checkpoint, all four cells scored in one call:
+
+| phrasing | trained | never seen | difference |
+|---|---:|---:|---:|
+| held out from training | -111.93 (SE 0.57) | -112.10 (SE 0.59) | +0.17 |
+| **present in training** | **-67.83 (SE 0.41)** | **-67.65 (SE 0.39)** | **-0.18** |
+
+All four cells come from this single job, on 200 entities per cohort. The
+held-out row of the **earlier, independent** 300-entity run in section 9a gave
+-112.90 against -112.29 (difference -0.61 +/- 0.68); the two runs agree that the
+held-out contrast is null, and must not be spliced into one table.
+
+The probe cannot separate trained from unseen entities **in the phrasing the
+model trained on**. An instrument that cannot detect knowledge where knowledge
+must be present says nothing by failing to detect it elsewhere, so the held-out
+null is uninterpretable and no claim may rest on it. The job exits 2 by design
+when this gate fails; the SLURM state `FAILED` is that guard, not a crash.
+
+**Independent confirmation from arithmetic.** At 74.91 tokens/document and
+24.89% value tokens, an entity carries 18.65 value tokens. Gate 0's 1.9732
+nats/token is then 53.08 bits/entity against the 52.96-bit ceiling, implying
+**-0.12** recoverable bits. The probe reports **-67.83** for the same nominal
+quantity. A 68-bit disagreement between two measurements of one number.
+
+**Most likely cause.** `probe_control.probe_bits` queries one attribute behind a
+bare `BIO_TEMPLATES[attr][0][0]` prefix, while training presented six attributes
+in a shared document. The probe strips the context the model learned under.
+
+**What would settle it.** `ops/crowding/memorization_control.py` — teacher-force
+the full rendered biography via `bios.render_bio_marked`, read NLL at marked
+value positions exactly as gate 0 does, trained cohort against unseen. Written
+and not yet run.
+
+**Retained from the original section.** Gate 0 = **1.9732 nats** is a valid
+training-loss measurement and survives. The statement that the model *fits fact
+text* survives. The statement that it *stores no retrievable facts* does not.
+
+## 9b. Original section, retained for provenance — DO NOT CITE
 
 **Produced by.** Gate 0 is a training-loss measurement. The storage probe is
 teacher-forced NLL through `evals/storage.py`, which writes content at the head
@@ -382,9 +548,17 @@ depress both cohorts, but knowledge present in any addressable form would
 separate them.
 
 **Does not support.** Any claim at or below capacity. This run sits at
-**F/C = 2.0**, which `docs/THEORY-CAPACITY.md` predicts is the abandonment
-regime, so the result is consistent with the model declining to enter storage
-rather than with storage being impossible.
+**F/C = 2.0**.
+
+**Correction 2026-08-05.** Earlier drafts of this section, and
+`docs/PAPER-MEASUREMENT.md`, said F/C = 2.0 is the *abandonment* regime that
+`docs/THEORY-CAPACITY.md` predicts. That is a misreading of our own theory.
+`theory/capacity.py` places F > C in **over-load**, where "dense is still
+capacity-limited and still spends all of C on the facts it can fit" and the
+freed amount plateaus; it puts abandonment at **F >>> C** and states explicitly
+that at twice capacity "the model can still fit half the facts, so it has every
+reason to keep spending." The theory therefore predicts *partial storage* here,
+not abandonment, and cannot be cited in support of a storage null at this ratio.
 
 **The per-snapshot probe, and why the absolute value is not the claim.** The
 probe draws a fixed entity set (`corpus_seed` is pinned, `storage.py:196-201`),
